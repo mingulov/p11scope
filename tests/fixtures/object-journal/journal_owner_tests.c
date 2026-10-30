@@ -2775,6 +2775,110 @@ static void producer_prepare_finish_and_collision(void)
       EXPECT(reason == 1, "real collision preserves its named reason"); }
 }
 
+/* A second tracked slot on the same physical owner, built from the first
+ * slot's retained fixture rows without a reset. */
+static void producer_second_begin(struct journal_entry_context *entry, struct owner_start_key *key)
+{
+    struct journal_entry_witness witness;
+    void *first = lookup(&INSTANCE_START, &producer_terminal_key);
+    struct object_start *side;
+    EXPECT(first != NULL, "first slot witness retained");
+    memcpy(&witness, first, sizeof(witness));
+    EXPECT(update(&INSTANCE_START, key, &witness, 0) == 0, "second slot witness");
+    EXPECT(p11_owner_start_insert(key, start_value) == 0, "second slot START");
+    side = lookup(&OBJECT_START, key);
+    EXPECT(side != NULL, "second slot subordinate");
+    side->layout = JOURNAL_LAYOUT_LP64;
+    side->phase = OBJECT_PHASE_READY;
+    p11_journal_begin(key, entry);
+}
+
+/* Pending stop then exec/exit: returns never run, custody stays intact,
+ * and cleanup abandons every live tracked BEGIN exactly once with the
+ * exec/exit reason. Lifetime words survive so the exec successor keeps
+ * the same thread and continues the sequence. */
+static void producer_cleanup_exec_exit(void)
+{
+    struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+    struct owner_start_key second = producer_terminal_key;
+    struct journal_return_words words;
+    struct object_start *side;
+    u64 thread;
+    second.slot = 6;
+    p11_journal_begin(&producer_terminal_key, &entry);
+    producer_second_begin(&entry, &second);
+    EXPECT(ring_submits == 2 && !producer_gaps, "two tracked BEGINs on one owner");
+    EXPECT(lookup(&START, &producer_terminal_key) && lookup(&START, &second) &&
+               lookup(&JOURNAL_START, &producer_terminal_key) && lookup(&JOURNAL_START, &second),
+           "pending stop leaves ordinary and journal custody untouched");
+    EXPECT(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START,
+           "cleanup reports abandoned live STARTs");
+    EXPECT(ring_submits == 4 && !producer_gaps, "one ABANDON per live BEGIN, no second loss");
+    EXPECT(((unsigned char *)ring_log[2])[4] == JOURNAL_KIND_ABANDON &&
+               record_u32(ring_log[2], 48) == 5 && record_u32(ring_log[2], 52) == 6 &&
+               record_u64(ring_log[2], 16) == 1,
+           "first cleanup ABANDON names slot, exec/exit reason and original sequence");
+    EXPECT(((unsigned char *)ring_log[3])[4] == JOURNAL_KIND_ABANDON &&
+               record_u32(ring_log[3], 48) == 6 && record_u32(ring_log[3], 52) == 6 &&
+               record_u64(ring_log[3], 16) == 2,
+           "second cleanup ABANDON names slot, exec/exit reason and original sequence");
+    EXPECT(!lookup(&START, &producer_terminal_key) && !lookup(&START, &second) &&
+               !lookup(&OBJECT_START, &producer_terminal_key) && !lookup(&OBJECT_START, &second) &&
+               !lookup(&JOURNAL_START, &producer_terminal_key) && !lookup(&JOURNAL_START, &second) &&
+               !ctl.outstanding,
+           "cleanup retires every custody row");
+    thread = owners[0].journal_thread;
+    EXPECT(thread == 1 && owners[0].journal_sequence == 2, "exec preserves lifetime words");
+    EXPECT(p11_owner_start_insert(&producer_terminal_key, start_value) == 0, "exec successor START");
+    side = lookup(&OBJECT_START, &producer_terminal_key);
+    EXPECT(side != NULL, "exec successor subordinate");
+    side->layout = JOURNAL_LAYOUT_LP64;
+    side->phase = OBJECT_PHASE_READY;
+    p11_journal_begin(&producer_terminal_key, &entry);
+    EXPECT(ring_submits == 5 && record_u64(ring_log[4], 8) == thread &&
+               record_u64(ring_log[4], 16) == 3,
+           "successor BEGIN continues thread and sequence, never reuses a terminal identity");
+    p11_journal_returning(&producer_terminal_key, &words);
+    EXPECT(words.thread == thread && words.sequence == 3 && words.flags == 0,
+           "successor return joins its own BEGIN");
+    EXPECT(!p11_owner_start_remove(&producer_terminal_key, 1) && ring_submits == 5 &&
+               !producer_gaps && !ctl.outstanding,
+           "successor settles silently beside its END");
+}
+
+/* NO_END owes no terminal: cleanup abandons only the ordinary START. */
+static void producer_cleanup_no_end(void)
+{
+    struct journal_entry_context entry = producer_setup(2, JOURNAL_CLASS_NO_END, 0, 255);
+    p11_journal_begin(&producer_terminal_key, &entry);
+    EXPECT(ring_submits == 1 && !lookup(&JOURNAL_START, &producer_terminal_key),
+           "NO_END BEGIN holds no side row");
+    EXPECT(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START,
+           "cleanup still reports the abandoned ordinary START");
+    EXPECT(ring_submits == 1 && !producer_gaps && !lookup(&START, &producer_terminal_key) &&
+               !ctl.outstanding,
+           "NO_END cleanup publishes no ABANDON and counts no journal loss");
+}
+
+/* A RETURNING row at exit never submitted its END (submission follows
+ * removal), so cleanup abandons it exactly once instead of staying
+ * silent on a reason-carrying removal. */
+static void producer_cleanup_returning(void)
+{
+    struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+    struct journal_return_words words;
+    p11_journal_begin(&producer_terminal_key, &entry);
+    p11_journal_returning(&producer_terminal_key, &words);
+    EXPECT(words.thread == 1 && words.sequence == 1 && words.flags == 0, "return advanced the row");
+    EXPECT(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START,
+           "cleanup reports the still-owned START");
+    EXPECT(ring_submits == 2 && ((unsigned char *)ring_log[1])[4] == JOURNAL_KIND_ABANDON &&
+               record_u32(ring_log[1], 52) == 6 && record_u64(ring_log[1], 16) == 1 &&
+               !producer_gaps && !lookup(&JOURNAL_START, &producer_terminal_key) &&
+               !lookup(&START, &producer_terminal_key) && !ctl.outstanding,
+           "unsubmitted END abandons once with the exec/exit reason");
+}
+
 /* Exact pre-BEGIN native row snapshots for the private P0a unit module.
  * END construction there uses shared production Rust writers, not BEGIN
  * bytes copied back into an equality-shaped payload. */
@@ -2901,6 +3005,9 @@ int main(int argc, char **argv)
         producer_terminal_matrix();
         producer_return_refusals();
         producer_prepare_finish_and_collision();
+        producer_cleanup_exec_exit();
+        producer_cleanup_no_end();
+        producer_cleanup_returning();
         if (!failures)
             fprintf(stderr, "journal producer fixture: all checks passed\n");
         return failures != 0;

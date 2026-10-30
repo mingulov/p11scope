@@ -2040,3 +2040,167 @@ fn object_journal_marker_wired_detailed_only() {
         }
     }
 }
+
+/// Every finite ABANDON reason is either emitted by a named producer
+/// site or explicitly reserved in the shared contract. A reason with
+/// neither would let the fixture's wire coverage (removal reasons
+/// 0..=9) silently outrun the live producer.
+#[test]
+fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_REASON_ABI_REFUSED, JOURNAL_REASON_ENTRY_COLLISION, JOURNAL_REASON_EXEC_EXIT,
+        JOURNAL_REASON_IDENTITY_REFUSED, JOURNAL_REASON_INSERT_FAILED,
+        JOURNAL_REASON_PARTIAL_TRANSACTION, JOURNAL_REASON_SCOPE_LOST,
+        JOURNAL_REASON_STOP_CLEANUP, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+    };
+    assert_eq!(
+        [
+            JOURNAL_REASON_ENTRY_COLLISION,
+            JOURNAL_REASON_INSERT_FAILED,
+            JOURNAL_REASON_SCOPE_LOST,
+            JOURNAL_REASON_ABI_REFUSED,
+            JOURNAL_REASON_IDENTITY_REFUSED,
+            JOURNAL_REASON_EXEC_EXIT,
+            JOURNAL_REASON_STOP_CLEANUP,
+            JOURNAL_REASON_PARTIAL_TRANSACTION,
+            JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        ],
+        [1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "the finite reason set is exactly 1..=9"
+    );
+    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_else(|_| panic!("read {path}"));
+    let main_rs = read("crates/ebpf/src/main.rs");
+    let owner_c = read("crates/ebpf/native/task_owner.c");
+    let owner_h = read("crates/ebpf/native/task_owner.h");
+    let journal_c = read("crates/ebpf/native/object_journal.c");
+    let common = read("crates/ebpf-common/src/object_journal.rs");
+    for (define, expected) in [
+        ("#define P11_OWNER_START_REASON_COLLISION", JOURNAL_REASON_ENTRY_COLLISION),
+        ("#define P11_OWNER_START_REASON_EXEC_EXIT", JOURNAL_REASON_EXEC_EXIT),
+    ] {
+        let line = owner_h
+            .lines()
+            .find(|line| line.starts_with(define))
+            .unwrap_or_else(|| panic!("native define {define}"));
+        let literal = line[define.len()..].trim().trim_end_matches('U').trim();
+        let native: u32 = literal.parse().expect("native reason parses");
+        assert_eq!(native, expected, "native and wire reason numbers agree");
+    }
+    for (reason, site) in [
+        ("entry-collision", "P11_OWNER_START_REASON_COLLISION"),
+        ("exec-exit", "P11_OWNER_START_REASON_EXEC_EXIT"),
+    ] {
+        assert!(owner_c.contains(site), "{reason} emitter site {site}");
+    }
+    for (reason, token) in [
+        ("insert-failed", "JOURNAL_REASON_INSERT_FAILED"),
+        ("scope-lost", "JOURNAL_REASON_SCOPE_LOST"),
+        ("abi-refused", "JOURNAL_REASON_ABI_REFUSED"),
+        ("identity-refused", "JOURNAL_REASON_IDENTITY_REFUSED"),
+        ("sync-return-result-lost", "JOURNAL_REASON_SYNC_RETURN_RESULT_LOST"),
+    ] {
+        assert!(main_rs.contains(token), "{reason} emitter token {token}");
+    }
+    assert!(
+        journal_c.contains("reason = 9;"),
+        "unsettled normal removal coerces to sync-return-result-lost"
+    );
+    for reserved in [
+        "JOURNAL_REASON_STOP_CLEANUP",
+        "JOURNAL_REASON_PARTIAL_TRANSACTION",
+    ] {
+        assert!(
+            !main_rs.contains(reserved) && !owner_c.contains(reserved)
+                && !journal_c.contains(reserved),
+            "{reserved} stays unemitted while it is reserved"
+        );
+        let documented = common
+            .lines()
+            .any(|line| line.contains(reserved) && line.contains("reserved"));
+        assert!(documented, "{reserved} carries its reservation in the shared contract");
+    }
+}
+
+/// Causal mutants against the linked native producer: each mutation is
+/// compiled into the actual fixture binary and must turn a passing run
+/// red. Source-text presence alone proves none of these orderings.
+#[test]
+fn object_journal_producer_mutants_are_causal() {
+    use std::process::Command;
+    let source = std::fs::read_to_string("crates/ebpf/native/object_journal.c")
+        .expect("read native journal");
+    let work = tempfile::tempdir().expect("mutant work directory");
+    // (label, mutation, production define, fixture argument)
+    let cases: [(&str, Option<(&str, &str)>, bool, Option<&str>); 5] = [
+        ("control-combined", None, false, None),
+        ("control-producer", None, true, Some("producer")),
+        (
+            "finish-ignores-cleanup",
+            Some(("    if (cleanup_committed != 1) {", "    if (cleanup_committed == 99U) {")),
+            true,
+            Some("producer"),
+        ),
+        (
+            "owner-bind-dropped",
+            Some((
+                "    return owner && key && owner->flags == OWNER_LEASED &&\n        key->pid_tgid == owner->original_pid_tgid;",
+                "    return owner && key;",
+            )),
+            false,
+            None,
+        ),
+        (
+            "header-reserved-poisoned",
+            Some(("    out[6] = 0;", "    out[6] = 1;")),
+            false,
+            None,
+        ),
+    ];
+    for (index, (label, mutant, production, argument)) in cases.into_iter().enumerate() {
+        let directory = work.path().join(index.to_string());
+        std::fs::create_dir(&directory).unwrap();
+        for file in ["task_owner.c", "task_owner.h", "object_journal.h"] {
+            std::fs::copy(
+                std::path::Path::new("crates/ebpf/native").join(file),
+                directory.join(file),
+            )
+            .unwrap();
+        }
+        let native = if let Some((before, after)) = mutant {
+            assert_eq!(source.matches(before).count(), 1, "{label} mutation anchor");
+            source.replace(before, after)
+        } else {
+            source.clone()
+        };
+        std::fs::write(directory.join("object_journal.c"), native).unwrap();
+        let binary = directory.join("fixture");
+        let mut compiler = Command::new("clang-18");
+        compiler.args(["-O2", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"]);
+        if production {
+            compiler.arg("-DP11SCOPE_OBJECT_JOURNAL");
+        }
+        compiler
+            .arg("-I")
+            .arg(&directory)
+            .arg("tests/fixtures/object-journal/journal_owner_tests.c")
+            .arg("-o")
+            .arg(&binary);
+        let output = compiler.output().expect("compile mutant fixture");
+        assert!(
+            output.status.success(),
+            "{label} compile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut run = Command::new(&binary);
+        if let Some(argument) = argument {
+            run.arg(argument);
+        }
+        let output = run.output().expect("run mutant fixture");
+        assert_eq!(
+            output.status.success(),
+            mutant.is_none(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

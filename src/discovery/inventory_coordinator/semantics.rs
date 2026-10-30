@@ -2,6 +2,7 @@
 //! Sole subset minter over the coordinator's retained, accepted sources.
 
 use super::*;
+use crate::discovery::identity::pin_manifest_objects_deferred_in_views_with_prior;
 
 #[path = "semantics/finalizer.rs"]
 mod finalizer;
@@ -224,6 +225,10 @@ pub(crate) struct SubsetPreparation {
 pub(crate) struct SemanticInputs {
     paths: Vec<PathBuf>,
     retained: Option<RetainedInputs>,
+    /// Already-retained `--prearm-module` pin usage (packet 6.13 round-3,
+    /// finding 3), charged against the shared manifest+pre-arm budget when
+    /// these manifests pin. Set by the coordinator before first use.
+    prearm_prior: (usize, u64),
 }
 
 struct RetainedInputs {
@@ -237,7 +242,20 @@ impl SemanticInputs {
         Self {
             paths,
             retained: None,
+            prearm_prior: (0, 0),
         }
+    }
+
+    /// Records the run-retained pre-arm pin usage the manifest side must
+    /// charge (packet 6.13 round-3, finding 3). The coordinator calls this
+    /// from `set_prearm_pinning`, before any preparation memoizes.
+    pub(crate) fn set_prearm_prior(&mut self, objects: usize, bytes: u64) {
+        self.prearm_prior = (objects, bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prearm_prior(&self) -> (usize, u64) {
+        self.prearm_prior
     }
 
     pub(crate) fn prepare(&mut self, engine: &Engine) -> SubsetPreparation {
@@ -249,6 +267,7 @@ impl SemanticInputs {
     /// paths. Shared by the full mint and the selected restriction so
     /// both read the same retained files.
     fn retained_or_load(&mut self, engine: &Engine) -> &RetainedInputs {
+        let (prior_objects, prior_bytes) = self.prearm_prior;
         self.retained.get_or_insert_with(|| {
             let mut inputs = Vec::new();
             let mut refusals = Vec::new();
@@ -256,10 +275,12 @@ impl SemanticInputs {
             for path in &self.paths {
                 let accepted = (|| -> Result<ManifestInput> {
                     let manifest = read_manifest_file(path)?;
-                    let pinning = pin_manifest_objects_deferred_in_views_with_budget(
+                    let pinning = pin_manifest_objects_deferred_in_views_with_prior(
                         &manifest,
                         &engine.views,
                         &mut budget,
+                        prior_objects,
+                        prior_bytes,
                     )
                     .map_err(|_| anyhow!("manifest pinning refused"))?;
                     Ok(ManifestInput {
@@ -3543,6 +3564,129 @@ mod finalizer_history_tests {
         }
     }
 
+    /// A structurally valid 512-object manifest over 512 distinct real
+    /// files (same bytes, distinct inodes): the object-cap twin's input.
+    fn wide_manifest(dir: &std::path::Path) -> Manifest {
+        let base = dir.join("obj-000.so");
+        std::fs::copy("/bin/true", &base).unwrap();
+        let file = open_object(&base).unwrap();
+        let inspected = inspect_file(&file).unwrap();
+        let mut objects = Vec::new();
+        let mut provenance = Vec::new();
+        for i in 0..512u32 {
+            let path = dir.join(format!("obj-{i:03}.so"));
+            if i > 0 {
+                std::fs::copy(&base, &path).unwrap();
+            }
+            let spelling = path.to_str().unwrap().to_string();
+            let open = open_object(&path).unwrap();
+            let key = mapping_file_key(&open).unwrap();
+            objects.push(ObjectRecord {
+                id: i,
+                path: spelling.clone(),
+                identity: inspected.identity.clone(),
+            });
+            provenance.push(ProvenanceObject {
+                path: spelling,
+                device_major: key.device_major,
+                device_minor: key.device_minor,
+                inode: key.inode,
+                identity: inspected.identity.clone(),
+            });
+        }
+        Manifest {
+            schema: SCHEMA.into(),
+            module_path: objects[0].path.clone(),
+            objects,
+            provenance_objects: provenance,
+            interface_list: Acquisition::Absent,
+            surfaces: vec![SurfaceRecord {
+                source: SurfaceSource::LegacyFunctionList,
+                acquisition: Acquisition::Ok,
+                version: Some(Version {
+                    major: 2,
+                    minor: 40,
+                }),
+                walk: WalkOutcome::Full,
+                functions: vec![FunctionRecord {
+                    name: "C_Initialize".into(),
+                    resolution: Resolution::NullPointer,
+                }],
+            }],
+            vendor_interfaces: vec![],
+            alias_groups: vec![],
+            selection_evidence: Default::default(),
+        }
+    }
+
+    #[test]
+    fn semantic_manifest_pinning_charges_retained_prearm_objects() {
+        // Packet 6.13 round-3 (re-audit finding 3, N+1 with both input
+        // classes): one real retained pre-arm pin plus a 512-object
+        // manifest exceeds the shared 512-object budget — the semantic
+        // reader refuses at pinning, before opening anything.
+        let dir = tempfile::tempdir().unwrap();
+        let prearm_path = dir.path().join("prearm-real.so");
+        std::fs::copy("/bin/true", &prearm_path).unwrap();
+        let prearm = crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+            std::slice::from_ref(&prearm_path),
+            &[],
+            None,
+            0,
+            0,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
+        )
+        .expect("one real pre-arm pin");
+        let prior_objects = prearm.pins.pinned().count();
+        let prior_bytes = prearm.pins.pinned_object_bytes();
+        assert_eq!(prior_objects, 1);
+
+        let wide_dir = tempfile::tempdir().unwrap();
+        let manifest = wide_manifest(wide_dir.path());
+        assert_eq!(manifest.objects.len(), 512);
+        assert!(
+            crate::manifest_input::validate_structure(&manifest).is_empty(),
+            "the N+1 manifest is structurally valid, so only the budget can refuse it"
+        );
+        let input = wide_dir.path().join("operator-input.json");
+        std::fs::write(&input, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        // The engine pins the first object independently, mirroring how
+        // `subset` attests: pinning success must be reachable, so only
+        // the budget refusal distinguishes the charged run.
+        let first = crate::discovery::identity::pin_manifest_objects_deferred(&Manifest {
+            objects: manifest.objects[..1].to_vec(),
+            provenance_objects: manifest.provenance_objects[..1].to_vec(),
+            ..manifest.clone()
+        })
+        .expect("the first wide object pins alone");
+        let engine = engine_for_test(Vec::new(), Vec::new(), first.pins);
+        let mut charged = SemanticInputs::new(vec![input]);
+        charged.set_prearm_prior(prior_objects, prior_bytes);
+        let refused = charged.prepare(&engine);
+        assert_eq!(
+            refused.refusals,
+            vec![SemanticRefusal::ManifestInput],
+            "1 retained + 512 manifest objects exceed the shared cap"
+        );
+        // Control: a small manifest with the same retained usage attests —
+        // the charge refuses only the over-budget input.
+        let small = HistoryFixture::new();
+        let small_input = small.dir.path().join("operator-input.json");
+        std::fs::write(&small_input, serde_json::to_vec(&small.manifest).unwrap()).unwrap();
+        let small_engine = engine_for_test(Vec::new(), Vec::new(), small.pins.clone());
+        let mut charged_small = SemanticInputs::new(vec![small_input]);
+        charged_small.set_prearm_prior(prior_objects, prior_bytes);
+        let accepted = charged_small.prepare(&small_engine);
+        assert!(
+            !accepted.refusals.contains(&SemanticRefusal::ManifestInput),
+            "a small manifest with retained usage still pins"
+        );
+        assert!(
+            accepted.subset.is_some(),
+            "the charged small manifest attests like any other operator input"
+        );
+    }
+
     #[test]
     fn selected_conversion_envelope_keeps_original_files_and_exact_closure() {
         let fixture = HistoryFixture::new();
@@ -5298,6 +5442,8 @@ mod promotion_lifecycle_tests {
                 &[],
                 &mut budget,
                 &probe,
+                0,
+                0,
             )
             .expect("split pinning succeeds");
         assert_eq!(probe.overlay_checks.get(), 1);
@@ -5452,6 +5598,8 @@ mod promotion_lifecycle_tests {
                 &[],
                 &mut budget,
                 &probe,
+                0,
+                0,
             )
             .expect("pinning succeeds without a split");
         assert_eq!(probe.overlay_checks.get(), 1);
@@ -5538,6 +5686,8 @@ mod promotion_lifecycle_tests {
                 &[],
                 &mut budget,
                 &probe,
+                0,
+                0,
             )
             .expect("pinning succeeds with an inconclusive probe");
         assert_eq!(probe.overlay_checks.get(), 1);
@@ -5571,6 +5721,8 @@ mod promotion_lifecycle_tests {
                 &[],
                 &mut budget,
                 &probe,
+                0,
+                0,
             )
             .expect("pinning succeeds with an agreeing probe");
         assert_eq!(probe.overlay_checks.get(), 1);
@@ -5613,6 +5765,8 @@ mod promotion_lifecycle_tests {
                 &[],
                 &mut budget,
                 &probe,
+                0,
+                0,
             )
             .expect("split pinning succeeds");
         let pin = pinning.pins.pinned().next().expect("one object");

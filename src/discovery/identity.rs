@@ -6571,7 +6571,14 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
     views: &[ProcessView],
     budget: &mut CaptureWorkBudget,
 ) -> Result<ManifestPinning, ManifestPinError> {
-    pin_manifest_objects_deferred_in_views_with_probe(m, views, budget, &KernelSelfMappingProbe)
+    pin_manifest_objects_deferred_in_views_with_probe(
+        m,
+        views,
+        budget,
+        &KernelSelfMappingProbe,
+        0,
+        0,
+    )
 }
 
 /// [`pin_manifest_objects_deferred_in_views_with_budget`] with an injected
@@ -6582,8 +6589,41 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_probe(
     views: &[ProcessView],
     budget: &mut CaptureWorkBudget,
     probe: &impl SelfMappingProbe,
+    prior_objects: usize,
+    prior_bytes: u64,
 ) -> Result<ManifestPinning, ManifestPinError> {
-    pin_manifest_objects_with_read_policy(m, views, budget, probe, false)
+    pin_manifest_objects_with_read_policy(
+        m,
+        views,
+        budget,
+        probe,
+        false,
+        prior_objects,
+        prior_bytes,
+    )
+}
+
+/// [`pin_manifest_objects_deferred_in_views_with_budget`] charging
+/// already-retained capture-level pins (packet 6.13 round-3, finding 3):
+/// inventory retains `--prearm-module` pins before manifests pin, so the
+/// manifest side charges that usage against the shared 512-object/512-MiB
+/// manifest+pre-arm budget (R2-D1-3). Mirrors the run path, where pre-arm
+/// pinning charges already-pinned manifest usage instead.
+pub(crate) fn pin_manifest_objects_deferred_in_views_with_prior(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    prior_objects: usize,
+    prior_bytes: u64,
+) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_deferred_in_views_with_probe(
+        m,
+        views,
+        budget,
+        &KernelSelfMappingProbe,
+        prior_objects,
+        prior_bytes,
+    )
 }
 
 /// Count collection shares the scan's inspection cache and actual read
@@ -6593,7 +6633,29 @@ pub(crate) fn pin_count_manifest_objects_in_views_with_budget(
     views: &[ProcessView],
     budget: &mut CaptureWorkBudget,
 ) -> Result<ManifestPinning, ManifestPinError> {
-    pin_manifest_objects_with_read_policy(m, views, budget, &KernelSelfMappingProbe, true)
+    pin_manifest_objects_with_read_policy(m, views, budget, &KernelSelfMappingProbe, true, 0, 0)
+}
+
+/// [`pin_count_manifest_objects_in_views_with_budget`] charging
+/// already-retained capture-level pins (packet 6.13 round-3, finding 3):
+/// per-pass count-manifest pins coexist with the run-retained pre-arm
+/// pins, so they charge the same shared object/byte budget.
+pub(crate) fn pin_count_manifest_objects_in_views_with_prior(
+    m: &Manifest,
+    views: &[ProcessView],
+    budget: &mut CaptureWorkBudget,
+    prior_objects: usize,
+    prior_bytes: u64,
+) -> Result<ManifestPinning, ManifestPinError> {
+    pin_manifest_objects_with_read_policy(
+        m,
+        views,
+        budget,
+        &KernelSelfMappingProbe,
+        true,
+        prior_objects,
+        prior_bytes,
+    )
 }
 
 fn inspect_count_manifest_file(
@@ -6649,16 +6711,28 @@ fn pin_manifest_objects_with_read_policy(
     budget: &mut CaptureWorkBudget,
     probe: &impl SelfMappingProbe,
     meter_identity: bool,
+    prior_objects: usize,
+    prior_bytes: u64,
 ) -> Result<ManifestPinning, ManifestPinError> {
     let structural = validate_structure(m);
     if !structural.is_empty() {
         return Err(ManifestPinError::Invalid(structural));
     }
+    // Shared capture-level budget (packet 6.13 round-3, finding 3): this
+    // manifest's objects charge against already-retained pins (pre-arm in
+    // inventory; nothing yet on the run path, where pre-arm charges the
+    // other way instead). The object check runs before any open, so an
+    // over-budget manifest refuses without touching its files.
+    if prior_objects.saturating_add(m.objects.len()) > MAX_OBJECTS {
+        return Err(ManifestPinError::Fatal(vec![format!(
+            "manifest and pre-arm objects total more than the {MAX_OBJECTS}-object limit"
+        )]));
+    }
 
     let mut problems = Vec::new();
     let mut stale = Vec::new();
     let mut pinned = Vec::new();
-    let mut total_object_bytes = 0u64;
+    let mut total_object_bytes = prior_bytes;
     for object in &m.objects {
         let path = Path::new(&object.path);
         let retained = match retained_view_for_manifest_locator(&object.path, views) {
@@ -6741,7 +6815,7 @@ fn pin_manifest_objects_with_read_policy(
         };
         if total > MAX_TOTAL_OBJECT_BYTES {
             problems.push(format!(
-                "manifest objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+                "manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
             ));
             continue;
         }
@@ -9219,6 +9293,167 @@ mod tests {
         assert!(
             budget.attempted_io_bytes() >= std::fs::metadata(path).unwrap().len(),
             "a changed pin must miss the inspection cache and pay for the fresh hash"
+        );
+    }
+
+    #[test]
+    fn manifest_pinning_with_prior_enforces_combined_object_cap() {
+        // Packet 6.13 round-3 (re-audit finding 3, N+1): one real retained
+        // pre-arm pin plus a 512-object manifest exceeds the shared
+        // 512-object budget — the manifest side refuses with the combined
+        // limit message, before opening anything.
+        let dir = tempfile::tempdir().unwrap();
+        let prearm_path = dir.path().join("prearm-real.so");
+        std::fs::copy("/bin/sh", &prearm_path).unwrap();
+        let prearm = pin_prearm_objects_in_views_with_budget(
+            std::slice::from_ref(&prearm_path),
+            &[],
+            None,
+            0,
+            0,
+            &mut CaptureWorkBudget::default(),
+        )
+        .expect("one real pre-arm pin");
+        let prior_objects = prearm.pins.pinned().count();
+        let prior_bytes = prearm.pins.pinned_object_bytes();
+        assert_eq!(prior_objects, 1);
+
+        let (_manifest_dir, _path, mut manifest, _) = count_manifest_file();
+        let identity = manifest.objects[0].identity.clone();
+        for id in 1..(MAX_OBJECTS as u32) {
+            manifest.objects.push(ObjectRecord {
+                id,
+                path: format!("/nonexistent-613r3/obj-{id}"),
+                identity: identity.clone(),
+            });
+        }
+        assert_eq!(manifest.objects.len(), MAX_OBJECTS);
+        assert!(
+            validate_structure(&manifest).is_empty(),
+            "the N+1 manifest is structurally valid, so only the budget can refuse it"
+        );
+        let result = pin_manifest_objects_deferred_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            prior_objects,
+            prior_bytes,
+        );
+        assert!(
+            result.is_err(),
+            "1 retained + 512 manifest objects exceed the shared cap"
+        );
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, ManifestPinError::Fatal(_)),
+            "a budget refusal is Fatal, not Invalid: {error:?}"
+        );
+        let limit = format!("{MAX_OBJECTS}-object limit");
+        assert!(
+            error
+                .problems()
+                .iter()
+                .any(|problem| problem.contains(&limit)),
+            "refusal names the combined object cap: {:?}",
+            error.problems()
+        );
+    }
+
+    #[test]
+    fn manifest_pinning_with_prior_accepts_combined_object_boundary() {
+        // Boundary twin: 511 already-retained objects plus one manifest
+        // object sit exactly at the shared cap and pin; one more prior
+        // refuses. The accept case guards against over-refusal.
+        let (_dir, _path, manifest, _) = count_manifest_file();
+        let pinning = pin_manifest_objects_deferred_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            MAX_OBJECTS - 1,
+            0,
+        )
+        .expect("511 retained + 1 manifest object is exactly the cap");
+        assert!(pinning.stale.is_empty());
+        assert_eq!(pinning.pins.pinned().count(), 1);
+        let result = pin_manifest_objects_deferred_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            MAX_OBJECTS,
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "512 retained + 1 manifest object exceed the shared cap"
+        );
+        let limit = format!("{MAX_OBJECTS}-object limit");
+        assert!(
+            result
+                .unwrap_err()
+                .problems()
+                .iter()
+                .any(|problem| problem.contains(&limit)),
+            "refusal names the combined object cap"
+        );
+    }
+
+    #[test]
+    fn manifest_pinning_with_prior_enforces_combined_byte_cap() {
+        // Byte twin: a manifest object pins exactly at the shared byte cap
+        // and refuses one byte past it.
+        let (_dir, path, manifest, _) = count_manifest_file();
+        let size = std::fs::metadata(&path).unwrap().len();
+        pin_manifest_objects_deferred_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            0,
+            MAX_TOTAL_OBJECT_BYTES - size,
+        )
+        .expect("bytes exactly at the shared cap pin");
+        let result = pin_manifest_objects_deferred_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            0,
+            MAX_TOTAL_OBJECT_BYTES - size + 1,
+        );
+        assert!(result.is_err(), "one byte past the shared cap refuses");
+        let limit = format!("{MAX_TOTAL_OBJECT_BYTES}-byte limit");
+        assert!(
+            result
+                .unwrap_err()
+                .problems()
+                .iter()
+                .any(|problem| problem.contains(&limit)),
+            "refusal names the combined byte cap"
+        );
+    }
+
+    #[test]
+    fn count_manifest_pinning_with_prior_enforces_combined_cap() {
+        // The per-pass count reader charges the same shared budget: a full
+        // retained set plus one count object refuses before any read.
+        let (_dir, _path, manifest, _) = count_manifest_file();
+        let result = pin_count_manifest_objects_in_views_with_prior(
+            &manifest,
+            &[],
+            &mut CaptureWorkBudget::default(),
+            MAX_OBJECTS,
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "512 retained + 1 count object exceed the shared cap"
+        );
+        let limit = format!("{MAX_OBJECTS}-object limit");
+        assert!(
+            result
+                .unwrap_err()
+                .problems()
+                .iter()
+                .any(|problem| problem.contains(&limit)),
+            "refusal names the combined object cap"
         );
     }
 

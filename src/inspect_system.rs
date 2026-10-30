@@ -34,7 +34,7 @@ use crate::discovery::engine::{
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{
     ExaminedObject, PinnedObjectId, PinnedObjects, ReconciledModule, bind_scanned_modules,
-    canonicalize_scanned_overlays, pin_count_manifest_objects_in_views_with_budget,
+    canonicalize_scanned_overlays, pin_count_manifest_objects_in_views_with_prior,
     pin_scanned_view_objects,
 };
 use crate::discovery::kernel_identity::{EXAMINED_ANCHOR_CAP, ExaminedCustody};
@@ -1112,9 +1112,13 @@ pub(crate) fn collect_with_budget(
     policy: AdmissionPolicy,
     budget: CaptureWorkBudget,
 ) -> Result<Catalog> {
-    collect_with_count_manifests(hints, hooks, max_scan_pids, policy, budget, &[])
+    collect_with_count_manifests(hints, hooks, max_scan_pids, policy, budget, &[], 0, 0)
 }
 
+/// System collection with explicit count manifests. `prior_objects` /
+/// `prior_bytes` are already-retained capture-level pins, charged against
+/// the shared manifest+pre-arm budget (packet 6.13 round-3, finding 3).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_with_count_manifests(
     hints: &[PathBuf],
     hooks: &HookRegistry,
@@ -1122,6 +1126,8 @@ pub(crate) fn collect_with_count_manifests(
     policy: AdmissionPolicy,
     budget: CaptureWorkBudget,
     manifests: &[PathBuf],
+    prior_objects: usize,
+    prior_bytes: u64,
 ) -> Result<Catalog> {
     collect_identity(
         hints,
@@ -1131,6 +1137,8 @@ pub(crate) fn collect_with_count_manifests(
         false,
         budget,
         manifests,
+        prior_objects,
+        prior_bytes,
     )
     .map(|(catalog, _)| catalog)
 }
@@ -1157,6 +1165,8 @@ pub(crate) fn collect_inventory_identity(
         true,
         CaptureWorkBudget::default(),
         &[],
+        0,
+        0,
     )?;
     Ok((catalog, custody.expect("opt-in collection owns custody")))
 }
@@ -1170,6 +1180,8 @@ fn collect_identity(
     identity: bool,
     budget: CaptureWorkBudget,
     manifests: &[PathBuf],
+    prior_objects: usize,
+    prior_bytes: u64,
 ) -> Result<(Catalog, Option<ExaminedCustody>)> {
     let mut timings = StageTimings::new();
     let (mut collection, mut custody) = if identity {
@@ -1256,7 +1268,13 @@ fn collect_identity(
     let attributed =
         with_confirmation_pools(shards, segment_policy, proof_stat_threads(), attribute);
     timings.span(StageKind::Scan, "confirm", confirm_start, monotonic_ns());
-    prepare_count_manifests(&mut collection, &mut bound, manifests);
+    prepare_count_manifests(
+        &mut collection,
+        &mut bound,
+        manifests,
+        prior_objects,
+        prior_bytes,
+    );
     let assemble_start = monotonic_ns();
     let mut catalog = assemble(collection, bound, attributed, policy);
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
@@ -1322,9 +1340,13 @@ pub(crate) fn collect_pid_with_budget(
     policy: AdmissionPolicy,
     budget: CaptureWorkBudget,
 ) -> Result<Catalog> {
-    collect_pid_with_count_manifests(pid, hints, hooks, policy, budget, &[])
+    collect_pid_with_count_manifests(pid, hints, hooks, policy, budget, &[], 0, 0)
 }
 
+/// Pid collection with explicit count manifests. `prior_objects` /
+/// `prior_bytes` are already-retained capture-level pins, charged against
+/// the shared manifest+pre-arm budget (packet 6.13 round-3, finding 3).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_pid_with_count_manifests(
     pid: u32,
     hints: &[PathBuf],
@@ -1332,6 +1354,8 @@ pub(crate) fn collect_pid_with_count_manifests(
     policy: AdmissionPolicy,
     mut budget: CaptureWorkBudget,
     manifests: &[PathBuf],
+    prior_objects: usize,
+    prior_bytes: u64,
 ) -> Result<Catalog> {
     progress!("p11scope: deep-scanning pid {pid}...");
     let mut noise = DiscoveryNoiseAggregator::default();
@@ -1364,7 +1388,13 @@ pub(crate) fn collect_pid_with_count_manifests(
         budget,
     };
     let mut bound = bind_collection(&mut collection);
-    prepare_count_manifests(&mut collection, &mut bound, manifests);
+    prepare_count_manifests(
+        &mut collection,
+        &mut bound,
+        manifests,
+        prior_objects,
+        prior_bytes,
+    );
     Ok(assemble(collection, bound, None, policy))
 }
 
@@ -1492,7 +1522,16 @@ fn read_count_manifest_file(path: &Path, budget: &mut CaptureWorkBudget) -> Resu
 /// allowance. Only an exact provider observed in this scope can contribute;
 /// callbacks may live in other validated files. No table-completeness test
 /// discards useful entries, and semantic/selection permissions stay elsewhere.
-fn prepare_count_manifests(collection: &mut Collection, bound: &mut Bound, paths: &[PathBuf]) {
+/// `prior_objects`/`prior_bytes` are already-retained capture-level pins
+/// (packet 6.13 round-3, finding 3), charged against the shared
+/// manifest+pre-arm object/byte budget.
+fn prepare_count_manifests(
+    collection: &mut Collection,
+    bound: &mut Bound,
+    paths: &[PathBuf],
+    prior_objects: usize,
+    prior_bytes: u64,
+) {
     for path in paths {
         let accepted = (|| -> Result<Manifest> {
             collection.budget.spend(1).map_err(anyhow::Error::msg)?;
@@ -1562,10 +1601,12 @@ fn prepare_count_manifests(collection: &mut Collection, bound: &mut Bound, paths
                 );
                 views.push(view);
             }
-            let pinning = pin_count_manifest_objects_in_views_with_budget(
+            let pinning = pin_count_manifest_objects_in_views_with_prior(
                 &manifest,
                 &views,
                 &mut collection.budget,
+                prior_objects,
+                prior_bytes,
             )
             .map_err(|error| anyhow::anyhow!("manifest pinning refused: {:?}", error.problems()))?;
             ensure!(
@@ -3718,6 +3759,9 @@ impl<P: crate::discovery::confirm_shards::SegmentProof>
 /// plus userspace or kernel sweep proof per the capture-owned shared
 /// state, assembled under the Inventory policy. `inspect --system`
 /// keeps using [`collect`] (userspace-only, frozen output).
+/// `prior_objects` / `prior_bytes` are already-retained capture-level
+/// pins, charged against the shared manifest+pre-arm budget (packet 6.13
+/// round-3, finding 3).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_system_with_identity(
     hints: &[PathBuf],
@@ -3727,6 +3771,8 @@ pub(crate) fn collect_system_with_identity(
     shared: IdentityShared,
     budget: CaptureWorkBudget,
     manifests: &[PathBuf],
+    prior_objects: usize,
+    prior_bytes: u64,
 ) -> Result<Catalog> {
     if !matches!(policy, AdmissionPolicy::Inventory(_)) {
         return Err(anyhow::anyhow!(
@@ -3843,7 +3889,13 @@ pub(crate) fn collect_system_with_identity(
         },
     );
     timings.span(StageKind::Scan, "confirm", confirm_start, monotonic_ns());
-    prepare_count_manifests(&mut collection, &mut bound, manifests);
+    prepare_count_manifests(
+        &mut collection,
+        &mut bound,
+        manifests,
+        prior_objects,
+        prior_bytes,
+    );
     let assemble_start = monotonic_ns();
     let mut catalog = assemble(collection, bound, attributed, policy);
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
@@ -4270,6 +4322,116 @@ mod tests {
             selection, checks,
         )));
         (shared, ptr)
+    }
+
+    /// A 1-object count-manifest document over a real file, modeled on
+    /// identity's `count_manifest_file` helper.
+    fn count_manifest_doc() -> (tempfile::TempDir, std::path::PathBuf) {
+        use p11scope_manifest::manifest::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count-object.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mapping = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+        let spelling = path.to_str().unwrap().to_string();
+        let manifest = Manifest {
+            schema: SCHEMA.into(),
+            module_path: spelling.clone(),
+            objects: vec![ObjectRecord {
+                id: 0,
+                path: spelling.clone(),
+                identity: inspected.identity.clone(),
+            }],
+            provenance_objects: vec![ProvenanceObject {
+                path: spelling,
+                device_major: mapping.device_major,
+                device_minor: mapping.device_minor,
+                inode: mapping.inode,
+                identity: inspected.identity,
+            }],
+            interface_list: Acquisition::Absent,
+            surfaces: vec![SurfaceRecord {
+                source: SurfaceSource::LegacyFunctionList,
+                acquisition: Acquisition::Ok,
+                version: Some(Version {
+                    major: 2,
+                    minor: 40,
+                }),
+                walk: WalkOutcome::Full,
+                functions: vec![FunctionRecord {
+                    name: "C_Initialize".into(),
+                    resolution: Resolution::NullPointer,
+                }],
+            }],
+            vendor_interfaces: vec![],
+            alias_groups: vec![],
+            selection_evidence: Default::default(),
+        };
+        assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
+        let doc = dir.path().join("count.json");
+        std::fs::write(&doc, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        (dir, doc)
+    }
+
+    fn empty_collection() -> super::Collection {
+        super::Collection {
+            enumerated: Vec::new(),
+            selected: Vec::new(),
+            cap: 0,
+            cap_hit: false,
+            members: Vec::new(),
+            scope_gaps: Vec::new(),
+            proc_list_failed: false,
+            sweep: Vec::new(),
+            sweep_unavailable: std::collections::BTreeSet::new(),
+            budget: crate::discovery::scan::CaptureWorkBudget::new(
+                crate::discovery::scan::ScanLimits {
+                    per_object_bytes: 8 << 20,
+                    total_bytes: 64 << 20,
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn prepare_count_manifests_charges_retained_prearm_prior() {
+        // Packet 6.13 round-3 (re-audit finding 3): per-pass count pins
+        // charge already-retained pre-arm usage against the shared cap —
+        // a full retained set refuses one more count object by budget.
+        let (_dir, doc) = count_manifest_doc();
+        let mut collection = empty_collection();
+        let mut bound = super::bind_collection(&mut collection);
+        super::prepare_count_manifests(
+            &mut collection,
+            &mut bound,
+            std::slice::from_ref(&doc),
+            512,
+            0,
+        );
+        assert!(bound.count_manifests.is_empty());
+        assert_eq!(collection.scope_gaps.len(), 1);
+        assert!(
+            collection.scope_gaps[0].reason.contains("512-object limit"),
+            "over-budget count pin refuses by budget: {:?}",
+            collection.scope_gaps[0].reason
+        );
+        // Control: the same document without retained usage pins — it is
+        // refused later for scope reasons (nothing collected), not budget.
+        let mut collection = empty_collection();
+        let mut bound = super::bind_collection(&mut collection);
+        super::prepare_count_manifests(
+            &mut collection,
+            &mut bound,
+            std::slice::from_ref(&doc),
+            0,
+            0,
+        );
+        assert!(bound.count_manifests.is_empty());
+        assert_eq!(collection.scope_gaps.len(), 1);
+        let reason = &collection.scope_gaps[0].reason;
+        assert!(reason.contains("not exactly mapped"), "{reason}");
+        assert!(!reason.contains("object limit"), "{reason}");
     }
 
     /// D3d: forced preflight refuses each arm with its finite label,

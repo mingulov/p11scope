@@ -1127,6 +1127,11 @@ fn pin_inventory_prearm(
         InventoryRunScope::System | InventoryRunScope::Cgroup => (Vec::new(), None),
     };
     let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    // Round-3 (re-audit finding 3): pre-arm pins first in inventory, so no
+    // manifest usage exists to charge here. The shared capture-level
+    // budget is enforced on the other side instead — the coordinator
+    // retains this pinning's object/byte usage and both the semantic and
+    // the count manifest readers charge it when they pin.
     pin_prearm_objects_in_views_with_budget(prearm_modules, &views, named_pid, 0, 0, &mut budget)
         .map_err(|error| {
             for problem in error.problems() {

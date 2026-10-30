@@ -257,6 +257,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Inventory capture. Detailed-subset offset activation stays pending
     /// (disclosed gap); the pins themselves are real and live for the run.
     prearm: Option<crate::discovery::identity::PrearmPinning>,
+    /// The retained pre-arm pins' object/byte usage (packet 6.13 round-3,
+    /// finding 3): manifests pin after pre-arm in inventory, so both the
+    /// semantic and the count readers charge this usage against the one
+    /// shared capture-level manifest+pre-arm budget.
+    prearm_prior: (usize, u64),
     adapter: CallerAdapter<Source>,
     registry: CallerRegistry,
     attach_set: InventoryAttachSet,
@@ -476,6 +481,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
             count_manifests: Vec::new(),
             prearm: None,
+            prearm_prior: (0, 0),
             adapter,
             registry,
             attach_set: InventoryAttachSet::new(endpoint_budget),
@@ -538,15 +544,38 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn set_manifests(&mut self, manifests: Vec<PathBuf>) {
         self.count_manifests = manifests.clone();
         self.semantic_inputs = semantics::SemanticInputs::new(manifests);
+        // A fresh input set keeps the retained pre-arm charge whatever the
+        // setter order is.
+        let (objects, bytes) = self.prearm_prior;
+        self.semantic_inputs.set_prearm_prior(objects, bytes);
     }
 
     /// Retains an already-validated `--prearm-module` pinning for the run's
     /// lifetime (F5). The pins hold their FDs until the coordinator drops.
+    /// Their object/byte usage is also the manifest-side prior (packet 6.13
+    /// round-3, finding 3): semantic and count readers charge it against
+    /// the one shared capture-level budget.
     pub(crate) fn set_prearm_pinning(
         &mut self,
         pinning: crate::discovery::identity::PrearmPinning,
     ) {
+        let usage = (
+            pinning.pins.pinned().count(),
+            pinning.pins.pinned_object_bytes(),
+        );
+        self.prearm_prior = usage;
+        self.semantic_inputs.set_prearm_prior(usage.0, usage.1);
         self.prearm = Some(pinning);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prearm_prior(&self) -> (usize, u64) {
+        self.prearm_prior
+    }
+
+    #[cfg(test)]
+    pub(crate) fn semantic_prearm_prior(&self) -> (usize, u64) {
+        self.semantic_inputs.prearm_prior()
     }
 
     #[cfg(test)]
@@ -2430,6 +2459,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
         let manifests = self.count_manifests.clone();
+        let (prior_objects, prior_bytes) = self.prearm_prior;
         let budget =
             self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default(), false);
         move || {
@@ -2439,7 +2469,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             match scope {
                 InventoryScope::Pid(pid) => {
                     crate::inspect_system::collect_pid_with_count_manifests(
-                        pid, &hints, &hooks, policy, budget, &manifests,
+                        pid,
+                        &hints,
+                        &hooks,
+                        policy,
+                        budget,
+                        &manifests,
+                        prior_objects,
+                        prior_bytes,
                     )
                 }
                 InventoryScope::System => crate::inspect_system::collect_with_count_manifests(
@@ -2449,6 +2486,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     policy,
                     budget,
                     &manifests,
+                    prior_objects,
+                    prior_bytes,
                 ),
             }
         }
@@ -2470,6 +2509,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
         let manifests = self.count_manifests.clone();
+        let (prior_objects, prior_bytes) = self.prearm_prior;
         let budget = self.collector_budget(
             crate::discovery::scan::CaptureWorkBudget::default(),
             semantic_capture_live,
@@ -2481,7 +2521,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             match scope {
                 InventoryScope::Pid(pid) => {
                     crate::inspect_system::collect_pid_with_count_manifests(
-                        pid, &hints, &hooks, policy, budget, &manifests,
+                        pid,
+                        &hints,
+                        &hooks,
+                        policy,
+                        budget,
+                        &manifests,
+                        prior_objects,
+                        prior_bytes,
                     )
                 }
                 InventoryScope::System => crate::inspect_system::collect_system_with_identity(
@@ -2492,6 +2539,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     shared,
                     budget,
                     &manifests,
+                    prior_objects,
+                    prior_bytes,
                 ),
             }
         }
@@ -2538,6 +2587,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ),
             observer,
             count_manifests: self.count_manifests.clone(),
+            prearm_prior: self.prearm_prior,
         };
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
@@ -8028,6 +8078,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn set_prearm_pinning_records_combined_budget_usage() {
+        // Packet 6.13 round-3 (re-audit finding 3): retaining pre-arm pins
+        // records their real object/byte usage for the manifest-side
+        // charge — in production setter order and reversed.
+        let dir = tempfile::tempdir().unwrap();
+        for prearm_first in [false, true] {
+            let a = dir.path().join(format!("prearm-{prearm_first}-a.so"));
+            let b = dir.path().join(format!("prearm-{prearm_first}-b.so"));
+            std::fs::copy("/bin/sh", &a).unwrap();
+            std::fs::copy("/bin/sh", &b).unwrap();
+            let pinning = crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+                &[a, b],
+                &[],
+                None,
+                0,
+                0,
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
+            )
+            .expect("two real pre-arm pins");
+            let usage = (
+                pinning.pins.pinned().count(),
+                pinning.pins.pinned_object_bytes(),
+            );
+            assert_eq!(usage.0, 2);
+            let mut coordinator = InventoryCoordinator::new_with_budget(
+                Scope::Pid(std::process::id()),
+                HookRegistry::builtin(),
+                Vec::new(),
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+                crate::capacity::inventory_endpoint_budget(None).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(coordinator.prearm_prior(), (0, 0));
+            if prearm_first {
+                coordinator.set_prearm_pinning(pinning);
+                coordinator.set_manifests(Vec::new());
+            } else {
+                coordinator.set_manifests(Vec::new());
+                coordinator.set_prearm_pinning(pinning);
+            }
+            assert_eq!(coordinator.prearm_prior(), usage);
+            assert_eq!(
+                coordinator.semantic_prearm_prior(),
+                usage,
+                "the semantic reader charges the same retained usage"
+            );
+        }
+    }
+
+    #[test]
     fn inventory_selected_budget_growth_refusal_keeps_ids_and_positive_history() {
         use crate::discovery::inventory_attach_set::tests as fx;
         let mut scene = CaptureScene::new(2);
@@ -8531,6 +8632,8 @@ pub(crate) mod tests {
                 total_bytes: 256 << 10,
             }),
             std::slice::from_ref(&fixture.manifest),
+            0,
+            0,
         )
         .unwrap();
         assert_eq!(

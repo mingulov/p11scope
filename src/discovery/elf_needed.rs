@@ -33,7 +33,9 @@ use std::path::{Path, PathBuf};
 /// named only past depth 2 is out of scope, and the in-scope set
 /// completes without it.
 pub(crate) const HINT_MAX_DEPTH: u32 = 2;
-/// Row D: at most 32 ELF objects opened and parsed per analysis.
+/// Row D: at most 32 ELF objects opened per analysis, counting the
+/// executable and every candidate attempt (failed parses and
+/// SONAME mismatches included), reserved before each open.
 pub(crate) const HINT_MAX_OBJECTS_PER_ANALYSIS: usize = 32;
 /// Row D: at most 128 examined `DT_NEEDED` edges per analysis.
 pub(crate) const HINT_MAX_EDGES_PER_ANALYSIS: usize = 128;
@@ -199,13 +201,34 @@ struct StashedExe {
     exec_ts_ns: u64,
 }
 
+/// One dependency object whose parsed content supports a cached
+/// verdict: its recorded identity plus the size/mtime/ctime snapshot
+/// taken inside its stability bracket. A cache hit must reproduce
+/// every recorded snapshot exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DepProof {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
+}
+
 /// A cached per-executable verdict with the identity snapshot a hit
 /// must reproduce exactly: same file (dev, ino) and unchanged
 /// size/mtime/ctime, so an in-place modification never serves stale.
-/// Only completed non-`unknown` verdicts are cached: `unknown` means the
-/// in-scope set never completed, and a later scan may learn the missing
-/// path, so an `unknown` is always re-attempted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Transitive verdicts also carry every intermediate dependency
+/// snapshot, the candidate count each resolution chose from, and the
+/// effective watched-name list the name test used: a hit revalidates
+/// all of it, so a changed, removed or newly shadowed dependency
+/// refuses the hit instead of serving stale. Only completed
+/// non-`unknown` verdicts from a clean walk (no failed candidate
+/// attempts, no latched early verdict) are cached: `unknown` means
+/// the in-scope set never completed, and a later scan may learn the
+/// missing path, so an `unknown` is always re-attempted.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct VerdictEntry {
     hint: StaticHint,
     size: u64,
@@ -213,6 +236,22 @@ struct VerdictEntry {
     mtime_nsec: i64,
     ctime_sec: i64,
     ctime_nsec: i64,
+    deps: Vec<DepProof>,
+    resolutions: Vec<(Vec<u8>, usize)>,
+    watched_names: Vec<Vec<u8>>,
+}
+
+/// Per-walk accounting and cache proof: objects reserved so far
+/// (the executable counts as the first), the dependency snapshots
+/// behind the verdict, the candidate count per resolved name, and
+/// whether the walk stayed clean enough for its verdict to be
+/// cacheable under revalidation.
+#[derive(Debug, Default)]
+struct WalkProof {
+    objects: usize,
+    deps: Vec<DepProof>,
+    resolutions: Vec<(Vec<u8>, usize)>,
+    clean: bool,
 }
 
 /// The raw `(dev, ino)` pair the kernel records for the file behind an
@@ -405,9 +444,9 @@ impl ExtensiveState {
         if !self.enabled || self.capture_bytes_charged >= HINT_MAX_BYTES_PER_CAPTURE {
             return StaticHint::Unknown;
         }
-        if let Some(entry) = self.verdicts.get(&(dev, ino)).copied()
+        if let Some(entry) = self.verdicts.get(&(dev, ino)).cloned()
             && entry.hint != StaticHint::Unknown
-            && self.verify_snapshot(dev, ino, &entry)
+            && self.verify_entry(dev, ino, &entry)
         {
             return entry.hint;
         }
@@ -442,7 +481,7 @@ impl ExtensiveState {
         let Some(pre) = pre else {
             return StaticHint::Unknown;
         };
-        let hint = self.walk_dependencies(&exe, dev, ino);
+        let (hint, proof) = self.walk_dependencies(&exe, dev, ino);
         #[cfg(test)]
         if let Some(mutate) = self.test_exe_mutator {
             mutate(&path);
@@ -461,9 +500,14 @@ impl ExtensiveState {
         if pre != post {
             return StaticHint::Unknown;
         }
-        // Cache only completed non-unknown verdicts, and only while the
-        // cache has room (a full cache serves hits but retains nothing new).
-        if hint != StaticHint::Unknown && self.verdicts.len() < HINT_MAX_VERDICT_CACHE_ENTRIES {
+        // Cache only completed non-unknown verdicts from a clean walk
+        // (its dependency proof revalidates on a hit), and only while
+        // the cache has room (a full cache serves hits but retains
+        // nothing new).
+        if hint != StaticHint::Unknown
+            && proof.clean
+            && self.verdicts.len() < HINT_MAX_VERDICT_CACHE_ENTRIES
+        {
             self.verdicts.insert(
                 (dev, ino),
                 VerdictEntry {
@@ -473,18 +517,35 @@ impl ExtensiveState {
                     mtime_nsec: pre.2,
                     ctime_sec: pre.3,
                     ctime_nsec: pre.4,
+                    deps: proof.deps,
+                    resolutions: proof.resolutions,
+                    watched_names: self.effective_watched_names(),
                 },
             );
         }
         hint
     }
 
-    /// Reopen the learned path and demand the recorded identity plus the
-    /// cached size/mtime/ctime snapshot. A hit proves the same unchanged
-    /// file; anything else refuses. The reopen is not a custody grant:
-    /// it supplies no birth, admission, or absence authority.
-    fn verify_snapshot(&self, dev: u64, ino: u64, entry: &VerdictEntry) -> bool {
-        let Some(path) = self.path_cache.get(&kdev_key(dev, ino)) else {
+    /// The learned or pinned path for one recorded `(dev, ino)` pair,
+    /// when this capture still knows one.
+    fn learned_path(&self, dev: u64, ino: u64) -> Option<PathBuf> {
+        if let Some(path) = self.path_cache.get(&kdev_key(dev, ino)) {
+            return Some(path.clone());
+        }
+        self.watched
+            .iter()
+            .find(|provider| (provider.dev, provider.ino) == (dev, ino))
+            .map(|provider| provider.path.clone())
+    }
+
+    /// Reopen the known path and demand the recorded identity plus
+    /// the recorded size/mtime/ctime snapshot. This is the same-file
+    /// proof a cache hit demands of the executable and of every
+    /// dependency behind a transitive verdict; anything else refuses.
+    /// The reopen is not a custody grant: it supplies no birth,
+    /// admission, or absence authority.
+    fn verify_unchanged(&self, dev: u64, ino: u64, snapshot: (u64, i64, i64, i64, i64)) -> bool {
+        let Some(path) = self.learned_path(dev, ino) else {
             return false;
         };
         let Ok(file) = File::open(path) else {
@@ -496,13 +557,83 @@ impl ExtensiveState {
         if identity != (dev, ino) {
             return false;
         }
-        snapshot_of(&file).is_ok_and(|snap| {
-            snap.0 == entry.size
-                && snap.1 == entry.mtime_sec
-                && snap.2 == entry.mtime_nsec
-                && snap.3 == entry.ctime_sec
-                && snap.4 == entry.ctime_nsec
-        })
+        snapshot_of(&file).is_ok_and(|snap| snap == snapshot)
+    }
+
+    /// A cache hit must reproduce the whole recorded basis: the
+    /// effective watched-name list the name test used, the candidate
+    /// count every resolution chose from (a newly learned candidate
+    /// could shadow the recorded choice), the executable snapshot,
+    /// and every intermediate dependency snapshot. Any mismatch,
+    /// change or removal refuses the hit and the caller re-analyzes.
+    fn verify_entry(&self, dev: u64, ino: u64, entry: &VerdictEntry) -> bool {
+        if self.effective_watched_names() != entry.watched_names {
+            return false;
+        }
+        if entry
+            .resolutions
+            .iter()
+            .any(|(name, count)| self.candidates_for(name).len() != *count)
+        {
+            return false;
+        }
+        let exe = (
+            entry.size,
+            entry.mtime_sec,
+            entry.mtime_nsec,
+            entry.ctime_sec,
+            entry.ctime_nsec,
+        );
+        self.verify_unchanged(dev, ino, exe)
+            && entry.deps.iter().all(|dep| {
+                self.verify_unchanged(
+                    dep.dev,
+                    dep.ino,
+                    (
+                        dep.size,
+                        dep.mtime_sec,
+                        dep.mtime_nsec,
+                        dep.ctime_sec,
+                        dep.ctime_nsec,
+                    ),
+                )
+            })
+    }
+
+    /// The name each watched provider contributes to the Row B name
+    /// test, in watched order: its SONAME when known, else its
+    /// pinned-path basename.
+    fn effective_watched_names(&self) -> Vec<Vec<u8>> {
+        self.watched
+            .iter()
+            .map(|provider| {
+                if provider.soname.is_empty() {
+                    path_basename(&provider.path).unwrap_or(&[]).to_vec()
+                } else {
+                    provider.soname.clone()
+                }
+            })
+            .collect()
+    }
+
+    /// Row B resolution candidates for one needed name, in the
+    /// deterministic order resolution tries them: basename matches
+    /// over the scan-learned path cache, then the pinned watched
+    /// paths. No RUNPATH, no loader search, no directory walks.
+    fn candidates_for(&self, name: &[u8]) -> Vec<(PathBuf, (u64, u64))> {
+        let mut candidates: Vec<(PathBuf, (u64, u64))> = Vec::new();
+        for (key, path) in &self.path_cache {
+            if path_basename(path).is_some_and(|base| base == name) {
+                let dev = (key.device.major << 20) | (key.device.minor & 0xfffff);
+                candidates.push((path.clone(), (dev, key.inode)));
+            }
+        }
+        for provider in &self.watched {
+            if path_basename(&provider.path).is_some_and(|base| base == name) {
+                candidates.push((provider.path.clone(), (provider.dev, provider.ino)));
+            }
+        }
+        candidates
     }
 
     /// Row B: the provider name test. A needed name matches a watched
@@ -522,48 +653,58 @@ impl ExtensiveState {
     /// parsed dependency. Returns `None` when no candidate survives,
     /// `Some(None)` when the name resolves to an already-parsed object
     /// (the edge is charged but no new object is), and `Some(Some)`
-    /// with the fresh parse otherwise. Candidates are basename matches
-    /// over the scan-learned path cache plus the pinned watched paths —
-    /// no RUNPATH, no loader search, no directory walks. Each candidate
+    /// with the fresh parse otherwise. Row D object accounting
+    /// reserves against the remaining allowance *before* each new
+    /// candidate is opened, failed attempts included (open failures,
+    /// identity mismatches, failed parses, unstable brackets and
+    /// SONAME mismatches all consume), so the 32-object ceiling is a
+    /// bound on opened objects, never a post-parse discovery. When the
+    /// allowance is spent, only an already-parsed candidate later in
+    /// the order can still resolve the name. Each attempted candidate
     /// is opened, `fstat`-verified against its learned/pinned identity,
     /// stability-bracketed around its bounded parse, and SONAME-checked
     /// (a present SONAME must equal the needed name); the first candidate
     /// to survive all five wins, the rest are tried in deterministic order.
     /// A changed or unavailable intermediate voids that candidate, so its
     /// required chain resolves nowhere and the walk voids per Row C.
+    /// A successful resolution records its dependency snapshot and the
+    /// candidate count it chose from for later cache revalidation;
+    /// any failed attempt marks the walk unclean (uncacheable), since a
+    /// rejected candidate is not part of that recorded proof.
     fn resolve_needed(
         &self,
         name: &[u8],
         charge: &mut u64,
         visited: &mut BTreeSet<(u64, u64)>,
         capture_base: u64,
+        proof: &mut WalkProof,
     ) -> Option<Option<ElfNeeded>> {
-        let mut candidates: Vec<(PathBuf, (u64, u64))> = Vec::new();
-        for (key, path) in &self.path_cache {
-            if path_basename(path).is_some_and(|base| base == name) {
-                let dev = (key.device.major << 20) | (key.device.minor & 0xfffff);
-                candidates.push((path.clone(), (dev, key.inode)));
-            }
-        }
-        for provider in &self.watched {
-            if path_basename(&provider.path).is_some_and(|base| base == name) {
-                candidates.push((provider.path.clone(), (provider.dev, provider.ino)));
-            }
-        }
+        let candidates = self.candidates_for(name);
+        let candidate_count = candidates.len();
         for (path, identity) in candidates {
             if visited.contains(&identity) {
                 // Already parsed this analysis: the name is resolved
                 // and re-parsing would double-charge bytes.
+                proof.resolutions.push((name.to_vec(), candidate_count));
                 return Some(None);
             }
+            if proof.objects >= HINT_MAX_OBJECTS_PER_ANALYSIS {
+                // No allowance to open a new object; keep scanning
+                // only in case an already-parsed candidate follows.
+                continue;
+            }
+            proof.objects += 1;
             let Ok(file) = File::open(&path) else {
+                proof.clean = false;
                 continue;
             };
             let Ok(found) = identity_of(&file) else {
+                proof.clean = false;
                 continue;
             };
             if found != identity {
                 // Path replaced since learning: not the file we knew.
+                proof.clean = false;
                 continue;
             }
             // Row A: bracket the bounded parse. A change or an
@@ -576,20 +717,38 @@ impl ExtensiveState {
             }
             let parsed = match read_elf_needed(&file, charge, capture_base) {
                 Ok(parsed) => parsed,
-                Err(_) => continue,
+                Err(_) => {
+                    proof.clean = false;
+                    continue;
+                }
             };
-            let post = snapshot_of(&file);
-            if !matches!((&pre, &post), (Some(pre), Ok(post)) if pre == post) {
+            let (Some(pre), Ok(post)) = (pre, snapshot_of(&file)) else {
+                proof.clean = false;
+                continue;
+            };
+            if pre != post {
+                proof.clean = false;
                 continue;
             }
             if let Some(soname) = parsed.soname.as_deref()
                 && soname != name
             {
+                proof.clean = false;
                 continue;
             }
             // Marked only after a successful parse: a failed candidate
             // must not shadow an intact alias with the same identity.
             visited.insert(identity);
+            proof.deps.push(DepProof {
+                dev: identity.0,
+                ino: identity.1,
+                size: pre.0,
+                mtime_sec: pre.1,
+                mtime_nsec: pre.2,
+                ctime_sec: pre.3,
+                ctime_nsec: pre.4,
+            });
+            proof.resolutions.push((name.to_vec(), candidate_count));
             return Some(Some(parsed));
         }
         None
@@ -603,22 +762,33 @@ impl ExtensiveState {
     /// a blown object budget, or a blown capture budget voids to the
     /// latched loader hint if the loader chain completed within budget,
     /// else to `unknown`. A clean walk with no witness is honestly
-    /// negative. Charges (objects, edges, bytes) include duplicates and
-    /// failed parses and are never refunded.
-    fn walk_dependencies(&mut self, exe: &File, dev: u64, ino: u64) -> StaticHint {
+    /// negative. Charges (objects reserved before each open, edges,
+    /// bytes) include duplicates and failed parses and are never
+    /// refunded. The returned proof records the dependency evidence
+    /// behind the hint; only a clean proof may be cached, and a hit
+    /// must revalidate it. Verdicts reached through the latched-loader
+    /// fallback are never clean: their basis includes an unresolved or
+    /// over-budget branch the proof does not record.
+    fn walk_dependencies(&mut self, exe: &File, dev: u64, ino: u64) -> (StaticHint, WalkProof) {
         // Row D: every span read checks the remaining per-capture
         // allowance before touching the file, so the direct-provider
         // early return and the empty closure cannot over-read either.
         let capture_base = self.capture_bytes_charged;
         let mut charge = 0u64;
-        let mut objects = 1usize;
+        let mut proof = WalkProof {
+            objects: 1,
+            deps: Vec::new(),
+            resolutions: Vec::new(),
+            clean: true,
+        };
         let mut edges = 0usize;
         let mut visited = BTreeSet::from([(dev, ino)]);
         let exe_parsed = match read_elf_needed(exe, &mut charge, capture_base) {
             Ok(parsed) => parsed,
             Err(_) => {
                 self.capture_bytes_charged = self.capture_bytes_charged.saturating_add(charge);
-                return StaticHint::Unknown;
+                proof.clean = false;
+                return (StaticHint::Unknown, proof);
             }
         };
         let mut loader_latched = false;
@@ -631,12 +801,13 @@ impl ExtensiveState {
                     if edges > HINT_MAX_EDGES_PER_ANALYSIS {
                         self.capture_bytes_charged =
                             self.capture_bytes_charged.saturating_add(charge);
-                        return Self::latched_or_unknown(loader_latched);
+                        proof.clean = false;
+                        return (Self::latched_or_unknown(loader_latched), proof);
                     }
                     if self.matches_watched_provider(name) {
                         self.capture_bytes_charged =
                             self.capture_bytes_charged.saturating_add(charge);
-                        return StaticHint::LinksProvider;
+                        return (StaticHint::LinksProvider, proof);
                     }
                     if name.as_slice() == HINT_LOADER_SONAME {
                         loader_latched = true;
@@ -648,30 +819,30 @@ impl ExtensiveState {
             // needed order); the first failure voids.
             for parsed in &level {
                 for name in &parsed.needed {
-                    let Some(resolved) =
-                        self.resolve_needed(name, &mut charge, &mut visited, capture_base)
-                    else {
+                    let Some(resolved) = self.resolve_needed(
+                        name,
+                        &mut charge,
+                        &mut visited,
+                        capture_base,
+                        &mut proof,
+                    ) else {
                         self.capture_bytes_charged =
                             self.capture_bytes_charged.saturating_add(charge);
-                        return Self::latched_or_unknown(loader_latched);
+                        proof.clean = false;
+                        return (Self::latched_or_unknown(loader_latched), proof);
                     };
                     let Some(resolved) = resolved else {
                         // Already parsed: the edge was charged, no new
                         // object followed.
                         continue;
                     };
-                    objects += 1;
-                    if objects > HINT_MAX_OBJECTS_PER_ANALYSIS {
-                        self.capture_bytes_charged =
-                            self.capture_bytes_charged.saturating_add(charge);
-                        return Self::latched_or_unknown(loader_latched);
-                    }
                     if self.capture_bytes_charged.saturating_add(charge)
                         > HINT_MAX_BYTES_PER_CAPTURE
                     {
                         self.capture_bytes_charged =
                             self.capture_bytes_charged.saturating_add(charge);
-                        return Self::latched_or_unknown(loader_latched);
+                        proof.clean = false;
+                        return (Self::latched_or_unknown(loader_latched), proof);
                     }
                     next.push(resolved);
                 }
@@ -679,11 +850,12 @@ impl ExtensiveState {
             level = next;
         }
         self.capture_bytes_charged = self.capture_bytes_charged.saturating_add(charge);
-        if loader_latched {
+        let hint = if loader_latched {
             StaticHint::LinksPkcs11Loader
         } else {
             StaticHint::NoStaticLinkWithinScope
-        }
+        };
+        (hint, proof)
     }
 
     fn latched_or_unknown(loader_latched: bool) -> StaticHint {
@@ -1833,6 +2005,9 @@ mod tests {
                     mtime_nsec: 0,
                     ctime_sec: 0,
                     ctime_nsec: 0,
+                    deps: Vec::new(),
+                    resolutions: Vec::new(),
+                    watched_names: Vec::new(),
                 },
             );
         }

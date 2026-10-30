@@ -12441,6 +12441,9 @@ fn key_operation_kem_adapter_reads_reach_original_wire_and_commit() {
         reads: Vec<u64>,
     }
     impl Spy {
+        // One explicit parameter per adapter input: side, descriptor,
+        // row, layout, sp, gate, output flag.
+        #[allow(clippy::too_many_arguments)]
         fn entry(
             &mut self,
             side: Option<&mut ObjectStart>,
@@ -12492,7 +12495,7 @@ fn key_operation_kem_adapter_reads_reach_original_wire_and_commit() {
     // Run both production adapters; return the shaped verdicts
     // ((input word, status) x2, (result word, status)) plus the
     // acquisition logs and both adapter verdicts.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn adapters(
         function: u32,
         layout: LinuxLayout,

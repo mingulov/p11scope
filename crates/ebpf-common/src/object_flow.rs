@@ -2317,7 +2317,7 @@ mod tests {
         // path (task_owner.c): ENTRY/READY/RETURNING pass the range
         // check; a required query additionally demands READY.
         fn required_side_admits(side: &ObjectStart) -> bool {
-            matches!(side.phase, 1 | 2 | 3) && side.phase == 2
+            matches!(side.phase, 1..=3) && side.phase == 2
         }
         // (encapsulate, layout, template ptr, template count, arg 6,
         // stack cell, kem wired, output non-null, retained result,

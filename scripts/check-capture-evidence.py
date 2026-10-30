@@ -179,6 +179,12 @@ ALLOWED_UNOBSERVED_REASONS = {
     "health_loss",
     "scope_uncertain",
 }
+# Residual 6.13 review: the watch/window shapes are closed. `since_ns` is
+# always present (null until armed); `until_ns`/`ended_by` appear only when
+# the end actually happened; `changed` is the object_changed bracket.
+WATCH_KEYS = {"since_ns", "state", "until_ns", "ended_by", "changed"}
+WATCH_CHANGED_KEYS = {"last_ok_ns", "detected_ns", "previous_ino"}
+UNOBSERVED_WINDOW_KEYS = {"start_ns", "end_ns", "reason"}
 ALLOWED_TABLE_SOURCES = {"scan", "manifest"}
 ALLOWED_CORROBORATION = {
     "single_source",
@@ -1640,12 +1646,17 @@ def exact_prearm_keys(module):
     if "watch" in module:
         watch = module["watch"]
         require(
+            isinstance(watch, dict)
+            and {"since_ns", "state"} <= set(watch)
+            and set(watch) <= WATCH_KEYS,
+            f"invalid watch keys: {module}",
+        )
+        require(
             watch["state"] in ALLOWED_WATCH_STATES,
             f"invalid watch state: {module}",
         )
         require(
-            "since_ns" in watch
-            and (watch["since_ns"] is None or u64(watch["since_ns"])),
+            watch["since_ns"] is None or u64(watch["since_ns"]),
             f"invalid watch since_ns: {module}",
         )
         if "until_ns" in watch:
@@ -1658,11 +1669,47 @@ def exact_prearm_keys(module):
         if "changed" in watch:
             changed = watch["changed"]
             require(
+                isinstance(changed, dict) and set(changed) == WATCH_CHANGED_KEYS,
+                f"invalid watch changed keys: {module}",
+            )
+            require(
                 u64(changed["last_ok_ns"])
                 and u64(changed["detected_ns"])
                 and u64(changed["previous_ino"])
                 and changed["last_ok_ns"] <= changed["detected_ns"],
                 f"invalid watch changed bracket: {module}",
+            )
+        # Interval ordering and state/end coherence. The legitimate
+        # clock-unknown end (`ended` + `attached`, no stamps) stays valid:
+        # only invented or contradictory shapes are rejected.
+        since = watch["since_ns"]
+        until = watch.get("until_ns")
+        state = watch["state"]
+        ended_by = watch.get("ended_by")
+        if since is not None and until is not None:
+            require(since <= until, f"invalid watch interval: {module}")
+        if state in ("armed", "armed_idle"):
+            require(since is not None, f"invalid watch arm: {module}")
+        if state in ("pinned_unarmed", "unavailable"):
+            require(since is None, f"invalid watch arm: {module}")
+        if state == "ended":
+            require(ended_by is not None, f"invalid watch end: {module}")
+        if ended_by is not None:
+            require(
+                state in ("ended", "armed_idle"),
+                f"invalid watch end: {module}",
+            )
+        if state == "armed_idle" and ended_by is not None:
+            require(
+                ended_by in ("scope_end", "stop"),
+                f"invalid watch end: {module}",
+            )
+        if until is not None:
+            require(ended_by is not None, f"invalid watch end: {module}")
+        if "changed" in watch:
+            require(
+                state == "ended" and ended_by == "object_changed",
+                f"invalid watch changed: {module}",
             )
     if "attached_at_ns" in module:
         attached = module["attached_at_ns"]
@@ -1674,6 +1721,10 @@ def exact_prearm_keys(module):
         windows = module["unobserved_windows"]
         require(isinstance(windows, list), f"invalid unobserved_windows: {module}")
         for window in windows:
+            require(
+                isinstance(window, dict) and set(window) == UNOBSERVED_WINDOW_KEYS,
+                f"invalid unobserved window keys: {module}",
+            )
             require(
                 u64(window["start_ns"])
                 and u64(window["end_ns"])

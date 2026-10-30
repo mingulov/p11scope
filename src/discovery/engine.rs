@@ -27596,8 +27596,9 @@ impl Engine {
         self.prearm.set_scope_start_ns(scope_start_ns);
     }
 
-    /// Whether this capture holds any pre-arm watch (packet 6.13): terminal
-    /// paths skip interval work entirely when there is none.
+    /// Whether this capture holds any pre-arm watch (packet 6.13): only
+    /// `watch` transitions need one — generic attach/window assembly runs
+    /// with or without watches.
     pub(crate) fn has_prearm_watches(&self) -> bool {
         !self.prearm.is_empty()
     }
@@ -27631,10 +27632,13 @@ impl Engine {
 
     /// Closes the capture for every pre-arm watch (packet 6.13, R2-D1-4/5/7):
     /// final link evaluation, idle qualification over the closed interval
-    /// (armed + clean health + no observed use), the end for `cause`, and
-    /// the evidence-assembly merge of attach keys from real session
-    /// stamps. `used` names modules with observed calls; `attach_failures`
-    /// are the session's `(slot, reason)` failures for per-module health.
+    /// (armed + clean terminal observation/scope/link health + no observed
+    /// use), the end for `cause`, and the evidence-assembly merge of attach
+    /// keys from real session stamps. `used` names modules with observed
+    /// calls; `attach_failures` are the session's `(slot, reason)` failures
+    /// for per-module health; `kernel`/`malformed_records` are the terminal
+    /// call-observation health the run path sampled beside the reports.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish_prearm_capture(
         &mut self,
         session: &impl EngineSession,
@@ -27642,41 +27646,62 @@ impl Engine {
         used: &BTreeSet<plan::ModuleId>,
         attach_failures: &[(u32, String)],
         now: Option<u64>,
+        kernel: &crate::metrics::KernelEvidence,
+        malformed_records: u64,
     ) {
-        if self.prearm.is_empty() {
-            return;
-        }
-        self.refresh_prearm_liveness(session, now);
-        let failed_slots: BTreeSet<u32> = attach_failures.iter().map(|(slot, _)| *slot).collect();
-        let objects: BTreeMap<plan::ModuleId, PinnedObjectId> = self
-            .plan
-            .modules
-            .iter()
-            .map(|module| (module.id, module.object))
-            .collect();
-        let mut module_of: BTreeMap<PinnedObjectId, plan::ModuleId> = BTreeMap::new();
-        for (id, object) in &objects {
-            module_of.insert(*object, *id);
-        }
-        for (object, module) in &module_of {
-            let own_failed =
-                self.plan.slots.iter().any(|slot| {
+        // Generic attach/window assembly is independent of the optional
+        // pre-arm watch transitions below: a capture without pre-arm
+        // watches still gets its late-discovery windows assembled.
+        if !self.prearm.is_empty() {
+            self.refresh_prearm_liveness(session, now);
+            let failed_slots: BTreeSet<u32> =
+                attach_failures.iter().map(|(slot, _)| *slot).collect();
+            let link_gap = self.physical_gap.open
+                || self.physical_gap.unknown
+                || self.physical_gap.episodes > 0
+                || self.task_uprobe_link_losses > 0
+                || self.multi_rebuild_gaps > 0;
+            let objects: BTreeMap<plan::ModuleId, PinnedObjectId> = self
+                .plan
+                .modules
+                .iter()
+                .map(|module| (module.id, module.object))
+                .collect();
+            let mut module_of: BTreeMap<PinnedObjectId, plan::ModuleId> = BTreeMap::new();
+            for (id, object) in &objects {
+                module_of.insert(*object, *id);
+            }
+            for (object, module) in &module_of {
+                let own_failed = self.plan.slots.iter().any(|slot| {
                     slot.module_ids.contains(module) && failed_slots.contains(&slot.index)
                 });
-            let health_clean = crate::prearm_module::idle_health_clean(
-                self.counter_snapshot.ring_loss,
-                self.counter_snapshot.export_state_failures,
-                self.counter_snapshot.export_bounded_read_failures,
-                self.discovery_truncated,
-                self.malformed_discovery,
-                own_failed,
-            );
-            if let Some(watch) = self.prearm.get_mut(*object) {
-                watch.evaluate_idle(used.contains(module), health_clean);
+                let health = crate::prearm_module::PrearmHealth {
+                    discovery_ring_loss: self.counter_snapshot.ring_loss,
+                    discovery_state_failures: self.counter_snapshot.export_state_failures,
+                    discovery_read_failures: self.counter_snapshot.export_bounded_read_failures,
+                    discovery_truncated: self.discovery_truncated,
+                    malformed_discovery: self.malformed_discovery,
+                    discovery_abi_refusals: self.counter_snapshot.abi_refusals,
+                    kernel: *kernel,
+                    malformed_records,
+                    link_gap,
+                    own_attach_failures: own_failed,
+                };
+                let health_clean = crate::prearm_module::idle_health_clean(&health);
+                if let Some(watch) = self.prearm.get_mut(*object) {
+                    watch.evaluate_idle(used.contains(module), health_clean);
+                    // A health-dirty armed watch truncates at its last
+                    // proven-clean bound instead of riding to the natural end.
+                    if !health_clean
+                        && watch.render().state == crate::render::PrearmWatchState::Armed
+                    {
+                        watch.end(crate::prearm_module::prearm_loss_cause(&health), now);
+                    }
+                }
             }
+            self.prearm.end_all(cause, now);
+            self.rerender_prearm_watches();
         }
-        self.prearm.end_all(cause, now);
-        self.rerender_prearm_watches();
         let stamps: BTreeMap<u32, u64> = self
             .plan
             .slots
@@ -27693,9 +27718,11 @@ impl Engine {
         let proofs = BTreeMap::new();
         self.prearm
             .assemble(&mut self.discovery.modules, &self.plan, &stamps, &proofs);
-        // Retire after assembly: deactivation unresolves declared keys, and
-        // the stamps are historical facts the assembly must still read.
-        self.retire_prematurely_ended_watch_slots();
+        if !self.prearm.is_empty() {
+            // Retire after assembly: deactivation unresolves declared keys,
+            // and the stamps are historical facts the assembly must still read.
+            self.retire_prematurely_ended_watch_slots();
+        }
     }
 
     /// Current link facts for one watch's declared set: a key counts as
@@ -28408,6 +28435,11 @@ pub(crate) mod session_fixture {
         /// scripted ring outcomes here, `discovery_dequeue` serves it
         /// first, and staged items hold shared-allowance credits.
         staged: VecDeque<crate::events::DiscoveryItem>,
+        /// Scripted pre-arm link facts (packet 6.13 residual tests): live
+        /// slot links plus their attach-complete stamps. Empty unless a test
+        /// sets them; production `Session` supplies the real ones.
+        pub(crate) scripted_links: BTreeSet<u32>,
+        pub(crate) scripted_stamps: BTreeMap<u32, u64>,
         pub(crate) counters: CounterSnapshot,
         /// One entry per upcoming `counter_snapshot` call; `true` fails it.
         counter_script: RefCell<VecDeque<bool>>,
@@ -28678,13 +28710,18 @@ pub(crate) mod session_fixture {
             self.reexec_diagnostic.clone()
         }
         fn has_slot_link(&self, slot: u32) -> bool {
-            self.global_retirement
-                .as_ref()
-                .is_some_and(|state| state.borrow().has_slot_link(slot))
+            self.scripted_links.contains(&slot)
+                || self
+                    .global_retirement
+                    .as_ref()
+                    .is_some_and(|state| state.borrow().has_slot_link(slot))
                 || self
                     .pid_continuity
                     .as_ref()
                     .is_some_and(|state| state.borrow().has_slot_link(slot))
+        }
+        fn slot_attached_at(&self, slot: u32) -> Option<u64> {
+            self.scripted_stamps.get(&slot).copied()
         }
         fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
             self.pid_continuity

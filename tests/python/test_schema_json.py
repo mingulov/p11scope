@@ -537,6 +537,99 @@ class PrearmOracleAgreement(unittest.TestCase):
         with self.assertRaises(AssertionError):
             CHECKER["exact_discovery_semantics"](broken)
 
+    def test_watch_shapes_enforce_keys_ordering_and_coherence(self):
+        """Residual 6.13 review: the oracle closes watch/window shapes."""
+        changed = {
+            "last_ok_ns": 200,
+            "detected_ns": 300,
+            "previous_ino": 42,
+        }
+        valid = (
+            {"since_ns": None, "state": "pinned_unarmed"},
+            {"since_ns": None, "state": "unavailable"},
+            {"since_ns": 100, "state": "armed"},
+            {"since_ns": 100, "state": "armed_idle"},
+            # Legitimate clock-unknown end: latched cause, no invented stamps.
+            {"since_ns": None, "state": "ended", "ended_by": "attached"},
+            # Never-mapped cancel and natural closes.
+            {
+                "since_ns": None,
+                "state": "ended",
+                "until_ns": 300,
+                "ended_by": "scope_end",
+            },
+            {
+                "since_ns": 100,
+                "state": "armed_idle",
+                "until_ns": 300,
+                "ended_by": "scope_end",
+            },
+            {
+                "since_ns": 100,
+                "state": "ended",
+                "until_ns": 300,
+                "ended_by": "object_changed",
+                "changed": dict(changed),
+            },
+        )
+        for watch in valid:
+            evidence = self.evidence(("prearm",))
+            evidence["discovery"][0]["watch"] = copy.deepcopy(watch)
+            CHECKER["exact_discovery_semantics"](evidence)
+        invalid = (
+            # Reversed interval, idle without arm, ended without cause,
+            # synthetic extra key.
+            {
+                "since_ns": 300,
+                "state": "armed_idle",
+                "until_ns": 100,
+                "ended_by": "scope_end",
+            },
+            {"since_ns": None, "state": "armed_idle"},
+            {"since_ns": 100, "state": "ended", "until_ns": 200},
+            {
+                "since_ns": 100,
+                "state": "armed_idle",
+                "until_ns": 200,
+                "ended_by": "scope_end",
+                "raw_pin": "SYNTHETIC",
+            },
+            # Coherence: end causes only on ended/preserved-idle, a natural
+            # close alone preserves idle, until implies an end, changed
+            # implies object_changed, unarmed waits carry no arm instant.
+            {"since_ns": 100, "state": "armed", "ended_by": "scope_end"},
+            {"since_ns": 100, "state": "armed_idle", "ended_by": "health_loss"},
+            {"since_ns": 100, "state": "armed", "until_ns": 200},
+            {
+                "since_ns": 100,
+                "state": "ended",
+                "until_ns": 200,
+                "ended_by": "scope_end",
+                "changed": dict(changed),
+            },
+            {"since_ns": 100, "state": "pinned_unarmed"},
+            {"since_ns": 100, "state": "unavailable"},
+        )
+        for watch in invalid:
+            broken = self.evidence(("prearm",))
+            broken["discovery"][0]["watch"] = copy.deepcopy(watch)
+            with self.assertRaises(
+                AssertionError, msg=f"oracle accepted {watch!r}"
+            ):
+                CHECKER["exact_discovery_semantics"](broken)
+        # Windows close their keys and order their bounds too.
+        evidence = self.evidence(("prearm",))
+        evidence["discovery"][0]["unobserved_windows"] = [
+            {"start_ns": 50, "end_ns": 900, "reason": "pre_attach", "extra": 1}
+        ]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_discovery_semantics"](evidence)
+        evidence["discovery"][0]["unobserved_windows"] = [
+            {"start_ns": 900, "end_ns": 50, "reason": "pre_attach"}
+        ]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_discovery_semantics"](evidence)
+
 
 if __name__ == "__main__":
     unittest.main()

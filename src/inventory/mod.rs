@@ -717,6 +717,15 @@ pub fn run(
     if !prearm_modules.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--prearm-module requires --capture auto or native");
     }
+    // Packet 6.13 residual: the selected-file startup pin/custody path is
+    // not implemented, so the combination is refused before side effects
+    // instead of running a PARTIAL capture that never activates the input.
+    if !prearm_modules.is_empty() {
+        anyhow::bail!(
+            "--prearm-module inventory activation is not implemented under \
+             --capture auto/native; refusing before side effects"
+        );
+    }
     let scope: crate::cli::ScopeArg = scope.into();
     if identity_backend_explicit && !matches!(scope, crate::cli::ScopeArg::System) {
         anyhow::bail!(
@@ -1169,6 +1178,15 @@ fn run_with_terminal_budget(
     if !prearm_modules.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--prearm-module requires --capture auto or native");
     }
+    // Packet 6.13 residual: the selected-file startup pin/custody path is
+    // not implemented, so the combination is refused before side effects
+    // instead of running a PARTIAL capture that never activates the input.
+    if !prearm_modules.is_empty() {
+        anyhow::bail!(
+            "--prearm-module inventory activation is not implemented under \
+             --capture auto/native; refusing before side effects"
+        );
+    }
     validate_primary_destinations(out, event_log)?;
     if capture != CaptureMode::Scan {
         let _host = host()?;
@@ -1259,18 +1277,13 @@ fn run_with_terminal_budget(
         coordinator.enable_caller_metadata(started_ns)?;
     }
     coordinator.set_manifests(manifests.to_vec());
-    // Packet 6.13: inventory accepts and retains `--prearm-module` inputs,
-    // but Detailed-subset offset activation follows in a later packet — the
-    // pending activation is disclosed, never silently dropped.
-    if !prearm_modules.is_empty() {
-        coordinator.note_scope_gap(
-            "pre-arm subset pending".into(),
-            format!(
-                "{} --prearm-module input(s) retained; Detailed-subset offset activation follows in a later packet",
-                prearm_modules.len()
-            ),
-        );
-    }
+    // `--prearm-module` inputs were refused above: reaching here with a
+    // nonempty list is impossible, and a pending-activation gap is not an
+    // implementation of the selected-file contract.
+    debug_assert!(
+        prearm_modules.is_empty(),
+        "pre-arm inventory inputs refuse before coordinator setup"
+    );
     // F4 (review): a document with no `exact` flag still says, as a
     // scope-level gap, that /proc PIDs are not the kernel's here.
     stage_numbering_gap(&mut coordinator, &numbering);
@@ -7988,6 +8001,55 @@ mod tests {
             format!("{error:#}").contains("--prearm-module requires --capture auto or native"),
             "unexpected refusal: {error:#}"
         );
+    }
+
+    #[test]
+    fn inventory_run_refuses_prearm_under_auto_and_native_before_side_effects() {
+        // The selected-file startup pin/custody path is not implemented:
+        // inventory refuses the combination before probing, sinks or scans.
+        for mode in [CaptureMode::Auto, CaptureMode::Native] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out.json");
+            let mut stdout = Vec::new();
+            let error = run_with_terminal_budget(
+                InspectScope::Pid(std::process::id()),
+                &[],
+                &[],
+                &[PathBuf::from("/opt/p11-provider.so")],
+                &HookRegistry::builtin(),
+                true,
+                Some(1),
+                None,
+                inventory_endpoint_budget(None).unwrap(),
+                None,
+                Some(&out),
+                false,
+                None,
+                None,
+                None,
+                mode,
+                crate::attach::BackendSelection::Singles,
+                None,
+                false,
+                &|| false,
+                &|| {},
+                false,
+                &mut WriterStdout(&mut stdout),
+                &DashboardIo::stdio(),
+                DiagnosticRequest::disabled(),
+                None,
+                &|| panic!("refusal must precede host probing"),
+                None,
+                None,
+            )
+            .expect_err("inventory with --prearm-module under auto/native must refuse");
+            assert!(
+                format!("{error:#}").contains("--prearm-module"),
+                "unexpected refusal: {error:#}"
+            );
+            assert!(!out.exists(), "refusal must precede sink creation");
+            assert!(stdout.is_empty());
+        }
     }
 
     #[test]

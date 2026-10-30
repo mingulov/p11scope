@@ -8255,6 +8255,8 @@ fn prearm_finish_closes_watches_and_merges_assembly_keys() {
         &BTreeSet::new(),
         &[],
         None,
+        &crate::metrics::KernelEvidence::default(),
+        0,
     );
     assert_eq!(engine.discovery.modules.len(), 1);
     let record = &engine.discovery.modules[0];
@@ -8268,6 +8270,238 @@ fn prearm_finish_closes_watches_and_merges_assembly_keys() {
     // the never-mapped watch discloses no window of its own.
     assert_eq!(record.attached_at_ns, Some(None));
     assert_eq!(record.unobserved_windows, None);
+}
+
+/// Packet 6.13 residual: one bare pre-arm watch driven to its terminal
+/// state with scripted links/stamps and explicit terminal health, all with
+/// zero observed use. Stamps land at 1000, the frozen stop at 5000: a
+/// qualified interval closes at the stop, a truncated one at its proof.
+fn finish_prearm_terminal_health(
+    kernel: crate::metrics::KernelEvidence,
+    malformed_records: u64,
+    gap_episodes: u64,
+) -> crate::render::PrearmWatch {
+    use crate::render::PrearmWatchEnd;
+
+    let fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_prearm_before_load();
+    assert!(engine.has_prearm_watches());
+    assert!(
+        !engine.plan().slots.is_empty(),
+        "bare pre-arm must plan its proved exports"
+    );
+    let mut session = ScriptedSession::default();
+    for slot in engine.plan().slots.iter() {
+        session.scripted_links.insert(slot.index);
+        session.scripted_stamps.insert(slot.index, 1000);
+    }
+    if gap_episodes > 0 {
+        engine.physical_gap.episodes = gap_episodes;
+    }
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &kernel,
+        malformed_records,
+    );
+    assert_eq!(engine.discovery.modules.len(), 1);
+    *engine.discovery.modules[0]
+        .watch
+        .as_ref()
+        .expect("finish renders every watch")
+}
+
+/// Quiet and healthy with zero use: armed plus clean terminal health
+/// reads `armed_idle` over the closed stop-bounded interval.
+#[test]
+fn prearm_quiet_healthy_arms_idle_with_closed_bounds() {
+    use crate::render::{PrearmWatchEnd, PrearmWatchState};
+
+    let watch = finish_prearm_terminal_health(crate::metrics::KernelEvidence::default(), 0, 0);
+    assert_eq!(watch.state, PrearmWatchState::ArmedIdle);
+    assert_eq!(watch.since_ns, Some(1000));
+    assert_eq!(watch.until_ns, Some(5000));
+    assert_eq!(watch.ended_by, Some(PrearmWatchEnd::ScopeEnd));
+}
+
+/// Call-event loss with zero observed use: the quiet claim is refused and
+/// the armed interval truncates as health loss, never `armed_idle`.
+#[test]
+fn prearm_call_ring_loss_refuses_idle() {
+    use crate::render::{PrearmWatchEnd, PrearmWatchState};
+
+    let kernel = crate::metrics::KernelEvidence {
+        ring_loss: 1,
+        ..Default::default()
+    };
+    let watch = finish_prearm_terminal_health(kernel, 0, 0);
+    assert_eq!(watch.state, PrearmWatchState::Ended);
+    assert_eq!(watch.ended_by, Some(PrearmWatchEnd::HealthLoss));
+}
+
+/// Scope and identity refusals with zero use end scope-uncertain: cgroup
+/// admission, kernel/discovery ABI and kernel identity/control signals.
+#[test]
+fn prearm_scope_identity_refusal_ends_scope_uncertain() {
+    use crate::render::{PrearmWatchEnd, PrearmWatchState};
+
+    let cgroup = crate::metrics::KernelEvidence {
+        cgroup_scope_failures: 1,
+        ..Default::default()
+    };
+    let identity = crate::metrics::KernelEvidence {
+        control: crate::metrics::KernelControl {
+            identity_unavailable: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let kernel_abi = crate::metrics::KernelEvidence {
+        abi_refusals: 1,
+        ..Default::default()
+    };
+    for kernel in [cgroup, identity, kernel_abi] {
+        let watch = finish_prearm_terminal_health(kernel, 0, 0);
+        assert_eq!(watch.state, PrearmWatchState::Ended);
+        assert_eq!(watch.ended_by, Some(PrearmWatchEnd::ScopeUncertain));
+    }
+    // Discovery-side ABI refusal refuses through the engine's own snapshot.
+    let fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_prearm_before_load();
+    let mut session = ScriptedSession::default();
+    for slot in engine.plan().slots.iter() {
+        session.scripted_links.insert(slot.index);
+        session.scripted_stamps.insert(slot.index, 1000);
+    }
+    engine.counter_snapshot.abi_refusals = 1;
+    engine.finish_prearm_capture(
+        &session,
+        crate::render::PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+    );
+    let watch = engine.discovery.modules[0]
+        .watch
+        .as_ref()
+        .expect("finish renders every watch");
+    assert_eq!(watch.state, PrearmWatchState::Ended);
+    assert_eq!(watch.ended_by, Some(PrearmWatchEnd::ScopeUncertain));
+}
+
+/// A malformed call feed with zero use refuses the quiet claim as loss.
+#[test]
+fn prearm_malformed_feed_refuses_idle() {
+    use crate::render::{PrearmWatchEnd, PrearmWatchState};
+
+    let watch = finish_prearm_terminal_health(crate::metrics::KernelEvidence::default(), 1, 0);
+    assert_eq!(watch.state, PrearmWatchState::Ended);
+    assert_eq!(watch.ended_by, Some(PrearmWatchEnd::HealthLoss));
+}
+
+/// Link gaps refuse the quiet claim: a finally lost link truncates at the
+/// arm instant, and a recorded gap episode voids idle even when the final
+/// snapshot shows every link live.
+#[test]
+fn prearm_link_gaps_refuse_idle() {
+    use crate::render::{PrearmWatchEnd, PrearmWatchState};
+
+    // Detach: arm with live links, then lose every link before the end.
+    // The claim truncates at the last verified instant (the arm 1000), not
+    // at the detection time (the stop 5000).
+    let fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_prearm_before_load();
+    let mut linked = ScriptedSession::default();
+    for slot in engine.plan().slots.iter() {
+        linked.scripted_links.insert(slot.index);
+        linked.scripted_stamps.insert(slot.index, 1000);
+    }
+    engine.refresh_prearm_liveness(&linked, Some(1000));
+    let unlinked = ScriptedSession::default();
+    engine.finish_prearm_capture(
+        &unlinked,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+    );
+    let watch = engine.discovery.modules[0]
+        .watch
+        .as_ref()
+        .expect("finish renders every watch");
+    assert_eq!(watch.state, PrearmWatchState::Ended);
+    assert_eq!(watch.ended_by, Some(PrearmWatchEnd::HealthLoss));
+    assert_eq!(watch.since_ns, Some(1000));
+    assert_eq!(watch.until_ns, Some(1000));
+    // Rebuild: a healed gap the final snapshot cannot see still voids the
+    // uninterrupted-quiet claim.
+    let watch = finish_prearm_terminal_health(crate::metrics::KernelEvidence::default(), 0, 1);
+    assert_eq!(watch.state, PrearmWatchState::Ended);
+    assert_eq!(watch.ended_by, Some(PrearmWatchEnd::HealthLoss));
+}
+
+/// Packet 6.13 residual: generic captures assemble their late-discovery
+/// window too. Scan-only before any mapping admits nothing; after the real
+/// load the terminal merge discloses the nonempty `late_discovery` window.
+#[test]
+fn generic_terminal_assembly_discloses_late_discovery_window() {
+    use crate::render::PrearmWatchEnd;
+
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_scan_only_before_load();
+    assert!(!engine.has_prearm_watches());
+    assert!(
+        engine.discovery.modules.is_empty(),
+        "scan-only pre-load admits nothing"
+    );
+    fixture.load();
+    engine.request_refresh(fixture.pid(), None);
+    refresh_inventory_once(&mut engine);
+    engine.publish_current_capture_facts().unwrap();
+    assert!(
+        engine.modules.iter().any(|module| module
+            .scanned
+            .tables
+            .iter()
+            .any(|table| { table.entries.len() == 68 })),
+        "the mapped provider is really admitted"
+    );
+    assert_eq!(engine.discovery.modules.len(), 1);
+    assert!(!engine.has_prearm_watches());
+    let mut session = ScriptedSession::default();
+    for slot in engine.plan().slots.iter() {
+        session.scripted_stamps.insert(slot.index, 900);
+    }
+    engine.set_scope_start_ns(Some(50));
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+    );
+    let record = &engine.discovery.modules[0];
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    let windows = record
+        .unobserved_windows
+        .as_ref()
+        .expect("the late module discloses its window");
+    assert!(
+        !windows.is_empty()
+            && windows
+                .iter()
+                .any(|window| { window.reason == crate::render::UnobservedReason::LateDiscovery }),
+        "a real late module carries a late_discovery window: {windows:?}"
+    );
 }
 
 /// U-14: pins "0 after a scan-only `--pid` exit" through the real engine

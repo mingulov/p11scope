@@ -246,8 +246,11 @@ publications.
 
 ## Pre-arm watch keys on `evidence.discovery[]`
 
-Modules named by `--prearm-module` (packet 6.13) carry three additive keys;
-every other module omits all three. `sources` gains the one new label
+Modules named by `--prearm-module` (packet 6.13) carry `watch`; only
+`watch` is pre-arm-only. `attached_at_ns` and `unobserved_windows` merge at
+evidence assembly onto every module with attach stamps, including generic
+captures without pre-arm watches (a module that missed the initial build
+discloses `late_discovery`). `sources` gains the one new label
 `"prearm"` (canonical order `scan`, `manifest`, `prearm`); pre-arm-only
 modules read `corroboration: ["uncorroborated"]`, and pre-arm never emits
 decoded tables. `watch` is `{since_ns, state, until_ns?, ended_by?,

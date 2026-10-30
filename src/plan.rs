@@ -4071,12 +4071,13 @@ fn lower_manifest(
 }
 
 /// Lowers one resolved `--prearm-module` piece (packet 6.13, R2-D1-1/2).
-/// Operator-authoritative like a manifest piece (`scan_evidence: None`:
-/// admitted whole under the unchanged caps), but with no tables, no
-/// interfaces and no surfaces — a pre-arm input proves offsets, never
-/// tables. Targets carry file-derived names, so they read operator-side
-/// like manifest names; `fork_safe` stays false because no standard
-/// interface exposes them.
+/// Operator-side like a manifest piece (`scan_evidence: None`: admitted
+/// whole under the unchanged caps), but with no tables, no interfaces and
+/// no surfaces — a pre-arm input proves offsets, never tables. Targets
+/// carry file-derived names, so they read operator-side like manifest
+/// names; file selection is not attestation, so they stay count-only
+/// unless an independently accepted manifest authorizes the same slot.
+/// `fork_safe` stays false because no standard interface exposes them.
 fn lower_prearm(piece: &PrearmPlanPiece) -> Discovered<'_> {
     let mut targets = Vec::new();
     let mut skipped = Vec::new();
@@ -4087,7 +4088,7 @@ fn lower_prearm(piece: &PrearmPlanPiece) -> Discovered<'_> {
             object_path: &piece.path,
             file_offset: *file_offset,
             fork_safe: false,
-            semantic_authorized: true,
+            semantic_authorized: false,
             name_authorized: true,
             table: None,
             ordinal: standard_ordinal(name).map(|ordinal| SlotOrdinal {
@@ -6922,6 +6923,69 @@ mod tests {
         assert!(!plan.slots[0].semantic_authorized);
         assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
         assert!(plan.slots[0].semantic_ambiguous);
+    }
+
+    fn prearm_piece(proved: Vec<(String, u64)>) -> PrearmPlanPiece {
+        PrearmPlanPiece {
+            object: TEST_PINNED_OBJECT,
+            key: TEST_OBJECT,
+            path: "/opt/p11.so".into(),
+            proved,
+            non_executable: Vec::new(),
+        }
+    }
+
+    fn build_with_prearm(
+        scanned: &[ReconciledModule],
+        manifests: &[Manifest],
+        prearm: &[PrearmPlanPiece],
+    ) -> AttachPlan {
+        build_from_sources_with(
+            scanned,
+            manifests,
+            prearm,
+            |key, _| u32::try_from(key.inode).ok().map(PinnedObjectId),
+            |_, _| true,
+            ExistingAllocation {
+                slots: 0,
+                active: &BTreeMap::new(),
+                owned: &BTreeMap::new(),
+            },
+            false,
+            AdmissionPolicy::detailed(),
+            AdmissionScope::Named,
+        )
+    }
+
+    #[test]
+    fn bare_prearm_stays_count_only_without_manifest_authority() {
+        // File selection is not attestation: export-proved targets stay
+        // named but count-only until an accepted manifest supplies authority.
+        let plan = build_with_prearm(&[], &[], &[prearm_piece(vec![("C_SignInit".into(), 0x10)])]);
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, ["C_SignInit"]);
+        assert_eq!(plan.slots[0].descriptor_index, 0);
+        assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
+        assert!(!plan.slots[0].semantic_authorized);
+    }
+
+    #[test]
+    fn manifest_backed_prearm_keeps_semantic_authority() {
+        // Positive twin: the same export plus an accepted manifest claim
+        // for the same object authorizes the descriptor.
+        let manifest = manifest_with(vec![resolved("C_SignInit", 0x10)]);
+        let plan = build_with_prearm(
+            &[],
+            std::slice::from_ref(&manifest),
+            &[prearm_piece(vec![("C_SignInit".into(), 0x10)])],
+        );
+        assert_eq!(plan.slots.len(), 1);
+        assert!(plan.slots[0].semantic_authorized);
+        assert_ne!(plan.slots[0].descriptor_index, 0);
+        assert_eq!(
+            plan.slots[0].semantics,
+            crate::kinds::descriptor("C_SignInit").unwrap()
+        );
     }
 
     #[test]

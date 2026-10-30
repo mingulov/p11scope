@@ -12,7 +12,7 @@
 use crate::attach::{CapturePolicy, Scope, Session};
 use crate::cli::{self, CaptureArgs, Kind, RunArgs, ScopeArg};
 use crate::discovery::attribution;
-use crate::discovery::engine::Engine;
+use crate::discovery::engine::{Engine, EngineSession};
 use crate::discovery::pause::{
     ArmResult, PauseCoordinator, PauseError, PauseIo, PauseStatus, SessionPauseIo,
 };
@@ -1987,25 +1987,37 @@ fn prearm_report_owners(
 }
 
 /// Closes pre-arm watches at terminal publication (packet 6.13, R2-D1-4/7):
-/// idle qualification over observed use, cancel for the capture end, and
-/// the attach-key assembly merge onto the discovery records — all before
-/// the evidence seals. A no-op without pre-arm watches.
+/// idle qualification over observed use and terminal health, the end for
+/// the capture end, and the attach-key assembly merge onto the discovery
+/// records — all before the evidence seals. Watches close at the frozen
+/// stop/scope-ending boundary `stop_ns` (the loop-end stamp beside the
+/// loss sampling), never at a later publication read, so the published
+/// interval excludes the blind tail. Generic captures without watches
+/// still assemble their attach/window keys.
+#[allow(clippy::too_many_arguments)]
 fn finish_prearm_terminal(
     engine: &mut Engine,
-    session: &Session,
+    session: &impl EngineSession,
+    attach_failures: &[(u32, String)],
     end: CaptureEnd,
     reports: &[metrics::SlotReport],
+    kernel: &metrics::KernelEvidence,
+    malformed_records: u64,
+    stop_ns: Option<u64>,
 ) {
-    if !engine.has_prearm_watches() {
-        return;
-    }
-    let used = prearm_used_modules(reports, engine.plan(), engine.pinned());
+    let used = if engine.has_prearm_watches() {
+        prearm_used_modules(reports, engine.plan(), engine.pinned())
+    } else {
+        BTreeSet::new()
+    };
     engine.finish_prearm_capture(
         session,
         end.prearm_end_cause(),
         &used,
-        session.attach_failures(),
-        crate::attach::monotonic_ns(),
+        attach_failures,
+        stop_ns,
+        kernel,
+        malformed_records,
     );
 }
 
@@ -5470,6 +5482,7 @@ fn capture_profile(
                         // Sealing during a quiesce failure: the watches end
                         // stopped, never as a clean scope end.
                         CaptureEnd::Error,
+                        loop_end_ns,
                     )
                     .map(|_| ())
                 },
@@ -5633,6 +5646,7 @@ fn capture_profile(
                         capture_tracking_degraded,
                         &poll_terminal_cancellation,
                         end,
+                        loop_end_ns,
                     )
                 },
             )
@@ -5662,6 +5676,7 @@ fn capture_profile(
         capture_tracking_degraded: bool,
         poll_terminal_cancellation: &impl Fn(),
         end: CaptureEnd,
+        stop_ns: Option<u64>,
     ) -> Result<render::Evidence> {
         poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
@@ -5681,7 +5696,16 @@ fn capture_profile(
             .pinned()
             .check_unchanged()
             .map_err(anyhow::Error::msg)?;
-        finish_prearm_terminal(context.0, context.1, end, reports);
+        finish_prearm_terminal(
+            context.0,
+            &*context.1,
+            context.1.attach_failures(),
+            end,
+            reports,
+            &kernel_evidence,
+            *consumers.malformed_records,
+            stop_ns,
+        );
         let settle_start = crate::attach::monotonic_ns();
         context.0.settle_terminal_drain();
         consumers.scheduling.span_stage(
@@ -6516,7 +6540,20 @@ fn capture_trace(
                         .pinned()
                         .check_unchanged()
                         .map_err(anyhow::Error::msg)?;
-                    finish_prearm_terminal(context.0, context.1, end, &reports);
+                    // Terminal observation health is sampled beside the
+                    // reports, before the watches close on it.
+                    let kernel_start = Instant::now();
+                    let terminal_kernel = metrics::kernel_evidence(context.1)?;
+                    finish_prearm_terminal(
+                        context.0,
+                        &*context.1,
+                        context.1.attach_failures(),
+                        end,
+                        &reports,
+                        &terminal_kernel,
+                        *consumers.malformed_records,
+                        loop_end_ns,
+                    );
                     let settle_start = crate::attach::monotonic_ns();
                     context.0.settle_terminal_drain();
                     consumers.scheduling.span_stage(
@@ -6526,11 +6563,9 @@ fn capture_trace(
                         crate::attach::monotonic_ns(),
                     );
                     let trace_truncated = end == CaptureEnd::LimitReached || *context.3 == Some(0);
-                    let maps_start = Instant::now();
-                    let terminal_kernel = metrics::kernel_evidence(context.1)?;
                     consumers
                         .scheduling
-                        .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
+                        .add_phase(SchedulingPhase::Maps, kernel_start.elapsed());
                     consumers.scheduling.note_terminal(
                         terminal_kernel.ring_loss,
                         context.0.capture_facts().discovery_losses()[0],
@@ -12299,6 +12334,82 @@ mod tests {
             BTreeSet::from([ModuleId(3), ModuleId(7)]),
         );
         assert!(prearm_report_owners(&prearm_test_report(None, 4, 0, 0), &plan, &pins).is_empty());
+    }
+
+    #[test]
+    fn prearm_terminal_freezes_watches_at_stop_not_publication() {
+        use crate::attach::BackendSelection;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+        use crate::discovery::hooks::HookRegistry;
+
+        // A trivial provider with no standard exports: the watch waits
+        // unarmed — the close boundary is what this test pins, not coverage.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("stop-freeze.c");
+        std::fs::write(&src, "int stop_freeze_marker;\n").unwrap();
+        let provider = dir.path().join("stop-freeze.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&provider)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pid = std::process::id();
+        // Stop long ago, publication now: duration, signal and error ends
+        // all close at the frozen stop, excluding the blind tail.
+        for (end, cause) in [
+            (
+                CaptureEnd::DurationExpired,
+                crate::render::PrearmWatchEnd::ScopeEnd,
+            ),
+            (CaptureEnd::Signal, crate::render::PrearmWatchEnd::Stop),
+            (CaptureEnd::Error, crate::render::PrearmWatchEnd::Stop),
+        ] {
+            let args = CaptureArgs {
+                kind: Kind::Profile,
+                modules: Vec::new(),
+                manifests: Vec::new(),
+                prearm_modules: vec![provider.clone()],
+                hooks: HookRegistry::builtin(),
+                scope: ScopeArg::Pid(pid),
+                metrics: false,
+                counter_mode: None,
+                duration: None,
+                out: None,
+                max_events: None,
+                max_scan_pids: None,
+                ring_bytes: None,
+                drain_interval: None,
+                unsafe_requested: false,
+                allow_confined_uretprobe: false,
+                attach_backend: BackendSelection::default(),
+            };
+            let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the self view");
+            let mut engine =
+                Engine::discover(&args, &Scope::Pid(pid), Some(view)).expect("pre-arm discover");
+            assert!(engine.has_prearm_watches());
+            let session = ScriptedSession::default();
+            let reports: Vec<metrics::SlotReport> = Vec::new();
+            finish_prearm_terminal(
+                &mut engine,
+                &session,
+                &[],
+                end,
+                &reports,
+                &metrics::KernelEvidence::default(),
+                0,
+                Some(1000),
+            );
+            let watch = engine.discovery().modules[0]
+                .watch
+                .as_ref()
+                .expect("finish renders every watch");
+            assert_eq!(watch.until_ns, Some(1000));
+            assert_eq!(watch.ended_by, Some(cause));
+        }
     }
 
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {

@@ -111,10 +111,9 @@
 //! this patch never writes `docs/privacy/allowlist-v1.md`. Fresh-file
 //! attribution stays 6.12's. Installed exactness positives stay C6-D. The
 //! inventory Detailed-subset work follows the input surface in a later
-//! packet: inventory accepts and retains `--prearm-module` inputs here,
-//! refuses them by name under `--capture scan`, and discloses the pending
-//! activation as a scope gap — pinning, subset absorb and offset activation
-//! are that packet's.
+//! packet: until its startup pin/custody path exists, inventory refuses
+//! `--prearm-module` inputs by name before side effects under every
+//! capture mode — a pending-activation gap is not an implementation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -181,9 +180,11 @@ impl PrearmWatch {
 
     /// Arm evaluation against current link facts, one entry per declared
     /// key: partial attachment remains unarmed for the declared set, and
-    /// readiness never precedes the last member's real attach stamp. Links
-    /// without any stamp cannot prove an arm instant, so the unarmed wait
-    /// discharges as `ended_by: attached` instead of arming.
+    /// readiness never precedes the last member's real attach stamp. Every
+    /// required member needs its own real timestamp before the watch claims
+    /// an arm instant — one known stamp is not the known maximum of the
+    /// declared set — so any missing stamp discharges the unarmed wait as
+    /// `ended_by: attached` instead of arming.
     pub(crate) fn evaluate_arm(&mut self, links: &[DeclaredLink]) {
         if self.state != PrearmWatchState::PinnedUnarmed {
             return;
@@ -199,16 +200,21 @@ impl PrearmWatch {
         if !all_linked {
             return;
         }
-        let latest = self
-            .declared
-            .iter()
-            .filter_map(|key| {
-                links
-                    .iter()
-                    .find(|link| link.key == *key)
-                    .and_then(|link| link.stamped_at)
-            })
-            .max();
+        let mut latest: Option<u64> = None;
+        for key in &self.declared {
+            let Some(stamped_at) = links
+                .iter()
+                .find(|link| link.key == *key)
+                .and_then(|link| link.stamped_at)
+            else {
+                // Fully linked but the arm instant is unknown: no armed
+                // interval is claimable, so the unarmed wait ends here.
+                self.state = PrearmWatchState::Ended;
+                self.ended_by = Some(PrearmWatchEnd::Attached);
+                return;
+            };
+            latest = Some(latest.map_or(stamped_at, |known| known.max(stamped_at)));
+        }
         match latest {
             Some(since) => {
                 self.state = PrearmWatchState::Armed;
@@ -216,8 +222,6 @@ impl PrearmWatch {
                 self.last_verified_ns = Some(since);
             }
             None => {
-                // Fully linked but the arm instant is unknown: no armed
-                // interval is claimable, so the unarmed wait ends here.
                 self.state = PrearmWatchState::Ended;
                 self.ended_by = Some(PrearmWatchEnd::Attached);
             }
@@ -347,26 +351,67 @@ pub(crate) enum ExactnessProofKind {
     OrderingEvidence,
 }
 
+/// Terminal observation/scope/link health for idle qualification
+/// (packet 6.13 residual, R2-D1-4): the same counters the capture verdict
+/// reads, scoped to what a quiet claim needs. Discovery transport loss,
+/// call-event loss, scope/identity refusals, malformed feeds, link gaps
+/// and the module's own attach failures all void `armed_idle`. A sibling
+/// object's change does not void this module's quiet: per-object change
+/// evidence ends that object's watch, not this one's interval.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrearmHealth {
+    pub discovery_ring_loss: u64,
+    pub discovery_state_failures: u64,
+    pub discovery_read_failures: u64,
+    pub discovery_truncated: u64,
+    pub malformed_discovery: u64,
+    pub discovery_abi_refusals: u64,
+    pub kernel: crate::metrics::KernelEvidence,
+    pub malformed_records: u64,
+    pub link_gap: bool,
+    pub own_attach_failures: bool,
+}
+
 /// Whether one module's observation health is clean enough to qualify an
-/// `armed_idle` interval (R2-D1-4): no unattributable event loss anywhere
-/// in the capture (ring, export, discovery, truncation counters all zero)
-/// and no attach failure on the module's own slots. A sibling object's
-/// change does not void this module's quiet: per-object change evidence
-/// ends that object's watch, not this one's interval.
-pub(crate) fn idle_health_clean(
-    ring_loss: u64,
-    export_state_failures: u64,
-    export_read_failures: u64,
-    discovery_truncated: u64,
-    malformed_discovery: u64,
-    own_attach_failures: bool,
-) -> bool {
-    ring_loss == 0
-        && export_state_failures == 0
-        && export_read_failures == 0
-        && discovery_truncated == 0
-        && malformed_discovery == 0
-        && !own_attach_failures
+/// `armed_idle` interval: every loss/scope/identity/link counter quiet —
+/// discovery transport, call-event loss, scope/identity refusals, the
+/// malformed call feed, recorded link gaps and the module's own attach
+/// failures. A final live-link snapshot alone authorizes nothing.
+pub(crate) fn idle_health_clean(health: &PrearmHealth) -> bool {
+    health.discovery_ring_loss == 0
+        && health.discovery_state_failures == 0
+        && health.discovery_read_failures == 0
+        && health.discovery_truncated == 0
+        && health.malformed_discovery == 0
+        && health.discovery_abi_refusals == 0
+        && health.kernel.ring_loss == 0
+        && health.kernel.start_insert_failures == 0
+        && health.kernel.unmatched_returns == 0
+        && health.kernel.rv_update_failures == 0
+        && health.kernel.cgroup_scope_failures == 0
+        && health.kernel.semantic_capture_failures == 0
+        && health.kernel.template_tail_failures == 0
+        && health.kernel.unregistered_mechanisms == 0
+        && health.kernel.abi_refusals == 0
+        && health.kernel.control.evidence().complete()
+        && health.malformed_records == 0
+        && !health.link_gap
+        && !health.own_attach_failures
+}
+
+/// Loss cause for a health-dirty armed watch: scope/identity uncertainty
+/// truncates as `scope_uncertain`, other loss as `health_loss`. Both close
+/// at the last proven-clean bound, never at the detection instant.
+pub(crate) fn prearm_loss_cause(health: &PrearmHealth) -> PrearmWatchEnd {
+    if health.kernel.cgroup_scope_failures > 0
+        || health.kernel.abi_refusals > 0
+        || health.discovery_abi_refusals > 0
+        || !health.kernel.control.evidence().complete()
+    {
+        PrearmWatchEnd::ScopeUncertain
+    } else {
+        PrearmWatchEnd::HealthLoss
+    }
 }
 
 /// Capture-lifetime pre-arm state, owned by the engine: one watch per
@@ -460,9 +505,11 @@ impl PrearmState {
     /// real attach-complete stamps. Pure over its inputs; the run/session
     /// path supplies the stamps at capture end.
     ///
-    /// * `attached_at_ns` is always set post-assembly: the max over the
-    ///   declared set's real stamps for watched modules (over the module's
-    ///   attached slots otherwise), null when nothing attached.
+    /// * `attached_at_ns` is always set post-assembly: for watched
+    ///   modules the max over the declared set's real stamps, and only when
+    ///   every required member carries one (any missing stamp leaves the
+    ///   instant unknown); over the module's attached slots otherwise; null
+    ///   when nothing attached.
     /// * The base `[scope_start_ns, attached_at_ns]` window emits for every
     ///   attached module without an R2-D1-6 proof, except never-mapped
     ///   pre-arm (its watch speaks). Reason is `pre_attach`, or
@@ -492,14 +539,22 @@ impl PrearmState {
             let object = objects.get(&record.id).copied();
             let watch = object.and_then(|object| self.watches.get(&object));
             let attached_at = match watch {
-                Some(watch) => watch
-                    .declared
-                    .iter()
-                    .filter_map(|key| {
-                        plan.slot_index_for_key(*key)
+                // The declared set's maximum needs every member's real
+                // stamp: a subset maximum is not declared-set readiness.
+                Some(watch) => {
+                    let mut latest: Option<u64> = None;
+                    for key in watch.declared.iter() {
+                        let Some(stamped_at) = plan
+                            .slot_index_for_key(*key)
                             .and_then(|index| attached.get(&index).copied())
-                    })
-                    .max(),
+                        else {
+                            latest = None;
+                            break;
+                        };
+                        latest = Some(latest.map_or(stamped_at, |known| known.max(stamped_at)));
+                    }
+                    latest
+                }
                 None => plan
                     .slots
                     .iter()
@@ -622,6 +677,25 @@ mod tests {
     }
 
     #[test]
+    fn mixed_known_unknown_stamps_never_arm() {
+        let a = key(1, 0x1000);
+        let b = key(1, 0x2000);
+        // One known stamp is not the known maximum of the declared set: a
+        // missing required stamp fails closed to unknown readiness, in both
+        // link orderings.
+        for links in [
+            vec![link(a, true, Some(100)), link(b, true, None)],
+            vec![link(a, true, None), link(b, true, Some(100))],
+        ] {
+            let mut watch = watched(BTreeSet::from([a, b]));
+            watch.evaluate_arm(&links);
+            assert_eq!(watch.render().state, PrearmWatchState::Ended);
+            assert_eq!(watch.ended_by(), Some(PrearmWatchEnd::Attached));
+            assert_eq!(watch.render().since_ns, None);
+        }
+    }
+
+    #[test]
     fn idle_qualifies_only_when_unused_and_clean() {
         let a = key(1, 0x1000);
         let mut watch = watched(BTreeSet::from([a]));
@@ -682,15 +756,85 @@ mod tests {
         assert_eq!(watch.render().until_ns, Some(100));
     }
 
+    fn quiet_health() -> PrearmHealth {
+        PrearmHealth {
+            discovery_ring_loss: 0,
+            discovery_state_failures: 0,
+            discovery_read_failures: 0,
+            discovery_truncated: 0,
+            malformed_discovery: 0,
+            discovery_abi_refusals: 0,
+            kernel: crate::metrics::KernelEvidence::default(),
+            malformed_records: 0,
+            link_gap: false,
+            own_attach_failures: false,
+        }
+    }
+
     #[test]
     fn idle_health_clean_requires_all_quiet() {
-        assert!(idle_health_clean(0, 0, 0, 0, 0, false));
-        assert!(!idle_health_clean(1, 0, 0, 0, 0, false));
-        assert!(!idle_health_clean(0, 1, 0, 0, 0, false));
-        assert!(!idle_health_clean(0, 0, 1, 0, 0, false));
-        assert!(!idle_health_clean(0, 0, 0, 1, 0, false));
-        assert!(!idle_health_clean(0, 0, 0, 0, 1, false));
-        assert!(!idle_health_clean(0, 0, 0, 0, 0, true));
+        assert!(idle_health_clean(&quiet_health()));
+        let mut dirty = quiet_health();
+        dirty.discovery_ring_loss = 1;
+        assert!(!idle_health_clean(&dirty));
+        let mut dirty = quiet_health();
+        dirty.discovery_state_failures = 1;
+        assert!(!idle_health_clean(&dirty));
+        let mut dirty = quiet_health();
+        dirty.discovery_read_failures = 1;
+        assert!(!idle_health_clean(&dirty));
+        let mut dirty = quiet_health();
+        dirty.discovery_truncated = 1;
+        assert!(!idle_health_clean(&dirty));
+        let mut dirty = quiet_health();
+        dirty.malformed_discovery = 1;
+        assert!(!idle_health_clean(&dirty));
+        let mut dirty = quiet_health();
+        dirty.own_attach_failures = true;
+        assert!(!idle_health_clean(&dirty));
+    }
+
+    #[test]
+    fn idle_health_clean_feeds_call_scope_and_link_health() {
+        // Every terminal loss/scope/link input voids the quiet claim, even
+        // with zero observed use and a clean discovery ring.
+        let mut dirty = quiet_health();
+        dirty.kernel.ring_loss = 1;
+        assert!(!idle_health_clean(&dirty));
+        let mut dirty = quiet_health();
+        dirty.kernel.cgroup_scope_failures = 1;
+        assert!(!idle_health_clean(&dirty));
+        let mut dirty = quiet_health();
+        dirty.kernel.abi_refusals = 1;
+        assert!(!idle_health_clean(&dirty));
+        let mut dirty = quiet_health();
+        dirty.discovery_abi_refusals = 1;
+        assert!(!idle_health_clean(&dirty));
+        let mut dirty = quiet_health();
+        dirty.kernel.control.identity_unavailable = 1;
+        assert!(!idle_health_clean(&dirty));
+        let mut dirty = quiet_health();
+        dirty.malformed_records = 1;
+        assert!(!idle_health_clean(&dirty));
+        let mut dirty = quiet_health();
+        dirty.link_gap = true;
+        assert!(!idle_health_clean(&dirty));
+    }
+
+    #[test]
+    fn loss_cause_separates_scope_uncertainty_from_health_loss() {
+        let mut scope = quiet_health();
+        scope.kernel.cgroup_scope_failures = 1;
+        assert_eq!(prearm_loss_cause(&scope), PrearmWatchEnd::ScopeUncertain);
+        let mut scope = quiet_health();
+        scope.kernel.control.identity_unavailable = 1;
+        assert_eq!(prearm_loss_cause(&scope), PrearmWatchEnd::ScopeUncertain);
+        let mut loss = quiet_health();
+        loss.kernel.ring_loss = 1;
+        assert_eq!(prearm_loss_cause(&loss), PrearmWatchEnd::HealthLoss);
+        let mut loss = quiet_health();
+        loss.malformed_records = 1;
+        assert_eq!(prearm_loss_cause(&loss), PrearmWatchEnd::HealthLoss);
     }
 
     fn slot(index: u32, object: u32, file_offset: u64, module: u32) -> Slot {
@@ -877,6 +1021,31 @@ mod tests {
                 },
             ]),
         );
+    }
+
+    #[test]
+    fn assembly_requires_every_declared_stamp_for_attached_at() {
+        let a = key(7, 0x1000);
+        let b = key(7, 0x2000);
+        // A subset maximum is not declared-set readiness: whichever member
+        // lacks a stamp, the attach instant stays unknown and undisclosed.
+        for attached in [BTreeMap::from([(0, 900)]), BTreeMap::from([(1, 1200)])] {
+            let mut plan = crate::plan::AttachPlan::from_slots(vec![
+                slot(0, 7, 0x1000, 3),
+                slot(1, 7, 0x2000, 3),
+            ]);
+            plan.modules = vec![module(3, 7)];
+            let mut state = PrearmState::empty();
+            state.set_scope_start_ns(Some(50));
+            state.record_initial_modules([PinnedObjectId(7)]);
+            state
+                .watches
+                .insert(PinnedObjectId(7), watched(BTreeSet::from([a, b])));
+            let mut records = vec![record(3, vec!["scan", "prearm"])];
+            state.assemble(&mut records, &plan, &attached, &BTreeMap::new());
+            assert_eq!(records[0].attached_at_ns, Some(None));
+            assert_eq!(records[0].unobserved_windows, None);
+        }
     }
 
     #[test]

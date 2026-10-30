@@ -6243,6 +6243,7 @@ fn capture_start_members_that_ended_are_not_losses() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6308,6 +6309,7 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let mut args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6477,6 +6479,7 @@ fn some_zero_max_scan_pids_clamps_to_default_like_none() {
     std::fs::write(dir.path().join("cgroup.procs"), "").expect("a cgroup.procs");
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
     let args_with = |max_scan_pids| CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6544,6 +6547,7 @@ fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6647,6 +6651,7 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6813,6 +6818,7 @@ fn retained_views_survive_ordinary_rotation_passes() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -6939,6 +6945,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -7176,6 +7183,7 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -7373,6 +7381,7 @@ fn reconcile_quantum_zero_defers_the_whole_slice() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -7507,6 +7516,7 @@ fn refresh_requests_survive_allocation_exhaustion() {
     let listing: String = pids[..3].iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -7600,6 +7610,7 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -10140,6 +10151,7 @@ fn evidence_verdict(
         object_capture: render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
+        gap_exe_hints: None,
         unprotected_live_windows: 0,
         module_unresolved_slots: 0,
         provider_changed: false,
@@ -22710,6 +22722,7 @@ fn capture_start_releases_view_ids_for_members_that_ended_before_scan() {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],
@@ -26820,6 +26833,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         object_capture: render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
+        gap_exe_hints: None,
         unprotected_live_windows: 0,
         module_unresolved_slots: 0,
         provider_changed: false,
@@ -28700,6 +28714,7 @@ fn system_scope_spawn_loaded_multi(driver: &Path, providers: &[PathBuf]) -> Syst
 
 fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs {
     CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: hints,
         manifests: vec![],
@@ -31075,6 +31090,7 @@ fn e06_cgroup_args(
     max_scan_pids: Option<usize>,
 ) -> CaptureArgs {
     CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: hints,
         manifests: vec![],
@@ -54681,9 +54697,12 @@ fn gap_exe_hint_fixture(
         "gexe",
         &exf::build_elf(&exf::ElfSpec::exe(needed)),
     );
+    let (provider_dev, provider_ino) = exf::record_identity_of(&provider);
     engine.extensive.set_watched_for_test(vec![WatchedProvider {
         path: provider.clone(),
         soname: soname.to_vec(),
+        dev: provider_dev,
+        ino: provider_ino,
     }]);
     engine
         .extensive

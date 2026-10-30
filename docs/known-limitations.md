@@ -46,7 +46,9 @@ collection pass` gap and one informational stderr line. The first
 calls a provider makes after a late load can be missed before its
 probes land, and use before admission voids that watch (`unknown`,
 `use_before_admission`). Very short-lived callers can stay unbound or
-unattributed (see below); tracking them needs a later opt-in mode.
+unattributed (see below); the `--track-short-lived` opt-in mode
+classifies their gaps into static-linkage hints instead of leaving
+bare counts, but full call attribution for them is still planned.
 Short-lived processes missed at system scale are counted only as gaps
 (`pid_descendant_gaps`); their calls through attached providers still
 count. A process whose main thread had already exited when the capture
@@ -175,6 +177,19 @@ activation follows in a later packet (disclosed as a `pre-arm subset
 pending` scope gap). An in-place rewrite that preserves `(ino, size, ctime)`
 at the filesystem's granularity is undetectable by the retained-fd checks;
 heavier proof is later work.
+
+Extensive mode (`--track-short-lived`) publishes a `gap_exe_hints`
+split beside `pid_descendant_gaps`, labelled `STATIC HINT`. A hint
+resolves the dead executable's identity only against paths live scans
+already learned: a binary no scan ever saw (no newcomer scan before
+its exit, no surviving same-binary process) classifies `unknown`, as
+does anything past the published budgets (depth 2, 32 objects, 128
+edges, 1 MiB per executable, 64 MiB per capture, 255-byte names).
+`dlopen`-only provider use is invisible by design and reads
+`no_static_link_within_scope`, never a use claim. Inventory captures
+do not arm extensive mode yet, so they publish no split. Hints never
+move call or attribution shares; exit records still settle no birth,
+admission, absence, or call (R57).
 
 ## Planned for later versions
 

@@ -1050,6 +1050,7 @@ fn system_sweep_releases_its_pins() {
         })
         .count();
     let args = crate::cli::CaptureArgs {
+        track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         manifests: vec![],

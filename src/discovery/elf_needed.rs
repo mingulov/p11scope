@@ -16,14 +16,22 @@
 //! `unknown`, never partial-as-complete. Exit records are not receipts
 //! (R57): nothing here settles birth, admission, absence, or calls.
 
+use crate::discovery::identity::PinnedObjects;
+use crate::process::ProcessView;
 use p11scope_ebpf_common::DiscoveryRecord;
 use p11scope_manifest::maps::{Device, ObjectKey};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 
 /// Row D (D-transitive): the executable is depth 0, its `DT_NEEDED`
-/// entries are tested and resolved at depth 1, their entries at depth 2.
-/// Depth-2 entries are tested but never descended into.
+/// names are name-tested and resolved at depth 1, their names at depth 2.
+/// Depth-2 objects are opened, identity-verified, parsed, and
+/// SONAME-checked, but their own names are never examined: a provider
+/// named only past depth 2 is out of scope, and the in-scope set
+/// completes without it.
 pub(crate) const HINT_MAX_DEPTH: u32 = 2;
 /// Row D: at most 32 ELF objects opened and parsed per analysis.
 pub(crate) const HINT_MAX_OBJECTS_PER_ANALYSIS: usize = 32;
@@ -51,7 +59,10 @@ pub(crate) const STATIC_HINT_LABEL: &str = "STATIC HINT";
 /// Row C/D: the scope string published beside every hint split.
 pub(crate) const STATIC_HINT_SCOPE_D_TRANSITIVE: &str = "D-transitive depth=2 objects<=32 edges<=128 exe-bytes<=1MiB capture-bytes<=64MiB names<=255B verdicts<=1024";
 
-/// Row C: the finite per-gap hint classes.
+/// Row C: the finite per-gap hint classes. The publication keys
+/// (`links_provider`, `links_pkcs11_loader`,
+/// `no_static_link_within_scope`, `unknown`) live with the renderer;
+/// analysis compares variants, never strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StaticHint {
     LinksProvider,
@@ -60,22 +71,13 @@ pub(crate) enum StaticHint {
     Unknown,
 }
 
-impl StaticHint {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::LinksProvider => "links_provider",
-            Self::LinksPkcs11Loader => "links_pkcs11_loader",
-            Self::NoStaticLinkWithinScope => "no_static_link_within_scope",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
 /// Row C: per-gap classification counts. The four counts sum to the
 /// analyzed unmatched-exit subpopulation, never to `pid_descendant_gaps`
-/// itself (admissions and overflow sentinels carry no hint).
+/// itself (admissions and overflow sentinels carry no hint). Nominally
+/// `pub` for the `render::Evidence` field; the module stays
+/// `pub(crate)`, so no new nameable public API escapes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct GapExeHints {
+pub struct GapExeHints {
     pub links_provider: u64,
     pub links_pkcs11_loader: u64,
     pub no_static_link_within_scope: u64,
@@ -83,6 +85,9 @@ pub(crate) struct GapExeHints {
 }
 
 impl GapExeHints {
+    /// Test-assertion API: production render emits the four counts, no
+    /// total, so this stays out of non-test builds.
+    #[cfg(test)]
     pub(crate) fn total(self) -> u64 {
         self.links_provider
             .saturating_add(self.links_pkcs11_loader)
@@ -132,14 +137,55 @@ pub(crate) fn kdev_key(dev: u64, ino: u64) -> ObjectKey {
     }
 }
 
+/// Row A scan sink: learn one scanned view's executable `(dev, ino)`
+/// → path pair while its generation pin holds. The readlink and the
+/// `fstat` run inside the same `run_while_same` bracket as the scan's
+/// own exe read, so a reused PID fails the bracket instead of teaching
+/// a wrong pair; the analysis re-verifies on reopen either way.
+/// Silent on every failure: an unlearned binary classifies `unknown`,
+/// never guessed. A free function so scan sites holding
+/// `&self.views[..]` can pass disjoint field borrows.
+pub(crate) fn learn_view_exe(state: &mut ExtensiveState, view: &ProcessView) {
+    if !state.enabled() {
+        return;
+    }
+    let pid = view.pid();
+    let learned = view.run_while_same(|| {
+        let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        let meta = std::fs::metadata(&path).ok()?;
+        let key = cache_key_of_metadata(&meta);
+        Some((key, path))
+    });
+    if let Ok(Some((key, path))) = learned {
+        state.learn_scan_path(key, &path);
+    }
+}
+
+/// The scan-learned cache key for `fstat` metadata: the same
+/// major/minor/inode triple [`kdev_key`] decodes the kernel pair into,
+/// so a recorded pair meets its learned path.
+pub(crate) fn cache_key_of_metadata(meta: &std::fs::Metadata) -> ObjectKey {
+    ObjectKey {
+        device: Device {
+            major: u64::from(libc::major(meta.dev())),
+            minor: u64::from(libc::minor(meta.dev())),
+        },
+        inode: meta.ino(),
+    }
+}
+
 /// One watched provider the Row B name test matches against: the pinned
 /// path plus its SONAME bytes, or the path basename when no SONAME is
 /// known. Snapshot at attach; SONAMEs and basenames are stable across
-/// file replacement, so the snapshot cannot go stale.
+/// file replacement, so the name test cannot go stale. The raw
+/// `(dev, ino)` pair re-verifies the pinned path on every reopen, so an
+/// edge followed into a replaced file voids instead of misreading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WatchedProvider {
     pub path: PathBuf,
     pub soname: Vec<u8>,
+    pub dev: u64,
+    pub ino: u64,
 }
 
 /// A pending exe identity: seeded from an EXEC record, consumed at most
@@ -151,12 +197,14 @@ struct StashedExe {
     dev: u64,
     ino: u64,
     exec_ts_ns: u64,
-    ticket: u64,
 }
 
 /// A cached per-executable verdict with the identity snapshot a hit
 /// must reproduce exactly: same file (dev, ino) and unchanged
 /// size/mtime/ctime, so an in-place modification never serves stale.
+/// Only completed non-`unknown` verdicts are cached: `unknown` means the
+/// in-scope set never completed, and a later scan may learn the missing
+/// path, so an `unknown` is always re-attempted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VerdictEntry {
     hint: StaticHint,
@@ -165,6 +213,32 @@ struct VerdictEntry {
     mtime_nsec: i64,
     ctime_sec: i64,
     ctime_nsec: i64,
+}
+
+/// The raw `(dev, ino)` pair the kernel records for the file behind an
+/// open handle: `fstat` major/minor recombined into the kernel kdev_t
+/// layout plus the inode. Comparing this against the recorded pair is
+/// the same-file proof; the path alone never is.
+fn identity_of(file: &File) -> std::io::Result<(u64, u64)> {
+    let meta = file.metadata()?;
+    let major = u64::from(libc::major(meta.dev()));
+    let minor = u64::from(libc::minor(meta.dev()));
+    Ok(((major << 20) | minor, meta.ino()))
+}
+
+fn snapshot_of(file: &File) -> std::io::Result<(u64, i64, i64, i64, i64)> {
+    let meta = file.metadata()?;
+    Ok((
+        meta.size(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    ))
+}
+
+fn path_basename(path: &Path) -> Option<&[u8]> {
+    path.file_name().map(|name| name.as_bytes())
 }
 
 /// Capture-local extensive-mode state. Everything here is discarded at
@@ -201,7 +275,12 @@ impl ExtensiveState {
     /// Row A: learn one `(dev, ino)` → path pair from a live scan. First
     /// learned wins (bind-mounted aliases reopen the same file, and the
     /// reopen verify decides); inode 0 and a full cache retain nothing.
+    /// Disabled captures learn nothing: the cache is extensive-mode
+    /// scratch, and a wrong early learn would shadow a later right one.
     pub(crate) fn learn_scan_path(&mut self, key: ObjectKey, path: &Path) {
+        if !self.enabled {
+            return;
+        }
         if key.inode == 0 || self.path_cache.contains_key(&key) {
             return;
         }
@@ -211,26 +290,350 @@ impl ExtensiveState {
         self.path_cache.insert(key, path.to_path_buf());
     }
 
-    /// B-RED shell: GREEN seeds the stash from EXEC records.
+    /// Row B: snapshot every pinned object as a watched provider: the
+    /// observer-openable attach path, the SONAME parsed from the pinned
+    /// handle, and the `fstat` identity for reopen verification.
+    /// Degrades gracefully, never fails the capture: an unopenable path
+    /// becomes empty (never a resolve candidate, still name-tested when
+    /// a SONAME parsed), an unreadable handle becomes `(0, 0)` with an
+    /// empty SONAME (basename-tested only, never resolvable). Snapshot
+    /// spans charge the capture byte budget like any examined spans.
+    pub(crate) fn snapshot_watched(&mut self, pinned: &PinnedObjects) {
+        let ids: Vec<_> = pinned.pinned().map(|summary| summary.id).collect();
+        let mut watched = Vec::with_capacity(ids.len());
+        for id in ids {
+            let path = pinned.attach_path_for(id).unwrap_or_default();
+            let (dev, ino, soname) = match pinned.file_for(id) {
+                Some(file) => {
+                    let identity = identity_of(file).unwrap_or((0, 0));
+                    let mut charge = 0u64;
+                    let soname = read_elf_needed(file, &mut charge)
+                        .map(|parsed| parsed.soname.unwrap_or_default())
+                        .unwrap_or_default();
+                    self.capture_bytes_charged = self.capture_bytes_charged.saturating_add(charge);
+                    (identity.0, identity.1, soname)
+                }
+                None => (0, 0, Vec::new()),
+            };
+            watched.push(WatchedProvider {
+                path,
+                soname,
+                dev,
+                ino,
+            });
+        }
+        self.watched = watched;
+    }
+
+    /// Row A: seed one pending exe identity from an EXEC record. The
+    /// stash is never bare-PID addressed: seeding requires the nonzero
+    /// producer ticket, and consumption requires the stash timestamp to
+    /// precede the exit timestamp. A re-exec overwrites (latest wins);
+    /// a full stash evicts the smallest PID first (deterministic).
     pub(crate) fn note_exec_record(&mut self, record: &DiscoveryRecord) {
-        let _ = record;
+        if !self.enabled || record.binding_id == 0 {
+            return;
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        if self.stash.len() >= HINT_MAX_EXE_STASH_ENTRIES && !self.stash.contains_key(&pid) {
+            self.stash.pop_first();
+        }
+        self.stash.insert(
+            pid,
+            StashedExe {
+                dev: record.pointers[0],
+                ino: record.pointers[1],
+                exec_ts_ns: record.hook_ts_ns,
+            },
+        );
     }
 
-    /// B-RED shell: GREEN drops the stash when a PID is admitted.
+    /// An admitted PID's exits match its admission, never a gap, so its
+    /// stash entry is dead. Dropping it also bounds the stash against
+    /// long-lived processes that never gap.
     pub(crate) fn drop_stash_for_pid(&mut self, pid: u32) {
-        let _ = pid;
+        self.stash.remove(&pid);
     }
 
-    /// B-RED shell: GREEN consumes the stash, analyzes, and counts.
+    /// Row C: consume the stash for one novel unmatched exit and count
+    /// exactly one hint. Consume-once: the entry is removed whether or
+    /// not the analysis completes. A missing entry, a reordered entry
+    /// (stash timestamp at or past the exit timestamp), or an absent
+    /// exe pair counts `unknown` without analysis. Disabled captures
+    /// neither consume nor count.
     pub(crate) fn classify_gap(&mut self, record: &DiscoveryRecord) -> StaticHint {
-        let _ = record;
-        StaticHint::Unknown
+        if !self.enabled {
+            return StaticHint::Unknown;
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        let stashed = self.stash.remove(&pid);
+        let hint = match stashed {
+            Some(stashed)
+                if stashed.exec_ts_ns < record.hook_ts_ns
+                    && !ExeIdentity {
+                        dev: stashed.dev,
+                        ino: stashed.ino,
+                    }
+                    .absent() =>
+            {
+                self.analyze_executable(stashed.dev, stashed.ino)
+            }
+            _ => StaticHint::Unknown,
+        };
+        self.hints.count(hint);
+        hint
     }
 
-    /// B-RED shell: GREEN runs the bounded D-transitive analysis.
+    /// Row B/D: run the bounded D-transitive analysis for one recorded
+    /// `(dev, ino)` pair. A spent capture budget refuses before any work
+    /// (no analysis counted); a verdict-cache hit with current same-file
+    /// proof skips the reparse; anything else opens and verifies the
+    /// executable (one analysis counted) and walks it.
     pub(crate) fn analyze_executable(&mut self, dev: u64, ino: u64) -> StaticHint {
-        let _ = (dev, ino);
-        StaticHint::Unknown
+        if !self.enabled || self.capture_bytes_charged >= HINT_MAX_BYTES_PER_CAPTURE {
+            return StaticHint::Unknown;
+        }
+        if let Some(entry) = self.verdicts.get(&(dev, ino)).copied()
+            && entry.hint != StaticHint::Unknown
+            && self.verify_snapshot(dev, ino, &entry)
+        {
+            return entry.hint;
+        }
+        // A stale or non-cacheable entry never serves; drop it so a
+        // voided re-analysis cannot resurrect it.
+        self.verdicts.remove(&(dev, ino));
+        self.analyses_run = self.analyses_run.saturating_add(1);
+        let path = self.path_cache.get(&kdev_key(dev, ino)).cloned();
+        let Some(path) = path else {
+            return StaticHint::Unknown;
+        };
+        let Ok(exe) = File::open(&path) else {
+            return StaticHint::Unknown;
+        };
+        let Ok(identity) = identity_of(&exe) else {
+            return StaticHint::Unknown;
+        };
+        if identity != (dev, ino) {
+            return StaticHint::Unknown;
+        }
+        let pre = snapshot_of(&exe).ok();
+        let hint = self.walk_dependencies(&exe, dev, ino);
+        // Cache only completed non-unknown verdicts, only when the file
+        // did not change mid-analysis, and only while the cache has room
+        // (a full cache serves hits but retains nothing new).
+        if hint != StaticHint::Unknown
+            && let (Some(pre), Ok(post)) = (pre, snapshot_of(&exe))
+            && pre == post
+            && self.verdicts.len() < HINT_MAX_VERDICT_CACHE_ENTRIES
+        {
+            self.verdicts.insert(
+                (dev, ino),
+                VerdictEntry {
+                    hint,
+                    size: pre.0,
+                    mtime_sec: pre.1,
+                    mtime_nsec: pre.2,
+                    ctime_sec: pre.3,
+                    ctime_nsec: pre.4,
+                },
+            );
+        }
+        hint
+    }
+
+    /// Reopen the learned path and demand the recorded identity plus the
+    /// cached size/mtime/ctime snapshot. A hit proves the same unchanged
+    /// file; anything else refuses. The reopen is not a custody grant:
+    /// it supplies no birth, admission, or absence authority.
+    fn verify_snapshot(&self, dev: u64, ino: u64, entry: &VerdictEntry) -> bool {
+        let Some(path) = self.path_cache.get(&kdev_key(dev, ino)) else {
+            return false;
+        };
+        let Ok(file) = File::open(path) else {
+            return false;
+        };
+        let Ok(identity) = identity_of(&file) else {
+            return false;
+        };
+        if identity != (dev, ino) {
+            return false;
+        }
+        snapshot_of(&file).is_ok_and(|snap| {
+            snap.0 == entry.size
+                && snap.1 == entry.mtime_sec
+                && snap.2 == entry.mtime_nsec
+                && snap.3 == entry.ctime_sec
+                && snap.4 == entry.ctime_nsec
+        })
+    }
+
+    /// Row B: the provider name test. A needed name matches a watched
+    /// provider by SONAME when one is known, else by pinned-path
+    /// basename. The test is pure names: no file is opened.
+    fn matches_watched_provider(&self, name: &[u8]) -> bool {
+        self.watched.iter().any(|provider| {
+            if provider.soname.is_empty() {
+                path_basename(&provider.path).is_some_and(|base| base == name)
+            } else {
+                provider.soname == name
+            }
+        })
+    }
+
+    /// Row B: resolve one needed name to an opened, identity-verified,
+    /// parsed dependency. Returns `None` when no candidate survives,
+    /// `Some(None)` when the name resolves to an already-parsed object
+    /// (the edge is charged but no new object is), and `Some(Some)`
+    /// with the fresh parse otherwise. Candidates are basename matches
+    /// over the scan-learned path cache plus the pinned watched paths —
+    /// no RUNPATH, no loader search, no directory walks. Each candidate
+    /// is opened, `fstat`-verified against its learned/pinned identity,
+    /// parsed within budget, and SONAME-checked (a present SONAME must
+    /// equal the needed name); the first candidate to survive all four
+    /// wins, the rest are tried in deterministic order.
+    fn resolve_needed(
+        &self,
+        name: &[u8],
+        charge: &mut u64,
+        visited: &mut BTreeSet<(u64, u64)>,
+    ) -> Option<Option<ElfNeeded>> {
+        let mut candidates: Vec<(PathBuf, (u64, u64))> = Vec::new();
+        for (key, path) in &self.path_cache {
+            if path_basename(path).is_some_and(|base| base == name) {
+                let dev = (key.device.major << 20) | (key.device.minor & 0xfffff);
+                candidates.push((path.clone(), (dev, key.inode)));
+            }
+        }
+        for provider in &self.watched {
+            if path_basename(&provider.path).is_some_and(|base| base == name) {
+                candidates.push((provider.path.clone(), (provider.dev, provider.ino)));
+            }
+        }
+        for (path, identity) in candidates {
+            if visited.contains(&identity) {
+                // Already parsed this analysis: the name is resolved
+                // and re-parsing would double-charge bytes.
+                return Some(None);
+            }
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            let Ok(found) = identity_of(&file) else {
+                continue;
+            };
+            if found != identity {
+                // Path replaced since learning: not the file we knew.
+                continue;
+            }
+            let parsed = match read_elf_needed(&file, charge) {
+                Ok(parsed) => parsed,
+                Err(_) => continue,
+            };
+            if let Some(soname) = parsed.soname.as_deref()
+                && soname != name
+            {
+                continue;
+            }
+            // Marked only after a successful parse: a failed candidate
+            // must not shadow an intact alias with the same identity.
+            visited.insert(identity);
+            return Some(Some(parsed));
+        }
+        None
+    }
+
+    /// Row D: the D-transitive walk. Each level first name-tests every
+    /// edge (charging the edge budget): a provider match returns at
+    /// once, a loader match latches. Untested levels never resolve, so a
+    /// later sibling's provider witness survives an earlier sibling's
+    /// unresolvable name. Then each name resolves: an unresolvable name,
+    /// a blown object budget, or a blown capture budget voids to the
+    /// latched loader hint if the loader chain completed within budget,
+    /// else to `unknown`. A clean walk with no witness is honestly
+    /// negative. Charges (objects, edges, bytes) include duplicates and
+    /// failed parses and are never refunded.
+    fn walk_dependencies(&mut self, exe: &File, dev: u64, ino: u64) -> StaticHint {
+        let mut charge = 0u64;
+        let mut objects = 1usize;
+        let mut edges = 0usize;
+        let mut visited = BTreeSet::from([(dev, ino)]);
+        let exe_parsed = match read_elf_needed(exe, &mut charge) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                self.capture_bytes_charged = self.capture_bytes_charged.saturating_add(charge);
+                return StaticHint::Unknown;
+            }
+        };
+        let mut loader_latched = false;
+        let mut level = vec![exe_parsed];
+        for _depth in 0..HINT_MAX_DEPTH {
+            let mut next = Vec::new();
+            for parsed in &level {
+                for name in &parsed.needed {
+                    edges += 1;
+                    if edges > HINT_MAX_EDGES_PER_ANALYSIS {
+                        self.capture_bytes_charged =
+                            self.capture_bytes_charged.saturating_add(charge);
+                        return Self::latched_or_unknown(loader_latched);
+                    }
+                    if self.matches_watched_provider(name) {
+                        self.capture_bytes_charged =
+                            self.capture_bytes_charged.saturating_add(charge);
+                        return StaticHint::LinksProvider;
+                    }
+                    if name.as_slice() == HINT_LOADER_SONAME {
+                        loader_latched = true;
+                    }
+                }
+            }
+            // Level name-tested with no provider witness: resolve every
+            // edge. Resolution order is deterministic (level order, then
+            // needed order); the first failure voids.
+            for parsed in &level {
+                for name in &parsed.needed {
+                    let Some(resolved) = self.resolve_needed(name, &mut charge, &mut visited)
+                    else {
+                        self.capture_bytes_charged =
+                            self.capture_bytes_charged.saturating_add(charge);
+                        return Self::latched_or_unknown(loader_latched);
+                    };
+                    let Some(resolved) = resolved else {
+                        // Already parsed: the edge was charged, no new
+                        // object followed.
+                        continue;
+                    };
+                    objects += 1;
+                    if objects > HINT_MAX_OBJECTS_PER_ANALYSIS {
+                        self.capture_bytes_charged =
+                            self.capture_bytes_charged.saturating_add(charge);
+                        return Self::latched_or_unknown(loader_latched);
+                    }
+                    if self.capture_bytes_charged.saturating_add(charge)
+                        > HINT_MAX_BYTES_PER_CAPTURE
+                    {
+                        self.capture_bytes_charged =
+                            self.capture_bytes_charged.saturating_add(charge);
+                        return Self::latched_or_unknown(loader_latched);
+                    }
+                    next.push(resolved);
+                }
+            }
+            level = next;
+        }
+        self.capture_bytes_charged = self.capture_bytes_charged.saturating_add(charge);
+        if loader_latched {
+            StaticHint::LinksPkcs11Loader
+        } else {
+            StaticHint::NoStaticLinkWithinScope
+        }
+    }
+
+    fn latched_or_unknown(loader_latched: bool) -> StaticHint {
+        if loader_latched {
+            StaticHint::LinksPkcs11Loader
+        } else {
+            StaticHint::Unknown
+        }
     }
 
     #[cfg(test)]
@@ -275,22 +678,207 @@ pub(crate) enum ElfReadFailure {
     NameTooLong,
 }
 
-/// B-RED shell: GREEN reads one object's bounded ELF spans.
-pub(crate) fn read_elf_needed(
-    file: &std::fs::File,
-    charge: &mut u64,
-) -> Result<ElfNeeded, ElfReadFailure> {
-    let _ = (file, charge);
-    Err(ElfReadFailure::Malformed)
+/// One bounded span read: bytes are charged before the read, so failed
+/// parses still account for the spans they attempted, and no span can
+/// over-allocate past the per-analysis budget.
+struct BoundedReader<'a> {
+    file: &'a File,
+    charge: &'a mut u64,
+}
+
+impl BoundedReader<'_> {
+    fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, ElfReadFailure> {
+        *self.charge = self.charge.saturating_add(len as u64);
+        if *self.charge > HINT_MAX_BYTES_PER_ANALYSIS {
+            return Err(ElfReadFailure::OverBudget);
+        }
+        let mut buf = vec![0u8; len];
+        self.file
+            .read_exact_at(&mut buf, offset)
+            .map_err(|_| ElfReadFailure::Malformed)?;
+        Ok(buf)
+    }
+}
+
+fn le_u16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn le_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn le_u64(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+/// Row B: read one object's `DT_NEEDED` names and optional `DT_SONAME`
+/// through bounded spans (header, program headers, dynamic array,
+/// string table). Every span is charged to the per-analysis budget,
+/// including spans of failed parses. Both 32- and 64-bit little-endian
+/// objects parse; anything else — bad magic, big-endian, truncated
+/// spans, an untranslatable string-table address, an unterminated name —
+/// is `Malformed`. A name longer than 255 bytes is `NameTooLong`. An
+/// object with no program headers or no `PT_DYNAMIC` is honestly empty
+/// (statically linked as far as `DT_NEEDED` shows), not malformed.
+pub(crate) fn read_elf_needed(file: &File, charge: &mut u64) -> Result<ElfNeeded, ElfReadFailure> {
+    let mut reader = BoundedReader { file, charge };
+    let ehdr = reader.read_at(0, 64)?;
+    if ehdr[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return Err(ElfReadFailure::Malformed);
+    }
+    let bits32 = match ehdr[4] {
+        1 => true,
+        2 => false,
+        _ => return Err(ElfReadFailure::Malformed),
+    };
+    if ehdr[5] != 1 {
+        return Err(ElfReadFailure::Malformed);
+    }
+    let (phoff, phentsize, phnum) = if bits32 {
+        (
+            u64::from(le_u32(&ehdr[0x1c..0x20])),
+            usize::from(le_u16(&ehdr[0x2a..0x2c])),
+            le_u16(&ehdr[0x2c..0x2e]),
+        )
+    } else {
+        (
+            le_u64(&ehdr[0x20..0x28]),
+            usize::from(le_u16(&ehdr[0x36..0x38])),
+            le_u16(&ehdr[0x38..0x3a]),
+        )
+    };
+    if phnum == 0 {
+        return Ok(ElfNeeded {
+            needed: Vec::new(),
+            soname: None,
+        });
+    }
+    if phnum == 0xffff {
+        return Err(ElfReadFailure::Malformed);
+    }
+    let min_entsize = if bits32 { 32 } else { 56 };
+    if phentsize < min_entsize {
+        return Err(ElfReadFailure::Malformed);
+    }
+    let phdrs = reader.read_at(phoff, usize::from(phnum) * phentsize)?;
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new();
+    let mut dynamic: Option<(u64, u64)> = None;
+    for index in 0..usize::from(phnum) {
+        let base = index * phentsize;
+        let p_type = le_u32(&phdrs[base..base + 4]);
+        let (p_offset, p_vaddr, p_filesz) = if bits32 {
+            (
+                u64::from(le_u32(&phdrs[base + 4..base + 8])),
+                u64::from(le_u32(&phdrs[base + 8..base + 12])),
+                u64::from(le_u32(&phdrs[base + 16..base + 20])),
+            )
+        } else {
+            (
+                le_u64(&phdrs[base + 8..base + 16]),
+                le_u64(&phdrs[base + 16..base + 24]),
+                le_u64(&phdrs[base + 32..base + 40]),
+            )
+        };
+        if p_type == 1 {
+            loads.push((p_offset, p_vaddr, p_filesz));
+        } else if p_type == 2 && dynamic.is_none() {
+            dynamic = Some((p_offset, p_filesz));
+        }
+    }
+    let Some((dyn_off, dyn_filesz)) = dynamic else {
+        return Ok(ElfNeeded {
+            needed: Vec::new(),
+            soname: None,
+        });
+    };
+    let entsize = if bits32 { 8u64 } else { 16u64 };
+    if dyn_filesz % entsize != 0 {
+        return Err(ElfReadFailure::Malformed);
+    }
+    let dyn_bytes = reader.read_at(dyn_off, dyn_filesz as usize)?;
+    let mut needed_offs: Vec<u64> = Vec::new();
+    let mut soname_off: Option<u64> = None;
+    let mut strtab_vaddr: Option<u64> = None;
+    let mut strsz: Option<u64> = None;
+    for chunk in dyn_bytes.chunks_exact(entsize as usize) {
+        let (tag, val) = if bits32 {
+            (
+                u64::from(le_u32(&chunk[0..4])),
+                u64::from(le_u32(&chunk[4..8])),
+            )
+        } else {
+            (le_u64(&chunk[0..8]), le_u64(&chunk[8..16]))
+        };
+        match tag {
+            0 => break,
+            1 => needed_offs.push(val),
+            5 => strtab_vaddr = Some(val),
+            10 => strsz = Some(val),
+            14 => soname_off = soname_off.or(Some(val)),
+            _ => {}
+        }
+    }
+    if needed_offs.is_empty() && soname_off.is_none() {
+        return Ok(ElfNeeded {
+            needed: Vec::new(),
+            soname: None,
+        });
+    }
+    let (Some(strtab_vaddr), Some(strsz)) = (strtab_vaddr, strsz) else {
+        return Err(ElfReadFailure::Malformed);
+    };
+    let strtab_off = loads
+        .iter()
+        .find(|(_, vaddr, filesz)| {
+            strtab_vaddr >= *vaddr && strtab_vaddr.wrapping_sub(*vaddr) < *filesz
+        })
+        .map(|(offset, vaddr, _)| strtab_vaddr - vaddr + offset);
+    let Some(strtab_off) = strtab_off else {
+        return Err(ElfReadFailure::Malformed);
+    };
+    let strtab = reader.read_at(strtab_off, strsz as usize)?;
+    let mut needed = Vec::with_capacity(needed_offs.len());
+    for off in needed_offs {
+        needed.push(extract_name(&strtab, off)?);
+    }
+    let soname = match soname_off {
+        Some(off) => Some(extract_name(&strtab, off)?),
+        None => None,
+    };
+    Ok(ElfNeeded { needed, soname })
+}
+
+/// Extract one NUL-terminated name at a string-table offset. Offsets past
+/// the table and unterminated tails are malformed; names over 255 bytes
+/// void the analysis on their own.
+fn extract_name(strtab: &[u8], off: u64) -> Result<Vec<u8>, ElfReadFailure> {
+    let off = off as usize;
+    if off >= strtab.len() {
+        return Err(ElfReadFailure::Malformed);
+    }
+    let tail = &strtab[off..];
+    let end = tail.iter().position(|byte| *byte == 0);
+    let Some(end) = end else {
+        return Err(ElfReadFailure::Malformed);
+    };
+    if end > HINT_MAX_NEEDED_NAME_BYTES {
+        return Err(ElfReadFailure::NameTooLong);
+    }
+    Ok(tail[..end].to_vec())
 }
 
 #[cfg(test)]
 pub(crate) mod fixture {
     //! Hand-built minimal ELF fixtures with exact `DT_NEEDED`/`DT_SONAME`
     //! control. No toolchain dependency; every byte is asserted.
+    //!
+    //! (`MetadataExt` arrives via `super::*`; a second explicit import
+    //! would be redundant.)
 
     use super::*;
-    use std::os::unix::fs::MetadataExt as _;
 
     pub(crate) struct ElfSpec {
         pub needed: Vec<Vec<u8>>,
@@ -466,22 +1054,14 @@ pub(crate) mod fixture {
     /// executable at `path`: `fstat` major/minor recombined into the
     /// kernel kdev_t layout.
     pub(crate) fn record_identity_of(path: &Path) -> (u64, u64) {
-        let meta = std::fs::metadata(path).expect("stat ELF fixture");
-        let major = u64::from(libc::major(meta.dev()));
-        let minor = u64::from(libc::minor(meta.dev()));
-        ((major << 20) | minor, meta.ino())
+        let file = std::fs::File::open(path).expect("open ELF fixture");
+        super::identity_of(&file).expect("stat ELF fixture")
     }
 
     /// The scan-learned cache key for the file at `path`.
     pub(crate) fn cache_key_of(path: &Path) -> ObjectKey {
         let meta = std::fs::metadata(path).expect("stat ELF fixture");
-        ObjectKey {
-            device: Device {
-                major: u64::from(libc::major(meta.dev())),
-                minor: u64::from(libc::minor(meta.dev())),
-            },
-            inode: meta.ino(),
-        }
+        super::cache_key_of_metadata(&meta)
     }
 }
 
@@ -491,9 +1071,12 @@ mod tests {
     use super::*;
 
     fn watched(path: &Path, soname: &[u8]) -> WatchedProvider {
+        let (dev, ino) = record_identity_of(path);
         WatchedProvider {
             path: path.to_path_buf(),
             soname: soname.to_vec(),
+            dev,
+            ino,
         }
     }
 
@@ -548,10 +1131,15 @@ mod tests {
     #[test]
     fn learn_scan_path_bounds_cache() {
         let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        // Disabled captures learn nothing (zero footprint when off).
+        let mut off = ExtensiveState::new();
         let key = |inode| ObjectKey {
             device: Device { major: 8, minor: 1 },
             inode,
         };
+        off.learn_scan_path(key(7), Path::new("/z"));
+        assert_eq!(off.path_cache_len_for_test(), 0);
         state.learn_scan_path(key(0), Path::new("/x"));
         assert_eq!(state.path_cache_len_for_test(), 0);
         state.learn_scan_path(key(7), Path::new("/a"));
@@ -594,10 +1182,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut provider_spec = ElfSpec::lib(b"libprov.so.1", &[]);
         provider_spec.bits32 = true;
-        provider_spec.vaddr_bias = 0x8048_000;
+        provider_spec.vaddr_bias = 0x0804_8000;
         let mut exe_spec = ElfSpec::exe(&[b"libprov.so.1"]);
         exe_spec.bits32 = true;
-        exe_spec.vaddr_bias = 0x8048_000;
+        exe_spec.vaddr_bias = 0x0804_8000;
         let provider = write_elf(dir.path(), "libprov.so", &build_elf(&provider_spec));
         let exe = write_elf(dir.path(), "exe32", &build_elf(&exe_spec));
         let (hint, state) = analyzed(

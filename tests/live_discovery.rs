@@ -48,6 +48,7 @@ fn engine_initial_discovery_preserves_plan() {
     let provider = build_and_load_fixture(&fixture_dir());
     let pid = std::process::id();
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: Kind::Profile,
         modules: vec![provider],
         manifests: vec![],

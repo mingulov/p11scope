@@ -9,7 +9,7 @@ use aya::Ebpf;
 use aya::maps::{Array, CgroupArray, HashMap};
 use p11scope_ebpf_common::{
     CFG_FLAGS, FLAG_CGROUP_FILTER, FLAG_PAUSE_ENABLED, FLAG_PID_FILTER, FLAG_POLICY_INVENTORY,
-    FLAG_SYSTEM_FILTER, valid_config, valid_inventory_config,
+    FLAG_SYSTEM_FILTER, FLAG_TRACK_SHORT_LIVED, valid_config, valid_inventory_config,
 };
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -208,8 +208,15 @@ pub(crate) fn publish(
     scope: &Scope,
     policy: CapturePolicy,
     generation_token: Option<u64>,
+    track_short_lived: bool,
 ) -> Result<()> {
-    publish_detailed_with(scope, policy, generation_token, &mut EbpfScopeIo(ebpf))
+    publish_detailed_with(
+        scope,
+        policy,
+        generation_token,
+        track_short_lived,
+        &mut EbpfScopeIo(ebpf),
+    )
 }
 
 pub(crate) fn publish_inventory(ebpf: &mut Ebpf, scope: &Scope) -> Result<()> {
@@ -228,6 +235,7 @@ fn publish_detailed_with(
     scope: &Scope,
     policy: CapturePolicy,
     generation_token: Option<u64>,
+    track_short_lived: bool,
     io: &mut impl ScopePublicationIo,
 ) -> Result<()> {
     if generation_token == Some(0) {
@@ -237,7 +245,14 @@ fn publish_detailed_with(
         bail!("pause generation requires PID scope");
     }
     let pause_flag = generation_token.map_or(0, |_| FLAG_PAUSE_ENABLED);
-    let config = scope_flag(scope) | policy.config_bit() | pause_flag;
+    // 6.14 Option B: extensive mode arms the kernel exe-identity read
+    // on EXEC. Default off; inventory never sets this bit.
+    let extensive_flag = if track_short_lived {
+        FLAG_TRACK_SHORT_LIVED
+    } else {
+        0
+    };
+    let config = scope_flag(scope) | policy.config_bit() | pause_flag | extensive_flag;
     if !valid_config(config) {
         bail!("refusing invalid CONFIG {config:#x}");
     }

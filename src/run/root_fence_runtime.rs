@@ -295,6 +295,7 @@ fn scenario(
     receive(&mut stream, b"READY\n", Instant::now() + TIMEOUT)?;
     let scope = Scope::Pid(pid);
     let args = CaptureArgs {
+        track_short_lived: false,
         kind,
         modules: vec![stage.join("provider.so")],
         manifests: vec![stage.join("provider.json")],

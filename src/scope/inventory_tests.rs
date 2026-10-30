@@ -248,7 +248,7 @@ fn detailed_scope_factoring_preserves_policies_pause_tokens_and_reserved_config_
                 config: [0, 0x1234],
                 ..ScopeMaps::default()
             };
-            publish_detailed_with(&Scope::Pid(101), policy, token, &mut maps).unwrap();
+            publish_detailed_with(&Scope::Pid(101), policy, token, false, &mut maps).unwrap();
             assert_eq!(maps.pids, BTreeMap::from([(101, token.unwrap_or(1))]));
             assert_eq!(
                 maps.config,
@@ -264,8 +264,28 @@ fn detailed_scope_factoring_preserves_policies_pause_tokens_and_reserved_config_
     for (scope, token) in [(Scope::Pid(101), Some(0)), (Scope::System, Some(17))] {
         let mut maps = ScopeMaps::default();
         assert!(
-            publish_detailed_with(&scope, CapturePolicy::Allowlisted, token, &mut maps).is_err()
+            publish_detailed_with(&scope, CapturePolicy::Allowlisted, token, false, &mut maps)
+                .is_err()
         );
         assert!(maps.operations.is_empty());
+    }
+}
+
+#[test]
+fn detailed_scope_track_short_lived_sets_only_the_extensive_bit() {
+    for track in [false, true] {
+        let mut maps = ScopeMaps::default();
+        publish_detailed_with(
+            &Scope::Pid(101),
+            CapturePolicy::Allowlisted,
+            None,
+            track,
+            &mut maps,
+        )
+        .unwrap();
+        let bit = p11scope_ebpf_common::FLAG_TRACK_SHORT_LIVED;
+        assert_eq!(maps.config[0] & bit, if track { bit } else { 0 });
+        assert_eq!(maps.config[0] & !bit, 1 | 4);
+        assert!(p11scope_ebpf_common::valid_config(maps.config[0]));
     }
 }

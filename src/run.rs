@@ -2386,6 +2386,9 @@ fn capture_with_host(
     refuse_if_interrupted_before_attach(&stop)?;
     let mut engine = discovered?;
     engine.retain_return_probe_admission(return_admission);
+    // 6.14 Option B: arm extensive mode before the session publishes
+    // its CONFIG bit; inventory never reaches this flow.
+    engine.arm_extensive(a.track_short_lived);
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     if engine.plan().modules.is_empty() {
@@ -3347,6 +3350,7 @@ fn run_owned_inner_with_host(
     })?;
     let scope = Scope::Pid(pid);
     let capture_args = CaptureArgs {
+        track_short_lived: args.track_short_lived,
         kind: args.kind,
         modules: args.modules.clone(),
         manifests: args.manifests.clone(),
@@ -3379,6 +3383,9 @@ fn run_owned_inner_with_host(
     let out = OutputSink::open(args.kind, args.out.as_deref())
         .map_err(|error| combine_setup_failure(error, &mut child))?;
 
+    // 6.14 Option B: arm extensive mode before the session publishes
+    // its CONFIG bit.
+    engine.arm_extensive(args.track_short_lived);
     // `start_owned_session` arms the pre-exec loader context before the
     // barrier when exact PT_INTERP binding is safe, and otherwise leaves
     // `initial_set_capture = none` with sticky `PARTIAL`.
@@ -8229,6 +8236,9 @@ fn evidence_for(
         object_capture,
         pid_descendant_gaps,
         multi_rebuild_gaps: engine.multi_rebuild_gaps(),
+        // 6.14 Option B: `None` unless extensive mode armed; the JSON
+        // key is then omitted, never null.
+        gap_exe_hints: engine.gap_exe_hints().copied(),
         // Design §5.7: a live-learned attach key is protected only inside a
         // confirmed pause owner's window. A nonzero debug-state hit counter is
         // what says a live window happened at all; the design forbids
@@ -12471,6 +12481,7 @@ mod tests {
 
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {
         RunArgs {
+            track_short_lived: false,
             kind: Kind::Profile,
             modules: Vec::new(),
             manifests: Vec::new(),
@@ -12520,6 +12531,7 @@ mod tests {
 
     fn capture_args(scope: ScopeArg) -> CaptureArgs {
         CaptureArgs {
+            track_short_lived: false,
             kind: Kind::Profile,
             modules: Vec::new(),
             manifests: Vec::new(),

@@ -777,6 +777,19 @@ Limits that matter in pods:
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one
   aggregate document.
+- `--track-short-lived` — profile and `run` (default off): extensive
+  mode. The kernel records the exec-time executable identity (device +
+  inode, no path, argv, or environment) in EXEC records, and each novel
+  unmatched exit gains a bounded static-linkage hint (`gap_exe_hints`
+  beside `pid_descendant_gaps`): does the dead process's executable
+  name a pinned watched provider, or the PKCS#11 loader, within two
+  `DT_NEEDED` steps. A hint is labelled `STATIC HINT`, never a call
+  or verdict, and never moves call/attribution shares. Beside
+  `--trace` the exe words ride the raw EXEC records with no hint
+  analysis; beside `--mode metrics` or exact `--pid` scope the
+  flag is accepted but adds nothing observable (nothing there
+  classifies gaps). Privacy row: `docs/privacy/allowlist-v3.md`
+  (extensive-mode executable dependency hints).
 - `run --trace` — stream one line per completed call (trace semantics) for an
   owned command instead of aggregating a profile.
 - `run --kill-on-timeout` — when `--duration` expires, terminate and reap the

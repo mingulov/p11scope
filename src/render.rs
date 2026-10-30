@@ -3,6 +3,9 @@
 //! that lost information never reads as complete.
 
 use crate::attach::CapturePolicy;
+use crate::discovery::elf_needed::{
+    GapExeHints, STATIC_HINT_LABEL, STATIC_HINT_SCOPE_D_TRANSITIVE,
+};
 use crate::discovery::scan::Skipped;
 use crate::kinds;
 use crate::metrics::{SlotReport, percentile_ns};
@@ -990,6 +993,11 @@ pub struct Evidence {
     pub pid_descendant_gaps: u64,
     #[serde(skip)]
     pub multi_rebuild_gaps: u64,
+    /// 6.14 Option B extensive-mode split of the novel unmatched-exit
+    /// subpopulation, `None` unless armed. Manually serialized beside
+    /// the gap counts; never part of shares or verdicts.
+    #[serde(skip)]
+    pub gap_exe_hints: Option<GapExeHints>,
     /// Whether a live window (design §5.7: a first required attach key learned
     /// from a live loader or export event) went unprotected by a confirmed
     /// pause owner: 0 or 1, inferred as `loader_discovery.hits > 0` and
@@ -2517,6 +2525,22 @@ pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
     );
     object.insert("pid_descendant_gaps".into(), ev.pid_descendant_gaps.into());
     object.insert("multi_rebuild_gaps".into(), ev.multi_rebuild_gaps.into());
+    // 6.14 Option B: present if and only if extensive mode armed. The
+    // label and scope ride every publication (Row C); the counts never
+    // feed shares, verdicts, or completeness.
+    if let Some(hints) = ev.gap_exe_hints {
+        object.insert(
+            "gap_exe_hints".into(),
+            serde_json::json!({
+                "label": STATIC_HINT_LABEL,
+                "scope": STATIC_HINT_SCOPE_D_TRANSITIVE,
+                "links_provider": hints.links_provider,
+                "links_pkcs11_loader": hints.links_pkcs11_loader,
+                "no_static_link_within_scope": hints.no_static_link_within_scope,
+                "unknown": hints.unknown,
+            }),
+        );
+    }
     evidence
 }
 
@@ -3318,6 +3342,7 @@ pub(crate) mod tests {
             object_capture: ObjectCaptureEvidence::for_build(false),
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
+            gap_exe_hints: None,
             unprotected_live_windows: 0,
             module_unresolved_slots: 0,
             provider_changed: false,
@@ -3391,6 +3416,8 @@ pub(crate) mod tests {
         );
         assert_eq!(profile["evidence"]["pid_descendant_gaps"], 0);
         assert_eq!(profile["evidence"]["multi_rebuild_gaps"], 0);
+        // Disarmed: the split key is absent, never null.
+        assert!(profile["evidence"].get("gap_exe_hints").is_none());
 
         let metrics = json(&reports_fixture(), &ev, &capture_fixture());
         assert_eq!(metrics["schema"], "p11scope/observed-profile/v3-metrics");
@@ -3406,6 +3433,38 @@ pub(crate) mod tests {
         ] {
             assert!(metrics["evidence"].get(field).is_none(), "{field}");
         }
+    }
+
+    #[test]
+    fn profile_v3_gap_exe_hints_split_is_exact_when_armed() {
+        let mut ev = evidence();
+        ev.gap_exe_hints = Some(GapExeHints {
+            links_provider: 2,
+            links_pkcs11_loader: 1,
+            no_static_link_within_scope: 4,
+            unknown: 3,
+        });
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["evidence"]["gap_exe_hints"],
+            serde_json::json!({
+                "label": "STATIC HINT",
+                "scope": STATIC_HINT_SCOPE_D_TRANSITIVE,
+                "links_provider": 2,
+                "links_pkcs11_loader": 1,
+                "no_static_link_within_scope": 4,
+                "unknown": 3,
+            })
+        );
+        // The metrics lane embeds `Evidence` directly: profile-only
+        // fields stay absent even when armed.
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        assert!(metrics["evidence"].get("gap_exe_hints").is_none());
     }
 
     #[test]

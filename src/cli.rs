@@ -57,6 +57,10 @@ pub struct CaptureArgs {
     pub allow_confined_uretprobe: bool,
     /// `--attach-backend`: static attach backend; Auto follows the policy.
     pub attach_backend: BackendSelection,
+    /// `--track-short-lived`: extensive mode (6.14 Option B). The kernel
+    /// records exec-time exe identity and the engine classifies novel
+    /// unmatched exits into static-linkage hints. Default off.
+    pub track_short_lived: bool,
 }
 
 /// What `run` is allowed to do to its own child to keep loader discovery from
@@ -104,6 +108,9 @@ pub struct RunArgs {
     /// `--kill-on-timeout`: `--duration` expiry ends the child too, instead of
     /// handing it back still running.
     pub kill_on_timeout: bool,
+    /// `--track-short-lived`: extensive mode (6.14 Option B), same as
+    /// profile. Default off.
+    pub track_short_lived: bool,
     /// Everything after `--`, verbatim — bytes, not text: Linux arguments
     /// need not be UTF-8 (M-9). Never empty.
     pub command: Vec<OsString>,
@@ -393,6 +400,7 @@ usage:
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
+                   [--track-short-lived]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
                    [--max-scan-pids <n>]
@@ -400,7 +408,7 @@ usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--duration <…>]
-                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout]
+                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--track-short-lived]
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
@@ -420,6 +428,9 @@ run starts CMD itself and captures exactly that command; it takes no --pid/--cgr
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--track-short-lived (profile/run, default off) is extensive mode: the kernel records
+exec-time executable identity and unmatched exits classify into STATIC HINT linkage
+classes beside pid_descendant_gaps, never moving call or attribution shares.
 Live capture requires usable uprobe_multi host capability (normally Linux 6.6+;
 working backports qualify by probe), including with --attach-backend singles.
 Offline inspect/diff and inventory --capture scan do not require live capability.
@@ -456,6 +467,7 @@ const PROFILE_HELP: &str = "usage:
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
+                   [--track-short-lived]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
                    [--max-scan-pids <n>]
@@ -472,6 +484,8 @@ scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs
 Aggregate across the selected scope; counts are not per application.
 --mode metrics is the lighter maps-only profile mode; metrics is not a subcommand.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
+--track-short-lived (default off) is extensive mode: the kernel records exec-time
+executable identity and unmatched exits classify into STATIC HINT linkage classes.
 Ctrl-C or SIGTERM ends capture cleanly and writes the final -o report.
 ";
 
@@ -499,7 +513,7 @@ Without --max-events, trace stops at a 10,000,000-event default cap; TRUNCATED n
 /// `p11scope run --help`: scoped syntax, examples and evidence limits.
 const RUN_HELP: &str = "usage:
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--duration <…>]
-                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout]
+                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--track-short-lived]
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
 
@@ -516,6 +530,8 @@ Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
 Profile and metrics counts are aggregate, not per application; --trace selects completed events.
 --pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--track-short-lived (default off) is extensive mode: the kernel records exec-time
+executable identity and unmatched exits classify into STATIC HINT linkage classes.
 ";
 
 /// `p11scope inspect --help`: scoped syntax, examples and evidence limits.
@@ -715,6 +731,7 @@ struct Common {
     drain_interval: Option<Duration>,
     unsafe_requested: bool,
     allow_confined_uretprobe: bool,
+    track_short_lived: bool,
     attach_backend: BackendSelection,
     /// `--attach-backend` is scalar like the rest, but its type has no
     /// unset state, so repeats are tracked separately.
@@ -870,6 +887,7 @@ fn capture_option(
         }
         "--unsafe-unvalidated-metadata" => common.unsafe_requested = true,
         "--allow-uretprobe-on-confined-target" => common.allow_confined_uretprobe = true,
+        "--track-short-lived" => common.track_short_lived = true,
         _ => return Ok(false),
     }
     Ok(true)
@@ -1475,6 +1493,7 @@ pub fn parse_capture(
         unsafe_requested: common.unsafe_requested,
         allow_confined_uretprobe: common.allow_confined_uretprobe,
         attach_backend: common.attach_backend,
+        track_short_lived: common.track_short_lived,
     })
 }
 
@@ -1562,6 +1581,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         pause,
         attach_backend: common.attach_backend,
         kill_on_timeout,
+        track_short_lived: common.track_short_lived,
         command,
     })
 }
@@ -1689,6 +1709,30 @@ mod tests {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    #[test]
+    fn track_short_lived_defaults_off_and_parses_on_profile_and_run() {
+        let Command::Profile(plain) = parse(args(&["profile", "--pid", "4242"])).unwrap() else {
+            panic!("profile must parse");
+        };
+        assert!(!plain.track_short_lived);
+        let Command::Profile(armed) =
+            parse(args(&["profile", "--pid", "4242", "--track-short-lived"])).unwrap()
+        else {
+            panic!("profile --track-short-lived must parse");
+        };
+        assert!(armed.track_short_lived);
+        let Command::Run(run_armed) =
+            parse(args(&["run", "--track-short-lived", "--", "true"])).unwrap()
+        else {
+            panic!("run --track-short-lived must parse");
+        };
+        assert!(run_armed.track_short_lived);
+        let Command::Run(run_plain) = parse(args(&["run", "--", "true"])).unwrap() else {
+            panic!("run must parse");
+        };
+        assert!(!run_plain.track_short_lived);
     }
 
     #[test]
@@ -3826,11 +3870,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        // 7804 / 0x48e22805a6f37227 (packet 6.13): the diff against the
-        // pinned text is exactly the `--prearm-module` profile + inventory
-        // synopsis insertions and the one note line; no other drift. The
-        // pair was validated by reproducing the old pinned pair with the
-        // same FNV-1a extractor.
+        // TEMPORARY (I-12 port re-application): help pin recomputed at the
+        // end of the stack for prearm + extensive insertions combined.
         assert_eq!(USAGE.len(), 7804);
         assert_eq!(hash, 0x48e22805a6f37227);
         assert_eq!(HelpTopic::Global.text(), USAGE);

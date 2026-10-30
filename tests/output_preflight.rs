@@ -34,6 +34,7 @@ fn untrusted_output_is_refused_before_the_discovery_scan() {
     std::fs::set_permissions(&untrusted, std::fs::Permissions::from_mode(0o775)).unwrap();
 
     let args = CaptureArgs {
+        track_short_lived: false,
         kind: Kind::Profile,
         modules: Vec::new(),
         // Poison the discovery scan too: this missing manifest is read inside
@@ -64,6 +65,7 @@ fn untrusted_output_is_refused_before_the_discovery_scan() {
 
 fn poisoned_profile_args(out: PathBuf) -> CaptureArgs {
     CaptureArgs {
+        track_short_lived: false,
         kind: Kind::Profile,
         modules: Vec::new(),
         // Read inside `Engine::discover`: if discovery ran first, the missing

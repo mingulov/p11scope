@@ -1044,7 +1044,7 @@ fn assert_exact_policy_map_metadata_contract(attach: &str) -> Result<(), String>
     require_before(
         attach,
         "validate_policy_maps(&ebpf, object_has_unsafe)",
-        "crate::scope::publish(&mut ebpf, scope, policy, generation_token)",
+        "crate::scope::publish(",
         "exact policy-map metadata before publication",
     )
 }
@@ -1184,8 +1184,9 @@ fn assert_live_discovery_host_contract(
     }
 
     // Both Detailed and counters use one Engine-owned start route. It passes
-    // the same owned-child capability, exact optional counter spec and the
-    // capture's retained return-probe admission into the shared Session factory.
+    // the same owned-child capability, exact optional counter spec, the
+    // capture's retained return-probe admission, and the extensive-mode
+    // flag into the shared Session factory.
     if main.contains("Session::start(")
         || main.contains("Session::start_counter(")
         || main.contains("Session::start_for_capture(")
@@ -1196,7 +1197,7 @@ fn assert_live_discovery_host_contract(
         || engine.contains("Session::start_counter(")
         || engine.matches("Session::start_for_capture(").count() != 1
         || engine
-            .matches("Session::start_for_capture(\n                    plan,\n                    scope,\n                    pinned,\n                    policy,\n                    pause_generation.take(),\n                    ring_bytes,\n                    owned_child,\n                    backend,\n                    counter.as_ref(),\n                    admission.clone(),\n                )")
+            .matches("Session::start_for_capture(\n                    plan,\n                    scope,\n                    pinned,\n                    policy,\n                    pause_generation.take(),\n                    ring_bytes,\n                    owned_child,\n                    backend,\n                    counter.as_ref(),\n                    admission.clone(),\n                    track_short_lived,\n                )")
             .count()
             != 1
         || engine
@@ -1286,7 +1287,7 @@ fn assert_live_discovery_host_contract(
         (
             "SessionPreparation::PublishScope",
             "SessionPreparation::PrepareIdentity",
-            "crate::scope::publish(&mut ebpf",
+            "crate::scope::publish(",
         ),
         (
             "SessionPreparation::PrepareIdentity",
@@ -11968,6 +11969,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         object_capture: p11scope::render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
+        gap_exe_hints: None,
         unprotected_live_windows: 1,
         module_unresolved_slots: 0,
         discovery: DiscoveryEvidence {

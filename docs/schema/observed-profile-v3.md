@@ -200,6 +200,25 @@ overflow increment when the bounded ledger is full. If admission already
 counted the gap, coalescing overflow marks `PARTIAL` without another increment.
 Replays and further unremembered keys do not increment again.
 
+`gap_exe_hints` is present if and only if the capture armed extensive
+mode (`--track-short-lived`); otherwise the key is absent, never null.
+It classifies the novel unmatched-exit subpopulation of
+`pid_descendant_gaps` (admissions and overflow sentinels carry no hint)
+into finite static-linkage classes: `links_provider` (the dead
+executable names a pinned watched provider within two `DT_NEEDED`
+steps), `links_pkcs11_loader` (it names `libp11-kit.so.0`),
+`no_static_link_within_scope` (the in-scope needed set completed with
+neither), and `unknown` (unverifiable or over budget — never a partial
+result presented as complete). Every publication carries
+`"label": "STATIC HINT"` and the scope string
+`"D-transitive depth=2 objects<=32 edges<=128 exe-bytes<=1MiB
+capture-bytes<=64MiB names<=255B verdicts<=1024"`. The four counts are
+saturating u64s summing to the analyzed subpopulation, never to
+`pid_descendant_gaps` itself. Hints are never calls, never verdicts,
+never merged into call or attribution shares, and settle no birth,
+admission, absence, or call (R57). `dlopen`-only provider use is
+invisible by design and reads `no_static_link_within_scope`.
+
 `task_uprobe_link_losses` is a saturating u64 count of matched leader-exit
 records whose retained process generation proved that a member of the process
 group remained live. It is settled from the generation-bound process view, not

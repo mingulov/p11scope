@@ -1158,6 +1158,8 @@ fn start_selected_attempt(
             // Promotion stays Detailed; child counter specs arrive later.
             None,
             None,
+            // A pre-link probe session never arms extensive mode.
+            false,
         )
     })()
     .map_err(SelectedPreparationFailure::before_links)?;

@@ -6465,6 +6465,9 @@ fn discover_plan(
             broad_admit,
             &mut discovered.stage_timings,
         );
+        // 6.14 Option B: the scan observed this generation alive; learn
+        // its executable path whether or not the scan completed.
+        elf_needed::learn_view_exe(&mut discovered.extensive, &view);
         discovered.deep_scans = discovered.deep_scans.saturating_add(1);
         match scan_result {
             Ok((found, pins)) => {
@@ -10742,6 +10745,17 @@ impl Engine {
     /// the split is `None` (key omitted) unless armed.
     pub(crate) fn gap_exe_hints(&self) -> Option<&elf_needed::GapExeHints> {
         self.extensive.enabled().then_some(self.extensive.hints())
+    }
+
+    /// 6.14 Option B: arm extensive mode from `--track-short-lived`
+    /// before the session starts (run flow only; inventory never calls
+    /// this, so its surface is unchanged). Arming snapshots the pinned
+    /// watched providers; the kernel bit publishes with the session.
+    pub(crate) fn arm_extensive(&mut self, track_short_lived: bool) {
+        self.extensive.set_enabled(track_short_lived);
+        if track_short_lived {
+            self.extensive.snapshot_watched(&self.pinned);
+        }
     }
 
     pub(crate) fn multi_rebuild_gaps(&self) -> u64 {
@@ -15234,6 +15248,8 @@ impl Engine {
                 &mut self.stage_timings,
             ),
         };
+        // 6.14 Option B: learn the scanned generation's executable path.
+        elf_needed::learn_view_exe(&mut self.extensive, &self.views[position]);
         self.deep_scans = self.deep_scans.saturating_add(1);
         #[cfg(test)]
         if catchup_authority.is_some()
@@ -20784,6 +20800,8 @@ impl Engine {
                 broad_admit,
                 &mut self.stage_timings,
             );
+            // 6.14 Option B: learn the refreshed generation's executable.
+            elf_needed::learn_view_exe(&mut self.extensive, &self.views[position]);
             self.deep_scans = self.deep_scans.saturating_add(1);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
@@ -21590,6 +21608,8 @@ impl Engine {
             broad_admit,
             &mut self.stage_timings,
         );
+        // 6.14 Option B: learn the probationary generation's executable.
+        elf_needed::learn_view_exe(&mut self.extensive, &view);
         self.deep_scans = self.deep_scans.saturating_add(1);
         let skipped = self.absorb_scan_counters(counters);
         match scan_result {
@@ -21706,6 +21726,8 @@ impl Engine {
                 broad_admit,
                 &mut self.stage_timings,
             );
+            // 6.14 Option B: learn the newcomer's executable path.
+            elf_needed::learn_view_exe(&mut self.extensive, &view);
             self.deep_scans = self.deep_scans.saturating_add(1);
             skipped.extend(self.absorb_scan_counters(counters));
             match scan_result {
@@ -28388,6 +28410,10 @@ impl Engine {
         let named = matches!(retained_scope, Scope::Pid(_));
         let scope = &retained_scope;
         let admission = self.return_probe_admission.clone();
+        // 6.14 Option B: the kernel exe-identity read arms exactly when
+        // the engine armed extensive mode. Hoisted: the closure below
+        // cannot borrow `self` while `start_retained_with` holds it.
+        let track_short_lived = self.extensive.enabled();
         let mut session =
             match start_retained_with(self, named, process::stale_view_ids, |plan, pinned| {
                 Session::start_for_capture(
@@ -28401,6 +28427,7 @@ impl Engine {
                     backend,
                     counter.as_ref(),
                     admission.clone(),
+                    track_short_lived,
                 )
             }) {
                 Ok(session) => session,

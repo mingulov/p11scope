@@ -21,6 +21,7 @@ fn work_dir(name: &str) -> PathBuf {
 
 fn paused_run(pause: PausePolicy, marker: &Path) -> RunArgs {
     RunArgs {
+        track_short_lived: false,
         kind: Kind::Profile,
         modules: Vec::new(),
         manifests: Vec::new(),

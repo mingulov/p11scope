@@ -55,6 +55,7 @@ use crate::inventory_promotion::lifecycle::{
 };
 use crate::inventory_promotion::{PromotionRequest, RequestId};
 use crate::inventory_semantics::AttestedSubset;
+use crate::inventory_semantics::selected::ProvisionalSelectedLane;
 use crate::plan::{AdmissionPolicy, AttachKey, AttachPlan};
 use crate::process::PidPin;
 use crate::semantics_edge::resources::SemanticResourceReserver;
@@ -195,12 +196,14 @@ pub(crate) enum BoundWindow {
 /// The sealed prepared-child identity for one reservation (R2-D2-B):
 /// the original custody, the pre-view baseline, and the required
 /// provider/endpoint coverage the reservation was proved against.
-/// Minted ONLY from a [`PreparationBundle`]: the reserve side seals one
-/// into custody and the worker side carries one in the activation
-/// source, and the bind refuses unless the two agree — so a reservation
-/// for provider A can never bind a prepared child for provider B, even
-/// with an identical original and image. Numeric object ids are never
-/// compared: they are store-local.
+/// Minted ONLY from a [`PreparationBundle`] (reserve and worker sides)
+/// or from the sealed [`ProvisionalSelectedLane`] (delivered side):
+/// the reserve side seals one into custody, the worker side carries
+/// one in the activation source, and the bind refuses unless both the
+/// worker-side and the delivered-lane identities agree with the
+/// reservation — so a reservation for provider A can never bind a
+/// prepared child for provider B, even with an identical original and
+/// image. Numeric object ids are never compared: they are store-local.
 pub(crate) struct PreparedChildReceipt {
     original: Arc<PidPin>,
     baseline: PromotionImageBaseline,
@@ -215,7 +218,26 @@ impl PreparedChildReceipt {
     /// when the subset is not exactly one pinned provider (ambiguous,
     /// empty or unpinned): such a bundle never seals a reservation.
     pub(crate) fn of_bundle(bundle: &PreparationBundle) -> Option<Self> {
-        let convert = bundle.convert_subset();
+        Self::of_parts(
+            bundle.convert_subset(),
+            &bundle.original,
+            &bundle.baseline,
+        )
+    }
+
+    /// Seal the delivered lane's prepared-child identity: the sealed
+    /// original custody, baseline, and conversion envelope the worker
+    /// actually prepared. `None` when the lane's subset is not exactly
+    /// one pinned provider: such a lane never binds.
+    pub(crate) fn of_lane(lane: &ProvisionalSelectedLane) -> Option<Self> {
+        Self::of_parts(lane.convert_subset(), lane.original(), lane.baseline())
+    }
+
+    fn of_parts(
+        convert: &AttestedSubset,
+        original: &Arc<PidPin>,
+        baseline: &PromotionImageBaseline,
+    ) -> Option<Self> {
         if convert.required().len() != 1 {
             return None;
         }
@@ -231,8 +253,8 @@ impl PreparedChildReceipt {
         }
         slots.sort();
         Some(Self {
-            original: Arc::clone(&bundle.original),
-            baseline: bundle.baseline.clone(),
+            original: Arc::clone(original),
+            baseline: baseline.clone(),
             required,
             slots,
         })
@@ -952,22 +974,23 @@ impl GatedActivationSource {
 
     /// Bind validation (R2-D2-B) without the native CAS: takes the
     /// reservation exactly once, binds `expected.generation()`, then
-    /// requires the worker-side prepared child to agree with the
-    /// reservation's sealed identity (same original custody, same
-    /// provider/endpoint coverage), the binding's domain to name the
-    /// presented child session, the binding image's exec to still match
-    /// the pre-view baseline row for the resolved original, and the
-    /// retained child slots to still cover the reserved physical key on
-    /// the same retained object (live file checks). Any mismatch parks
-    /// the window `Unactivated` and refuses WITHOUT running the CAS;
-    /// the lifecycle maps the refusal to its unchanged
-    /// `ActivationFailed` path. Factored out of
-    /// [`NativeActivationSource::activate`] so the full validation
-    /// matrix runs without a live child Session.
+    /// requires the worker-side prepared child AND the actually
+    /// delivered lane to agree with the reservation's sealed identity
+    /// (same original custody, same provider/endpoint coverage), the
+    /// binding's domain to name the presented child session, the
+    /// binding image's exec to still match the pre-view baseline row
+    /// for the resolved original, and the retained child slots to
+    /// still cover the reserved physical key on the same retained
+    /// object (live file checks). Any mismatch parks the window
+    /// `Unactivated` and refuses WITHOUT running the CAS; the
+    /// lifecycle maps the refusal to its unchanged `ActivationFailed`
+    /// path. Factored out of the activation seam so the full
+    /// validation matrix runs without a live child Session.
     pub(crate) fn validate_and_bind(
         &mut self,
         expected: &SelectedActivationBinding,
         child_domain: Option<NativeDomainId>,
+        delivered: &PreparedChildReceipt,
     ) -> Result<CounterDetailWindow, NativeActivationRefusal> {
         // Take the reservation exactly once: a missing reservation
         // (double activation, or a driver that never reserved)
@@ -983,6 +1006,13 @@ impl GatedActivationSource {
         // endpoint coverage): an A-reservation never binds a B-child,
         // even with an identical original and image.
         if !sealed.agrees_with(&self.prepared) {
+            self.park_unactivated(window);
+            return Err(NativeActivationRefusal::BindingMismatch);
+        }
+        // The actually delivered lane must agree with the reservation
+        // too: a reservation for A with a worker-side receipt for A
+        // still refuses when the worker delivered B.
+        if !sealed.agrees_with(delivered) {
             self.park_unactivated(window);
             return Err(NativeActivationRefusal::BindingMismatch);
         }
@@ -1027,12 +1057,42 @@ impl GatedActivationSource {
 impl NativeActivationSource for GatedActivationSource {
     fn activate(
         &mut self,
-        session: &Session,
+        _session: &Session,
         expected: &SelectedActivationBinding,
     ) -> Result<NativeCasReceipt, NativeActivationRefusal> {
+        // Without the sealed delivered lane, the delivered-child
+        // binding cannot be established: refuse fail-closed without a
+        // CAS, parking Unactivated. Production reaches
+        // `activate_with_lane` through the lifecycle service instead.
+        let Some(reserved) = self.custody.take_reserved() else {
+            return Err(NativeActivationRefusal::BindingMismatch);
+        };
+        let (window, _) = reserved.bind_with_receipt(expected.generation());
+        self.park_unactivated(window);
+        Err(NativeActivationRefusal::BindingMismatch)
+    }
+
+    fn activate_with_lane(
+        &mut self,
+        session: &Session,
+        expected: &SelectedActivationBinding,
+        lane: &ProvisionalSelectedLane,
+    ) -> Result<NativeCasReceipt, NativeActivationRefusal> {
+        // Seal the delivered lane's identity from the actual sealed
+        // lane (never from caller-supplied values); a lane that
+        // cannot seal never binds.
+        let Some(delivered) = PreparedChildReceipt::of_lane(lane) else {
+            let Some(reserved) = self.custody.take_reserved() else {
+                return Err(NativeActivationRefusal::BindingMismatch);
+            };
+            let (window, _) = reserved.bind_with_receipt(expected.generation());
+            self.park_unactivated(window);
+            return Err(NativeActivationRefusal::BindingMismatch);
+        };
         // 1. take the reservation + bind the sealed generation +
         //    validate (parks Unactivated on any failure, no CAS).
-        let window = self.validate_and_bind(expected, session.native_domain())?;
+        let window =
+            self.validate_and_bind(expected, session.native_domain(), &delivered)?;
         // 2. delegate the one genuine CAS to the inner minter.
         match self.inner.activate(session, expected) {
             // 3. park Active on success, Unactivated on CAS refusal.
@@ -2383,8 +2443,10 @@ mod tests {
             PreparedChildReceipt::of_bundle(&proved.bundle)
                 .expect("scene seals its prepared child"),
         );
+        let delivered = PreparedChildReceipt::of_bundle(&proved.bundle)
+            .expect("scene seals its prepared child");
         let window = source
-            .validate_and_bind(&expected, Some(domain))
+            .validate_and_bind(&expected, Some(domain), &delivered)
             .expect("sealed binding validates");
         assert_eq!(
             cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
@@ -2747,9 +2809,11 @@ mod tests {
                 PreparedChildReceipt::of_bundle(&proved.bundle)
                     .expect("scene seals its prepared child"),
             );
+            let delivered = PreparedChildReceipt::of_bundle(&proved.bundle)
+                .expect("scene seals its prepared child");
             assert_eq!(
                 source
-                    .validate_and_bind(&expected, child_domain)
+                    .validate_and_bind(&expected, child_domain, &delivered)
                     .unwrap_err(),
                 NativeActivationRefusal::BindingMismatch,
                 "case exec={exec_id:#x} domain={child_domain_case} rewrite={rewrite}"
@@ -2831,8 +2895,10 @@ mod tests {
             PreparedChildReceipt::of_bundle(&proved.bundle)
                 .expect("scene seals its prepared child"),
         );
+        let delivered = PreparedChildReceipt::of_bundle(&proved.bundle)
+            .expect("scene seals its prepared child");
         source
-            .validate_and_bind(&expected, Some(domain))
+            .validate_and_bind(&expected, Some(domain), &delivered)
             .expect("cookie differences do not fail the bind");
     }
 
@@ -4134,11 +4200,14 @@ mod tests {
     #[test]
     fn selected_detail_bind_refuses_reservation_for_other_provider() {
         use crate::inventory_promotion::lifecycle::NativeActivationRefusal;
-        // A reservation for provider A must never bind a prepared child
-        // for provider B, even with identical original custody and
-        // image. Healthy A→A binds; A→B refuses WITHOUT a CAS and
-        // parks Unactivated. Both bundles share one pin so only the
-        // provider/coverage identity distinguishes them.
+        // A reservation for provider A must never bind when the
+        // worker-side receipt names provider B, even with identical
+        // original custody and image. Healthy A→A binds; worker-B
+        // refuses WITHOUT a CAS and parks Unactivated. Both bundles
+        // share one pin so only the provider/coverage identity
+        // distinguishes them. The delivered lane agrees (A) in both
+        // arms, isolating the worker-side check; the delivered-child
+        // twin covers worker-A/delivered-B.
         let pool = test_pool();
         let scene = stage_two_providers(pool);
         let pin = Arc::new(crate::process::PidPin::open(std::process::id()).expect("self pins"));
@@ -4193,8 +4262,10 @@ mod tests {
             PreparedChildReceipt::of_bundle(&proved_a.bundle)
                 .expect("scene seals its prepared child"),
         );
+        let delivered_a = PreparedChildReceipt::of_bundle(&proved_a.bundle)
+            .expect("scene seals its prepared child");
         healthy
-            .validate_and_bind(&expected, Some(domain))
+            .validate_and_bind(&expected, Some(domain), &delivered_a)
             .expect("A-reservation→A-child binds");
         assert_eq!(
             cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
@@ -4222,12 +4293,14 @@ mod tests {
             PreparedChildReceipt::of_bundle(&proved_b.bundle)
                 .expect("scene seals its prepared child"),
         );
+        let delivered_a2 = PreparedChildReceipt::of_bundle(&proved_a.bundle)
+            .expect("scene seals its prepared child");
         assert_eq!(
             mixed
-                .validate_and_bind(&expected, Some(domain))
+                .validate_and_bind(&expected, Some(domain), &delivered_a2)
                 .unwrap_err(),
             NativeActivationRefusal::BindingMismatch,
-            "A-reservation→B-child refuses before the CAS"
+            "A-reservation→worker-B refuses before the CAS"
         );
         assert_eq!(
             cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
@@ -4239,6 +4312,150 @@ mod tests {
             matches!(parked, BoundWindow::Unactivated(_)),
             "a refused bind parks Unactivated, never Active"
         );
+    }
+
+    #[test]
+    fn selected_detail_bind_refuses_delivered_child_for_other_provider() {
+        use crate::inventory_promotion::lifecycle::NativeActivationRefusal;
+        // A reservation for A with a worker-side receipt for A must
+        // still refuse when the actually delivered lane prepared B —
+        // even with identical original custody and image. Healthy
+        // A/A/A binds; A/A/B refuses WITHOUT a CAS, parks
+        // Unactivated, and retains its resources until a genuine
+        // close. Both bundles share one pin so only the
+        // provider/coverage identity distinguishes them.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let pin = Arc::new(crate::process::PidPin::open(std::process::id()).expect("self pins"));
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let convert_b = convert_for(&scene.plan, scene.id_b);
+        let proved_a = promotion_scene_with_pin(
+            Arc::clone(&pin),
+            convert_a,
+            scene.objects.clone(),
+            BTreeMap::from([(scene.id_a, BTreeSet::from([0]))]),
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let proved_b = promotion_scene_with_pin(
+            Arc::clone(&pin),
+            convert_b,
+            scene.objects.clone(),
+            BTreeMap::from([(scene.id_b, BTreeSet::from([0]))]),
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved_a.request,
+            &proved_a.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("A reserves");
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("domain mints");
+        let expected = expected_binding(domain, DETAIL_GENERATION, 0xC00, 0xE9E);
+        let cas_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Healthy control: reservation A, worker A, delivered A binds.
+        let mut healthy = GatedActivationSource::new(
+            Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
+            custody.clone(),
+            PreparedChildReceipt::of_bundle(&proved_a.bundle)
+                .expect("scene seals its prepared child"),
+        );
+        let delivered_a = PreparedChildReceipt::of_bundle(&proved_a.bundle)
+            .expect("scene seals its prepared child");
+        healthy
+            .validate_and_bind(&expected, Some(domain), &delivered_a)
+            .expect("A/A/A binds");
+        assert_eq!(
+            cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "bind validation never attempts the CAS"
+        );
+        // The healthy bind took the reservation; reserve A again, then
+        // deliver B's prepared child under worker-A credentials.
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved_a.request,
+            &proved_a.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("A reserves again");
+        let charged_after_reserve = scene.pool.snapshot().charged_bytes;
+        let mut injected = GatedActivationSource::new(
+            Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
+            custody.clone(),
+            PreparedChildReceipt::of_bundle(&proved_a.bundle)
+                .expect("scene seals its prepared child"),
+        );
+        let delivered_b = PreparedChildReceipt::of_bundle(&proved_b.bundle)
+            .expect("scene seals its prepared child");
+        assert_eq!(
+            injected
+                .validate_and_bind(&expected, Some(domain), &delivered_b)
+                .unwrap_err(),
+            NativeActivationRefusal::BindingMismatch,
+            "A/A/B refuses before the CAS"
+        );
+        assert_eq!(
+            cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused bind never attempts the CAS"
+        );
+        assert_eq!(
+            scene.pool.snapshot().charged_bytes,
+            charged_after_reserve,
+            "a refused bind retains its resources until genuine cleanup"
+        );
+        let parked = custody.take_bound().expect("the refusal parks");
+        let BoundWindow::Unactivated(window) = parked else {
+            panic!("a refused bind parks Unactivated, never Active");
+        };
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 11, 12),
+            window_of(40, 50),
+        );
+        let bracket = CloseBracket::new(SEQ_AFTER, CounterMode::Counts, Some(&after));
+        close_detail_window_on_banks(
+            window,
+            &scene.banks,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            &scene.plan,
+            &bracket,
+        )
+        .expect("Unactivated close delivers lineage");
+        assert!(
+            scene.pool.snapshot().charged_bytes < charged_after_reserve,
+            "genuine close releases the retained charge"
+        );
+        assert!(!custody.is_occupied());
     }
 
     #[test]

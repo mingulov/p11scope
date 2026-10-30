@@ -181,6 +181,22 @@ pub(crate) trait NativeActivationSource: Send {
         session: &Session,
         expected: &SelectedActivationBinding,
     ) -> Result<NativeCasReceipt, NativeActivationRefusal>;
+
+    /// Lane-aware activation for gates that bind the reservation to
+    /// the actually delivered prepared child (R2-D2-B): the service
+    /// passes the sealed lane it just converted, so the gate can
+    /// compare the delivered envelope against its reservation before
+    /// the CAS. The default delegates to [`Self::activate`] for
+    /// sources that need no delivered-child binding (the native
+    /// minter, test stubs).
+    fn activate_with_lane(
+        &mut self,
+        session: &Session,
+        expected: &SelectedActivationBinding,
+        _lane: &ProvisionalSelectedLane,
+    ) -> Result<NativeCasReceipt, NativeActivationRefusal> {
+        self.activate(session, expected)
+    }
 }
 
 /// The native owner's domain-completion proof: Q/drain bounds proved,
@@ -926,10 +942,9 @@ impl SelectedLifecycleService {
             }
             Ok(lane) => {
                 let binding = lane.activation_binding();
-                let receipt = match lane
-                    .live_session()
-                    .map(|session| source.activate(session, &binding))
-                {
+                let receipt = match lane.live_session().map(|session| {
+                    source.activate_with_lane(session, &binding, &lane)
+                }) {
                     Some(Ok(receipt)) => receipt,
                     _ => {
                         drop(capacity);

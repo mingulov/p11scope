@@ -3608,6 +3608,16 @@ fn drive_quantum(
     (facts, position)
 }
 
+/// Feed one admitted call to the S1Only direct twin.
+fn observe_direct(
+    direct: &mut EdgeSemantics,
+    sink: &mut Vec<OperationEffect>,
+    facts: &SemanticCall,
+) {
+    let origin = EffectOrigin::from(facts);
+    direct.observe_with_effects(facts, &origin, sink);
+}
+
 /// G11/H9-§1: Joint async flows through the carve-out: the PENDING
 /// Init stages and seals (queuing S1-side), while the completion —
 /// H8-negative-only, un-ingestable without tainting the image —
@@ -14097,4 +14107,542 @@ fn key_operation_joint_async_pending_mint_then_unbound_completion() {
         .find(|row| row.category == "sign" && row.reason == "unbound")
         .expect("async completion rows unknown-key");
     assert_eq!((row.completed, row.active), (1, 0));
+}
+
+// ==================== 6.07a object/session lifecycles ====================
+// P4 Initialize era rule (owner-approved 2026-10-29) plus lifecycle
+// close-all/finalize/copy/find coverage, each ending in a
+// producer→seal→reducer→projection link proof. Model-only green is
+// not delivery: every test below commits.
+
+/// P4-M5 through producer→seal→reducer→projection: the scene domain
+/// is bootstrapped (live era), so a qualified C_Initialize OK
+/// contradicts — Downgraded joins, UnseenFinalize gap — while the
+/// seal itself succeeds and the commit stays honest.
+#[test]
+fn key_operation_lifecycle_initialize_ok_contradicts_live_era() {
+    use crate::semantics_objects::{Attribution, Lifetime, ObjectGap, SessionState};
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    assert!(joint.has_live_operations(), "the use is live before init");
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    let projection = scene.model.project();
+    assert_eq!(projection.objects.len(), 1);
+    let view = &projection.objects[0];
+    assert_eq!(
+        view.attribution,
+        Attribution::Downgraded(ObjectGap::UnseenFinalize),
+        "duplicate OK downgrades the published join"
+    );
+    assert_eq!(
+        view.lifetime,
+        Lifetime::Retired(ObjectGap::UnseenFinalize),
+        "contradiction retires live continuity"
+    );
+    assert!(
+        projection
+            .sessions
+            .iter()
+            .all(|s| matches!(s.state, SessionState::Ended(ObjectGap::UnseenFinalize))),
+        "live sessions end uncertain"
+    );
+    assert!(
+        projection.gap(ObjectGap::UnseenFinalize) >= 1,
+        "the contradiction is counted"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(committed.status, ObsStatus::Populated);
+    assert_eq!(committed.reason, "none");
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the use row stands");
+    assert_eq!(
+        (row.started, row.active, row.key_join_lost),
+        (1, 0, 1),
+        "the ended binding closes to key_join_lost"
+    );
+    let object = &committed.objects[0];
+    assert_eq!(object.lifetime, "retired");
+    assert_eq!(object.lifetime_reason, Some("unseen_finalize"));
+    assert_eq!(object.attribution, "downgraded");
+    assert_eq!(object.attribution_reason, Some("unseen_finalize"));
+    assert!(
+        committed
+            .gaps
+            .iter()
+            .any(|gap| gap.subject == "model" && gap.reason == "unseen_finalize"),
+        "the gap row survives to the projection"
+    );
+}
+
+/// P4-M4 through the link: ALREADY_INITIALIZED is a benign no-op —
+/// no mint, no end, no void, no contradiction — and P4-M2 argument 0
+/// is never a session: two session words behave identically.
+#[test]
+fn key_operation_lifecycle_initialize_already_is_benign_noop() {
+    use crate::semantics_objects::{Lifetime, ObjectGap, SessionState};
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+    let (facts, _) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    observe_direct(&mut direct, &mut direct_sink, &facts);
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    let (facts, _) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    observe_direct(&mut direct, &mut direct_sink, &facts);
+    let (facts, _) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    observe_direct(&mut direct, &mut direct_sink, &facts);
+    let sessions_before = scene.model.project().sessions.len();
+    for word in [7u64, 8u64] {
+        let mut already =
+            ShapedS1::shaped("C_Initialize", CkRv::CRYPTOKI_ALREADY_INITIALIZED.0, 0, 0);
+        already.session = Some(word);
+        let (facts, _) = drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &already,
+        );
+        observe_direct(&mut direct, &mut direct_sink, &facts);
+    }
+    let projection = scene.model.project();
+    assert_eq!(
+        projection.sessions.len(),
+        sessions_before,
+        "argument 0 never names a session"
+    );
+    assert!(
+        projection
+            .objects
+            .iter()
+            .all(|view| matches!(view.lifetime, Lifetime::Live)),
+        "ALREADY ends nothing"
+    );
+    assert!(
+        projection
+            .sessions
+            .iter()
+            .all(|s| matches!(s.state, SessionState::Live)),
+        "ALREADY closes nothing"
+    );
+    assert_eq!(projection.gap(ObjectGap::UnseenFinalize), 0);
+    assert_s1_equal(&joint, &direct);
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(committed.status, ObsStatus::Populated);
+    assert_eq!(committed.reason, "none");
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the live use stands");
+    assert_eq!(
+        (row.started, row.active, row.key_join_lost),
+        (1, 1, 0),
+        "the use stays live across benign ALREADYs"
+    );
+}
+
+/// Absent-tail copy/find invent nothing: copy reports its unreadable
+/// output, the find sequence stays silent, and a later use still
+/// populates proved rows through the commit.
+#[test]
+fn key_operation_lifecycle_copy_find_absent_tail_invents_nothing() {
+    use crate::semantics_objects::ObjectGap;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    let mut copy = ShapedS1::shaped("C_CopyObject", CkRv::OK.0, 0, 0);
+    copy.input0 = Some((CREATED_KEY, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &copy,
+    );
+    assert_eq!(
+        scene.model.project().objects.len(),
+        1,
+        "an unreadable copy output mints no view"
+    );
+    assert!(
+        scene.model.project().gap(ObjectGap::OutputUnreadable) >= 1,
+        "the missing output is counted, never guessed"
+    );
+    for name in ["C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal"] {
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped(name, CkRv::OK.0, 0, 0),
+        );
+    }
+    assert_eq!(
+        scene.model.project().objects.len(),
+        1,
+        "an absent find tail invents no views"
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(committed.status, ObsStatus::Populated);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the completed use rows proved");
+    assert_eq!(
+        (row.started, row.completed, row.active, row.key_join_lost),
+        (1, 1, 0, 0)
+    );
+    assert!(
+        committed
+            .gaps
+            .iter()
+            .any(|gap| gap.reason == "output_unreadable"),
+        "the copy gap survives to the projection"
+    );
+}
+
+/// 6.07a delivery gate: close-all retires uncertain, a successful
+/// finalize ends the era (the seal fails DomainEnded fail-closed and
+/// held staging keeps S1 conserved), a failed finalize keeps
+/// state, and the unlinked lane twin reports journal_unavailable —
+/// with status/reason/row/bucket behavior committed at every stage.
+#[test]
+fn key_operation_lifecycle_close_all_finalize_commit_link() {
+    use crate::key_operation_projection::producer::commit_with_journal_linked;
+    use crate::semantics_objects::{Lifetime, ObjectGap, SessionState};
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+    // Stage 1: a healthy use populates proved rows.
+    let (facts, _) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    observe_direct(&mut direct, &mut direct_sink, &facts);
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    let (facts, _) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    observe_direct(&mut direct, &mut direct_sink, &facts);
+    let (facts, _) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    observe_direct(&mut direct, &mut direct_sink, &facts);
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (committed.status, committed.reason),
+        (ObsStatus::Populated, "none")
+    );
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("stage 1 rows the live use");
+    assert_eq!((row.started, row.active), (1, 1));
+    assert_eq!(committed.budgets.key_occupied, 1);
+    assert_eq!(committed.objects.len(), 1);
+    assert_eq!(committed.objects[0].lifetime, "live");
+    // Stage 2: close-all over unknown seal scopes retires uncertain.
+    let (facts, _) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CloseAllSessions", CkRv::OK.0, 0, 0),
+    );
+    observe_direct(&mut direct, &mut direct_sink, &facts);
+    assert_s1_equal(&joint, &direct);
+    let projection = scene.model.project();
+    assert!(
+        projection.objects.iter().all(|view| matches!(
+            view.lifetime,
+            Lifetime::Retired(ObjectGap::CloseAllUncertain)
+        )),
+        "uncertain close-all retires, never destroys"
+    );
+    assert!(
+        projection
+            .sessions
+            .iter()
+            .all(|s| matches!(s.state, SessionState::Ended(ObjectGap::CloseAllUncertain)))
+    );
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (committed.status, committed.reason),
+        (ObsStatus::Populated, "none")
+    );
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("stage 2 keeps the use row");
+    assert_eq!((row.active, row.key_join_lost), (0, 1));
+    assert_eq!(committed.objects[0].lifetime, "retired");
+    assert_eq!(
+        committed.objects[0].lifetime_reason,
+        Some("close_all_uncertain")
+    );
+    // Stage 3: a successful finalize ends the era. The seal fails
+    // DomainEnded fail-closed; the model already applied the era end
+    // inside the refused settle, and the Unqualified failure scope
+    // holds staging (Ignored) instead of replaying a second end.
+    let (_facts, _) = prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_Finalize", CkRv::OK.0, 0, 0),
+    );
+    let failure = scene.seal().expect_err("era end fails the seal");
+    assert_eq!(failure.gap, JournalGap::DomainEnded);
+    assert!(
+        failure.effects.effects.iter().any(|effect| matches!(
+            effect,
+            crate::semantics_objects::ObjectEffect::AccessEnded { .. }
+        )),
+        "the era end effects ride the failure"
+    );
+    let mut clean_source = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, refused) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut clean_source,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert_eq!(refused, 0);
+    assert_eq!(
+        outcome,
+        FailureApplyOutcome::Ignored,
+        "Unqualified scope holds staging intact"
+    );
+    assert_eq!(
+        staging.mode(),
+        FeedMode::Joint,
+        "the held feed never falls back"
+    );
+    // The finalize fact stays staged, never reduced: the S1 twin
+    // agrees without it, and S1 loses nothing it ever held.
+    assert_s1_equal(&joint, &direct);
+    let projection = scene.model.project();
+    assert!(
+        projection
+            .objects
+            .iter()
+            .all(|view| matches!(view.lifetime, Lifetime::AccessEnded(ObjectGap::Finalize))),
+        "finalize ends every view with its own reason"
+    );
+    let committed = commit(3, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (committed.status, committed.reason),
+        (ObsStatus::Populated, "none"),
+        "the held feed still commits the ended era honestly"
+    );
+    assert_eq!(committed.objects[0].lifetime, "access_ended");
+    assert_eq!(committed.objects[0].lifetime_reason, Some("finalize"));
+    // Stage 4: a failed finalize keeps state (twin scene).
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Finalize", CkRv::FUNCTION_FAILED.0, 0, 0),
+    );
+    assert!(joint.has_live_operations(), "failed finalize keeps S1 live");
+    let committed = commit(4, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (committed.status, committed.reason),
+        (ObsStatus::Populated, "none")
+    );
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("failed finalize keeps the live use");
+    assert_eq!((row.started, row.active, row.key_join_lost), (1, 1, 0));
+    assert_eq!(committed.objects[0].lifetime, "live");
+    // Stage 5: the same populated model through an unlinked lane
+    // reports journal_unavailable — rows in memory are not delivery.
+    let s1only = JointStaging::select_s1_only();
+    let unlinked =
+        commit_with_journal_linked(5, &[&s1only], &scene.model.project(), &keyuse, false);
+    assert_eq!(unlinked.status, ObsStatus::Unavailable);
+    assert_eq!(unlinked.reason, "journal_unavailable");
+    assert_eq!(unlinked.objects.len(), 1, "rows stay while status refuses");
 }

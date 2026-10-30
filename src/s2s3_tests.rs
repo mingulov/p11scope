@@ -4196,3 +4196,239 @@ fn s2s3_bounded_state_and_redaction_domain_with_pending_ticket_is_kept() {
         "the held domain still joins"
     );
 }
+
+// ---------------------------------------------------------------------------
+// initialize_era (6.07a P4: owner-approved 2026-10-29, merged P4-M1…M6)
+// ---------------------------------------------------------------------------
+
+fn init_call() -> Call {
+    call("C_Initialize")
+}
+
+#[test]
+fn s2s3_initialize_first_mint_qualifies_follow_ons() {
+    // P4-M3 case (i): a qualified OK on a held, never-bootstrapped,
+    // unended domain mints the era; later begins qualify.
+    let mut h = Hist::unqualified();
+    let init = h.run(1, init_call(), 2, ok());
+    let effects = h.settle(2);
+    assert!(
+        unresolved(&effects, init).is_none(),
+        "the mint publishes no refusal"
+    );
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let effects = h.settle(4);
+    let id = created(&effects, x, 0).expect("post-mint creation qualifies");
+    assert_eq!(view(&h.project(), id).lifetime, Lifetime::Live);
+    // Twin: without the Initialize, the same creation stays unproven.
+    let mut h = Hist::unqualified();
+    let x = h.run(1, create(SA), 2, ok().result(0, H1));
+    let effects = h.settle(2);
+    assert_eq!(created(&effects, x, 0), None);
+    assert_eq!(unresolved(&effects, x), Some(ObjectGap::BootstrapUnproven));
+}
+
+#[test]
+fn s2s3_initialize_already_is_benign_noop() {
+    // P4-M4: ALREADY_INITIALIZED confirms the live era — no mint, no
+    // end, no void, no contradiction.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    h.run(5, init_call(), 6, rv(CkRv::CRYPTOKI_ALREADY_INITIALIZED));
+    let effects = h.settle(6);
+    let id = created(&effects, x, 0).unwrap();
+    let p = h.project();
+    assert_eq!(view(&p, id).lifetime, Lifetime::Live);
+    assert!(p.sessions.iter().any(|s| s.state == SessionState::Live));
+    assert!(
+        effects.effects.iter().all(|effect| !matches!(
+            effect,
+            ObjectEffect::Downgraded { .. }
+                | ObjectEffect::Unresolved { .. }
+                | ObjectEffect::Gap { .. }
+        )),
+        "ALREADY disturbs nothing"
+    );
+    // ... and mints nothing on a pristine domain.
+    let mut h = Hist::unqualified();
+    h.run(1, init_call(), 2, rv(CkRv::CRYPTOKI_ALREADY_INITIALIZED));
+    h.settle(2);
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let effects = h.settle(4);
+    assert_eq!(created(&effects, x, 0), None, "ALREADY mints no era");
+}
+
+#[test]
+fn s2s3_initialize_failed_reinit_mints_nothing() {
+    // P4-M4: a failed Initialize on a fresh era domain mints nothing.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    h.run(3, call("C_Finalize"), 4, ok());
+    h.settle(4);
+    let era = h.add_domain(ObjectDomain::reference(1, 1, 1, 1, 2), false);
+    h.run_in(era, 1, init_call(), 2, rv(CkRv::FUNCTION_FAILED));
+    h.settle_in(era, 2);
+    let x = h.run_in(era, 3, create(SA), 4, ok().result(0, H1));
+    let effects = h.settle_in(era, 4);
+    assert_eq!(
+        created(&effects, x, 0),
+        None,
+        "failed re-init mints nothing"
+    );
+    assert_eq!(unresolved(&effects, x), Some(ObjectGap::BootstrapUnproven));
+}
+
+#[test]
+fn s2s3_initialize_finalize_reinit_split() {
+    // P4-M3 case (ii): post-Finalize, a qualified OK on the fresh
+    // sealed era domain mints the new era; handle-value reuse across
+    // eras never merges identities.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    h.run(5, call("C_Finalize"), 6, ok());
+    let effects = h.settle(6);
+    let old = created(&effects, x, 0).unwrap();
+    assert_eq!(
+        view(&h.project(), old).lifetime,
+        Lifetime::AccessEnded(ObjectGap::Finalize)
+    );
+    let era = h.add_domain(ObjectDomain::reference(1, 1, 1, 1, 2), false);
+    h.run_in(era, 1, init_call(), 2, ok());
+    h.settle_in(era, 2);
+    h.run_in(era, 3, open_in(slot(SLOT1)), 4, ok().session_out(SA));
+    let y = h.run_in(era, 5, create(SA), 6, ok().result(0, H1));
+    let effects = h.settle_in(era, 6);
+    let new = created(&effects, y, 0).expect("re-init mint qualifies the new era");
+    assert_ne!(new, old, "handle-value reuse across eras never merges");
+    assert_eq!(
+        view(&h.project(), new).origin,
+        ViewOrigin::Created(CreationFamily::Create)
+    );
+    assert_eq!(
+        h.try_begin_in(0, 7, create(SA)),
+        Err(ObjectGap::DomainEnded),
+        "the ended era stays ended: no resurrection"
+    );
+}
+
+#[test]
+fn s2s3_initialize_duplicate_ok_contradicts() {
+    // P4-M5: a qualified OK while the era is live contradicts — a
+    // conforming provider answers ALREADY there, so OK evidences an
+    // unseen Finalize or a nonconforming provider.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let before = h.settle(4);
+    let id = created(&before, x, 0).unwrap();
+    h.run(5, init_call(), 6, ok());
+    let effects = h.settle(6);
+    assert!(effects.effects.contains(&ObjectEffect::Downgraded {
+        object: id,
+        reason: ObjectGap::UnseenFinalize
+    }));
+    assert!(h.project().gap(ObjectGap::UnseenFinalize) >= 1);
+    // Post-contradiction proof needs a new bootstrap above the fence.
+    let y = h.run(7, create(SA), 8, ok().result(0, H2));
+    let effects = h.settle(8);
+    assert_eq!(created(&effects, y, 0), None);
+    assert_eq!(unresolved(&effects, y), Some(ObjectGap::BootstrapUnproven));
+}
+
+#[test]
+fn s2s3_initialize_concurrent_oks_first_mints_second_contradicts() {
+    // P4-M5: cut-order-first mints; the concurrent second OK — exempt
+    // from mint fencing as a fellow Initialize — then contradicts on
+    // the post-mint live era.
+    let mut h = Hist::unqualified();
+    let first = h.begin(1, init_call());
+    let second = h.begin(2, init_call());
+    h.done(first, 4, ok());
+    h.done(second, 5, ok());
+    let effects = h.settle(5);
+    assert!(
+        h.project().gap(ObjectGap::UnseenFinalize) >= 1,
+        "the second OK contradicts"
+    );
+    assert!(
+        !effects
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ObjectEffect::Downgraded { .. })),
+        "a pristine domain has no joins to downgrade"
+    );
+    // The contradiction voided the mint: follow-ons stay unproven.
+    let x = h.run(6, create(SA), 7, ok().result(0, H1));
+    let effects = h.settle(7);
+    assert_eq!(created(&effects, x, 0), None);
+}
+
+#[test]
+fn s2s3_initialize_straddler_fenced_publishes_nothing() {
+    // P4-M3: pending/straddling calls are fenced at the mint; their
+    // pre-split snapshots never publish across it.
+    let mut h = Hist::unqualified();
+    let init = h.begin(1, init_call());
+    let straddler = h.begin(2, create(SA));
+    h.done(init, 4, ok());
+    h.done(straddler, 5, ok().result(0, H1));
+    let effects = h.settle(5);
+    assert_eq!(
+        created(&effects, straddler, 0),
+        None,
+        "the straddler publishes nothing"
+    );
+    assert_eq!(
+        unresolved(&effects, straddler),
+        None,
+        "a fenced end replays nothing, not even a gap"
+    );
+    // The era itself is live for post-split begins.
+    let x = h.run(6, create(SA), 7, ok().result(0, H2));
+    let effects = h.settle(7);
+    assert!(
+        created(&effects, x, 0).is_some(),
+        "post-split begins qualify"
+    );
+}
+
+#[test]
+fn s2s3_initialize_pending_mints_nothing() {
+    // P4-M4: PENDING (Initialize is synchronous) mints nothing.
+    let mut h = Hist::unqualified();
+    h.run(1, init_call(), 2, rv(CkRv::PENDING));
+    h.settle(2);
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let effects = h.settle(4);
+    assert_eq!(created(&effects, x, 0), None, "PENDING mints nothing");
+    assert_eq!(unresolved(&effects, x), Some(ObjectGap::BootstrapUnproven));
+}
+
+#[test]
+fn s2s3_initialize_late_completion_after_finalize_is_stale() {
+    // P4-M6: a pre-finalize Initialize completion arriving after the
+    // era ended is a stale token and cannot join (no mint).
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    h.settle(4);
+    let init = h.begin(5, init_call());
+    h.run(6, call("C_Finalize"), 7, ok());
+    let effects = h.settle(7);
+    let id = created(&effects, x, 0).unwrap();
+    assert_eq!(
+        view(&h.project(), id).lifetime,
+        Lifetime::AccessEnded(ObjectGap::Finalize)
+    );
+    let late = h.done(init, 8, ok());
+    assert!(late.effects.contains(&ObjectEffect::Gap {
+        reason: ObjectGap::StaleToken
+    }));
+    assert_eq!(
+        view(&h.project(), id).lifetime,
+        Lifetime::AccessEnded(ObjectGap::Finalize),
+        "no resurrection"
+    );
+}

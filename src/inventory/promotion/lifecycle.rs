@@ -942,9 +942,10 @@ impl SelectedLifecycleService {
             }
             Ok(lane) => {
                 let binding = lane.activation_binding();
-                let receipt = match lane.live_session().map(|session| {
-                    source.activate_with_lane(session, &binding, &lane)
-                }) {
+                let receipt = match lane
+                    .live_session()
+                    .map(|session| source.activate_with_lane(session, &binding, &lane))
+                {
                     Some(Ok(receipt)) => receipt,
                     _ => {
                         drop(capacity);

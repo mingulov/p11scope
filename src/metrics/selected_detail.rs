@@ -218,11 +218,7 @@ impl PreparedChildReceipt {
     /// when the subset is not exactly one pinned provider (ambiguous,
     /// empty or unpinned): such a bundle never seals a reservation.
     pub(crate) fn of_bundle(bundle: &PreparationBundle) -> Option<Self> {
-        Self::of_parts(
-            bundle.convert_subset(),
-            &bundle.original,
-            &bundle.baseline,
-        )
+        Self::of_parts(bundle.convert_subset(), &bundle.original, &bundle.baseline)
     }
 
     /// Seal the delivered lane's prepared-child identity: the sealed
@@ -654,7 +650,11 @@ pub(super) fn accept_before_bracket(
         }
         CounterObservation::Advanced { deltas, .. } => {
             *seq = assigned;
-            Ok(accepted_receipt(&brackets.collector, assigned, Some(deltas)))
+            Ok(accepted_receipt(
+                &brackets.collector,
+                assigned,
+                Some(deltas),
+            ))
         }
         CounterObservation::ReadFailed(stage) => Err(read_stage_refusal(stage)),
         CounterObservation::Unavailable(_) => Err(SelectedDetailRefusal::BroadPlanTopology),
@@ -1123,8 +1123,7 @@ impl NativeActivationSource for GatedActivationSource {
         };
         // 1. take the reservation + bind the sealed generation +
         //    validate (parks Unactivated on any failure, no CAS).
-        let window =
-            self.validate_and_bind(expected, session.native_domain(), &delivered)?;
+        let window = self.validate_and_bind(expected, session.native_domain(), &delivered)?;
         // 2. delegate the one genuine CAS to the inner minter.
         match self.inner.activate(session, expected) {
             // 3. park Active on success, Unactivated on CAS refusal.
@@ -4908,8 +4907,7 @@ mod tests {
             window_of(20, 30),
         );
         assert_eq!(
-            accept_before_bracket(&mut brackets, Ok(r1), &scene.plan, brgen, &mut seq)
-                .unwrap_err(),
+            accept_before_bracket(&mut brackets, Ok(r1), &scene.plan, brgen, &mut seq).unwrap_err(),
             SelectedDetailRefusal::BroadPlanTopology,
             "healthy after unhealthy in one generation stays unavailable"
         );
@@ -4948,8 +4946,14 @@ mod tests {
             window_of(30, 40),
         );
         assert_eq!(
-            accept_before_bracket(&mut diff_brackets, Ok(short), &scene.plan, brgen, &mut diff_seq)
-                .unwrap_err(),
+            accept_before_bracket(
+                &mut diff_brackets,
+                Ok(short),
+                &scene.plan,
+                brgen,
+                &mut diff_seq
+            )
+            .unwrap_err(),
             SelectedDetailRefusal::BroadPlanTopology
         );
         assert_eq!(
@@ -5406,8 +5410,7 @@ mod tests {
             window_of(20, 30),
         );
         assert_eq!(
-            accept_before_bracket(&mut brackets, Ok(r1), &scene.plan, brgen, &mut seq)
-                .unwrap_err(),
+            accept_before_bracket(&mut brackets, Ok(r1), &scene.plan, brgen, &mut seq).unwrap_err(),
             SelectedDetailRefusal::BroadPlanTopology,
             "a latched-out acquisition mints no receipt"
         );
@@ -5473,6 +5476,9 @@ mod tests {
         let (verdict, preserved) =
             map_after_acceptance(AfterBracketAcceptance::Mismatched("rejected"));
         assert_eq!(verdict, CloseBracketVerdict::Mismatched("rejected"));
-        assert!(preserved.is_none(), "no receipt is fabricated for rejection");
+        assert!(
+            preserved.is_none(),
+            "no receipt is fabricated for rejection"
+        );
     }
 }

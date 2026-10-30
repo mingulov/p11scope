@@ -2394,8 +2394,15 @@ fn capture_with_host(
     engine.retain_return_probe_admission(return_admission);
     // 6.14 Option B: arm extensive mode before the session publishes
     // its CONFIG bit; inventory never reaches this flow. Counter
-    // policies never arm (the CLI combination already refused).
-    engine.arm_extensive(a.track_short_lived && policy.allows_track_short_lived());
+    // policies never arm (the CLI combination already refused), and
+    // neither do captures that cannot publish hints (614b P1).
+    engine.arm_extensive(extensive_effective(
+        a.track_short_lived,
+        kind,
+        a.metrics,
+        &scope,
+        policy,
+    ));
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     if engine.plan().modules.is_empty() {
@@ -2467,6 +2474,26 @@ fn no_profile_duration_notice() -> String {
     "p11scope: no --duration given; profile captures until interrupted (Ctrl-C) or the \
      process exits"
         .to_string()
+}
+
+/// 614b P1 narrow authorization: whether `--track-short-lived`
+/// actually arms the kernel exe-identity read for this capture. The
+/// read is granted only where the resulting STATIC HINT split can
+/// publish: a Detailed (non-counter) profile-kind, non-metrics
+/// capture over a generation-admitting scope (cgroup/system), the
+/// only shape that classifies descendant gaps. Everywhere else the
+/// flag stays accepted but records nothing — no exe identity is
+/// captured for a counter, trace, metrics, exact-PID or owned-`run`
+/// capture, where no hint could ever be published.
+pub(crate) fn extensive_effective(
+    track_short_lived: bool,
+    kind: Kind,
+    metrics: bool,
+    scope: &Scope,
+    policy: CapturePolicy,
+) -> bool {
+    let _ = (kind, metrics, scope);
+    track_short_lived && policy.allows_track_short_lived()
 }
 
 pub(crate) fn capture_policy(
@@ -3404,8 +3431,16 @@ fn run_owned_inner_with_host(
 
     // 6.14 Option B: arm extensive mode before the session publishes
     // its CONFIG bit. Counter policies never arm (the CLI
-    // combination already refused).
-    engine.arm_extensive(args.track_short_lived && policy.allows_track_short_lived());
+    // combination already refused), and neither do captures that
+    // cannot publish hints (614b P1): an owned `run` is an exact-PID
+    // scope, which never classifies descendant gaps.
+    engine.arm_extensive(extensive_effective(
+        args.track_short_lived,
+        args.kind,
+        args.metrics,
+        &scope,
+        policy,
+    ));
     // `start_owned_session` arms the pre-exec loader context before the
     // barrier when exact PT_INTERP binding is safe, and otherwise leaves
     // `initial_set_capture = none` with sticky `PARTIAL`.
@@ -12897,6 +12932,79 @@ mod tests {
             capture_policy(Kind::Trace, false, false, None, true).unwrap(),
             CapturePolicy::Allowlisted
         );
+    }
+
+    // 614b P1 narrow authorization: the exe-identity read arms only
+    // where the STATIC HINT split can publish — Detailed profile-kind,
+    // non-metrics captures over generation-admitting scopes. Trace,
+    // metrics, exact-PID and counter captures accept the flag but must
+    // record no exe identity: capture without a possible consumer is
+    // outside the grant.
+    #[test]
+    fn extensive_arms_only_on_hint_publishing_captures() {
+        let cgroup = Scope::Cgroup {
+            id: 1,
+            path: "/".into(),
+            dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+        };
+        let detailed = CapturePolicy::Allowlisted;
+        // The publishing shape arms, on either admitting scope.
+        assert!(extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &cgroup,
+            detailed
+        ));
+        assert!(extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &Scope::System,
+            detailed
+        ));
+        // Default off stays off everywhere.
+        assert!(!extensive_effective(
+            false,
+            Kind::Profile,
+            false,
+            &cgroup,
+            detailed
+        ));
+        // Trace publishes no profile evidence: never arm.
+        assert!(!extensive_effective(
+            true,
+            Kind::Trace,
+            false,
+            &cgroup,
+            detailed
+        ));
+        // Metrics renders no hint split: never arm.
+        assert!(!extensive_effective(
+            true,
+            Kind::Profile,
+            true,
+            &cgroup,
+            CapturePolicy::AggregateOnly
+        ));
+        // Exact-PID scope classifies no descendant gaps: never arm.
+        // (An owned `run` is this shape.)
+        assert!(!extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &Scope::Pid(41),
+            detailed
+        ));
+        // P2#2 confinement still holds inside the helper: a counter
+        // policy never arms, whatever the other inputs.
+        assert!(!extensive_effective(
+            true,
+            Kind::Profile,
+            false,
+            &cgroup,
+            CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Counts)
+        ));
     }
 
     #[test]

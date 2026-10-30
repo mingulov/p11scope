@@ -54928,3 +54928,27 @@ fn gap_exe_identity_shares_unchanged_twin() {
     assert_eq!(armed.gap_exe_hints().unwrap().total(), 1);
     assert!(plain.gap_exe_hints().is_none());
 }
+
+// 614b P1 narrow authorization, engine layer: `arm_extensive` itself
+// refuses to enable on a scope that never classifies descendant
+// gaps, so no future caller can arm the exe-identity read (or retain
+// its stash/caches) for an exact-PID capture. A generation-admitting
+// scope arms exactly as before.
+#[test]
+fn extensive_arm_requires_generation_admitting_scope() {
+    let mut pid_engine = Engine::empty();
+    pid_engine.arm_extensive(true);
+    assert!(
+        pid_engine.gap_exe_hints().is_none(),
+        "exact-PID scope must not arm extensive mode"
+    );
+    let pid = std::process::id();
+    let (mut cgroup_engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    cgroup_engine.arm_extensive(true);
+    assert!(
+        cgroup_engine.gap_exe_hints().is_some(),
+        "cgroup scope arms extensive mode"
+    );
+    cgroup_engine.arm_extensive(false);
+    assert!(cgroup_engine.gap_exe_hints().is_none());
+}

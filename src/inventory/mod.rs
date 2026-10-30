@@ -7183,17 +7183,13 @@ fn caller_json(
     metadata: &crate::caller_metadata::runtime::MetadataFrame,
 ) -> serde_json::Value {
     let record = caller;
-    // RED: numeric rendering through the RED-only escape (the leak the null
-    // twin rejects); GREEN emits null for both authority variants.
+    // Private native image values never render: the schema requires a new
+    // allowlist row for non-null values, so both authority variants emit
+    // null snapshot keys.
     let (task_cookie, exec_id) = match record.authority {
-        ImageAuthority::NativeExact { image } => {
-            let (task_cookie, exec_id) = image.red_raw();
-            (
-                serde_json::Value::from(task_cookie),
-                serde_json::Value::from(exec_id),
-            )
+        ImageAuthority::NativeExact { .. } | ImageAuthority::ScanPinned => {
+            (serde_json::Value::Null, serde_json::Value::Null)
         }
-        ImageAuthority::ScanPinned => (serde_json::Value::Null, serde_json::Value::Null),
     };
     let exe = record.exe.as_ref().map(|exe| {
         serde_json::json!({

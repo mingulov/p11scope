@@ -67,13 +67,15 @@ impl CallerImageObservation {
         image: DomainCookie,
         full_exec_id: u64,
     ) -> BindingObservation {
-        if self.generation == 0 {
-            return BindingObservation::Unavailable;
-        }
-        // RED: blanket matcher (the provenance-blind comparison the twins
-        // reject); GREEN classifies the domain and original allocation
-        // before comparing the image.
-        if self.matches_binding(original, image, full_exec_id) {
+        // Provenance first: a foreign domain, a foreign original
+        // allocation, or an invalid query generation is Unavailable,
+        // never a terminal image verdict.
+        if image.domain() != self.domain
+            || !Arc::ptr_eq(&self.original, original)
+            || self.generation == 0
+        {
+            BindingObservation::Unavailable
+        } else if self.matches_binding(original, image, full_exec_id) {
             BindingObservation::Match
         } else {
             BindingObservation::DifferentImage

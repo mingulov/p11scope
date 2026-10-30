@@ -52,8 +52,6 @@ pub(crate) struct FreshImageGuard<'a, S: ImageAcquisition + ?Sized> {
     source: &'a mut S,
     binder: &'a NativeBinder,
     window: ReadWindow,
-    // RED: cached first observation (the forbidden cache); GREEN removes it.
-    cached: Option<CallerImageObservation>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
@@ -65,9 +63,12 @@ impl<'a, S: ImageAcquisition + ?Sized> FreshImageGuard<'a, S> {
             source,
             binder,
             window,
-            cached: None,
         }
     }
+
+    /// End the guard's borrows after a check round. The guard holds no
+    /// state across checks, so releasing only ends the borrows.
+    pub(crate) fn release(self) {}
 }
 
 impl<S: ImageAcquisition + ?Sized> ImageGuard for FreshImageGuard<'_, S> {
@@ -80,19 +81,17 @@ impl<S: ImageAcquisition + ?Sized> ImageGuard for FreshImageGuard<'_, S> {
             return ImageCheck::Unavailable;
         }
         let original = view.retained_pin_arc();
-        // RED: reuse the first acquisition forever; GREEN acquires now.
-        if self.cached.is_none() {
-            match self.source.acquire_caller_image(original, self.window) {
-                Ok(observation) => self.cached = Some(observation),
-                // RED: fallback-as-Exact; GREEN returns Unavailable here.
-                Err(_) => return ImageCheck::Exact,
-            }
-        }
-        let observation = self.cached.as_ref().expect("cached above");
+        // A fresh acquisition on every check: a failed, stopped, or
+        // expired query is Unavailable, never a stored answer and never
+        // a fallback success.
+        let observation = match self.source.acquire_caller_image(original, self.window) {
+            Ok(observation) => observation,
+            Err(_) => return ImageCheck::Unavailable,
+        };
         if !view.still_the_same() {
             return ImageCheck::Unavailable;
         }
-        match expected.compare_observation(original, observation) {
+        match expected.compare_observation(original, &observation) {
             BindingObservation::Match => ImageCheck::Exact,
             BindingObservation::DifferentImage => ImageCheck::Changed,
             BindingObservation::Unavailable => ImageCheck::Unavailable,
@@ -447,7 +446,7 @@ mod tests {
         // A later source error yields Unavailable although the binder
         // still has its old binding: binder state is never currency.
         assert_eq!(guard.check(&view, expected), ImageCheck::Unavailable);
-        drop(guard);
+        guard.release();
         assert_eq!(source.calls(), 3, "one acquisition per check");
         assert_eq!(source.generations(), &[1, 2]);
         assert!(scene.binder.holds_image(domain, caller));
@@ -475,7 +474,7 @@ mod tests {
         source.script_observe(1, TICKET, EXEC);
         let mut guard = FreshImageGuard::new(&mut source, &scene.binder, window());
         assert_eq!(guard.check(&view, expected), ImageCheck::Exact);
-        drop(guard);
+        guard.release();
         assert_eq!(source.calls(), 1);
 
         // The same PID/start-time in a separately opened allocation is a
@@ -488,7 +487,7 @@ mod tests {
         source.script_observe_on(2, TICKET, EXEC, replacement);
         let mut guard = FreshImageGuard::new(&mut source, &scene.binder, window());
         assert_eq!(guard.check(&view, expected), ImageCheck::Unavailable);
-        drop(guard);
+        guard.release();
         assert_eq!(source.calls(), 1);
 
         // Equal ticket/exec from another domain refuses before any
@@ -498,7 +497,7 @@ mod tests {
         source.script_fail("must never be consumed");
         let mut guard = FreshImageGuard::new(&mut source, &scene.binder, window());
         assert_eq!(guard.check(&view, alien), ImageCheck::Unavailable);
-        drop(guard);
+        guard.release();
         assert_eq!(source.calls(), 0);
 
         // In the proper domain and original, a changed ticket or exec is
@@ -508,7 +507,7 @@ mod tests {
             source.script_observe(3, ticket, exec);
             let mut guard = FreshImageGuard::new(&mut source, &scene.binder, window());
             assert_eq!(guard.check(&view, expected), ImageCheck::Changed);
-            drop(guard);
+            guard.release();
             assert_eq!(source.calls(), 1);
         }
     }
@@ -666,7 +665,7 @@ mod tests {
         source.script_observe(1, TICKET, EXEC);
         let mut guard = FreshImageGuard::new(&mut source, &scene.binder, window());
         assert_eq!(guard.check(&view, expected2), ImageCheck::Exact);
-        drop(guard);
+        guard.release();
         assert_eq!(source.calls(), 1);
     }
 }

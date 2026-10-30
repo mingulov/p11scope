@@ -452,7 +452,7 @@ fn same_binary_exec_without_lifecycle_row_refuses_complete() {
         engine.acquire_inventory_scan(owner).is_err(),
         "an ended image scans nothing new"
     );
-    drop(guard);
+    guard.release();
     assert_eq!(source.calls(), 3);
     assert_eq!(source.generations(), &[1, 2, 3]);
     assert_eq!(binder.census().rows, 0);
@@ -479,7 +479,7 @@ fn same_binary_exec_without_lifecycle_row_refuses_complete() {
         .unwrap();
     assert!(commit.complete);
     assert_eq!(engine.inventory_last_complete(owner).unwrap(), Some(0));
-    drop(guard);
+    guard.release();
     assert_eq!(source.calls(), 6);
     assert_eq!(source.generations(), &[1, 2, 3, 4, 5, 6]);
     assert_eq!(binder.census().rows, 0, "no use row reached the binder");
@@ -516,7 +516,7 @@ fn fresh_guard_unavailable_never_scans_or_consumes_owner_capacity() {
         assert_eq!(engine.views.len(), 1);
         assert!(engine.retirement_intents.is_empty());
         engine.release_inventory_scan(&lease).unwrap();
-        drop(guard);
+        guard.release();
         assert_eq!(source.calls(), 2);
         assert_eq!(binder.census().rows, 0);
     }
@@ -532,7 +532,7 @@ fn fresh_guard_unavailable_never_scans_or_consumes_owner_capacity() {
                 .open_inventory_owner(pid, expected, &mut guard)
                 .is_err()
         );
-        drop(guard);
+        guard.release();
         assert_no_owner(&engine);
         assert_eq!(source.calls(), 1);
     }
@@ -548,7 +548,7 @@ fn fresh_guard_unavailable_never_scans_or_consumes_owner_capacity() {
                 .open_inventory_owner(pid, expected, &mut guard)
                 .is_err()
         );
-        drop(guard);
+        guard.release();
         assert_no_owner(&engine);
         assert_eq!(source.calls(), 1);
     }
@@ -564,7 +564,7 @@ fn fresh_guard_unavailable_never_scans_or_consumes_owner_capacity() {
                 .open_inventory_owner(pid, expected, &mut guard)
                 .is_err()
         );
-        drop(guard);
+        guard.release();
         assert_no_owner(&engine);
         assert_eq!(source.calls(), 1);
         assert!(source.generations().is_empty());
@@ -582,7 +582,7 @@ fn fresh_guard_unavailable_never_scans_or_consumes_owner_capacity() {
                 .open_inventory_owner(pid, expected, &mut guard)
                 .is_err()
         );
-        drop(guard);
+        guard.release();
         assert_no_owner(&engine);
         assert_eq!(source.calls(), 1);
     }
@@ -620,7 +620,7 @@ fn fresh_guard_unavailable_never_scans_or_consumes_owner_capacity() {
             engine.inventory_owner_epochs(owner).unwrap().image_state,
             ImageCheck::Unavailable
         );
-        drop(guard);
+        guard.release();
         assert_eq!(source.calls(), 8);
     }
 
@@ -660,7 +660,7 @@ fn fresh_guard_unavailable_never_scans_or_consumes_owner_capacity() {
             engine.inventory_owner_epochs(owner).unwrap().image_state,
             ImageCheck::Unavailable
         );
-        drop(guard);
+        guard.release();
         assert_eq!(source.calls(), 9);
     }
 
@@ -703,7 +703,7 @@ fn fresh_guard_unavailable_never_scans_or_consumes_owner_capacity() {
             engine.inventory_owner_epochs(owner).unwrap().image_state,
             ImageCheck::Unavailable
         );
-        drop(guard);
+        guard.release();
         assert_eq!(source.calls(), 11);
     }
 
@@ -720,7 +720,7 @@ fn fresh_guard_unavailable_never_scans_or_consumes_owner_capacity() {
             .unwrap();
         let receipt = scan_empty(&mut engine, owner, &mut guard, 0).unwrap();
         assert!(receipt_is_complete(&receipt, "genuine match"));
-        drop(guard);
+        guard.release();
         assert_eq!(source.calls(), 3);
         assert_eq!(binder.census().rows, 0);
     }

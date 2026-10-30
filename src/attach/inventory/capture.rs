@@ -521,12 +521,6 @@ impl DomainCookie {
     pub(crate) fn scripted(domain: NativeDomainId, cookie: u64) -> Self {
         Self::new(domain, cookie)
     }
-
-    /// RED-only numeric escape for the RED renderer and RED equality;
-    /// GREEN removes this (tickets are never numbers).
-    pub(crate) fn red_raw_cookie(&self) -> u64 {
-        self.cookie
-    }
 }
 
 /// The process incarnation a PID-scoped capture was opened for: the pid

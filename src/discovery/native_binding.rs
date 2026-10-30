@@ -84,25 +84,18 @@ pub(crate) use metadata::{BinderMetadataImage, BinderMetadataKey};
 /// only; there is no numeric accessor, tuple conversion, `Deref`, `Display`,
 /// serde form, `Default`, ordering, or production conversion from wire
 /// identity.
-// RED: derived field-printing `Debug` (the leak the redaction twin rejects);
-// GREEN replaces it with a redacted manual impl.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
 pub(crate) struct BoundImage {
     ticket: DomainCookie,
     full_exec_id: u64,
 }
 
-// RED: domain-blind numeric equality (the old aliasing semantics the twins
-// reject); GREEN derives domain-sensitive equality and drops `red_raw`.
-impl PartialEq for BoundImage {
-    fn eq(&self, other: &Self) -> bool {
-        self.ticket.red_raw_cookie() == other.ticket.red_raw_cookie()
-            && self.full_exec_id == other.full_exec_id
+impl std::fmt::Debug for BoundImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BoundImage(<expected>)")
     }
 }
-
-impl Eq for BoundImage {}
 
 #[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
 impl BoundImage {
@@ -123,11 +116,8 @@ impl BoundImage {
 
     /// Whether this expected image belongs to `domain`: an equality
     /// coordinate, never a number.
-    pub(crate) fn belongs_to(&self, _domain: NativeDomainId) -> bool {
-        // RED: always true (the naive membership the cross-domain twin
-        // rejects); GREEN compares the ticket's domain.
-        let _ = self.ticket;
-        true
+    pub(crate) fn belongs_to(&self, domain: NativeDomainId) -> bool {
+        self.ticket.domain() == domain
     }
 
     /// Compare a fresh observation of `original` against this expected
@@ -138,12 +128,6 @@ impl BoundImage {
         observation: &CallerImageObservation,
     ) -> BindingObservation {
         observation.compare_binding(original, self.ticket, self.full_exec_id)
-    }
-
-    /// RED-only numeric escape for the RED renderer; GREEN removes this
-    /// (the renderer must not read numbers).
-    pub(crate) fn red_raw(&self) -> (u64, u64) {
-        (self.ticket.red_raw_cookie(), self.full_exec_id)
     }
 }
 
@@ -898,15 +882,35 @@ impl NativeBinder {
         pid: u32,
         lookup: &dyn CallerLookup<Pin>,
     ) -> Option<BoundImage> {
-        // RED: settled association only (the naive factory the
-        // finished-domain twin rejects); GREEN adds every refusal below.
-        let _ = lookup;
         let state = self
             .domain_indices
             .get(&domain)
             .map(|index| &self.domains[*index])?;
-        let _ = (caller, pid);
+        if state.finished || state.ended.contains(&caller) {
+            return None;
+        }
         let &(ticket, exec) = state.callers.get(&caller)?;
+        // The live PID lookup must still name the requested caller.
+        let live = lookup.live_caller(pid).filter(|live| live.id == caller)?;
+        // A known-invalidated binding: an exec or lost lifecycle evidence
+        // at or after the caller's admission.
+        if state
+            .exec_ns
+            .get(&pid)
+            .is_some_and(|at| *at >= live.first_seen_ns)
+            || state.loss_ns.is_some_and(|at| at >= live.first_seen_ns)
+        {
+            return None;
+        }
+        // Conflicting: a newer exec of the ticket is known, so the
+        // settled association is no longer the current image.
+        if state
+            .cookies
+            .get(&ticket)
+            .is_some_and(|epochs| epochs.keys().next_back().is_some_and(|&later| later > exec))
+        {
+            return None;
+        }
         Some(BoundImage::from_settled(ticket, exec))
     }
 

@@ -4207,23 +4207,32 @@ fn init_call() -> Call {
 
 #[test]
 fn s2s3_initialize_first_mint_qualifies_follow_ons() {
-    // P4-M3 case (i): a qualified OK on a held, never-bootstrapped,
-    // unended domain mints the era; later begins qualify.
-    let mut h = Hist::unqualified();
+    // P4-M3 case (i): a qualified OK on a held, never-initialized,
+    // unended domain with independent birth custody mints the era;
+    // later begins qualify. A birth bootstrap alone is not a live era.
+    let mut h = Hist::qualified();
     let init = h.run(1, init_call(), 2, ok());
     let effects = h.settle(2);
     assert!(
         unresolved(&effects, init).is_none(),
         "the mint publishes no refusal"
     );
+    assert_eq!(
+        h.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "the first success never contradicts"
+    );
     let x = h.run(3, create(SA), 4, ok().result(0, H1));
     let effects = h.settle(4);
     let id = created(&effects, x, 0).expect("post-mint creation qualifies");
     assert_eq!(view(&h.project(), id).lifetime, Lifetime::Live);
-    // Twin: without the Initialize, the same creation stays unproven.
+    // Twin: success itself is not journal authority — an unqualified
+    // OK (no independent birth custody) mints nothing.
     let mut h = Hist::unqualified();
-    let x = h.run(1, create(SA), 2, ok().result(0, H1));
-    let effects = h.settle(2);
+    h.run(1, init_call(), 2, ok());
+    h.settle(2);
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let effects = h.settle(4);
     assert_eq!(created(&effects, x, 0), None);
     assert!(h.project().gap(ObjectGap::BootstrapUnproven) >= 1);
 }
@@ -4283,20 +4292,28 @@ fn s2s3_initialize_failed_reinit_mints_nothing() {
 fn s2s3_initialize_finalize_reinit_split() {
     // P4-M3 case (ii): post-Finalize, a qualified OK on the fresh
     // sealed era domain mints the new era; handle-value reuse across
-    // eras never merges identities.
+    // eras never merges identities. Reference-model split only: the
+    // sealed successor issuance path is finding 2 (pending 6.04).
     let mut h = Hist::qualified();
-    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
-    let x = h.run(3, create(SA), 4, ok().result(0, H1));
-    h.run(5, call("C_Finalize"), 6, ok());
-    let effects = h.settle(6);
+    h.run(1, init_call(), 2, ok());
+    h.settle(2);
+    h.run(3, open_in(slot(SLOT1)), 4, ok().session_out(SA));
+    let x = h.run(5, create(SA), 6, ok().result(0, H1));
+    h.run(7, call("C_Finalize"), 8, ok());
+    let effects = h.settle(8);
     let old = created(&effects, x, 0).unwrap();
     assert_eq!(
         view(&h.project(), old).lifetime,
         Lifetime::AccessEnded(ObjectGap::Finalize)
     );
-    let era = h.add_domain(ObjectDomain::reference(1, 1, 1, 1, 2), false);
+    let era = h.add_domain(ObjectDomain::reference(1, 1, 1, 1, 2), true);
     h.run_in(era, 1, init_call(), 2, ok());
     h.settle_in(era, 2);
+    assert_eq!(
+        h.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "the successor first success mints"
+    );
     h.run_in(era, 3, open_in(slot(SLOT1)), 4, ok().session_out(SA));
     let y = h.run_in(era, 5, create(SA), 6, ok().result(0, H1));
     let effects = h.settle_in(era, 6);
@@ -4307,7 +4324,7 @@ fn s2s3_initialize_finalize_reinit_split() {
         ViewOrigin::Created(CreationFamily::Create)
     );
     assert_eq!(
-        h.try_begin_in(0, 7, create(SA)),
+        h.try_begin_in(0, 9, create(SA)),
         Err(ObjectGap::DomainEnded),
         "the ended era stays ended: no resurrection"
     );
@@ -4315,24 +4332,32 @@ fn s2s3_initialize_finalize_reinit_split() {
 
 #[test]
 fn s2s3_initialize_duplicate_ok_contradicts() {
-    // P4-M5: a qualified OK while the era is live contradicts — a
-    // conforming provider answers ALREADY there, so OK evidences an
-    // unseen Finalize or a nonconforming provider.
+    // P4-M5: a genuine second qualified OK while the era is live
+    // contradicts — a conforming provider answers ALREADY there, so OK
+    // evidences an unseen Finalize or a nonconforming provider. The
+    // first success mints; a birth bootstrap alone contradicts nothing.
     let mut h = Hist::qualified();
-    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
-    let x = h.run(3, create(SA), 4, ok().result(0, H1));
-    let before = h.settle(4);
+    h.run(1, init_call(), 2, ok());
+    h.settle(2);
+    assert_eq!(
+        h.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "the first success mints"
+    );
+    h.run(3, open_in(slot(SLOT1)), 4, ok().session_out(SA));
+    let x = h.run(5, create(SA), 6, ok().result(0, H1));
+    let before = h.settle(6);
     let id = created(&before, x, 0).unwrap();
-    h.run(5, init_call(), 6, ok());
-    let effects = h.settle(6);
+    h.run(7, init_call(), 8, ok());
+    let effects = h.settle(8);
     assert!(effects.effects.contains(&ObjectEffect::Downgraded {
         object: id,
         reason: ObjectGap::UnseenFinalize
     }));
     assert!(h.project().gap(ObjectGap::UnseenFinalize) >= 1);
     // Post-contradiction proof needs a new bootstrap above the fence.
-    let y = h.run(7, create(SA), 8, ok().result(0, H2));
-    let effects = h.settle(8);
+    let y = h.run(9, create(SA), 10, ok().result(0, H2));
+    let effects = h.settle(10);
     assert_eq!(created(&effects, y, 0), None);
     assert!(h.project().gap(ObjectGap::BootstrapUnproven) >= 1);
 }
@@ -4341,8 +4366,8 @@ fn s2s3_initialize_duplicate_ok_contradicts() {
 fn s2s3_initialize_concurrent_oks_first_mints_second_contradicts() {
     // P4-M5: cut-order-first mints; the concurrent second OK — exempt
     // from mint fencing as a fellow Initialize — then contradicts on
-    // the post-mint live era.
-    let mut h = Hist::unqualified();
+    // the post-mint live era. Both begins carry birth custody.
+    let mut h = Hist::qualified();
     let first = h.begin(1, init_call());
     let second = h.begin(2, init_call());
     h.done(first, 4, ok());
@@ -4368,8 +4393,9 @@ fn s2s3_initialize_concurrent_oks_first_mints_second_contradicts() {
 #[test]
 fn s2s3_initialize_straddler_fenced_publishes_nothing() {
     // P4-M3: pending/straddling calls are fenced at the mint; their
-    // pre-split snapshots never publish across it.
-    let mut h = Hist::unqualified();
+    // pre-split snapshots never publish across it. Birth custody is
+    // present — without the fence the straddler would publish.
+    let mut h = Hist::qualified();
     let init = h.begin(1, init_call());
     let straddler = h.begin(2, create(SA));
     h.done(init, 4, ok());
@@ -4391,6 +4417,133 @@ fn s2s3_initialize_straddler_fenced_publishes_nothing() {
     assert!(
         created(&effects, x, 0).is_some(),
         "post-split begins qualify"
+    );
+}
+
+#[test]
+fn s2s3_initialize_straddler_fence_is_causal() {
+    // P4-M3 causal (finding 4): the mint fences straddlers; without the
+    // fence the straddler would publish across the split and a delayed
+    // removal would damage the successor. Full effect/gap delta plus the
+    // real settlement trace; M5 (fence removal) must fail the boundary
+    // assertion while the healthy post-boundary control holds.
+    use crate::semantics_objects::trace_settlement_for_test;
+    let mut h = Hist::qualified();
+    let domain = base_domain();
+    // Open first so the straddler and remover have a live session to act
+    // on; the session itself predates the mint and stays live.
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let init = h.begin(3, init_call());
+    let straddler = h.begin(4, create(SA));
+    // Delayed removal straddling the mint: begins before the anchor,
+    // completes after the successor exists. Its replay would retire
+    // the successor view.
+    let remover = h.begin(5, destroy(SA, H2));
+    h.done(init, 6, ok());
+    h.done(straddler, 7, ok().result(0, H1));
+    let x = h.begin(8, create(SA));
+    h.done(x, 9, ok().result(0, H2));
+    h.done(remover, 10, ok());
+    let gaps_before = h.project().gap(ObjectGap::BootstrapUnproven);
+    let (effects, trace) = trace_settlement_for_test(domain, || h.settle(10));
+    // Boundary: the straddler publishes nothing — no Created, no
+    // Unresolved, and no new gap. A Gap instead of Unresolved still
+    // fails here via the gap delta.
+    assert_eq!(
+        created(&effects, straddler, 0),
+        None,
+        "the straddler publishes nothing"
+    );
+    assert_eq!(
+        unresolved(&effects, straddler),
+        None,
+        "a fenced end replays nothing, not even Unresolved"
+    );
+    assert_eq!(
+        h.project().gap(ObjectGap::BootstrapUnproven),
+        gaps_before,
+        "a fenced end emits no gap either"
+    );
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Created { call, .. } if *call == straddler
+        )),
+        "no Created effect names the straddler"
+    );
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Unresolved { call, .. } if *call == straddler
+        )),
+        "no Unresolved effect names the straddler"
+    );
+    // The delayed remover also replays nothing: the successor view it
+    // names stays Live, never retired or destroyed.
+    assert_eq!(
+        unresolved(&effects, remover),
+        None,
+        "the fenced remover replays nothing"
+    );
+    // Settlement trace: fenced calls replay their pre-mint begins
+    // (one non-terminal step each) but no terminal end; the mint and
+    // the post-split join replay fully.
+    let straddler_begins = trace
+        .steps
+        .iter()
+        .filter(|step| step.call == straddler && !step.terminal)
+        .count();
+    let straddler_ends = trace
+        .steps
+        .iter()
+        .filter(|step| step.call == straddler && step.terminal)
+        .count();
+    let remover_begins = trace
+        .steps
+        .iter()
+        .filter(|step| step.call == remover && !step.terminal)
+        .count();
+    let remover_ends = trace
+        .steps
+        .iter()
+        .filter(|step| step.call == remover && step.terminal)
+        .count();
+    assert_eq!(
+        (straddler_begins, straddler_ends),
+        (1, 0),
+        "the straddler began before the mint but its end never replays"
+    );
+    assert_eq!(
+        (remover_begins, remover_ends),
+        (1, 0),
+        "the remover began before the mint but its end never replays"
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.call == init && step.terminal),
+        "the mint end replays"
+    );
+    assert!(
+        trace
+            .steps
+            .iter()
+            .any(|step| step.call == x && step.terminal),
+        "the post-split end replays"
+    );
+    // Healthy post-boundary control: the successor qualifies and stays
+    // Live despite the delayed remover naming its handle.
+    let id = created(&effects, x, 0).expect("post-split begins qualify");
+    assert_eq!(
+        view(&h.project(), id).lifetime,
+        Lifetime::Live,
+        "the successor survives the fenced remover"
+    );
+    assert_eq!(
+        h.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "the mint itself contradicts nothing"
     );
 }
 

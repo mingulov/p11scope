@@ -715,6 +715,12 @@ struct ShapedS1 {
     input1: Option<(u64, u8)>,
     /// CREATE result word override (`None` = the default key word).
     result: Option<u64>,
+    /// COPY result word override (`None` = unknown output, status 7;
+    /// `Some(word)` = valid VALUE result slot 0).
+    copy_result: Option<u64>,
+    /// FIND handles override (`None` = unknown output; `Some((words,
+    /// truncated))` = valid Find section with the given handle words).
+    find_handles: Option<(Vec<u64>, bool)>,
     /// GET attribute cells as (kind, status, value).
     getattr_cells: Vec<(u8, u8, u16)>,
 }
@@ -739,6 +745,8 @@ impl ShapedS1 {
             input0,
             input1: None,
             result: None,
+            copy_result: None,
+            find_handles: None,
             getattr_cells: Vec::new(),
         }
     }
@@ -828,21 +836,54 @@ fn end_for_call(begin: &[u8; 224], call: &ShapedS1) -> [u8; 632] {
             end_bytes(begin, OBJECT_ACTION_ACCESS, call.rv, ENTRY_NS + 50)
         }
         "C_DestroyObject" => end_bytes(begin, OBJECT_ACTION_DESTROY, call.rv, ENTRY_NS + 50),
-        // Copy/Find carry result protocols, so their tails stay present
-        // with unknown output sections: the conversion reads explicit
-        // unknown (NotCaptured/Unreadable), never an absent row. Both
-        // authorize result slot 0, which the validator requires
-        // non-absent: status 7 marks it never captured.
+        // Copy/Find carry result protocols, so their tails stay present.
+        // Unknown outputs (`None`) read explicit unknown
+        // (NotCaptured/Unreadable), never an absent row. Both authorize
+        // result slot 0, which the validator requires non-absent:
+        // status 7 marks it never captured. Valid overrides emit real
+        // VALUE / Find-section bytes through the same conversion seam.
         "C_CopyObject" => {
             let mut end = end_bytes(begin, OBJECT_ACTION_COPY, call.rv, ENTRY_NS + 50);
-            // Tail result slot 0: record[392 + 114].
-            end[506] = 7;
+            // Tail result slot 0: record[392 + 114]; word at +32.
+            match call.copy_result {
+                Some(word) => {
+                    assert_ne!(word, 0, "valid COPY result is nonzero");
+                    end[506] = 1;
+                    end[424..432].copy_from_slice(&word.to_le_bytes());
+                }
+                None => {
+                    end[506] = 7;
+                }
+            }
             end
         }
         "C_FindObjects" => {
             let mut end = end_bytes(begin, OBJECT_ACTION_FIND, call.rv, ENTRY_NS + 50);
             // Tail result slot 0: record[392 + 114].
             end[506] = 7;
+            if let Some((handles, truncated)) = &call.find_handles {
+                assert!(
+                    handles.len() <= 8,
+                    "at most eight find handles, got {}",
+                    handles.len()
+                );
+                assert!(
+                    !truncated || handles.len() == 8,
+                    "truncation implies eight cells"
+                );
+                // Find section: len at +124, flags at +125, valid at
+                // +126; cell statuses at +116..+124, words at
+                // +48+8*i. Record base is 392.
+                end[516] = handles.len() as u8;
+                end[517] = u8::from(*truncated);
+                end[518] = 1;
+                for (i, word) in handles.iter().enumerate() {
+                    assert_ne!(*word, 0, "valid FIND handle is nonzero");
+                    end[508 + i] = 1;
+                    let base = 440 + 8 * i;
+                    end[base..base + 8].copy_from_slice(&word.to_le_bytes());
+                }
+            }
             end
         }
         "C_GetAttributeValue" => {
@@ -14133,10 +14174,11 @@ fn key_operation_joint_async_pending_mint_then_unbound_completion() {
 // producer→seal→reducer→projection link proof. Model-only green is
 // not delivery: every test below commits.
 
-/// P4-M5 through producer→seal→reducer→projection: the scene domain
-/// is bootstrapped (live era), so a qualified C_Initialize OK
+/// P4-M5 through producer→seal→reducer→projection: a genuine second
+/// qualified C_Initialize OK on the live (already-initialized) era
 /// contradicts — Downgraded joins, UnseenFinalize gap — while the
-/// seal itself succeeds and the commit stays honest.
+/// seal itself succeeds and the commit stays honest. A birth bootstrap
+/// alone is not a live era: the first success mints.
 #[test]
 fn key_operation_lifecycle_initialize_ok_contradicts_live_era() {
     use crate::semantics_objects::{Attribution, Lifetime, ObjectGap, SessionState};
@@ -14146,6 +14188,19 @@ fn key_operation_lifecycle_initialize_ok_contradicts_live_era() {
     let mut joint = EdgeSemantics::default();
     let mut keyuse = KeyUseReducer::new();
     let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    assert_eq!(
+        scene.model.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "the first success mints"
+    );
     drive_quantum(
         &mut scene,
         &mut staging,
@@ -14174,7 +14229,10 @@ fn key_operation_lifecycle_initialize_ok_contradicts_live_era() {
         &mut sink,
         &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
     );
-    assert!(joint.has_live_operations(), "the use is live before init");
+    assert!(
+        joint.has_live_operations(),
+        "the use is live before duplicate"
+    );
     drive_quantum(
         &mut scene,
         &mut staging,
@@ -14810,4 +14868,794 @@ fn key_operation_lifecycle_handle_reuse_and_inaccessible_attributes() {
     assert_eq!(destroyed.queries.class, "unavailable");
     assert_eq!(destroyed.queries.key_type, "unavailable");
     assert_eq!(destroyed.label, None);
+}
+
+/// P4 first-initialize through seal (finding 1): fresh independently
+/// attested birth, Initialize OK first (no prior create/open), then
+/// create/getattr/SignInit/Sign. No unseen_finalize, populated rows.
+/// Includes one batched seal plus a duplicate-success twin.
+#[test]
+fn key_operation_lifecycle_first_initialize_through_seal() {
+    use crate::semantics_objects::{Attribution, Lifetime, ObjectGap, SessionState};
+    // Part A: separate seals, full link proof.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    assert_eq!(
+        scene.model.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "first Initialize mints, never contradicts"
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let projection = scene.model.project();
+    assert_eq!(
+        projection.gap(ObjectGap::UnseenFinalize),
+        0,
+        "no unseen_finalize across the first era"
+    );
+    assert_eq!(projection.objects.len(), 1, "real populated rows");
+    assert!(
+        matches!(projection.objects[0].lifetime, Lifetime::Live),
+        "the created view stays live"
+    );
+    assert!(
+        projection
+            .sessions
+            .iter()
+            .any(|s| matches!(s.state, SessionState::Live)),
+        "sessions stay live"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (committed.status, committed.reason),
+        (ObsStatus::Populated, "none")
+    );
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the completed use rows proved");
+    assert_eq!(
+        (row.started, row.completed, row.active, row.key_join_lost),
+        (1, 1, 0, 0),
+        "one started/completed keyed operation, no fallback/double replay"
+    );
+    // Part B: one batched seal (Initialize + create share a seal).
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let success = scene.seal().expect("batched quantum seals");
+    assert_eq!(success.prefix.settled().len(), 2);
+    let (outcome, refused) = staging.apply_seal(
+        &success,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert_eq!(outcome, SealApplyOutcome::Held, "multicall holds S1");
+    assert_eq!(refused, 0);
+    let projection = scene.model.project();
+    assert_eq!(
+        projection.gap(ObjectGap::UnseenFinalize),
+        0,
+        "batched first Initialize mints"
+    );
+    assert_eq!(
+        projection.objects.len(),
+        1,
+        "batched follow-on qualifies on the minted era"
+    );
+    // Part C: duplicate-success twin downgrades prior joins; ALREADY and
+    // FUNCTION_FAILED mint nothing and contradict nothing.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    assert!(
+        joint.has_live_operations(),
+        "the use is live before duplicate"
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    let projection = scene.model.project();
+    assert_eq!(projection.objects.len(), 1);
+    let view = &projection.objects[0];
+    assert_eq!(
+        view.attribution,
+        Attribution::Downgraded(ObjectGap::UnseenFinalize),
+        "duplicate OK downgrades the published join"
+    );
+    assert_eq!(
+        view.lifetime,
+        Lifetime::Retired(ObjectGap::UnseenFinalize),
+        "contradiction retires live continuity"
+    );
+    assert!(
+        projection.gap(ObjectGap::UnseenFinalize) >= 1,
+        "the duplicate contradiction is counted"
+    );
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the use row stands");
+    assert_eq!(
+        (row.started, row.active, row.key_join_lost),
+        (1, 0, 1),
+        "the ended binding closes to key_join_lost"
+    );
+    // ALREADY and FUNCTION_FAILED after a proved first success are benign
+    // no-mint no-contradiction twins (fresh scenes to avoid the voided domain).
+    for rv in [
+        CkRv::CRYPTOKI_ALREADY_INITIALIZED.0,
+        CkRv::FUNCTION_FAILED.0,
+    ] {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        );
+        let gaps_before = scene.model.project().gap(ObjectGap::UnseenFinalize);
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_Initialize", rv, 0, 0),
+        );
+        let projection = scene.model.project();
+        assert_eq!(
+            projection.gap(ObjectGap::UnseenFinalize),
+            gaps_before,
+            "rv {rv:#x} contradicts nothing"
+        );
+        assert!(
+            projection
+                .objects
+                .iter()
+                .all(|view| matches!(view.lifetime, Lifetime::Live)),
+            "rv {rv:#x} ends nothing"
+        );
+        assert!(joint.has_live_operations(), "rv {rv:#x} keeps S1 live");
+    }
+}
+
+/// Valid copy/find outputs through seal (finding 3): a valid COPY
+/// result mints a distinct incarnation with source-reference (not
+/// key-use) accounting; valid FIND lists first-observe unseen keys
+/// with unknown birth; established metadata and subsequent keyed uses
+/// of each returned object commit. Twins prove removing the output
+/// removes the rows. M6/M7 (dropping conversion) must fail here.
+#[test]
+fn key_operation_lifecycle_copy_find_outputs_through_seal() {
+    use crate::semantics_objects::{Birth, CreationFamily, Lifetime, ObjectGap, ViewOrigin};
+    const COPY_KEY: u64 = 0xB1B1_B1B1_B1B1_B1B1;
+    const FIND_A: u64 = 0xC1C1_C1C1_C1C1_C1C1;
+    const FIND_B: u64 = 0xC2C2_C2C2_C2C2_C2C2;
+    // Part A: valid COPY through the conversion seam.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut copy = ShapedS1::shaped("C_CopyObject", CkRv::OK.0, 0, 0);
+    copy.input0 = Some((CREATED_KEY, 1));
+    copy.copy_result = Some(COPY_KEY);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &copy,
+    );
+    let projection = scene.model.project();
+    assert_eq!(projection.objects.len(), 2, "copy mints a second view");
+    let source = projection
+        .objects
+        .iter()
+        .find(|view| matches!(view.origin, ViewOrigin::Created(CreationFamily::Create)))
+        .expect("source view stands");
+    let copied = projection
+        .objects
+        .iter()
+        .find(|view| matches!(view.origin, ViewOrigin::Created(CreationFamily::Copy)))
+        .expect("copy view mints through conversion");
+    assert_ne!(source.id, copied.id, "distinct incarnations");
+    assert_eq!(source.references, 1, "copy reads its source once");
+    assert_eq!(source.key_uses, 0, "copy is not a key use");
+    assert!(
+        matches!(copied.birth, Birth::Observed { .. }),
+        "copy birth is observed"
+    );
+    assert!(matches!(copied.lifetime, Lifetime::Live));
+    // Established metadata on the returned copy, then a keyed use.
+    let mut get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    get.input0 = Some((COPY_KEY, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    // Subsequent keyed use of the returned copy object.
+    let mut sign_init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    sign_init.input0 = Some((COPY_KEY, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign_init,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (committed.status, committed.reason),
+        (ObsStatus::Populated, "none")
+    );
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("copy-key use rows proved");
+    assert_eq!((row.started, row.completed), (1, 1));
+    assert_eq!(committed.objects.len(), 2);
+    // Part B: valid FIND through the seam, then use of a found key.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_FindObjectsInit", CkRv::OK.0, 0, 0),
+    );
+    let mut find = ShapedS1::shaped("C_FindObjects", CkRv::OK.0, 0, 0);
+    find.find_handles = Some((vec![FIND_A, FIND_B], false));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &find,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_FindObjectsFinal", CkRv::OK.0, 0, 0),
+    );
+    let projection = scene.model.project();
+    assert_eq!(
+        projection.objects.len(),
+        3,
+        "two found keys first-observe alongside the created one"
+    );
+    let found: Vec<_> = projection
+        .objects
+        .iter()
+        .filter(|view| matches!(view.origin, ViewOrigin::FirstObserved))
+        .collect();
+    assert_eq!(found.len(), 2, "both handles first-observe");
+    for view in &found {
+        assert_eq!(view.birth, Birth::Unknown, "found birth is unknown");
+        assert!(matches!(view.lifetime, Lifetime::Live));
+    }
+    let mut get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    get.input0 = Some((FIND_A, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    let mut sign_init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    sign_init.input0 = Some((FIND_A, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign_init,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("found-key use rows proved");
+    assert_eq!((row.started, row.completed), (1, 1));
+    // Part C: find counts 0, 8 and truncated-8 through the seam.
+    for (handles, truncated, expect_new, expect_gap) in [
+        (vec![], false, 0usize, false),
+        (
+            vec![
+                0xD1D1_D1D1_D1D1_D1D1,
+                0xD2D2_D2D2_D2D2_D2D2,
+                0xD3D3_D3D3_D3D3_D3D3,
+                0xD4D4_D4D4_D4D4_D4D4,
+                0xD5D5_D5D5_D5D5_D5D5,
+                0xD6D6_D6D6_D6D6_D6D6,
+                0xD7D7_D7D7_D7D7_D7D7,
+                0xD8D8_D8D8_D8D8_D8D8,
+            ],
+            false,
+            8usize,
+            false,
+        ),
+        (
+            vec![
+                0xE1E1_E1E1_E1E1_E1E1,
+                0xE2E2_E2E2_E2E2_E2E2,
+                0xE3E3_E3E3_E3E3_E3E3,
+                0xE4E4_E4E4_E4E4_E4E4,
+                0xE5E5_E5E5_E5E5_E5E5,
+                0xE6E6_E6E6_E6E6_E6E6,
+                0xE7E7_E7E7_E7E7_E7E7,
+                0xE8E8_E8E8_E8E8_E8E8,
+            ],
+            true,
+            8usize,
+            true,
+        ),
+    ] {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_FindObjectsInit", CkRv::OK.0, 0, 0),
+        );
+        let gaps_before = scene.model.project().gap(ObjectGap::OutputUnreadable);
+        let mut find = ShapedS1::shaped("C_FindObjects", CkRv::OK.0, 0, 0);
+        find.find_handles = Some((handles.clone(), truncated));
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &find,
+        );
+        let projection = scene.model.project();
+        assert_eq!(
+            projection.objects.len(),
+            1 + expect_new,
+            "find with {} handles (truncated={truncated})",
+            handles.len()
+        );
+        assert_eq!(
+            projection.gap(ObjectGap::OutputUnreadable) > gaps_before,
+            expect_gap,
+            "truncation gap iff truncated"
+        );
+    }
+    // Part D: unreadable/absent/failed twins invent nothing.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    // Unknown copy output.
+    let mut copy = ShapedS1::shaped("C_CopyObject", CkRv::OK.0, 0, 0);
+    copy.input0 = Some((CREATED_KEY, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &copy,
+    );
+    assert_eq!(
+        scene.model.project().objects.len(),
+        1,
+        "unknown copy output mints nothing"
+    );
+    // Failed copy with a valid result word still mints nothing.
+    let mut copy = ShapedS1::shaped("C_CopyObject", CkRv::FUNCTION_FAILED.0, 0, 0);
+    copy.input0 = Some((CREATED_KEY, 1));
+    copy.copy_result = Some(COPY_KEY);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &copy,
+    );
+    assert_eq!(
+        scene.model.project().objects.len(),
+        1,
+        "failed copy mints nothing"
+    );
+    // Unknown find output.
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_FindObjectsInit", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_FindObjects", CkRv::OK.0, 0, 0),
+    );
+    assert_eq!(
+        scene.model.project().objects.len(),
+        1,
+        "unknown find invents nothing"
+    );
+    // Failed find with valid handles still invents nothing.
+    let mut find = ShapedS1::shaped("C_FindObjects", CkRv::FUNCTION_FAILED.0, 0, 0);
+    find.find_handles = Some((vec![FIND_A], false));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &find,
+    );
+    assert_eq!(
+        scene.model.project().objects.len(),
+        1,
+        "failed find invents nothing"
+    );
+}
+
+/// Finding 2 — INCOMPLETE (pending 6.04 sealed era issuance):
+/// successful finalize ends the old era through its seal; a successor
+/// Initialize on the ended domain is refused at conversion — no fresh
+/// sealed `init_era` is constructed or propagated here. The old rows
+/// stay access-ended, the refused quantum changes nothing, and the
+/// commit stays honest. Successful reinitialize through the owning
+/// journal/seal is NOT delivered by 607a; see `docs/schema/inventory-v1.md`.
+#[test]
+fn key_operation_lifecycle_reinitialize_successor_blocked_pending_sealed_era() {
+    use crate::semantics_objects::{Lifetime, ObjectGap};
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Finalize", CkRv::OK.0, 0, 0),
+    );
+    let projection = scene.model.project();
+    assert!(
+        projection
+            .objects
+            .iter()
+            .all(|view| matches!(view.lifetime, Lifetime::AccessEnded(ObjectGap::Finalize))),
+        "old era access-ended"
+    );
+    assert_eq!(projection.objects.len(), 1, "only the old row exists");
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (committed.status, committed.reason),
+        (ObsStatus::Populated, "none")
+    );
+    assert_eq!(committed.objects[0].lifetime, "access_ended");
+    assert_eq!(committed.objects[0].lifetime_reason, Some("finalize"));
+    // A successor Initialize admitted against the ended domain is
+    // refused at conversion: nothing joins across the split, and no
+    // successor domain is minted here.
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    let failure = scene
+        .seal()
+        .expect_err("no successor joins across the split");
+    assert_eq!(failure.gap, JournalGap::ModelRefused);
+    let projection = scene.model.project();
+    assert_eq!(
+        projection.objects.len(),
+        1,
+        "the refused quantum mints no successor"
+    );
+    assert!(
+        projection
+            .objects
+            .iter()
+            .all(|view| matches!(view.lifetime, Lifetime::AccessEnded(ObjectGap::Finalize))),
+        "the refused quantum changes nothing"
+    );
+    // Same raw words in a later quantum are likewise refused (the
+    // first refusal taints the key, so the second reports taint):
+    // old tickets stay stale, never resurrected.
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let failure = scene.seal().expect_err("old-domain calls stay refused");
+    assert_eq!(failure.gap, JournalGap::DomainTainted);
+    assert_eq!(
+        scene.model.project().objects.len(),
+        1,
+        "no resurrection under reused words"
+    );
 }

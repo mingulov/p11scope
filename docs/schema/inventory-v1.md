@@ -863,13 +863,18 @@ never imply S1 loss.
   mirror the snapshot's loss accounting. Row limits refuse with
   `partial` coverage; history is never evicted.
 - Initialization-era boundaries: one qualified successful
-  `C_Initialize` mints one era; `ALREADY_INITIALIZED` and errors mint
-  nothing; a duplicate success on a live era contradicts
-  (`unseen_finalize`). Honesty limit: a finalize+reinitialize pair the
-  capture never saw stays undetectable from this rule alone (except
-  when later betrayed by `CRYPTOKI_NOT_INITIALIZED` or duplicate-OK
-  contradiction) — modeled Initialize handling never claims to detect
-  unseen reinitialization.
+  `C_Initialize` on a never-initialized domain mints the first era;
+  `ALREADY_INITIALIZED` and errors mint nothing; a genuine second
+  success on the live era contradicts (`unseen_finalize`). A birth
+  bootstrap alone is not a live era. Honesty limit: a
+  finalize+reinitialize pair the capture never saw stays undetectable
+  from this rule alone (except when later betrayed by
+  `CRYPTOKI_NOT_INITIALIZED` or duplicate-OK contradiction) — modeled
+  Initialize handling never claims to detect unseen reinitialization.
+  Successful reinitialize through the owning journal/seal (fresh sealed
+  `init_era` above the termination fence) is NOT delivered here: the
+  ended domain stays ended and later quanta refuse at conversion,
+  pending 6.04 sealed era issuance.
 - Privacy: no raw handles, pointers, native keys, epochs, PIDs/TIDs,
   address-derived hashes or arbitrary attribute bytes appear anywhere
   in this section. Key values, moduli, EC points, labels, IDs and PINs

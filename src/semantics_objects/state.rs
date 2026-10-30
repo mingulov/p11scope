@@ -518,6 +518,10 @@ impl ViewRecord {
 struct DomainState {
     /// Calls with begin cut >= this are qualified.
     bootstrap: Option<u64>,
+    /// Initialization era live: a qualified first `C_Initialize` OK
+    /// minted. Separate from journal/bootstrap qualification — a birth
+    /// bootstrap is not evidence a previous Initialize succeeded.
+    initialized: bool,
     /// Watermark: every event at or below has been applied.
     applied: Option<u64>,
     /// Highest prefix frontier accepted (completeness claimed through it).
@@ -1450,16 +1454,19 @@ impl ModelState {
 
     /// P4 Initialize era rule (owner 2026-10-29, merged P4-M1…M6).
     /// Exactly one qualified `CKR_OK` mints one never-reused
-    /// initialization era; everything else mints nothing. Runs outside
-    /// the bootstrap-qualification gate (see the `apply_end` hook): the
-    /// entry session word is never read as a session (P4-M2, ARG_NONE),
-    /// so no session is resolved and no input ever joins here.
+    /// initialization era; everything else mints nothing. The entry
+    /// session word is never read as a session (P4-M2, ARG_NONE), so
+    /// no session is resolved and no input ever joins here.
     ///
-    /// Current domain state selects the clause, which subsumes the
-    /// pair-generation check: a proof void after this call's begin
-    /// always clears the bootstrap and bumps the generation, so a
-    /// loss-straddling pair lands in the voided no-op below, never in
-    /// the mint. No new gap or effect vocabulary: the mint is proven
+    /// Initialization state is separate from journal/bootstrap
+    /// qualification: a birth bootstrap (installed before the first
+    /// call of an ordinary attested seal) is not evidence a previous
+    /// Initialize succeeded. The first mint requires the call's own
+    /// qualified begin snapshot under independent original custody
+    /// (P4-M1/M3); success itself is never journal authority (P4-M3–M5).
+    /// A genuine second success on the live era contradicts; a voided
+    /// domain (generation != 0) mints nothing and needs a new sealed
+    /// era domain. No new gap or effect vocabulary: the mint is proven
     /// by follow-on qualification, contradiction reuses
     /// `UnseenFinalize` (H9 v2 discipline).
     fn apply_initialize_era(
@@ -1493,7 +1500,15 @@ impl ModelState {
         if state.ended.is_some() {
             return;
         }
-        if state.bootstrap.is_some() {
+        if state.generation != 0 {
+            // Proof voided after activity (loss, ambiguity or
+            // contradiction): M4 mints nothing on loss or ambiguity.
+            // Checked before the live-era arm so a voided mint never
+            // re-contradicts. Recovery needs a new sealed era domain
+            // (P4-M5).
+            return;
+        }
+        if state.initialized {
             // P4-M5: a qualified OK while the era is live contradicts
             // — a conforming provider answers ALREADY there, so OK
             // evidences an unseen Finalize or a nonconforming
@@ -1503,19 +1518,17 @@ impl ModelState {
             self.contradict(domain, ObjectGap::UnseenFinalize, None, effects, ledger);
             return;
         }
-        if state.generation != 0 {
-            // Proof voided after activity (loss, ambiguity or
-            // contradiction): M3 case (i) needs never-bootstrapped,
-            // and M4 mints nothing on loss or ambiguity. The void
-            // already retired live continuity, so a no-op is safe;
-            // recovery needs a journal bootstrap or a new sealed era
-            // domain (P4-M5).
+        if !call.snapshot.qualified || call.snapshot.generation != state.generation {
+            // Unqualified success mints nothing: success itself is not
+            // journal authority (P4-M3–M5). The first era needs the
+            // call's own qualified begin under independent original
+            // custody (birth bootstrap, consistent prefix).
             return;
         }
-        // P4-M3 mint: held, never bootstrapped (generation 0: no void
-        // ever bumped it), not ended. The era anchor is the
-        // Initialize return cut: later begins qualify, while
-        // pre-split snapshots (begin below the anchor) can never
+        // P4-M3 mint: held, never initialized, never voided
+        // (generation 0), not ended, with a qualified begin. The era
+        // anchor is the Initialize return cut: later begins qualify,
+        // while pre-split snapshots (begin below the anchor) can never
         // publish across it.
         let cut = completion.cut;
         if state.fence_floor.is_some_and(|floor| cut <= floor) {
@@ -1538,7 +1551,9 @@ impl ModelState {
         for straddler in straddlers {
             self.fence(straddler);
         }
-        self.domains.get_mut(&domain).expect("domain").bootstrap = Some(cut);
+        let state = self.domains.get_mut(&domain).expect("domain");
+        state.bootstrap = Some(cut);
+        state.initialized = true;
     }
 
     /// Joins and actions of a qualified end. Returns false when the call
@@ -3601,6 +3616,7 @@ impl ModelState {
         let state = self.domains.get_mut(&domain).expect("domain");
         state.ended = Some(reason);
         state.bootstrap = None;
+        state.initialized = false;
         // Ended sessions dispose their deferred records above; flush
         // the queued releases so no dead charge denies later admissions.
         self.flush_deferred_releases(ledger);
@@ -3678,6 +3694,7 @@ impl ModelState {
         let max_cut = self.domains[&domain].cuts.iter().next_back().copied();
         let state = self.domains.get_mut(&domain).expect("domain");
         state.bootstrap = None;
+        state.initialized = false;
         state.fence_floor = max_opt(
             max_opt(state.fence_floor, state.covered),
             max_opt(state.applied, max_cut),

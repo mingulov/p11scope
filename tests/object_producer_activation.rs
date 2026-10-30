@@ -1061,6 +1061,59 @@ fn object_marker_arms_only_under_allowlisted_policy() {
     );
 }
 
+/// KEM entry acquisition runs only through the shared KEM adapter:
+/// the generic input/result paths skip both KEM actions, and the one
+/// KEM wrapper binds the build's FULL gate plus the owned call's
+/// validated S1 output verdict. No direct arg-7 or template read may
+/// bypass the adapter.
+#[test]
+fn object_kem_entry_runs_only_through_the_shared_adapter() {
+    let source = bpf_source();
+    let fill = source_between(
+        &source,
+        "fn object_fill_entry(",
+        "fn object_entry_derive(",
+    );
+    assert!(
+        fill.contains("OBJECT_ACTION_ENCAPSULATE")
+            && fill.contains("OBJECT_ACTION_DECAPSULATE"),
+        "generic input acquisition must skip both KEM actions"
+    );
+    let results = source_between(
+        &source,
+        "fn object_entry_results(",
+        "fn object_entry_find(",
+    );
+    assert!(
+        results.contains("OBJECT_ACTION_ENCAPSULATE")
+            && results.contains("OBJECT_ACTION_DECAPSULATE"),
+        "generic result retention must skip both KEM actions"
+    );
+    let kem = source_between(&source, "fn object_entry_kem(", "fn object_entry_results(");
+    assert!(
+        kem.contains("adapter_kem_entry"),
+        "the KEM wrapper must call the shared adapter"
+    );
+    assert!(
+        kem.contains("KEM_CAPTURE_WIRED"),
+        "the KEM wrapper must pass the build FULL gate, never a literal"
+    );
+    assert!(
+        kem.contains("OUTPUT_MASK") && kem.contains("OUTPUT_NON_NULL"),
+        "the KEM wrapper must derive the query verdict from the owned S1 output state"
+    );
+    let entry = source_between(
+        &source,
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(",
+        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+    );
+    assert_eq!(
+        entry.matches("object_entry_kem(").count(),
+        1,
+        "entry must call the KEM wrapper at exactly one site"
+    );
+}
+
 /// The private validated tail accompanies the owned H3 routed call into
 /// the consuming admission result, but it cannot construct the H9 model:
 /// no ObjectDomain, OriginFact, RefCut, CallToken, CompleteInputPrefix,

@@ -1328,6 +1328,759 @@ mod tests {
         }
     }
 
+    /// One scripted entry-argument table plus fetch/read spies for the
+    /// KEM entry adapter. Register fetches resolve from `args`;
+    /// `reads` logs every target-word address in order.
+    struct KemSpy {
+        args: [(u8, Option<u64>); 7],
+        fetches: Vec<u8>,
+        reads: Vec<u64>,
+        cell: Result<u64, ()>,
+    }
+
+    impl KemSpy {
+        fn new(args: [(u8, Option<u64>); 7], cell: Result<u64, ()>) -> Self {
+            Self {
+                args,
+                fetches: Vec::new(),
+                reads: Vec::new(),
+                cell,
+            }
+        }
+
+        fn fetch(&mut self, index: u8) -> Option<u64> {
+            self.fetches.push(index);
+            self.args
+                .iter()
+                .find(|(slot, _)| *slot == index)
+                .and_then(|(_, value)| *value)
+        }
+
+        fn read(&mut self, address: u64) -> Result<u64, ()> {
+            self.reads.push(address);
+            self.cell
+        }
+    }
+
+    fn kem_row(encapsulate: bool) -> ObjectDescriptorWire {
+        crate::object_wire::canonical_object_wire(if encapsulate { 92 } else { 93 })
+    }
+
+    fn kem_descriptor(encapsulate: bool) -> u32 {
+        if encapsulate { 93 } else { 94 }
+    }
+
+    // Mutation caught: a KEM input/result acquisition outside FULL, a
+    // template-pointee read, or a retained result on a refused path.
+    #[test]
+    fn kem_entry_acquires_input_and_result_on_healthy_full_call() {
+        use crate::object_capture::handle_status as hst;
+        for encapsulate in [true, false] {
+            for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+                let w = layout.word_bytes() as u64;
+                let sp = 0x1000u64;
+                let arg7 = if layout == LinuxLayout::Lp64 {
+                    sp + 16
+                } else {
+                    sp + 32
+                };
+                // Disjoint guard spans: template header at 0x5000 (2
+                // slots), length cell at 0x6000, result cell at 0x7000.
+                let template = 0x5000u64;
+                let length_cell = 0x6000u64;
+                let cell = 0x7000u64;
+                let mut spy = KemSpy::new(
+                    [
+                        (2, Some(0x1111)),
+                        (3, Some(template)),
+                        (4, Some(2)),
+                        (5, Some(0x8000)),
+                        (6, Some(length_cell)),
+                        (7, None),
+                        (0, None),
+                    ],
+                    Ok(cell),
+                );
+                let mut side = ObjectStart::default();
+                let row = kem_row(encapsulate);
+                let mut fetch = |index: u8| spy.fetch(index);
+                assert!(adapter_kem_entry(
+                    Some(&mut side),
+                    kem_descriptor(encapsulate),
+                    Some(&row),
+                    layout,
+                    sp,
+                    true,
+                    true,
+                    false,
+                    &mut fetch,
+                    |address| spy.read(address),
+                ));
+                assert_eq!(side.inputs, [0x1111, 0]);
+                assert_eq!(side.input_statuses, [hst::VALUE, hst::ABSENT]);
+                assert_eq!(side.result_ptrs, [cell, 0]);
+                assert_eq!(side.flags, 0);
+                // Decap never fetches the scalar arg 6; encap fetches
+                // the length-cell address as span-guard evidence only.
+                if encapsulate {
+                    assert_eq!(spy.fetches, vec![2, 3, 4, 6]);
+                } else {
+                    assert_eq!(spy.fetches, vec![2, 3, 4]);
+                }
+                // Exactly one target read: the arg-7 stack slot. No
+                // template header/value, ciphertext or length value.
+                assert_eq!(spy.reads, vec![arg7]);
+                assert_eq!(w, if layout == LinuxLayout::Lp64 { 8 } else { 4 });
+            }
+        }
+    }
+
+    // Mutation caught: a P0 KEM input or result-pointer acquisition.
+    // The gate is a runtime parameter so both branches run here; the
+    // BPF wrapper passes the build's KEM_CAPTURE_WIRED constant.
+    #[test]
+    fn kem_entry_p0_gate_refuses_before_any_fetch() {
+        use crate::object_capture::handle_status as hst;
+        for encapsulate in [true, false] {
+            for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+                let mut spy = KemSpy::new(
+                    [
+                        (2, Some(0x1111)),
+                        (3, Some(0x5000)),
+                        (4, Some(2)),
+                        (5, Some(0x8000)),
+                        (6, Some(0x6000)),
+                        (7, None),
+                        (0, None),
+                    ],
+                    Ok(0x7000),
+                );
+                let mut side = ObjectStart::default();
+                let row = kem_row(encapsulate);
+                let mut fetch = |index: u8| spy.fetch(index);
+                assert!(adapter_kem_entry(
+                    Some(&mut side),
+                    kem_descriptor(encapsulate),
+                    Some(&row),
+                    layout,
+                    0x1000,
+                    false,
+                    true,
+                    false,
+                    &mut fetch,
+                    |address| spy.read(address),
+                ));
+                assert!(spy.fetches.is_empty());
+                assert!(spy.reads.is_empty());
+                assert_eq!(side.inputs, [0, 0]);
+                assert_eq!(
+                    side.input_statuses,
+                    [hst::PROTOCOL_UNAVAILABLE, hst::ABSENT]
+                );
+                assert_eq!(side.result_ptrs, [0, 0]);
+            }
+        }
+    }
+
+    // Mutation caught: a retained result pointer (or an arg-7 read)
+    // on an encapsulation query shape. The input scalar stays
+    // acquired; output authority alone is refused.
+    #[test]
+    fn kem_entry_query_shape_retains_no_result_pointer() {
+        use crate::object_capture::handle_status as hst;
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let mut spy = KemSpy::new(
+                [
+                    (2, Some(0x1111)),
+                    (3, Some(0x5000)),
+                    (4, Some(2)),
+                    (5, Some(0)),
+                    (6, Some(0x6000)),
+                    (7, None),
+                    (0, None),
+                ],
+                Ok(0x7000),
+            );
+            let mut side = ObjectStart::default();
+            let row = kem_row(true);
+            let mut fetch = |index: u8| spy.fetch(index);
+            assert!(adapter_kem_entry(
+                Some(&mut side),
+                kem_descriptor(true),
+                Some(&row),
+                layout,
+                0x1000,
+                true,
+                false,
+                false,
+                &mut fetch,
+                |address| spy.read(address),
+            ));
+            assert_eq!(side.inputs, [0x1111, 0]);
+            assert_eq!(side.input_statuses, [hst::VALUE, hst::ABSENT]);
+            assert_eq!(side.result_ptrs, [0, 0]);
+            assert_eq!(spy.fetches, vec![2]);
+            assert!(spy.reads.is_empty());
+            // Decap has no query shape: a negative output verdict
+            // still retains (the scalar arg 6 is never consulted).
+            let mut spy = KemSpy::new(
+                [
+                    (2, Some(0x1111)),
+                    (3, Some(0x5000)),
+                    (4, Some(2)),
+                    (5, Some(0x8000)),
+                    (6, Some(9)),
+                    (7, None),
+                    (0, None),
+                ],
+                Ok(0x7000),
+            );
+            let mut side = ObjectStart::default();
+            let row = kem_row(false);
+            let mut fetch = |index: u8| spy.fetch(index);
+            assert!(adapter_kem_entry(
+                Some(&mut side),
+                kem_descriptor(false),
+                Some(&row),
+                layout,
+                0x1000,
+                true,
+                false,
+                false,
+                &mut fetch,
+                |address| spy.read(address),
+            ));
+            assert_eq!(side.result_ptrs, [0x7000, 0]);
+            assert_eq!(spy.fetches, vec![2, 3, 4]);
+        }
+    }
+
+    // Mutation caught: a retained result on an overlapping template
+    // header or length cell, on unavailable guard bounds, or on an
+    // unreadable arg-7 stack word.
+    #[test]
+    fn kem_entry_span_and_cell_refusals_withhold_output() {
+        use crate::object_capture::handle_status as hst;
+        // (template ptr, count, length cell, stack cell, retain?)
+        // Result cell at 0x7000 (LP64 words); template header two
+        // slots (48 bytes) unless noted.
+        for (variant, (template, count, length_cell, stack_cell, retain, reads)) in [
+            // Template header overlap withholds.
+            (
+                Some(0x6FF0u64),
+                Some(2u64),
+                Some(0x6000u64),
+                Ok(0x7000u64),
+                false,
+                1usize,
+            ),
+            // Template count overflow withholds (bound unavailable).
+            (
+                Some(0x5000u64),
+                Some(u64::MAX),
+                Some(0x6000u64),
+                Ok(0x7000u64),
+                false,
+                1,
+            ),
+            // Unreadable template words withhold (bound unavailable).
+            (None, Some(2u64), Some(0x6000u64), Ok(0x7000u64), false, 1),
+            (
+                Some(0x5000u64),
+                None,
+                Some(0x6000u64),
+                Ok(0x7000u64),
+                false,
+                1,
+            ),
+            // Length-cell overlap withholds.
+            (
+                Some(0x5000u64),
+                Some(2u64),
+                Some(0x7004u64),
+                Ok(0x7000u64),
+                false,
+                1,
+            ),
+            // Unreadable length-cell address withholds.
+            (
+                Some(0x5000u64),
+                Some(2u64),
+                None,
+                Ok(0x7000u64),
+                false,
+                1,
+            ),
+            // NULL length cell has no span: healthy retention.
+            (
+                Some(0x5000u64),
+                Some(2u64),
+                Some(0u64),
+                Ok(0x7000u64),
+                true,
+                1,
+            ),
+            // Empty template authorizes no span: healthy retention.
+            (
+                Some(0x5000u64),
+                Some(0u64),
+                Some(0x6000u64),
+                Ok(0x7000u64),
+                true,
+                1,
+            ),
+            // Over-cap template count still guards by arithmetic alone:
+            // no reads, healthy retention when disjoint.
+            (
+                Some(0x5000u64),
+                Some(9u64),
+                Some(0x6000u64),
+                Ok(0x7000u64),
+                true,
+                1,
+            ),
+            // Malformed template span (null base, nonzero count)
+            // withholds: the required bound is unusable.
+            (
+                Some(0u64),
+                Some(2u64),
+                Some(0x6000u64),
+                Ok(0x7000u64),
+                false,
+                1,
+            ),
+            // Unreadable arg-7 stack word retains nothing.
+            (
+                Some(0x5000u64),
+                Some(2u64),
+                Some(0x6000u64),
+                Err(()),
+                false,
+                1,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut spy = KemSpy::new(
+                [
+                    (2, Some(0x1111)),
+                    (3, template),
+                    (4, count),
+                    (5, Some(0x8000)),
+                    (6, length_cell),
+                    (7, None),
+                    (0, None),
+                ],
+                stack_cell,
+            );
+            let mut side = ObjectStart::default();
+            let row = kem_row(true);
+            let mut fetch = |index: u8| spy.fetch(index);
+            assert!(
+                adapter_kem_entry(
+                    Some(&mut side),
+                    kem_descriptor(true),
+                    Some(&row),
+                    LinuxLayout::Lp64,
+                    0x1000,
+                    true,
+                    true,
+                    false,
+                    &mut fetch,
+                    |address| spy.read(address),
+                ),
+                "variant {variant}"
+            );
+            assert_eq!(side.inputs, [0x1111, 0], "variant {variant}");
+            assert_eq!(
+                side.input_statuses,
+                [hst::VALUE, hst::ABSENT],
+                "variant {variant}"
+            );
+            assert_eq!(
+                side.result_ptrs,
+                if retain { [0x7000, 0] } else { [0, 0] },
+                "variant {variant}"
+            );
+            // The only target read is the arg-7 stack slot itself.
+            assert_eq!(spy.reads.len(), reads, "variant {variant}");
+            assert!(
+                spy.reads.iter().all(|address| *address == 0x1010),
+                "variant {variant}"
+            );
+        }
+        // An invalid result-cell span retains the pointer: return
+        // marks INVALID_SPAN (never reads); overlap checks need a
+        // valid cell first.
+        let mut spy = KemSpy::new(
+            [
+                (2, Some(0x1111)),
+                (3, Some(0x5000)),
+                (4, Some(2)),
+                (5, Some(0x8000)),
+                (6, Some(0x6000)),
+                (7, None),
+                (0, None),
+            ],
+            Ok(u64::MAX),
+        );
+        let mut side = ObjectStart::default();
+        let row = kem_row(true);
+        let mut fetch = |index: u8| spy.fetch(index);
+        assert!(adapter_kem_entry(
+            Some(&mut side),
+            kem_descriptor(true),
+            Some(&row),
+            LinuxLayout::Lp64,
+            0x1000,
+            true,
+            true,
+            false,
+            &mut fetch,
+            |address| spy.read(address),
+        ));
+        assert_eq!(side.result_ptrs, [u64::MAX, 0]);
+        assert_eq!(spy.reads, vec![0x1010]);
+        // A wrapping arg-7 stack address refuses loudly (mirrors
+        // pair/unwrap retention): the invocation abandons, no read.
+        let mut spy = KemSpy::new(
+            [
+                (2, Some(0x1111)),
+                (3, Some(0x5000)),
+                (4, Some(2)),
+                (5, Some(0x8000)),
+                (6, Some(0x6000)),
+                (7, None),
+                (0, None),
+            ],
+            Ok(0x7000),
+        );
+        let mut side = ObjectStart::default();
+        let row = kem_row(true);
+        let mut fetch = |index: u8| spy.fetch(index);
+        assert!(!adapter_kem_entry(
+            Some(&mut side),
+            kem_descriptor(true),
+            Some(&row),
+            LinuxLayout::Lp64,
+            u64::MAX - 15,
+            true,
+            true,
+            false,
+            &mut fetch,
+            |address| spy.read(address),
+        ));
+        assert!(spy.reads.is_empty());
+    }
+
+    // Mutation caught: KEM input rules drifting from the entry core
+    // (unreadable/zero/width/null-cancel), or a touched slot 1.
+    #[test]
+    fn kem_entry_inputs_mirror_the_entry_core() {
+        use crate::object_capture::handle_status as hst;
+        use crate::object_capture::object_flag as ofl;
+        for (input, layout, status, word, flags) in [
+            (None, LinuxLayout::Lp64, hst::UNREADABLE, 0, ofl::ARG_READ_FAILURE),
+            (
+                Some(0),
+                LinuxLayout::Lp64,
+                hst::INVALID_ZERO,
+                0,
+                0,
+            ),
+            (
+                Some(0x1_0000_0001),
+                LinuxLayout::Ilp32,
+                hst::INVALID_SPAN,
+                0,
+                0,
+            ),
+            (
+                Some(u32::MAX as u64),
+                LinuxLayout::Ilp32,
+                hst::VALUE,
+                u32::MAX as u64,
+                0,
+            ),
+        ] {
+            let mut spy = KemSpy::new(
+                [
+                    (2, input),
+                    (3, Some(0x5000)),
+                    (4, Some(2)),
+                    (5, Some(0x8000)),
+                    (6, Some(0x6000)),
+                    (7, None),
+                    (0, None),
+                ],
+                Ok(0x7000),
+            );
+            let mut side = ObjectStart::default();
+            let row = kem_row(true);
+            let mut fetch = |index: u8| spy.fetch(index);
+            assert!(adapter_kem_entry(
+                Some(&mut side),
+                kem_descriptor(true),
+                Some(&row),
+                layout,
+                0x1000,
+                true,
+                true,
+                false,
+                &mut fetch,
+                |address| spy.read(address),
+            ));
+            assert_eq!(side.inputs, [word, 0]);
+            assert_eq!(side.input_statuses, [status, hst::ABSENT]);
+            assert_eq!(side.flags, flags as u16);
+        }
+        // Null-mechanism cancellation suppresses a value input in place.
+        let mut spy = KemSpy::new(
+            [
+                (2, Some(0x1111)),
+                (3, Some(0x5000)),
+                (4, Some(2)),
+                (5, Some(0x8000)),
+                (6, Some(0x6000)),
+                (7, None),
+                (0, None),
+            ],
+            Ok(0x7000),
+        );
+        let mut side = ObjectStart::default();
+        let row = kem_row(false);
+        let mut fetch = |index: u8| spy.fetch(index);
+        assert!(adapter_kem_entry(
+            Some(&mut side),
+            kem_descriptor(false),
+            Some(&row),
+            LinuxLayout::Lp64,
+            0x1000,
+            true,
+            true,
+            true,
+            &mut fetch,
+            |address| spy.read(address),
+        ));
+        assert_eq!(side.inputs, [0, 0]);
+        assert_eq!(side.input_statuses, [hst::SUPPRESSED, hst::ABSENT]);
+        assert_eq!(side.flags, ofl::NULL_MECHANISM_CANCEL as u16);
+        assert_eq!(side.result_ptrs, [0x7000, 0]);
+    }
+
+    // Mutation caught: KEM handling leaking onto another family, or a
+    // silently accepted row/descriptor mismatch.
+    #[test]
+    fn kem_entry_ignores_other_families_and_mismatches() {
+        let create = crate::object_wire::canonical_object_wire(20);
+        let mut spy = KemSpy::new(
+            [
+                (2, Some(0x1111)),
+                (3, Some(0x5000)),
+                (4, Some(2)),
+                (5, Some(0x8000)),
+                (6, Some(0x6000)),
+                (7, None),
+                (0, None),
+            ],
+            Ok(0x7000),
+        );
+        let mut side = ObjectStart::default();
+        side.inputs = [0xAAAA, 0xBBBB];
+        let mut fetch = |index: u8| spy.fetch(index);
+        assert!(adapter_kem_entry(
+            Some(&mut side),
+            21,
+            Some(&create),
+            LinuxLayout::Lp64,
+            0x1000,
+            true,
+            true,
+            false,
+            &mut fetch,
+            |address| spy.read(address),
+        ));
+        assert!(spy.fetches.is_empty());
+        assert!(spy.reads.is_empty());
+        assert_eq!(side.inputs, [0xAAAA, 0xBBBB]);
+        assert_eq!(side.result_ptrs, [0, 0]);
+        // Custody/row failures refuse loudly without touching memory.
+        let row = kem_row(true);
+        for (side_none, row_none, descriptor) in
+            [(true, false, 93u32), (false, true, 93), (false, false, 94)]
+        {
+            let mut spy = KemSpy::new(
+                [
+                    (2, Some(0x1111)),
+                    (3, Some(0x5000)),
+                    (4, Some(2)),
+                    (5, Some(0x8000)),
+                    (6, Some(0x6000)),
+                    (7, None),
+                    (0, None),
+                ],
+                Ok(0x7000),
+            );
+            let mut side = ObjectStart::default();
+            let side_ref = (!side_none).then_some(&mut side);
+            let row_ref = (!row_none).then_some(&row);
+            let mut fetch = |index: u8| spy.fetch(index);
+            assert!(!adapter_kem_entry(
+                side_ref,
+                descriptor,
+                row_ref,
+                LinuxLayout::Lp64,
+                0x1000,
+                true,
+                true,
+                false,
+                &mut fetch,
+                |address| spy.read(address),
+            ));
+            assert!(spy.fetches.is_empty());
+            assert!(spy.reads.is_empty());
+        }
+        // A KEM action with a non-KEM row shape refuses loudly.
+        let mut bad = row;
+        bad.result_args = [6, crate::ARG_NONE];
+        let mut spy = KemSpy::new(
+            [
+                (2, Some(0x1111)),
+                (3, Some(0x5000)),
+                (4, Some(2)),
+                (5, Some(0x8000)),
+                (6, Some(0x6000)),
+                (7, None),
+                (0, None),
+            ],
+            Ok(0x7000),
+        );
+        let mut side = ObjectStart::default();
+        let mut fetch = |index: u8| spy.fetch(index);
+        assert!(!adapter_kem_entry(
+            Some(&mut side),
+            93,
+            Some(&bad),
+            LinuxLayout::Lp64,
+            0x1000,
+            true,
+            true,
+            false,
+            &mut fetch,
+            |address| spy.read(address),
+        ));
+        assert!(spy.fetches.is_empty());
+        assert!(spy.reads.is_empty());
+    }
+
+    // Mutation caught: a KEM result-cell read on a refused path, a
+    // pair/duplicate/partial rule firing with slot 1 absent, or a
+    // bypass of the joined-continuity gate.
+    #[test]
+    fn kem_return_uses_single_result_protocol() {
+        use crate::object_capture::handle_status as hst;
+        use crate::object_capture::object_flag as ofl;
+        for encapsulate in [true, false] {
+            for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+                let row = kem_row(encapsulate);
+                let descriptor = kem_descriptor(encapsulate);
+                // Healthy CKR_OK: exactly one read at the retained
+                // pointer; slot 1 stays absent; no pair flags.
+                for (cell, status) in [(0x777u64, hst::VALUE), (0, hst::INVALID_ZERO)] {
+                    let mut side = ObjectStart::default();
+                    side.descriptor_index = descriptor;
+                    side.phase = 2;
+                    side.result_ptrs = [0x7000, 0];
+                    let reads = core::cell::Cell::new(0u32);
+                    let ok = adapter_fill_return(
+                        Some(&mut side),
+                        descriptor,
+                        Some(&row),
+                        0,
+                        layout,
+                        0,
+                        0,
+                        true,
+                        |address| {
+                            reads.set(reads.get() + 1);
+                            assert_eq!(address, 0x7000);
+                            Ok(cell)
+                        },
+                    );
+                    assert!(ok);
+                    assert_eq!(reads.get(), 1);
+                    assert_eq!(side.result_statuses, [status, hst::ABSENT]);
+                    assert_eq!(side.result_ptrs, [if status == hst::VALUE { cell } else { 0 }, 0]);
+                    assert_eq!(side.flags & (ofl::ALIAS | ofl::DUPLICATE_RESULT | ofl::PARTIAL_RESULT) as u16, 0);
+                    assert_eq!(side.phase, 3);
+                }
+                // Unreadable cell: finite status, never a value.
+                let mut side = ObjectStart::default();
+                side.descriptor_index = descriptor;
+                side.phase = 2;
+                side.result_ptrs = [0x7000, 0];
+                assert!(adapter_fill_return(
+                    Some(&mut side),
+                    descriptor,
+                    Some(&row),
+                    0,
+                    layout,
+                    0,
+                    0,
+                    true,
+                    |_| Err(()),
+                ));
+                assert_eq!(side.result_statuses, [hst::UNREADABLE, hst::ABSENT]);
+                assert_eq!(side.result_ptrs, [0, 0]);
+                // Every refused path reads nothing: non-OK RV, denied
+                // continuity, null and invalid-span pointers.
+                for (rv, joined, ptr) in [
+                    (0x150u64, true, 0x7000u64),
+                    (516u64, true, 0x7000u64),
+                    (0u64, false, 0x7000u64),
+                    (0u64, true, 0u64),
+                    (0u64, true, u64::MAX),
+                ] {
+                    let mut side = ObjectStart::default();
+                    side.descriptor_index = descriptor;
+                    side.phase = 2;
+                    side.result_ptrs = [ptr, 0];
+                    let reads = core::cell::Cell::new(0u32);
+                    let ok = adapter_fill_return(
+                        Some(&mut side),
+                        descriptor,
+                        Some(&row),
+                        rv,
+                        layout,
+                        0,
+                        0,
+                        joined,
+                        |_| {
+                            reads.set(reads.get() + 1);
+                            Ok(0x777)
+                        },
+                    );
+                    assert_eq!(reads.get(), 0, "rv {rv:#x} joined {joined} ptr {ptr:#x}");
+                    if !joined {
+                        assert!(!ok);
+                    } else {
+                        assert!(ok);
+                        let expected = if rv != 0 {
+                            hst::PROTOCOL_UNAVAILABLE
+                        } else if ptr == 0 {
+                            hst::UNREADABLE
+                        } else {
+                            hst::INVALID_SPAN
+                        };
+                        assert_eq!(side.result_statuses, [expected, hst::ABSENT]);
+                        assert_eq!(side.result_ptrs, [0, 0]);
+                    }
+                }
+            }
+        }
+    }
+
     /// P0-only ship vehicle: the default build wires FULL object
     /// attribute capture. Only the `stub-object-attributes` BPF build
     /// shuts the gate; its qualification is the P0 artifact contract

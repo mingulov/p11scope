@@ -1104,10 +1104,9 @@ pub(crate) fn read_elf_needed(
     let Some(strtab_off) = offset.checked_add(delta) else {
         return Err(ElfReadFailure::Malformed);
     };
-    let (Some(strtab_end), Some(load_end)) = (
-        strtab_off.checked_add(strsz),
-        offset.checked_add(*filesz),
-    ) else {
+    let (Some(strtab_end), Some(load_end)) =
+        (strtab_off.checked_add(strsz), offset.checked_add(*filesz))
+    else {
         return Err(ElfReadFailure::Malformed);
     };
     if strtab_end > load_end {

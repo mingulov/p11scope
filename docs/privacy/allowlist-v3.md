@@ -82,6 +82,14 @@ remain forbidden. A generic argument-reader implementation accepting 7 is
 not authority: userspace publication and the kernel descriptor must both
 enforce the named-function restriction.
 
+Amendment (packet 6.07c, owner P1 clause 2): extend the named
+argument-7 exception to these two functions only — `C_EncapsulateKey`
+and `C_DecapsulateKey` result pointers: LP64 entry-SP+16 or ia32
+entry-SP+32, with complete-word bounds checks. The KEM rows below
+carry no template authorization: template pointer/count scalars may
+bound span guards, but no template header or value is read. No other
+descriptor may request 7; indices 8 or higher remain forbidden.
+
 ## Exact object descriptor combinations
 
 Unlisted combinations add no capture permission. Session argument 0 is the
@@ -99,6 +107,8 @@ the stated observation. Failed creation produces no object or creation time.
 | `C_GenerateKeyPair` | None | public out 6, private out 7; distinct results | public 2 / 3, private 4 / 5 |
 | `C_DeriveKey` | base key 2 | out 5 only for a supported scalar-result mechanism below; no identity with base | 3 / 4 only after the same entry-time mechanism guard |
 | `C_UnwrapKey` | unwrapping key 2 | out 7 | 5 / 6 |
+| `C_EncapsulateKey` | encapsulation key 2 | out 7; only with a positively non-null entry ciphertext pointer | None (T0: no template read) |
+| `C_DecapsulateKey` | decapsulation key 2 | out 7 | None (T0: no template read) |
 | `C_DestroyObject`, `C_GetObjectSize`, `C_GetAttributeValue`, `C_SetAttributeValue` | object 1 | None | None; `C_GetAttributeValue` uses the separate result protocol below |
 | `C_EncryptInit`, `C_DecryptInit`, `C_SignInit`, `C_SignRecoverInit`, `C_VerifyInit`, `C_VerifyRecoverInit` | key 2 | None | None |
 | `C_MessageEncryptInit`, `C_MessageDecryptInit`, `C_MessageSignInit`, `C_MessageVerifyInit`, `C_VerifySignatureInit` | key 2 | None | None |
@@ -188,7 +198,11 @@ explicit, narrow internal exceptions, not finite attribute values.
 | Find entry capacity | Arg 2, target-width scalar; retain only validation/cap state. | Private in-flight state; publish bounded decoded count and truncation status, not arbitrary caller capacity. | Count/capacity violation permits no array read. C4. |
 | Find returned-count pointer | Arg 3; full target-word span; matched CKR_OK only. | Private in-flight state only. | Null/unreadable count permits no array read. C1/C4. |
 | Find returned count and handles | Read count once; require `count <= entry_capacity`; validate the complete claimed array span before reading at most eight handles. Recheck count after the bounded read. | At most eight private handle words; publish first-observed pseudonyms, decoded count 0..8 and a truncation flag. No raw count/array. | Changed count discards the batch; failed element is unknown, never a zero handle. Count >8 records bounded omission and invalidates any assumption of an exhaustive search. C4. |
-| Template pointer and count | Only the six creation families above, or `C_GetAttributeValue` args 2/3; checked `count * 3W` span. Inspect first eight slots of each allowed template. | Request templates read at entry and discarded; GetAttribute headers retained only until matching return. Publish finite omission/read status, not raw count/pointer. | Overflow refuses decode; >8 records truncation; a failed header is unknown. Never recurse into array attributes. C1/C5/C6. |
+| Template pointer and count | Only the six template-authorized creation families above (KEM excluded under T0), or `C_GetAttributeValue` args 2/3; checked `count * 3W` span. Inspect first eight slots of each allowed template. | Request templates read at entry and discarded; GetAttribute headers retained only until matching return. Publish finite omission/read status, not raw count/pointer. | Overflow refuses decode; >8 records truncation; a failed header is unknown. Never recurse into array attributes. C1/C5/C6. |
+| KEM template-header span scalars | `C_EncapsulateKey`/`C_DecapsulateKey` args 3/4 register words only: checked `count * 3W` span arithmetic to test disjointness from the result cell. No template header or value is read under T0. | Probe scratch during entry only; no retention, no publication. | Unreadable words, overflowing count, or an invalid/overlapping span withholds the result pointer (unavailable); over-cap counts guard by arithmetic alone. C1/C3. |
+| KEM length-cell address | `C_EncapsulateKey` arg 6 register word only: one-word span guard against the result cell; the length value is never read. Decapsulation arg 6 is a scalar length value and is never consulted. | Probe scratch during entry only; no retention, no publication. | Unreadable address or an invalid/overlapping span withholds the result pointer; null has no span. C1/C3. |
+| KEM entry ciphertext-pointer decision | The owned call's validated S1 entry output-pointer state (finite null/non-null/unreadable class, never an address) for `C_EncapsulateKey`: only a positively non-null decision authorizes result-pointer retention. | Decided at entry; retained as retained-vs-zero result pointer only, in the existing fixed side-row fields (no new retained KEM field). Public result-unavailable reason only. | Null or unavailable decision retains no pointer: zero result-cell reads, no output authority, no key-use count. S1 call accounting unchanged. C1/C3. |
+| KEM capture flavor gate | FULL builds only (`KEM_CAPTURE_WIRED`); P0 refuses KEM input and result-pointer acquisition before any fetch. Clearing follows the existing result-pointer row: private in-flight state only, cleared on every terminal, loss, cancellation, exec or teardown path. | No KEM state exists in P0; FULL retains only the existing fixed side-row fields above. | P0 KEM calls stay S1-only with explicit unavailability. C1. |
 | Attribute selector | Read just `CK_ATTRIBUTE.type` to test equality against the six identifiers below before reading its pointer/length. | Retain a six-value selector enum only; unknown selectors are discarded without retaining their raw number or reading their pointer/length. | No new `CKA_ID` collection or pre-collection, including its value, length or pointer. C5/C6. |
 | Attribute value pointer | Only after selector equality; GetAttribute retains entry pointer and compares returned header pointer before decode. | Private in-flight GetAttribute slots only; request pointer is transient probe scratch. No pointer in result transport. | Null is size-only for GetAttribute, unavailable for requests; pointer/header changes or detectable overlap refuse the affected values. C1/C5/C6. |
 | Attribute entry capacity / returned length | Read the named selector's `ulValueLen`; target word, exact accepted value size and full-span checks. GetAttribute retains capacity and reads returned length. | Private in-flight validation; only finite state such as `size_only`, `unavailable`, `invalid_length`, `changed`, `unreadable` is public. | Width-correct unavailable sentinel, growing length, zero/wrong length, insufficient entry capacity, read failure: no value read. C5/C6. |
@@ -908,6 +922,13 @@ performs no attribute read. P0 marks present lists `UNINSPECTED`, and
 reports `evidence.object_capture = {available: false, reason: "not_enabled"}`.
 FULL reports `available: true`, which is a build fact, not evidence that any
 attribute was observed.
+
+Packet 6.07c KEM reads are FULL-only: P0 acquires nothing for KEM —
+the KEM adapter refuses input and result-pointer acquisition before
+any fetch (the attribute stub alone does not cover them, so the KEM
+adapter carries its own `KEM_CAPTURE_WIRED` gate). P0 KEM calls stay
+S1-only with explicit unavailability; FULL KEM capture follows the D1
+rows above.
 
 In FULL builds, for object-marked calls under `allowlisted`, `p11_entry`
 performs the inspection described here for both LP64 and ia32 callers

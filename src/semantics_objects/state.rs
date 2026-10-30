@@ -18,9 +18,9 @@ use super::{
     CompletedFact, CreationFamily, FieldState, FieldValue, FindResult, HandleInput, KeyLabel,
     Lifetime, LostOutcome, METADATA_FIELDS, MechanismEvidence, MetadataView, ObjectDomain,
     ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId, ObjectLimits, ObjectProjection,
-    ObjectView, OriginFact, QueryStatus, ResultSlot, SessionEnd, SessionHandle, SessionIncarnation,
-    SessionOrigin, SessionState, SessionView, SlotScope, StateEstimate, StateUsage, ViewOrigin,
-    field_index,
+    ObjectView, OriginFact, OutputEvidence, QueryStatus, ResultSlot, SessionEnd, SessionHandle,
+    SessionIncarnation, SessionOrigin, SessionState, SessionView, SlotScope, StateEstimate,
+    StateUsage, ViewOrigin, field_index,
 };
 use p11scope_ebpf_common::object_policy::{
     DeriveResultProtocol, ObjectAction, SafeAttributeKind, authorized_result_pointer_args,
@@ -238,6 +238,8 @@ fn creation_family(action: ObjectAction) -> Option<CreationFamily> {
         ObjectAction::GeneratePair => Some(CreationFamily::GeneratePair),
         ObjectAction::Derive => Some(CreationFamily::Derive),
         ObjectAction::Unwrap => Some(CreationFamily::Unwrap),
+        ObjectAction::Encapsulate => Some(CreationFamily::Encapsulate),
+        ObjectAction::Decapsulate => Some(CreationFamily::Decapsulate),
         _ => None,
     }
 }
@@ -338,6 +340,8 @@ struct PendingCall {
     /// Only the finite entry protocol is retained, never the raw word.
     derive_protocol: DeriveResultProtocol,
     entry_mechanism: MechClass,
+    /// Finite S1 output-pointer decision (encapsulation query guard).
+    entry_output: OutputEvidence,
     scope: SlotScope,
     completion: Option<Completion>,
     fenced: bool,
@@ -964,6 +968,7 @@ impl ModelState {
             requested: origin.requested,
             derive_protocol,
             entry_mechanism: MechClass::of(origin.entry_mechanism),
+            entry_output: origin.entry_output,
             scope: origin.scope,
             completion: None,
             fenced: false,
@@ -2453,7 +2458,9 @@ impl ModelState {
         // F4 key-use rule, per arm exactly as the Ok path: creation
         // freezes a use only for derive/unwrap; access freezes a use
         // for Access/OperationImport except GetObjectSize; destroy,
-        // find and attributes never freeze a key use.
+        // find and attributes never freeze a key use. KEM freezes no
+        // positive at all (see below): its deferred inputs stay
+        // unproven even though the Ok path counts a key use.
         let key_use = match call.kind {
             CallKind::Object(action) => match creation_family(action) {
                 Some(CreationFamily::Derive | CreationFamily::Unwrap) => true,
@@ -2465,12 +2472,25 @@ impl ModelState {
             },
             _ => false,
         };
+        // KEM deferred origins mint their uncertainty record but
+        // freeze no positive: completion can never redeem a frozen
+        // KEM use. The pending-result uncertainty is preserved.
+        let kem_no_freeze = match call.kind {
+            CallKind::Object(action) => matches!(
+                creation_family(action),
+                Some(CreationFamily::Encapsulate | CreationFamily::Decapsulate)
+            ),
+            _ => false,
+        };
         let mut inputs = [DeferredInput::Absent; 2];
         if let Some(s) = session {
             for (index, slot) in inputs.iter_mut().enumerate() {
                 *slot = match call.snapshot.inputs[index] {
                     OriginState::Absent => DeferredInput::Absent,
                     OriginState::Unproven(reason) => DeferredInput::Unproven(reason),
+                    OriginState::Settled(id) if kem_no_freeze => {
+                        DeferredInput::Unproven(ObjectGap::PendingResultUnavailable)
+                    }
                     OriginState::Settled(id) => match call.inputs[index] {
                         HandleInput::Value(handle)
                             if self.domains[&call.domain].bindings.get(&(s, handle))
@@ -2861,9 +2881,27 @@ impl ModelState {
             }
             return;
         }
-        // Inputs: copy source is a reference; derive base/unwrapping key a use.
+        // Encapsulation query shapes (null or unavailable entry
+        // ciphertext-pointer decision) supply no output authority
+        // and count no key use: a length probe performs no
+        // cryptographic operation. The sentinel cell is untouched
+        // garbage and must not tombstone anything.
+        if matches!(family, CreationFamily::Encapsulate)
+            && call.entry_output != OutputEvidence::NonNull
+        {
+            self.unresolved(effects, token, ObjectGap::ResultProtocolUnavailable);
+            return;
+        }
+        // Inputs: copy source is a reference; derive base/unwrapping
+        // key/KEM input a use.
         if call.inputs[0] != HandleInput::Absent {
-            let key_use = matches!(family, CreationFamily::Derive | CreationFamily::Unwrap);
+            let key_use = matches!(
+                family,
+                CreationFamily::Derive
+                    | CreationFamily::Unwrap
+                    | CreationFamily::Encapsulate
+                    | CreationFamily::Decapsulate
+            );
             match self.join_input(call, token, 0, session, effects) {
                 Ok(Some(id)) => self.reference(token, id, key_use, Some(0), effects),
                 Ok(None) => {}
@@ -2890,6 +2928,20 @@ impl ModelState {
         if candidates.len() == 2 && candidates[0].1 == candidates[1].1 {
             self.unresolved(effects, token, ObjectGap::PairDuplicate);
             self.tombstone(call.domain, session, candidates[0].1, effects);
+            return;
+        }
+        // Conservative KEM collision rule: an output handle equal to
+        // this call's input handle creates no output object and never
+        // merges identities (generic HandleReuse would otherwise
+        // retire the live input and mint over it). The input use
+        // above stands; only output creation is refused, without
+        // tombstoning the live input binding.
+        if matches!(
+            family,
+            CreationFamily::Encapsulate | CreationFamily::Decapsulate
+        ) && matches!(call.inputs[0], HandleInput::Value(input) if candidates.iter().any(|(_, h)| *h == input))
+        {
+            self.unresolved(effects, token, ObjectGap::OutputCollision);
             return;
         }
         for (slot, handle) in candidates {
@@ -4581,6 +4633,7 @@ mod tests {
                 requested: [None, None],
                 derive_protocol: DeriveResultProtocol::Unavailable,
                 entry_mechanism: MechClass::Value,
+                entry_output: OutputEvidence::NotCaptured,
                 scope: SlotScope::Unknown,
                 completion: Some(Completion {
                     cut: 11,
@@ -4757,6 +4810,7 @@ mod tests {
             requested: [None, None],
             derive_protocol: DeriveResultProtocol::Unavailable,
             entry_mechanism: MechClass::Value,
+            entry_output: OutputEvidence::NotCaptured,
             scope: SlotScope::Unknown,
             completion: Some(Completion {
                 cut: 11,
@@ -5740,6 +5794,7 @@ mod tests {
             requested: [None, None],
             derive_protocol: DeriveResultProtocol::Unavailable,
             entry_mechanism: MechClass::Value,
+            entry_output: OutputEvidence::NotCaptured,
             scope: SlotScope::Unknown,
             completion: Some(Completion {
                 cut: 11,
@@ -5806,6 +5861,7 @@ mod tests {
                 requested: [None, None],
                 derive_protocol: DeriveResultProtocol::Unavailable,
                 entry_mechanism: MechClass::Value,
+                entry_output: OutputEvidence::NotCaptured,
                 scope: SlotScope::Unknown,
                 completion: Some(Completion {
                     cut: 50,

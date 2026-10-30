@@ -58,6 +58,34 @@ fn unwrap_descriptor() -> ObjectDescriptorWire {
     }
 }
 
+/// Hand-built encapsulate row (function 92 is `C_EncapsulateKey`).
+fn encapsulate_descriptor() -> ObjectDescriptorWire {
+    ObjectDescriptorWire {
+        function: 92,
+        input_args: [2, N],
+        result_args: [7, N],
+        template_args: [N, N, N, N],
+        find_capacity_arg: N,
+        find_count_arg: N,
+        action: OBJECT_ACTION_ENCAPSULATE,
+        guard: OBJECT_GUARD_NAMED,
+    }
+}
+
+/// Hand-built decapsulate row (function 93 is `C_DecapsulateKey`).
+fn decapsulate_descriptor() -> ObjectDescriptorWire {
+    ObjectDescriptorWire {
+        function: 93,
+        input_args: [2, N],
+        result_args: [7, N],
+        template_args: [N, N, N, N],
+        find_capacity_arg: N,
+        find_count_arg: N,
+        action: OBJECT_ACTION_DECAPSULATE,
+        guard: OBJECT_GUARD_NAMED,
+    }
+}
+
 /// A valid Create tail encoded byte by byte (independent of the wire
 /// struct): version 1, 240 bytes, index 21, LP64, one value result.
 fn valid_create_tail() -> [u8; OBJECT_TAIL_BYTES] {
@@ -304,6 +332,94 @@ fn object_producer_arg7_is_named_and_full_span() {
         );
         assert_eq!(crate::ia32_arg_address(0x1000, u32::from(index)), None);
     }
+}
+
+#[test]
+fn object_producer_kem_wire_codes_are_append_only() {
+    // Append-only: existing 0..=12 values never move.
+    assert_eq!(OBJECT_ACTION_NONE, 0);
+    assert_eq!(OBJECT_ACTION_SET, 12);
+    assert_eq!(OBJECT_ACTION_ENCAPSULATE, 13);
+    assert_eq!(OBJECT_ACTION_DECAPSULATE, 14);
+    assert_eq!(OBJECT_ACTION_MAX, OBJECT_ACTION_DECAPSULATE);
+    // Canonical rows match the hand-built KEM rows exactly.
+    assert_eq!(canonical_object_wire(92), encapsulate_descriptor());
+    assert_eq!(canonical_object_wire(93), decapsulate_descriptor());
+    // Guard 1 (NamedFunction) on both; no scalar mechanism guard.
+    assert_eq!(canonical_object_wire(92).guard, OBJECT_GUARD_NAMED);
+    assert_eq!(canonical_object_wire(93).guard, OBJECT_GUARD_NAMED);
+    // The named arg-7 exception covers exactly the two KEM actions
+    // alongside pair/unwrap: LP64 SP+16, ia32 SP+32, complete words.
+    for row in [encapsulate_descriptor(), decapsulate_descriptor()] {
+        assert_eq!(
+            object_result_arg7_address(&row, 0x1000, LinuxLayout::Lp64),
+            Some(0x1010)
+        );
+        assert_eq!(
+            object_result_arg7_address(&row, 0x1000, LinuxLayout::Ilp32),
+            Some(0x1020)
+        );
+        assert_eq!(
+            object_result_arg7_address(&row, u64::MAX - 22, LinuxLayout::Lp64),
+            None
+        );
+    }
+    // Any other action naming argument 7 still refuses.
+    let mut access = create_descriptor();
+    access.action = OBJECT_ACTION_ACCESS;
+    access.result_args = [7, N];
+    assert_eq!(
+        object_result_arg7_address(&access, 0x1000, LinuxLayout::Lp64),
+        None
+    );
+}
+
+#[test]
+fn object_producer_kem_tail_pins_input_result_and_zero_lists() {
+    // A valid encapsulate tail: one value input, one value result,
+    // all-zero requested lists (T0: absent pairs stay all-zero).
+    let mut tail = [0u8; OBJECT_TAIL_BYTES];
+    put_u16(&mut tail, 0, OBJECT_CALL_VERSION);
+    put_u16(&mut tail, 2, OBJECT_CALL_BYTES);
+    put_u32(&mut tail, 4, 93);
+    tail[12] = OBJECT_LAYOUT_LP64;
+    tail[13] = OBJECT_ACTION_ENCAPSULATE;
+    put_u64(&mut tail, 16, 0x1111);
+    tail[112] = 1;
+    put_u64(&mut tail, 32, 0x2222);
+    tail[114] = 1;
+    let descriptor = encapsulate_descriptor();
+    assert!(validate_object_tail(&tail, &descriptor));
+    // A nonzero requested list refuses: KEM template pairs are absent.
+    for offset in [128, 128 + 33, 164, 164 + 33] {
+        let mut bad = tail;
+        bad[offset] = 1;
+        assert!(!validate_object_tail(&bad, &descriptor), "offset {offset}");
+    }
+    // Descriptor-present input/result slots require non-absent statuses.
+    let mut bad = tail;
+    bad[112] = 0;
+    assert!(!validate_object_tail(&bad, &descriptor));
+    let mut bad = tail;
+    bad[114] = 0;
+    assert!(!validate_object_tail(&bad, &descriptor));
+    // The decapsulate row validates its own tails only.
+    let mut decap = tail;
+    put_u32(&mut decap, 4, 94);
+    decap[13] = OBJECT_ACTION_DECAPSULATE;
+    assert!(validate_object_tail(&decap, &decapsulate_descriptor()));
+    assert!(!validate_object_tail(&decap, &descriptor));
+    assert!(!validate_object_tail(&tail, &decapsulate_descriptor()));
+    // START markers arm for both KEM rows through the frozen table.
+    let table = publish_object_descriptors();
+    assert_eq!(
+        validate_start_marker(94, &table),
+        StartMarkerVerdict::Required { index: 93 }
+    );
+    assert_eq!(
+        validate_start_marker(95, &table),
+        StartMarkerVerdict::Required { index: 94 }
+    );
 }
 
 #[test]

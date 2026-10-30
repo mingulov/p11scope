@@ -123,16 +123,15 @@ pub(crate) enum EndpointClass {
 
 /// Affecting but unmodeled: never journaled, represented only as
 /// negative uncertainty. C_InitToken wipes token objects and sessions;
-/// KEM and authenticated-wrap calls create and use objects through
-/// unwired protocols; async controls defer effects to unmodeled
-/// completions. (C_Initialize left this list under owner P4: it is
-/// modeled as `lifecycle::CRYPTOKI_INITIALIZE`; C_InitToken stays.)
-/// The rest must survive descriptor-shape edits, so all eight are
-/// listed explicitly rather than derived.
-pub(crate) const NEGATIVE_ONLY_FUNCTIONS: [&str; 8] = [
+/// authenticated-wrap calls create and use objects through unwired
+/// protocols; async controls defer effects to unmodeled completions.
+/// (C_Initialize left this list under owner P4: it is modeled as
+/// `lifecycle::CRYPTOKI_INITIALIZE`; KEM left it when packet 6.07c
+/// modeled it; C_InitToken stays.) The rest must survive
+/// descriptor-shape edits, so all six are listed explicitly rather
+/// than derived.
+pub(crate) const NEGATIVE_ONLY_FUNCTIONS: [&str; 6] = [
     "C_InitToken",
-    "C_EncapsulateKey",
-    "C_DecapsulateKey",
     "C_WrapKeyAuthenticated",
     "C_UnwrapKeyAuthenticated",
     "C_AsyncComplete",
@@ -2148,6 +2147,19 @@ fn origin_of(
         ],
         entry_mechanism: mechanism_evidence(begin.capture(), begin.entry_mechanism()),
         scope: super::SlotScope::Unknown,
+        entry_output: output_evidence(begin.capture()),
+    }
+}
+
+/// Finite S1 output-pointer decision from a capture word: only VALUE
+/// reads words elsewhere, and this class never does. Mirrors
+/// [`mechanism_evidence`] for the OUTPUT bits.
+fn output_evidence(capture_word: u32) -> super::OutputEvidence {
+    match capture_word & capture::OUTPUT_MASK {
+        x if x == capture::OUTPUT_NONE => super::OutputEvidence::NotCaptured,
+        x if x == capture::OUTPUT_NULL => super::OutputEvidence::Null,
+        x if x == capture::OUTPUT_UNREADABLE => super::OutputEvidence::Unreadable,
+        _ => super::OutputEvidence::NonNull,
     }
 }
 
@@ -9892,7 +9904,8 @@ pub(crate) mod tests {
         // (ordinal, name, class) for every non-modeled function.
         // P4 (owner 2026-10-29): ordinal 0 (C_Initialize) left this
         // table for the modeled set as lifecycle::CRYPTOKI_INITIALIZE.
-        let pinned: [(u32, &str, EndpointClass); 27] = [
+        // KEM (92/93) left this table when packet 6.07c modeled it.
+        let pinned: [(u32, &str, EndpointClass); 25] = [
             (2, "C_GetInfo", EndpointClass::ProvedIrrelevant),
             (3, "C_GetFunctionList", EndpointClass::ProvedIrrelevant),
             (4, "C_GetSlotList", EndpointClass::ProvedIrrelevant),
@@ -9912,8 +9925,6 @@ pub(crate) mod tests {
             (67, "C_WaitForSlotEvent", EndpointClass::ProvedIrrelevant),
             (68, "C_GetInterfaceList", EndpointClass::ProvedIrrelevant),
             (69, "C_GetInterface", EndpointClass::ProvedIrrelevant),
-            (92, "C_EncapsulateKey", EndpointClass::NegativeOnlyAffecting),
-            (93, "C_DecapsulateKey", EndpointClass::NegativeOnlyAffecting),
             (
                 98,
                 "C_GetSessionValidationFlags",
@@ -9959,7 +9970,7 @@ pub(crate) mod tests {
             );
             modeled += 1;
         }
-        assert_eq!(modeled, 77, "modeled census moved");
+        assert_eq!(modeled, 79, "modeled census moved");
         // Catalog gap sentinel: ordinal 104 is unnamed today. Filling it
         // must amend this census; until then it is refused, and so is
         // everything beyond the descriptor table.
@@ -10018,12 +10029,14 @@ pub(crate) mod tests {
         assert_eq!(scene.model.project().objects.len(), 1);
 
         // A negative-only invocation promising an END violates the frozen
-        // NO_END entry rule: contradiction, not a signal.
+        // NO_END entry rule: contradiction, not a signal. KEM used to be
+        // the control here; it is modeled now, so the still-negative
+        // authenticated wrap carries the control.
         let mut scene = Scene::new(image_default());
         scene.attest();
-        let encap = function_id("C_EncapsulateKey");
+        let auth_wrap = function_id("C_WrapKeyAuthenticated");
         assert_eq!(
-            scene.ingest(&begin_bytes(1, 1, encap, 0)),
+            scene.ingest(&begin_bytes(1, 1, auth_wrap, 0)),
             JournalDisposition::Contradiction(JournalContradiction::UnclosedEndpoint)
         );
         let readmitted = scene.fixture.admit();
@@ -11551,12 +11564,14 @@ pub(crate) mod tests {
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
 
         // Unsupported affecting endpoint: its invocation taints, and
-        // birth attestation refuses the image.
+        // birth attestation refuses the image. KEM used to be the
+        // control here; it is modeled now, so the still-negative
+        // authenticated wrap carries the control.
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
-        let encap = function_id("C_EncapsulateKey");
+        let auth_wrap = function_id("C_WrapKeyAuthenticated");
         assert_eq!(
-            scene.ingest(&begin_bytes(1, 1, encap, JOURNAL_BEGIN_NO_END)),
+            scene.ingest(&begin_bytes(1, 1, auth_wrap, JOURNAL_BEGIN_NO_END)),
             JournalDisposition::NegativeOnlyInvalidated
         );
         assert_eq!(

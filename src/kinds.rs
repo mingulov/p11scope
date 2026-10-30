@@ -456,7 +456,7 @@ mod tests {
             );
             permitted += usize::from(object_descriptor(field.name).is_some());
         }
-        assert_eq!(permitted, 25);
+        assert_eq!(permitted, 27);
         for name in [
             "",
             "C_NotAStandardFunction",
@@ -466,10 +466,27 @@ mod tests {
             " C_DeriveKey",
             "C_DeriveKey ",
             "C_UnwrapKeyAuthenticated",
-            "C_EncapsulateKey",
             "C_FindObjectsInit",
         ] {
             assert_eq!(object_descriptor(name), None, "{name:?}");
+        }
+        for (name, action) in [
+            (
+                "C_EncapsulateKey",
+                policy::ObjectAction::Encapsulate,
+            ),
+            (
+                "C_DecapsulateKey",
+                policy::ObjectAction::Decapsulate,
+            ),
+        ] {
+            let descriptor = object_descriptor(name).unwrap_or_else(|| panic!("{name} modeled"));
+            assert_eq!(descriptor.action, action, "{name}");
+            assert_eq!(
+                descriptor.result_protocol_guard,
+                policy::ResultProtocolGuard::NamedFunction,
+                "{name}"
+            );
         }
         let pair = object_descriptor("C_GenerateKeyPair").unwrap();
         assert_eq!(pair.action, policy::ObjectAction::GeneratePair);

@@ -277,13 +277,13 @@ const INPUT_MATRIX: &[(&str, [bool; 2])] = &[
     ("C_WrapKey", [true, true]),
     ("C_SetOperationState", [true, true]),
     ("C_FindObjects", [false, false]),
+    ("C_EncapsulateKey", [true, false]),
+    ("C_DecapsulateKey", [true, false]),
 ];
 
 const UNSUPPORTED_NAMES: &[&str] = &[
     "C_UnwrapKeyAuthenticated",
-    "C_EncapsulateKey",
     "C_FindObjectsInit",
-    "C_DecapsulateKey",
     "C_WrapKeyAuthenticated",
     "C_AsyncComplete",
 ];
@@ -302,7 +302,7 @@ const ERROR_RVS: &[u64] = &[
 // pair-overlap/duplicate/partial rule, span check or template authorization.
 #[test]
 fn object_producer_object_family_matrix() {
-    assert_eq!(INPUT_MATRIX.len(), 25);
+    assert_eq!(INPUT_MATRIX.len(), 27);
     assert_eq!(pkcs11_module::FUNCTION_NAMES.len(), 104);
     for (name, present) in INPUT_MATRIX {
         let descriptor = object_policy::object_descriptor(fid(name)).unwrap();
@@ -460,6 +460,8 @@ fn object_producer_object_family_matrix() {
         ("C_GenerateKey", 0xC200u64),
         ("C_DeriveKey", 0xC400u64),
         ("C_UnwrapKey", 0xC300u64),
+        ("C_EncapsulateKey", 0xC500u64),
+        ("C_DecapsulateKey", 0xC600u64),
     ] {
         for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
             let w = layout.word_bytes() as u64;
@@ -992,6 +994,8 @@ fn object_producer_object_family_matrix() {
         "C_WrapKey",
         "C_SetOperationState",
         "C_FindObjects",
+        "C_EncapsulateKey",
+        "C_DecapsulateKey",
     ] {
         assert_eq!(
             authorize_entry_templates(fid(name), scalars, accepted),

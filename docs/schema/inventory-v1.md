@@ -798,16 +798,22 @@ The additive `object_observations` section carries capture-local object
 activity and limited metadata observed from application calls: session
 rows, object views with requested/established metadata, proved-key
 operation aggregates and unknown-key summaries. The frozen consumer
-contract is
+contracts are
 [inventory-v1-object-observations.schema.json](inventory-v1-object-observations.schema.json)
-(section version 1); consumers must reject unknown section versions,
+(section version 1) and
+[inventory-v1-object-observations-v2.schema.json](inventory-v1-object-observations-v2.schema.json)
+(section version 2); consumers must reject unknown section versions,
 never guess. JSON, JSONL and the dashboard render from this one
 immutable projection. While H9 delivery stays gated, production
 captures carry `status: "unavailable"` with a finite `reason` and
 empty rows; unavailable/partial/stale name object authority only and
 never imply S1 loss.
 
-- `version` is 1; `revision` is the publication revision. `status` is
+- `version` is 1 or 2, following the content: 2 iff a KEM creation
+  (`encapsulate`, `decapsulate`) or role (`encapsulation_key`,
+  `decapsulation_key`) label is present, otherwise byte-stable 1.
+  Version 1 is frozen and never carries KEM labels. `revision` is the
+  publication revision. `status` is
   `populated`, `partial`, `stale` or `unavailable`; `reason` is `none`
   only when populated. A stale publication's rows are historical, not
   current authority.

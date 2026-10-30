@@ -1317,16 +1317,20 @@ impl JointStaging {
 const NOT_APPLICABLE_CATEGORIES: [&str; 4] =
     ["generate_key", "generate_key_pair", "digest", "direct"];
 
-/// Categories with no approved object role (H9 §64: no KEM object
-/// descriptor exists): receipts dropped, terminals aggregate as
-/// `role_unavailable`, S1 mechanism activity untouched.
+/// Categories whose receipt-less terminals aggregate as
+/// `role_unavailable` (H9 §82): KEM calls without a bound qualified
+/// receipt prove no role. Bound qualified KEM receipts resolve
+/// independently to their usable metadata outcome; only the
+/// receipt-less or unproved terminal maps here. S1 mechanism
+/// activity is untouched either way.
 const ROLE_UNAVAILABLE_CATEGORIES: [&str; 2] = ["encapsulate", "decapsulate"];
 
 /// Whether an operation category binds key receipts. Generation,
-/// ordinary digest, reference-only directs and KEM never bind.
+/// ordinary digest and reference-only directs never bind. KEM binds
+/// its qualified receipts; receipt-less terminals still partition
+/// `role_unavailable` via [`unbound_reason_for`].
 pub(crate) fn binds_keys(category: &str) -> bool {
     !NOT_APPLICABLE_CATEGORIES.contains(&category)
-        && !ROLE_UNAVAILABLE_CATEGORIES.contains(&category)
 }
 
 /// The frozen unknown-key reason for a receipt-less terminal of one
@@ -1363,6 +1367,8 @@ pub(crate) fn role_label(role: KeyRole) -> &'static str {
         KeyRole::WrappedKey => "wrapped_object",
         KeyRole::BaseKey => "base_key",
         KeyRole::UnwrappingKey => "unwrapping_key",
+        KeyRole::EncapsulationKey => "encapsulation_key",
+        KeyRole::DecapsulationKey => "decapsulation_key",
         KeyRole::Other => "other",
     }
 }
@@ -2380,6 +2386,8 @@ impl KeyUseReducer {
             (Some("C_WrapKey"), _, 1) => KeyRole::WrappedKey,
             (Some("C_DeriveKey"), _, _) => KeyRole::BaseKey,
             (Some("C_UnwrapKey"), _, _) => KeyRole::UnwrappingKey,
+            (Some("C_EncapsulateKey"), _, _) => KeyRole::EncapsulationKey,
+            (Some("C_DecapsulateKey"), _, _) => KeyRole::DecapsulationKey,
             (_, Some(p11scope_ebpf_common::object_policy::ObjectAction::Access), 0) => {
                 KeyRole::OperationKey
             }

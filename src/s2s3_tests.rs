@@ -15,9 +15,9 @@ use crate::semantics_objects::{
     CompleteInputPrefix, CompletedFact, CreationFamily, FieldState, FieldValue, FindResult,
     HandleInput, KeyLabel, Lifetime, LostOutcome, MAX_ACCESS_RELATIONS, MechanismEvidence,
     ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId, ObjectLimits,
-    ObjectProjection, ObjectSemantics, ObjectView, OriginFact, QueryStatus, RefCut, ResultSlot,
-    SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin, SessionState, SlotScope,
-    ViewOrigin,
+    ObjectProjection, ObjectSemantics, ObjectView, OriginFact, OutputEvidence, QueryStatus,
+    RefCut, ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin,
+    SessionState, SlotScope, ViewOrigin,
 };
 use p11scope_ebpf_common::LinuxLayout;
 use p11scope_ebpf_common::capture;
@@ -294,6 +294,7 @@ impl Hist {
             requested: call.requested,
             entry_mechanism: call.mechanism,
             scope: call.scope,
+            entry_output: OutputEvidence::NotCaptured,
         }
     }
 
@@ -2916,6 +2917,7 @@ fn scale_origin(
         requested: [None, None],
         entry_mechanism: MechanismEvidence::NotCaptured,
         scope: SlotScope::Unknown,
+        entry_output: OutputEvidence::NotCaptured,
     }
 }
 
@@ -3776,6 +3778,7 @@ fn churn(limits: ObjectLimits, cycles: u64) -> (ObjectSemantics, Vec<ObjectId>, 
         requested: [None, None],
         entry_mechanism: MechanismEvidence::NotCaptured,
         scope,
+        entry_output: OutputEvidence::NotCaptured,
     };
     let completed =
         |cut: u64, result: ResultSlot, session_out: HandleInput<SessionHandle>| CompletedFact {
@@ -3990,6 +3993,7 @@ fn short_lived(
             requested: [None, None],
             entry_mechanism: MechanismEvidence::NotCaptured,
             scope,
+            entry_output: OutputEvidence::NotCaptured,
         };
     let completed = |cut: u64, result: ResultSlot, session_out| CompletedFact {
         cut: RefCut::reference(cut),
@@ -4099,6 +4103,7 @@ fn s2s3_bounded_state_and_redaction_unknown_and_pruned_domains_fail_closed() {
                     requested: [None, None],
                     entry_mechanism: MechanismEvidence::NotCaptured,
                     scope: SlotScope::Unknown,
+                    entry_output: OutputEvidence::NotCaptured,
                 },
                 &mut *ledger,
             )

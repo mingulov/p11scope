@@ -1,0 +1,895 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://p11scope/inventory/v1-object-observations-v2.schema.json",
+  "title": "p11scope/inventory/v1 object_observations section (H9, version 2)",
+  "description": "Frozen consumer contract for H9 section version 2: identical to version 1 except the section version constant (2) and the extended role/creation vocabularies (encapsulation_key/decapsulation_key roles, encapsulate/decapsulate creations) published by packet 6.07c. Version 1 stays frozen; consumers dispatch on the section version and refuse unknown versions. Frozen consumer contract for the H9 operation/key delivery and presentation section of p11scope/inventory/v1 documents (Task 4, H9 section 3). Every object is closed: additionalProperties is false at every level, and every enum is exact. Consumers (JSON readers, JSONL reconstructors, the dashboard) must read only this contract, never reducer internals or friendly labels. Row counters are cumulative within their row: repeated cumulative JSONL snapshots (kinds object_observed and key_operations_observed) replace rows by (bucket, row key, revision) and must never be summed as deltas. A row is keyed by its full key tuple; a greater revision replaces an older one; rows never delete (retained history is immutable). A row event's revision is its last change: the emitter sends only changed rows per revision, so unchanged rows persist client-side below the pass marker's object_revision. status names object authority, not S1 health: unavailable/partial/stale never imply S1 loss. Unknown-key summaries never carry started (starts are never fabricated into the unknown bucket). No raw handles, pointers, native keys, epochs, PIDs/TIDs, address-derived hashes or arbitrary attribute bytes appear anywhere in this section.",
+  "type": "object",
+  "required": [
+    "version",
+    "revision",
+    "status",
+    "reason",
+    "sessions",
+    "objects",
+    "key_operations",
+    "unknown_key_operations",
+    "gaps",
+    "budgets"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 2,
+      "description": "Section version. Additive versioned section; consumers must reject unknown versions, never guess."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615,
+      "description": "Publication revision (production: coordinator passes at capture). JSONL rows carry their revision; greater replaces older."
+    },
+    "status": {
+      "enum": [
+        "populated",
+        "partial",
+        "stale",
+        "unavailable"
+      ],
+      "description": "populated: complete authority. partial: row/budget refusal omitted associations (S1 preserved). stale: retained older complete publication; the newer revision could not publish, and old active rows are historical, not current authority. unavailable: no Joint object evidence (S1 unaffected)."
+    },
+    "reason": {
+      "enum": [
+        "none",
+        "bootstrap_unavailable",
+        "journal_unavailable",
+        "proof_refused_fallback",
+        "authority_lost",
+        "row_budget_exhausted",
+        "publication_budget_exhausted",
+        "serialization_refused",
+        "sink_failed"
+      ],
+      "description": "Finite machine reason. none only when status is populated. journal_unavailable names the v0.5.0 world (no journal producer linked, so no key-operation feed exists); bootstrap_unavailable keeps its 0.6.0 meaning (journal linked, no birth yet). serialization_refused is reserved: the JSON encoder is infallible, so current producers never emit it."
+    },
+    "sessions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/session_row"
+      },
+      "description": "Model sessions, sorted by session id. Snapshot-only: the JSONL stream carries session lifecycle through object_observed rows, not a session kind."
+    },
+    "objects": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/object_row"
+      },
+      "description": "Object views, sorted by object id. Counters are successful references, never distinct keys, completed operations or physical token inventory."
+    },
+    "key_operations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/key_row"
+      },
+      "description": "Proved-key aggregate rows, sorted by (instance, object, category, role, metadata_at_use). Role rows count associations and cannot be summed across roles into a global operation denominator."
+    },
+    "unknown_key_operations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/unknown_row"
+      },
+      "description": "Capture-wide unknown-key summaries, sorted by (category, reason). Terminals partition here once per primary operation role; started is never present, never fabricated."
+    },
+    "gaps": {
+      "type": "object",
+      "required": [
+        "rows",
+        "suppressed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "rows": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/gap_row"
+          }
+        },
+        "suppressed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "required": [
+        "key_rows",
+        "object_rows",
+        "unknown_rows",
+        "encoded_bytes",
+        "allocation_refused",
+        "refusal_reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "key_rows": {
+          "$ref": "#/$defs/row_budget"
+        },
+        "object_rows": {
+          "$ref": "#/$defs/row_budget"
+        },
+        "unknown_rows": {
+          "type": "object",
+          "required": [
+            "occupied"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "occupied": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Unknown summaries are finite by construction (category x reason, capture-wide): no limit, no refusal path."
+            }
+          }
+        },
+        "encoded_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Measured JSON encoding bytes of this section at commit. A measurement, never an RSS estimate or heap-bound proof."
+        },
+        "allocation_refused": {
+          "const": false,
+          "description": "Byte-pool refusal. No pool is frozen (owner gate): always false until a reviewed pool ships with a schema update."
+        },
+        "refusal_reason": {
+          "const": "none",
+          "description": "Pool refusal reason. Always none until a reviewed pool ships."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "row_budget": {
+      "type": "object",
+      "required": [
+        "limit",
+        "occupied",
+        "refused"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "const": 65536
+        },
+        "occupied": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65536
+        },
+        "refused": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "session_row": {
+      "type": "object",
+      "required": [
+        "session",
+        "origin",
+        "status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "session": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "Public capture-local session id (monotonic model id, not a raw handle)."
+        },
+        "origin": {
+          "enum": [
+            "opened",
+            "first_observed"
+          ]
+        },
+        "status": {
+          "enum": [
+            "live",
+            "closed",
+            "lost"
+          ]
+        }
+      }
+    },
+    "metadata_field_class": {
+      "type": "object",
+      "required": [
+        "status",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "unknown",
+            "value",
+            "conflict",
+            "invalidated"
+          ]
+        },
+        "value": {
+          "enum": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            null
+          ],
+          "description": "Retained CKA_CLASS code (0 data, 1 certificate, 2 public_key, 3 private_key, 4 secret_key). Public JSON carries the accepted numeric code; labels are presentation names. Never key material."
+        }
+      }
+    },
+    "metadata_field_key_type": {
+      "type": "object",
+      "required": [
+        "status",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "unknown",
+            "value",
+            "conflict",
+            "invalidated"
+          ]
+        },
+        "value": {
+          "enum": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            16,
+            31,
+            64,
+            65,
+            null
+          ],
+          "description": "Retained CKA_KEY_TYPE code at OASIS numbers (0 rsa, 1 dsa, 2 dh, 3 ec, 4 x9_42_dh, 16 generic_secret, 31 aes, 64 ec_edwards, 65 ec_montgomery). Public JSON carries the accepted numeric code; labels are presentation names. Never key material."
+        }
+      }
+    },
+    "metadata_field_token": {
+      "type": "object",
+      "required": [
+        "status",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "unknown",
+            "value",
+            "conflict",
+            "invalidated"
+          ]
+        },
+        "value": {
+          "enum": [
+            0,
+            1,
+            null
+          ],
+          "description": "Retained CKA_TOKEN flag (0 session, 1 token). Never key material."
+        }
+      }
+    },
+    "metadata_field_value_len": {
+      "type": "object",
+      "required": [
+        "status",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "unknown",
+            "value",
+            "conflict",
+            "invalidated"
+          ]
+        },
+        "value": {
+          "enum": [
+            16,
+            24,
+            32,
+            null
+          ],
+          "description": "Retained CKA_VALUE_LEN byte size (AES 128/192/256 bits only with an independently established AES type). Never key material."
+        }
+      }
+    },
+    "metadata_field_modulus_bits": {
+      "type": "object",
+      "required": [
+        "status",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "unknown",
+            "value",
+            "conflict",
+            "invalidated"
+          ]
+        },
+        "value": {
+          "enum": [
+            1024,
+            2048,
+            3072,
+            4096,
+            8192,
+            null
+          ],
+          "description": "Retained CKA_MODULUS_BITS size. Modulus and exponent buffers are never read or carried. Never key material."
+        }
+      }
+    },
+    "metadata_field_curve": {
+      "type": "object",
+      "required": [
+        "status",
+        "value"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "unknown",
+            "value",
+            "conflict",
+            "invalidated"
+          ]
+        },
+        "value": {
+          "enum": [
+            "secp256r1",
+            "secp384r1",
+            "secp521r1",
+            null
+          ]
+        }
+      }
+    },
+    "metadata_block": {
+      "type": "object",
+      "required": [
+        "class",
+        "key_type",
+        "token",
+        "value_len",
+        "modulus_bits",
+        "ec_params"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/metadata_field_class"
+        },
+        "key_type": {
+          "$ref": "#/$defs/metadata_field_key_type"
+        },
+        "token": {
+          "$ref": "#/$defs/metadata_field_token"
+        },
+        "value_len": {
+          "$ref": "#/$defs/metadata_field_value_len"
+        },
+        "modulus_bits": {
+          "$ref": "#/$defs/metadata_field_modulus_bits"
+        },
+        "ec_params": {
+          "$ref": "#/$defs/metadata_field_curve"
+        }
+      }
+    },
+    "query_block": {
+      "type": "object",
+      "required": [
+        "class",
+        "key_type",
+        "token",
+        "value_len",
+        "modulus_bits",
+        "ec_params"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/query_status"
+        },
+        "key_type": {
+          "$ref": "#/$defs/query_status"
+        },
+        "token": {
+          "$ref": "#/$defs/query_status"
+        },
+        "value_len": {
+          "$ref": "#/$defs/query_status"
+        },
+        "modulus_bits": {
+          "$ref": "#/$defs/query_status"
+        },
+        "ec_params": {
+          "$ref": "#/$defs/query_status"
+        }
+      }
+    },
+    "query_status": {
+      "enum": [
+        "not_queried",
+        "established",
+        "unavailable",
+        "size_only",
+        "unsupported",
+        "malformed",
+        "excluded"
+      ]
+    },
+    "metadata_label": {
+      "enum": [
+        "rsa_1024",
+        "rsa_2048",
+        "rsa_3072",
+        "rsa_4096",
+        "rsa_other",
+        "aes_128",
+        "aes_192",
+        "aes_256",
+        "aes_other",
+        "ec_p256",
+        "ec_p384",
+        "ec_p521"
+      ],
+      "description": "Frozen label from established facts only: RSA modulus bits, AES value length in bits, EC finite curve. Requested-only sizes never label; success never certifies a requested size."
+    },
+    "gap_reason": {
+      "enum": [
+        "bootstrap_unproven",
+        "bootstrap_refused",
+        "prefix_contradiction",
+        "stale_prefix",
+        "closed_frontier",
+        "duplicate_call",
+        "duplicate_completion",
+        "stale_token",
+        "fenced_completion",
+        "malformed_fact",
+        "unsupported_function",
+        "domain_ended",
+        "result_protocol_unavailable",
+        "pending_result_unavailable",
+        "output_unreadable",
+        "pair_duplicate",
+        "null_mechanism_cancel",
+        "same_session_overlap",
+        "overlap_uncertain",
+        "output_collision",
+        "stale_origin",
+        "dependency_broken",
+        "unproven_input",
+        "unproven_session",
+        "metadata_uncertain",
+        "destroy_alias",
+        "close_uncertain",
+        "close_all_uncertain",
+        "logout_uncertain",
+        "session_closed",
+        "invalid_handle",
+        "ambiguous_outcome",
+        "session_contradiction",
+        "handle_reuse",
+        "finalize",
+        "token_reset",
+        "exec",
+        "fork",
+        "unload",
+        "loss",
+        "pending_capacity",
+        "session_capacity",
+        "object_capacity",
+        "instance_capacity",
+        "id_exhausted",
+        "device_loss",
+        "unseen_finalize",
+        "inconsistent_mechanism",
+        "outcome_lost",
+        "unknown_domain",
+        "domain_pruned",
+        "pruned_object_referenced"
+      ],
+      "description": "Model gap vocabulary (snake_case of the finite model enum) plus pruned_object_referenced: a retained key row references an object the model pruned (history stays; the dangle is explicit, never silent)."
+    },
+    "object_row": {
+      "type": "object",
+      "required": [
+        "object",
+        "session",
+        "origin",
+        "creation",
+        "birth",
+        "lifetime",
+        "lifetime_reason",
+        "attribution",
+        "attribution_reason",
+        "requested",
+        "established",
+        "queries",
+        "label",
+        "successful_references",
+        "successful_key_references",
+        "accessing_sessions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "object": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "Public capture-local object id (monotonic model id, not a raw handle)."
+        },
+        "session": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "The one proven accessing session."
+        },
+        "origin": {
+          "enum": [
+            "created",
+            "first_observed"
+          ]
+        },
+        "creation": {
+          "enum": [
+            "create",
+            "copy",
+            "generate",
+            "generate_pair",
+            "derive",
+            "unwrap",
+            "encapsulate",
+            "decapsulate",
+            null
+          ]
+        },
+        "birth": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "start_ns",
+            "end_ns"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "start_ns": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "end_ns": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            }
+          },
+          "description": "Observed call interval, never physical age. Null when unknown."
+        },
+        "lifetime": {
+          "enum": [
+            "live",
+            "destroyed",
+            "access_ended",
+            "retired"
+          ]
+        },
+        "lifetime_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/gap_reason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Reason for access_ended/retired; null for live/destroyed."
+        },
+        "attribution": {
+          "enum": [
+            "valid",
+            "downgraded"
+          ]
+        },
+        "attribution_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/gap_reason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Reason for downgraded; null while valid."
+        },
+        "requested": {
+          "$ref": "#/$defs/metadata_block"
+        },
+        "established": {
+          "$ref": "#/$defs/metadata_block"
+        },
+        "queries": {
+          "$ref": "#/$defs/query_block"
+        },
+        "label": {
+          "enum": [
+            "rsa_1024",
+            "rsa_2048",
+            "rsa_3072",
+            "rsa_4096",
+            "rsa_other",
+            "aes_128",
+            "aes_192",
+            "aes_256",
+            "aes_other",
+            "ec_p256",
+            "ec_p384",
+            "ec_p521",
+            null
+          ]
+        },
+        "successful_references": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "successful_key_references": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "accessing_sessions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "category": {
+      "enum": [
+        "digest",
+        "sign",
+        "verify",
+        "encrypt",
+        "decrypt",
+        "sign_recover",
+        "verify_recover",
+        "message_encrypt",
+        "message_decrypt",
+        "message_sign",
+        "message_verify",
+        "generate_key",
+        "generate_key_pair",
+        "wrap",
+        "unwrap",
+        "derive",
+        "encapsulate",
+        "decapsulate",
+        "wrap_authenticated",
+        "unwrap_authenticated",
+        "operation",
+        "direct",
+        "unknown"
+      ]
+    },
+    "role": {
+      "enum": [
+        "key",
+        "wrapping_key",
+        "wrapped_object",
+        "unwrapping_key",
+        "base_key",
+        "encapsulation_key",
+        "decapsulation_key",
+        "other"
+      ]
+    },
+    "unit": {
+      "enum": [
+        "operations",
+        "message_contexts"
+      ],
+      "description": "operations for ordinary categories; message_contexts for message_* categories. Never signatures-per-message."
+    },
+    "key_row": {
+      "type": "object",
+      "required": [
+        "instance",
+        "object",
+        "category",
+        "role",
+        "metadata_at_use",
+        "unit",
+        "started",
+        "completed",
+        "failed",
+        "cancelled",
+        "unknown",
+        "active",
+        "key_join_lost"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "type": "string",
+          "pattern": "^i[0-9]+$",
+          "description": "Existing registry instance id label (joinable to instances[])."
+        },
+        "object": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "category": {
+          "$ref": "#/$defs/category"
+        },
+        "role": {
+          "$ref": "#/$defs/role"
+        },
+        "metadata_at_use": {
+          "$ref": "#/$defs/metadata_label"
+        },
+        "unit": {
+          "$ref": "#/$defs/unit"
+        },
+        "started": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "completed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "cancelled": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "unknown": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "The S1 unknown terminal while the key relationship stayed proven; not an S1-outcome change."
+        },
+        "active": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "key_join_lost": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "Ends only the key association; not an S1 outcome. Row equation: started = completed + failed + cancelled + unknown + active + key_join_lost (before counter saturation)."
+        }
+      }
+    },
+    "unknown_reason": {
+      "enum": [
+        "unbound",
+        "key_join_lost",
+        "metadata_unknown",
+        "metadata_conflicting",
+        "role_unavailable",
+        "not_applicable"
+      ],
+      "description": "unbound: no receipt at start. key_join_lost: retirement ended a known association before the terminal. metadata_unknown/conflicting: known object, unusable label at use. role_unavailable: KEM (no approved object role). not_applicable: generation and ordinary digest (existing S1 units)."
+    },
+    "unknown_row": {
+      "type": "object",
+      "required": [
+        "category",
+        "reason",
+        "unit",
+        "completed",
+        "failed",
+        "cancelled",
+        "unknown",
+        "active"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/category"
+        },
+        "reason": {
+          "$ref": "#/$defs/unknown_reason"
+        },
+        "unit": {
+          "$ref": "#/$defs/unit"
+        },
+        "completed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "cancelled": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "unknown": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "active": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "gap_row": {
+      "type": "object",
+      "required": [
+        "subject",
+        "reason",
+        "repeats"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "subject": {
+          "enum": [
+            "model",
+            "key_operation"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/gap_reason"
+        },
+        "repeats": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    }
+  }
+}

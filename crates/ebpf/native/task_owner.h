@@ -160,7 +160,7 @@ _Static_assert(__builtin_offsetof(struct owner_discovery_key, domain) == 16, "di
 #define OBJECT_DESCRIPTORS_COUNT 105U
 #define OBJECT_START_BYTES 432U
 #define OBJECT_START_WORDS 54U
-#define OBJECT_ACTION_MAX 12U
+#define OBJECT_ACTION_MAX 14U
 #define OBJECT_GUARD_MAX 2U
 #define OBJECT_PHASE_ENTRY 1U
 #define OBJECT_PHASE_READY 2U

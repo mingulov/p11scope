@@ -88,10 +88,11 @@ use p11scope_ebpf_common::object_capture::{
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_flow::{
-    RefusedBaseOutcome, ReturnEventFacts, adapter_attributes_entry, adapter_derive_entry,
-    adapter_emit_find_control, adapter_emit_get_control, adapter_fill_return_control,
-    adapter_tail_fill, continuity_joins, decode_return_gate, emission_finalize, encode_return_gate,
-    fill_call_event, preserve_refused_base,
+    KEM_CAPTURE_WIRED, RefusedBaseOutcome, ReturnEventFacts, adapter_attributes_entry,
+    adapter_derive_entry, adapter_emit_find_control, adapter_emit_get_control,
+    adapter_fill_return_control, adapter_kem_entry, adapter_tail_fill, continuity_joins,
+    decode_return_gate, emission_finalize, encode_return_gate, fill_call_event,
+    preserve_refused_base,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_journal::{
@@ -100,10 +101,10 @@ use p11scope_ebpf_common::object_journal::{
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_wire::{
-    OBJECT_ACTION_DERIVE, OBJECT_ACTION_FIND, OBJECT_ACTION_IMPORT, OBJECT_ACTION_MAX,
-    OBJECT_ACTION_NONE, OBJECT_GUARD_NONE, OBJECT_GUARD_SCALAR_DERIVE, OBJECT_LAYOUT_ILP32,
-    OBJECT_LAYOUT_LP64, ObjectCallWire, ObjectDescriptorWire, ObjectEventRecord, ObjectStart,
-    object_result_arg7_address,
+    OBJECT_ACTION_DECAPSULATE, OBJECT_ACTION_DERIVE, OBJECT_ACTION_ENCAPSULATE, OBJECT_ACTION_FIND,
+    OBJECT_ACTION_IMPORT, OBJECT_ACTION_MAX, OBJECT_ACTION_NONE, OBJECT_GUARD_NONE,
+    OBJECT_GUARD_SCALAR_DERIVE, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectCallWire,
+    ObjectDescriptorWire, ObjectEventRecord, ObjectStart, object_result_arg7_address,
 };
 #[cfg_attr(feature = "inventory-only", allow(unused_imports))]
 use p11scope_ebpf_common::{
@@ -3133,6 +3134,12 @@ fn object_fill_entry(
     {
         return false;
     }
+    // KEM actions acquire through the shared KEM adapter below (FULL
+    // gate, query and span guards); the generic path must not fetch
+    // their arguments.
+    if row.action == OBJECT_ACTION_ENCAPSULATE || row.action == OBJECT_ACTION_DECAPSULATE {
+        return true;
+    }
     // Entry input handles as data, applying the `capture_entry_inputs`
     // rules against the frozen map row directly. The core entry takes a
     // function ordinal through the name table (which would carry .rodata
@@ -3224,6 +3231,45 @@ fn object_entry_derive(
     })
 }
 
+// H7 adapters tail: T0 KEM entry acquisition (key input arg 2 plus
+// scalar result arg 7) for exactly the two KEM actions. The generic
+// input and result paths skip KEM, so this wrapper is the only KEM
+// fetch site. BPF-local bindings only: probe registers/stack, the
+// owned call's validated S1 output verdict, the build FULL gate. All
+// sequencing lives in the shared adapter, executed by host tests
+// with injected readers.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_entry_kem(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+    entry_capture: u32,
+    null_cancel: bool,
+) -> bool {
+    let descriptor = side.as_ref().map_or(0, |s| s.descriptor_index);
+    let row = OBJECT_DESCRIPTORS.get(descriptor);
+    let stack_pointer = unsafe { (*ctx.regs).rsp as u64 };
+    // Negative query gate from the owned call's validated S1
+    // output-pointer state: only a positively non-null entry
+    // ciphertext pointer authorizes the result. The bit alone is
+    // never object authority.
+    let output_non_null = entry_capture & capture::OUTPUT_MASK == capture::OUTPUT_NON_NULL;
+    let mut fetch_arg = |index: u8| arg_u64(ctx, index, layout).ok();
+    adapter_kem_entry(
+        side,
+        descriptor,
+        row,
+        layout,
+        stack_pointer,
+        KEM_CAPTURE_WIRED,
+        output_non_null,
+        null_cancel,
+        &mut fetch_arg,
+        |addr| read_word(addr, layout),
+    )
+}
+
 // H7 adapters tail: result-pointer retention for non-Derive families.
 // Derive retains through its mechanism guard above and skips here, so the
 // guard cannot be bypassed by a raw argument read. Arg 7 (pair second,
@@ -3251,6 +3297,12 @@ fn object_entry_results(
         return false;
     }
     if row.action == OBJECT_ACTION_DERIVE {
+        return true;
+    }
+    // KEM actions retain through the shared KEM adapter below (FULL
+    // gate, query and span guards); the generic path must not fetch
+    // their result pointer.
+    if row.action == OBJECT_ACTION_ENCAPSULATE || row.action == OBJECT_ACTION_DECAPSULATE {
         return true;
     }
     let arg0 = row.result_args[0];
@@ -3881,6 +3933,14 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: b
         let results_side =
             unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
         if !object_entry_results(&ctx, results_side, layout) {
+            let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
+        let kem_side =
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
+        if !object_entry_kem(&ctx, kem_side, layout, entry_capture, null_cancel) {
             let _ = start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_INSERT_FAILED);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_START_INSERT_FAILURES);

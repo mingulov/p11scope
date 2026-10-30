@@ -255,6 +255,10 @@ pub(crate) enum KeyRole {
     BaseKey,
     /// `C_UnwrapKey` input 0: the unwrapping key.
     UnwrappingKey,
+    /// `C_EncapsulateKey` input 0: the encapsulation key.
+    EncapsulationKey,
+    /// `C_DecapsulateKey` input 0: the decapsulation key.
+    DecapsulationKey,
     /// Outside the classified vocabulary: counted, never guessed.
     Other,
 }

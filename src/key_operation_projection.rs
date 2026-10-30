@@ -697,12 +697,11 @@ pub(crate) fn budgets_json(budgets: &ObsBudgets) -> serde_json::Value {
     })
 }
 
-/// Render the whole section: the exact frozen keys. The single
-/// renderer behind JSON, JSONL row payloads and byte measurement —
-/// every consumer reads these shapes. The version follows the
-/// content: v2 iff a KEM creation or role label is present,
-/// otherwise byte-stable v1.
-pub(crate) fn object_observations_json(observations: &ObjectObservations) -> serde_json::Value {
+/// The H9 section version for these observations: v2 iff a KEM
+/// creation or role label is present, otherwise v1. The single
+/// version authority behind the JSON section, the JSONL row
+/// payloads and the pass marker.
+pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
     let kem = observations
         .objects
         .iter()
@@ -711,11 +710,20 @@ pub(crate) fn object_observations_json(observations: &ObjectObservations) -> ser
             .key_operations
             .iter()
             .any(|row| matches!(row.role, "encapsulation_key" | "decapsulation_key"));
-    let version = if kem {
+    if kem {
         OBSERVATIONS_VERSION_V2
     } else {
         OBSERVATIONS_VERSION
-    };
+    }
+}
+
+/// Render the whole section: the exact frozen keys. The single
+/// renderer behind JSON, JSONL row payloads and byte measurement —
+/// every consumer reads these shapes. The version follows the
+/// content (see [`observations_version`]): v2 iff a KEM creation
+/// or role label is present, otherwise byte-stable v1.
+pub(crate) fn object_observations_json(observations: &ObjectObservations) -> serde_json::Value {
+    let version = observations_version(observations);
     serde_json::json!({
         "version": version,
         "revision": observations.revision,

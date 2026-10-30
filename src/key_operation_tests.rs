@@ -5305,6 +5305,9 @@ fn read_stream(dir: &std::path::Path, live: &str) -> Vec<serde_json::Value> {
 /// key), replacing by revision. Same-revision repeats must be
 /// identical (rotation re-emission); older revisions never replace.
 fn reconstruct(lines: &[serde_json::Value]) -> Reconstructed {
+    use crate::key_operation_projection::contract::{
+        CREATION_LABELS, CREATION_LABELS_V2, ROLE_LABELS, ROLE_LABELS_V2,
+    };
     let mut objects = BTreeMap::new();
     let mut known = BTreeMap::new();
     let mut unknown = BTreeMap::new();
@@ -5312,10 +5315,38 @@ fn reconstruct(lines: &[serde_json::Value]) -> Reconstructed {
         let kind = line["kind"].as_str().unwrap_or("");
         let event = &line["event"];
         let revision = event["revision"].as_u64().unwrap_or(u64::MAX);
+        // Per-event H9 version authority: absent means v1 (pre-6.07c
+        // producers emit v1 rows only); unknown versions refuse,
+        // never guessed from labels or the final section.
+        let version = event
+            .get("version")
+            .map_or(1, |v| v.as_u64().unwrap_or(u64::MAX));
+        assert!(
+            version == 1 || version == 2,
+            "H9 row version {version} refused"
+        );
+        let (roles, creations): (&[&str], &[&str]) = if version == 2 {
+            (&ROLE_LABELS_V2[..], &CREATION_LABELS_V2[..])
+        } else {
+            (&ROLE_LABELS[..], &CREATION_LABELS[..])
+        };
         let (map, key) = match kind {
-            "object_observed" => (&mut objects, format!("o:{}", event["row"]["object"])),
+            "object_observed" => {
+                if let Some(creation) = event["row"]["creation"].as_str() {
+                    assert!(
+                        creations.contains(&creation),
+                        "object creation {creation} invalid for H9 v{version}"
+                    );
+                }
+                (&mut objects, format!("o:{}", event["row"]["object"]))
+            }
             "key_operations_observed" if event["bucket"] == "known" => {
                 let row = &event["row"];
+                let role = row["role"].as_str().unwrap_or("?");
+                assert!(
+                    roles.contains(&role),
+                    "key role {role} invalid for H9 v{version}"
+                );
                 (
                     &mut known,
                     format!(
@@ -11617,6 +11648,419 @@ fn key_operation_h9_v2_dispatches_on_kem_content() {
     let rendered = serde_json::to_string(&section).unwrap();
     assert!(!rendered.contains("encapsulat"), "{rendered}");
     assert!(!rendered.contains("decapsulat"), "{rendered}");
+}
+
+/// Item 20 (JSONL dispatch): the stream binds its own H9 version.
+/// Row events and the pass marker carry the section version;
+/// reconstruction dispatches role/creation vocabularies per event
+/// and refuses unknown versions. Creation-only and role-only KEM
+/// states, incremental v1→v2 transitions and rotation all ride
+/// real rendering and reconstruction.
+#[test]
+fn key_operation_kem_jsonl_version_dispatch() {
+    use crate::discovery::engine::inventory_coordinator::PassReport;
+    use crate::inventory_events::{pass_payload, KeyOperationEmitter};
+    use crate::key_operation_projection::{
+        object_observations_json, OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2,
+    };
+    fn row_versions(lines: &[serde_json::Value]) -> Vec<u64> {
+        lines
+            .iter()
+            .filter(|line| {
+                line["kind"] == "object_observed"
+                    || line["kind"] == "key_operations_observed"
+            })
+            .map(|line| line["event"]["version"].as_u64().unwrap_or(u64::MAX))
+            .collect()
+    }
+    fn row_keys(lines: &[serde_json::Value]) -> std::collections::BTreeSet<String> {
+        lines
+            .iter()
+            .filter_map(|line| {
+                let event = &line["event"];
+                match line["kind"].as_str().unwrap_or("") {
+                    "object_observed" => Some(format!("o:{}", event["row"]["object"])),
+                    "key_operations_observed" if event["bucket"] == "known" => {
+                        let row = &event["row"];
+                        Some(format!(
+                            "k:{}:{}:{}:{}:{}",
+                            row["instance"].as_str().unwrap_or("?"),
+                            row["object"],
+                            row["category"].as_str().unwrap_or("?"),
+                            row["role"].as_str().unwrap_or("?"),
+                            row["metadata_at_use"].as_str().unwrap_or("?"),
+                        ))
+                    }
+                    "key_operations_observed" => {
+                        let row = &event["row"];
+                        Some(format!(
+                            "u:{}:{}",
+                            row["category"].as_str().unwrap_or("?"),
+                            row["reason"].as_str().unwrap_or("?"),
+                        ))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+    fn marker_version(published: &crate::key_operation_projection::ObjectObservations) -> u64 {
+        let report = PassReport {
+            pass: 1,
+            scanned: 0,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        pass_payload(&report, &harness_presentation(), published, 0, 0)["object_version"]
+            .as_u64()
+            .unwrap_or(u64::MAX)
+    }
+    // Revision 1: KEM-free content renders and streams v1.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let aes = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1Fu16), (4u8, 1u8, 32u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &aes,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, AES_GCM, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let r1 = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert!(!r1.key_operations.is_empty(), "a proved v1 row");
+    let section = object_observations_json(&r1);
+    assert_eq!(section["version"], OBSERVATIONS_VERSION);
+    assert_eq!(marker_version(&r1), 1);
+    let dir = private_tempdir();
+    let mut emitter = KeyOperationEmitter::new();
+    let v1path = dir.path().join("v1.jsonl");
+    let mut writer = EventWriter::create(&v1path, 1 << 20, 5).unwrap();
+    loop {
+        let out = emitter.emit(&mut writer, &r1, 1_000).unwrap();
+        if out.emitted == 0 {
+            break;
+        }
+    }
+    drop(writer);
+    let v1lines = read_stream(dir.path(), "v1.jsonl");
+    assert!(!v1lines.is_empty());
+    assert!(
+        row_versions(&v1lines).iter().all(|v| *v == 1),
+        "v1 rows bind v1"
+    );
+    assert_reconstructed_eq_json(&reconstruct(&v1lines), &section, true);
+    // Revision 2: creation-only KEM on a fresh unestablished input
+    // (the r1 input carries AES, which would prove a row).
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            result: Some(0xF00D_F00D_F00D_F00D),
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_kem_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            input0: Some((0xF00D_F00D_F00D_F00D, 1)),
+            ..ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture())
+        },
+    );
+    let r2 = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    assert!(
+        r2.objects.iter().any(|row| row.creation == Some("encapsulate")),
+        "the minted KEM creation"
+    );
+    assert!(
+        r2.key_operations.iter().all(|row| {
+            row.role != "encapsulation_key" && row.role != "decapsulation_key"
+        }),
+        "creation-only: no KEM role row"
+    );
+    let section = object_observations_json(&r2);
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V2);
+    assert_eq!(marker_version(&r2), 2);
+    let v2path = dir.path().join("v2delta.jsonl");
+    let mut writer = EventWriter::create(&v2path, 1 << 20, 5).unwrap();
+    loop {
+        let out = emitter.emit(&mut writer, &r2, 2_000).unwrap();
+        if out.emitted == 0 {
+            break;
+        }
+    }
+    drop(writer);
+    let r2delta = read_stream(dir.path(), "v2delta.jsonl");
+    assert!(!r2delta.is_empty(), "the transition emits new rows");
+    assert!(
+        row_versions(&r2delta).iter().all(|v| *v == 2),
+        "new rows bind v2"
+    );
+    assert!(
+        row_keys(&v1lines).is_disjoint(&row_keys(&r2delta)),
+        "old rows persist below, never re-emitted"
+    );
+    assert_reconstructed_eq_json(
+        &reconstruct(&[v1lines.clone(), r2delta.clone()].concat()),
+        &section,
+        false,
+    );
+    // Revision 3: a proved KEM role joins the creation. The decap
+    // output takes a distinct handle: no rebind churn, so the only
+    // re-emission is the reused input's counter bump.
+    drive_kem_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            kem_result: Some((0xC0DE_C0DE_C0DE_C0DE, 1)),
+            ..ShapedS1::shaped("C_DecapsulateKey", CkRv::OK.0, 0x17, kem_decap_capture())
+        },
+    );
+    let r3 = commit(3, &[&staging], &scene.model.project(), &keyuse);
+    let section = object_observations_json(&r3);
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V2);
+    let v3path = dir.path().join("v3delta.jsonl");
+    let mut writer = EventWriter::create(&v3path, 1 << 20, 5).unwrap();
+    loop {
+        let out = emitter.emit(&mut writer, &r3, 3_000).unwrap();
+        if out.emitted == 0 {
+            break;
+        }
+    }
+    drop(writer);
+    let r3delta = read_stream(dir.path(), "v3delta.jsonl");
+    assert!(
+        row_versions(&r3delta).iter().all(|v| *v == 2),
+        "later rows bind v2"
+    );
+    let before = &row_keys(&v1lines) | &row_keys(&r2delta);
+    let r3keys = row_keys(&r3delta);
+    let reemitted: std::collections::BTreeSet<_> =
+        before.intersection(&r3keys).cloned().collect();
+    let v1objects: std::collections::BTreeSet<_> = row_keys(&v1lines)
+        .into_iter()
+        .filter(|key| key.starts_with("o:"))
+        .collect();
+    assert_eq!(
+        reemitted, v1objects,
+        "only the reused input's counter bump re-emits"
+    );
+    for line in &r3delta {
+        if line["kind"] == "object_observed"
+            && reemitted.contains(&format!("o:{}", line["event"]["row"]["object"]))
+        {
+            assert_eq!(line["event"]["version"], 2, "re-emits bind current v2");
+            assert_eq!(
+                line["event"]["row"]["creation"], "create",
+                "v1 vocabulary stays valid under v2"
+            );
+        }
+    }
+    let r3lines = [v1lines.clone(), r2delta.clone(), r3delta.clone()].concat();
+    let rebuilt = reconstruct(&r3lines);
+    assert_reconstructed_eq_json(&rebuilt, &section, false);
+    assert!(
+        rebuilt.known.keys().any(|key| key.contains("decapsulation_key")),
+        "the proved KEM role reconstructs"
+    );
+    // Dashboard tallies come from the same projection.
+    let tallies = crate::inventory_present::key_operation_tallies(&r3);
+    let decap = tallies
+        .iter()
+        .find(|tally| tally.category == "decapsulate")
+        .expect("decapsulate tally");
+    assert_eq!((decap.completed, decap.failed, decap.active), (1, 0, 0));
+    // Role-only KEM: a proved KEM role with no KEM creation
+    // anywhere still renders and streams v2.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let aes = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1Fu16), (4u8, 1u8, 32u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &aes,
+    );
+    drive_kem_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            kem_result: Some((0, 2)),
+            ..ShapedS1::shaped("C_DecapsulateKey", CkRv::OK.0, 0x17, kem_decap_capture())
+        },
+    );
+    let rr = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert!(
+        rr.objects
+            .iter()
+            .all(|row| !matches!(row.creation, Some("encapsulate" | "decapsulate"))),
+        "role-only: no KEM creation"
+    );
+    assert!(
+        rr.key_operations
+            .iter()
+            .any(|row| row.role == "decapsulation_key"),
+        "the proved KEM role"
+    );
+    let section = object_observations_json(&rr);
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V2);
+    assert_eq!(marker_version(&rr), 2);
+    let role_path = dir.path().join("role.jsonl");
+    let mut writer = EventWriter::create(&role_path, 1 << 20, 5).unwrap();
+    let mut emitter = KeyOperationEmitter::new();
+    loop {
+        let out = emitter.emit(&mut writer, &rr, 1_000).unwrap();
+        if out.emitted == 0 {
+            break;
+        }
+    }
+    drop(writer);
+    let role_lines = read_stream(dir.path(), "role.jsonl");
+    assert!(
+        row_versions(&role_lines).iter().all(|v| *v == 2),
+        "role-only rows bind v2"
+    );
+    assert_reconstructed_eq_json(&reconstruct(&role_lines), &section, true);
+    // Unknown versions refuse without guessing.
+    for bad in [
+        serde_json::json!(0),
+        serde_json::json!(99),
+        serde_json::json!("2"),
+        serde_json::Value::Null,
+    ] {
+        let lines = [serde_json::json!({
+            "kind": "object_observed",
+            "event": {"revision": 1, "version": bad, "row": {}},
+        })];
+        assert!(
+            std::panic::catch_unwind(|| reconstruct(&lines)).is_err(),
+            "version {bad} refuses"
+        );
+    }
+    // Rotation: the versioned stream survives generations; every
+    // retained row event binds a known version. One scene only:
+    // capture-local row keys are scene-scoped.
+    let spin_path = dir.path().join("spin.jsonl");
+    let measure = |lines: &[serde_json::Value]| {
+        lines
+            .iter()
+            .map(|line| line.to_string().len() + 1)
+            .sum::<usize>()
+    };
+    let all_bytes = measure(&r3lines);
+    let largest = r3lines
+        .iter()
+        .map(|line| line.to_string().len() + 1)
+        .max()
+        .unwrap();
+    let file_bytes = (largest + 512).max(all_bytes / 2) as u64;
+    let mut spin = EventWriter::create(&spin_path, file_bytes, 3).unwrap();
+    let mut emitter = KeyOperationEmitter::new();
+    emitter.emit(&mut spin, &r1, 1_000).unwrap();
+    emitter.emit(&mut spin, &r2, 2_000).unwrap();
+    emitter.emit(&mut spin, &r3, 3_000).unwrap();
+    assert!(spin.rotations() > 0, "rotation exercised");
+    drop(spin);
+    let spun = read_stream(dir.path(), "spin.jsonl");
+    for line in &spun {
+        if line["kind"] == "object_observed" || line["kind"] == "key_operations_observed" {
+            let version = line["event"]["version"].as_u64().unwrap_or(u64::MAX);
+            assert!(version == 1 || version == 2, "known version survives");
+        }
+    }
+    assert!(
+        spun.iter().any(|line| line["kind"] == "rotated"),
+        "rotation marker present"
+    );
+    assert!(
+        spun.iter().any(|line| line["kind"] == "object_observed"
+            && line["event"]["row"]["creation"] == "encapsulate"),
+        "the KEM creation survives rotation"
+    );
+    assert!(
+        spun.iter().any(|line| line["kind"] == "key_operations_observed"
+            && line["event"]["row"]["role"] == "decapsulation_key"),
+        "the KEM role survives rotation"
+    );
+    let section = object_observations_json(&r3);
+    assert_reconstructed_eq_json(&reconstruct(&spun), &section, false);
+}
+
+/// The unknown-version refusal names its version.
+#[test]
+#[should_panic(expected = "H9 row version 3 refused")]
+fn key_operation_kem_jsonl_unknown_version_refused() {
+    let lines = [serde_json::json!({
+        "kind": "object_observed",
+        "event": {"revision": 1, "version": 3, "row": {}},
+    })];
+    let _ = reconstruct(&lines);
 }
 
 /// Item 20 (contracts audit): v1 tables and the v1 schema stay

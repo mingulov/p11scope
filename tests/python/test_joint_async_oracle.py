@@ -1248,6 +1248,31 @@ class TransferTwins(unittest.TestCase):
 
 
 class AsyncStreamTwins(unittest.TestCase):
+    def test_h9_row_versions_ride_v1_async_content(self):
+        oracle = require_oracle(self)
+        collision, joint, _single = paired(oracle, "poll_msg")
+        with self.subTest("versioned v1 rows pass"):
+            stream = healthy_stream(collision, joint)
+            for line in stream:
+                if line["kind"] in ("object_observed",
+                                    "key_operations_observed"):
+                    line["event"]["version"] = 1
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = 1
+            oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("unknown row version refused"):
+            stream = healthy_stream(collision, joint)
+            stream[0]["event"]["version"] = 3
+            with self.assertRaisesRegex(oracle.LedgerError, "version"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("unknown marker version refused"):
+            stream = healthy_stream(collision, joint)
+            marker = next(line for line in stream
+                          if line["kind"] == "pass_committed")
+            marker["event"]["object_version"] = 3
+            with self.assertRaisesRegex(oracle.LedgerError, "version"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+
     def test_healthy_streams_pass_both_views(self):
         oracle = require_oracle(self)
         for mode in ("poll_msg", "cancel", "persisted"):

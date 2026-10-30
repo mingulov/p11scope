@@ -59,6 +59,11 @@ CATEGORIES = {"digest", "sign", "verify", "encrypt", "decrypt", "sign_recover",
               "operation", "direct", "unknown"}
 ROLES = {"key", "wrapping_key", "wrapped_object", "unwrapping_key", "base_key",
          "other"}
+# H9 row-event versions (packet 6.07c): this oracle validates v1
+# async content only and pins v1 snapshots; known row versions
+# ride along under the existing v1 row rules, while unknown
+# versions are refused rather than guessed.
+KNOWN_ROW_VERSIONS = (1, 2)
 UNITS = {"operations", "message_contexts"}
 UNKNOWN_REASONS = {"unbound", "key_join_lost", "metadata_unknown",
                    "metadata_conflicting", "role_unavailable", "not_applicable"}
@@ -115,6 +120,16 @@ def _integer(value, minimum=0):
 
 def _keys(row, expected):
     _require(type(row) is dict and set(row) == set(expected), "unexpected fields")
+
+
+def _row_event_version(event, where, base):
+    """Tolerate the additive row `version`, refusing unknown versions."""
+    keys = set(event)
+    _require(keys == base or keys == base | {"version"},
+             f"{where}: unexpected fields")
+    version = event.get("version", 1)
+    _require(type(version) is int and version in KNOWN_ROW_VERSIONS,
+             f"{where}: unsupported H9 row version {_shown(version)}")
 
 
 def _unique_object(pairs):
@@ -1005,13 +1020,13 @@ def compare_stream(events, collision, snapshot, view):
         _require(type(line["event"]) is dict, f"{where}: event must be an object")
         kind, event = line["kind"], line["event"]
         if kind == "object_observed":
-            _keys(event, {"revision", "row"})
+            _row_event_version(event, where, {"revision", "row"})
             _require(_integer(event["revision"]), f"{where}: revision out of range")
             key = ("object", _check_object_row(event["row"], where))
             series.setdefault(key, []).append(
                 (event["revision"], line["at_ns"], event["row"]))
         elif kind == "key_operations_observed":
-            _keys(event, {"revision", "bucket", "row"})
+            _row_event_version(event, where, {"revision", "bucket", "row"})
             _require(_integer(event["revision"]), f"{where}: revision out of range")
             _require(event["bucket"] in ("known", "unknown"),
                      f"{where}: bucket invalid")
@@ -1022,6 +1037,11 @@ def compare_stream(events, collision, snapshot, view):
             series.setdefault(key, []).append(
                 (event["revision"], line["at_ns"], event["row"]))
         elif kind == "pass_committed":
+            if "object_version" in event:
+                _require(type(event["object_version"]) is int
+                         and event["object_version"] in KNOWN_ROW_VERSIONS,
+                         f"{where}: unsupported H9 marker version "
+                         f"{_shown(event['object_version'])}")
             if "object_status" in event:
                 _require(event["object_status"] == snapshot["status"],
                          f"{where}: object_status {_shown(event['object_status'])}"

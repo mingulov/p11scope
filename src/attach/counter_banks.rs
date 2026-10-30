@@ -4815,6 +4815,7 @@ impl CounterBanks {
     /// `objects` is the store the child slot ids resolve in; the
     /// before-mark carries the driver's `read_seq_before` (R2-D2-C seq
     /// injection): the gate mints no seqs.
+    #[allow(clippy::too_many_arguments)] // One atomic reserve boundary over all facts, like the adapter orchestration.
     pub(crate) fn reserve_detail_window(
         &self,
         broad: BroadToggleFacts,
@@ -4956,13 +4957,15 @@ impl CounterBanks {
 
 impl Session {
     /// Reserve a selected-detail window against this broad counter
-    /// Session (reads its banks and facts). STAGED (6.15): called by
-    /// the detail adapter's session-level reserve; unit coverage runs
+    /// Session (reads its banks and facts). `child_objects` is the
+    /// store the child slot ids resolve in — the convert subset's own
+    /// id space, never the broad store. STAGED (6.15): called by the
+    /// detail adapter's session-level reserve; unit coverage runs
     /// banks-level.
     pub(crate) fn reserve_gate_window(
         &self,
         broad_plan: &AttachPlan,
-        objects: &PinnedObjects,
+        child_objects: &PinnedObjects,
         selected: u32,
         child_slots: &[Slot],
         read_seq_before: u64,
@@ -4977,7 +4980,7 @@ impl Session {
                 stopped: self.mutation_stopped(),
             },
             broad_plan,
-            objects,
+            child_objects,
             selected,
             child_slots,
             read_seq_before,
@@ -12782,7 +12785,9 @@ pub(crate) mod tests {
             assert_eq!(window.detail_generation(), generation);
             assert_eq!(window.selected(), 512);
             assert_eq!(window.mark_before().seq, 41);
-            let (lineage, drift) = window.close(&banks, NonZeroU64::new(7).unwrap(), 87).unwrap();
+            let (lineage, drift) = window
+                .close(&banks, NonZeroU64::new(7).unwrap(), 87)
+                .unwrap();
             assert_eq!(drift, None);
             assert_eq!(lineage.detail_generation, generation);
         }
@@ -12983,7 +12988,9 @@ pub(crate) mod tests {
         window
             .validate_live_match()
             .expect("retirement is invisible to the owned-data bind");
-        let (lineage, drift) = window.close(&banks, NonZeroU64::new(7).unwrap(), 87).unwrap();
+        let (lineage, drift) = window
+            .close(&banks, NonZeroU64::new(7).unwrap(), 87)
+            .unwrap();
         assert_eq!(lineage.broad_mark_before.indices.len(), 513);
         assert_eq!(lineage.broad_mark_after.indices.len(), 512);
         assert!(
@@ -13031,7 +13038,9 @@ pub(crate) mod tests {
         let window = reservation.bind_generation(9);
         poison_toggle_mutex(&banks.directory);
         assert_eq!(
-            window.close(&banks, NonZeroU64::new(7).unwrap(), 87).unwrap_err(),
+            window
+                .close(&banks, NonZeroU64::new(7).unwrap(), 87)
+                .unwrap_err(),
             super::DetailToggleRefusal::Quarantined
         );
     }

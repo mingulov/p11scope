@@ -250,6 +250,7 @@ pub(crate) struct SelectedEndpointReceipt {
     file_offset: u64,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // STAGED (6.15): minted by the driver packet's selection path.
 impl SelectedEndpointReceipt {
     pub(crate) fn new(view: ViewRevision, file_offset: u64) -> Self {
         Self { view, file_offset }
@@ -297,6 +298,7 @@ impl Promoter {
     /// the pair checks are identical, and the receipt must name this
     /// viewed revision — a receipt for another view is stale (the
     /// selection raced a redraw) and refuses without queueing.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (6.15): the driver packet queues with receipts.
     pub(crate) fn request_with_endpoint(
         &mut self,
         viewed: Arc<PromotionView>,

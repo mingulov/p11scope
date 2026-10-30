@@ -2488,7 +2488,7 @@ impl ModelState {
                 *slot = match call.snapshot.inputs[index] {
                     OriginState::Absent => DeferredInput::Absent,
                     OriginState::Unproven(reason) => DeferredInput::Unproven(reason),
-                    OriginState::Settled(id) if kem_no_freeze => {
+                    OriginState::Settled(_) if kem_no_freeze => {
                         DeferredInput::Unproven(ObjectGap::PendingResultUnavailable)
                     }
                     OriginState::Settled(id) => match call.inputs[index] {

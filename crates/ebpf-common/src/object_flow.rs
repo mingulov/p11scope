@@ -651,13 +651,12 @@ pub fn adapter_kem_entry(
             side.result_ptrs = [0, 0];
             return true;
         };
-        if length_cell != 0 {
-            if target_word_end(length_cell, layout).is_none()
-                || spans_overlap(cell, word_len, length_cell, word_len)
-            {
-                side.result_ptrs = [0, 0];
-                return true;
-            }
+        if length_cell != 0
+            && (target_word_end(length_cell, layout).is_none()
+                || spans_overlap(cell, word_len, length_cell, word_len))
+        {
+            side.result_ptrs = [0, 0];
+            return true;
         }
     }
     side.result_ptrs = [cell, 0];

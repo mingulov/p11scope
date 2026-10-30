@@ -1757,11 +1757,52 @@ fn assert_static_descriptor_cookie_contract(
     ] {
         require_contract_marker(returned, marker, contract)?;
     }
-    // Both return branches build their facts through the shared outlined
-    // consumer above: dropping either call would bypass descriptor
-    // semantics for that branch's emission.
-    if returned.matches("capture_return_facts::<").count() != 2 {
-        return Err("both return branches must consume descriptor facts".into());
+    // Each of the three return implementations builds its facts
+    // through the shared outlined consumer above: dropping any call
+    // would bypass descriptor semantics for that implementation's
+    // emission. The ordinary half and the monomorphic ordinary object
+    // copy capture with the false specialization; the generic
+    // (journal) object copy threads its JOURNAL parameter.
+    let ordinary_facts =
+        contract_section(ebpf, "fn ordinary_return(", "fn object_return_ordinary(")?;
+    let object_ordinary_facts = contract_section(
+        ebpf,
+        "fn object_return_ordinary(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    )?;
+    let object_facts = contract_section(
+        ebpf,
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+        "#[unsafe(no_mangle)]\n#[inline(never)]\npub extern \"C\" fn p11_link_fork_allowed",
+    )?;
+    for (section, specialization, contract) in [
+        (
+            ordinary_facts,
+            "capture_return_facts::<false>",
+            "ordinary return",
+        ),
+        (
+            object_ordinary_facts,
+            "capture_return_facts::<false>",
+            "ordinary object return",
+        ),
+        (
+            object_facts,
+            "capture_return_facts::<JOURNAL>",
+            "generic object return",
+        ),
+    ] {
+        if section.matches("capture_return_facts::<").count() != 1
+            || !section.contains(specialization)
+        {
+            return Err(format!(
+                "{contract} must consume descriptor facts exactly once with its own specialization"
+            ));
+        }
+    }
+    // No-new-site guard: exactly the three justified calls above.
+    if returned.matches("capture_return_facts::<").count() != 3 {
+        return Err("each return implementation must consume descriptor facts exactly once".into());
     }
     // fill_call_event stores its slot parameter into Event.slot: the sink
     // half of the call-site slot markers above.
@@ -13724,17 +13765,13 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         gate < reserve,
         "aggregate gate must precede the return-path EVENTS reserve"
     );
-    // H7 slice D: each return branch gates aggregate policy before any
-    // submit. ordinary_return retires its START row before its early
-    // return (no side row exists there); object_return retires through
-    // the checked removal inside the gate, since dispatch guarantees an
-    // object call there. The exact-text pins keep failing on any added
-    // submit site.
-    let ordinary = between(
-        &ebpf,
-        "fn ordinary_return(",
-        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
-    );
+    // H7 slice D: each return implementation gates aggregate policy
+    // before any submit. ordinary_return retires its START row before
+    // its early return (no side row exists there); each object_return
+    // copy retires through its own checked removal inside the gate,
+    // since dispatch guarantees an object call there. The exact-text
+    // pins keep failing on any added submit site.
+    let ordinary = between(&ebpf, "fn ordinary_return(", "fn object_return_ordinary(");
     let ordinary_retire = ordinary
         .find("if owned_start_remove(&key, true).is_err()")
         .expect("ordinary return must retire before its aggregate gate");
@@ -13751,6 +13788,25 @@ fn aggregate_policy_returns_before_both_events_reserves() {
     assert!(
         ordinary.contains("if cfg!(feature = \"counter-broad\") || flags & FLAG_POLICY_AGGREGATE != 0 {\n        return 0;\n    }"),
         "ordinary aggregate gate must return before any submit"
+    );
+    let object_ordinary = between(
+        &ebpf,
+        "fn object_return_ordinary(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    );
+    let object_ordinary_gate = object_ordinary
+        .find("if flags & FLAG_POLICY_AGGREGATE != 0")
+        .expect("ordinary object return must gate aggregate policy");
+    let object_ordinary_reserve = object_ordinary
+        .find("EVENTS.reserve::<ObjectEventRecord>(0)")
+        .expect("ordinary object return must hold its EVENTS reserve");
+    assert!(
+        object_ordinary_gate < object_ordinary_reserve,
+        "ordinary object aggregate gate must return before any submit"
+    );
+    assert!(
+        object_ordinary.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n        if owned_start_remove(&key, true).is_err() {\n            unsafe { p11_object_fault() };\n            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);\n        }\n        return 0;\n    }"),
+        "ordinary object aggregate gate must retire, then return before any submit"
     );
     let object = between(
         &ebpf,

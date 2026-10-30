@@ -8463,6 +8463,8 @@ fn prearm_link_gaps_refuse_idle() {
 /// stop must not extend the published bound past it. The watch arms at
 /// 1000, the first stop freezes at 1000, and the change is detected later
 /// at real-clock time: the published `until_ns` never exceeds the stop.
+/// Round-3 (re-audit finding 1): the stop caps the coverage end only — the
+/// published bracket still equals the real held-FD evidence.
 #[test]
 fn prearm_object_change_detected_after_stop_never_exceeds_first_stop() {
     use crate::render::{PrearmWatchEnd, PrearmWatchState};
@@ -8471,11 +8473,21 @@ fn prearm_object_change_detected_after_stop_never_exceeds_first_stop() {
     let fixture = DiscoveryLifecycleFixture::start();
     let mut engine = fixture.discover_prearm_before_load();
     assert!(engine.has_prearm_watches());
+    let watch_id = engine
+        .prearm
+        .watches()
+        .keys()
+        .next()
+        .copied()
+        .expect("one pre-arm watch");
     let mut session = ScriptedSession::default();
     for slot in engine.plan().slots.iter() {
         session.scripted_links.insert(slot.index);
         session.scripted_stamps.insert(slot.index, 1000);
     }
+    // A last successful held-FD check after the synthetic stop: the
+    // published bracket must preserve it, not rewrite it to the stop.
+    assert_eq!(engine.pinned().check_object_unchanged(watch_id), Ok(true));
     // Dirty the pinned provider after arming so the terminal refresh
     // detects the change at real-clock time (far past the frozen stop).
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -8510,6 +8522,22 @@ fn prearm_object_change_detected_after_stop_never_exceeds_first_stop() {
     assert!(
         until <= 1000,
         "published bound {until} exceeds the first stop 1000"
+    );
+    // Round-3 (re-audit finding 1): the stop bounds the coverage end only.
+    // The published bracket must equal the real held-FD evidence — both
+    // checks ran after the synthetic stop, and neither may be rewritten.
+    let real = engine
+        .pinned()
+        .change_bracket(watch_id)
+        .expect("detection latched a real held-FD bracket");
+    assert!(
+        real.last_ok_ns > 1000 && real.detected_ns > 1000,
+        "both bracket checks ran after the synthetic stop 1000: {real:?}"
+    );
+    assert_eq!(
+        watch.changed,
+        Some(real),
+        "published bracket must equal the held-FD evidence"
     );
 }
 

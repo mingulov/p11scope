@@ -301,11 +301,13 @@ impl PrearmWatch {
         self.state = PrearmWatchState::Ended;
     }
 
-    /// Clamps the published bound to the first stop (packet 6.13 round-2,
-    /// F3): a change detected after observation stopped must not extend
-    /// `until_ns` past it. The bracket's detection instant clamps with the
-    /// bound so the two stay coherent; `last_ok_ns` clamps too, so the
-    /// bracket still orders.
+    /// Caps the published coverage end at the first stop (packet 6.13
+    /// round-2, F3): a change detected after observation stopped must not
+    /// extend `until_ns` past it. The held-FD bracket is observed evidence,
+    /// not a scope-clipped coordinate: it stays exactly as the checks
+    /// reported it (round-3 re-audit finding 1), even when the last-ok or
+    /// detection instant falls after the stop. Rewriting either instant to
+    /// the stop would assert a check or detection never observed.
     pub(crate) fn clamp_to_stop(&mut self, stop_ns: Option<u64>) {
         let Some(cap) = stop_ns else {
             return;
@@ -314,14 +316,6 @@ impl PrearmWatch {
             && until > cap
         {
             self.until_ns = Some(cap);
-        }
-        if let Some(changed) = self.changed.as_mut() {
-            if changed.detected_ns > cap {
-                changed.detected_ns = cap;
-            }
-            if changed.last_ok_ns > cap {
-                changed.last_ok_ns = cap;
-            }
         }
     }
 
@@ -786,6 +780,32 @@ mod tests {
         watch.end(PrearmWatchEnd::HealthLoss, Some(500));
         assert_eq!(watch.render().state, PrearmWatchState::Ended);
         assert_eq!(watch.render().until_ns, Some(100));
+    }
+
+    #[test]
+    fn clamp_to_stop_preserves_real_change_bracket() {
+        // Packet 6.13 round-3 (re-audit finding 1): the published coverage
+        // end caps at the first stop, but the held-FD bracket is observed
+        // evidence — a last-ok/detected pair after the stop stays as
+        // observed, never rewritten to the stop.
+        let a = key(1, 0x1000);
+        let mut watch = watched(BTreeSet::from([a]));
+        watch.evaluate_arm(&[link(a, true, Some(100))]);
+        watch.note_object_changed(PrearmObjectChange {
+            last_ok_ns: 3000,
+            detected_ns: 4000,
+            previous_ino: 42,
+        });
+        watch.clamp_to_stop(Some(1000));
+        assert_eq!(watch.render().until_ns, Some(1000));
+        assert_eq!(
+            watch.render().changed,
+            Some(PrearmObjectChange {
+                last_ok_ns: 3000,
+                detected_ns: 4000,
+                previous_ino: 42,
+            }),
+        );
     }
 
     fn quiet_health() -> PrearmHealth {

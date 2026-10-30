@@ -145,7 +145,9 @@ pub const JOURNAL_REASON_ABI_REFUSED: u32 = 4;
 pub const JOURNAL_REASON_IDENTITY_REFUSED: u32 = 5;
 pub const JOURNAL_REASON_EXEC_EXIT: u32 = 6;
 /// Reserved: `JOURNAL_REASON_STOP_CLEANUP` names a future stop sweep; no
-/// producer emits it, and pending-stop custody settles by exec-exit instead.
+/// producer emits it. Open-gate exec/exit cleanup settles retained calls,
+/// while a closed stop gate admits no such witness: pending custody stays
+/// pending with unknown disposition until the sweep is designed.
 pub const JOURNAL_REASON_STOP_CLEANUP: u32 = 7;
 /// Reserved: `JOURNAL_REASON_PARTIAL_TRANSACTION` names a torn combined
 /// transaction; the live producer never emits it and refuses forward instead.

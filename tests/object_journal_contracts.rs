@@ -966,10 +966,13 @@ fn object_journal_native_producer_preserves_wire_and_custody() {
         }
         // The small flavor's one-entry side map admits one fewer live
         // BEGIN (and its cleanup ABANDON) in the multi-slot cleanup case.
+        // The two single-slot stop-gate sections add one BEGIN (closed
+        // gate, no terminal) plus one BEGIN/ABANDON pair (open-gate
+        // control) in every flavor.
         let expected = if name == "small" {
-            [33, 1, 20]
+            [35, 1, 21]
         } else {
-            [34, 1, 21]
+            [36, 1, 22]
         };
         assert_eq!(counts, expected, "exact producer record selection");
     }
@@ -2066,7 +2069,10 @@ fn object_journal_marker_wired_detailed_only() {
 /// Every finite ABANDON reason is either emitted by a named producer
 /// site or explicitly reserved in the shared contract. A reason with
 /// neither would let the fixture's wire coverage (removal reasons
-/// 0..=9) silently outrun the live producer.
+/// 0..=9) silently outrun the live producer. Emission means an
+/// executable reason-bearing removal/settlement site, never bare
+/// token presence: the import block already names every token, so a
+/// scope-loss mutant that keeps its import must be rejected.
 #[test]
 fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
     use p11scope_ebpf_common::object_journal::{
@@ -2092,9 +2098,11 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
     );
     let read = |path: &str| std::fs::read_to_string(path).unwrap_or_else(|_| panic!("read {path}"));
     let main_rs = read("crates/ebpf/src/main.rs");
+    let roots_rs = read("crates/ebpf/src/journal_roots.rs");
     let owner_c = read("crates/ebpf/native/task_owner.c");
     let owner_h = read("crates/ebpf/native/task_owner.h");
     let journal_c = read("crates/ebpf/native/object_journal.c");
+    let fixture_c = read("tests/fixtures/object-journal/journal_owner_tests.c");
     let common = read("crates/ebpf-common/src/object_journal.rs");
     for (define, expected) in [
         (
@@ -2114,27 +2122,168 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
         let native: u32 = literal.parse().expect("native reason parses");
         assert_eq!(native, expected, "native and wire reason numbers agree");
     }
-    for (reason, site) in [
-        ("entry-collision", "P11_OWNER_START_REASON_COLLISION"),
-        ("exec-exit", "P11_OWNER_START_REASON_EXEC_EXIT"),
-    ] {
-        assert!(owner_c.contains(site), "{reason} emitter site {site}");
+    /// Executable reason-bearing call sites: source lines that carry
+    /// both the reason token and a removal/settlement call shape.
+    /// Import lines and prose never match: they carry no call.
+    fn executable_sites<'a>(text: &'a str, token: &str, calls: &[&str]) -> Vec<&'a str> {
+        text.lines()
+            .filter(|line| line.contains(token) && calls.iter().any(|call| line.contains(call)))
+            .collect()
     }
-    for (reason, token) in [
-        ("insert-failed", "JOURNAL_REASON_INSERT_FAILED"),
-        ("scope-lost", "JOURNAL_REASON_SCOPE_LOST"),
-        ("abi-refused", "JOURNAL_REASON_ABI_REFUSED"),
-        ("identity-refused", "JOURNAL_REASON_IDENTITY_REFUSED"),
-        (
-            "sync-return-result-lost",
-            "JOURNAL_REASON_SYNC_RETURN_RESULT_LOST",
-        ),
+    // The main import block names every Rust-side token, so whole-file
+    // presence cannot tell an emitter from an import. Pin that trap:
+    // the import must still carry all five tokens, and only the
+    // call-shaped lines below count as emitters.
+    let import_marker = "use p11scope_ebpf_common::object_journal::{";
+    let import_at = main_rs.find(import_marker).expect("reason import block");
+    let import_end = main_rs[import_at..].find("};").expect("import end") + import_at + "};".len();
+    let import_block = &main_rs[import_at..import_end];
+    for token in [
+        "JOURNAL_REASON_INSERT_FAILED",
+        "JOURNAL_REASON_SCOPE_LOST",
+        "JOURNAL_REASON_ABI_REFUSED",
+        "JOURNAL_REASON_IDENTITY_REFUSED",
+        "JOURNAL_REASON_SYNC_RETURN_RESULT_LOST",
     ] {
-        assert!(main_rs.contains(token), "{reason} emitter token {token}");
+        assert!(import_block.contains(token), "import still names {token}");
     }
+    // Native calls may wrap the reason onto the next line; join wrapped
+    // call lines so the shape check sees whole calls.
+    let owner_joined = owner_c.replace(",\n", ", ");
+    // Each named emitter, individually: at least one executable
+    // reason-bearing removal/settlement site in its producer file.
     assert!(
-        journal_c.contains("reason = 9;"),
+        !executable_sites(
+            &owner_joined,
+            "P11_OWNER_START_REASON_COLLISION",
+            &["remove_start("]
+        )
+        .is_empty(),
+        "entry-collision emitter: reason-bearing remove_start in task_owner.c"
+    );
+    assert!(
+        !executable_sites(
+            &main_rs,
+            "JOURNAL_REASON_INSERT_FAILED",
+            &["start_remove_for::<JOURNAL>("]
+        )
+        .is_empty(),
+        "insert-failed emitter: reason-bearing removal in main.rs"
+    );
+    assert!(
+        !executable_sites(
+            &main_rs,
+            "JOURNAL_REASON_SCOPE_LOST",
+            &["start_remove_rc_for::<JOURNAL>("]
+        )
+        .is_empty(),
+        "scope-lost emitter: reason-bearing removal in main.rs"
+    );
+    assert!(
+        !executable_sites(
+            &main_rs,
+            "JOURNAL_REASON_ABI_REFUSED",
+            &[
+                "start_remove_for::<JOURNAL>(",
+                "start_discard_for::<JOURNAL>("
+            ]
+        )
+        .is_empty(),
+        "abi-refused emitter: reason-bearing removal in main.rs"
+    );
+    assert!(
+        !executable_sites(
+            &main_rs,
+            "JOURNAL_REASON_IDENTITY_REFUSED",
+            &["start_remove_for::<JOURNAL>("]
+        )
+        .is_empty(),
+        "identity-refused emitter: reason-bearing removal in main.rs"
+    );
+    assert!(
+        !executable_sites(
+            &roots_rs,
+            "JOURNAL_REASON_IDENTITY_REFUSED",
+            &["remove(&key"]
+        )
+        .is_empty(),
+        "identity-refused emitter: reason-bearing remove in journal_roots.rs"
+    );
+    assert!(
+        !executable_sites(
+            &owner_joined,
+            "P11_OWNER_START_REASON_EXEC_EXIT",
+            &["remove_start("]
+        )
+        .is_empty(),
+        "exec-exit emitter: reason-bearing remove_start in task_owner.c"
+    );
+    assert!(
+        !executable_sites(
+            &main_rs,
+            "JOURNAL_REASON_SYNC_RETURN_RESULT_LOST",
+            &["start_remove_for::<JOURNAL>("]
+        )
+        .is_empty(),
+        "sync-return-result-lost emitter: reason-bearing removal in main.rs"
+    );
+    assert!(
+        !executable_sites(
+            &roots_rs,
+            "JOURNAL_REASON_SYNC_RETURN_RESULT_LOST",
+            &["remove(&key"]
+        )
+        .is_empty(),
+        "sync-return-result-lost emitter: reason-bearing remove in journal_roots.rs"
+    );
+    let completion = roots_rs
+        .split("fn completion_reason")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}\n").next())
+        .expect("completion_reason body");
+    assert!(
+        completion.contains("JOURNAL_REASON_SYNC_RETURN_RESULT_LOST"),
+        "unsettled completion names sync-return-result-lost"
+    );
+    let settle = journal_c
+        .split("u32 p11_journal_settle_prepare")
+        .nth(1)
+        .and_then(|tail| tail.split("u32 p11_journal_settle_finish").next())
+        .expect("settle prepare body");
+    assert!(
+        settle.contains("reason = 9;"),
         "unsettled normal removal coerces to sync-return-result-lost"
+    );
+    assert_eq!(
+        journal_c.matches("reason = 9;").count(),
+        1,
+        "the settle coercion is the only numeric reason emission"
+    );
+    // Negative control: the review's counterexample — every scope-loss
+    // use outside the import re-pointed at another finite reason.
+    // Whole-file presence stays green on this mutant; the
+    // executable-site check must reject it.
+    let scope_site = "start_remove_rc_for::<JOURNAL>(&key, false, JOURNAL_REASON_SCOPE_LOST)";
+    assert!(
+        main_rs[import_end..].contains(scope_site),
+        "mutant removes a real scope-loss site"
+    );
+    let mutant = format!(
+        "{import_block}{}",
+        main_rs[import_end..].replace("JOURNAL_REASON_SCOPE_LOST", "JOURNAL_REASON_INSERT_FAILED")
+    );
+    assert!(
+        mutant.contains("JOURNAL_REASON_SCOPE_LOST"),
+        "mutant keeps the import: whole-file presence stays green"
+    );
+    assert!(
+        executable_sites(
+            &mutant,
+            "JOURNAL_REASON_SCOPE_LOST",
+            &["start_remove_rc_for::<JOURNAL>("]
+        )
+        .is_empty(),
+        "scope-loss mutant rejected"
     );
     for reserved in [
         "JOURNAL_REASON_STOP_CLEANUP",
@@ -2142,6 +2291,7 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
     ] {
         assert!(
             !main_rs.contains(reserved)
+                && !roots_rs.contains(reserved)
                 && !owner_c.contains(reserved)
                 && !journal_c.contains(reserved),
             "{reserved} stays unemitted while it is reserved"
@@ -2154,6 +2304,225 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
             "{reserved} carries its reservation in the shared contract"
         );
     }
+    // Numeric C spellings: production C emits no reserved numeric
+    // reason. The settle coercion above is the only numeric reason
+    // assignment, and it names 9.
+    for (name, text) in [("task_owner.c", &owner_c), ("object_journal.c", &journal_c)] {
+        for (index, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            for spelling in ["= 7", "=7", "= 8", "=8"] {
+                assert!(
+                    !(code.contains("reason") && code.contains(spelling)),
+                    "{name}:{}: numeric reserved reason in production C: {line}",
+                    index + 1
+                );
+            }
+        }
+    }
+    // Native reason numbers stay out of the reserved codes.
+    for line in owner_h.lines() {
+        if let Some(rest) = line.strip_prefix("#define P11_OWNER_START_REASON_") {
+            let literal = rest
+                .split_whitespace()
+                .nth(1)
+                .expect("native reason value")
+                .trim_end_matches('U');
+            let native: u32 = literal.parse().expect("native reason parses");
+            assert!(
+                !matches!(native, 7 | 8),
+                "native reason avoids reserved codes: {line}"
+            );
+        }
+    }
+    // Reserved numerics stay distinct from fixture injection: the
+    // producer matrix injects every wire reason 0..=9 through the
+    // public removal entry (wire coverage, not emission evidence),
+    // while production C above emits no numeric 7/8.
+    assert!(
+        fixture_c.contains("for (u32 reason = 0; reason <= 9; reason++)"),
+        "fixture injects the full wire reason range"
+    );
+}
+
+/// Closed stop gate preserves tracked custody: lifecycle and return
+/// entries attempted after the stop request retire nothing and publish
+/// no terminal, while the open-gate control settles through the same
+/// wrapped entries. A bridge mutant that bypasses admission must fail
+/// the closed-gate assertions.
+#[test]
+fn object_journal_stop_gate_closed_preserves_custody() {
+    use std::process::Command;
+    let common = std::fs::read_to_string("crates/ebpf-common/src/object_journal.rs")
+        .expect("read shared journal contract");
+    // The shared reservation qualifies its settlement claim: open-gate
+    // cleanup settles retained calls, while a closed gate supplies no
+    // such witness.
+    assert!(
+        common.contains("a closed stop gate admits no such witness"),
+        "stop reservation qualified to open-gate settlement"
+    );
+    let fixture = std::fs::read_to_string("tests/fixtures/object-journal/journal_owner_tests.c")
+        .expect("read journal fixture");
+    for token in [
+        "producer_stop_gate_closed_preserves_custody",
+        "producer_stop_gate_open_settles",
+        "\"stop-gate\"",
+    ] {
+        assert!(
+            fixture.contains(token),
+            "stop-gate control present: {token}"
+        );
+    }
+    // Both wrapped entries admit through the gate; the bypass mutant
+    // below discards both admissions.
+    assert_eq!(
+        fixture.matches("if (!stop_gate_enter())").count(),
+        2,
+        "admission anchor"
+    );
+    let work = tempfile::tempdir().expect("stop-gate work directory");
+    let compile = |source: &std::path::Path, binary: &std::path::Path| {
+        Command::new("clang-18")
+            .args([
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pthread",
+                "-DP11SCOPE_OBJECT_JOURNAL",
+                "-I",
+                "crates/ebpf/native",
+            ])
+            .arg(source)
+            .arg("-o")
+            .arg(binary)
+            .output()
+            .expect("compile stop-gate fixture")
+    };
+    // Healthy control: the unmutated fixture passes its stop-gate mode
+    // with the mode marker.
+    let healthy_src = work.path().join("fixture.c");
+    std::fs::write(&healthy_src, &fixture).unwrap();
+    let healthy_bin = work.path().join("fixture");
+    let output = compile(&healthy_src, &healthy_bin);
+    assert!(
+        output.status.success(),
+        "healthy compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new(&healthy_bin)
+        .arg("stop-gate")
+        .output()
+        .expect("run stop-gate fixture");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "healthy stop-gate run: {stderr}");
+    assert!(
+        stderr.contains("journal stop-gate fixture: all checks passed"),
+        "stop-gate marker: {stderr}"
+    );
+    // Negative control: admission bypassed — the wrapped entries run
+    // despite the closed gate, so the closed-gate assertions must fail.
+    // The call stays (counting intact); only its verdict is discarded.
+    let bypassed = fixture.replace("if (!stop_gate_enter())", "if (!stop_gate_enter() && 0)");
+    let mutant_src = work.path().join("mutant.c");
+    std::fs::write(&mutant_src, &bypassed).unwrap();
+    let mutant_bin = work.path().join("mutant");
+    let output = compile(&mutant_src, &mutant_bin);
+    assert!(
+        output.status.success(),
+        "mutant compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new(&mutant_bin)
+        .arg("stop-gate")
+        .output()
+        .expect("run bypassed fixture");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "bypassed admission must fail");
+    assert!(
+        stderr.contains("producer_stop_gate_closed_preserves_custody"),
+        "bypass fails in the closed-gate section: {stderr}"
+    );
+}
+
+/// Lifecycle and journal-return roots admit through the stop gate
+/// before touching custody: exec/exit roots return before cleanup and
+/// the journal return root returns before the return body when
+/// admission fails. A mutant dropping the gate must fail this pin.
+#[test]
+fn object_journal_lifecycle_roots_gate_cleanup_on_stop() {
+    let main_rs = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
+    let roots_rs =
+        std::fs::read_to_string("crates/ebpf/src/journal_roots.rs").expect("read journal roots");
+    /// A root gates its delegated call: admission and its early return
+    /// both precede the call, inside the root's own head.
+    fn root_gates_before_call(text: &str, root_fn: &str, gated_call: &str) -> bool {
+        let root = format!("fn {root_fn}(");
+        let Some(start) = text.find(root.as_str()) else {
+            return false;
+        };
+        let after = &text[start..];
+        let Some(call) = after.find(gated_call) else {
+            return false;
+        };
+        let head = &after[..call];
+        let (Some(gate), Some(early)) = (head.find("stop_gate_enter()"), head.find("return 0"))
+        else {
+            return false;
+        };
+        gate < early
+    }
+    for (root_fn, gated_call) in [
+        ("sched_process_exec", "sched_process_exec_impl"),
+        ("sched_process_exit", "sched_process_exit_impl"),
+    ] {
+        assert!(
+            root_gates_before_call(&main_rs, root_fn, gated_call),
+            "{root_fn} returns before its impl when admission fails"
+        );
+    }
+    assert!(
+        root_gates_before_call(&roots_rs, "p11_return_journal", "p11_return_impl"),
+        "p11_return_journal returns before its impl when admission fails"
+    );
+    // Both lifecycle impls actually reach cleanup: without that, the
+    // gate pin above would hold vacuously.
+    for (impl_fn, next_fn) in [
+        ("fn sched_process_exec_impl", "fn sched_process_exit"),
+        ("fn sched_process_exit_impl", "fn cookie_of"),
+    ] {
+        let start = main_rs.find(impl_fn).expect("lifecycle impl");
+        let tail = &main_rs[start..];
+        let end = tail[impl_fn.len()..].find(next_fn).expect("impl end") + impl_fn.len();
+        assert!(
+            tail[..end].contains("p11_owner_cleanup()"),
+            "{impl_fn} reaches cleanup"
+        );
+    }
+    // Negative control: the exec root with its admission gate removed
+    // (every other root keeps its gate). Whole-file gate presence
+    // stays green on this mutant; the per-root pin must reject it,
+    // while the sibling root still gates.
+    let gated = "pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {\n    if !stop_gate_enter() {\n        return 0;\n    }\n";
+    assert_eq!(main_rs.matches(gated).count(), 1, "exec gate anchor");
+    let mutant = main_rs.replacen(
+        gated,
+        "pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {\n",
+        1,
+    );
+    assert!(
+        mutant.contains("stop_gate_enter()"),
+        "mutant keeps other gates: whole-file presence stays green"
+    );
+    assert!(
+        !root_gates_before_call(&mutant, "sched_process_exec", "sched_process_exec_impl"),
+        "gate-bypassed exec root rejected"
+    );
+    assert!(
+        root_gates_before_call(&mutant, "sched_process_exit", "sched_process_exit_impl"),
+        "sibling root still gates (control)"
+    );
 }
 
 /// Causal mutants against the linked native producer: each mutation is

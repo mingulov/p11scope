@@ -2796,11 +2796,133 @@ static void producer_second_begin(struct journal_entry_context *entry, struct ow
 }
 #endif
 
-/* Pending stop then exec/exit: returns never run, custody stays intact,
- * and cleanup abandons every live tracked BEGIN exactly once with the
- * exec/exit reason. Lifetime words survive so the exec successor keeps
- * the same thread and continues the sequence. */
-static void producer_cleanup_exec_exit(void)
+/* Stop-admission bridge: mirrors the BPF lifecycle/journal-return root
+ * shape (`stop_gate_enter` in crates/ebpf/src/main.rs, journal return
+ * root in crates/ebpf/src/journal_roots.rs). The gate word uses the
+ * production layout: bit 63 is the stop request, the low 63 bits count
+ * admitted bodies. Entries attempted after the stop return early
+ * without touching custody. Single-threaded fixture: no atomics. */
+static u64 stop_gate_word;
+
+static void stop_gate_reset(void)
+{
+    stop_gate_word = 0;
+}
+
+static void stop_gate_request_stop(void)
+{
+    stop_gate_word |= (1ULL << 63);
+}
+
+static int stop_gate_enter(void)
+{
+    if (stop_gate_word & (1ULL << 63))
+        return 0;
+    stop_gate_word++;
+    if (stop_gate_word & (1ULL << 63)) {
+        stop_gate_word--;
+        return 0;
+    }
+    return 1;
+}
+
+static void stop_gate_leave(void)
+{
+    stop_gate_word--;
+}
+
+/* Out-of-band denied outcome: real cleanup outcomes are 0/1/2. */
+#define STOP_GATE_DENIED_CLEANUP (~0U)
+
+/* Mirrors the sched_process_exec/exit roots: admission first, mandatory
+ * cleanup only when admitted. */
+static u32 stop_gated_cleanup(void)
+{
+    u32 rc;
+    if (!stop_gate_enter())
+        return STOP_GATE_DENIED_CLEANUP;
+    rc = p11_owner_cleanup();
+    stop_gate_leave();
+    return rc;
+}
+
+/* Mirrors the journal return root: admission first, native returning
+ * only when admitted. Returns 1 when the return ran, 0 when denied
+ * (words untouched). */
+static int stop_gated_returning(const struct owner_start_key *key, struct journal_return_words *words)
+{
+    if (!stop_gate_enter())
+        return 0;
+    p11_journal_returning(key, words);
+    stop_gate_leave();
+    return 1;
+}
+
+/* Closed stop gate: lifecycle and return entries attempted after the
+ * stop request retire nothing and publish no terminal. Tracked
+ * custody stays pending (a BEGUN row with its BEGIN identity, the
+ * ordinary START, the outstanding lease) with unknown disposition — a
+ * closed gate supplies no settlement witness. The stop sweep itself
+ * stays undesigned; this section emits no stop-cleanup reason. */
+static void producer_stop_gate_closed_preserves_custody(void)
+{
+    struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+    struct journal_return_words words, sentinel;
+    struct journal_start_value *side;
+    stop_gate_reset();
+    memset(&sentinel, 0xa5, sizeof(sentinel));
+    words = sentinel;
+    p11_journal_begin(&producer_terminal_key, &entry);
+    EXPECT(ring_submits == 1 && ((unsigned char *)ring_log[0])[4] == JOURNAL_KIND_BEGIN &&
+               !producer_gaps,
+           "tracked BEGIN admitted before the stop");
+    stop_gate_request_stop();
+    EXPECT(stop_gated_returning(&producer_terminal_key, &words) == 0,
+           "closed gate denies the return entry");
+    EXPECT(!memcmp(&words, &sentinel, sizeof(words)), "denied return leaves words untouched");
+    EXPECT(stop_gated_cleanup() == STOP_GATE_DENIED_CLEANUP,
+           "closed gate denies the lifecycle cleanup entry");
+    EXPECT(ring_submits == 1 && !producer_gaps,
+           "denied entries publish no terminal and count no loss");
+    side = lookup(&JOURNAL_START, &producer_terminal_key);
+    EXPECT(side && side->thread == 1 && side->sequence == 1 && side->phase == JOURNAL_PHASE_BEGUN,
+           "denied entries leave the tracked row pending");
+    EXPECT(lookup(&START, &producer_terminal_key) && lookup(&OBJECT_START, &producer_terminal_key) &&
+               ctl.outstanding == 1,
+           "denied entries retire no ordinary custody");
+    EXPECT(owners[0].journal_thread == 1 && owners[0].journal_sequence == 1,
+           "denied entries advance no lifetime word");
+}
+
+/* Open-gate control for the bridge: the same wrapped entries settle
+ * while admission stays open — one ABANDON with the exec/exit reason,
+ * every custody row retired. */
+static void producer_stop_gate_open_settles(void)
+{
+    struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
+    struct journal_return_words words;
+    stop_gate_reset();
+    p11_journal_begin(&producer_terminal_key, &entry);
+    EXPECT(stop_gated_returning(&producer_terminal_key, &words) == 1,
+           "open gate admits the return entry");
+    EXPECT(words.thread == 1 && words.sequence == 1 && words.flags == 0,
+           "admitted return joins its BEGIN");
+    EXPECT(stop_gated_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START,
+           "open gate admits the lifecycle cleanup");
+    EXPECT(ring_submits == 2 && ((unsigned char *)ring_log[1])[4] == JOURNAL_KIND_ABANDON &&
+               record_u32(ring_log[1], 52) == 6 && record_u64(ring_log[1], 16) == 1 &&
+               !producer_gaps && !lookup(&JOURNAL_START, &producer_terminal_key) &&
+               !lookup(&START, &producer_terminal_key) && !ctl.outstanding,
+           "admitted cleanup abandons once with the exec/exit reason");
+}
+
+/* Open-gate exec/exit cleanup: returns never run, custody stays intact
+ * until cleanup, and cleanup abandons every live tracked BEGIN exactly
+ * once with the exec/exit reason. Lifetime words survive so the exec
+ * successor keeps the same thread and continues the sequence. This
+ * proves settlement while admission stays open; a closed stop gate
+ * admits no such witness (see the stop-gate sections above). */
+static void producer_cleanup_exec_exit_open_gate(void)
 {
     struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
     struct owner_start_key second = producer_terminal_key;
@@ -2819,7 +2941,7 @@ static void producer_cleanup_exec_exit(void)
     EXPECT(lookup(&START, &producer_terminal_key) &&
                lookup(&JOURNAL_START, &producer_terminal_key) &&
                (JOURNAL_START_LIMIT == 1 || (lookup(&START, &second) && lookup(&JOURNAL_START, &second))),
-           "pending stop leaves ordinary and journal custody untouched");
+           "open gate leaves ordinary and journal custody untouched before cleanup");
     EXPECT(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START,
            "cleanup reports abandoned live STARTs");
     EXPECT(ring_submits == 2U + 2U * (JOURNAL_START_LIMIT > 1) && !producer_gaps,
@@ -3023,11 +3145,20 @@ int main(int argc, char **argv)
         producer_terminal_matrix();
         producer_return_refusals();
         producer_prepare_finish_and_collision();
-        producer_cleanup_exec_exit();
+        producer_cleanup_exec_exit_open_gate();
         producer_cleanup_no_end();
         producer_cleanup_returning();
+        producer_stop_gate_closed_preserves_custody();
+        producer_stop_gate_open_settles();
         if (!failures)
             fprintf(stderr, "journal producer fixture: all checks passed\n");
+        return failures != 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "stop-gate")) {
+        producer_stop_gate_closed_preserves_custody();
+        producer_stop_gate_open_settles();
+        if (!failures)
+            fprintf(stderr, "journal stop-gate fixture: all checks passed\n");
         return failures != 0;
     }
 #endif

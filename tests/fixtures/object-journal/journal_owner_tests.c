@@ -2796,65 +2796,46 @@ static void producer_second_begin(struct journal_entry_context *entry, struct ow
 }
 #endif
 
-/* Stop-admission bridge: mirrors the BPF lifecycle/journal-return root
- * shape (`stop_gate_enter` in crates/ebpf/src/main.rs, journal return
- * root in crates/ebpf/src/journal_roots.rs). The gate word uses the
- * production layout: bit 63 is the stop request, the low 63 bits count
- * admitted bodies. Entries attempted after the stop return early
- * without touching custody. Single-threaded fixture: no atomics. */
-static u64 stop_gate_word;
-
-static void stop_gate_reset(void)
-{
-    stop_gate_word = 0;
-}
-
-static void stop_gate_request_stop(void)
-{
-    stop_gate_word |= (1ULL << 63);
-}
-
-static int stop_gate_enter(void)
-{
-    if (stop_gate_word & (1ULL << 63))
-        return 0;
-    stop_gate_word++;
-    if (stop_gate_word & (1ULL << 63)) {
-        stop_gate_word--;
-        return 0;
-    }
-    return 1;
-}
-
-static void stop_gate_leave(void)
-{
-    stop_gate_word--;
-}
+/* Stop-admission bridge: the wrapped entries below mirror the BPF
+ * lifecycle/journal-return root shape (`stop_gate_enter` in
+ * crates/ebpf/src/main.rs, journal return root in
+ * crates/ebpf/src/journal_roots.rs), but every admission verdict
+ * arrives from the driver over this ops table. The Rust stop-gate
+ * test supplies the shared production `stop_gate_admit_with` +
+ * production constants, so these sections execute against the real
+ * admission decision, never a handwritten reimplementation. */
+struct stop_gate_ops {
+    void (*reset)(void);
+    void (*request_stop)(void);
+    int (*enter)(void);
+    void (*leave)(void);
+};
 
 /* Out-of-band denied outcome: real cleanup outcomes are 0/1/2. */
 #define STOP_GATE_DENIED_CLEANUP (~0U)
 
 /* Mirrors the sched_process_exec/exit roots: admission first, mandatory
  * cleanup only when admitted. */
-static u32 stop_gated_cleanup(void)
+static u32 stop_gated_cleanup(const struct stop_gate_ops *ops)
 {
     u32 rc;
-    if (!stop_gate_enter())
+    if (!ops->enter())
         return STOP_GATE_DENIED_CLEANUP;
     rc = p11_owner_cleanup();
-    stop_gate_leave();
+    ops->leave();
     return rc;
 }
 
 /* Mirrors the journal return root: admission first, native returning
  * only when admitted. Returns 1 when the return ran, 0 when denied
  * (words untouched). */
-static int stop_gated_returning(const struct owner_start_key *key, struct journal_return_words *words)
+static int stop_gated_returning(const struct stop_gate_ops *ops, const struct owner_start_key *key,
+                                struct journal_return_words *words)
 {
-    if (!stop_gate_enter())
+    if (!ops->enter())
         return 0;
     p11_journal_returning(key, words);
-    stop_gate_leave();
+    ops->leave();
     return 1;
 }
 
@@ -2864,23 +2845,23 @@ static int stop_gated_returning(const struct owner_start_key *key, struct journa
  * ordinary START, the outstanding lease) with unknown disposition — a
  * closed gate supplies no settlement witness. The stop sweep itself
  * stays undesigned; this section emits no stop-cleanup reason. */
-static void producer_stop_gate_closed_preserves_custody(void)
+static void producer_stop_gate_closed_preserves_custody(const struct stop_gate_ops *ops)
 {
     struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
     struct journal_return_words words, sentinel;
     struct journal_start_value *side;
-    stop_gate_reset();
+    ops->reset();
     memset(&sentinel, 0xa5, sizeof(sentinel));
     words = sentinel;
     p11_journal_begin(&producer_terminal_key, &entry);
     EXPECT(ring_submits == 1 && ((unsigned char *)ring_log[0])[4] == JOURNAL_KIND_BEGIN &&
                !producer_gaps,
            "tracked BEGIN admitted before the stop");
-    stop_gate_request_stop();
-    EXPECT(stop_gated_returning(&producer_terminal_key, &words) == 0,
+    ops->request_stop();
+    EXPECT(stop_gated_returning(ops, &producer_terminal_key, &words) == 0,
            "closed gate denies the return entry");
     EXPECT(!memcmp(&words, &sentinel, sizeof(words)), "denied return leaves words untouched");
-    EXPECT(stop_gated_cleanup() == STOP_GATE_DENIED_CLEANUP,
+    EXPECT(stop_gated_cleanup(ops) == STOP_GATE_DENIED_CLEANUP,
            "closed gate denies the lifecycle cleanup entry");
     EXPECT(ring_submits == 1 && !producer_gaps,
            "denied entries publish no terminal and count no loss");
@@ -2897,23 +2878,40 @@ static void producer_stop_gate_closed_preserves_custody(void)
 /* Open-gate control for the bridge: the same wrapped entries settle
  * while admission stays open — one ABANDON with the exec/exit reason,
  * every custody row retired. */
-static void producer_stop_gate_open_settles(void)
+static void producer_stop_gate_open_settles(const struct stop_gate_ops *ops)
 {
     struct journal_entry_context entry = producer_setup(21, JOURNAL_CLASS_TRACKED, 1, 0);
     struct journal_return_words words;
-    stop_gate_reset();
+    ops->reset();
     p11_journal_begin(&producer_terminal_key, &entry);
-    EXPECT(stop_gated_returning(&producer_terminal_key, &words) == 1,
+    EXPECT(stop_gated_returning(ops, &producer_terminal_key, &words) == 1,
            "open gate admits the return entry");
     EXPECT(words.thread == 1 && words.sequence == 1 && words.flags == 0,
            "admitted return joins its BEGIN");
-    EXPECT(stop_gated_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START,
+    EXPECT(stop_gated_cleanup(ops) == P11_OWNER_CLEANUP_ABANDONED_START,
            "open gate admits the lifecycle cleanup");
     EXPECT(ring_submits == 2 && ((unsigned char *)ring_log[1])[4] == JOURNAL_KIND_ABANDON &&
                record_u32(ring_log[1], 52) == 6 && record_u64(ring_log[1], 16) == 1 &&
                !producer_gaps && !lookup(&JOURNAL_START, &producer_terminal_key) &&
                !lookup(&START, &producer_terminal_key) && !ctl.outstanding,
            "admitted cleanup abandons once with the exec/exit reason");
+}
+
+/* FFI batteries for the Rust stop-gate test: each runs one custody
+ * section against this fixture's native state and returns its own
+ * failure count. */
+int p11scope_stop_gate_closed(const struct stop_gate_ops *ops)
+{
+    int before = failures;
+    producer_stop_gate_closed_preserves_custody(ops);
+    return failures - before;
+}
+
+int p11scope_stop_gate_open(const struct stop_gate_ops *ops)
+{
+    int before = failures;
+    producer_stop_gate_open_settles(ops);
+    return failures - before;
 }
 
 /* Open-gate exec/exit cleanup: returns never run, custody stays intact
@@ -3148,19 +3146,13 @@ int main(int argc, char **argv)
         producer_cleanup_exec_exit_open_gate();
         producer_cleanup_no_end();
         producer_cleanup_returning();
-        producer_stop_gate_closed_preserves_custody();
-        producer_stop_gate_open_settles();
         if (!failures)
             fprintf(stderr, "journal producer fixture: all checks passed\n");
         return failures != 0;
     }
-    if (argc == 2 && !strcmp(argv[1], "stop-gate")) {
-        producer_stop_gate_closed_preserves_custody();
-        producer_stop_gate_open_settles();
-        if (!failures)
-            fprintf(stderr, "journal stop-gate fixture: all checks passed\n");
-        return failures != 0;
-    }
+    /* The stop-gate custody sections run only through the FFI batteries
+     * above: the Rust driver supplies production admission verdicts,
+     * which a standalone C process cannot mint. */
 #endif
 #ifdef P11SCOPE_INVENTORY_ONLY
     inventory_carries_no_journal();

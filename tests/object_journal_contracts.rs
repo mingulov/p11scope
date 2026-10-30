@@ -966,13 +966,14 @@ fn object_journal_native_producer_preserves_wire_and_custody() {
         }
         // The small flavor's one-entry side map admits one fewer live
         // BEGIN (and its cleanup ABANDON) in the multi-slot cleanup case.
-        // The two single-slot stop-gate sections add one BEGIN (closed
-        // gate, no terminal) plus one BEGIN/ABANDON pair (open-gate
-        // control) in every flavor.
+        // The two single-slot stop-gate sections run only through the
+        // FFI batteries (production admission verdicts need the Rust
+        // driver), so this battery carries no closed-gate BEGIN and no
+        // open-gate BEGIN/ABANDON pair.
         let expected = if name == "small" {
-            [35, 1, 21]
+            [33, 1, 20]
         } else {
-            [36, 1, 22]
+            [34, 1, 21]
         };
         assert_eq!(counts, expected, "exact producer record selection");
     }
@@ -2344,14 +2345,21 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
     );
 }
 
-/// Closed stop gate preserves tracked custody: lifecycle and return
-/// entries attempted after the stop request retire nothing and publish
-/// no terminal, while the open-gate control settles through the same
-/// wrapped entries. A bridge mutant that bypasses admission must fail
-/// the closed-gate assertions.
+/// Closed stop gate preserves tracked custody, decided by the shared
+/// production admission: the fixture's lifecycle/return entries call
+/// back into `stop_gate_admit_with` + production constants over an
+/// FFI ops table, driving the same native custody state. Closed-gate
+/// entries retire nothing and publish no terminal, while the
+/// open-gate control settles through the same wrapped entries.
+/// Hostile ops (always-admit / always-deny) must flip the verdicts
+/// they govern, proving custody rides on the linked admission.
 #[test]
 fn object_journal_stop_gate_closed_preserves_custody() {
+    use p11scope_ebpf_common::{STOP_GATE_COUNT_MASK, STOP_GATE_STOP, stop_gate_admit_with};
+    use std::ffi::CString;
+    use std::os::raw::c_int;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
     let common = std::fs::read_to_string("crates/ebpf-common/src/object_journal.rs")
         .expect("read shared journal contract");
     // The shared reservation qualifies its settlement claim: open-gate
@@ -2363,100 +2371,188 @@ fn object_journal_stop_gate_closed_preserves_custody() {
     );
     let fixture = std::fs::read_to_string("tests/fixtures/object-journal/journal_owner_tests.c")
         .expect("read journal fixture");
+    // The fixture carries the FFI admission seam and no handwritten
+    // gate of its own: every verdict below comes from the shared
+    // `stop_gate_admit_with` linked into this test.
     for token in [
-        "producer_stop_gate_closed_preserves_custody",
-        "producer_stop_gate_open_settles",
-        "\"stop-gate\"",
+        "struct stop_gate_ops",
+        "p11scope_stop_gate_closed",
+        "p11scope_stop_gate_open",
+    ] {
+        assert!(fixture.contains(token), "stop-gate seam present: {token}");
+    }
+    for shadow in [
+        "stop_gate_word",
+        "static int stop_gate_enter",
+        "static void stop_gate_leave",
+        "static void stop_gate_request_stop",
+        "1ULL << 63",
     ] {
         assert!(
-            fixture.contains(token),
-            "stop-gate control present: {token}"
+            !fixture.contains(shadow),
+            "no handwritten gate remains: {shadow}"
         );
     }
-    // Both wrapped entries admit through the gate; the bypass mutant
-    // below discards both admissions.
-    assert_eq!(
-        fixture.matches("if (!stop_gate_enter())").count(),
-        2,
-        "admission anchor"
-    );
+    // The bridge: production admission + production constants over one
+    // shared word, exposed to the fixture through the ops table.
+    static WORD: AtomicU64 = AtomicU64::new(0);
+    fn read() -> u64 {
+        WORD.compare_exchange(0, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap_or_else(|previous| previous)
+    }
+    fn add(delta: i64) {
+        WORD.fetch_add(delta as u64, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn gate_reset() {
+        WORD.store(0, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn gate_request_stop() {
+        WORD.fetch_or(STOP_GATE_STOP, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn gate_enter() -> c_int {
+        stop_gate_admit_with(read, add) as c_int
+    }
+    unsafe extern "C" fn gate_leave() {
+        add(-1);
+    }
+    unsafe extern "C" fn gate_always_admit() -> c_int {
+        1
+    }
+    unsafe extern "C" fn gate_always_deny() -> c_int {
+        0
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct StopGateOps {
+        reset: unsafe extern "C" fn(),
+        request_stop: unsafe extern "C" fn(),
+        enter: unsafe extern "C" fn() -> c_int,
+        leave: unsafe extern "C" fn(),
+    }
+    // The bridge carries production semantics: pin its word
+    // transitions before the fixture runs through them.
+    assert_eq!(STOP_GATE_STOP, 1 << 63);
+    assert_eq!(STOP_GATE_STOP & STOP_GATE_COUNT_MASK, 0);
+    assert_eq!(STOP_GATE_STOP | STOP_GATE_COUNT_MASK, u64::MAX);
+    unsafe {
+        gate_reset();
+        assert_eq!(WORD.load(Ordering::SeqCst), 0);
+        assert_eq!(gate_enter(), 1);
+        assert_eq!(WORD.load(Ordering::SeqCst), 1);
+        gate_request_stop();
+        assert_eq!(gate_enter(), 0);
+        assert_eq!(WORD.load(Ordering::SeqCst), STOP_GATE_STOP | 1);
+        gate_leave();
+        assert_eq!(WORD.load(Ordering::SeqCst), STOP_GATE_STOP);
+        assert_eq!(gate_enter(), 0);
+        gate_reset();
+    }
+    // The same native fixture state, loaded in-process: the custody
+    // sections run against the real native maps, admitted by the
+    // bridge above.
     let work = tempfile::tempdir().expect("stop-gate work directory");
-    let compile = |source: &std::path::Path, binary: &std::path::Path| {
-        Command::new("clang-18")
-            .args([
-                "-O2",
-                "-g",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-pthread",
-                "-DP11SCOPE_OBJECT_JOURNAL",
-                "-I",
-                "crates/ebpf/native",
-            ])
-            .arg(source)
-            .arg("-o")
-            .arg(binary)
-            .output()
-            .expect("compile stop-gate fixture")
+    let shared = work.path().join("fixture.so");
+    let output = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-fPIC",
+            "-shared",
+            "-DP11SCOPE_OBJECT_JOURNAL",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/object-journal/journal_owner_tests.c",
+            "-o",
+        ])
+        .arg(&shared)
+        .output()
+        .expect("compile stop-gate fixture");
+    assert!(
+        output.status.success(),
+        "fixture compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = CString::new(shared.as_os_str().as_encoded_bytes()).expect("NUL-free .so path");
+    // SAFETY: the path is a valid NUL-free object path; the handle is
+    // checked before any symbol resolves through it.
+    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    assert!(!handle.is_null(), "dlopen stop-gate fixture");
+    let symbol = |name: &str| {
+        let name = CString::new(name).expect("NUL-free symbol");
+        // SAFETY: the handle is live; dlsym only reads it.
+        let pointer = unsafe { libc::dlsym(handle, name.as_ptr()) };
+        assert!(!pointer.is_null(), "fixture entry present: {name:?}");
+        pointer
     };
-    // Healthy control: the unmutated fixture passes its stop-gate mode
-    // with the mode marker.
-    let healthy_src = work.path().join("fixture.c");
-    std::fs::write(&healthy_src, &fixture).unwrap();
-    let healthy_bin = work.path().join("fixture");
-    let output = compile(&healthy_src, &healthy_bin);
-    assert!(
-        output.status.success(),
-        "healthy compile: {}",
-        String::from_utf8_lossy(&output.stderr)
+    type Battery = unsafe extern "C" fn(*const StopGateOps) -> c_int;
+    // SAFETY: the entries are the `int (const struct stop_gate_ops *)`
+    // batteries pinned above; the ops table outlives every call.
+    let closed: Battery = unsafe { std::mem::transmute(symbol("p11scope_stop_gate_closed")) };
+    let open: Battery = unsafe { std::mem::transmute(symbol("p11scope_stop_gate_open")) };
+    let production = StopGateOps {
+        reset: gate_reset,
+        request_stop: gate_request_stop,
+        enter: gate_enter,
+        leave: gate_leave,
+    };
+    // Healthy controls: the closed gate preserves custody and the
+    // open gate settles, both admitted by production verdicts.
+    // SAFETY: each entry runs its custody section against the
+    // fixture's own native state with the ops table above.
+    assert_eq!(
+        unsafe { closed(&production) },
+        0,
+        "closed gate preserves custody"
     );
-    let output = Command::new(&healthy_bin)
-        .arg("stop-gate")
-        .output()
-        .expect("run stop-gate fixture");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "healthy stop-gate run: {stderr}");
-    assert!(
-        stderr.contains("journal stop-gate fixture: all checks passed"),
-        "stop-gate marker: {stderr}"
+    assert_eq!(unsafe { open(&production) }, 0, "open gate settles");
+    // Hostile controls: verdicts that defy the gate must flip the
+    // sections they govern — custody rides on the linked admission,
+    // never on fixture self-checks.
+    let always_admit = StopGateOps {
+        enter: gate_always_admit,
+        ..production
+    };
+    assert_ne!(
+        unsafe { closed(&always_admit) },
+        0,
+        "always-admit ops fail the closed section"
     );
-    // Negative control: admission bypassed — the wrapped entries run
-    // despite the closed gate, so the closed-gate assertions must fail.
-    // The call stays (counting intact); only its verdict is discarded.
-    let bypassed = fixture.replace("if (!stop_gate_enter())", "if (!stop_gate_enter() && 0)");
-    let mutant_src = work.path().join("mutant.c");
-    std::fs::write(&mutant_src, &bypassed).unwrap();
-    let mutant_bin = work.path().join("mutant");
-    let output = compile(&mutant_src, &mutant_bin);
-    assert!(
-        output.status.success(),
-        "mutant compile: {}",
-        String::from_utf8_lossy(&output.stderr)
+    let always_deny = StopGateOps {
+        enter: gate_always_deny,
+        ..production
+    };
+    assert_ne!(
+        unsafe { open(&always_deny) },
+        0,
+        "always-deny ops fail the open section"
     );
-    let output = Command::new(&mutant_bin)
-        .arg("stop-gate")
-        .output()
-        .expect("run bypassed fixture");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "bypassed admission must fail");
-    assert!(
-        stderr.contains("producer_stop_gate_closed_preserves_custody"),
-        "bypass fails in the closed-gate section: {stderr}"
-    );
+    // SAFETY: the handle is live and no entry runs past this point.
+    unsafe {
+        libc::dlclose(handle);
+    }
 }
 
 /// Lifecycle and journal-return roots admit through the stop gate
 /// before touching custody: exec/exit roots return before cleanup and
 /// the journal return root returns before the return body when
-/// admission fails. A mutant dropping the gate must fail this pin.
+/// admission fails. The pin matches the ACTUAL admission condition
+/// (`if !stop_gate_enter() { return 0; }`), never bare token
+/// presence: a disconnected (`&& false`), inverted, or removed gate
+/// must fail it, separately for each of the three roots.
 #[test]
 fn object_journal_lifecycle_roots_gate_cleanup_on_stop() {
     let main_rs = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF roots");
     let roots_rs =
         std::fs::read_to_string("crates/ebpf/src/journal_roots.rs").expect("read journal roots");
-    /// A root gates its delegated call: admission and its early return
-    /// both precede the call, inside the root's own head.
+    /// A root gates its delegated call: the ACTUAL admission
+    /// condition — admission failure returns before the gated call,
+    /// with nothing in between — inside the root's own head.
+    /// Whitespace-insensitive; a disconnected (`&& false`),
+    /// inverted, or missing condition never matches.
     fn root_gates_before_call(text: &str, root_fn: &str, gated_call: &str) -> bool {
         let root = format!("fn {root_fn}(");
         let Some(start) = text.find(root.as_str()) else {
@@ -2467,25 +2563,51 @@ fn object_journal_lifecycle_roots_gate_cleanup_on_stop() {
             return false;
         };
         let head = &after[..call];
-        let (Some(gate), Some(early)) = (head.find("stop_gate_enter()"), head.find("return 0"))
-        else {
-            return false;
-        };
-        gate < early
+        let flat: String = head.chars().filter(|c| !c.is_whitespace()).collect();
+        flat.contains("if!stop_gate_enter(){return0;}")
     }
-    for (root_fn, gated_call) in [
-        ("sched_process_exec", "sched_process_exec_impl"),
-        ("sched_process_exit", "sched_process_exit_impl"),
-    ] {
+    struct Root<'a> {
+        file: &'static str,
+        text: &'a str,
+        anchor: &'static str,
+        block: &'static str,
+        root_fn: &'static str,
+        gated_call: &'static str,
+    }
+    let roots = [
+        Root {
+            file: "main.rs",
+            text: &main_rs,
+            anchor: "pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {\n    if !stop_gate_enter() {\n        return 0;\n    }\n",
+            block: "    if !stop_gate_enter() {\n        return 0;\n    }\n",
+            root_fn: "sched_process_exec",
+            gated_call: "sched_process_exec_impl",
+        },
+        Root {
+            file: "main.rs",
+            text: &main_rs,
+            anchor: "pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {\n    if !stop_gate_enter() {\n        return 0;\n    }\n",
+            block: "    if !stop_gate_enter() {\n        return 0;\n    }\n",
+            root_fn: "sched_process_exit",
+            gated_call: "sched_process_exit_impl",
+        },
+        Root {
+            file: "journal_roots.rs",
+            text: &roots_rs,
+            anchor: "pub fn p11_return_journal(ctx: RetProbeContext) -> u32 {\n        keep_endpoint_stack(&ctx);\n        if !stop_gate_enter() {\n            return 0;\n        }\n",
+            block: "        if !stop_gate_enter() {\n            return 0;\n        }\n",
+            root_fn: "p11_return_journal",
+            gated_call: "p11_return_impl",
+        },
+    ];
+    for root in &roots {
         assert!(
-            root_gates_before_call(&main_rs, root_fn, gated_call),
-            "{root_fn} returns before its impl when admission fails"
+            root_gates_before_call(root.text, root.root_fn, root.gated_call),
+            "{} {} returns before its gated call when admission fails",
+            root.file,
+            root.root_fn
         );
     }
-    assert!(
-        root_gates_before_call(&roots_rs, "p11_return_journal", "p11_return_impl"),
-        "p11_return_journal returns before its impl when admission fails"
-    );
     // Both lifecycle impls actually reach cleanup: without that, the
     // gate pin above would hold vacuously.
     for (impl_fn, next_fn) in [
@@ -2500,28 +2622,98 @@ fn object_journal_lifecycle_roots_gate_cleanup_on_stop() {
             "{impl_fn} reaches cleanup"
         );
     }
-    // Negative control: the exec root with its admission gate removed
-    // (every other root keeps its gate). Whole-file gate presence
-    // stays green on this mutant; the per-root pin must reject it,
-    // while the sibling root still gates.
-    let gated = "pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {\n    if !stop_gate_enter() {\n        return 0;\n    }\n";
-    assert_eq!(main_rs.matches(gated).count(), 1, "exec gate anchor");
-    let mutant = main_rs.replacen(
-        gated,
-        "pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {\n",
-        1,
-    );
+    // The journal return pin holds non-vacuously too: the gated return
+    // reaches native returning through `complete`.
     assert!(
-        mutant.contains("stop_gate_enter()"),
-        "mutant keeps other gates: whole-file presence stays green"
+        main_rs.contains("journal_roots::program::complete("),
+        "the gated return reaches journal completion"
     );
+    let complete_at = roots_rs
+        .find("pub(crate) unsafe fn complete(")
+        .expect("complete fn");
+    let complete_tail = &roots_rs[complete_at..];
+    let complete_end = complete_tail
+        .find("pub(crate) fn ordinary_return")
+        .expect("complete end");
     assert!(
-        !root_gates_before_call(&mutant, "sched_process_exec", "sched_process_exec_impl"),
-        "gate-bypassed exec root rejected"
+        complete_tail[..complete_end].contains("p11_journal_returning(key, &mut words)"),
+        "completion reaches native returning"
     );
+    // Negative controls, one triple per root: a bypassed gate (the
+    // admission block removed), a disconnected condition (`&& false`:
+    // every token present, the verdict unused) and an inverted
+    // condition (returns when ADMITTED). Whole-file gate presence
+    // stays green on every mutant; the per-root pin must reject the
+    // mutated root while its siblings still gate.
+    let mut accepted = Vec::new();
+    for root in &roots {
+        assert_eq!(
+            root.text.matches(root.anchor).count(),
+            1,
+            "{} {} gate anchor",
+            root.file,
+            root.root_fn
+        );
+        assert_eq!(
+            root.anchor.matches(root.block).count(),
+            1,
+            "{} {} gate block anchor",
+            root.file,
+            root.root_fn
+        );
+        let mutants = [
+            ("bypass", root.anchor.replace(root.block, "")),
+            (
+                "disconnected",
+                root.anchor.replace(
+                    "if !stop_gate_enter() {",
+                    "if !stop_gate_enter() && false {",
+                ),
+            ),
+            (
+                "inverted",
+                root.anchor
+                    .replace("if !stop_gate_enter() {", "if stop_gate_enter() {"),
+            ),
+        ];
+        for (kind, anchor) in &mutants {
+            assert_ne!(
+                anchor, root.anchor,
+                "{} {} {kind} mutant differs",
+                root.file, root.root_fn
+            );
+            let mutant = root.text.replacen(root.anchor, anchor, 1);
+            assert!(
+                mutant.contains("stop_gate_enter()"),
+                "{} {} {kind} keeps gates elsewhere: whole-file presence stays green",
+                root.file,
+                root.root_fn
+            );
+            if root_gates_before_call(&mutant, root.root_fn, root.gated_call) {
+                accepted.push(format!("{} {} {kind}", root.file, root.root_fn));
+            }
+            for sibling in &roots {
+                let text = if sibling.file == root.file && sibling.root_fn != root.root_fn {
+                    &mutant
+                } else if sibling.root_fn == root.root_fn {
+                    continue;
+                } else {
+                    sibling.text
+                };
+                assert!(
+                    root_gates_before_call(text, sibling.root_fn, sibling.gated_call),
+                    "{} {} {kind}: sibling {} still gates (control)",
+                    root.file,
+                    root.root_fn,
+                    sibling.root_fn
+                );
+            }
+        }
+    }
     assert!(
-        root_gates_before_call(&mutant, "sched_process_exit", "sched_process_exit_impl"),
-        "sibling root still gates (control)"
+        accepted.is_empty(),
+        "mutants the pin accepts (must reject all):\n{}",
+        accepted.join("\n")
     );
 }
 

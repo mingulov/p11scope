@@ -2973,7 +2973,9 @@ fn object_journal_producer_mutants_are_causal() {
     let source = std::fs::read_to_string("crates/ebpf/native/object_journal.c")
         .expect("read native journal");
     let work = tempfile::tempdir().expect("mutant work directory");
-    // (label, mutation, production define, fixture argument)
+    // (label, mutation, journal define, fixture argument). The flag
+    // selects journal-enabled native code, which the proof and
+    // production journal selections share — never "production" alone.
     type MutantCase<'a> = (&'a str, Option<(&'a str, &'a str)>, bool, Option<&'a str>);
     let cases: [MutantCase<'_>; 5] = [
         ("control-combined", None, false, None),
@@ -3003,7 +3005,7 @@ fn object_journal_producer_mutants_are_causal() {
             None,
         ),
     ];
-    for (index, (label, mutant, production, argument)) in cases.into_iter().enumerate() {
+    for (index, (label, mutant, journal, argument)) in cases.into_iter().enumerate() {
         let directory = work.path().join(index.to_string());
         std::fs::create_dir(&directory).unwrap();
         for file in ["task_owner.c", "task_owner.h", "object_journal.h"] {
@@ -3023,7 +3025,7 @@ fn object_journal_producer_mutants_are_causal() {
         let binary = directory.join("fixture");
         let mut compiler = Command::new("clang-18");
         compiler.args(["-O2", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"]);
-        if production {
+        if journal {
             compiler.arg("-DP11SCOPE_OBJECT_JOURNAL");
         }
         compiler

@@ -13,6 +13,11 @@ static NEXT_LEDGER_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct LedgerGeneration(u64);
 
+/// `Role::Model` namespace for deferred-origin charges (6.07b): the
+/// origin ticket doubles as the pending-call charge key under
+/// namespace 0, so deferred records charge here instead.
+const DEFERRED_NAMESPACE: u64 = 1;
+
 /// Resource provenance only. The private constructor retains the ledger's
 /// nonrecycled generation as well as its private operation ID.
 #[derive(Clone, Copy)]
@@ -434,6 +439,30 @@ impl StagingLedger {
 
     pub(crate) fn release_model(&mut self, token: u64) {
         self.release_role(Role::Model, Self::key(token));
+    }
+
+    /// Charge one deferred origin before its model insertion (6.07b
+    /// §§2.2/3.8): keyed by origin ticket under a deferred namespace,
+    /// so the charge never collides with the origin pending call's
+    /// own Model charge and needs no ledger operation when the record
+    /// moves pending→detached or across Join (same ticket).
+    pub(crate) fn charge_deferred(&mut self, token: u64, bytes: u64) -> Result<(), LedgerRefusal> {
+        self.charge_role(Role::Model, Self::deferred_key(token), None, bytes)
+            .map(|_| ())
+    }
+
+    /// Release one deferred origin's charge at consume/loss. Tickets
+    /// never recycle, so releasing an already-released ticket is a
+    /// no-op, never a wrong refund.
+    pub(crate) fn release_deferred(&mut self, token: u64) {
+        self.release_role(Role::Model, Self::deferred_key(token));
+    }
+
+    fn deferred_key(value: u64) -> RoleKey {
+        RoleKey {
+            namespace: DEFERRED_NAMESPACE,
+            value,
+        }
     }
 
     pub(crate) fn mint_keyassoc(&mut self, bytes: u64) -> Result<u64, LedgerRefusal> {

@@ -995,6 +995,9 @@ pub(crate) struct StateEstimate {
     pub(crate) session_records: usize,
     pub(crate) live_bindings: usize,
     pub(crate) pending_calls: usize,
+    /// Live deferred async origins (6.07b): pending plus detached
+    /// map entries, in bytes like the other components.
+    pub(crate) deferred_origins: usize,
 }
 
 /// The sanitized, pointer-free projection.

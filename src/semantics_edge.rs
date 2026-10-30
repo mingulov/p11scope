@@ -411,6 +411,39 @@ struct AsyncId {
     resource: Option<ResourceLease>,
 }
 
+/// First-wins PENDING routing (§3.5): preflight reserves exactly the
+/// `Fresh` insertion charge; execution orphans the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRoute {
+    /// Unknown function or a session-less OPEN_SESSION: orphans,
+    /// grows nothing.
+    Unroutable,
+    /// A live (session, target) already holds custody: first wins
+    /// with counted ambiguity, grows nothing.
+    Duplicate,
+    /// A new fact will queue.
+    Fresh {
+        function: u32,
+        descriptor: SlotSemantics,
+        charge: usize,
+    },
+}
+
+/// Exactly-one completion eligibility (§3.3): preflight reserves the
+/// unique record's replay growth only; execution consumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompleteEligible {
+    /// No record: orphans, grows nothing.
+    Zero,
+    /// Two or more records: ambiguous, orphans with evidence and
+    /// consumes none, grows nothing.
+    Many,
+    /// The unique pending (session, target) record.
+    Pending((u64, u32)),
+    /// The unique detached (slot, target, value) record.
+    Detached((u64, u32, u64)),
+}
+
 /// One mechanism id's per-edge aggregates. The id stays verbatim
 /// (`u64` — vendor ids survive unchanged); the name resolves at
 /// render from the registered table.
@@ -655,6 +688,57 @@ impl EdgeSemantics {
         }
     }
 
+    /// First-wins PENDING routing shared by preflight and execution
+    /// (§3.5): at most one live fact per (session, target).
+    fn route_pending(&self, call: &SemanticCall) -> PendingRoute {
+        let descriptor =
+            crate::kinds::descriptor(&call.function).unwrap_or(SlotSemantics::COUNT_ONLY);
+        let Some(function) = crate::kinds::function_id(&call.function) else {
+            return PendingRoute::Unroutable;
+        };
+        if descriptor.lifecycle == lifecycle::OPEN_SESSION && call.session == SESSION_NONE {
+            return PendingRoute::Unroutable;
+        }
+        if self.pending.contains_key(&(call.session, function)) {
+            return PendingRoute::Duplicate;
+        }
+        let charge = Self::async_charge(call, &descriptor);
+        PendingRoute::Fresh {
+            function,
+            descriptor,
+            charge,
+        }
+    }
+
+    /// Exactly-one completion eligibility shared by preflight and
+    /// execution (§3.3): the pending (session, target) plus detached
+    /// ids owned by the completer for that target.
+    fn complete_eligible(&self, session: u64, target: u32) -> CompleteEligible {
+        let pending_key = (session, target);
+        let has_pending = self.pending.contains_key(&pending_key);
+        let mut detached_match = None;
+        let mut detached_count = 0usize;
+        for (key, id) in &self.detached {
+            if id.owner == Some(session) && key.1 == target {
+                detached_count += 1;
+                detached_match = Some(*key);
+            }
+        }
+        let eligible = usize::from(has_pending) + detached_count;
+        if eligible != 1 {
+            return if eligible >= 2 {
+                CompleteEligible::Many
+            } else {
+                CompleteEligible::Zero
+            };
+        }
+        if has_pending {
+            CompleteEligible::Pending(pending_key)
+        } else {
+            CompleteEligible::Detached(detached_match.expect("sole eligible record"))
+        }
+    }
+
     // Inspect the incoming descriptor and touched keys only. No allocation,
     // accumulated provenance scan, deletion credit or cloned reducer.
     fn preflight_growth(&self, call: &SemanticCall) -> usize {
@@ -673,21 +757,23 @@ impl EdgeSemantics {
             {
                 return 0;
             }
-            let original = self
-                .pending
-                .get(&(call.session, call.target_function))
-                .map(|p| (&p.call, &p.origin))
-                .or_else(|| {
-                    self.detached.iter().find_map(|(key, id)| {
-                        (id.owner == Some(call.session) && key.1 == call.target_function)
-                            .then_some((&id.call, &id.origin))
-                    })
-                });
-            return original
-                .filter(|(_, origin)| self.origin_matches(call.session, origin))
-                .map_or(0, |(original, _)| {
-                    self.completed_growth(original, call.session, call.rv)
-                });
+            // Shared exactly-one eligibility with execution (§3.3):
+            // zero or ambiguous completions grow nothing.
+            let original = match self.complete_eligible(call.session, call.target_function) {
+                CompleteEligible::Pending(key) => {
+                    let record = &self.pending[&key];
+                    (&record.call, &record.origin)
+                }
+                CompleteEligible::Detached(key) => {
+                    let record = &self.detached[&key];
+                    (&record.call, &record.origin)
+                }
+                CompleteEligible::Zero | CompleteEligible::Many => return 0,
+            };
+            if !self.origin_matches(call.session, original.1) {
+                return 0;
+            }
+            return self.completed_growth(original.0, call.session, call.rv);
         }
         if matches!(
             descriptor.lifecycle,
@@ -696,12 +782,12 @@ impl EdgeSemantics {
             return 0;
         }
         if call.rv == CkRv::PENDING.0 {
-            if crate::kinds::function_id(&call.function).is_none()
-                || (descriptor.lifecycle == lifecycle::OPEN_SESSION && call.session == SESSION_NONE)
-            {
-                return 0;
+            // Shared first-wins routing with execution (§3.5):
+            // unroutable and duplicate PENDINGs grow nothing.
+            match self.route_pending(call) {
+                PendingRoute::Fresh { charge, .. } => return charge,
+                PendingRoute::Unroutable | PendingRoute::Duplicate => return 0,
             }
-            return Self::async_charge(call, &descriptor);
         }
         self.completed_growth(call, call.session, call.rv)
     }
@@ -1878,55 +1964,48 @@ impl EdgeSemantics {
                 // record consumes once; zero or ≥2 orphan with
                 // evidence and consume none. Pending-first and
                 // BTree-first selection are withdrawn as proof.
-                let pending_key = (call.session, call.target_function);
-                let has_pending = self.pending.contains_key(&pending_key);
-                let mut detached_match = None;
-                let mut detached_count = 0usize;
-                for (key, id) in &self.detached {
-                    if id.owner == Some(call.session) && key.1 == call.target_function {
-                        detached_count += 1;
-                        detached_match = Some(*key);
+                // Eligibility is shared with preflight, which reserves
+                // only the unique record's replay growth.
+                match self.complete_eligible(call.session, call.target_function) {
+                    CompleteEligible::Zero => {
+                        self.orphans = self.orphans.saturating_add(1);
                     }
-                }
-                let eligible = usize::from(has_pending) + detached_count;
-                if eligible != 1 {
-                    self.orphans = self.orphans.saturating_add(1);
-                    if eligible >= 2 {
+                    CompleteEligible::Many => {
+                        self.orphans = self.orphans.saturating_add(1);
                         self.evidence.async_duplicates =
                             self.evidence.async_duplicates.saturating_add(1);
                     }
-                    return;
+                    CompleteEligible::Pending(pending_key) => {
+                        let pending = self
+                            .pending
+                            .remove(&pending_key)
+                            .expect("eligible pending record");
+                        let PendingCall {
+                            call: original,
+                            origin,
+                            resource,
+                            ..
+                        } = pending;
+                        self.complete_pending(call, original, &origin, sink);
+                        drop(origin);
+                        drop(resource);
+                    }
+                    CompleteEligible::Detached(detached_key) => {
+                        let id = self
+                            .detached
+                            .remove(&detached_key)
+                            .expect("eligible detached record");
+                        let AsyncId {
+                            call: original,
+                            origin,
+                            resource,
+                            ..
+                        } = id;
+                        self.complete_pending(call, original, &origin, sink);
+                        drop(origin);
+                        drop(resource);
+                    }
                 }
-                if has_pending {
-                    let pending = self
-                        .pending
-                        .remove(&pending_key)
-                        .expect("eligible pending record");
-                    let PendingCall {
-                        call: original,
-                        origin,
-                        resource,
-                        ..
-                    } = pending;
-                    self.complete_pending(call, original, &origin, sink);
-                    drop(origin);
-                    drop(resource);
-                    return;
-                }
-                let detached_key = detached_match.expect("eligible detached record");
-                let id = self
-                    .detached
-                    .remove(&detached_key)
-                    .expect("eligible detached record");
-                let AsyncId {
-                    call: original,
-                    origin,
-                    resource,
-                    ..
-                } = id;
-                self.complete_pending(call, original, &origin, sink);
-                drop(origin);
-                drop(resource);
             }
             lifecycle::ASYNC_GET_ID if call.rv == CkRv::OK.0 => {
                 let Some(slot) = self.open.get(&call.session).copied() else {
@@ -1989,30 +2068,29 @@ impl EdgeSemantics {
     /// `queue_pending`. Unroutable pendings (unknown function, or an
     /// `OPEN_SESSION` that never named its session) count as orphans.
     fn queue_pending<S: OperationSink>(&mut self, call: &SemanticCall, sink: &mut S) {
-        let descriptor =
-            crate::kinds::descriptor(&call.function).unwrap_or(SlotSemantics::COUNT_ONLY);
-        let Some(function_id) = crate::kinds::function_id(&call.function) else {
-            self.orphans = self.orphans.saturating_add(1);
-            return;
-        };
-        if descriptor.lifecycle == lifecycle::OPEN_SESSION && call.session == SESSION_NONE {
-            self.orphans = self.orphans.saturating_add(1);
-            return;
-        }
         // 6.07b duplicate queue (§3.5): a live (session, target)
         // refuses the second PENDING — first wins, counted ambiguity,
         // never an overwrite. No charge is taken for a refused queue.
-        if self.pending.contains_key(&(call.session, function_id)) {
-            self.evidence.async_duplicates = self.evidence.async_duplicates.saturating_add(1);
+        // Routing is shared with preflight, which reserves only Fresh.
+        let route = self.route_pending(call);
+        let PendingRoute::Fresh {
+            function,
+            descriptor,
+            charge,
+        } = route
+        else {
+            if route == PendingRoute::Duplicate {
+                self.evidence.async_duplicates = self.evidence.async_duplicates.saturating_add(1);
+            }
             self.orphans = self.orphans.saturating_add(1);
             return;
-        }
+        };
         self.sequence = self.sequence.wrapping_add(1);
         let sequence = self.sequence;
-        let resource = self.take_resource_charge(Self::async_charge(call, &descriptor));
+        let resource = self.take_resource_charge(charge);
         let origin = self.capture_origin(call.session, &descriptor);
         self.pending.insert(
-            (call.session, function_id),
+            (call.session, function),
             PendingCall {
                 call: call.clone(),
                 origin,

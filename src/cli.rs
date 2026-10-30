@@ -3826,8 +3826,13 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 7439);
-        assert_eq!(hash, 0x0d750e3cbc700f55);
+        // 7804 / 0x48e22805a6f37227 (packet 6.13): the diff against the
+        // pinned text is exactly the `--prearm-module` profile + inventory
+        // synopsis insertions and the one note line; no other drift. The
+        // pair was validated by reproducing the old pinned pair with the
+        // same FNV-1a extractor.
+        assert_eq!(USAGE.len(), 7804);
+        assert_eq!(hash, 0x48e22805a6f37227);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

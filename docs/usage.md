@@ -370,6 +370,27 @@ profile, trace, run, and inspect.
 unsupported instead of accepting and ignoring operator input; use
 `inspect --pid <pid> --module <provider.so>` for module-specific discovery.
 
+### Pre-arming providers with `--prearm-module`
+
+Repeatable `--prearm-module <provider.so>` (profile, trace, run, inventory)
+names a provider file to pin before any mapping and pre-arm its proved
+offsets, so a provider that loads mid-capture is already held. It inherits
+the command's scope: it never narrows the memory scan (that is `--module`)
+and carries no function-name/offset claims (that is `--manifest`). One bad
+path fails startup before any capture work. Pre-mapping attach still needs
+proved offsets — an accompanying `--manifest` claim for the same pinned
+file, or the file's own standard PKCS#11 exports proved executable in held
+bytes; unproved functions attach only after ordinary scan corroboration,
+with the gap disclosed. Records seen only through pre-arm stay
+`Uncorroborated` and force `PARTIAL` until scan or manifest corroboration.
+
+Under inventory, `--prearm-module` requires `--capture auto` or `native`
+and is refused by name under `scan`. Inventory pins and retains the inputs
+at startup, but Detailed-subset offset activation follows in a later
+packet: the report discloses a scope gap of the form "N `--prearm-module`
+input(s) retained; Detailed-subset offset activation follows in a later
+packet".
+
 ### Attaching to an existing Kubernetes pod
 
 `scripts/attach-pod.sh` resolves a pod/container to its host cgroup and runs the

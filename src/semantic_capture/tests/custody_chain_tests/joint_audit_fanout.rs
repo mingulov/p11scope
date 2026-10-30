@@ -20491,12 +20491,15 @@ fn joint_machine_receipt_model_sizes_and_collect_growth() {
     use std::mem::size_of;
     assert_eq!(size_of::<crate::discovery::instances::InstanceId>(), 8);
     // 488 + 32: the retained target carries the entry's probed maps key
-    // (pre-6.8 overlay split rendering). Re-audited: the worst-case
+    // (pre-6.8 overlay split rendering). +40 (packet 6.13): the entry
+    // carries the per-object change-bracket cells (`last_ok_ns`/
+    // `detected_ns`, +32) and the pre-arm raw-source marker (+8;
+    // `changed` packs into the bool tail). Re-audited: the worst-case
     // 1,024-partition transaction below still binds within the 64 MiB
-    // pool, so the reservation holds.
+    // pool at this size, so the reservation holds.
     assert_eq!(
         size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),
-        520
+        560
     );
     assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 784);
     assert_eq!(size_of::<crate::inventory_semantics::LaneNegative>(), 16);

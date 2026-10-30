@@ -111,7 +111,7 @@ impl StopGate {
     /// later request's instant.
     pub(crate) fn request_stop_with(&self, now: Option<u64>) {
         let stamped = match now {
-            Some(ns) => ns.max(1).min(FIRST_STOP_UNKNOWN - 1),
+            Some(ns) => ns.clamp(1, FIRST_STOP_UNKNOWN - 1),
             None => FIRST_STOP_UNKNOWN,
         };
         let _ = self

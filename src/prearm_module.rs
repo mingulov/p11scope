@@ -301,6 +301,23 @@ impl PrearmWatch {
         self.state = PrearmWatchState::Ended;
     }
 
+    /// Records a terminal `pinned_object_changed` bracket under an unknown
+    /// first stop (packet 6.13 round-4, re-audit finding 1). The bracket is
+    /// real held-FD evidence and stays exact, but the detection ran in the
+    /// blind tail after the stop, so the coverage end stays unknown; the
+    /// later `end_all` close keeps it unknown. Pre-stop truncations at
+    /// proven bounds are untouched. A change that lands after the watch
+    /// already ended still leaves the first end standing.
+    pub(crate) fn note_object_changed_unknown_stop(&mut self, bracket: PrearmObjectChange) {
+        if self.is_ended() {
+            return;
+        }
+        self.changed = Some(bracket);
+        self.until_ns = None;
+        self.ended_by = Some(PrearmWatchEnd::ObjectChanged);
+        self.state = PrearmWatchState::Ended;
+    }
+
     /// Caps the published coverage end at the first stop (packet 6.13
     /// round-2, F3): a change detected after observation stopped must not
     /// extend `until_ns` past it. The held-FD bracket is observed evidence,

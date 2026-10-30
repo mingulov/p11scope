@@ -72,6 +72,10 @@ ROLES = {"key", "wrapping_key", "wrapped_object", "unwrapping_key", "base_key",
 # feeds (unversioned claims) accept the union; the snapshot's own
 # version still governs its rows.
 ROLES_V2 = ROLES | {"encapsulation_key", "decapsulation_key"}
+CREATIONS = {"create", "copy", "generate", "generate_pair", "derive",
+             "unwrap"}
+# H9 section v2 additions (packet 6.07c): v1 tables stay frozen.
+CREATIONS_V2 = CREATIONS | {"encapsulate", "decapsulate"}
 SNAPSHOT_VERSIONS = (1, 2)
 LABELS = {"rsa_1024", "rsa_2048", "rsa_3072", "rsa_4096", "rsa_other", "aes_128",
           "aes_192", "aes_256", "aes_other", "ec_p256", "ec_p384", "ec_p521"}
@@ -362,7 +366,7 @@ def _check_unknown_row(row, where):
     return (row["category"], row["reason"])
 
 
-def _check_object_row(row, where):
+def _check_object_row(row, where, creations=CREATIONS):
     _require(type(row) is dict, f"{where}: object row must be an object")
     _keys(row, {"object", "session", "origin", "creation", "birth", "lifetime",
                 "lifetime_reason", "attribution", "attribution_reason",
@@ -370,6 +374,8 @@ def _check_object_row(row, where):
                 "successful_references", "successful_key_references",
                 "accessing_sessions"})
     _require(_integer(row["object"]), f"{where}: object id out of range")
+    _require(row["creation"] is None or row["creation"] in creations,
+             f"{where}: object creation invalid")
     _require(row["label"] is None or row["label"] in LABELS,
              f"{where}: object label invalid")
     return row["object"]
@@ -396,12 +402,45 @@ def _snapshot_roles(document):
     return ROLES_V2 if version == 2 else ROLES
 
 
+def _snapshot_creations(document):
+    """Creation vocabulary governed by the snapshot's section version."""
+    version = document["version"]
+    _require(type(version) is int and version in SNAPSHOT_VERSIONS,
+             "snapshot version mismatch")
+    return CREATIONS_V2 if version == 2 else CREATIONS
+
+
+def _row_version(event, where, base):
+    """H9 row-event version from stream authority (packet 6.07c).
+
+    The event carries exactly its base keys plus the additive
+    `version`; an absent version is a v1 row (pre-6.07c producers
+    emit v1 rows only). Unknown versions are refused, never
+    guessed from labels or the final snapshot.
+    """
+    keys = set(event)
+    _require(keys == base or keys == base | {"version"},
+             f"{where}: unexpected fields")
+    version = event.get("version", 1)
+    _require(type(version) is int and version in SNAPSHOT_VERSIONS,
+             f"{where}: unsupported H9 row version {_shown(version)}")
+    return version
+
+
+def _row_vocabularies(version):
+    """Role and creation vocabularies for one row-event version."""
+    if version == 2:
+        return ROLES_V2, CREATIONS_V2
+    return ROLES, CREATIONS
+
+
 def validate_snapshot(document):
     """Validate the frozen H9 subset; refuse anything but populated output."""
     _keys(document, {"version", "revision", "status", "reason", "sessions",
                      "objects", "key_operations", "unknown_key_operations",
                      "gaps", "budgets"})
     roles = _snapshot_roles(document)
+    creations = _snapshot_creations(document)
     _require(_integer(document["revision"]), "snapshot revision out of range")
     _require(document["status"] in STATUSES, "snapshot status invalid")
     _require(document["reason"] in STATUS_REASONS, "snapshot reason invalid")
@@ -425,7 +464,8 @@ def validate_snapshot(document):
         session_ids.append(row["session"])
     _check_sorted_unique(session_ids, "snapshot sessions")
     _require(type(document["objects"]) is list, "snapshot objects must be a list")
-    object_ids = [_check_object_row(row, f"snapshot object {position}")
+    object_ids = [_check_object_row(row, f"snapshot object {position}",
+                                         creations)
                   for position, row in enumerate(document["objects"])]
     _check_sorted_unique(object_ids, "snapshot objects")
     _require(type(document["key_operations"]) is list,
@@ -609,7 +649,6 @@ def compare_stream(events, feeds, snapshot):
     last_seq = None
     last_revision = None
     series = {}
-    roles = _snapshot_roles(snapshot)
     for position, line in enumerate(events):
         where = f"stream line {position}"
         _require(type(line) is dict, f"{where} must be an object")
@@ -624,13 +663,15 @@ def compare_stream(events, feeds, snapshot):
         _require(type(line["event"]) is dict, f"{where}: event must be an object")
         kind, event = line["kind"], line["event"]
         if kind == "object_observed":
-            _keys(event, {"revision", "row"})
+            version = _row_version(event, where, {"revision", "row"})
+            _, creations = _row_vocabularies(version)
             _require(_integer(event["revision"]), f"{where}: revision out of range")
-            key = ("object", _check_object_row(event["row"], where))
+            key = ("object", _check_object_row(event["row"], where, creations))
             series.setdefault(key, []).append(
                 (event["revision"], line["at_ns"], event["row"]))
         elif kind == "key_operations_observed":
-            _keys(event, {"revision", "bucket", "row"})
+            version = _row_version(event, where, {"revision", "bucket", "row"})
+            roles, _ = _row_vocabularies(version)
             _require(_integer(event["revision"]), f"{where}: revision out of range")
             _require(event["bucket"] in ("known", "unknown"),
                      f"{where}: bucket invalid")
@@ -641,6 +682,11 @@ def compare_stream(events, feeds, snapshot):
             series.setdefault(key, []).append(
                 (event["revision"], line["at_ns"], event["row"]))
         elif kind == "pass_committed":
+            if "object_version" in event:
+                _require(type(event["object_version"]) is int
+                         and event["object_version"] in SNAPSHOT_VERSIONS,
+                         f"{where}: unsupported H9 marker version "
+                         f"{_shown(event['object_version'])}")
             if "object_status" in event:
                 _require(event["object_status"] == snapshot["status"],
                          f"{where}: object_status {_shown(event['object_status'])}"

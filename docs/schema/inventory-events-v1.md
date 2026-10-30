@@ -55,12 +55,18 @@ Every line carries the same envelope plus its `kind`-specific `event`:
 
 - `object_observed` (additive): one object view as the snapshot
   `objects[]` row verbatim, keyed by capture-local `object`:
-  `{revision, row}`. `revision` is the publication revision of the
-  row's last change; the pass marker's `object_revision` names the
-  current revision, and unchanged rows persist client-side below it.
+  `{revision, row}` plus the additive `version` (the H9 section
+  version governing the row's role/creation vocabularies; absent
+  means 1 — pre-6.07c producers emit v1 rows only). `revision` is
+  the publication revision of the row's last change; the pass
+  marker's `object_revision` names the current revision, and
+  unchanged rows persist client-side below it. Consumers dispatch
+  vocabularies per row version and refuse unknown versions.
 - `key_operations_observed` (additive): one proved-key aggregate or
   unknown-key summary as the snapshot row verbatim:
-  `{revision, bucket, row}` with `bucket` `known` (keyed by instance,
+  `{revision, bucket, row}` plus the additive `version` (as in
+  `object_observed`: the row's H9 section version, absent means 1)
+  with `bucket` `known` (keyed by instance,
   object, category, role and metadata label) or `unknown` (keyed by
   category and reason). A revision bump alone re-emits nothing: rows
   emit when their row digest changed since the stream last carried
@@ -157,7 +163,9 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   object row kinds under their one shared 4,096-row per-commit quota.
   Every `pass_committed` also carries `object_revision` (the current
   object publication revision; unchanged rows persist client-side
-  below it) and `object_status` (that publication's status).
+  below it), `object_status` (that publication's status) and the
+  additive `object_version` (that publication's H9 section version;
+  absent means 1). Consumers refuse unknown versions.
 - `edge_observed`: one edge as the snapshot `edges[]` entry verbatim,
   plus the three derived presentation states `presence`, `capture`,
   `activity` and additive `identity_context` — computed from the same model the dashboard renders,

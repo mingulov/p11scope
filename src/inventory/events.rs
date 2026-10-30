@@ -2166,11 +2166,18 @@ fn projection_row_keys(
 fn projection_row_events(
     observations: &crate::key_operation_projection::ObjectObservations,
 ) -> Vec<(String, &'static str, serde_json::Value)> {
-    use crate::key_operation_projection::{key_row_json, object_row_json, unknown_row_json};
+    use crate::key_operation_projection::{
+        key_row_json, object_row_json, observations_version, unknown_row_json,
+    };
+    // The row's H9 section version, bound on-stream: consumers
+    // dispatch role/creation vocabularies per event and refuse
+    // unknown versions (absent means v1 for pre-6.07c streams).
+    let version = observations_version(observations);
     let mut events = Vec::new();
     for row in &observations.objects {
         let payload = serde_json::json!({
             "revision": observations.revision,
+            "version": version,
             "row": object_row_json(row),
         });
         events.push((object_event_key(row.object), "object_observed", payload));
@@ -2178,6 +2185,7 @@ fn projection_row_events(
     for row in &observations.key_operations {
         let payload = serde_json::json!({
             "revision": observations.revision,
+            "version": version,
             "bucket": "known",
             "row": key_row_json(row),
         });
@@ -2186,6 +2194,7 @@ fn projection_row_events(
     for row in &observations.unknown_key_operations {
         let payload = serde_json::json!({
             "revision": observations.revision,
+            "version": version,
             "bucket": "unknown",
             "row": unknown_row_json(row),
         });
@@ -2407,6 +2416,7 @@ pub(crate) fn pass_payload(
         "gaps_suppressed": presentation.gaps_suppressed,
         "object_revision": published.revision,
         "object_status": published.status.label(),
+        "object_version": crate::key_operation_projection::observations_version(published),
     })
 }
 

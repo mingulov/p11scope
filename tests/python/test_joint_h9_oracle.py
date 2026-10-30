@@ -757,6 +757,104 @@ class CompareTwins(unittest.TestCase):
 
 
 class StreamTwins(unittest.TestCase):
+    def test_h9_v2_stream_dispatch(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "interleave")
+        with self.subTest("v2 transition stream validates"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 2
+            snapshot["objects"][0]["creation"] = "encapsulate"
+            stream = healthy_stream([first, second], snapshot)
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    line["event"]["version"] = 2
+                elif line["kind"] == "key_operations_observed":
+                    line["event"]["version"] = 1
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = 2
+            oracle.validate_snapshot(snapshot)
+            oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("unversioned v1 stream still validates"):
+            snapshot = healthy_snapshot([first, second])
+            stream = healthy_stream([first, second], snapshot)
+            oracle.compare_stream(stream, [first, second], snapshot)
+
+    def test_h9_stream_version_refusals(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "interleave")
+        with self.subTest("unknown row version refused"):
+            snapshot = healthy_snapshot([first, second])
+            stream = healthy_stream([first, second], snapshot)
+            stream[0]["event"]["version"] = 3
+            with self.assertRaisesRegex(oracle.LedgerError, "version"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("unknown marker version refused"):
+            snapshot = healthy_snapshot([first, second])
+            stream = healthy_stream([first, second], snapshot)
+            marker = next(line for line in stream
+                          if line["kind"] == "pass_committed")
+            marker["event"]["object_version"] = 3
+            with self.assertRaisesRegex(oracle.LedgerError, "version"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("v2 role on a v1 row refused from stream authority"):
+            snapshot = healthy_snapshot([first, second])
+            stream = healthy_stream([first, second], snapshot)
+            target = snapshot["key_operations"][0]
+            old_key = (target["instance"], target["object"],
+                       target["category"], target["role"],
+                       target["metadata_at_use"])
+            target["role"] = "decapsulation_key"
+            snapshot["version"] = 2
+            snapshot["objects"][0]["creation"] = "encapsulate"
+            for line in stream:
+                if line["kind"] == "key_operations_observed":
+                    row = line["event"]["row"]
+                    if (row["instance"], row["object"], row["category"],
+                            row["role"], row["metadata_at_use"]) == old_key:
+                        row["role"] = "decapsulation_key"
+                    line["event"]["version"] = 1
+                elif line["kind"] == "object_observed":
+                    if line["event"]["row"]["object"] == \
+                            snapshot["objects"][0]["object"]:
+                        line["event"]["row"]["creation"] = "encapsulate"
+                    line["event"]["version"] = 2
+            oracle.validate_snapshot(snapshot)
+            with self.assertRaisesRegex(oracle.LedgerError, "role invalid"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+
+    def test_h9_creation_dispatches_on_version(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "interleave")
+        with self.subTest("v1 creation-only KEM refused"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["objects"][0]["creation"] = "encapsulate"
+            stream = healthy_stream([first, second], snapshot)
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "creation invalid"):
+                oracle.validate_snapshot(snapshot)
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "creation invalid"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("v2 creation-only KEM validates"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 2
+            snapshot["objects"][0]["creation"] = "encapsulate"
+            stream = healthy_stream([first, second], snapshot)
+            for line in stream:
+                if line["kind"] in ("object_observed",
+                                    "key_operations_observed"):
+                    line["event"]["version"] = 2
+            oracle.validate_snapshot(snapshot)
+            oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("null creation validates in both versions"):
+            for version in (1, 2):
+                snapshot = healthy_snapshot([first, second])
+                snapshot["version"] = version
+                snapshot["objects"][0]["creation"] = None
+                stream = healthy_stream([first, second], snapshot)
+                oracle.validate_snapshot(snapshot)
+                oracle.compare_stream(stream, [first, second], snapshot)
+
     def test_mutation_reordered_replay_rejected(self):
         oracle = require_oracle(self)
         _, _, first, second = validated_pair(oracle, "interleave")

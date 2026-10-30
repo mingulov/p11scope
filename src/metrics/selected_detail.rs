@@ -507,19 +507,36 @@ impl std::fmt::Debug for BroadBracketCollector {
     }
 }
 
-/// An accepted bracketing acquisition: the seq assigned to it plus its
-/// real acquisition identity (generation, mode, window, row count).
-/// Minted ONLY by observing the exact acquisition through the broad
-/// collector ([`accept_before_bracket`]/[`accept_after_bracket`]); the
-/// session reserve path brackets on these, never on driver counts or
-/// discarded reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// An accepted bracketing acquisition: the seq assigned to it, its
+/// real acquisition identity (generation, mode, window, row count),
+/// and — for `Advanced` observations only — the exact interval deltas
+/// from the previously installed baseline to this read, with their
+/// charged storage. Minted ONLY by observing the exact acquisition
+/// through the broad collector
+/// ([`accept_before_bracket`]/[`accept_after_bracket`]); the session
+/// reserve path brackets on these, never on driver counts or
+/// discarded reads. `Initial` and `GenerationChanged` carry no
+/// interval (`None`, never fabricated zeros); failed acquisitions
+/// mint no receipt at all.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AcceptedBracket {
     pub(crate) seq: u64,
     pub(crate) generation: NonZeroU64,
     pub(crate) mode: CounterMode,
     pub(crate) window: Option<(u64, u64)>,
     pub(crate) rows: usize,
+    deltas: Option<CounterDeltas>,
+}
+
+impl AcceptedBracket {
+    /// The accepted interval's deltas, when this receipt closes an
+    /// interval (`Advanced` only). Metrics-owned: only metrics code
+    /// renders these (the driver packet's report composer calls
+    /// [`render_aggregate_bracket`]); the driver never holds a
+    /// `CounterDeltas`.
+    pub(super) fn deltas(&self) -> Option<&CounterDeltas> {
+        self.deltas.as_ref()
+    }
 }
 
 /// How the final acquisition checked at close: fresh (seq assigned),
@@ -527,7 +544,7 @@ pub(crate) struct AcceptedBracket {
 /// seq brackets the close but never masquerades as fresh), or
 /// mismatched (acquired but defective or collector-rejected, disclosed
 /// and never promoted).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AfterBracketAcceptance {
     Fresh(AcceptedBracket),
     Unavailable,
@@ -551,8 +568,14 @@ fn read_stage_refusal(stage: ReadStage) -> SelectedDetailRefusal {
 
 /// Read the accepted receipt off the collector's installed baseline:
 /// the real acquisition window and identity of the exact read the
-/// collector just accepted — never a reconstructed or earlier read.
-fn accepted_receipt(collector: &CounterCollector, assigned: u64) -> AcceptedBracket {
+/// collector just accepted — never a reconstructed or earlier read —
+/// plus that observation's interval deltas when it closed one
+/// (`Advanced` only; `Initial`/`GenerationChanged` carry none).
+fn accepted_receipt(
+    collector: &CounterCollector,
+    assigned: u64,
+    deltas: Option<CounterDeltas>,
+) -> AcceptedBracket {
     let installed = collector
         .current()
         .expect("acceptance installs the observed read");
@@ -565,6 +588,7 @@ fn accepted_receipt(collector: &CounterCollector, assigned: u64) -> AcceptedBrac
             .window
             .map(|window| (window.started_ns, window.finished_ns)),
         rows: view.rows.map(|rows| rows.len()).unwrap_or(0),
+        deltas,
     }
 }
 
@@ -624,11 +648,13 @@ pub(super) fn accept_before_bracket(
         .checked_add(1)
         .ok_or(SelectedDetailRefusal::BroadPlanTopology)?;
     match brackets.collector.observe(Ok(read)) {
-        CounterObservation::Initial
-        | CounterObservation::Advanced { .. }
-        | CounterObservation::GenerationChanged { .. } => {
+        CounterObservation::Initial | CounterObservation::GenerationChanged { .. } => {
             *seq = assigned;
-            Ok(accepted_receipt(&brackets.collector, assigned))
+            Ok(accepted_receipt(&brackets.collector, assigned, None))
+        }
+        CounterObservation::Advanced { deltas, .. } => {
+            *seq = assigned;
+            Ok(accepted_receipt(&brackets.collector, assigned, Some(deltas)))
         }
         CounterObservation::ReadFailed(stage) => Err(read_stage_refusal(stage)),
         CounterObservation::Unavailable(_) => Err(SelectedDetailRefusal::BroadPlanTopology),
@@ -677,11 +703,17 @@ pub(super) fn accept_after_bracket(
         return AfterBracketAcceptance::Mismatched("rejected");
     };
     match brackets.collector.observe(Ok(read)) {
-        CounterObservation::Initial
-        | CounterObservation::Advanced { .. }
-        | CounterObservation::GenerationChanged { .. } => {
+        CounterObservation::Initial | CounterObservation::GenerationChanged { .. } => {
             *seq = assigned;
-            AfterBracketAcceptance::Fresh(accepted_receipt(&brackets.collector, assigned))
+            AfterBracketAcceptance::Fresh(accepted_receipt(&brackets.collector, assigned, None))
+        }
+        CounterObservation::Advanced { deltas, .. } => {
+            *seq = assigned;
+            AfterBracketAcceptance::Fresh(accepted_receipt(
+                &brackets.collector,
+                assigned,
+                Some(deltas),
+            ))
         }
         CounterObservation::ReadFailed(_) | CounterObservation::Unavailable(_) => {
             AfterBracketAcceptance::Mismatched("rejected")
@@ -1154,9 +1186,11 @@ pub(crate) enum CloseBracketVerdict {
 
 /// A closed window: the lineage joining detail rows to broad rows,
 /// the first broad-identity drift if any, the bracketing successful-
-/// observe seqs, and the after-bracket verdict. Carries no sums:
-/// broad totals render only from broad reads, detail only from the
-/// child's own stream.
+/// observe seqs, the after-bracket verdict, and — when the final
+/// acquisition was freshly accepted — its receipt with that
+/// interval's deltas for aggregate rendering. Carries no combined
+/// totals: broad intervals render only from their own broad reads,
+/// detail only from the child's own stream.
 #[derive(Debug)]
 pub(crate) struct DetailCloseReport {
     pub(crate) lineage: CounterDetailLineage,
@@ -1164,6 +1198,25 @@ pub(crate) struct DetailCloseReport {
     pub(crate) seq_before: u64,
     pub(crate) seq_after: u64,
     pub(crate) bracket: CloseBracketVerdict,
+    pub(crate) after_receipt: Option<AcceptedBracket>,
+}
+
+/// Map a session-path after acceptance to its close verdict plus the
+/// preserved after receipt: `Fresh` stays `Matched` with its
+/// interval; `Unavailable` and `Mismatched` carry no receipt (never
+/// a fabricated delta). Shared by [`close_detail_window`] and its
+/// twins (the live close needs running maps; twins drive this
+/// mapping with receipts from [`accept_after_bracket`]).
+fn map_after_acceptance(
+    acceptance: AfterBracketAcceptance,
+) -> (CloseBracketVerdict, Option<AcceptedBracket>) {
+    match acceptance {
+        AfterBracketAcceptance::Fresh(receipt) => (CloseBracketVerdict::Matched, Some(receipt)),
+        AfterBracketAcceptance::Unavailable => (CloseBracketVerdict::AfterUnavailable, None),
+        AfterBracketAcceptance::Mismatched(reason) => {
+            (CloseBracketVerdict::Mismatched(reason), None)
+        }
+    }
 }
 
 /// Phase 3 (driver tick): close exactly once, after the child's own
@@ -1204,12 +1257,8 @@ pub(crate) fn close_detail_window(
     };
     let acquired =
         super::counter_reader::read_banked(broad, broad_plan, broad_objects, limits, reserve);
-    let bracket = match accept_after_bracket(brackets, acquired, broad_plan, mode, generation, seq)
-    {
-        AfterBracketAcceptance::Fresh(_) => CloseBracketVerdict::Matched,
-        AfterBracketAcceptance::Unavailable => CloseBracketVerdict::AfterUnavailable,
-        AfterBracketAcceptance::Mismatched(reason) => CloseBracketVerdict::Mismatched(reason),
-    };
+    let acceptance = accept_after_bracket(brackets, acquired, broad_plan, mode, generation, seq);
+    let (bracket, after_receipt) = map_after_acceptance(acceptance);
     // On rejection `seq` is untouched: the last accepted seq brackets
     // the close, explicitly not fresh.
     let seq_after = *seq;
@@ -1220,6 +1269,7 @@ pub(crate) fn close_detail_window(
         seq_before,
         seq_after,
         bracket,
+        after_receipt,
     })
 }
 
@@ -1238,6 +1288,8 @@ pub(super) fn close_detail_window_on_banks(
     let seq_before = window.mark_before().seq;
     // The close always delivers its true live marks; a defective
     // bracket is reported in the verdict, never fixed up or hidden.
+    // The banks-level seam observes no collector, so it carries no
+    // after receipt (never a fabricated interval).
     let (lineage, drift) = window.close(banks, generation, bracket.seq_after)?;
     Ok(DetailCloseReport {
         lineage,
@@ -1245,6 +1297,7 @@ pub(super) fn close_detail_window_on_banks(
         seq_before,
         seq_after: bracket.seq_after,
         bracket: verdict,
+        after_receipt: None,
     })
 }
 
@@ -4443,7 +4496,7 @@ mod tests {
             window_of(40, 50),
         );
         let bracket = CloseBracket::new(SEQ_AFTER, CounterMode::Counts, Some(&after));
-        close_detail_window_on_banks(
+        let report = close_detail_window_on_banks(
             window,
             &scene.banks,
             NonZeroU64::new(BROAD_GENERATION).unwrap(),
@@ -4451,6 +4504,10 @@ mod tests {
             &bracket,
         )
         .expect("Unactivated close delivers lineage");
+        assert!(
+            report.after_receipt.is_none(),
+            "the banks-level seam observes no collector, so it carries no receipt"
+        );
         assert!(
             scene.pool.snapshot().charged_bytes < charged_after_reserve,
             "genuine close releases the retained charge"
@@ -5198,5 +5255,224 @@ mod tests {
         };
         assert_eq!((seq, receipt.seq), (3, 3));
         assert_eq!(receipt.generation, brgen8);
+    }
+
+    #[test]
+    fn selected_detail_bracket_deltas_conserve_across_accepts() {
+        // Before/inside/after nonzero conservation through the actual
+        // accept functions: each accepted `Advanced` interval carries
+        // its exact nonzero deltas once (100→110 and 110→120 emit 10
+        // each, never 0/0, never a 20 cumulative), `Initial` carries
+        // none, and the close mapping preserves the fresh interval
+        // for aggregate rendering without summing detail into broad.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let before = accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("before accepts");
+        assert_eq!((seq, before.seq), (1, 1));
+        assert_eq!(before.window, Some((10, 20)));
+        assert_eq!(before.rows, 4);
+        assert!(
+            before.deltas().is_none(),
+            "Initial installs the baseline with no interval"
+        );
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let inside = accept_before_bracket(&mut brackets, Ok(r1), &scene.plan, brgen, &mut seq)
+            .expect("inside accepts");
+        assert_eq!((seq, inside.seq), (2, 2));
+        assert_eq!(inside.window, Some((20, 30)));
+        let span10 = inside
+            .deltas()
+            .expect("the 100→110 interval carries its deltas");
+        assert_eq!((span10[0].entered, span10[0].returned), (10, 10));
+        assert_eq!((span10[3].entered, span10[3].returned), (10, 10));
+        let aggregate10 =
+            render_aggregate_bracket(span10, CounterMode::Counts, before.seq, inside.seq);
+        assert_eq!(aggregate10["rows"][0]["entered"], serde_json::json!(10));
+        assert_eq!(aggregate10["rows"][0]["returned"], serde_json::json!(10));
+        assert_eq!(aggregate10["mode_mixed"], serde_json::json!(false));
+        assert!(aggregate10.get("total").is_none());
+        let r2 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 120, 120),
+            window_of(30, 40),
+        );
+        let fresh = accept_after_bracket(
+            &mut brackets,
+            Ok(r2),
+            &scene.plan,
+            CounterMode::Counts,
+            brgen,
+            &mut seq,
+        );
+        let AfterBracketAcceptance::Fresh(after) = fresh else {
+            panic!("a fresh acquisition accepts: {fresh:?}");
+        };
+        assert_eq!((seq, after.seq), (3, 3));
+        assert_eq!(after.window, Some((30, 40)));
+        let span20 = after
+            .deltas()
+            .expect("the 110→120 interval carries its deltas");
+        assert_eq!((span20[0].entered, span20[0].returned), (10, 10));
+        let aggregate20 =
+            render_aggregate_bracket(span20, CounterMode::Counts, inside.seq, after.seq);
+        assert_eq!(aggregate20["rows"][0]["entered"], serde_json::json!(10));
+        assert!(aggregate20.get("total").is_none());
+        let (verdict, preserved) = map_after_acceptance(AfterBracketAcceptance::Fresh(after));
+        assert_eq!(verdict, CloseBracketVerdict::Matched);
+        let kept = preserved.expect("the close preserves its fresh interval");
+        assert_eq!(kept.seq, 3);
+        let kept_span = kept.deltas().expect("the preserved receipt keeps deltas");
+        assert_eq!((kept_span[0].entered, kept_span[0].returned), (10, 10));
+    }
+
+    #[test]
+    fn selected_detail_bracket_deltas_emit_nothing_on_failure() {
+        // Failed observations emit no fabricated delta: refused
+        // before brackets mint no receipt, `Initial` and
+        // `GenerationChanged` carry `None` (never zeros), failed and
+        // mismatched after brackets carry no receipt, and the close
+        // mapping preserves nothing for them.
+        use super::super::counter_collector::ReadStage;
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+        );
+        let before = accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("before accepts");
+        assert_eq!(seq, 1);
+        assert!(
+            before.deltas().is_none(),
+            "Initial carries no interval, never zeros"
+        );
+        let saturated = scripted_read_with_signals(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+            CounterHealth {
+                saturated: true,
+                contended: false,
+            },
+            KernelEvidence::default(),
+        );
+        assert_eq!(
+            accept_before_bracket(&mut brackets, Ok(saturated), &scene.plan, brgen, &mut seq)
+                .unwrap_err(),
+            SelectedDetailRefusal::BroadPlanTopology,
+            "an unhealthy acquisition mints no receipt"
+        );
+        assert_eq!(seq, 1);
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 7),
+            window_of(20, 30),
+        );
+        assert_eq!(
+            accept_before_bracket(&mut brackets, Ok(r1), &scene.plan, brgen, &mut seq)
+                .unwrap_err(),
+            SelectedDetailRefusal::BroadPlanTopology,
+            "a latched-out acquisition mints no receipt"
+        );
+        assert_eq!(seq, 1);
+        let brgen8 = NonZeroU64::new(BROAD_GENERATION + 1).unwrap();
+        let r8 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen8,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 9, 9),
+            window_of(40, 50),
+        );
+        let jumped = accept_before_bracket(&mut brackets, Ok(r8), &scene.plan, brgen8, &mut seq)
+            .expect("the fresh generation adopts");
+        assert_eq!((seq, jumped.seq), (2, 2));
+        assert!(
+            jumped.deltas().is_none(),
+            "GenerationChanged carries no interval across generations"
+        );
+        assert_eq!(
+            accept_after_bracket(
+                &mut brackets,
+                Err(ReadStage::Budget),
+                &scene.plan,
+                CounterMode::Counts,
+                brgen8,
+                &mut seq
+            ),
+            AfterBracketAcceptance::Unavailable,
+            "a failed acquisition carries no receipt"
+        );
+        assert_eq!(seq, 2);
+        let bad = scripted_read_with_signals(
+            &scene.pool,
+            &scene.plan,
+            brgen8,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 9, 9),
+            window_of(40, 50),
+            CounterHealth {
+                saturated: true,
+                contended: false,
+            },
+            KernelEvidence::default(),
+        );
+        assert_eq!(
+            accept_after_bracket(
+                &mut brackets,
+                Ok(bad),
+                &scene.plan,
+                CounterMode::Counts,
+                brgen8,
+                &mut seq
+            ),
+            AfterBracketAcceptance::Mismatched("health"),
+            "an unhealthy after bracket carries no receipt"
+        );
+        assert_eq!(seq, 2);
+        let (verdict, preserved) = map_after_acceptance(AfterBracketAcceptance::Unavailable);
+        assert_eq!(verdict, CloseBracketVerdict::AfterUnavailable);
+        assert!(preserved.is_none(), "no receipt is fabricated for loss");
+        let (verdict, preserved) =
+            map_after_acceptance(AfterBracketAcceptance::Mismatched("rejected"));
+        assert_eq!(verdict, CloseBracketVerdict::Mismatched("rejected"));
+        assert!(preserved.is_none(), "no receipt is fabricated for rejection");
     }
 }

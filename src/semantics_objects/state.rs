@@ -664,9 +664,11 @@ pub(super) struct ModelState {
     deferred_sequence: u64,
     /// Origin tickets whose deferred records were consumed or
     /// disposed on a path without ledger access (redeem, session
-    /// death): their shared-budget charges release at the next
-    /// deferred mint (before its charge) and at every prune, so the
-    /// queue never spans settles and a remint observes freed budget.
+    /// death): their shared-budget charges release at every disposal
+    /// return with ledger access (invalidation, abandonment,
+    /// session-disposal ends), at the next deferred mint (before its
+    /// charge) and at every prune, so the queue never spans settles
+    /// and a remint observes freed budget.
     deferred_releases: Vec<u64>,
     /// Live tombstone bindings (usage reporting).
     tombstones: usize,
@@ -1427,6 +1429,9 @@ impl ModelState {
         } else if rv == CkRv::GENERAL_ERROR {
             self.retire_scope(call.domain, scope, ObjectGap::AmbiguousOutcome, effects);
         }
+        // Device-loss escalation above may dispose sessions; flush their
+        // queued releases so no dead charge denies later admissions.
+        self.flush_deferred_releases(ledger);
     }
 
     /// Joins and actions of a qualified end. Returns false when the call
@@ -1505,6 +1510,7 @@ impl ModelState {
             && call.kind != CallKind::Lifecycle(lifecycle::CLOSE_SESSION)
         {
             self.close_session(s, Some(ObjectGap::SessionContradiction), None, effects);
+            self.flush_deferred_releases(ledger);
             return;
         }
 
@@ -1591,6 +1597,10 @@ impl ModelState {
             // runs, so an invalid acting session stays conservative.
             CallKind::Neutral => {}
         }
+        // Close, close-all, creation-overflow and open-reuse arms
+        // above may dispose sessions; flush their queued releases
+        // before returning.
+        self.flush_deferred_releases(ledger);
     }
 
     /// Boundary effects of a call whose acting session is not known.
@@ -2526,7 +2536,8 @@ impl ModelState {
     /// funnel through `end_session`, so one hook covers them.
     fn dispose_session_deferred(&mut self, s: SessionIncarnation) {
         // Disposal has no ledger access: queue each removed record's
-        // ticket so its charge releases at the next mint or prune.
+        // ticket so its charge releases at the next disposal return,
+        // mint or prune with ledger access.
         let dead_pending: Vec<((SessionIncarnation, u32), u64)> = self
             .deferred_pending
             .iter()
@@ -3483,6 +3494,9 @@ impl ModelState {
         let state = self.domains.get_mut(&domain).expect("domain");
         state.ended = Some(reason);
         state.bootstrap = None;
+        // Ended sessions dispose their deferred records above; flush
+        // the queued releases so no dead charge denies later admissions.
+        self.flush_deferred_releases(ledger);
     }
 
     fn clear_domain(
@@ -3568,6 +3582,10 @@ impl ModelState {
             return;
         };
         state.generation = next;
+        // Retired sessions dispose their deferred records above; flush
+        // the queued releases so no dead charge denies later admissions.
+        // (The exhaustion arm returns through `end_domain`, which flushes.)
+        self.flush_deferred_releases(ledger);
     }
 
     /// A contradicted or unrepresentable history (`reason`): downgrade every
@@ -3681,6 +3699,9 @@ impl ModelState {
         ledger: &mut super::journal::StagingLedger,
     ) {
         if affected.is_empty() {
+            // No void follows on this path, but the caller may have
+            // disposed sessions already: flush their queued releases.
+            self.flush_deferred_releases(ledger);
             return;
         }
         for token in affected {
@@ -3955,7 +3976,7 @@ impl ModelState {
             }
             let record = self.deferred_pending.remove(&key).expect("legal record");
             // Consumption has no ledger access: the charge releases
-            // at the next mint or prune.
+            // at the next disposal return, mint or prune with ledger access.
             self.deferred_releases.push(record.ticket.0);
             return Some(self.redeem_effects(&record));
         }
@@ -4460,6 +4481,52 @@ mod tests {
             (token, effects)
         }
 
+        /// Drive one C_CloseSession OK END through begin+end replay
+        /// against a caller-held ledger, so session disposal runs on
+        /// the production end path with ledger access.
+        fn close_session_with_ledger(
+            &mut self,
+            session: HandleInput<SessionHandle>,
+            ledger: &mut super::super::journal::StagingLedger,
+        ) {
+            self.next_key += 1;
+            self.next_token += 1;
+            let token = CallToken(self.next_token);
+            let call = PendingCall {
+                domain: self.domain,
+                key: CallKey::reference(self.next_key),
+                begin: 10,
+                entry_ns: 100,
+                function: crate::kinds::function_id("C_CloseSession").expect("catalog function"),
+                kind: CallKind::Lifecycle(lifecycle::CLOSE_SESSION),
+                session,
+                inputs: [HandleInput::Absent, HandleInput::Absent],
+                requested: [None, None],
+                derive_protocol: DeriveResultProtocol::Unavailable,
+                entry_mechanism: MechClass::Value,
+                scope: SlotScope::Unknown,
+                completion: Some(Completion {
+                    cut: 11,
+                    end_ns: 110,
+                    rv: CkRv::OK.0,
+                    return_mechanism: MechanismEvidence::NotCaptured,
+                    results: [ResultSlot::NotCaptured, ResultSlot::NotCaptured],
+                    session_out: HandleInput::Absent,
+                    found: FindResult::NotCaptured,
+                    attributes: None,
+                    malformed: false,
+                }),
+                fenced: false,
+                begin_applied: false,
+                end_applied: false,
+                snapshot: EMPTY_SNAPSHOT,
+            };
+            self.state.pending.insert(token, call);
+            self.state.apply_begin(token);
+            let mut effects = ObjectEffects::default();
+            self.state.apply_end(token, &mut effects, ledger);
+        }
+
         fn minted(effects: &ObjectEffects, token: CallToken) -> bool {
             effects
                 .effects
@@ -4933,12 +5000,17 @@ mod tests {
 
     // Charge-before-insert (§§2.2/3.8): each deferred record holds
     // a real shared-budget charge for its whole lifetime. An
-    // exhausted budget refuses the mint with counted evidence —
-    // no record, no sequence advance, no growth.
+    // exhausted shared pool refuses the mint with counted evidence —
+    // no record, no sequence advance, no growth. Exhaustion is pinned
+    // at the pool, never at a ledger-local byte cap, so the refusal
+    // exercises the actual shared budget; disposing one record then
+    // releases its charge and admits the previously refused mint.
     #[test]
     fn deferred_mint_exhausted_budget_refuses_without_growth() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let pool = SemanticResourcePool::default();
+        let mut ledger = super::super::journal::StagingLedger::with_resources(pool.reserver());
         let mut fx = DeferredFixture::new();
-        let mut ledger = super::super::journal::StagingLedger::new();
         let target = fx.target("C_SignInit");
         let (token_a, effects_a) = fx.pending_access_with_ledger(
             HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
@@ -4947,6 +5019,8 @@ mod tests {
             &mut ledger,
         );
         assert!(DeferredFixture::minted(&effects_a, token_a));
+        let one = ledger.charged_bytes();
+        assert!(one > 0, "the mint holds a real shared-budget charge");
         fx.state
             .alloc_session(
                 fx.domain,
@@ -4964,8 +5038,8 @@ mod tests {
         assert!(DeferredFixture::minted(&effects_b, token_b));
         assert_eq!(fx.state.usage().deferred_origins, 2);
         let full = ledger.charged_bytes();
-        assert!(full > 0, "two mints hold real shared-budget charges");
-        ledger.set_byte_limit(full);
+        assert_eq!(full, 2 * one, "two mints hold real shared-budget charges");
+        pool.reference_set_limit(pool.snapshot().charged_bytes);
         fx.state
             .alloc_session(
                 fx.domain,
@@ -4999,6 +5073,32 @@ mod tests {
             "refused mint advances nothing"
         );
         assert_eq!(fx.state.gaps.get(&ObjectGap::PendingCapacity), Some(&1));
+        // Disposing A through session invalidation releases its pool
+        // charge eagerly: the ledger drops to B's charge alone, and
+        // the previously refused mint is admitted on retry.
+        fx.state.invalidate(
+            AffectedScope::Session(fx.domain, SessionHandle::new(DSESSION).unwrap()),
+            ObjectGap::DeviceLoss,
+            &mut ledger,
+        );
+        assert_eq!(fx.state.usage().deferred_origins, 1);
+        assert_eq!(
+            ledger.charged_bytes(),
+            one,
+            "disposing A releases its shared-pool charge"
+        );
+        let (token_d, effects_d) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION + 2).unwrap()),
+            HandleInput::Absent,
+            target,
+            &mut ledger,
+        );
+        assert!(
+            DeferredFixture::minted(&effects_d, token_d),
+            "the released charge admits the refused mint on retry"
+        );
+        assert_eq!(fx.state.usage().deferred_origins, 2);
+        assert_eq!(ledger.charged_bytes(), full);
     }
 
     // The charge moves with the record across detach/Join (same
@@ -5128,6 +5228,101 @@ mod tests {
         );
         assert_eq!(fx.state.usage().deferred_origins, 1);
         assert_eq!(ledger.charged_bytes(), one);
+    }
+
+    // Pool-backed disposal twin driver (607b-F3 round 2): mint one
+    // deferred origin against the shared pool, pin the pool at its
+    // charged baseline, dispose the record through `dispose`, then
+    // require the dead charge released AND a subsequent pool
+    // admission granted. While the queued ticket lingers, the dead
+    // charge denies the intervening admission.
+    fn disposal_releases_for_admission(
+        dispose: impl FnOnce(&mut DeferredFixture, &mut super::super::journal::StagingLedger),
+    ) {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let pool = SemanticResourcePool::default();
+        let mut ledger = super::super::journal::StagingLedger::with_resources(pool.reserver());
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (token_a, effects_a) = fx.pending_access_with_ledger(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Value(ObjectHandle::new(DKEY).unwrap()),
+            target,
+            &mut ledger,
+        );
+        assert!(DeferredFixture::minted(&effects_a, token_a));
+        let one = ledger.charged_bytes();
+        assert!(one > 0, "the mint holds a real shared-budget charge");
+        pool.reference_set_limit(pool.snapshot().charged_bytes);
+        dispose(&mut fx, &mut ledger);
+        assert_eq!(fx.state.usage().deferred_origins, 0);
+        let admit = usize::try_from(one).expect("test charge fits");
+        assert!(
+            pool.reserver().reserve(admit).is_ok(),
+            "the released charge admits an intervening pool reservation"
+        );
+        assert_eq!(
+            ledger.charged_bytes(),
+            0,
+            "disposal releases the dead charge eagerly"
+        );
+    }
+
+    // Session disposal through invalidation flushes the queued
+    // release before returning: no dead charge lingers to deny the
+    // next admission.
+    #[test]
+    fn deferred_session_invalidation_releases_charge_for_admission() {
+        disposal_releases_for_admission(|fx, ledger| {
+            fx.state.invalidate(
+                AffectedScope::Session(fx.domain, SessionHandle::new(DSESSION).unwrap()),
+                ObjectGap::DeviceLoss,
+                ledger,
+            );
+        });
+    }
+
+    // Domain disposal through removal-class invalidation (the
+    // end-domain path) flushes the queued release before returning.
+    #[test]
+    fn deferred_domain_removal_invalidation_releases_charge_for_admission() {
+        disposal_releases_for_admission(|fx, ledger| {
+            fx.state
+                .invalidate(AffectedScope::Domain(fx.domain), ObjectGap::Exec, ledger);
+        });
+    }
+
+    // Domain disposal through loss-class invalidation (the
+    // clear-and-void path) flushes the queued release before
+    // returning.
+    #[test]
+    fn deferred_domain_loss_invalidation_releases_charge_for_admission() {
+        disposal_releases_for_admission(|fx, ledger| {
+            fx.state
+                .invalidate(AffectedScope::Domain(fx.domain), ObjectGap::Loss, ledger);
+        });
+    }
+
+    // Domain abandonment flushes the queued release before
+    // returning: no dead charge lingers to deny the next admission.
+    #[test]
+    fn deferred_domain_abandonment_releases_charge_for_admission() {
+        disposal_releases_for_admission(|fx, ledger| {
+            fx.state.abandon_domain(fx.domain, ledger);
+        });
+    }
+
+    // Session disposal on the production close path (C_CloseSession
+    // end replay) flushes the queued release before returning: no
+    // dead charge lingers to deny the next admission.
+    #[test]
+    fn deferred_close_session_end_releases_charge_for_admission() {
+        disposal_releases_for_admission(|fx, ledger| {
+            fx.close_session_with_ledger(
+                HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+                ledger,
+            );
+        });
     }
 
     // Oldest-first eviction releases the evicted record's charge:

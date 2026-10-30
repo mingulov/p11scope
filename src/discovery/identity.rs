@@ -6626,17 +6626,8 @@ pub(crate) fn pin_manifest_objects_deferred_in_views_with_prior(
     )
 }
 
-/// Count collection shares the scan's inspection cache and actual read
-/// allowance. The semantic reader above retains its existing policy.
-pub(crate) fn pin_count_manifest_objects_in_views_with_budget(
-    m: &Manifest,
-    views: &[ProcessView],
-    budget: &mut CaptureWorkBudget,
-) -> Result<ManifestPinning, ManifestPinError> {
-    pin_manifest_objects_with_read_policy(m, views, budget, &KernelSelfMappingProbe, true, 0, 0)
-}
-
-/// [`pin_count_manifest_objects_in_views_with_budget`] charging
+/// Pins count-manifest objects, sharing the scan's inspection cache and
+/// actual read allowance. `prior_objects`/`prior_bytes` are
 /// already-retained capture-level pins (packet 6.13 round-3, finding 3):
 /// per-pass count-manifest pins coexist with the run-retained pre-arm
 /// pins, so they charge the same shared object/byte budget.
@@ -9254,7 +9245,7 @@ mod tests {
         let (_dir, path, manifest, _) = count_manifest_file();
         let mut budget = count_manifest_read_budget();
         assert!(std::fs::metadata(path).unwrap().len() > budget.limits().total_bytes);
-        let result = pin_count_manifest_objects_in_views_with_budget(&manifest, &[], &mut budget);
+        let result = pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0);
         assert!(
             result.is_err(),
             "a cold identity hash cannot bypass the read allowance"
@@ -9268,7 +9259,7 @@ mod tests {
         let mut budget = count_manifest_read_budget();
         cache_count_inspection(&path, inspected, &mut budget);
         let result =
-            pin_count_manifest_objects_in_views_with_budget(&manifest, &[], &mut budget).unwrap();
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0).unwrap();
         assert!(result.stale.is_empty());
         assert_eq!(result.pins.pinned().count(), 1);
         assert!(budget.attempted_io_bytes() < std::fs::metadata(path).unwrap().len());
@@ -9287,7 +9278,7 @@ mod tests {
             .write_all(&[1])
             .unwrap();
         let result =
-            pin_count_manifest_objects_in_views_with_budget(&manifest, &[], &mut budget).unwrap();
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0).unwrap();
         assert_eq!(result.stale.len(), 1);
         assert_eq!(result.pins.pinned().count(), 0);
         assert!(
@@ -9472,7 +9463,7 @@ mod tests {
         manifest.provenance_objects[0].device_minor = key.device.minor;
         manifest.provenance_objects[0].inode = key.inode;
         assert!(
-            pin_count_manifest_objects_in_views_with_budget(&manifest, &[], &mut budget).is_err(),
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0).is_err(),
             "digest equality is not an exact opened-file cache witness"
         );
     }
@@ -9525,7 +9516,7 @@ mod tests {
         assert!(file_bytes[0] > budget.limits().total_bytes);
         for manifest in &manifests {
             let result =
-                pin_count_manifest_objects_in_views_with_budget(manifest, &[], &mut budget)
+                pin_count_manifest_objects_in_views_with_prior(manifest, &[], &mut budget, 0, 0)
                     .unwrap();
             assert!(result.stale.is_empty());
             assert_eq!(result.pins.pinned().count(), 1);

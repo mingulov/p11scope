@@ -57,7 +57,8 @@ fn private_root_class_array_uses_the_frozen_endpoint_classifier() {
         counts[class as usize] += 1;
         assert!(root_writers::entry_context(descriptor, class, LinuxLayout::Lp64).is_some());
     }
-    assert_eq!(counts, [0, 19, 76, 9]);
+    // P4 (owner 2026-10-29): C_Initialize moved negative-only → modeled.
+    assert_eq!(counts, [0, 19, 77, 8]);
     for descriptor in [0, MAX_DESCRIPTORS, u32::MAX] {
         assert_eq!(classes.get(descriptor), 0);
         assert!(root_writers::entry_context(descriptor, 0, LinuxLayout::Lp64).is_none());

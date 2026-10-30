@@ -122,15 +122,14 @@ pub(crate) enum EndpointClass {
 }
 
 /// Affecting but unmodeled: never journaled, represented only as
-/// negative uncertainty. C_Initialize resets cryptoki state (the init
-/// era); C_InitToken wipes token objects and sessions; KEM and
-/// authenticated-wrap calls create and use objects through unwired
-/// protocols; async controls defer effects to unmodeled completions.
-/// Both initializers share descriptor shapes with pure reads, and the
-/// rest must survive descriptor-shape edits, so all nine are listed
-/// explicitly rather than derived.
-pub(crate) const NEGATIVE_ONLY_FUNCTIONS: [&str; 9] = [
-    "C_Initialize",
+/// negative uncertainty. C_InitToken wipes token objects and sessions;
+/// KEM and authenticated-wrap calls create and use objects through
+/// unwired protocols; async controls defer effects to unmodeled
+/// completions. (C_Initialize left this list under owner P4: it is
+/// modeled as `lifecycle::CRYPTOKI_INITIALIZE`; C_InitToken stays.)
+/// The rest must survive descriptor-shape edits, so all eight are
+/// listed explicitly rather than derived.
+pub(crate) const NEGATIVE_ONLY_FUNCTIONS: [&str; 8] = [
     "C_InitToken",
     "C_EncapsulateKey",
     "C_DecapsulateKey",
@@ -7105,7 +7104,7 @@ pub(crate) mod tests {
     /// manifest: every modeled function journal tests stage needs an
     /// admittable plan slot, since each staged call converts only
     /// under its own H3 admission claim.
-    const ADMITTABLE_FUNCTIONS: [&str; 16] = [
+    const ADMITTABLE_FUNCTIONS: [&str; 23] = [
         "C_CreateObject",
         "C_GetAttributeValue",
         "C_SignInit",
@@ -7125,6 +7124,14 @@ pub(crate) mod tests {
         "C_MessageSignFinal",
         // H9 key-role extension (dual-reference direct call).
         "C_WrapKey",
+        // 6.07a lifecycle extensions, appended for the same reason.
+        "C_Initialize",
+        "C_CopyObject",
+        "C_FindObjectsInit",
+        "C_FindObjects",
+        "C_FindObjectsFinal",
+        "C_CloseAllSessions",
+        "C_Finalize",
     ];
 
     /// v3-only functions, resolved on the 3.0 interface surface
@@ -9883,8 +9890,9 @@ pub(crate) mod tests {
             );
         }
         // (ordinal, name, class) for every non-modeled function.
-        let pinned: [(u32, &str, EndpointClass); 28] = [
-            (0, "C_Initialize", EndpointClass::NegativeOnlyAffecting),
+        // P4 (owner 2026-10-29): ordinal 0 (C_Initialize) left this
+        // table for the modeled set as lifecycle::CRYPTOKI_INITIALIZE.
+        let pinned: [(u32, &str, EndpointClass); 27] = [
             (2, "C_GetInfo", EndpointClass::ProvedIrrelevant),
             (3, "C_GetFunctionList", EndpointClass::ProvedIrrelevant),
             (4, "C_GetSlotList", EndpointClass::ProvedIrrelevant),
@@ -9951,7 +9959,7 @@ pub(crate) mod tests {
             );
             modeled += 1;
         }
-        assert_eq!(modeled, 76, "modeled census moved");
+        assert_eq!(modeled, 77, "modeled census moved");
         // Catalog gap sentinel: ordinal 104 is unnamed today. Filling it
         // must amend this census; until then it is refused, and so is
         // everything beyond the descriptor table.
@@ -9981,7 +9989,9 @@ pub(crate) mod tests {
         // and invalidates the possibly affected incarnation before any
         // user effect can be proven: staged entries are disposed,
         // attestation refuses, and no later seal proves.
-        let init = function_id("C_Initialize");
+        // P4: C_Initialize is modeled now; C_InitToken (explicitly
+        // still negative-only) carries the invocation exemplar.
+        let init = function_id("C_InitToken");
         let invoked = begin_bytes(1, 2, init, JOURNAL_BEGIN_NO_END);
         assert_eq!(
             scene.ingest(&invoked),

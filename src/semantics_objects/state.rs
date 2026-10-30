@@ -224,7 +224,8 @@ fn call_kind(function: u32) -> Option<CallKind> {
         | lifecycle::LOGOUT
         | lifecycle::FIND_INIT
         | lifecycle::FIND_FINAL
-        | lifecycle::SESSION_CANCEL => Some(CallKind::Lifecycle(slot.lifecycle)),
+        | lifecycle::SESSION_CANCEL
+        | lifecycle::CRYPTOKI_INITIALIZE => Some(CallKind::Lifecycle(slot.lifecycle)),
         _ => None,
     }
 }
@@ -1405,6 +1406,19 @@ impl ModelState {
             );
             return;
         }
+        // P4 Initialize era rule (owner 2026-10-29). Qualification here
+        // is journal/seal qualification — a matched BEGIN/END pair with
+        // owned cuts settled through a consistent prefix — not model
+        // bootstrap qualification, which by construction cannot precede
+        // a first mint (P4-M1). The arm therefore runs outside the
+        // qualified gate below, like the escalation above. No generic
+        // removal escalation follows: a failed Initialize leaves
+        // provider state unchanged (symmetric to failed Finalize), so
+        // errors must not retire scope.
+        if call.kind == CallKind::Lifecycle(lifecycle::CRYPTOKI_INITIALIZE) {
+            self.apply_initialize_era(&call, &completion, outcome, effects, ledger);
+            return;
+        }
         let scope = self.call_scope(&call);
 
         // A proof void after this call's begin replay rejects its snapshot,
@@ -1432,6 +1446,99 @@ impl ModelState {
         // Device-loss escalation above may dispose sessions; flush their
         // queued releases so no dead charge denies later admissions.
         self.flush_deferred_releases(ledger);
+    }
+
+    /// P4 Initialize era rule (owner 2026-10-29, merged P4-M1…M6).
+    /// Exactly one qualified `CKR_OK` mints one never-reused
+    /// initialization era; everything else mints nothing. Runs outside
+    /// the bootstrap-qualification gate (see the `apply_end` hook): the
+    /// entry session word is never read as a session (P4-M2, ARG_NONE),
+    /// so no session is resolved and no input ever joins here.
+    ///
+    /// Current domain state selects the clause, which subsumes the
+    /// pair-generation check: a proof void after this call's begin
+    /// always clears the bootstrap and bumps the generation, so a
+    /// loss-straddling pair lands in the voided no-op below, never in
+    /// the mint. No new gap or effect vocabulary: the mint is proven
+    /// by follow-on qualification, contradiction reuses
+    /// `UnseenFinalize` (H9 v2 discipline).
+    fn apply_initialize_era(
+        &mut self,
+        call: &PendingCall,
+        completion: &Completion,
+        outcome: Outcome,
+        effects: &mut ObjectEffects,
+        ledger: &mut super::journal::StagingLedger,
+    ) {
+        // P4-M4, carved out before everything: ALREADY_INITIALIZED
+        // confirms initialized state consistent with the live era — a
+        // benign no-op (no mint, no end, no void, no contradiction),
+        // whatever the domain state.
+        if !completion.malformed && CkRv(completion.rv) == CkRv::CRYPTOKI_ALREADY_INITIALIZED {
+            return;
+        }
+        // P4-M4: every other non-OK return — errors, PENDING
+        // (Initialize is synchronous), malformed completions (which
+        // classify Ambiguous) — mints nothing and disturbs nothing.
+        if outcome != Outcome::Ok {
+            return;
+        }
+        let domain = call.domain;
+        let state = &self.domains[&domain];
+        // Ended domains never resurrect (producer contract): no mint,
+        // no clear, no re-bootstrap. Unreachable through begin/settle
+        // (begins on ended domains are refused; end_domain releases
+        // in-flight tickets to StaleToken), but the guard documents
+        // the M3 terminal-era invariant.
+        if state.ended.is_some() {
+            return;
+        }
+        if state.bootstrap.is_some() {
+            // P4-M5: a qualified OK while the era is live contradicts
+            // — a conforming provider answers ALREADY there, so OK
+            // evidences an unseen Finalize or a nonconforming
+            // provider, and joins published since the unseen boundary
+            // cannot be located (a clean end_domain would leave them
+            // Valid).
+            self.contradict(domain, ObjectGap::UnseenFinalize, None, effects, ledger);
+            return;
+        }
+        if state.generation != 0 {
+            // Proof voided after activity (loss, ambiguity or
+            // contradiction): M3 case (i) needs never-bootstrapped,
+            // and M4 mints nothing on loss or ambiguity. The void
+            // already retired live continuity, so a no-op is safe;
+            // recovery needs a journal bootstrap or a new sealed era
+            // domain (P4-M5).
+            return;
+        }
+        // P4-M3 mint: held, never bootstrapped (generation 0: no void
+        // ever bumped it), not ended. The era anchor is the
+        // Initialize return cut: later begins qualify, while
+        // pre-split snapshots (begin below the anchor) can never
+        // publish across it.
+        let cut = completion.cut;
+        if state.fence_floor.is_some_and(|floor| cut <= floor) {
+            // Uncertainty at or above the boundary: M4 mints nothing.
+            return;
+        }
+        // Pending and straddling calls are fenced — except fellow
+        // Initialize calls, which P4-M5 judges on the post-mint era
+        // (a concurrent second OK then contradicts). `fence` skips
+        // applied calls and the minting call itself.
+        let straddlers: Vec<CallToken> = self
+            .domain_calls(domain)
+            .into_iter()
+            .filter(|candidate| {
+                let other = &self.pending[candidate];
+                other.begin < cut
+                    && other.kind != CallKind::Lifecycle(lifecycle::CRYPTOKI_INITIALIZE)
+            })
+            .collect();
+        for straddler in straddlers {
+            self.fence(straddler);
+        }
+        self.domains.get_mut(&domain).expect("domain").bootstrap = Some(cut);
     }
 
     /// Joins and actions of a qualified end. Returns false when the call

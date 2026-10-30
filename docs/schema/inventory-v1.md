@@ -862,10 +862,19 @@ never imply S1 loss.
   measured `encoded_bytes`, pool `allocation_refused`/`refusal_reason`)
   mirror the snapshot's loss accounting. Row limits refuse with
   `partial` coverage; history is never evicted.
+- Initialization-era boundaries: one qualified successful
+  `C_Initialize` mints one era; `ALREADY_INITIALIZED` and errors mint
+  nothing; a duplicate success on a live era contradicts
+  (`unseen_finalize`). Honesty limit: a finalize+reinitialize pair the
+  capture never saw stays undetectable from this rule alone (except
+  when later betrayed by `CRYPTOKI_NOT_INITIALIZED` or duplicate-OK
+  contradiction) — modeled Initialize handling never claims to detect
+  unseen reinitialization.
 - Privacy: no raw handles, pointers, native keys, epochs, PIDs/TIDs,
   address-derived hashes or arbitrary attribute bytes appear anywhere
   in this section. Key values, moduli, EC points, labels, IDs and PINs
-  are never read or carried.
+  are never read or carried. Initialize arguments (including `pInitArgs`)
+  are never read.
 
 ## Caller metadata (additive within v1)
 

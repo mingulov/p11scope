@@ -6666,11 +6666,13 @@ mod joint_ledger_parse_tests {
     }
 
     /// Exactly the script's probed SoftHSM functions stay semantic except
-    /// C_Initialize and C_GetSlotList, which the capture catalog pins
-    /// count-only. If this catalog moves, every semantic-only population
-    /// below (and the cells' exactness asserts) must be revisited.
+    /// C_GetSlotList, which the capture catalog pins count-only (P4,
+    /// owner 2026-10-29, moved C_Initialize to semantic as
+    /// lifecycle::CRYPTOKI_INITIALIZE). If this catalog moves, every
+    /// semantic-only population below (and the cells' exactness
+    /// asserts) must be revisited.
     #[test]
-    fn joint_soft_functions_pin_two_count_only() {
+    fn joint_soft_functions_pin_one_count_only() {
         let mut count_only = Vec::new();
         for name in JOINT_SOFT_FUNCTIONS {
             let descriptor = crate::kinds::descriptor(name)
@@ -6679,7 +6681,7 @@ mod joint_ledger_parse_tests {
                 count_only.push(*name);
             }
         }
-        assert_eq!(count_only, ["C_Initialize", "C_GetSlotList"]);
+        assert_eq!(count_only, ["C_GetSlotList"]);
     }
 
     fn script_ledger(entries: &[(&str, u64)]) -> BTreeMap<String, u64> {
@@ -6711,7 +6713,7 @@ mod joint_ledger_parse_tests {
             ("C_Finalize", 1),
         ]);
         assert_eq!(digest2.values().sum::<u64>(), 16);
-        assert_eq!(ledger_semantic_split(&digest2), (14, 2));
+        assert_eq!(ledger_semantic_split(&digest2), (15, 1));
         // Cell 3 A / cell 2 E script: --iters 1 over two token slots.
         let digest1 = script_ledger(&[
             ("C_Initialize", 1),
@@ -6729,23 +6731,23 @@ mod joint_ledger_parse_tests {
             ("C_Finalize", 1),
         ]);
         assert_eq!(digest1.values().sum::<u64>(), 14);
-        assert_eq!(ledger_semantic_split(&digest1), (12, 2));
+        assert_eq!(ledger_semantic_split(&digest1), (13, 1));
         // Cell 2 E: the tallied gen-1 probe plus the --iters 1 script.
         let mut probe = digest1.clone();
         for function in ["C_Initialize", "C_GetSlotList", "C_Finalize"] {
             *probe.get_mut(function).expect("scripted call") += 1;
         }
         assert_eq!(probe.values().sum::<u64>(), 17);
-        assert_eq!(ledger_semantic_split(&probe), (13, 4));
+        assert_eq!(ledger_semantic_split(&probe), (15, 2));
         // Cell 2 C: the absence subject's three calls.
         let absent = script_ledger(&[("C_Initialize", 1), ("C_GetSlotList", 1), ("C_Finalize", 1)]);
-        assert_eq!(ledger_semantic_split(&absent), (1, 2));
+        assert_eq!(ledger_semantic_split(&absent), (2, 1));
         // The held pair (cells 1 A, 2 H/S): fully semantic.
         let held = script_ledger(&[("C_SignInit", 1), ("C_Sign", 1)]);
         assert_eq!(ledger_semantic_split(&held), (2, 0));
         // Unknown names are never observed.
         let strange = script_ledger(&[("C_Initialize", 1), ("C_Bogus", 3)]);
-        assert_eq!(ledger_semantic_split(&strange), (0, 4));
+        assert_eq!(ledger_semantic_split(&strange), (1, 3));
     }
 
     /// The disclosed-gap counter matches the exact subject/reason/caller
@@ -6992,7 +6994,7 @@ mod joint_ledger_parse_tests {
         assert!(lines.contains("caller never admitted"), "{lines}");
         assert!(lines.contains("semantic input refused"), "{lines}");
         assert!(
-            lines.contains("fn=C_Initialize entered=1 count-only"),
+            lines.contains("fn=C_Initialize entered=1 semantic"),
             "{lines}"
         );
         assert!(lines.contains("fn=C_Sign entered=2 semantic"), "{lines}");

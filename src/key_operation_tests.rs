@@ -535,8 +535,9 @@ use p11scope_ebpf_common::object_journal::{
     JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, decode_journal_record,
 };
 use p11scope_ebpf_common::object_wire::{
-    OBJECT_ACTION_ACCESS, OBJECT_ACTION_CREATE, OBJECT_ACTION_DESTROY, ObjectDescriptorWire,
-    publish_object_descriptors, verify_object_descriptors,
+    OBJECT_ACTION_ACCESS, OBJECT_ACTION_COPY, OBJECT_ACTION_CREATE, OBJECT_ACTION_DESTROY,
+    OBJECT_ACTION_FIND, ObjectDescriptorWire, publish_object_descriptors,
+    verify_object_descriptors,
 };
 use p11scope_ebpf_common::{Event, ImageIdentity, InstanceStamp, MAX_DESCRIPTORS};
 
@@ -827,6 +828,23 @@ fn end_for_call(begin: &[u8; 224], call: &ShapedS1) -> [u8; 632] {
             end_bytes(begin, OBJECT_ACTION_ACCESS, call.rv, ENTRY_NS + 50)
         }
         "C_DestroyObject" => end_bytes(begin, OBJECT_ACTION_DESTROY, call.rv, ENTRY_NS + 50),
+        // Copy/Find carry result protocols, so their tails stay present
+        // with unknown output sections: the conversion reads explicit
+        // unknown (NotCaptured/Unreadable), never an absent row. Both
+        // authorize result slot 0, which the validator requires
+        // non-absent: status 7 marks it never captured.
+        "C_CopyObject" => {
+            let mut end = end_bytes(begin, OBJECT_ACTION_COPY, call.rv, ENTRY_NS + 50);
+            // Tail result slot 0: record[392 + 114].
+            end[506] = 7;
+            end
+        }
+        "C_FindObjects" => {
+            let mut end = end_bytes(begin, OBJECT_ACTION_FIND, call.rv, ENTRY_NS + 50);
+            // Tail result slot 0: record[392 + 114].
+            end[506] = 7;
+            end
+        }
         "C_GetAttributeValue" => {
             end_bytes_getattr(begin, call.rv, ENTRY_NS + 50, &call.getattr_cells)
         }
@@ -14313,11 +14331,11 @@ fn key_operation_lifecycle_initialize_already_is_benign_noop() {
     );
 }
 
-/// Absent-tail copy/find invent nothing: copy reports its unreadable
-/// output, the find sequence stays silent, and a later use still
-/// populates proved rows through the commit.
+/// Unknown-output copy/find invent nothing: copy reports its
+/// unreadable output, the find sequence stays silent, and a later use
+/// still populates proved rows through the commit.
 #[test]
-fn key_operation_lifecycle_copy_find_absent_tail_invents_nothing() {
+fn key_operation_lifecycle_copy_find_unknown_output_invents_nothing() {
     use crate::semantics_objects::ObjectGap;
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
@@ -14416,16 +14434,14 @@ fn key_operation_lifecycle_copy_find_absent_tail_invents_nothing() {
 }
 
 /// 6.07a delivery gate: close-all retires uncertain, a successful
-/// finalize ends the era (the seal fails DomainEnded fail-closed and
-/// held staging keeps S1 conserved), a failed finalize keeps
+/// finalize ends the era inside its seal, a later quantum on the
+/// ended domain is refused at conversion, a failed finalize keeps
 /// state, and the unlinked lane twin reports journal_unavailable —
 /// with status/reason/row/bucket behavior committed at every stage.
 #[test]
 fn key_operation_lifecycle_close_all_finalize_commit_link() {
     use crate::key_operation_projection::producer::commit_with_journal_linked;
     use crate::semantics_objects::{Lifetime, ObjectGap, SessionState};
-    let instance =
-        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -14521,49 +14537,59 @@ fn key_operation_lifecycle_close_all_finalize_commit_link() {
         committed.objects[0].lifetime_reason,
         Some("close_all_uncertain")
     );
-    // Stage 3: a successful finalize ends the era. The seal fails
-    // DomainEnded fail-closed; the model already applied the era end
-    // inside the refused settle, and the Unqualified failure scope
-    // holds staging (Ignored) instead of replaying a second end.
-    let (_facts, _) = prepare_call(
+    // Stage 3: a successful finalize ends a live era inside its
+    // seal (fresh scene: finalize retires live views, and stage 2
+    // already retired this scene's). The commit shows the ended era
+    // honestly; a later quantum on the ended domain is refused at
+    // conversion — nothing joins across the split.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+    let (facts, _) = drive_quantum(
         &mut scene,
         &mut staging,
-        &ShapedS1::shaped("C_Finalize", CkRv::OK.0, 0, 0),
-    );
-    let failure = scene.seal().expect_err("era end fails the seal");
-    assert_eq!(failure.gap, JournalGap::DomainEnded);
-    assert!(
-        failure.effects.effects.iter().any(|effect| matches!(
-            effect,
-            crate::semantics_objects::ObjectEffect::AccessEnded { .. }
-        )),
-        "the era end effects ride the failure"
-    );
-    let mut clean_source = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, refused) = staging.apply_algorithm_failure_for_test(
-        &failure,
-        &mut clean_source,
-        &scene.model,
-        scene.adapter.ledger_mut(),
         &mut joint,
         &mut keyuse,
-        instance,
         &mut sink,
-        None,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
-    assert_eq!(refused, 0);
-    assert_eq!(
-        outcome,
-        FailureApplyOutcome::Ignored,
-        "Unqualified scope holds staging intact"
+    observe_direct(&mut direct, &mut direct_sink, &facts);
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    let (facts, _) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
     );
-    assert_eq!(
-        staging.mode(),
-        FeedMode::Joint,
-        "the held feed never falls back"
+    observe_direct(&mut direct, &mut direct_sink, &facts);
+    let (facts, _) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
     );
-    // The finalize fact stays staged, never reduced: the S1 twin
-    // agrees without it, and S1 loses nothing it ever held.
+    observe_direct(&mut direct, &mut direct_sink, &facts);
+    let (facts, _) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Finalize", CkRv::OK.0, 0, 0),
+    );
+    observe_direct(&mut direct, &mut direct_sink, &facts);
     assert_s1_equal(&joint, &direct);
     let projection = scene.model.project();
     assert!(
@@ -14573,14 +14599,47 @@ fn key_operation_lifecycle_close_all_finalize_commit_link() {
             .all(|view| matches!(view.lifetime, Lifetime::AccessEnded(ObjectGap::Finalize))),
         "finalize ends every view with its own reason"
     );
+    assert!(
+        projection
+            .sessions
+            .iter()
+            .all(|s| !matches!(s.state, SessionState::Live)),
+        "finalize ends every session"
+    );
     let committed = commit(3, &[&staging], &scene.model.project(), &keyuse);
     assert_eq!(
         (committed.status, committed.reason),
         (ObsStatus::Populated, "none"),
-        "the held feed still commits the ended era honestly"
+        "the Joint feed commits the ended era honestly"
     );
     assert_eq!(committed.objects[0].lifetime, "access_ended");
     assert_eq!(committed.objects[0].lifetime_reason, Some("finalize"));
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("stage 3 keeps the use row");
+    assert_eq!(
+        (row.started, row.completed, row.active, row.key_join_lost),
+        (1, 0, 0, 1),
+        "the live binding closes to key_join_lost exactly once"
+    );
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let failure = scene.seal().expect_err("nothing joins across the split");
+    assert_eq!(failure.gap, JournalGap::ModelRefused);
+    assert!(
+        scene
+            .model
+            .project()
+            .objects
+            .iter()
+            .all(|view| matches!(view.lifetime, Lifetime::AccessEnded(ObjectGap::Finalize))),
+        "the refused quantum changes nothing"
+    );
     // Stage 4: a failed finalize keeps state (twin scene).
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
@@ -14645,4 +14704,110 @@ fn key_operation_lifecycle_close_all_finalize_commit_link() {
     assert_eq!(unlinked.status, ObsStatus::Unavailable);
     assert_eq!(unlinked.reason, "journal_unavailable");
     assert_eq!(unlinked.objects.len(), 1, "rows stay while status refuses");
+}
+
+/// Object handle reuse retires the old view and mints the new one,
+/// and inaccessible attribute reads establish nothing: a SENSITIVE
+/// GetAttributeValue records its unavailable queries without
+/// inventing values. The commit carries both rows honestly.
+#[test]
+fn key_operation_lifecycle_handle_reuse_and_inaccessible_attributes() {
+    use crate::semantics_objects::{FieldState, Lifetime, ObjectGap, QueryStatus, field_index};
+    use p11scope_ebpf_common::object_policy::SafeAttributeKind;
+    const H1: u64 = 0xA1A1_0001;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.result = Some(H1);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create,
+    );
+    let mut reuse = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    reuse.result = Some(H1);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &reuse,
+    );
+    let mut get = ShapedS1::shaped("C_GetAttributeValue", CkRv::ATTRIBUTE_SENSITIVE.0, 0, 0);
+    get.input0 = Some((H1, 1));
+    get.getattr_cells = vec![(1u8, 3u8, 0u16), (2u8, 3u8, 0u16)];
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    let projection = scene.model.project();
+    assert_eq!(projection.objects.len(), 2);
+    assert!(
+        projection
+            .objects
+            .iter()
+            .any(|view| matches!(view.lifetime, Lifetime::Retired(ObjectGap::HandleReuse))),
+        "the reused old view retires"
+    );
+    let live = projection
+        .objects
+        .iter()
+        .find(|view| matches!(view.lifetime, Lifetime::Live))
+        .expect("the reuse mints a live view");
+    for kind in [SafeAttributeKind::Class, SafeAttributeKind::KeyType] {
+        assert_eq!(
+            live.established.field(kind),
+            FieldState::Unknown,
+            "inaccessible reads establish nothing"
+        );
+        assert_eq!(
+            live.queries[field_index(kind)],
+            QueryStatus::Unavailable,
+            "the unavailable query is recorded"
+        );
+    }
+    assert_eq!(live.label, None, "no label without values");
+    let mut destroy = ShapedS1::shaped("C_DestroyObject", CkRv::OK.0, 0, 0);
+    destroy.input0 = Some((H1, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &destroy,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (committed.status, committed.reason),
+        (ObsStatus::Populated, "none")
+    );
+    assert_eq!(committed.objects.len(), 2);
+    assert!(
+        committed
+            .objects
+            .iter()
+            .any(|row| row.lifetime == "retired" && row.lifetime_reason == Some("handle_reuse")),
+        "the retired row keeps its reason"
+    );
+    let destroyed = committed
+        .objects
+        .iter()
+        .find(|row| row.lifetime == "destroyed")
+        .expect("the reuse target destroys");
+    assert_eq!(destroyed.queries.class, "unavailable");
+    assert_eq!(destroyed.queries.key_type, "unavailable");
+    assert_eq!(destroyed.label, None);
 }

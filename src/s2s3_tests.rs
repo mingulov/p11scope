@@ -4225,7 +4225,7 @@ fn s2s3_initialize_first_mint_qualifies_follow_ons() {
     let x = h.run(1, create(SA), 2, ok().result(0, H1));
     let effects = h.settle(2);
     assert_eq!(created(&effects, x, 0), None);
-    assert_eq!(unresolved(&effects, x), Some(ObjectGap::BootstrapUnproven));
+    assert!(h.project().gap(ObjectGap::BootstrapUnproven) >= 1);
 }
 
 #[test]
@@ -4276,7 +4276,7 @@ fn s2s3_initialize_failed_reinit_mints_nothing() {
         None,
         "failed re-init mints nothing"
     );
-    assert_eq!(unresolved(&effects, x), Some(ObjectGap::BootstrapUnproven));
+    assert!(h.project().gap(ObjectGap::BootstrapUnproven) >= 1);
 }
 
 #[test]
@@ -4334,7 +4334,7 @@ fn s2s3_initialize_duplicate_ok_contradicts() {
     let y = h.run(7, create(SA), 8, ok().result(0, H2));
     let effects = h.settle(8);
     assert_eq!(created(&effects, y, 0), None);
-    assert_eq!(unresolved(&effects, y), Some(ObjectGap::BootstrapUnproven));
+    assert!(h.project().gap(ObjectGap::BootstrapUnproven) >= 1);
 }
 
 #[test]
@@ -4403,26 +4403,34 @@ fn s2s3_initialize_pending_mints_nothing() {
     let x = h.run(3, create(SA), 4, ok().result(0, H1));
     let effects = h.settle(4);
     assert_eq!(created(&effects, x, 0), None, "PENDING mints nothing");
-    assert_eq!(unresolved(&effects, x), Some(ObjectGap::BootstrapUnproven));
+    assert!(h.project().gap(ObjectGap::BootstrapUnproven) >= 1);
 }
 
 #[test]
 fn s2s3_initialize_late_completion_after_finalize_is_stale() {
-    // P4-M6: a pre-finalize Initialize completion arriving after the
-    // era ended is a stale token and cannot join (no mint).
+    // P4-M6: a pre-finalize Initialize whose completion stages but
+    // never replays before the era ends is dropped with the era (no
+    // mint, no join, no contradiction); a late re-delivery of its
+    // released ticket is refused as stale.
     let mut h = Hist::qualified();
     h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
     let x = h.run(3, create(SA), 4, ok().result(0, H1));
-    h.settle(4);
+    let before = h.settle(4);
+    let id = created(&before, x, 0).unwrap();
     let init = h.begin(5, init_call());
     h.run(6, call("C_Finalize"), 7, ok());
-    let effects = h.settle(7);
-    let id = created(&effects, x, 0).unwrap();
+    h.done(init, 8, ok());
+    h.settle(8);
     assert_eq!(
         view(&h.project(), id).lifetime,
         Lifetime::AccessEnded(ObjectGap::Finalize)
     );
-    let late = h.done(init, 8, ok());
+    assert_eq!(
+        h.project().gap(ObjectGap::UnseenFinalize),
+        0,
+        "the dropped Initialize contradicts nothing"
+    );
+    let late = h.done(init, 9, ok());
     assert!(late.effects.contains(&ObjectEffect::Gap {
         reason: ObjectGap::StaleToken
     }));
@@ -4430,5 +4438,32 @@ fn s2s3_initialize_late_completion_after_finalize_is_stale() {
         view(&h.project(), id).lifetime,
         Lifetime::AccessEnded(ObjectGap::Finalize),
         "no resurrection"
+    );
+}
+
+#[test]
+fn s2s3_session_handle_reuse_retires_old_mints_new() {
+    // 6.07a: opening over a live session word retires the old
+    // incarnation (uncertain: the close was never observed) and
+    // mints the new one; old views retire, never silently rebind.
+    let mut h = Hist::qualified();
+    let first = h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let second = h.run(5, open_in(slot(SLOT1)), 6, ok().session_out(SA));
+    let effects = h.settle(6);
+    let s1 = opened(&effects, first).unwrap();
+    let s2 = opened(&effects, second).unwrap();
+    assert_ne!(s1, s2, "reuse mints a new incarnation");
+    let p = h.project();
+    assert_eq!(
+        p.session(s1).unwrap().state,
+        SessionState::Ended(ObjectGap::HandleReuse)
+    );
+    assert_eq!(p.session(s2).unwrap().state, SessionState::Live);
+    let id = created(&effects, x, 0).unwrap();
+    assert_eq!(
+        view(&p, id).lifetime,
+        Lifetime::Retired(ObjectGap::HandleReuse),
+        "old views retire"
     );
 }

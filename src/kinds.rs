@@ -176,8 +176,12 @@ fn with_output(mut value: SlotSemantics, output: u8) -> SlotSemantics {
 /// reserved for names outside the shared published 104-slot inventory.
 pub fn descriptor(name: &str) -> Option<SlotSemantics> {
     let value = match name {
-        "C_Initialize" | "C_GetInfo" | "C_GetFunctionList" | "C_GetSlotList"
-        | "C_GetInterfaceList" | "C_GetInterface" => SlotSemantics::COUNT_ONLY,
+        // P4-M2: every Initialize argument selector stays ARG_NONE
+        // (argument 0 is not a session handle); only the lifecycle
+        // tag is added, so S1 claims nothing new for the call.
+        "C_Initialize" => lifecycle_only(lifecycle::CRYPTOKI_INITIALIZE),
+        "C_GetInfo" | "C_GetFunctionList" | "C_GetSlotList" | "C_GetInterfaceList"
+        | "C_GetInterface" => SlotSemantics::COUNT_ONLY,
 
         "C_Finalize" => lifecycle_only(lifecycle::FINALIZE),
         "C_GetSlotInfo" | "C_GetTokenInfo" | "C_GetMechanismList" | "C_GetMechanismInfo"

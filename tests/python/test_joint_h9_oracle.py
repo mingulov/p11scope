@@ -548,6 +548,27 @@ class CompareTwins(unittest.TestCase):
                 stream = healthy_stream([first, second], snapshot)
                 oracle.compare_stream(stream, [first, second], snapshot)
 
+    def test_h9_v2_snapshot_dispatch(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "interleave")
+        with self.subTest("v2 KEM role validates"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 2
+            snapshot["key_operations"][0]["role"] = "decapsulation_key"
+            oracle.validate_snapshot(snapshot)
+        with self.subTest("v1 refuses KEM roles"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["key_operations"][0]["role"] = "decapsulation_key"
+            with self.assertRaisesRegex(oracle.LedgerError, "role invalid"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("unknown versions refused"):
+            for version in (0, 3, 99):
+                snapshot = healthy_snapshot([first, second])
+                snapshot["version"] = version
+                with self.assertRaisesRegex(oracle.LedgerError,
+                                            "version mismatch"):
+                    oracle.validate_snapshot(snapshot)
+
     def test_healthy_same_scope_handle_joins_one_row(self):
         oracle = require_oracle(self)
         cfg_b = dict(MODES["loss"][0], feed="B")

@@ -11351,6 +11351,243 @@ fn key_operation_kem_abandoned_call_clears_without_proof() {
     assert_eq!(facts.function.as_ref(), "C_EncapsulateKey");
 }
 
+/// Item 20 (H9 dispatch): the section version follows its content.
+/// KEM creation or role labels publish version 2; KEM-free content
+/// keeps byte-stable version 1. The JSONL stream reconstructs the
+/// versioned section exactly, and dashboard tallies carry the KEM
+/// categories.
+#[test]
+fn key_operation_h9_v2_dispatches_on_kem_content() {
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2, object_observations_json,
+    };
+    assert_eq!(OBSERVATIONS_VERSION, 1);
+    assert_eq!(OBSERVATIONS_VERSION_V2, 2);
+    // KEM-bearing commit renders version 2 with the new labels.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let aes = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1Fu16), (4u8, 1u8, 32u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &aes,
+    );
+    drive_kem_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_DecapsulateKey", CkRv::OK.0, 0x17, kem_decap_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 2);
+    let rendered = serde_json::to_string(&section).unwrap();
+    assert!(rendered.contains("\"decapsulation_key\""), "{rendered}");
+    assert!(rendered.contains("\"decapsulate\""), "{rendered}");
+    // The JSONL stream reconstructs the versioned section exactly.
+    let dir = private_tempdir();
+    let path = dir.path().join("kem.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    let mut emitter = KeyOperationEmitter::new();
+    loop {
+        let out = emitter.emit(&mut writer, &committed, 1_000).unwrap();
+        if out.emitted == 0 {
+            break;
+        }
+    }
+    drop(writer);
+    let lines = read_stream(dir.path(), "kem.jsonl");
+    assert_reconstructed_eq_json(&reconstruct(&lines), &section, true);
+    // Dashboard tallies (what the keys line renders) carry the KEM
+    // category with its exact counters.
+    let tallies = crate::inventory_present::key_operation_tallies(&committed);
+    let decap = tallies
+        .iter()
+        .find(|tally| tally.category == "decapsulate")
+        .expect("decapsulate tally");
+    assert_eq!((decap.completed, decap.failed, decap.active), (1, 0, 0));
+    // KEM-free content keeps version 1: proved rows and all.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let aes = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1Fu16), (4u8, 1u8, 32u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &aes,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, AES_GCM, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert!(!committed.key_operations.is_empty(), "a proved v1 row");
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 1);
+    let rendered = serde_json::to_string(&section).unwrap();
+    assert!(!rendered.contains("encapsulat"), "{rendered}");
+    assert!(!rendered.contains("decapsulat"), "{rendered}");
+}
+
+/// Item 20 (contracts audit): v1 tables and the v1 schema stay
+/// frozen; v2 adds exactly the KEM role/creation labels; metadata
+/// stays at 12; the native and canary action ranges match the wire.
+#[test]
+fn key_operation_kem_contracts_audit() {
+    use crate::key_operation_projection::contract::*;
+    // Roles 6→8, creations 6→8, metadata pinned at 12 under M2.
+    assert_eq!(ROLE_LABELS.len(), 6);
+    assert_eq!(ROLE_LABELS_V2.len(), 8);
+    assert_eq!(
+        ROLE_LABELS_V2,
+        [
+            "key",
+            "wrapping_key",
+            "wrapped_object",
+            "base_key",
+            "unwrapping_key",
+            "encapsulation_key",
+            "decapsulation_key",
+            "other",
+        ]
+    );
+    assert_eq!(CREATION_LABELS.len(), 6);
+    assert_eq!(CREATION_LABELS_V2.len(), 8);
+    assert_eq!(
+        CREATION_LABELS_V2,
+        [
+            "create",
+            "copy",
+            "generate",
+            "generate_pair",
+            "derive",
+            "unwrap",
+            "encapsulate",
+            "decapsulate",
+        ]
+    );
+    assert_eq!(METADATA_LABELS.len(), 12);
+    // v1 schema: frozen, no KEM labels, version 1.
+    let v1: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string("docs/schema/inventory-v1-object-observations.schema.json")
+            .expect("v1 schema reads"),
+    )
+    .expect("v1 schema parses");
+    assert_eq!(v1["properties"]["version"]["const"], 1);
+    let v1_roles = v1["properties"]["key_operations"]["items"]["properties"]["role"]["enum"]
+        .as_array()
+        .expect("v1 role enum");
+    assert_eq!(v1_roles.len(), 6);
+    assert!(
+        !v1_roles.iter().any(|label| label
+            .as_str()
+            .is_some_and(|label| label.contains("capsulat"))),
+        "v1 roles exclude KEM"
+    );
+    // v2 schema: version 2, v1 plus exactly the KEM labels.
+    let v2: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string("docs/schema/inventory-v1-object-observations-v2.schema.json")
+            .expect("v2 schema reads"),
+    )
+    .expect("v2 schema parses");
+    assert_eq!(v2["properties"]["version"]["const"], 2);
+    let v2_roles = v2["properties"]["key_operations"]["items"]["properties"]["role"]["enum"]
+        .as_array()
+        .expect("v2 role enum");
+    assert_eq!(
+        v2_roles
+            .iter()
+            .filter_map(|label| label.as_str())
+            .collect::<Vec<_>>(),
+        ROLE_LABELS_V2,
+    );
+    let v2_creations = v2["properties"]["objects"]["items"]["properties"]["creation"]["enum"]
+        .as_array()
+        .expect("v2 creation enum");
+    assert_eq!(v2_creations.len(), 9, "8 creations plus null");
+    // Native and canary action ranges match the wire exactly.
+    let header =
+        std::fs::read_to_string("crates/ebpf/native/task_owner.h").expect("native header reads");
+    let define = "#define OBJECT_ACTION_MAX";
+    let line = header
+        .lines()
+        .find(|line| line.starts_with(define))
+        .expect("native action max");
+    let native: u8 = line[define.len()..]
+        .trim()
+        .trim_end_matches('U')
+        .trim()
+        .parse()
+        .expect("native max parses");
+    assert_eq!(
+        native,
+        p11scope_ebpf_common::object_wire::OBJECT_ACTION_MAX
+    );
+    assert_eq!(
+        p11scope_ebpf_common::object_wire::OBJECT_ACTION_MAX,
+        14
+    );
+    let canary = std::fs::read_to_string("scripts/check-canary-evidence.py")
+        .expect("canary script reads");
+    let binding = "OBJECT_ACTION_MAX = ";
+    let line = canary
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(binding))
+        .expect("canary action max");
+    let script: u8 = line[binding.len()..].trim().parse().expect("canary parses");
+    assert_eq!(script, 14);
+}
+
 // ==================== Checkbox 5: ledger, PQC, measurement ====================
 
 /// H9-§4: KEM endpoints are modeled (packet 6.07c stages and joins

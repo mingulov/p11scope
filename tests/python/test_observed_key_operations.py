@@ -597,6 +597,55 @@ class ObservedRsaTests(unittest.TestCase):
             self.assertEqual(schema["properties"]["revision"]["maximum"],
                              ORACLE.MAX_WORD)
 
+    def test_oracle_v2_tables_match_v2_schema(self):
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations-v2.schema.json",
+                  encoding="utf-8") as stream:
+            schema = json.load(stream)
+        defs = schema["$defs"]
+        with self.subTest("version const"):
+            self.assertEqual(schema["properties"]["version"]["const"], 2)
+            self.assertEqual(ORACLE.OBSERVATIONS_VERSION_V2, 2)
+        with self.subTest("ROLES_V2"):
+            self.assertEqual(set(ORACLE.ROLES_V2), set(defs["role"]["enum"]))
+            self.assertEqual(set(ORACLE.ROLES_V2),
+                             set(ORACLE.ROLES)
+                             | {"encapsulation_key", "decapsulation_key"})
+        with self.subTest("CREATIONS_V2"):
+            self.assertEqual(set(ORACLE.CREATIONS_V2),
+                             set(defs["object_row"]["properties"]["creation"]["enum"])
+                             - {None})
+            self.assertEqual(set(ORACLE.CREATIONS_V2),
+                             set(ORACLE.CREATIONS)
+                             | {"encapsulate", "decapsulate"})
+        with self.subTest("metadata stays 12"):
+            self.assertEqual(set(ORACLE.METADATA_LABELS),
+                             set(defs["metadata_label"]["enum"]))
+
+    def test_h9_v2_section_qualifies_and_v1_refuses_kem(self):
+        section = observed("kem-v2.json")
+        with self.subTest("v2 shape qualifies"):
+            facts = ORACLE.check_section(copy.deepcopy(section))
+            self.assertEqual(len(facts["rows"]), 1)
+            self.assertEqual(len(facts["unknown"]), 1)
+        with self.subTest("v1 rejects KEM labels"):
+            downgraded = copy.deepcopy(section)
+            downgraded["version"] = 1
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(downgraded)
+        with self.subTest("unknown versions refused"):
+            for version in (0, 3, 99):
+                mutated = copy.deepcopy(section)
+                mutated["version"] = version
+                with self.assertRaises(ORACLE.OracleRefusal):
+                    ORACLE.check_section(mutated)
+        with self.subTest("fabricated v2 role refused"):
+            mutated = copy.deepcopy(section)
+            mutated["key_operations"][0]["role"] = "C_Fabricated"
+            with self.assertRaises(ORACLE.OracleRefusal) as caught:
+                ORACLE.check_section(mutated)
+            self.assertNotIn("C_Fabricated", str(caught.exception))
+
 
 # S1 twins: the installed RSA capture as v0.5.0 reports it (no key-operation
 # feed). Every number below is derived from the ledger workload

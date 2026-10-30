@@ -1,0 +1,127 @@
+{
+  "version": 2,
+  "revision": 9,
+  "status": "populated",
+  "reason": "none",
+  "sessions": [
+    {"session": 1, "origin": "opened", "status": "live"}
+  ],
+  "objects": [
+    {
+      "object": 11,
+      "session": 1,
+      "origin": "created",
+      "creation": "create",
+      "birth": {"start_ns": 1000, "end_ns": 2000},
+      "lifetime": "live",
+      "lifetime_reason": null,
+      "attribution": "valid",
+      "attribution_reason": null,
+      "requested": {
+        "class": {"status": "value", "value": 4},
+        "key_type": {"status": "value", "value": 31},
+        "token": {"status": "value", "value": 0},
+        "value_len": {"status": "value", "value": 32},
+        "modulus_bits": {"status": "unknown", "value": null},
+        "ec_params": {"status": "unknown", "value": null}
+      },
+      "established": {
+        "class": {"status": "value", "value": 4},
+        "key_type": {"status": "value", "value": 31},
+        "token": {"status": "value", "value": 0},
+        "value_len": {"status": "value", "value": 32},
+        "modulus_bits": {"status": "unknown", "value": null},
+        "ec_params": {"status": "unknown", "value": null}
+      },
+      "queries": {
+        "class": "established",
+        "key_type": "established",
+        "token": "established",
+        "value_len": "established",
+        "modulus_bits": "not_queried",
+        "ec_params": "not_queried"
+      },
+      "label": "aes_256",
+      "successful_references": 2,
+      "successful_key_references": 2,
+      "accessing_sessions": 1
+    },
+    {
+      "object": 12,
+      "session": 1,
+      "origin": "created",
+      "creation": "encapsulate",
+      "birth": {"start_ns": 3000, "end_ns": 4000},
+      "lifetime": "live",
+      "lifetime_reason": null,
+      "attribution": "valid",
+      "attribution_reason": null,
+      "requested": {
+        "class": {"status": "unknown", "value": null},
+        "key_type": {"status": "unknown", "value": null},
+        "token": {"status": "unknown", "value": null},
+        "value_len": {"status": "unknown", "value": null},
+        "modulus_bits": {"status": "unknown", "value": null},
+        "ec_params": {"status": "unknown", "value": null}
+      },
+      "established": {
+        "class": {"status": "unknown", "value": null},
+        "key_type": {"status": "unknown", "value": null},
+        "token": {"status": "unknown", "value": null},
+        "value_len": {"status": "unknown", "value": null},
+        "modulus_bits": {"status": "unknown", "value": null},
+        "ec_params": {"status": "unknown", "value": null}
+      },
+      "queries": {
+        "class": "not_queried",
+        "key_type": "not_queried",
+        "token": "not_queried",
+        "value_len": "not_queried",
+        "modulus_bits": "not_queried",
+        "ec_params": "not_queried"
+      },
+      "label": null,
+      "successful_references": 0,
+      "successful_key_references": 0,
+      "accessing_sessions": 0
+    }
+  ],
+  "key_operations": [
+    {
+      "instance": "i1",
+      "object": 11,
+      "category": "decapsulate",
+      "role": "decapsulation_key",
+      "metadata_at_use": "aes_256",
+      "unit": "operations",
+      "started": 1,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 0,
+      "unknown": 0,
+      "active": 0,
+      "key_join_lost": 0
+    }
+  ],
+  "unknown_key_operations": [
+    {
+      "category": "encapsulate",
+      "reason": "metadata_unknown",
+      "unit": "operations",
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 0,
+      "unknown": 0,
+      "active": 0
+    }
+  ],
+  "gaps": {"rows": [], "suppressed": 0},
+  "budgets": {
+    "key_rows": {"limit": 65536, "occupied": 1, "refused": 0},
+    "object_rows": {"limit": 65536, "occupied": 2, "refused": 0},
+    "unknown_rows": {"occupied": 1},
+    "encoded_bytes": 2400,
+    "allocation_refused": false,
+    "refusal_reason": "none"
+  }
+}

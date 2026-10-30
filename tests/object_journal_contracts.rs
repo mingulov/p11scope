@@ -2224,13 +2224,49 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
         }
         out
     }
-    /// A bare reserved numeric (7/8): decimal or hex, one outer cast
-    /// and integer suffixes tolerated, nothing else.
+    /// A bare reserved numeric (7/8): decimal or hex, balanced
+    /// outer grouping parens, one outer cast, and integer suffixes
+    /// tolerated, nothing else. Grouping (`(7U)`) wraps the whole
+    /// argument; a cast (`(u32)7`) leaves trailing content.
     fn is_reserved_numeric(argument: &str) -> bool {
         let mut argument = argument.trim();
-        // One outer cast prefix (`(u32)7`) tolerated.
-        if argument.contains(')') {
-            argument = argument.rsplit(')').next().unwrap_or(argument).trim();
+        loop {
+            let trimmed = argument.trim();
+            // Balanced outer grouping: the leading `(` matches the
+            // final `)`, so stripping peels one grouping layer.
+            if trimmed.len() >= 2 && trimmed.starts_with('(') && trimmed.ends_with(')') {
+                let bytes = trimmed.as_bytes();
+                let mut depth = 0u32;
+                let mut wraps = true;
+                for (index, &byte) in bytes.iter().enumerate() {
+                    if byte == b'(' {
+                        depth += 1;
+                    } else if byte == b')' {
+                        depth -= 1;
+                        if depth == 0 && index + 1 < bytes.len() {
+                            wraps = false;
+                            break;
+                        }
+                    }
+                }
+                if wraps && depth == 0 {
+                    argument = trimmed[1..trimmed.len() - 1].trim();
+                    continue;
+                }
+            }
+            // One outer cast prefix (`(u32)7`) tolerated: a leading
+            // group with trailing content is a cast, not grouping.
+            if trimmed.starts_with('(')
+                && let Some(close) = trimmed.find(')')
+            {
+                let rest = trimmed[close + 1..].trim();
+                if !rest.is_empty() {
+                    argument = rest;
+                    continue;
+                }
+            }
+            argument = trimmed;
+            break;
         }
         let digits = argument.trim_end_matches(['U', 'u', 'L', 'l']);
         let value = if let Some(hex) = digits
@@ -2258,14 +2294,22 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
                 }
             }
         }
-        for shape in ["remove_start(", "start_remove_reason("] {
+        // Explicit inventory of reason-taking native calls and
+        // their reason-argument positions: removal calls carry the
+        // reason last, while the forwarding settlement call carries
+        // it second (`key, reason, &journal`).
+        for (shape, position) in [
+            ("remove_start(", None),
+            ("start_remove_reason(", None),
+            ("p11_journal_settle_prepare(", Some(1)),
+        ] {
             let mut rest = code.as_str();
             while let Some(at) = rest.find(shape) {
                 let lineno = code.len() - rest.len() + at;
                 let lineno = code[..lineno].matches('\n').count() + 1;
                 rest = &rest[at + shape.len()..];
                 // Balance to the call's own closing paren, across
-                // wrapped lines; the reason is the last argument.
+                // wrapped lines.
                 let mut depth = 1u32;
                 let mut end = None;
                 for (offset, c) in rest.char_indices() {
@@ -2286,19 +2330,30 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
                     break;
                 };
                 let args = &rest[..end];
+                let mut parts = Vec::new();
                 let mut depth = 0u32;
-                let mut last_comma = None;
+                let mut start = 0;
                 for (offset, c) in args.char_indices() {
                     match c {
                         '(' => depth += 1,
                         ')' => depth = depth.saturating_sub(1),
-                        ',' if depth == 0 => last_comma = Some(offset),
+                        ',' if depth == 0 => {
+                            parts.push(&args[start..offset]);
+                            start = offset + 1;
+                        }
                         _ => {}
                     }
                 }
-                let reason = match last_comma {
-                    Some(offset) => &args[offset + 1..],
-                    None => args,
+                parts.push(&args[start..]);
+                let reason = match position {
+                    None => parts.last().copied().unwrap_or(args),
+                    Some(index) => {
+                        let Some(reason) = parts.get(index).copied() else {
+                            rest = &rest[end + 1..];
+                            continue;
+                        };
+                        reason
+                    }
                 };
                 if is_reserved_numeric(reason) {
                     let call: String = args.chars().filter(|c| !c.is_whitespace()).collect();
@@ -2555,6 +2610,49 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
         (
             "8U-wrapped",
             owner_c.replacen("P11_OWNER_START_REASON_EXEC_EXIT", "8U", 1),
+        ),
+    ] {
+        assert!(
+            mutant.contains("P11_OWNER_START_REASON_COLLISION")
+                && mutant.contains("P11_OWNER_START_REASON_EXEC_EXIT"),
+            "{label} keeps named emitters: token presence stays green"
+        );
+        assert!(
+            !reserved_numeric_sites(&mutant).is_empty(),
+            "{label} numeric reason argument rejected"
+        );
+    }
+    // Round-4 counterexamples: the forwarding settlement call's
+    // second argument and parenthesized numerics at a real
+    // removal call. Both keep the named emitters intact.
+    let settle_call = "p11_journal_settle_prepare(key, reason, &journal)";
+    assert_eq!(
+        owner_c.matches(settle_call).count(),
+        1,
+        "settlement forwarding call anchor"
+    );
+    let return_site = "return start_remove_reason(key, required, P11_OWNER_START_REASON_RETURN);";
+    assert_eq!(
+        owner_c.matches(return_site).count(),
+        1,
+        "return removal call anchor"
+    );
+    for (label, mutant) in [
+        (
+            "settle-7U",
+            owner_c.replacen(
+                settle_call,
+                "p11_journal_settle_prepare(key, 7U, &journal)",
+                1,
+            ),
+        ),
+        (
+            "grouped-7U",
+            owner_c.replacen("P11_OWNER_START_REASON_RETURN", "(7U)", 1),
+        ),
+        (
+            "grouped-8U",
+            owner_c.replacen("P11_OWNER_START_REASON_RETURN", "(8U)", 1),
         ),
     ] {
         assert!(

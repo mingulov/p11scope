@@ -621,7 +621,7 @@ pub fn adapter_kem_entry(
     };
     // An invalid result-cell span retains the pointer: return marks
     // INVALID_SPAN (never reads). Overlap guards need a valid cell.
-    let word_len = u64::from(layout.word_bytes());
+    let word_len = layout.word_bytes() as u64;
     if target_word_end(cell, layout).is_none() {
         side.result_ptrs = [cell, 0];
         return true;
@@ -634,7 +634,7 @@ pub fn adapter_kem_entry(
     };
     let template_len = attribute_table_span(template_count, layout).unwrap_or(0);
     if template_count != 0 {
-        if template_len == 0 || validate_target_span(template_ptr, template_len).is_none() {
+        if template_len == 0 || validate_target_span(template_ptr, template_len, layout).is_none() {
             side.result_ptrs = [0, 0];
             return true;
         }
@@ -1460,7 +1460,10 @@ pub fn production_capture_get_return(
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     #[test]
     fn refused_base_requires_retirement_and_fault_before_output() {
@@ -1508,17 +1511,46 @@ mod tests {
             }
         }
 
-        fn fetch(&mut self, index: u8) -> Option<u64> {
-            self.fetches.push(index);
-            self.args
-                .iter()
-                .find(|(slot, _)| *slot == index)
-                .and_then(|(_, value)| *value)
-        }
-
-        fn read(&mut self, address: u64) -> Result<u64, ()> {
-            self.reads.push(address);
-            self.cell
+        /// Run the entry adapter with fetch/read closures over
+        /// disjoint spy fields, so the two `FnMut` borrows coexist.
+        #[allow(clippy::too_many_arguments)]
+        fn run(
+            &mut self,
+            side: Option<&mut ObjectStart>,
+            descriptor: u32,
+            row: Option<&ObjectDescriptorWire>,
+            layout: LinuxLayout,
+            stack_pointer: u64,
+            kem_wired: bool,
+            output_non_null: bool,
+            null_cancel: bool,
+        ) -> bool {
+            let args = &self.args;
+            let cell = self.cell;
+            let fetches = &mut self.fetches;
+            let reads = &mut self.reads;
+            let mut fetch = |index: u8| {
+                fetches.push(index);
+                args.iter()
+                    .find(|(slot, _)| *slot == index)
+                    .and_then(|(_, value)| *value)
+            };
+            let read = |address: u64| {
+                reads.push(address);
+                cell
+            };
+            adapter_kem_entry(
+                side,
+                descriptor,
+                row,
+                layout,
+                stack_pointer,
+                kem_wired,
+                output_non_null,
+                null_cancel,
+                &mut fetch,
+                read,
+            )
         }
     }
 
@@ -1567,8 +1599,7 @@ mod tests {
                 );
                 let mut side = ObjectStart::default();
                 let row = kem_row(encapsulate);
-                let mut fetch = |index: u8| spy.fetch(index);
-                assert!(adapter_kem_entry(
+                assert!(spy.run(
                     Some(&mut side),
                     kem_descriptor(encapsulate),
                     Some(&row),
@@ -1577,8 +1608,6 @@ mod tests {
                     true,
                     true,
                     false,
-                    &mut fetch,
-                    |address| spy.read(address),
                 ));
                 assert_eq!(side.inputs, [0x1111, 0]);
                 assert_eq!(side.input_statuses, [hst::VALUE, hst::ABSENT]);
@@ -1621,8 +1650,7 @@ mod tests {
                 );
                 let mut side = ObjectStart::default();
                 let row = kem_row(encapsulate);
-                let mut fetch = |index: u8| spy.fetch(index);
-                assert!(adapter_kem_entry(
+                assert!(spy.run(
                     Some(&mut side),
                     kem_descriptor(encapsulate),
                     Some(&row),
@@ -1631,8 +1659,6 @@ mod tests {
                     false,
                     true,
                     false,
-                    &mut fetch,
-                    |address| spy.read(address),
                 ));
                 assert!(spy.fetches.is_empty());
                 assert!(spy.reads.is_empty());
@@ -1667,8 +1693,7 @@ mod tests {
             );
             let mut side = ObjectStart::default();
             let row = kem_row(true);
-            let mut fetch = |index: u8| spy.fetch(index);
-            assert!(adapter_kem_entry(
+            assert!(spy.run(
                 Some(&mut side),
                 kem_descriptor(true),
                 Some(&row),
@@ -1677,8 +1702,6 @@ mod tests {
                 true,
                 false,
                 false,
-                &mut fetch,
-                |address| spy.read(address),
             ));
             assert_eq!(side.inputs, [0x1111, 0]);
             assert_eq!(side.input_statuses, [hst::VALUE, hst::ABSENT]);
@@ -1701,8 +1724,7 @@ mod tests {
             );
             let mut side = ObjectStart::default();
             let row = kem_row(false);
-            let mut fetch = |index: u8| spy.fetch(index);
-            assert!(adapter_kem_entry(
+            assert!(spy.run(
                 Some(&mut side),
                 kem_descriptor(false),
                 Some(&row),
@@ -1711,8 +1733,6 @@ mod tests {
                 true,
                 false,
                 false,
-                &mut fetch,
-                |address| spy.read(address),
             ));
             assert_eq!(side.result_ptrs, [0x7000, 0]);
             assert_eq!(spy.fetches, vec![2, 3, 4]);
@@ -1833,9 +1853,8 @@ mod tests {
             );
             let mut side = ObjectStart::default();
             let row = kem_row(true);
-            let mut fetch = |index: u8| spy.fetch(index);
             assert!(
-                adapter_kem_entry(
+                spy.run(
                     Some(&mut side),
                     kem_descriptor(true),
                     Some(&row),
@@ -1844,8 +1863,6 @@ mod tests {
                     true,
                     true,
                     false,
-                    &mut fetch,
-                    |address| spy.read(address),
                 ),
                 "variant {variant}"
             );
@@ -1884,8 +1901,7 @@ mod tests {
         );
         let mut side = ObjectStart::default();
         let row = kem_row(true);
-        let mut fetch = |index: u8| spy.fetch(index);
-        assert!(adapter_kem_entry(
+        assert!(spy.run(
             Some(&mut side),
             kem_descriptor(true),
             Some(&row),
@@ -1894,8 +1910,6 @@ mod tests {
             true,
             true,
             false,
-            &mut fetch,
-            |address| spy.read(address),
         ));
         assert_eq!(side.result_ptrs, [u64::MAX, 0]);
         assert_eq!(spy.reads, vec![0x1010]);
@@ -1915,8 +1929,7 @@ mod tests {
         );
         let mut side = ObjectStart::default();
         let row = kem_row(true);
-        let mut fetch = |index: u8| spy.fetch(index);
-        assert!(!adapter_kem_entry(
+        assert!(!spy.run(
             Some(&mut side),
             kem_descriptor(true),
             Some(&row),
@@ -1925,8 +1938,6 @@ mod tests {
             true,
             true,
             false,
-            &mut fetch,
-            |address| spy.read(address),
         ));
         assert!(spy.reads.is_empty());
     }
@@ -1975,8 +1986,7 @@ mod tests {
             );
             let mut side = ObjectStart::default();
             let row = kem_row(true);
-            let mut fetch = |index: u8| spy.fetch(index);
-            assert!(adapter_kem_entry(
+            assert!(spy.run(
                 Some(&mut side),
                 kem_descriptor(true),
                 Some(&row),
@@ -1985,8 +1995,6 @@ mod tests {
                 true,
                 true,
                 false,
-                &mut fetch,
-                |address| spy.read(address),
             ));
             assert_eq!(side.inputs, [word, 0]);
             assert_eq!(side.input_statuses, [status, hst::ABSENT]);
@@ -2007,8 +2015,7 @@ mod tests {
         );
         let mut side = ObjectStart::default();
         let row = kem_row(false);
-        let mut fetch = |index: u8| spy.fetch(index);
-        assert!(adapter_kem_entry(
+        assert!(spy.run(
             Some(&mut side),
             kem_descriptor(false),
             Some(&row),
@@ -2017,8 +2024,6 @@ mod tests {
             true,
             true,
             true,
-            &mut fetch,
-            |address| spy.read(address),
         ));
         assert_eq!(side.inputs, [0, 0]);
         assert_eq!(side.input_statuses, [hst::SUPPRESSED, hst::ABSENT]);
@@ -2045,8 +2050,7 @@ mod tests {
         );
         let mut side = ObjectStart::default();
         side.inputs = [0xAAAA, 0xBBBB];
-        let mut fetch = |index: u8| spy.fetch(index);
-        assert!(adapter_kem_entry(
+        assert!(spy.run(
             Some(&mut side),
             21,
             Some(&create),
@@ -2055,8 +2059,6 @@ mod tests {
             true,
             true,
             false,
-            &mut fetch,
-            |address| spy.read(address),
         ));
         assert!(spy.fetches.is_empty());
         assert!(spy.reads.is_empty());
@@ -2082,8 +2084,7 @@ mod tests {
             let mut side = ObjectStart::default();
             let side_ref = (!side_none).then_some(&mut side);
             let row_ref = (!row_none).then_some(&row);
-            let mut fetch = |index: u8| spy.fetch(index);
-            assert!(!adapter_kem_entry(
+            assert!(!spy.run(
                 side_ref,
                 descriptor,
                 row_ref,
@@ -2092,8 +2093,6 @@ mod tests {
                 true,
                 true,
                 false,
-                &mut fetch,
-                |address| spy.read(address),
             ));
             assert!(spy.fetches.is_empty());
             assert!(spy.reads.is_empty());
@@ -2114,8 +2113,7 @@ mod tests {
             Ok(0x7000),
         );
         let mut side = ObjectStart::default();
-        let mut fetch = |index: u8| spy.fetch(index);
-        assert!(!adapter_kem_entry(
+        assert!(!spy.run(
             Some(&mut side),
             93,
             Some(&bad),
@@ -2124,8 +2122,6 @@ mod tests {
             true,
             true,
             false,
-            &mut fetch,
-            |address| spy.read(address),
         ));
         assert!(spy.fetches.is_empty());
         assert!(spy.reads.is_empty());

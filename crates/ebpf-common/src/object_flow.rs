@@ -21,16 +21,17 @@
 use crate::event_type;
 use crate::instance;
 use crate::object_capture::{
-    authorize_derive_return, classify_derive_mechanism, find_flag, handle_status, object_flag,
-    return_accepts_get_results, spans_overlap, validate_target_span, DeriveEntry, GetEntryVerdict,
-    ReturnAuthority,
+    attribute_table_span, authorize_derive_return, classify_derive_mechanism, find_flag,
+    handle_status, object_flag, return_accepts_get_results, spans_overlap, validate_target_span,
+    DeriveEntry, GetEntryVerdict, ReturnAuthority,
 };
 use crate::object_policy::ScalarDeriveMechanism;
 use crate::object_wire::{
-    ObjectAttributeListWire, ObjectCallWire, ObjectDescriptorWire, ObjectStart,
-    OBJECT_ACTION_DERIVE, OBJECT_ACTION_FIND, OBJECT_ACTION_GET, OBJECT_ACTION_MAX,
-    OBJECT_ACTION_NONE, OBJECT_ATTR_LIST_UNINSPECTED, OBJECT_DERIVE_UNAVAILABLE, OBJECT_FLAGS_MASK,
-    OBJECT_GUARD_NONE, OBJECT_GUARD_SCALAR_DERIVE,
+    object_result_arg7_address, ObjectAttributeListWire, ObjectCallWire, ObjectDescriptorWire,
+    ObjectStart, OBJECT_ACTION_DECAPSULATE, OBJECT_ACTION_DERIVE, OBJECT_ACTION_ENCAPSULATE,
+    OBJECT_ACTION_FIND, OBJECT_ACTION_GET, OBJECT_ACTION_MAX, OBJECT_ACTION_NONE,
+    OBJECT_ATTR_LIST_UNINSPECTED, OBJECT_DERIVE_UNAVAILABLE, OBJECT_FLAGS_MASK, OBJECT_GUARD_NONE,
+    OBJECT_GUARD_SCALAR_DERIVE,
 };
 use crate::{
     target_word_end, CallStart, Event, ImageIdentity, InstanceContinuity, LinuxLayout, ARG_NONE,
@@ -502,6 +503,165 @@ pub(crate) fn capture_request_pairs(
         );
     }
     side.flags |= accumulated as u16;
+}
+
+/// Build flavor for T0 KEM capture: false only in the
+/// `stub-object-attributes` (P0) BPF build. The KEM entry wrapper
+/// passes this constant; the shared adapter takes it as a runtime
+/// parameter so both branches run in the host suite.
+pub const KEM_CAPTURE_WIRED: bool = !cfg!(feature = "stub-object-attributes");
+
+/// Production KEM entry adapter body (T0): acquire the key input
+/// (arg 2) and retain the scalar result pointer (arg 7) for exactly
+/// the two KEM actions. Any other action returns true untouched.
+/// False only on custody/row failure or a wrapping arg-7 stack
+/// address (loud abandon, mirroring pair/unwrap); every other
+/// refusal retains zero, which the return core maps to unreadable
+/// with zero reads.
+///
+/// `kem_wired` is the build FULL gate (P0 refuses before any
+/// fetch); `output_non_null` is the owned call's validated S1
+/// entry output-pointer verdict (encapsulation query shapes retain
+/// no result); `null_cancel` mirrors the entry core's suppression.
+/// `fetch_arg` supplies entry argument scalars (registers/stack);
+/// `read_word` reads exactly one target word: the arg-7 stack slot.
+/// Template headers/values, ciphertext and length values are never
+/// read; args 3/4/6 scalars only bound span guards. Performs no
+/// read for slot 1 (always absent).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn adapter_kem_entry(
+    side: Option<&mut ObjectStart>,
+    descriptor: u32,
+    row: Option<&ObjectDescriptorWire>,
+    layout: LinuxLayout,
+    stack_pointer: u64,
+    kem_wired: bool,
+    output_non_null: bool,
+    null_cancel: bool,
+    fetch_arg: &mut impl FnMut(u8) -> Option<u64>,
+    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+) -> bool {
+    let Some(side) = side else {
+        return false;
+    };
+    let Some(row) = row else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    let encapsulate = row.action == OBJECT_ACTION_ENCAPSULATE;
+    if !encapsulate && row.action != OBJECT_ACTION_DECAPSULATE {
+        return true;
+    }
+    // The ordinals below duplicate the KEM rows; refuse loudly if
+    // the frozen row disagrees rather than reading the wrong args.
+    if row.input_args != [2, ARG_NONE]
+        || row.result_args != [7, ARG_NONE]
+        || row.template_args != [ARG_NONE, ARG_NONE, ARG_NONE, ARG_NONE]
+        || row.find_capacity_arg != ARG_NONE
+        || row.find_count_arg != ARG_NONE
+    {
+        return false;
+    }
+    // FULL-only reads: P0 refuses before either the input or the
+    // result-pointer acquisition, fetching nothing.
+    if !kem_wired {
+        side.inputs = [0, 0];
+        side.input_statuses = [handle_status::PROTOCOL_UNAVAILABLE, handle_status::ABSENT];
+        side.result_ptrs = [0, 0];
+        return true;
+    }
+    // Slot-0 input rules mirror the entry core exactly.
+    let mut flags = 0u32;
+    let (status, word) = match fetch_arg(2) {
+        None => {
+            flags |= object_flag::ARG_READ_FAILURE;
+            (handle_status::UNREADABLE, 0)
+        }
+        Some(0) => (handle_status::INVALID_ZERO, 0),
+        Some(candidate) => {
+            if layout == LinuxLayout::Ilp32 && candidate > u64::from(u32::MAX) {
+                (handle_status::INVALID_SPAN, 0)
+            } else {
+                (handle_status::VALUE, candidate)
+            }
+        }
+    };
+    let (status, word) = if null_cancel && status == handle_status::VALUE {
+        flags |= object_flag::NULL_MECHANISM_CANCEL;
+        (handle_status::SUPPRESSED, 0)
+    } else {
+        (status, word)
+    };
+    side.inputs = [word, 0];
+    side.input_statuses = [status, handle_status::ABSENT];
+    side.flags = flags as u16;
+    // Encapsulation query shapes retain no result pointer: only a
+    // positively non-null entry ciphertext pointer authorizes the
+    // output. The input scalar above stays acquired.
+    if encapsulate && !output_non_null {
+        side.result_ptrs = [0, 0];
+        return true;
+    }
+    // The arg-7 stack address must compute before any target read;
+    // a wrapping address abandons loudly like pair/unwrap.
+    let Some(arg7) = object_result_arg7_address(row, stack_pointer, layout) else {
+        return false;
+    };
+    let Ok(cell) = read_word(arg7) else {
+        side.result_ptrs = [0, 0];
+        return true;
+    };
+    // An invalid result-cell span retains the pointer: return marks
+    // INVALID_SPAN (never reads). Overlap guards need a valid cell.
+    let word_len = u64::from(layout.word_bytes());
+    if target_word_end(cell, layout).is_none() {
+        side.result_ptrs = [cell, 0];
+        return true;
+    }
+    // Template-header guard from pointer/count scalars alone: no
+    // template memory is read. Unavailable bounds withhold output.
+    let (Some(template_ptr), Some(template_count)) = (fetch_arg(3), fetch_arg(4)) else {
+        side.result_ptrs = [0, 0];
+        return true;
+    };
+    let template_len = attribute_table_span(template_count, layout).unwrap_or(0);
+    if template_count != 0 {
+        if template_len == 0 || validate_target_span(template_ptr, template_len).is_none() {
+            side.result_ptrs = [0, 0];
+            return true;
+        }
+        if spans_overlap(cell, word_len, template_ptr, template_len) {
+            side.result_ptrs = [0, 0];
+            return true;
+        }
+    }
+    // Encapsulation length-cell guard: the arg-6 address bounds one
+    // word; its value is never read. A null cell has no span.
+    // Decapsulation arg 6 is a scalar length, never consulted.
+    if encapsulate {
+        let Some(length_cell) = fetch_arg(6) else {
+            side.result_ptrs = [0, 0];
+            return true;
+        };
+        if length_cell != 0 {
+            if target_word_end(length_cell, layout).is_none()
+                || spans_overlap(cell, word_len, length_cell, word_len)
+            {
+                side.result_ptrs = [0, 0];
+                return true;
+            }
+        }
+    }
+    side.result_ptrs = [cell, 0];
+    true
 }
 
 // Per-slot return gates for the unrolled fill below. Always inlined

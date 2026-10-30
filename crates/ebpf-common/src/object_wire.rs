@@ -33,7 +33,11 @@ pub const OBJECT_ACTION_IMPORT: u8 = 9;
 pub const OBJECT_ACTION_FIND: u8 = 10;
 pub const OBJECT_ACTION_GET: u8 = 11;
 pub const OBJECT_ACTION_SET: u8 = 12;
-pub const OBJECT_ACTION_MAX: u8 = OBJECT_ACTION_SET;
+/// `C_EncapsulateKey` (append-only; existing 0..=12 values never move).
+pub const OBJECT_ACTION_ENCAPSULATE: u8 = 13;
+/// `C_DecapsulateKey` (append-only; existing 0..=12 values never move).
+pub const OBJECT_ACTION_DECAPSULATE: u8 = 14;
+pub const OBJECT_ACTION_MAX: u8 = OBJECT_ACTION_DECAPSULATE;
 
 /// Frozen result-protocol guard codes.
 pub const OBJECT_GUARD_NONE: u8 = 0;
@@ -294,6 +298,8 @@ pub fn canonical_object_wire(function: u32) -> ObjectDescriptorWire {
         ObjectAction::GeneratePair => OBJECT_ACTION_PAIR,
         ObjectAction::Derive => OBJECT_ACTION_DERIVE,
         ObjectAction::Unwrap => OBJECT_ACTION_UNWRAP,
+        ObjectAction::Encapsulate => OBJECT_ACTION_ENCAPSULATE,
+        ObjectAction::Decapsulate => OBJECT_ACTION_DECAPSULATE,
         ObjectAction::Destroy => OBJECT_ACTION_DESTROY,
         ObjectAction::Access => OBJECT_ACTION_ACCESS,
         ObjectAction::OperationImport => OBJECT_ACTION_IMPORT,
@@ -647,19 +653,22 @@ pub fn validate_start_marker(
     }
 }
 
-/// Address of the named object-result argument 7 for pair-private and
-/// unwrap descriptors only: LP64 SP+16, ia32 SP+32, with the complete word
-/// span checked. Any other descriptor, a wrapping address or an address
-/// outside the target word range refuses. Arguments 8/9 have no reader:
-/// this helper takes no index, and the ordinary reader still refuses them.
+/// Address of the named object-result argument 7 for pair-private,
+/// unwrap and T0 KEM descriptors only: LP64 SP+16, ia32 SP+32, with the
+/// complete word span checked. Any other descriptor, a wrapping address or
+/// an address outside the target word range refuses. Arguments 8/9 have no
+/// reader: this helper takes no index, and the ordinary reader still
+/// refuses them.
 pub fn object_result_arg7_address(
     descriptor: &ObjectDescriptorWire,
     stack_pointer: u64,
     layout: LinuxLayout,
 ) -> Option<u64> {
-    let pair_or_unwrap =
-        descriptor.action == OBJECT_ACTION_PAIR || descriptor.action == OBJECT_ACTION_UNWRAP;
-    if !pair_or_unwrap || !descriptor.result_args.contains(&7) {
+    let named_seven = descriptor.action == OBJECT_ACTION_PAIR
+        || descriptor.action == OBJECT_ACTION_UNWRAP
+        || descriptor.action == OBJECT_ACTION_ENCAPSULATE
+        || descriptor.action == OBJECT_ACTION_DECAPSULATE;
+    if !named_seven || !descriptor.result_args.contains(&7) {
         return None;
     }
     match layout {

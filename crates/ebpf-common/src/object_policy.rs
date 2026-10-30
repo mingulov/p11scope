@@ -94,6 +94,12 @@ pub enum ObjectAction {
     Find,
     GetAttributes,
     SetAttributes,
+    /// `C_EncapsulateKey` (T0): one key input, one named scalar
+    /// result, no template reads.
+    Encapsulate,
+    /// `C_DecapsulateKey` (T0): one key input, one named scalar
+    /// result, no template reads.
+    Decapsulate,
 }
 
 /// Additional entry evidence needed before result-pointer/template access.
@@ -177,6 +183,18 @@ pub fn object_descriptor(function: u32) -> Option<ObjectCaptureDescriptor> {
             result_pointer_args: [7, ARG_NONE],
             template_args: [(5, 6), (ARG_NONE, ARG_NONE)],
             ..ObjectCaptureDescriptor::new(ObjectAction::Unwrap)
+        },
+        // T0 KEM: key input at arg 2, scalar result at arg 7, no
+        // template pairs (never authorized, never read).
+        "C_EncapsulateKey" => ObjectCaptureDescriptor {
+            input_args: [2, ARG_NONE],
+            result_pointer_args: [7, ARG_NONE],
+            ..ObjectCaptureDescriptor::new(ObjectAction::Encapsulate)
+        },
+        "C_DecapsulateKey" => ObjectCaptureDescriptor {
+            input_args: [2, ARG_NONE],
+            result_pointer_args: [7, ARG_NONE],
+            ..ObjectCaptureDescriptor::new(ObjectAction::Decapsulate)
         },
         "C_DestroyObject" => ObjectCaptureDescriptor {
             input_args: [1, ARG_NONE],

@@ -692,7 +692,7 @@ def decode_event(raw):
 OBJECT_TEMPLATE_INDICES = frozenset({21, 22, 59, 60, 63, 62, 25})
 OBJECT_GET_INDEX = 25
 OBJECT_FIND_ACTION = 10
-OBJECT_ACTION_MAX = 12
+OBJECT_ACTION_MAX = 14
 
 
 def decode_object_tail(tail):

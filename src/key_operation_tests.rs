@@ -8407,15 +8407,11 @@ fn key_operation_schema_contract() {
             UNKNOWN_REASONS.contains(&unbound_reason_for(category)),
             "{category}"
         );
-        let applicable = ![
-            "generate_key",
-            "generate_key_pair",
-            "digest",
-            "direct",
-            "encapsulate",
-            "decapsulate",
-        ]
-        .contains(&category);
+        // Packet 6.07c: KEM binds its qualified receipts
+        // (receipt-less terminals still partition
+        // role_unavailable via unbound_reason_for).
+        let applicable =
+            !["generate_key", "generate_key_pair", "digest", "direct"].contains(&category);
         assert_eq!(binds_keys(category), applicable, "{category}");
         let message = matches!(
             category,
@@ -9221,9 +9217,7 @@ fn direct_receipts(sink: &[OperationEffect]) -> Vec<crate::semantics_edge::KeyRe
         .collect()
 }
 
-fn referenced_effects(
-    success: &SealSuccess,
-) -> Vec<crate::semantics_objects::ObjectEffect> {
+fn referenced_effects(success: &SealSuccess) -> Vec<crate::semantics_objects::ObjectEffect> {
     success
         .effects
         .effects
@@ -9291,12 +9285,7 @@ fn key_operation_kem_encapsulate_binds_input_role() {
         &mut joint,
         &mut keyuse,
         &mut sink,
-        &ShapedS1::shaped(
-            "C_EncapsulateKey",
-            CkRv::OK.0,
-            0x17,
-            kem_encap_capture(),
-        ),
+        &ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture()),
     );
     let referenced = referenced_effects(&success);
     assert_eq!(referenced.len(), 1, "one qualified input reference");
@@ -9334,20 +9323,24 @@ fn key_operation_kem_encapsulate_binds_input_role() {
         .collect();
     assert_eq!(unknown, vec![("encapsulate", "metadata_unknown", 1)]);
     assert!(
-        !committed.unknown_key_operations.iter().any(|row| row.category == "decapsulate")
+        !committed
+            .unknown_key_operations
+            .iter()
+            .any(|row| row.category == "decapsulate")
             && !committed
                 .key_operations
                 .iter()
                 .any(|row| row.category == "decapsulate"),
         "decapsulate ledger untouched"
     );
-    // The key use counted on the input object row exactly once.
+    // The key use counted on the input object row exactly once
+    // (the GET reference plus the KEM reference).
     let input_row = committed
         .objects
         .iter()
         .find(|row| row.successful_key_references == 1)
         .expect("one key use on the input");
-    assert_eq!(input_row.successful_references, 1);
+    assert_eq!(input_row.successful_references, 2);
 }
 
 /// Item 1 twins: receipt-less and unproved encapsulation stays
@@ -9427,7 +9420,10 @@ fn key_operation_kem_encapsulate_unproved_twins() {
             "status {status}"
         );
         assert!(
-            committed.gaps.iter().any(|row| row.reason == "unproven_input"),
+            committed
+                .gaps
+                .iter()
+                .any(|row| row.reason == "unproven_input"),
             "status {status}: the failed join names its gap"
         );
         assert!(
@@ -9511,36 +9507,52 @@ fn key_operation_kem_conflict_and_attribution_twins() {
         &mut tiny_sink,
         &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
-    let real_id = tiny.model.project().objects[0].id;
-    let encap_fn = crate::kinds::function_id("C_EncapsulateKey").unwrap();
-    let receipt = crate::semantics_edge::KeyReceipt {
-        key: real_id,
-        function: encap_fn,
-        input: 0,
-        role: KeyRole::EncapsulationKey,
-        position: 700,
-        metadata: crate::semantics_objects::KeyMetadataFlags {
-            requested: 0x1F,
-            established: 0x1F,
-            conflicted: 0,
-        },
-        label: Some(crate::semantics_objects::KeyLabel::Aes { value_len: 32 }),
-        attribution_valid: false,
-        lost: false,
-    };
-    let call = op("C_EncapsulateKey", 7, 800_000);
-    let origin = EffectOrigin::from(&call);
-    let effect = OperationEffect::DirectCompleted {
-        id: crate::semantics_edge::OperationId(1),
-        category: "encapsulate",
-        mechanism: Some(0x17),
-        key_receipts: vec![receipt],
-        origin,
-    };
+    let (_, _, tiny_success) = drive_kem_quantum(
+        &mut tiny,
+        &mut tiny_staging,
+        &mut tiny_edge,
+        &mut tiny_keyuse,
+        &mut tiny_sink,
+        &ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture()),
+    );
+    assert_eq!(referenced_effects(&tiny_success).len(), 1);
+    // Rebuild the real direct effect with invalidated attribution
+    // (strip_receipts idiom: OperationId has no test constructor).
+    let rebuilt: Vec<OperationEffect> = tiny_sink
+        .iter()
+        .filter(|effect| matches!(effect, OperationEffect::DirectCompleted { .. }))
+        .filter(|effect| direct(effect).1 == "encapsulate")
+        .map(|effect| match effect {
+            OperationEffect::DirectCompleted {
+                id,
+                category,
+                mechanism,
+                key_receipts,
+                origin,
+            } => {
+                let mut receipts = key_receipts.clone();
+                assert_eq!(receipts.len(), 1);
+                receipts[0].attribution_valid = false;
+                OperationEffect::DirectCompleted {
+                    id: *id,
+                    category,
+                    mechanism: *mechanism,
+                    key_receipts: receipts,
+                    origin: origin.clone(),
+                }
+            }
+            other => panic!("expected DirectCompleted, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(rebuilt.len(), 1);
+    let mut fresh_keyuse = KeyUseReducer::new();
     let mut assoc_ledger = StagingLedger::new();
     let instance =
         crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
-    tiny_keyuse.observe_effect(instance, &effect, Some(&mut assoc_ledger), None);
+    for effect in &rebuilt {
+        fresh_keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+    }
+    let tiny_keyuse = fresh_keyuse;
     let committed = commit(2, &[&tiny_staging], &tiny.model.project(), &tiny_keyuse);
     assert!(
         committed.key_operations.is_empty(),
@@ -9587,12 +9599,7 @@ fn key_operation_kem_decapsulate_binds_input_role() {
         &mut joint,
         &mut keyuse,
         &mut sink,
-        &ShapedS1::shaped(
-            "C_DecapsulateKey",
-            CkRv::OK.0,
-            0x17,
-            kem_decap_capture(),
-        ),
+        &ShapedS1::shaped("C_DecapsulateKey", CkRv::OK.0, 0x17, kem_decap_capture()),
     );
     let referenced = referenced_effects(&success);
     assert_eq!(referenced.len(), 1, "one qualified input reference");
@@ -9621,7 +9628,10 @@ fn key_operation_kem_decapsulate_binds_input_role() {
         .collect();
     assert_eq!(unknown, vec![("decapsulate", "metadata_unknown", 1)]);
     assert!(
-        !committed.unknown_key_operations.iter().any(|row| row.category == "encapsulate")
+        !committed
+            .unknown_key_operations
+            .iter()
+            .any(|row| row.category == "encapsulate")
             && !committed
                 .key_operations
                 .iter()
@@ -9896,12 +9906,7 @@ fn key_operation_kem_decapsulate_mints_output_object() {
         &mut joint,
         &mut keyuse,
         &mut sink,
-        &ShapedS1::shaped(
-            "C_DecapsulateKey",
-            CkRv::OK.0,
-            0x17,
-            kem_decap_capture(),
-        ),
+        &ShapedS1::shaped("C_DecapsulateKey", CkRv::OK.0, 0x17, kem_decap_capture()),
     );
     let created: Vec<_> = success
         .effects
@@ -9942,12 +9947,7 @@ fn key_operation_kem_decapsulate_mints_output_object() {
     let before = scene.model.project().objects.len();
     let collision = ShapedS1 {
         kem_result: Some((CREATED_KEY, 1)),
-        ..ShapedS1::shaped(
-            "C_DecapsulateKey",
-            CkRv::OK.0,
-            0x17,
-            kem_decap_capture(),
-        )
+        ..ShapedS1::shaped("C_DecapsulateKey", CkRv::OK.0, 0x17, kem_decap_capture())
     };
     let (_, _, success) = drive_kem_quantum(
         &mut scene,
@@ -10089,7 +10089,10 @@ fn key_operation_kem_metadata_unknown_terminal() {
         // equation holds on the typed row.
         let row = &committed.unknown_key_operations[0];
         assert_eq!(row.unit, "operations");
-        assert_eq!((row.failed, row.cancelled, row.unknown, row.active), (0, 0, 0, 0));
+        assert_eq!(
+            (row.failed, row.cancelled, row.unknown, row.active),
+            (0, 0, 0, 0)
+        );
     }
 }
 
@@ -10152,7 +10155,10 @@ fn key_operation_kem_buffer_too_small_invents_nothing() {
         assert_eq!((joint.started(), joint.completed()), (started, completed));
         let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
         assert!(
-            !committed.key_operations.iter().any(|row| row.category == category)
+            !committed
+                .key_operations
+                .iter()
+                .any(|row| row.category == category)
                 && !committed
                     .unknown_key_operations
                     .iter()
@@ -10279,10 +10285,11 @@ fn key_operation_kem_pending_and_ambiguous_gaps() {
             &pending,
         );
         assert!(
-            success.effects.effects.iter().any(|effect| matches!(
-                effect,
-                ObjectEffect::DeferredMinted { .. }
-            )),
+            success
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::DeferredMinted { .. })),
             "{name}: pending uncertainty preserved"
         );
         assert!(
@@ -10290,26 +10297,31 @@ fn key_operation_kem_pending_and_ambiguous_gaps() {
             "{name}: PENDING freezes no use"
         );
         assert!(
-            success.effects.effects.iter().all(|effect| !matches!(
-                effect,
-                ObjectEffect::Created { .. }
-            )),
+            success
+                .effects
+                .effects
+                .iter()
+                .all(|effect| !matches!(effect, ObjectEffect::Created { .. })),
             "{name}: PENDING creates nothing"
         );
         assert!(direct_receipts(&sink).is_empty());
         let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
         assert!(
-            committed.gaps.iter().any(|row| row.reason == "pending_result_unavailable"),
+            committed
+                .gaps
+                .iter()
+                .any(|row| row.reason == "pending_result_unavailable"),
             "{name}: the pending gap lands"
         );
         // Each named ambiguous RV: nothing but its gap.
+        // (CRYPTOKI_NOT_INITIALIZED is not ambiguous: unseen
+        // finalize contradicts, asserted separately below.)
         for rv in [
             CkRv::GENERAL_ERROR.0,
             CkRv::DEVICE_ERROR.0,
             CkRv::DEVICE_MEMORY.0,
             CkRv::DEVICE_REMOVED.0,
             CkRv::TOKEN_NOT_PRESENT.0,
-            CkRv::CRYPTOKI_NOT_INITIALIZED.0,
         ] {
             let mut scene = JointScene::new();
             let bootstrap = scene.bootstrap();
@@ -10344,15 +10356,61 @@ fn key_operation_kem_pending_and_ambiguous_gaps() {
             assert!(direct_receipts(&sink).is_empty());
             let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
             assert!(
-                committed.gaps.iter().any(|row| row.reason == "ambiguous_outcome"),
+                committed
+                    .gaps
+                    .iter()
+                    .any(|row| row.reason == "ambiguous_outcome"),
                 "{name} {rv:#x}: the ambiguity gap lands"
             );
             assert!(
-                !committed.objects.iter().any(|row| row.creation.is_some()
-                    && row.creation != Some("create")),
+                !committed
+                    .objects
+                    .iter()
+                    .any(|row| row.creation.is_some() && row.creation != Some("create")),
                 "{name} {rv:#x}: no creation published"
             );
         }
+        // CRYPTOKI_NOT_INITIALIZED contradicts with unseen
+        // finalize (generic finalize semantics, not ambiguity).
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        let uninit = ShapedS1 {
+            kem_result: Some((0, 7)),
+            ..ShapedS1::shaped(name, CkRv::CRYPTOKI_NOT_INITIALIZED.0, 0x17, capture)
+        };
+        let (_, _, success) = drive_kem_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &uninit,
+        );
+        assert!(
+            referenced_effects(&success).is_empty(),
+            "{name}: no input use"
+        );
+        assert!(direct_receipts(&sink).is_empty());
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert!(
+            committed
+                .gaps
+                .iter()
+                .any(|row| row.reason == "unseen_finalize"),
+            "{name}: the finalize contradiction lands"
+        );
     }
 }
 
@@ -10397,11 +10455,19 @@ fn key_operation_kem_session_invalid_contradicts_session() {
                 referenced_effects(&success).is_empty(),
                 "{name} {rv:#x}: no input use"
             );
-            let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
             assert!(
-                committed.gaps.iter().any(|row| row.reason == "session_contradiction"),
-                "{name} {rv:#x}: the contradiction gap lands"
+                success.effects.effects.iter().any(|effect| matches!(
+                    effect,
+                    crate::semantics_objects::ObjectEffect::SessionEnded {
+                        end: crate::semantics_objects::SessionEnd::Uncertain(
+                            crate::semantics_objects::ObjectGap::SessionContradiction
+                        ),
+                        ..
+                    }
+                )),
+                "{name} {rv:#x}: the contradiction ends the session"
             );
+            let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
             assert_eq!(
                 committed.sessions.len(),
                 1,
@@ -10464,10 +10530,10 @@ fn key_operation_kem_no_deferred_positive() {
             .redeem_deferred(ticket)
             .expect("live record redeems once");
         assert!(
-            !redeemed.effects.iter().any(|effect| matches!(
-                effect,
-                ObjectEffect::Referenced { .. }
-            )),
+            !redeemed
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::Referenced { .. })),
             "{name}: completion redeems no reference"
         );
         assert_eq!(scene.model.project().usage.deferred_origins, 0);
@@ -10507,6 +10573,7 @@ fn key_operation_kem_query_corner_refuses_use_and_output() {
             &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
         );
         let before = scene.model.project().objects.len();
+        let s1_before = (joint.started(), joint.completed());
         let query = ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, capture);
         let (_, _, success) = drive_kem_quantum(
             &mut scene,
@@ -10528,7 +10595,10 @@ fn key_operation_kem_query_corner_refuses_use_and_output() {
         assert!(direct_receipts(&sink).is_empty());
         let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
         assert!(
-            committed.gaps.iter().any(|row| row.reason == "result_protocol_unavailable"),
+            committed
+                .gaps
+                .iter()
+                .any(|row| row.reason == "result_protocol_unavailable"),
             "capture {capture:#x}: the refused protocol names its gap"
         );
         // The completed S1 terminal still partitions role_unavailable:
@@ -10545,7 +10615,11 @@ fn key_operation_kem_query_corner_refuses_use_and_output() {
         );
         // S1 still completes the observed successful call: S1
         // accounting is unchanged by the object refusal.
-        assert_eq!((joint.started(), joint.completed()), (2, 2));
+        assert_eq!(
+            (joint.started(), joint.completed()),
+            (s1_before.0 + 1, s1_before.1 + 1),
+            "capture {capture:#x}: S1 completes the refused query"
+        );
     }
     // Healthy twin: the non-null owned call uses and creates.
     let mut scene = JointScene::new();
@@ -10562,6 +10636,7 @@ fn key_operation_kem_query_corner_refuses_use_and_output() {
         &mut sink,
         &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
+    let s1_before = (joint.started(), joint.completed());
     let (_, _, success) = drive_kem_quantum(
         &mut scene,
         &mut staging,
@@ -10572,7 +10647,11 @@ fn key_operation_kem_query_corner_refuses_use_and_output() {
     );
     assert_eq!(referenced_effects(&success).len(), 1);
     assert_eq!(scene.model.project().objects.len(), 2);
-    assert_eq!((joint.started(), joint.completed()), (2, 2));
+    assert_eq!(
+        (joint.started(), joint.completed()),
+        (s1_before.0 + 1, s1_before.1 + 1),
+        "S1 completes the healthy call"
+    );
 }
 
 /// Item 11 (model leg): hostile input scalars never establish use.
@@ -10646,7 +10725,6 @@ fn key_operation_kem_hostile_input_establishes_no_use() {
     }
     // A nonzero word with a non-VALUE status refuses BEGIN decode:
     // hostile scalars never reach the join.
-    use crate::semantics_objects::journal::decode_journal_record;
     let descriptors = publish_object_descriptors();
     let probe = JointScene::new();
     for (index, name) in ["C_EncapsulateKey", "C_DecapsulateKey"]
@@ -10660,7 +10738,7 @@ fn key_operation_kem_hostile_input_establishes_no_use() {
             };
             let begin = begin_for_call(&probe, &call, index as u64 * 10 + status as u64);
             assert!(
-                decode_journal_record(&begin, &descriptors).is_err(),
+                decode_journal_record(&begin, &descriptors).is_none(),
                 "{name} status {status}: nonzero hostile word refuses"
             );
         }
@@ -10672,12 +10750,12 @@ fn key_operation_kem_hostile_input_establishes_no_use() {
 /// output while the proved input use stands.
 #[test]
 fn key_operation_kem_hostile_result_mints_nothing() {
-    // (word, status, gap): unreadable and zero cells report
-    // output_unreadable; protocol-unavailable stays uncaptured.
+    // (word, status, gap): every non-handle cell shape reports
+    // output_unreadable while the proved input use stands.
     for (word, status, gap) in [
         (0u64, 2u8, "output_unreadable"),
         (0u64, 3u8, "output_unreadable"),
-        (0u64, 7u8, "unexpected_output"),
+        (0u64, 7u8, "output_unreadable"),
     ] {
         for (name, capture) in [
             ("C_EncapsulateKey", kem_encap_capture()),
@@ -10734,7 +10812,6 @@ fn key_operation_kem_hostile_result_mints_nothing() {
 /// list refuses decode; absent pairs stay all-zero on the wire.
 #[test]
 fn key_operation_kem_t0_rejects_templated_begin() {
-    use crate::semantics_objects::journal::{decode_journal_record, ValidatedJournalBegin};
     let descriptors = publish_object_descriptors();
     verify_object_descriptors(&descriptors);
     let scene = JointScene::new();
@@ -10745,16 +10822,20 @@ fn key_operation_kem_t0_rejects_templated_begin() {
         let call = ShapedS1::shaped(name, CkRv::OK.0, 0x17, kem_encap_capture());
         let begin = begin_for_call(&scene, &call, index as u64 + 1);
         // Healthy KEM BEGIN decodes with absent template pairs.
-        let record = decode_journal_record(&begin, &descriptors).expect("healthy KEM BEGIN");
-        let validated = ValidatedJournalBegin::validate(record).expect("validates");
-        assert_eq!(validated.requested(), [[0u8; 36]; 2]);
+        let p11scope_ebpf_common::object_journal::JournalRecord::Begin(validated) =
+            decode_journal_record(&begin, &descriptors).expect("healthy KEM BEGIN")
+        else {
+            panic!("{name} BEGIN input");
+        };
+        assert_eq!(validated.requested_pair(0), [0u8; 36]);
+        assert_eq!(validated.requested_pair(1), [0u8; 36]);
         // Any nonzero requested byte refuses: no KEM template read
         // exists to authorize it.
         for offset in [128usize, 160, 164, 196] {
             let mut bad = begin;
             bad[offset] = 1;
             assert!(
-                decode_journal_record(&bad, &descriptors).is_err(),
+                decode_journal_record(&bad, &descriptors).is_none(),
                 "{name} offset {offset}: templated BEGIN refuses"
             );
         }
@@ -10817,17 +10898,18 @@ fn key_operation_kem_single_result_is_never_a_pair() {
 }
 
 /// Item 17: retirement. A KEM input retired between the call's
-/// begin snapshot and its completion never joins: the stale
-/// original is not replaced by the current equal handle, no
-/// reference binds, and the successful S1 operation stays in the
-/// role_unavailable unknown summary.
+/// begin snapshot and its completion never joins: the overlapping
+/// same-session destroy is interference, so the stale original
+/// binds no reference, gains no replacement view, and mints no
+/// output (the completion's output handle tombstones).
 #[test]
 fn key_operation_kem_stale_input_is_never_replaced() {
+    use crate::semantics_objects::journal::StagingLedger;
     use crate::semantics_objects::{
-        CallKey, CompletedFact, HandleInput, MechanismEvidence, ObjectDomain, ObjectEffect,
-        ObjectHandle, ObjectSemantics, OriginFact, RefCut, ResultSlot, SessionHandle, SlotScope,
+        CallKey, CompleteInputPrefix, CompletedFact, HandleInput, MechanismEvidence, ObjectDomain,
+        ObjectEffect, ObjectHandle, ObjectSemantics, OriginFact, RefCut, ResultSlot, SessionHandle,
+        SlotScope,
     };
-    use crate::semantics_objects::journal::{CompleteInputPrefix, StagingLedger};
     let domain = ObjectDomain::reference(1, 1, 1, 1, 1);
     let mut model = ObjectSemantics::new();
     model.register_domain(domain).expect("domain registers");
@@ -10875,9 +10957,18 @@ fn key_operation_kem_stale_input_is_never_replaced() {
         &mut ledger,
     );
     model.settle(
-        CompleteInputPrefix::reference(domain, RefCut::reference(2), &[], Some(RefCut::reference(0))),
+        CompleteInputPrefix::reference(
+            domain,
+            RefCut::reference(2),
+            &[],
+            Some(RefCut::reference(0)),
+        ),
         &mut ledger,
     );
+    // Capture the input's opaque id before retirement: views carry
+    // no handle.
+    let created: Vec<_> = model.project().objects.iter().map(|view| view.id).collect();
+    assert_eq!(created.len(), 1);
     // KEM begins (snapshot binds the live input), then the input is
     // destroyed, then the KEM call completes: the completion replays
     // after the retirement.
@@ -10914,42 +11005,56 @@ fn key_operation_kem_stale_input_is_never_replaced() {
         &mut ledger,
     );
     let effects = model.settle(
-        CompleteInputPrefix::reference(domain, RefCut::reference(6), &[], Some(RefCut::reference(0))),
+        CompleteInputPrefix::reference(
+            domain,
+            RefCut::reference(6),
+            &[],
+            Some(RefCut::reference(0)),
+        ),
         &mut ledger,
     );
     assert!(
-        !effects.effects.iter().any(|effect| matches!(
-            effect,
-            ObjectEffect::Referenced { .. }
-        )),
+        !effects
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ObjectEffect::Referenced { .. })),
         "the stale input binds no reference"
     );
+    // The retired input's access stays ended; the interfered
+    // output never mints. Exactly one view (no rebound view for
+    // the stale handle, no output view), the input one retired
+    // with no reference bound.
+    let views = model.project().objects;
+    assert_eq!(views.len(), 1);
+    let stale = views
+        .iter()
+        .find(|view| view.id == created[0])
+        .expect("the input view survives");
+    assert!(
+        !matches!(stale.lifetime, crate::semantics_objects::Lifetime::Live),
+        "the input view stays retired"
+    );
+    assert_eq!(stale.references, 0, "the stale input binds no reference");
+    assert_eq!(stale.key_uses, 0, "the stale input counts no key use");
     assert!(
         !effects.effects.iter().any(|effect| matches!(
             effect,
-            ObjectEffect::Rebound { .. }
+            ObjectEffect::Created { .. } | ObjectEffect::FirstObserved { .. }
         )),
-        "the stale original is not replaced"
-    );
-    // The retired input's access stays ended; the independently
-    // observed output still mints.
-    let views = model.project().objects;
-    assert_eq!(views.len(), 2);
-    assert!(
-        views.iter().any(|view| view.handle == input
-            && !matches!(
-                view.lifetime,
-                crate::semantics_objects::Lifetime::Live
-            )),
-        "the input view stays retired"
+        "the interfered completion mints nothing"
     );
 }
 
-/// Item 17 (Joint leg): a KEM call against an already-retired
-/// input completes its S1 operation into the role_unavailable
-/// summary; no receipt binds.
+/// Item 17 (Joint leg): an OK-returning KEM call against an
+/// already-retired input first-observes (generic rebound
+/// semantics, shared with derive/unwrap): the retired object
+/// itself gains no reference and stays destroyed, while the
+/// fresh first-observed input binds a receipt with unknown
+/// metadata. (Truly unprovable inputs stay receipt-less per the
+/// unproved twins; INVALID_HANDLE ends access per bad_handle.)
 #[test]
 fn key_operation_kem_retired_input_stays_unavailable() {
+    use crate::semantics_objects::ObjectEffect;
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -10972,6 +11077,7 @@ fn key_operation_kem_retired_input_stays_unavailable() {
         &mut sink,
         &ShapedS1::shaped("C_DestroyObject", CkRv::OK.0, 0, 0),
     );
+    let retired_id = scene.model.project().objects[0].id;
     let (_, _, success) = drive_kem_quantum(
         &mut scene,
         &mut staging,
@@ -10980,15 +11086,47 @@ fn key_operation_kem_retired_input_stays_unavailable() {
         &mut sink,
         &ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture()),
     );
-    assert!(referenced_effects(&success).is_empty());
-    assert!(direct_receipts(&sink).is_empty());
+    // The join targets a fresh first-observed view, never the
+    // retired object.
+    assert!(
+        success
+            .effects
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ObjectEffect::FirstObserved { .. })),
+        "the rebound handle first-observes"
+    );
+    let referenced = referenced_effects(&success);
+    assert_eq!(referenced.len(), 1);
+    match &referenced[0] {
+        ObjectEffect::Referenced { object, .. } => {
+            assert_ne!(*object, retired_id, "the retired object gains no reference")
+        }
+        other => panic!("expected Referenced, got {other:?}"),
+    }
+    let views = scene.model.project().objects;
+    let retired = views
+        .iter()
+        .find(|view| view.id == retired_id)
+        .expect("the retired view survives");
+    assert!(
+        matches!(
+            retired.lifetime,
+            crate::semantics_objects::Lifetime::Destroyed
+        ),
+        "the retired view stays destroyed"
+    );
+    assert_eq!(retired.references, 0);
+    assert_eq!(retired.key_uses, 0);
+    let receipts = direct_receipts(&sink);
+    assert_eq!(receipts.len(), 1);
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
     let unknown: Vec<_> = committed
         .unknown_key_operations
         .iter()
         .map(|row| (row.category, row.reason, row.completed))
         .collect();
-    assert_eq!(unknown, vec![("encapsulate", "role_unavailable", 1)]);
+    assert_eq!(unknown, vec![("encapsulate", "metadata_unknown", 1)]);
 }
 
 /// Item 18: later qualification is forward-only. A KEM output's
@@ -11269,8 +11407,7 @@ fn key_operation_kem_wire_to_commit_link() {
     );
     assert_eq!(committed.objects.len(), 31, "create plus thirty outputs");
     assert!(
-        committed.objects.len()
-            <= crate::semantics_objects::ObjectLimits::policy().object_records,
+        committed.objects.len() <= crate::semantics_objects::ObjectLimits::policy().object_records,
         "bounded object rows"
     );
 }
@@ -11315,6 +11452,10 @@ fn key_operation_kem_abandoned_call_clears_without_proof() {
     );
     assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
     assert_eq!(
+        scene.ingest_ordinary(ordinary_for(&begin, CkRv::OK.0)),
+        JournalDisposition::ReturnObserved
+    );
+    assert_eq!(
         scene.ingest(&abandon_bytes(
             scene.thread,
             scene.sequence,
@@ -11348,7 +11489,7 @@ fn key_operation_kem_abandoned_call_clears_without_proof() {
             .any(|row| row.creation == Some("encapsulate")),
         "abandoned KEM mints nothing"
     );
-    assert_eq!(facts.function.as_ref(), "C_EncapsulateKey");
+    assert_eq!(facts.function, "C_EncapsulateKey");
 }
 
 /// Item 20 (H9 dispatch): the section version follows its content.
@@ -11523,7 +11664,7 @@ fn key_operation_kem_contracts_audit() {
     )
     .expect("v1 schema parses");
     assert_eq!(v1["properties"]["version"]["const"], 1);
-    let v1_roles = v1["properties"]["key_operations"]["items"]["properties"]["role"]["enum"]
+    let v1_roles = v1["$defs"]["role"]["enum"]
         .as_array()
         .expect("v1 role enum");
     assert_eq!(v1_roles.len(), 6);
@@ -11533,6 +11674,15 @@ fn key_operation_kem_contracts_audit() {
             .is_some_and(|label| label.contains("capsulat"))),
         "v1 roles exclude KEM"
     );
+    let v1_creations = v1["$defs"]["object_row"]["properties"]["creation"]["enum"]
+        .as_array()
+        .expect("v1 creation enum");
+    assert!(
+        !v1_creations.iter().any(|label| label
+            .as_str()
+            .is_some_and(|label| label.contains("capsulat"))),
+        "v1 creations exclude KEM"
+    );
     // v2 schema: version 2, v1 plus exactly the KEM labels.
     let v2: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string("docs/schema/inventory-v1-object-observations-v2.schema.json")
@@ -11540,7 +11690,7 @@ fn key_operation_kem_contracts_audit() {
     )
     .expect("v2 schema parses");
     assert_eq!(v2["properties"]["version"]["const"], 2);
-    let v2_roles = v2["properties"]["key_operations"]["items"]["properties"]["role"]["enum"]
+    let v2_roles = v2["$defs"]["role"]["enum"]
         .as_array()
         .expect("v2 role enum");
     assert_eq!(
@@ -11550,7 +11700,7 @@ fn key_operation_kem_contracts_audit() {
             .collect::<Vec<_>>(),
         ROLE_LABELS_V2,
     );
-    let v2_creations = v2["properties"]["objects"]["items"]["properties"]["creation"]["enum"]
+    let v2_creations = v2["$defs"]["object_row"]["properties"]["creation"]["enum"]
         .as_array()
         .expect("v2 creation enum");
     assert_eq!(v2_creations.len(), 9, "8 creations plus null");
@@ -11568,16 +11718,10 @@ fn key_operation_kem_contracts_audit() {
         .trim()
         .parse()
         .expect("native max parses");
-    assert_eq!(
-        native,
-        p11scope_ebpf_common::object_wire::OBJECT_ACTION_MAX
-    );
-    assert_eq!(
-        p11scope_ebpf_common::object_wire::OBJECT_ACTION_MAX,
-        14
-    );
-    let canary = std::fs::read_to_string("scripts/check-canary-evidence.py")
-        .expect("canary script reads");
+    assert_eq!(native, p11scope_ebpf_common::object_wire::OBJECT_ACTION_MAX);
+    assert_eq!(p11scope_ebpf_common::object_wire::OBJECT_ACTION_MAX, 14);
+    let canary =
+        std::fs::read_to_string("scripts/check-canary-evidence.py").expect("canary script reads");
     let binding = "OBJECT_ACTION_MAX = ";
     let line = canary
         .lines()

@@ -749,8 +749,7 @@ fn s2s3_kem_descriptors_are_named_scalar_result_without_templates() {
         assert_eq!(descriptor.find_capacity_arg, N, "{name}");
         assert_eq!(descriptor.find_count_ptr_arg, N, "{name}");
         assert_eq!(
-            descriptor.result_protocol_guard,
-            NamedFunction,
+            descriptor.result_protocol_guard, NamedFunction,
             "{name}: no new mechanism read"
         );
         // NamedFunction authorizes the nominal result slot for every

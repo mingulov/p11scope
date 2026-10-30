@@ -15,9 +15,9 @@ use crate::semantics_objects::{
     CompleteInputPrefix, CompletedFact, CreationFamily, FieldState, FieldValue, FindResult,
     HandleInput, KeyLabel, Lifetime, LostOutcome, MAX_ACCESS_RELATIONS, MechanismEvidence,
     ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId, ObjectLimits,
-    ObjectProjection, ObjectSemantics, ObjectView, OriginFact, OutputEvidence, QueryStatus,
-    RefCut, ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin,
-    SessionState, SlotScope, ViewOrigin,
+    ObjectProjection, ObjectSemantics, ObjectView, OriginFact, OutputEvidence, QueryStatus, RefCut,
+    ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin, SessionState,
+    SlotScope, ViewOrigin,
 };
 use p11scope_ebpf_common::LinuxLayout;
 use p11scope_ebpf_common::capture;

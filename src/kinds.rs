@@ -471,14 +471,8 @@ mod tests {
             assert_eq!(object_descriptor(name), None, "{name:?}");
         }
         for (name, action) in [
-            (
-                "C_EncapsulateKey",
-                policy::ObjectAction::Encapsulate,
-            ),
-            (
-                "C_DecapsulateKey",
-                policy::ObjectAction::Decapsulate,
-            ),
+            ("C_EncapsulateKey", policy::ObjectAction::Encapsulate),
+            ("C_DecapsulateKey", policy::ObjectAction::Decapsulate),
         ] {
             let descriptor = object_descriptor(name).unwrap_or_else(|| panic!("{name} modeled"));
             assert_eq!(descriptor.action, action, "{name}");

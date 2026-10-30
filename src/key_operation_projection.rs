@@ -703,11 +703,14 @@ pub(crate) fn budgets_json(budgets: &ObsBudgets) -> serde_json::Value {
 /// content: v2 iff a KEM creation or role label is present,
 /// otherwise byte-stable v1.
 pub(crate) fn object_observations_json(observations: &ObjectObservations) -> serde_json::Value {
-    let kem = observations.objects.iter().any(|row| {
-        matches!(row.creation, Some("encapsulate" | "decapsulate"))
-    }) || observations.key_operations.iter().any(|row| {
-        matches!(row.role, "encapsulation_key" | "decapsulation_key")
-    });
+    let kem = observations
+        .objects
+        .iter()
+        .any(|row| matches!(row.creation, Some("encapsulate" | "decapsulate")))
+        || observations
+            .key_operations
+            .iter()
+            .any(|row| matches!(row.role, "encapsulation_key" | "decapsulation_key"));
     let version = if kem {
         OBSERVATIONS_VERSION_V2
     } else {

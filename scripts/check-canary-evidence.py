@@ -132,12 +132,13 @@ ARG_READ_FAILURE = 1 << 4
 CALL_START_SIZE = 288
 # H7 finite object-required markers accepted at CallStart offset 264
 # (marker = eligible function ordinal + 2). Derived from the frozen
-# standard catalog order and the closed object-policy eligible set (25
-# functions); the Rust `object_producer_canary_matches_rust_marker_rule`
-# contract re-derives this set and fails on any drift.
+# standard catalog order and the closed object-policy eligible set (27
+# functions; packet 6.07c adds the KEM markers 94/95); the Rust
+# `object_producer_canary_matches_rust_marker_rule` contract
+# re-derives this set and fails on any drift.
 OBJECT_ELIGIBLE_MARKERS = frozenset({
     19, 22, 23, 24, 25, 26, 27, 29, 31, 35, 42, 44, 48, 50, 54,
-    60, 61, 62, 63, 64, 74, 79, 84, 89, 96,
+    60, 61, 62, 63, 64, 74, 79, 84, 89, 94, 95, 96,
 })
 # One EVENTS ring record: the 328-byte Event plus its private 40-byte
 # continuity tail (ebpf-common EventRecord, Task 3 Stage A). H7 slice D

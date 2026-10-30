@@ -9597,6 +9597,143 @@ fn key_operation_kem_conflict_and_attribution_twins() {
     assert_eq!(unknown, vec![("encapsulate", "metadata_unknown", 1)]);
 }
 
+/// Finding 6 (supported-label attribution twin): with a supported
+/// usable label established, the otherwise identical valid receipt
+/// proves its row — changing ONLY attribution_valid partitions
+/// unknown. Both KEM functions. (Genuine ML-KEM unknown-metadata
+/// controls stay separate in the item-1/2 role tests.)
+#[test]
+fn key_operation_kem_supported_label_attribution_twins() {
+    use crate::semantics_edge::KeyRole;
+    for (name, capture, category, role) in [
+        (
+            "C_EncapsulateKey",
+            kem_encap_capture(),
+            "encapsulate",
+            KeyRole::EncapsulationKey,
+        ),
+        (
+            "C_DecapsulateKey",
+            kem_decap_capture(),
+            "decapsulate",
+            KeyRole::DecapsulationKey,
+        ),
+    ] {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1 {
+                getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1Fu16), (4u8, 1u8, 32u16)],
+                ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+            },
+        );
+        let (_, _, success) = drive_kem_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped(name, CkRv::OK.0, 0x17, capture),
+        );
+        assert_eq!(referenced_effects(&success).len(), 1);
+        // The valid receipt carries the role and a supported label,
+        // and proves its row.
+        let kem_effects: Vec<&OperationEffect> = sink
+            .iter()
+            .filter(|effect| matches!(effect, OperationEffect::DirectCompleted { .. }))
+            .filter(|effect| direct(effect).1 == category)
+            .collect();
+        assert_eq!(kem_effects.len(), 1);
+        match kem_effects[0] {
+            OperationEffect::DirectCompleted { key_receipts, .. } => {
+                assert_eq!(key_receipts.len(), 1);
+                assert_eq!(key_receipts[0].role, role);
+                assert!(
+                    key_receipts[0].label.is_some(),
+                    "supported label established"
+                );
+                assert!(key_receipts[0].attribution_valid);
+            }
+            other => panic!("expected DirectCompleted, got {other:?}"),
+        }
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert_eq!(
+            committed.key_operations.len(),
+            1,
+            "the valid receipt proves"
+        );
+        assert_eq!(committed.key_operations[0].metadata_at_use, "aes_256");
+        // Rebuild the identical effect with ONLY attribution flipped:
+        // the same supported label now partitions unknown.
+        let rebuilt: Vec<OperationEffect> = sink
+            .iter()
+            .filter(|effect| matches!(effect, OperationEffect::DirectCompleted { .. }))
+            .filter(|effect| direct(effect).1 == category)
+            .map(|effect| match effect {
+                OperationEffect::DirectCompleted {
+                    id,
+                    category,
+                    mechanism,
+                    key_receipts,
+                    origin,
+                } => {
+                    let mut receipts = key_receipts.clone();
+                    assert_eq!(receipts.len(), 1);
+                    assert!(
+                        receipts[0].label.is_some(),
+                        "the flip changes only attribution, not the label"
+                    );
+                    receipts[0].attribution_valid = false;
+                    OperationEffect::DirectCompleted {
+                        id: *id,
+                        category,
+                        mechanism: *mechanism,
+                        key_receipts: receipts,
+                        origin: origin.clone(),
+                    }
+                }
+                other => panic!("expected DirectCompleted, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(rebuilt.len(), 1);
+        let mut fresh_keyuse = KeyUseReducer::new();
+        let mut assoc_ledger = StagingLedger::new();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+        for effect in &rebuilt {
+            fresh_keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+        }
+        let committed = commit(2, &[&staging], &scene.model.project(), &fresh_keyuse);
+        assert!(
+            committed.key_operations.is_empty(),
+            "invalid attribution proves no row"
+        );
+        let unknown: Vec<_> = committed
+            .unknown_key_operations
+            .iter()
+            .map(|row| (row.category, row.reason, row.completed))
+            .collect();
+        assert_eq!(unknown, vec![(category, "metadata_unknown", 1)]);
+    }
+}
+
 /// Item 2: decapsulation binds its input role (mirror of item 1);
 /// the encapsulate ledger stays empty.
 #[test]
@@ -11233,6 +11370,223 @@ fn key_operation_kem_later_use_qualifies_forward_only() {
     assert_eq!(row.completed, 1);
 }
 
+/// Item 18 (created-output twin): the actual minted output of each
+/// KEM family flows into the later use — never the original input.
+/// Its first use stays unknown; a generic-secret GET keeps it
+/// unknown under M2; independently established AES metadata qualifies
+/// only a subsequent use of that same output. Earlier same-category
+/// summaries and receipt snapshots never change (no backfill). Each
+/// establishment runs on its own output: sequential contradictory
+/// GETs would conflict on KeyType instead of qualifying.
+#[test]
+fn key_operation_kem_created_output_later_use_m2_twins() {
+    for (
+        produce_name,
+        produce_capture,
+        output_word,
+        consume_name,
+        consume_capture,
+        category,
+        role,
+    ) in [
+        (
+            "C_EncapsulateKey",
+            kem_encap_capture(),
+            0xE001u64,
+            "C_DecapsulateKey",
+            kem_decap_capture(),
+            "decapsulate",
+            "decapsulation_key",
+        ),
+        (
+            "C_DecapsulateKey",
+            kem_decap_capture(),
+            0xD001u64,
+            "C_EncapsulateKey",
+            kem_encap_capture(),
+            "encapsulate",
+            "encapsulation_key",
+        ),
+    ] {
+        for (cells, proves) in [
+            (
+                vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x10u16), (4u8, 1u8, 32u16)],
+                false,
+            ),
+            (
+                vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1Fu16), (4u8, 1u8, 32u16)],
+                true,
+            ),
+        ] {
+            let mut scene = JointScene::new();
+            let bootstrap = scene.bootstrap();
+            let mut staging = JointStaging::select_joint(Some(&bootstrap));
+            let mut joint = EdgeSemantics::default();
+            let mut keyuse = KeyUseReducer::new();
+            let mut sink = Vec::new();
+            drive_quantum(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &mut sink,
+                &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+            );
+            let input_id = commit(1, &[&staging], &scene.model.project(), &keyuse)
+                .objects
+                .iter()
+                .find(|row| row.creation == Some("create"))
+                .expect("the create quantum publishes its input")
+                .object;
+            // Produce: the family mints its actual output word.
+            let (_, _, produced) = drive_kem_quantum(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &mut sink,
+                &ShapedS1 {
+                    input0: Some((CREATED_KEY, 1)),
+                    input1: Some((0, 0)),
+                    kem_result: Some((output_word, 1)),
+                    ..ShapedS1::shaped(produce_name, CkRv::OK.0, 0x17, produce_capture)
+                },
+            );
+            let output_id = produced
+                .effects
+                .effects
+                .iter()
+                .find_map(|effect| match effect {
+                    crate::semantics_objects::ObjectEffect::Created { object, .. } => Some(*object),
+                    _ => None,
+                })
+                .expect("the production quantum mints its output")
+                .as_u64();
+            assert_ne!(output_id, input_id, "output and input are distinct views");
+            // First use of the output: unknown (no metadata yet). The
+            // use joins the OUTPUT identity, never the original input.
+            let (_, _, first) = drive_kem_quantum(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &mut sink,
+                &ShapedS1 {
+                    input0: Some((output_word, 1)),
+                    input1: Some((0, 0)),
+                    kem_result: Some((0xC001, 1)),
+                    ..ShapedS1::shaped(consume_name, CkRv::OK.0, 0x17, consume_capture)
+                },
+            );
+            let first_refs = referenced_effects(&first);
+            assert_eq!(first_refs.len(), 1, "the first use joins exactly once");
+            match &first_refs[0] {
+                crate::semantics_objects::ObjectEffect::Referenced { object, .. } => {
+                    assert_eq!(
+                        object.as_u64(),
+                        output_id,
+                        "the later use joins the minted output, not the input"
+                    );
+                }
+                other => panic!("expected a Referenced effect, got {other:?}"),
+            }
+            let snap1 = commit(1, &[&staging], &scene.model.project(), &keyuse);
+            let unknown1: Vec<_> = snap1
+                .unknown_key_operations
+                .iter()
+                .map(|row| (row.category, row.reason, row.completed))
+                .collect();
+            assert!(
+                unknown1.contains(&(category, "metadata_unknown", 1)),
+                "first use of the output stays unknown: {unknown1:?}"
+            );
+            assert!(snap1.key_operations.is_empty(), "nothing proves yet");
+            let receipts1 = direct_receipts(&sink);
+            // GET on the output, then a second use of that same
+            // output: generic-secret stays unknown under M2; AES
+            // qualifies only this subsequent use.
+            drive_quantum(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &mut sink,
+                &ShapedS1 {
+                    input0: Some((output_word, 1)),
+                    getattr_cells: cells,
+                    ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+                },
+            );
+            let (_, _, second) = drive_kem_quantum(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &mut sink,
+                &ShapedS1 {
+                    input0: Some((output_word, 1)),
+                    input1: Some((0, 0)),
+                    kem_result: Some((0xC002, 1)),
+                    ..ShapedS1::shaped(consume_name, CkRv::OK.0, 0x17, consume_capture)
+                },
+            );
+            let second_refs = referenced_effects(&second);
+            assert_eq!(second_refs.len(), 1);
+            match &second_refs[0] {
+                crate::semantics_objects::ObjectEffect::Referenced { object, .. } => {
+                    assert_eq!(
+                        object.as_u64(),
+                        output_id,
+                        "the second use joins the output"
+                    );
+                }
+                other => panic!("expected a Referenced effect, got {other:?}"),
+            }
+            let snap2 = commit(2, &[&staging], &scene.model.project(), &keyuse);
+            let unknown2: Vec<_> = snap2
+                .unknown_key_operations
+                .iter()
+                .map(|row| (row.category, row.reason, row.completed))
+                .collect();
+            if proves {
+                assert!(
+                    unknown2.contains(&(category, "metadata_unknown", 1)),
+                    "the earlier unknown summary stands untouched: {unknown2:?}"
+                );
+                assert_eq!(
+                    snap2.key_operations.len(),
+                    1,
+                    "exactly the qualified use proves"
+                );
+                let row = &snap2.key_operations[0];
+                assert_eq!(row.category, category);
+                assert_eq!(row.role, role);
+                assert_eq!(row.metadata_at_use, "aes_256");
+                assert_eq!(row.completed, 1);
+            } else {
+                assert!(
+                    unknown2.contains(&(category, "metadata_unknown", 2)),
+                    "generic-secret GET keeps the output unknown: {unknown2:?}"
+                );
+                assert!(
+                    snap2.key_operations.is_empty(),
+                    "generic-secret proves nothing"
+                );
+            }
+            let receipts2 = direct_receipts(&sink);
+            assert!(
+                receipts2.len() > receipts1.len(),
+                "later drives append receipts"
+            );
+            assert_eq!(
+                receipts2[..receipts1.len()],
+                receipts1,
+                "earlier receipt snapshots never change"
+            );
+        }
+    }
+}
+
 /// Item 19: the KEM link proof. Wire bytes drive the real
 /// BEGIN/END→seal→reducer→commit chain: references equal receipts
 /// (positive observation only), receipts bind to their own call,
@@ -11659,16 +12013,15 @@ fn key_operation_h9_v2_dispatches_on_kem_content() {
 #[test]
 fn key_operation_kem_jsonl_version_dispatch() {
     use crate::discovery::engine::inventory_coordinator::PassReport;
-    use crate::inventory_events::{pass_payload, KeyOperationEmitter};
+    use crate::inventory_events::{KeyOperationEmitter, pass_payload};
     use crate::key_operation_projection::{
-        object_observations_json, OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2,
+        OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2, object_observations_json,
     };
     fn row_versions(lines: &[serde_json::Value]) -> Vec<u64> {
         lines
             .iter()
             .filter(|line| {
-                line["kind"] == "object_observed"
-                    || line["kind"] == "key_operations_observed"
+                line["kind"] == "object_observed" || line["kind"] == "key_operations_observed"
             })
             .map(|line| line["event"]["version"].as_u64().unwrap_or(u64::MAX))
             .collect()
@@ -11812,13 +12165,15 @@ fn key_operation_kem_jsonl_version_dispatch() {
     );
     let r2 = commit(2, &[&staging], &scene.model.project(), &keyuse);
     assert!(
-        r2.objects.iter().any(|row| row.creation == Some("encapsulate")),
+        r2.objects
+            .iter()
+            .any(|row| row.creation == Some("encapsulate")),
         "the minted KEM creation"
     );
     assert!(
-        r2.key_operations.iter().all(|row| {
-            row.role != "encapsulation_key" && row.role != "decapsulation_key"
-        }),
+        r2.key_operations
+            .iter()
+            .all(|row| { row.role != "encapsulation_key" && row.role != "decapsulation_key" }),
         "creation-only: no KEM role row"
     );
     let section = object_observations_json(&r2);
@@ -11881,8 +12236,7 @@ fn key_operation_kem_jsonl_version_dispatch() {
     );
     let before = &row_keys(&v1lines) | &row_keys(&r2delta);
     let r3keys = row_keys(&r3delta);
-    let reemitted: std::collections::BTreeSet<_> =
-        before.intersection(&r3keys).cloned().collect();
+    let reemitted: std::collections::BTreeSet<_> = before.intersection(&r3keys).cloned().collect();
     let v1objects: std::collections::BTreeSet<_> = row_keys(&v1lines)
         .into_iter()
         .filter(|key| key.starts_with("o:"))
@@ -11906,7 +12260,10 @@ fn key_operation_kem_jsonl_version_dispatch() {
     let rebuilt = reconstruct(&r3lines);
     assert_reconstructed_eq_json(&rebuilt, &section, false);
     assert!(
-        rebuilt.known.keys().any(|key| key.contains("decapsulation_key")),
+        rebuilt
+            .known
+            .keys()
+            .any(|key| key.contains("decapsulation_key")),
         "the proved KEM role reconstructs"
     );
     // Dashboard tallies come from the same projection.
@@ -12044,8 +12401,9 @@ fn key_operation_kem_jsonl_version_dispatch() {
         "the KEM creation survives rotation"
     );
     assert!(
-        spun.iter().any(|line| line["kind"] == "key_operations_observed"
-            && line["event"]["row"]["role"] == "decapsulation_key"),
+        spun.iter()
+            .any(|line| line["kind"] == "key_operations_observed"
+                && line["event"]["row"]["role"] == "decapsulation_key"),
         "the KEM role survives rotation"
     );
     let section = object_observations_json(&r3);
@@ -12061,6 +12419,1167 @@ fn key_operation_kem_jsonl_unknown_version_refused() {
         "event": {"revision": 1, "version": 3, "row": {}},
     })];
     let _ = reconstruct(&lines);
+}
+
+/// Item 7 (adapter link): adapter-generated KEM verdicts reach the
+/// original wire and commit. The production entry/return adapters
+/// run under scripted registers; their exact input/result verdicts
+/// shape the admitted BEGIN/END; seal, reducer and commit publish
+/// those identities. Query/P0/non-OK legs prove no invented
+/// authority and unchanged S1 against literal controls.
+#[test]
+fn key_operation_kem_adapter_reads_reach_original_wire_and_commit() {
+    use p11scope_ebpf_common::LinuxLayout;
+    use p11scope_ebpf_common::object_flow::{adapter_fill_return, adapter_kem_entry};
+    use p11scope_ebpf_common::object_wire::{
+        ObjectDescriptorWire, ObjectStart, canonical_object_wire,
+    };
+    struct Spy {
+        table: [(u8, Option<u64>); 7],
+        cell: Result<u64, ()>,
+        fetches: Vec<u8>,
+        reads: Vec<u64>,
+    }
+    impl Spy {
+        fn entry(
+            &mut self,
+            side: Option<&mut ObjectStart>,
+            descriptor: u32,
+            row: Option<&ObjectDescriptorWire>,
+            layout: LinuxLayout,
+            sp: u64,
+            kem_wired: bool,
+            output_non_null: bool,
+        ) -> bool {
+            adapter_kem_entry(
+                side,
+                descriptor,
+                row,
+                layout,
+                sp,
+                kem_wired,
+                output_non_null,
+                false,
+                &mut |index| {
+                    self.fetches.push(index);
+                    if index == 7 {
+                        return None;
+                    }
+                    self.table
+                        .iter()
+                        .find_map(|slot| (slot.0 == index).then_some(slot.1).flatten())
+                },
+                |address| {
+                    self.reads.push(address);
+                    self.cell
+                },
+            )
+        }
+    }
+    fn native_entry_side(descriptor: u32, action: u8) -> ObjectStart {
+        ObjectStart {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 0xC0FF_EE00_C0FF_EE00,
+                exec_id: 0xE9EC_1D00_E9EC_1D00,
+            },
+            entry_ns: 0x1111_2222_3333_4444,
+            descriptor_index: descriptor,
+            action,
+            phase: 1,
+            ..ObjectStart::default()
+        }
+    }
+    // Run both production adapters; return the shaped verdicts
+    // ((input word, status) x2, (result word, status)) plus the
+    // acquisition logs and both adapter verdicts.
+    #[allow(clippy::too_many_arguments)]
+    fn adapters(
+        function: u32,
+        layout: LinuxLayout,
+        args: [(u8, Option<u64>); 7],
+        cell: Result<u64, ()>,
+        kem_wired: bool,
+        output_non_null: bool,
+        rv: u64,
+        joined: bool,
+        result_word: u64,
+    ) -> (
+        (u64, u8),
+        (u64, u8),
+        (u64, u8),
+        Vec<u8>,
+        Vec<u64>,
+        bool,
+        bool,
+    ) {
+        let row = canonical_object_wire(function);
+        let descriptor = function + 1;
+        let mut spy = Spy {
+            table: args,
+            cell,
+            fetches: Vec::new(),
+            reads: Vec::new(),
+        };
+        let mut side = native_entry_side(descriptor, row.action);
+        let entry_ok = spy.entry(
+            Some(&mut side),
+            descriptor,
+            Some(&row),
+            layout,
+            0x1000,
+            kem_wired,
+            output_non_null,
+        );
+        let inputs = (side.inputs, side.input_statuses, side.phase);
+        let mut ret_reads = Vec::new();
+        let return_ok = adapter_fill_return(
+            Some(&mut side),
+            descriptor,
+            Some(&row),
+            rv,
+            layout,
+            0,
+            0,
+            joined,
+            |address| {
+                ret_reads.push(address);
+                Ok(result_word)
+            },
+        );
+        (
+            (inputs.0[0], inputs.1[0]),
+            (inputs.0[1], inputs.1[1]),
+            (side.result_ptrs[0], side.result_statuses[0]),
+            spy.fetches,
+            [spy.reads, ret_reads].concat(),
+            entry_ok,
+            return_ok,
+        )
+    }
+    fn drive_shaped(
+        call: &ShapedS1,
+        create_result: Option<u64>,
+    ) -> (
+        JointScene,
+        JointStaging,
+        EdgeSemantics,
+        KeyUseReducer,
+        SealSuccess,
+    ) {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1 {
+                result: create_result,
+                ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+            },
+        );
+        let (_, _, success) = drive_kem_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            call,
+        );
+        (scene, staging, joint, keyuse, success)
+    }
+    // Healthy FULL legs, both functions and ABIs: the adapter
+    // words reach the commit as the referenced input and the
+    // minted output; the KEM creation publishes.
+    // S1 shape control: the create quantum alone is count-only,
+    // so each leg's (1, 1) is exactly the KEM direct completion.
+    {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        assert_eq!(
+            (joint.started(), joint.completed(), joint.failed()),
+            (0, 0, 0),
+            "create alone counts nothing"
+        );
+    }
+    for (leg, (encapsulate, layout)) in [
+        (true, LinuxLayout::Lp64),
+        (true, LinuxLayout::Ilp32),
+        (false, LinuxLayout::Lp64),
+        (false, LinuxLayout::Ilp32),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let function = if encapsulate { 92 } else { 93 };
+        let name = if encapsulate {
+            "C_EncapsulateKey"
+        } else {
+            "C_DecapsulateKey"
+        };
+        let capture = if encapsulate {
+            kem_encap_capture()
+        } else {
+            kem_decap_capture()
+        };
+        // Words must fit the leg's ABI: 64-bit constants are
+        // unrepresentable in Ilp32 registers (status 4), so Ilp32
+        // legs create and join a 32-bit input and mint 32-bit
+        // outputs. The join is by word in every leg.
+        let input_word = if matches!(layout, LinuxLayout::Ilp32) {
+            0x7172
+        } else {
+            CREATED_KEY
+        };
+        let create_result = Some(input_word);
+        let output = if matches!(layout, LinuxLayout::Ilp32) {
+            0x7740 + leg as u64
+        } else {
+            0x7710_0000_0000_0000u64 | (leg as u64 + 1)
+        };
+        let (input0, input1, result, fetches, reads, entry_ok, return_ok) = adapters(
+            function,
+            layout,
+            [
+                (2, Some(input_word)),
+                (3, Some(0x5000)),
+                (4, Some(2)),
+                (5, Some(0x8000)),
+                (6, if encapsulate { Some(0x6000) } else { Some(9) }),
+                (7, None),
+                (0, None),
+            ],
+            Ok(0x7000),
+            true,
+            true,
+            0,
+            true,
+            output,
+        );
+        assert!(entry_ok && return_ok, "leg {leg}");
+        assert_eq!(input0, (input_word, 1), "leg {leg}");
+        assert_eq!(input1, (0, 0), "leg {leg}");
+        assert_eq!(result, (output, 1), "leg {leg}");
+        assert_eq!(
+            fetches,
+            if encapsulate {
+                vec![2, 3, 4, 6, 5]
+            } else {
+                vec![2, 3, 4, 5]
+            },
+            "leg {leg}"
+        );
+        assert_eq!(reads.len(), 2, "leg {leg}: entry cell plus return read");
+        let call = ShapedS1 {
+            input0: Some(input0),
+            input1: Some(input1),
+            kem_result: Some(result),
+            ..ShapedS1::shaped(name, CkRv::OK.0, 0x17, capture)
+        };
+        let (scene, staging, joint, keyuse, success) = drive_shaped(&call, create_result);
+        let created: Vec<_> = success
+            .effects
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                crate::semantics_objects::ObjectEffect::Created { slot, object, .. } => {
+                    Some((*slot, *object))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(created.len(), 1, "leg {leg}: one output minted");
+        assert_eq!(created[0].0, 0, "leg {leg}: slot 0 only");
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        let creation = if encapsulate {
+            "encapsulate"
+        } else {
+            "decapsulate"
+        };
+        let created_row = committed
+            .objects
+            .iter()
+            .find(|row| row.creation == Some(creation))
+            .unwrap_or_else(|| panic!("leg {leg}: minted output publishes"));
+        assert_eq!(created_row.creation, Some(creation), "leg {leg}");
+        assert_eq!((joint.started(), joint.completed()), (1, 1), "leg {leg}");
+        // The literal control commits identically: the adapter
+        // verdicts encode exactly as hand-shaped bytes.
+        let (scene, staging, joint, keyuse, _) = drive_shaped(
+            &ShapedS1 {
+                input0: Some((input_word, 1)),
+                input1: Some((0, 0)),
+                kem_result: Some((output, 1)),
+                ..ShapedS1::shaped(name, CkRv::OK.0, 0x17, capture)
+            },
+            create_result,
+        );
+        let control = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert_eq!(
+            crate::key_operation_projection::object_observations_json(&committed),
+            crate::key_operation_projection::object_observations_json(&control),
+            "leg {leg}"
+        );
+        assert_eq!((joint.started(), joint.completed()), (1, 1), "leg {leg}");
+    }
+    // Encapsulation query shapes retain no result: no creation,
+    // unknown input, and the END slot is irrelevant (the adapter
+    // (0, UNREADABLE) commits exactly as the default END).
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let input_word = if matches!(layout, LinuxLayout::Ilp32) {
+            0x7172
+        } else {
+            CREATED_KEY
+        };
+        let create_result = Some(input_word);
+        let (input0, input1, result, _, reads, entry_ok, return_ok) = adapters(
+            92,
+            layout,
+            [
+                (2, Some(input_word)),
+                (3, Some(0x5000)),
+                (4, Some(2)),
+                (5, Some(0)),
+                (6, Some(0x6000)),
+                (7, None),
+                (0, None),
+            ],
+            Ok(0x7000),
+            true,
+            false,
+            0,
+            true,
+            0,
+        );
+        assert!(entry_ok && return_ok);
+        assert_eq!(input0, (input_word, 1));
+        assert_eq!(result, (0, 2));
+        assert!(reads.is_empty(), "query reads nothing");
+        let call = ShapedS1 {
+            input0: Some(input0),
+            input1: Some(input1),
+            kem_result: Some(result),
+            ..ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_query_capture())
+        };
+        let (scene, staging, joint, keyuse, success) = drive_shaped(&call, create_result);
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                crate::semantics_objects::ObjectEffect::Created { .. }
+            )),
+            "query mints nothing"
+        );
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert!(committed.key_operations.is_empty(), "query proves nothing");
+        assert_eq!((joint.started(), joint.completed()), (1, 1));
+        let (scene, staging, joint, keyuse, _) = drive_shaped(
+            &ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_query_capture()),
+            None,
+        );
+        let control = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert_eq!(
+            crate::key_operation_projection::object_observations_json(&committed),
+            crate::key_operation_projection::object_observations_json(&control),
+        );
+        assert_eq!((joint.started(), joint.completed()), (1, 1));
+    }
+    // P0 legs carry the refusal verdicts: unreadable input, no
+    // creation, zero adapter reads, S1 preserved.
+    for (function, name, capture) in [
+        (92, "C_EncapsulateKey", kem_encap_capture()),
+        (93, "C_DecapsulateKey", kem_decap_capture()),
+    ] {
+        let (input0, _, result, fetches, reads, entry_ok, return_ok) = adapters(
+            function,
+            LinuxLayout::Lp64,
+            [
+                (2, Some(CREATED_KEY)),
+                (3, Some(0x5000)),
+                (4, Some(2)),
+                (5, Some(0x8000)),
+                (6, Some(0x6000)),
+                (7, None),
+                (0, None),
+            ],
+            Ok(0x7000),
+            false,
+            true,
+            0,
+            true,
+            0,
+        );
+        assert!(entry_ok && return_ok);
+        assert_eq!(input0, (0, 7));
+        assert_eq!(result, (0, 2));
+        assert!(fetches.is_empty() && reads.is_empty());
+        let (scene, staging, joint, keyuse, success) = drive_shaped(
+            &ShapedS1 {
+                input0: Some(input0),
+                input1: Some((0, 0)),
+                kem_result: Some(result),
+                ..ShapedS1::shaped(name, CkRv::OK.0, 0x17, capture)
+            },
+            None,
+        );
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                crate::semantics_objects::ObjectEffect::Created { .. }
+            )),
+            "{name}: P0 mints nothing"
+        );
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert!(
+            committed.key_operations.is_empty(),
+            "{name}: P0 proves nothing"
+        );
+        assert_eq!((joint.started(), joint.completed()), (1, 1));
+    }
+    // A failing return withholds the word: no creation, no read,
+    // the failed completion accounts in S1.
+    let (_, _, result, _, reads, entry_ok, return_ok) = adapters(
+        92,
+        LinuxLayout::Lp64,
+        [
+            (2, Some(CREATED_KEY)),
+            (3, Some(0x5000)),
+            (4, Some(2)),
+            (5, Some(0x8000)),
+            (6, Some(0x6000)),
+            (7, None),
+            (0, None),
+        ],
+        Ok(0x7000),
+        true,
+        true,
+        CkRv::BUFFER_TOO_SMALL.0,
+        true,
+        0,
+    );
+    assert!(entry_ok && return_ok);
+    assert_eq!(result, (0, 7));
+    assert_eq!(
+        reads.len(),
+        1,
+        "entry cell only; failed return reads nothing"
+    );
+    let (scene, staging, joint, keyuse, success) = drive_shaped(
+        &ShapedS1 {
+            input0: Some((CREATED_KEY, 1)),
+            input1: Some((0, 0)),
+            kem_result: Some(result),
+            ..ShapedS1::shaped(
+                "C_EncapsulateKey",
+                CkRv::BUFFER_TOO_SMALL.0,
+                0x17,
+                kem_encap_capture(),
+            )
+        },
+        None,
+    );
+    assert!(
+        !success.effects.effects.iter().any(|effect| matches!(
+            effect,
+            crate::semantics_objects::ObjectEffect::Created { .. }
+        )),
+        "failed return mints nothing"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert!(committed.key_operations.is_empty());
+    assert_eq!((joint.started(), joint.completed()), (0, 0));
+    // Failed directs emit and count nothing: `failed` counts
+    // machine ends only. S1 is exactly the create-only baseline.
+    assert_eq!(joint.failed(), 0);
+    // Identity flow: two adapter-shaped mints with distinct words
+    // publish two live objects; both uses join the same input.
+    // Ignored words would rebind one handle instead.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut created_ids = Vec::new();
+    let mut referenced = Vec::new();
+    for word in [0x7721u64, 0x7722u64] {
+        let (_, _, result, _, _, entry_ok, return_ok) = adapters(
+            92,
+            LinuxLayout::Lp64,
+            [
+                (2, Some(CREATED_KEY)),
+                (3, Some(0x5000)),
+                (4, Some(2)),
+                (5, Some(0x8000)),
+                (6, Some(0x6000)),
+                (7, None),
+                (0, None),
+            ],
+            Ok(0x7000),
+            true,
+            true,
+            0,
+            true,
+            word,
+        );
+        assert!(entry_ok && return_ok);
+        assert_eq!(result, (word, 1));
+        let (_, _, success) = drive_kem_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1 {
+                input0: Some((CREATED_KEY, 1)),
+                input1: Some((0, 0)),
+                kem_result: Some(result),
+                ..ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture())
+            },
+        );
+        for effect in &success.effects.effects {
+            match effect {
+                crate::semantics_objects::ObjectEffect::Created { object, .. } => {
+                    created_ids.push(*object);
+                }
+                crate::semantics_objects::ObjectEffect::Referenced { object, input, .. } => {
+                    referenced.push((*object, *input));
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(created_ids.len(), 2, "two distinct outputs minted");
+    assert!(
+        created_ids[0] != created_ids[1],
+        "distinct words, distinct views"
+    );
+    assert_eq!(referenced.len(), 2, "both uses join");
+    assert!(referenced[0] == referenced[1], "same live input");
+    assert_eq!(referenced[0].1, Some(0), "input ordinal 0");
+    assert!(
+        !created_ids.contains(&referenced[0].0),
+        "input is not an output"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        committed
+            .objects
+            .iter()
+            .filter(|row| row.creation == Some("encapsulate"))
+            .count(),
+        2,
+        "both outputs publish"
+    );
+    // Unknown/count-only provider control: the same KEM call under an
+    // S1Only feed reduces S1-direct with no object authority — no
+    // objects, no key operations, exactly one unknown-key row.
+    let mut s1only = EdgeSemantics::default();
+    let mut s1only_sink = Vec::new();
+    let mut s1only_keyuse = KeyUseReducer::new();
+    let mut assoc_ledger = StagingLedger::new();
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    feed(
+        &mut s1only,
+        &mut s1only_sink,
+        &call("C_OpenSession", 9, CkRv::OK.0, 90),
+    );
+    feed(
+        &mut s1only,
+        &mut s1only_sink,
+        &call("C_EncapsulateKey", 9, CkRv::OK.0, 100),
+    );
+    for effect in &s1only_sink {
+        s1only_keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+    }
+    let empty = JointScene::new();
+    let s1only_staging = JointStaging::select_s1_only();
+    let twin = crate::key_operation_projection::producer::commit_with_journal_linked(
+        1,
+        &[&s1only_staging],
+        &empty.model.project(),
+        &s1only_keyuse,
+        true,
+    );
+    assert!(twin.objects.is_empty() && twin.key_operations.is_empty());
+    assert_eq!(twin.unknown_key_operations.len(), 1);
+    let row = &twin.unknown_key_operations[0];
+    assert_eq!(row.category, "encapsulate");
+    assert_eq!(
+        row.reason, "role_unavailable",
+        "no object proof, no KEM role"
+    );
+    assert_eq!((row.completed, row.active), (1, 0));
+}
+
+/// Item 12 (async negative): a PENDING KEM encap drives a real
+/// GetID -> Join -> Complete attempt through the live S1 async
+/// machinery — the completion replays the KEM origin — yet the
+/// object-side deferred ticket redeems to nothing: KEM freezes
+/// neither its input nor its output, the retry is idempotent, and
+/// the later OK quantum carries no pending residue. A pending sign
+/// twin proves the same machinery completes non-KEM calls
+/// identically; a pending wrap twin proves non-KEM flows freeze
+/// their settled input. Repeat and stale completions have no
+/// additional effect.
+#[test]
+fn key_operation_kem_pending_getid_join_complete_is_negative() {
+    // Object side: the live input, then a PENDING encap quantum
+    // through the production seal.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let input_id = commit(1, &[&staging], &scene.model.project(), &keyuse)
+        .objects
+        .iter()
+        .find(|row| row.creation == Some("create"))
+        .expect("the create quantum publishes its input")
+        .object;
+    let (_, _, pending_success) = drive_kem_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            input0: Some((CREATED_KEY, 1)),
+            input1: Some((0, 0)),
+            kem_result: Some((0, 7)),
+            ..ShapedS1::shaped(
+                "C_EncapsulateKey",
+                CkRv::PENDING.0,
+                0x17,
+                kem_encap_capture(),
+            )
+        },
+    );
+    let ticket = pending_success
+        .effects
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            crate::semantics_objects::ObjectEffect::DeferredMinted { call, .. } => Some(*call),
+            _ => None,
+        })
+        .expect("the PENDING seal mints a deferred ticket");
+    // S1 side: the same PENDING encap completes through live async.
+    let target = crate::kinds::function_id("C_EncapsulateKey").unwrap();
+    let mut edge = EdgeSemantics::default();
+    let mut async_sink = Vec::new();
+    feed(
+        &mut edge,
+        &mut async_sink,
+        &call("C_OpenSession", 7, CkRv::OK.0, 90),
+    );
+    feed(
+        &mut edge,
+        &mut async_sink,
+        &call("C_EncapsulateKey", 7, CkRv::PENDING.0, 100),
+    );
+    feed(
+        &mut edge,
+        &mut async_sink,
+        &async_control("C_AsyncGetID", 7, target, 42, 110),
+    );
+    feed(
+        &mut edge,
+        &mut async_sink,
+        &async_control("C_AsyncJoin", 7, target, 42, 120),
+    );
+    let effects = feed(
+        &mut edge,
+        &mut async_sink,
+        &async_control("C_AsyncComplete", 7, target, 0, 150),
+    );
+    assert_eq!(effects.len(), 1, "the KEM completion replays its origin");
+    match &effects[0] {
+        OperationEffect::DirectCompleted {
+            category, origin, ..
+        } => {
+            assert_eq!(*category, "encapsulate");
+            assert_eq!(
+                (origin.function.as_str(), origin.session, origin.ts_ns),
+                ("C_EncapsulateKey", 7, 100),
+                "the replay carries the original KEM call"
+            );
+        }
+        other => panic!("expected DirectCompleted, got {other:?}"),
+    }
+    assert_eq!(
+        (edge.started(), edge.completed()),
+        (1, 1),
+        "S1 async is live for KEM targets"
+    );
+    // Non-KEM twin on the same machinery: a pending sign init
+    // completes identically.
+    let sign_target = sign_init_target();
+    feed(
+        &mut edge,
+        &mut async_sink,
+        &call("C_OpenSession", 8, CkRv::OK.0, 160),
+    );
+    feed(&mut edge, &mut async_sink, &pending_init(8, 170));
+    feed(
+        &mut edge,
+        &mut async_sink,
+        &async_control("C_AsyncGetID", 8, sign_target, 43, 180),
+    );
+    let sign_effects = feed(
+        &mut edge,
+        &mut async_sink,
+        &async_control("C_AsyncComplete", 8, sign_target, 0, 190),
+    );
+    assert_eq!(sign_effects.len(), 1, "the sign twin replays too");
+    assert_eq!(edge.started(), 2);
+    assert_eq!(edge.completed(), 1, "the sign twin opens a machine");
+    // Object side: the live session holds the ticket, but KEM
+    // freezes nothing — the redemption resolves neither the input
+    // nor the output — and the retry is idempotent.
+    let redeemed = scene
+        .model
+        .redeem_deferred(ticket)
+        .expect("the live session holds the PENDING ticket");
+    assert!(
+        redeemed.effects.is_empty(),
+        "KEM freezes nothing: no input reference, no output"
+    );
+    assert!(
+        scene.model.redeem_deferred(ticket).is_none(),
+        "the retry redeems nothing: the record is consumed"
+    );
+    // Causal control: the same PENDING flow for a non-KEM direct
+    // op freezes its settled input — only KEM voids the freeze.
+    let mut wscene = JointScene::new();
+    let wbootstrap = wscene.bootstrap();
+    let mut wstaging = JointStaging::select_joint(Some(&wbootstrap));
+    let mut wjoint = EdgeSemantics::default();
+    let mut wkeyuse = KeyUseReducer::new();
+    let mut wsink = Vec::new();
+    drive_quantum(
+        &mut wscene,
+        &mut wstaging,
+        &mut wjoint,
+        &mut wkeyuse,
+        &mut wsink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let winput_id = commit(1, &[&wstaging], &wscene.model.project(), &wkeyuse)
+        .objects
+        .iter()
+        .find(|row| row.creation == Some("create"))
+        .expect("the wrap scene publishes its input")
+        .object;
+    drive_quantum(
+        &mut wscene,
+        &mut wstaging,
+        &mut wjoint,
+        &mut wkeyuse,
+        &mut wsink,
+        &ShapedS1 {
+            result: Some(0x7173),
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        },
+    );
+    let winput1_id = commit(1, &[&wstaging], &wscene.model.project(), &wkeyuse)
+        .objects
+        .iter()
+        .filter(|row| row.creation == Some("create"))
+        .map(|row| row.object)
+        .find(|id| *id != winput_id)
+        .expect("the wrap scene publishes its second input");
+    let (_, _, wpending) = drive_kem_quantum(
+        &mut wscene,
+        &mut wstaging,
+        &mut wjoint,
+        &mut wkeyuse,
+        &mut wsink,
+        &ShapedS1 {
+            input0: Some((CREATED_KEY, 1)),
+            input1: Some((0x7173, 1)),
+            ..ShapedS1::shaped("C_WrapKey", CkRv::PENDING.0, RSA_PKCS, init_capture())
+        },
+    );
+    let wticket = wpending
+        .effects
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            crate::semantics_objects::ObjectEffect::DeferredMinted { call, .. } => Some(*call),
+            _ => None,
+        })
+        .expect("the PENDING wrap seals a deferred ticket");
+    let wredeemed = wscene
+        .model
+        .redeem_deferred(wticket)
+        .expect("the live session holds the wrap ticket");
+    assert_eq!(
+        wredeemed.effects.len(),
+        2,
+        "the non-KEM freeze resolves both settled inputs"
+    );
+    for (effect, (ordinal, id)) in wredeemed
+        .effects
+        .iter()
+        .zip([(0u8, winput_id), (1u8, winput1_id)])
+    {
+        match effect {
+            crate::semantics_objects::ObjectEffect::Referenced { object, input, .. } => {
+                assert_eq!(input, &Some(ordinal));
+                assert_eq!(object.as_u64(), id);
+            }
+            other => panic!("expected the frozen input reference, got {other:?}"),
+        }
+    }
+    let pending_view = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert!(
+        pending_view
+            .objects
+            .iter()
+            .all(|row| row.creation != Some("encapsulate")),
+        "the PENDING quantum publishes no KEM output"
+    );
+    // The later OK quantum joins the live input (not a pending
+    // artifact) and publishes exactly one output.
+    let (_, _, ok_success) = drive_kem_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            input0: Some((CREATED_KEY, 1)),
+            input1: Some((0, 0)),
+            kem_result: Some((0x7000, 1)),
+            ..ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture())
+        },
+    );
+    let refs = referenced_effects(&ok_success);
+    assert_eq!(refs.len(), 1, "the OK use joins exactly once");
+    match &refs[0] {
+        crate::semantics_objects::ObjectEffect::Referenced { object, input, .. } => {
+            assert_eq!(input, &Some(0), "the OK use joins positionally");
+            assert_eq!(
+                object.as_u64(),
+                input_id,
+                "the OK use joins the live input, not a pending artifact"
+            );
+        }
+        other => panic!("expected a Referenced effect, got {other:?}"),
+    }
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        committed
+            .objects
+            .iter()
+            .filter(|row| row.creation == Some("encapsulate"))
+            .count(),
+        1,
+        "exactly the OK output publishes"
+    );
+    // Repeat/stale completion has no additional effect: no pending
+    // remains, so the replay neither emits nor counts, the consumed
+    // ticket still redeems nothing, and no new KEM row publishes.
+    let (started_before, completed_before) = (edge.started(), edge.completed());
+    let repeat = feed(
+        &mut edge,
+        &mut async_sink,
+        &async_control("C_AsyncComplete", 7, target, 0, 200),
+    );
+    assert!(repeat.is_empty(), "repeat completion emits nothing");
+    let decap_target = crate::kinds::function_id("C_DecapsulateKey").unwrap();
+    let stale = feed(
+        &mut edge,
+        &mut async_sink,
+        &async_control("C_AsyncComplete", 7, decap_target, 0, 210),
+    );
+    assert!(stale.is_empty(), "stale completion emits nothing");
+    assert_eq!(
+        (edge.started(), edge.completed()),
+        (started_before, completed_before),
+        "repeat/stale completions count nothing"
+    );
+    assert!(
+        scene.model.redeem_deferred(ticket).is_none(),
+        "the consumed ticket still redeems nothing"
+    );
+    let recommitted = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        recommitted
+            .objects
+            .iter()
+            .filter(|row| row.creation == Some("encapsulate"))
+            .count(),
+        1,
+        "no new KEM row from repeat/stale completion"
+    );
+}
+
+/// Item 14 (row + publication pressure): KEM operations account
+/// through the same owner census as every other operation — 1000
+/// H8Open plus 24 genuine KEM raw quants (collected through the
+/// owner's adapter, each joined by its staged payload) fill the 1024
+/// census; at capacity the sourced N15 mint joins through the owner
+/// while the sourceless mint refuses Full allocating nothing. No KEM
+/// bypass of pressure accounting exists. KEM-bearing revisions then
+/// run the publication gate: the byte limit admits, stales the
+/// retained KEM rows intact, or yields the pre-reserved negative.
+/// (The generic gate mechanics are the publication neighbor's; here
+/// only KEM rows ride the gate.)
+#[test]
+fn key_operation_kem_actual_row_and_publication_pressure() {
+    use crate::attach::SessionDrainProducers;
+    use crate::attach::capture::NativeDomainId;
+    use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
+    use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, SemanticResourcePool};
+    use crate::semantics_objects::journal::LedgerRefusal;
+    use crate::semantics_objects::journal::joint_driver::{JointCaptureOwner, RawJointQuantum};
+
+    let rows = publish_object_descriptors();
+    assert!(verify_object_descriptors(&rows));
+    let domain = NativeDomainId::mint();
+    let events = EventsDomain::test_standin(0xf202);
+    let producers = SessionDrainProducers::test_pair(domain, events.clone());
+    let pool = SemanticResourcePool::default();
+    let base = pool.snapshot().charged_bytes;
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    let fault = SteadyFaultCell(7);
+    owner
+        .ledger_mut()
+        .charge_h8open(0, 8)
+        .expect("H8Open charges");
+    let pool_after_first = pool.snapshot().charged_bytes;
+    let table_prepay = pool_after_first - base - (8 + OWNED_ALLOCATION_PADDING);
+    assert!(table_prepay > 0, "the first charge prepays the table");
+    for ordinal in 1..1000 {
+        owner
+            .ledger_mut()
+            .charge_h8open(ordinal, 8)
+            .expect("H8Open charges");
+    }
+    assert_eq!(owner.ledger().census(), 1000);
+    let mut staged_origins = Vec::new();
+    for sequence in 1..=24u64 {
+        let pool_before_quantum = pool.snapshot().charged_bytes;
+        let kem = ShapedS1 {
+            input0: Some((CREATED_KEY, 1)),
+            input1: Some((0, 0)),
+            kem_result: Some((0x7000 + sequence, 1)),
+            ..ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture())
+        };
+        let begin = begin_bytes_shaped(
+            1,
+            sequence,
+            function_id("C_EncapsulateKey"),
+            0,
+            (COOKIE, EXEC),
+            SESSION,
+            0x17,
+            kem_encap_capture(),
+            kem.input0,
+            kem.input1,
+            kem.flags,
+        );
+        let end = end_bytes_kem(&begin, OBJECT_ACTION_ENCAPSULATE, &kem);
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([begin.to_vec(), end.to_vec()], 2),
+            events.clone(),
+        );
+        let origin = {
+            let quantum = RawJointQuantum::collect_with_adapter(
+                &mut drain,
+                &rows,
+                2,
+                &fault,
+                &producers,
+                |bytes| pool.reserve(bytes),
+                owner.adapter_mut(),
+            )
+            .expect("a genuine KEM quantum collects through the owner's adapter");
+            let (h0, _) = quantum
+                .h0_input(producers.native_domain(), 2)
+                .expect("the completed quantum lends its H0 input");
+            h0.iter()
+                .find_map(|record| record.joint_resource)
+                .expect("the completed END projects a genuine adapter origin")
+        };
+        let staged = owner
+            .ledger_mut()
+            .charge_collected(producers.native_domain(), sequence, 300, Some(&origin))
+            .expect("the staged payload joins its raw KEM operation");
+        staged_origins.push((sequence, staged));
+        assert_eq!(
+            pool.snapshot().charged_bytes - pool_before_quantum,
+            OWNED_ALLOCATION_PADDING + (300 + OWNED_ALLOCATION_PADDING),
+            "quantum {sequence} retains exactly its raw plus staged leases"
+        );
+    }
+    assert_eq!(
+        owner.ledger().census(),
+        1024,
+        "1000 H8Open plus 24 joined KEM raw operations fill the census"
+    );
+    assert_eq!(owner.ledger().staged(), 24);
+    let (ticket, source) = &staged_origins[0];
+    let assoc = owner
+        .ledger_mut()
+        .mint_keyassoc_from_stage(24, Some(source))
+        .expect("at-capacity N15 mint joins through the owner");
+    assert_eq!(owner.ledger().census(), 1024, "the join keeps census flat");
+    owner
+        .ledger_mut()
+        .release_collected(producers.native_domain(), *ticket);
+    owner.ledger_mut().release_keyassoc(assoc);
+    let pool_before_refusal = pool.snapshot().charged_bytes;
+    let bytes_before_refusal = owner.ledger().charged_bytes();
+    let (result, peak, allocs, requested) =
+        crate::test_alloc::counted_peak_during(|| owner.ledger_mut().mint_keyassoc(24));
+    assert!(
+        matches!(result, Err(LedgerRefusal::Full)),
+        "a sourceless mint at capacity refuses Full"
+    );
+    assert!(!peak.incomplete);
+    assert_eq!((peak.live_bytes, peak.peak_bytes), (0, 0));
+    assert_eq!((allocs, requested), (0, 0));
+    assert_eq!(owner.ledger().census(), 1024);
+    assert_eq!(owner.ledger().charged_bytes(), bytes_before_refusal);
+    assert_eq!(
+        pool.snapshot().charged_bytes,
+        pool_before_refusal,
+        "the refused mint moves no pool bytes"
+    );
+    // KEM revisions ride the publication gate: one mint, then a
+    // second mint in the same scene for a genuinely bigger revision.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_kem_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            input0: Some((CREATED_KEY, 1)),
+            input1: Some((0, 0)),
+            kem_result: Some((0x7000, 1)),
+            ..ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture())
+        },
+    );
+    let r1 = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        r1.objects
+            .iter()
+            .filter(|row| row.creation == Some("encapsulate"))
+            .count(),
+        1,
+        "r1 carries its KEM row"
+    );
+    drive_kem_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            input0: Some((CREATED_KEY, 1)),
+            input1: Some((0, 0)),
+            kem_result: Some((0x7001, 1)),
+            ..ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture())
+        },
+    );
+    let r2 = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        r2.objects
+            .iter()
+            .filter(|row| row.creation == Some("encapsulate"))
+            .count(),
+        2,
+        "r2 carries both KEM rows"
+    );
+    assert!(
+        r2.budgets.encoded_bytes > r1.budgets.encoded_bytes,
+        "the second KEM revision is genuinely bigger"
+    );
+    let mut limited = crate::key_operation_projection::ObservationPublisher::with_byte_limit(
+        r1.budgets.encoded_bytes,
+    );
+    assert_eq!(limited.publish(r1.clone()).revision, 1);
+    assert_eq!(
+        limited.publication().unwrap().status,
+        crate::key_operation_projection::ObsStatus::Populated
+    );
+    let stale = limited.publish(r2.clone());
+    assert_eq!(
+        stale.status,
+        crate::key_operation_projection::ObsStatus::Stale
+    );
+    assert_eq!(stale.reason, "publication_budget_exhausted");
+    assert_eq!(
+        stale.revision, 1,
+        "the retained revision, not the refused one"
+    );
+    assert_eq!(stale.objects, r1.objects, "KEM rows survive intact");
+    assert_eq!(stale.key_operations, r1.key_operations);
+    assert_eq!(stale.budgets, r1.budgets, "budgets keep content state");
+    // An over-budget first KEM publication yields the pre-reserved
+    // negative: unavailable + cause, no rows, no big allocation.
+    let mut starved = crate::key_operation_projection::ObservationPublisher::with_byte_limit(10);
+    let negative = starved.publish(r1.clone());
+    assert_eq!(
+        negative.status,
+        crate::key_operation_projection::ObsStatus::Unavailable
+    );
+    assert_eq!(negative.reason, "publication_budget_exhausted");
+    assert_eq!(negative.revision, 1);
+    assert!(negative.key_operations.is_empty() && negative.objects.is_empty());
+    assert!(negative.budgets.encoded_bytes < r1.budgets.encoded_bytes);
 }
 
 /// Item 20 (contracts audit): v1 tables and the v1 schema stay

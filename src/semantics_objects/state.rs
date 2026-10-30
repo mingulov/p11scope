@@ -4786,6 +4786,254 @@ mod tests {
         assert_eq!(fx.state.objects.len(), before, "no first-observed view");
     }
 
+    // Finding 6 (retirement twin): the consuming seam rejects
+    // borrowing a replacement view. A KEM call begins and ends
+    // against the live input, joining the original; then a real
+    // admitted destroy+create pair retires the original and reuses
+    // the equal handle for a new object. Every call travels the
+    // real admitted entry/return route in serial order, so no
+    // overlap confound exists anywhere; the seam is then consulted
+    // with the resulting frozen pending call and live bindings,
+    // and it reports StaleOrigin instead of borrowing the
+    // replacement. A later use agrees with the current view. The
+    // conservative overlap refusal stays covered by item 17.
+    #[test]
+    fn replacement_view_is_rejected_at_join() {
+        use crate::kinds::function_id;
+        use crate::semantics_objects::journal::StagingLedger;
+        use crate::semantics_objects::{
+            CallKey, CompleteInputPrefix, CompletedFact, HandleInput, MechanismEvidence,
+            ObjectDomain, ObjectEffect, ObjectHandle, ObjectSemantics, OriginFact, RefCut,
+            ResultSlot, SessionHandle, SlotScope,
+        };
+        use pkcs11_types::CkRv;
+        let domain = ObjectDomain::reference(1, 1, 1, 1, 1);
+        let mut model = ObjectSemantics::new();
+        model.register_domain(domain).expect("domain registers");
+        let mut ledger = StagingLedger::new();
+        let session = SessionHandle::new(7).unwrap();
+        let input = ObjectHandle::new(0xA11CE).unwrap();
+        let output = ObjectHandle::new(0xB0B).unwrap();
+        let output2 = ObjectHandle::new(0xB0C).unwrap();
+        let scope = SlotScope::reference_known(3, 1);
+        let origin = |cut: u64, key: u64, function: u32, inputs| OriginFact {
+            domain,
+            cut: RefCut::reference(cut),
+            key: CallKey::reference(key),
+            entry_ns: 100 + cut,
+            function,
+            session: HandleInput::Value(session),
+            inputs,
+            requested: [None, None],
+            entry_mechanism: MechanismEvidence::Value(0x17),
+            scope,
+            entry_output: crate::semantics_objects::OutputEvidence::NonNull,
+        };
+        let completed = |cut: u64, results| CompletedFact {
+            cut: RefCut::reference(cut),
+            end_ns: 200 + cut,
+            rv: CkRv::OK.0,
+            return_mechanism: MechanismEvidence::Value(0x17),
+            results,
+            session_out: HandleInput::Value(session),
+            found: crate::semantics_objects::FindResult::NotCaptured,
+            attributes: None,
+        };
+        let settle_to = |model: &mut ObjectSemantics, ledger: &mut StagingLedger, cut: u64| {
+            model.settle(
+                CompleteInputPrefix::reference(
+                    domain,
+                    RefCut::reference(cut),
+                    &[],
+                    Some(RefCut::reference(0)),
+                ),
+                ledger,
+            )
+        };
+        let create = function_id("C_CreateObject").unwrap();
+        let destroy = function_id("C_DestroyObject").unwrap();
+        let encap = function_id("C_EncapsulateKey").unwrap();
+        // Create the input and settle it: the end first-observes
+        // session 7 and mints the original view.
+        let token = model
+            .begin(
+                origin(1, 11, create, [HandleInput::Absent, HandleInput::Absent]),
+                &mut ledger,
+            )
+            .expect("create begins");
+        model.complete(
+            token,
+            completed(2, [ResultSlot::Handle(input), ResultSlot::NotCaptured]),
+            &mut ledger,
+        );
+        settle_to(&mut model, &mut ledger, 2);
+        let created: Vec<_> = model.project().objects.iter().map(|view| view.id).collect();
+        assert_eq!(created.len(), 1, "one input view exists");
+        let original = created[0];
+        // The KEM call runs against the live input and joins the
+        // original: its authority is real, not staged.
+        let kem = model
+            .begin(
+                origin(
+                    3,
+                    13,
+                    encap,
+                    [HandleInput::Value(input), HandleInput::Absent],
+                ),
+                &mut ledger,
+            )
+            .expect("KEM begins");
+        // Freeze the applied begin directly: settle runs the same
+        // production application, but it also prunes a call once
+        // its completion applies with no overlap left, so the
+        // applied snapshot would be unobservable afterwards.
+        // apply_begin is deterministic over admitted state -- the
+        // same session, bindings and bootstrap settle would read.
+        model.state.apply_begin(kem);
+        let frozen = model.state.pending[&kem].clone();
+        assert_eq!(
+            frozen.snapshot.inputs[0],
+            OriginState::Settled(original),
+            "the KEM snapshot binds the original input"
+        );
+        model.complete(
+            kem,
+            completed(4, [ResultSlot::Handle(output), ResultSlot::NotCaptured]),
+            &mut ledger,
+        );
+        let use_effects = settle_to(&mut model, &mut ledger, 4);
+        assert!(
+            use_effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Referenced { object, .. } if *object == original
+            )),
+            "the KEM use joins the original input"
+        );
+        assert!(
+            !use_effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::Unresolved { .. })),
+            "the KEM use resolves cleanly"
+        );
+        // A real admitted destroy retires the original; a real
+        // admitted recreate reuses the equal handle.
+        let goodbye = model
+            .begin(
+                origin(
+                    5,
+                    14,
+                    destroy,
+                    [HandleInput::Value(input), HandleInput::Absent],
+                ),
+                &mut ledger,
+            )
+            .expect("destroy begins");
+        model.complete(
+            goodbye,
+            completed(6, [ResultSlot::NotCaptured, ResultSlot::NotCaptured]),
+            &mut ledger,
+        );
+        let recreate = model
+            .begin(
+                origin(7, 16, create, [HandleInput::Absent, HandleInput::Absent]),
+                &mut ledger,
+            )
+            .expect("recreate begins");
+        model.complete(
+            recreate,
+            completed(8, [ResultSlot::Handle(input), ResultSlot::NotCaptured]),
+            &mut ledger,
+        );
+        settle_to(&mut model, &mut ledger, 8);
+        // Non-vacuity: the equal handle now binds a replacement
+        // while the frozen KEM snapshot still names the original.
+        let incarnation = frozen.snapshot.session.expect("KEM session settled");
+        let replacement = match model.state.domains[&domain]
+            .bindings
+            .get(&(incarnation, input))
+            .copied()
+        {
+            Some(Binding::View(id)) => {
+                assert_ne!(id, original, "the equal handle names a new object");
+                id
+            }
+            other => panic!("the recreate must rebind the equal handle, got {other:?}"),
+        };
+        // The seam: original-origin against replacement-view
+        // rejects with StaleOrigin and joins nothing.
+        let mut effects = ObjectEffects::default();
+        let joined = model
+            .state
+            .join_input(&frozen, kem, 0, incarnation, &mut effects);
+        assert_eq!(
+            joined,
+            Err(ObjectGap::StaleOrigin),
+            "the seam rejects borrowing the replacement view"
+        );
+        assert!(
+            effects.effects.is_empty(),
+            "the rejected join records no effects of its own"
+        );
+        // Agreement control: a later use after the dust settles
+        // joins the current (replacement) view cleanly.
+        let later = model
+            .begin(
+                origin(
+                    9,
+                    18,
+                    encap,
+                    [HandleInput::Value(input), HandleInput::Absent],
+                ),
+                &mut ledger,
+            )
+            .expect("later use begins");
+        model.complete(
+            later,
+            completed(10, [ResultSlot::Handle(output2), ResultSlot::NotCaptured]),
+            &mut ledger,
+        );
+        let later_effects = settle_to(&mut model, &mut ledger, 10);
+        assert!(
+            later_effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Referenced { object, .. } if *object == replacement
+            )),
+            "agreement joins the current view"
+        );
+        assert!(
+            !later_effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::Unresolved { .. })),
+            "agreement resolves cleanly"
+        );
+        // Final ledger: the original keeps exactly its real use and
+        // stays retired; the replacement carries exactly the
+        // agreement use.
+        let views = model.project().objects;
+        let stale = views
+            .iter()
+            .find(|view| view.id == original)
+            .expect("the original view survives");
+        assert!(
+            !matches!(stale.lifetime, Lifetime::Live),
+            "the original view stays retired"
+        );
+        assert_eq!(stale.references, 1, "the original keeps its real use");
+        assert_eq!(stale.key_uses, 1, "the original counts its real use");
+        let current = views
+            .iter()
+            .find(|view| view.id == replacement)
+            .expect("the replacement view survives");
+        assert!(
+            matches!(current.lifetime, Lifetime::Live),
+            "the replacement view stays live"
+        );
+        assert_eq!(current.references, 1, "the replacement carries one use");
+        assert_eq!(current.key_uses, 1, "the replacement counts one key use");
+    }
+
     // F6: a Settled snapshot whose binding changed before the END
     // freezes Unproven(StaleOrigin), never the replacement.
     #[test]

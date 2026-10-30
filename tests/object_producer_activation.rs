@@ -1105,6 +1105,291 @@ fn object_kem_entry_runs_only_through_the_shared_adapter() {
     );
 }
 
+/// Finding 4 (policy/flavor selection): KEM acquisition activates only
+/// under the selected FULL allowlisted gate. This witness consumes the
+/// actual selected build switches and executes the real gating seam in
+/// every configuration cell (default FULL, Host P0, unsafe): the marker
+/// arm (allowlisted policy only), the behind-required wrapper call, the
+/// aggregate constructor (never a side), the shared entry adapter driven
+/// with the cell's own gate, and the counter bank objects (aggregate
+/// roots only, no object-entry code). P0, every counter mode, aggregate,
+/// unsafe policy and unknown/count-only providers select no new KEM
+/// acquisition. The FULL exact fetch lists are the S1 control: the
+/// allowlisted S1 fields flow (no less), nothing new reads (no more).
+///
+/// The host `KEM_CAPTURE_WIRED` const is deliberately NOT the cell gate:
+/// root features never forward to the host common crate, so it stays
+/// FULL in every root cell; P0 reaches only the Detailed BPF bytes via
+/// build.rs. The cell gate here is the root selection itself.
+#[test]
+fn object_kem_policy_and_flavor_zero_new_reads() {
+    use p11scope_ebpf_common::object_flow::adapter_kem_entry;
+    use p11scope_ebpf_common::object_wire::{ObjectStart, canonical_object_wire};
+    use p11scope_ebpf_common::{ImageIdentity, LinuxLayout};
+
+    // The actual selected switches drive every leg below.
+    let p0 = cfg!(feature = "stub-object-attributes");
+    let unsafe_build = cfg!(feature = "unsafe-unvalidated-metadata");
+    let gate = !p0;
+
+    // Marker arm (every cell, including unsafe/P0): ordinary seed,
+    // exactly one arm site, exactly the allowlisted branch. Unsafe and
+    // unknown/count-only providers keep the zero seed.
+    let source = bpf_source();
+    let entry = source_between(
+        &source,
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(",
+        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+    );
+    assert!(
+        entry.contains("object_required: 0,"),
+        "entry must seed object_required to zero (ordinary)"
+    );
+    assert_eq!(
+        entry.matches("object_marker_for").count(),
+        1,
+        "entry must arm the object marker at exactly one site"
+    );
+    assert!(
+        entry.contains(
+            "if flags & FLAG_POLICY_ALLOWLISTED != 0 {\n        seed.object_required = object_marker_for(cookie_of(&ctx));\n    }"
+        ),
+        "the marker call must be the body of the allowlisted-policy branch"
+    );
+
+    // KEM-behind-required: no KEM acquisition before the required gate;
+    // exactly one wrapper call behind it, passing the build gate.
+    let before_required = source_between(
+        &source,
+        "fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: bool>(",
+        "if object_required != 0 {",
+    );
+    assert!(
+        !before_required.contains("object_entry_kem("),
+        "no KEM acquisition before the required gate (unsafe={unsafe_build})"
+    );
+    let required_region =
+        source_between(&source, "if object_required != 0 {", "fn p11_return_impl<");
+    assert_eq!(
+        required_region.matches("object_entry_kem(").count(),
+        1,
+        "the KEM wrapper runs at exactly one site behind the required gate"
+    );
+    let kem = source_between(&source, "fn object_entry_kem(", "fn object_entry_results(");
+    assert!(
+        kem.contains("KEM_CAPTURE_WIRED"),
+        "the KEM wrapper must pass the build gate, never a literal"
+    );
+
+    // Aggregate constructor (native): accounting-only delegation with a
+    // null side source; no side allocation for any call including KEM.
+    // The runtime no-side proof is the aggregate neighbor (owner suite).
+    let native =
+        std::fs::read_to_string("crates/ebpf/native/task_owner.c").expect("read native owner");
+    let aggregate = source_between(
+        &native,
+        "u32 p11_owner_start_aggregate(",
+        "/* Validated live subordinate row, or NULL.",
+    );
+    assert!(
+        aggregate.contains("begin_owned_start(key, (void *)0, timestamp, 1)"),
+        "aggregate must delegate with a null side source"
+    );
+    assert!(
+        !aggregate.contains("object_side_alloc") && !aggregate.contains("OBJECT_START"),
+        "aggregate must name no side allocation"
+    );
+
+    // Real gating seam: healthy vectors for both functions through the
+    // shared entry adapter with the cell's own gate.
+    fn entry_side(descriptor: u32, action: u8) -> ObjectStart {
+        ObjectStart {
+            image: ImageIdentity {
+                task_cookie: 0xC0FF_EE00_C0FF_EE00,
+                exec_id: 0xDEAD_BEEF_DEAD_BEEF,
+            },
+            entry_ns: 0x1111_2222_3333_4444,
+            descriptor_index: descriptor,
+            action,
+            phase: 1,
+            ..ObjectStart::default()
+        }
+    }
+    for (function, non_null_fetches) in
+        [(92u32, vec![2u8, 3, 4, 6, 5]), (93u32, vec![2u8, 3, 4, 5])]
+    {
+        let row = canonical_object_wire(function);
+        let descriptor = function + 1;
+        for output_non_null in [false, true] {
+            let mut side = entry_side(descriptor, row.action);
+            let mut fetches = Vec::new();
+            let mut reads: Vec<u64> = Vec::new();
+            let table: [(u8, Option<u64>); 7] = [
+                (2, Some(0x1111)),
+                (3, Some(0x5000)),
+                (4, Some(2)),
+                (5, Some(if output_non_null { 0x8000 } else { 0 })),
+                (6, Some(0x6000)),
+                (7, None),
+                (0, None),
+            ];
+            let ok = adapter_kem_entry(
+                Some(&mut side),
+                descriptor,
+                Some(&row),
+                LinuxLayout::Lp64,
+                0x1000,
+                gate,
+                output_non_null,
+                false,
+                &mut |index| {
+                    fetches.push(index);
+                    if index == 7 {
+                        return None;
+                    }
+                    table
+                        .iter()
+                        .find_map(|slot| (slot.0 == index).then_some(slot.1).flatten())
+                },
+                |address| {
+                    reads.push(address);
+                    Ok(0x7000)
+                },
+            );
+            if p0 {
+                // P0 is blind to the S1 verdict: the gate refuses first
+                // as a successful finite refusal — READY with unavailable
+                // verdicts, zero fetches, zero reads.
+                use p11scope_ebpf_common::object_capture::handle_status as hst;
+                assert!(
+                    ok && fetches.is_empty() && reads.is_empty(),
+                    "P0 function {function} non_null={output_non_null}: finite refusal, no acquisition"
+                );
+                assert_eq!(side.inputs, [0, 0]);
+                assert_eq!(
+                    side.input_statuses,
+                    [hst::PROTOCOL_UNAVAILABLE, hst::ABSENT]
+                );
+                assert_eq!(side.result_ptrs, [0, 0]);
+                assert_eq!(side.phase, 2, "P0 finite refusal reaches READY");
+            } else if output_non_null {
+                // FULL allowlisted positive: the exact allowlisted S1
+                // fields flow — no less (control), no more (no new reads).
+                assert!(ok, "FULL function {function}: healthy entry acquires");
+                assert_eq!(
+                    fetches, non_null_fetches,
+                    "FULL function {function}: exact fetches"
+                );
+                assert_eq!(
+                    reads,
+                    vec![0x1010],
+                    "FULL function {function}: exactly the cell read"
+                );
+                assert_eq!(side.inputs, [0x1111, 0]);
+                assert_eq!(side.result_ptrs, [0x7000, 0]);
+                assert_eq!(side.phase, 2, "FULL reaches READY");
+            } else if function == 92 {
+                // FULL encap query: enters, retains nothing, reads
+                // nothing. A null ciphertext probe performs no
+                // cryptographic operation (entry + model guards).
+                assert!(ok, "FULL encap: query enters");
+                assert_eq!(
+                    side.result_ptrs,
+                    [0, 0],
+                    "FULL encap: query retains nothing"
+                );
+                assert!(reads.is_empty(), "FULL encap: query reads nothing");
+            } else {
+                // FULL decap under a null secret-output verdict: the key
+                // output is independent of secret sizing, so entry still
+                // acquires and retains the provider-written key cell
+                // exactly as the non-null leg. No over-refusal: the
+                // query guards are encap-only by design.
+                assert!(ok, "FULL decap: null-secret verdict still enters");
+                assert_eq!(
+                    fetches, non_null_fetches,
+                    "FULL decap: null-secret verdict fetches identically"
+                );
+                assert_eq!(
+                    reads,
+                    vec![0x1010],
+                    "FULL decap: null-secret verdict reads the cell"
+                );
+                assert_eq!(side.result_ptrs, [0x7000, 0]);
+                assert_eq!(
+                    side.phase, 2,
+                    "FULL decap: null-secret verdict reaches READY"
+                );
+            }
+        }
+    }
+
+    // Counter modes: selection-consistent, and no object-entry code in
+    // any bank object (aggregate roots only). The bank maps/objects
+    // share definitions with main; acquisition is code, and the code
+    // is absent. The main object is the positive control.
+    if !counter_objects_enabled() {
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"), "");
+        for token in COUNTER_BANK_TOKENS {
+            assert!(
+                counter_object_bytes(token).is_empty(),
+                "{token} must be omitted when disabled"
+            );
+        }
+        return;
+    }
+    let directory = tempfile::tempdir().expect("counter KEM-absence check");
+    let main = embedded_object(directory.path());
+    let mut paths = vec![main];
+    for token in COUNTER_BANK_TOKENS {
+        paths.push(write_counter_object(token, directory.path()));
+    }
+    let output = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["-I", "-c", KEM_COUNTER_CHECKER])
+        .args(&paths)
+        .output()
+        .expect("inspect counter objects for KEM acquisition");
+    assert!(
+        output.status.success(),
+        "counter KEM-absence failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
+/// Counter-bank KEM absence: argv[1] is the main object (positive
+/// control: KEM acquisition code present), the rest are bank objects
+/// (aggregate roots only, no object-entry code).
+const KEM_COUNTER_CHECKER: &str = r##"
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path('scripts').resolve()))
+from _loader import load_path
+
+checker = load_path(Path('scripts/check-bpf-map-defs.py'), 'kem_counter_checker')
+
+main = Path(sys.argv[1])
+names = [s[0] for s in checker.Elf(main.read_bytes()).symbols]
+assert names, 'main object has no symbols (vacuous)'
+assert any('object_entry_kem' in n for n in names), 'main object lacks object_entry_kem (positive control)'
+assert 'p11_object_side_get' in names, 'main object lacks p11_object_side_get (positive control)'
+assert 'p11_owner_start_begin' in names, 'main object lacks p11_owner_start_begin (positive control)'
+print(f'main: {len(names)} symbols, KEM acquisition present (positive control)')
+
+for path in sys.argv[2:]:
+    names = [s[0] for s in checker.Elf(Path(path).read_bytes()).symbols]
+    assert names, f'{path}: no symbols (vacuous)'
+    assert 'p11_owner_start_aggregate' in names, f'{path}: no aggregate root (vacuous)'
+    bad = [n for n in names
+           if 'object_entry' in n or 'object_fill' in n
+           or n in ('p11_object_side_get', 'p11_owner_start_begin')]
+    assert not bad, f'{path}: object acquisition code present: {bad}'
+    print(f'{path}: {len(names)} symbols, aggregate-only, no object acquisition')
+"##;
+
 /// The private validated tail accompanies the owned H3 routed call into
 /// the consuming admission result, but it cannot construct the H9 model:
 /// no ObjectDomain, OriginFact, RefCut, CallToken, CompleteInputPrefix,
@@ -1677,6 +1962,21 @@ fn object_return_refused_continuity_keeps_ordinary_base() {
         assert!(!arm.contains("object_fill_return("));
         assert!(!arm.contains("object_tail_fill("));
         assert!(!arm.contains("object_emit_"));
+        // Changed-image order (F4): the image refusal precedes the first
+        // fill in the object return arm, so a return whose task image
+        // changed retires before any read. The arm is
+        // descriptor-agnostic; KEM flows through it (behind-required pin).
+        assert_eq!(
+            returned.matches("image_pair_matches").count(),
+            1,
+            "{name}: exactly one image check in the object arm"
+        );
+        let image_at = returned.find("image_pair_matches").unwrap();
+        let fill_at = returned.find("object_fill_return(").unwrap();
+        assert!(
+            image_at < fill_at,
+            "{name}: image refusal must precede the first fill"
+        );
         let healthy = source_between(returned, "let tail =", "entry.submit(0)");
         assert!(
             !healthy.contains("EVENTS.output"),

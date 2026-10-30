@@ -2548,10 +2548,7 @@ mod tests {
                 side.image.exec_id, 0xE9EC_1D00_E9EC_1D00,
                 "variant {variant}"
             );
-            assert_eq!(
-                side.entry_ns, 0x1111_2222_3333_4444,
-                "variant {variant}"
-            );
+            assert_eq!(side.entry_ns, 0x1111_2222_3333_4444, "variant {variant}");
             assert_eq!(side.result_ptrs, [retained, 0], "variant {variant}");
             // The same row flows into the production return: one
             // result read on the healthy path, zero on every
@@ -2583,7 +2580,14 @@ mod tests {
             );
             assert_eq!(
                 side.result_ptrs,
-                [if return_status == hst::VALUE { 0x777 } else { 0 }, 0],
+                [
+                    if return_status == hst::VALUE {
+                        0x777
+                    } else {
+                        0
+                    },
+                    0
+                ],
                 "variant {variant}"
             );
             assert_eq!(side.phase, 3, "variant {variant}");
@@ -2687,62 +2691,20 @@ mod tests {
         // only the ciphertext guard fires.
         for (variant, (encapsulate, layout, arg5, stack_cell, retain)) in [
             // Equality: phKey == pCiphertext withholds.
-            (
-                true,
-                LinuxLayout::Lp64,
-                Some(0x7000u64),
-                0x7000u64,
-                false,
-            ),
-            (
-                false,
-                LinuxLayout::Ilp32,
-                Some(0x7000u64),
-                0x7000u64,
-                false,
-            ),
+            (true, LinuxLayout::Lp64, Some(0x7000u64), 0x7000u64, false),
+            (false, LinuxLayout::Ilp32, Some(0x7000u64), 0x7000u64, false),
             // Interior overlap from below withholds.
-            (
-                true,
-                LinuxLayout::Lp64,
-                Some(0x7004u64),
-                0x7000u64,
-                false,
-            ),
-            (
-                false,
-                LinuxLayout::Lp64,
-                Some(0x7007u64),
-                0x7000u64,
-                false,
-            ),
+            (true, LinuxLayout::Lp64, Some(0x7004u64), 0x7000u64, false),
+            (false, LinuxLayout::Lp64, Some(0x7007u64), 0x7000u64, false),
             // At or above the base with unknown extent withholds.
-            (
-                true,
-                LinuxLayout::Lp64,
-                Some(0x6800u64),
-                0x7000u64,
-                false,
-            ),
-            (
-                false,
-                LinuxLayout::Ilp32,
-                Some(0x6800u64),
-                0x7000u64,
-                false,
-            ),
+            (true, LinuxLayout::Lp64, Some(0x6800u64), 0x7000u64, false),
+            (false, LinuxLayout::Ilp32, Some(0x6800u64), 0x7000u64, false),
             // An unavailable ciphertext bound withholds.
             (true, LinuxLayout::Lp64, None, 0x7000u64, false),
             (false, LinuxLayout::Ilp32, None, 0x7000u64, false),
             // A null contradicting the non-null S1 verdict
             // withholds: the required bound is unavailable.
-            (
-                true,
-                LinuxLayout::Lp64,
-                Some(0u64),
-                0x7000u64,
-                false,
-            ),
+            (true, LinuxLayout::Lp64, Some(0u64), 0x7000u64, false),
             // Top-edge interior overlap withholds.
             (
                 true,
@@ -2753,66 +2715,18 @@ mod tests {
             ),
             // Healthy disjoint input/output retains, both
             // functions and ABIs.
-            (
-                true,
-                LinuxLayout::Lp64,
-                Some(0x8000u64),
-                0x7000u64,
-                true,
-            ),
-            (
-                true,
-                LinuxLayout::Ilp32,
-                Some(0x8000u64),
-                0x7000u64,
-                true,
-            ),
-            (
-                false,
-                LinuxLayout::Lp64,
-                Some(0x8000u64),
-                0x7000u64,
-                true,
-            ),
-            (
-                false,
-                LinuxLayout::Ilp32,
-                Some(0x8000u64),
-                0x7000u64,
-                true,
-            ),
+            (true, LinuxLayout::Lp64, Some(0x8000u64), 0x7000u64, true),
+            (true, LinuxLayout::Ilp32, Some(0x8000u64), 0x7000u64, true),
+            (false, LinuxLayout::Lp64, Some(0x8000u64), 0x7000u64, true),
+            (false, LinuxLayout::Ilp32, Some(0x8000u64), 0x7000u64, true),
             // Touching the base is disjoint: the cell ends where
             // the buffer begins.
-            (
-                true,
-                LinuxLayout::Lp64,
-                Some(0x7008u64),
-                0x7000u64,
-                true,
-            ),
-            (
-                false,
-                LinuxLayout::Ilp32,
-                Some(0x7004u64),
-                0x7000u64,
-                true,
-            ),
+            (true, LinuxLayout::Lp64, Some(0x7008u64), 0x7000u64, true),
+            (false, LinuxLayout::Ilp32, Some(0x7004u64), 0x7000u64, true),
             // Top-edge cell wholly below the base retains.
-            (
-                true,
-                LinuxLayout::Lp64,
-                Some(u64::MAX),
-                u64::MAX - 7,
-                true,
-            ),
+            (true, LinuxLayout::Lp64, Some(u64::MAX), u64::MAX - 7, true),
             // A null decapsulation input has no span: retains.
-            (
-                false,
-                LinuxLayout::Lp64,
-                Some(0u64),
-                0x7000u64,
-                true,
-            ),
+            (false, LinuxLayout::Lp64, Some(0u64), 0x7000u64, true),
         ]
         .into_iter()
         .enumerate()
@@ -2904,18 +2818,491 @@ mod tests {
             assert_eq!(reads.get(), u32::from(retain), "variant {variant}");
             assert_eq!(
                 side.result_statuses,
-                [if retain { hst::VALUE } else { hst::UNREADABLE }, hst::ABSENT],
+                [
+                    if retain { hst::VALUE } else { hst::UNREADABLE },
+                    hst::ABSENT
+                ],
                 "variant {variant}"
             );
             assert_eq!(side.phase, 3, "variant {variant}");
         }
     }
 
+    // The build flavor gates acquisition through the actual
+    // KEM_CAPTURE_WIRED constant, never a literal: FULL builds
+    // acquire exactly; P0 builds acquire nothing. Runs in both
+    // configurations (the P0 cell runs this selector plus the
+    // finite controls, never the FULL positives).
+    #[test]
+    fn kem_build_flavor_precedes_acquisition() {
+        let p0 = cfg!(feature = "stub-object-attributes");
+        assert_eq!(KEM_CAPTURE_WIRED, !p0, "flavor constant matches the build");
+        for (encapsulate, layout) in [
+            (true, LinuxLayout::Lp64),
+            (true, LinuxLayout::Ilp32),
+            (false, LinuxLayout::Lp64),
+            (false, LinuxLayout::Ilp32),
+        ] {
+            let row = kem_row(encapsulate);
+            let descriptor = kem_descriptor(encapsulate);
+            let mut spy = KemSpy::new(
+                [
+                    (2, Some(0x1111)),
+                    (3, Some(0x5000)),
+                    (4, Some(2)),
+                    (5, Some(0x8000)),
+                    (6, if encapsulate { Some(0x6000) } else { Some(9) }),
+                    (7, None),
+                    (0, None),
+                ],
+                Ok(0x7000),
+            );
+            let mut side = ObjectStart {
+                phase: 1,
+                ..ObjectStart::default()
+            };
+            assert!(spy.run(
+                Some(&mut side),
+                descriptor,
+                Some(&row),
+                layout,
+                0x1000,
+                KEM_CAPTURE_WIRED,
+                true,
+                false,
+            ));
+            // Both flavors advance ENTRY to READY through the
+            // production adapter; only FULL acquires.
+            assert_eq!(side.phase, 2);
+            if p0 {
+                assert!(spy.fetches.is_empty(), "P0 fetches nothing");
+                assert!(spy.reads.is_empty(), "P0 reads nothing");
+                assert_eq!(side.inputs, [0, 0]);
+                assert_eq!(side.result_ptrs, [0, 0]);
+            } else {
+                assert_eq!(
+                    spy.fetches,
+                    if encapsulate {
+                        alloc::vec![2, 3, 4, 6, 5]
+                    } else {
+                        alloc::vec![2, 3, 4, 5]
+                    }
+                );
+                assert_eq!(side.inputs, [0x1111, 0]);
+                assert_eq!(side.result_ptrs, [0x7000, 0]);
+            }
+        }
+    }
+
+    // Duplicate, stale and lost KEM returns refuse with zero
+    // reads: a consumed (RETURNING) row, an unadvanced (ENTRY)
+    // row, a lost side, a mismatched descriptor and a foreign
+    // phase never reach the result reader. No read precedes any
+    // refusal.
+    #[test]
+    fn kem_return_duplicate_stale_and_custody_zero_reads() {
+        use crate::object_capture::handle_status as hst;
+        let row = kem_row(true);
+        let descriptor = kem_descriptor(true);
+        // The healthy route first: ENTRY -> READY -> one result
+        // read -> RETURNING.
+        let mut spy = KemSpy::new(
+            [
+                (2, Some(0x1111)),
+                (3, Some(0x5000)),
+                (4, Some(2)),
+                (5, Some(0x8000)),
+                (6, Some(0x6000)),
+                (7, None),
+                (0, None),
+            ],
+            Ok(0x7000),
+        );
+        let mut side = ObjectStart {
+            phase: 1,
+            ..ObjectStart::default()
+        };
+        assert!(spy.run(
+            Some(&mut side),
+            descriptor,
+            Some(&row),
+            LinuxLayout::Lp64,
+            0x1000,
+            true,
+            true,
+            false,
+        ));
+        assert_eq!(side.phase, 2);
+        let reads = core::cell::Cell::new(0u32);
+        let read = |address: u64| {
+            reads.set(reads.get() + 1);
+            assert_eq!(address, 0x7000);
+            Ok(0x777)
+        };
+        assert!(adapter_fill_return(
+            Some(&mut side),
+            descriptor,
+            Some(&row),
+            0,
+            LinuxLayout::Lp64,
+            0,
+            0,
+            true,
+            read,
+        ));
+        assert_eq!(reads.get(), 1);
+        assert_eq!(side.result_statuses, [hst::VALUE, hst::ABSENT]);
+        assert_eq!(side.phase, 3);
+        // A duplicate return on the consumed row refuses.
+        let read = |address: u64| {
+            reads.set(reads.get() + 1);
+            assert_eq!(address, 0x7000);
+            Ok(0x777)
+        };
+        assert!(!adapter_fill_return(
+            Some(&mut side),
+            descriptor,
+            Some(&row),
+            0,
+            LinuxLayout::Lp64,
+            0,
+            0,
+            true,
+            read,
+        ));
+        assert_eq!(reads.get(), 1, "duplicate return reads nothing");
+        assert_eq!(side.phase, 3);
+        // A stale return on an unadvanced ENTRY row refuses: the
+        // row never reached READY (finding 1's pre-fix state).
+        let mut stale = ObjectStart {
+            phase: 1,
+            ..ObjectStart::default()
+        };
+        stale.result_ptrs = [0x7000, 0];
+        let read = |address: u64| {
+            reads.set(reads.get() + 1);
+            assert_eq!(address, 0x7000);
+            Ok(0x777)
+        };
+        assert!(!adapter_fill_return(
+            Some(&mut stale),
+            descriptor,
+            Some(&row),
+            0,
+            LinuxLayout::Lp64,
+            0,
+            0,
+            true,
+            read,
+        ));
+        assert_eq!(reads.get(), 1, "stale return reads nothing");
+        // A lost side refuses.
+        let read = |_: u64| {
+            reads.set(reads.get() + 1);
+            Ok(0x777)
+        };
+        assert!(!adapter_fill_return(
+            None,
+            descriptor,
+            Some(&row),
+            0,
+            LinuxLayout::Lp64,
+            0,
+            0,
+            true,
+            read,
+        ));
+        assert_eq!(reads.get(), 1, "lost side reads nothing");
+        // A mismatched descriptor refuses without reading.
+        let mut side = ObjectStart {
+            phase: 2,
+            ..ObjectStart::default()
+        };
+        side.result_ptrs = [0x7000, 0];
+        let read = |_: u64| {
+            reads.set(reads.get() + 1);
+            Ok(0x777)
+        };
+        assert!(!adapter_fill_return(
+            Some(&mut side),
+            descriptor,
+            Some(&kem_row(false)),
+            0,
+            LinuxLayout::Lp64,
+            0,
+            0,
+            true,
+            read,
+        ));
+        assert_eq!(reads.get(), 1, "custody mismatch reads nothing");
+        // A foreign phase refuses without reading.
+        let mut side = ObjectStart {
+            phase: 9,
+            ..ObjectStart::default()
+        };
+        side.result_ptrs = [0x7000, 0];
+        let read = |_: u64| {
+            reads.set(reads.get() + 1);
+            Ok(0x777)
+        };
+        assert!(!adapter_fill_return(
+            Some(&mut side),
+            descriptor,
+            Some(&row),
+            0,
+            LinuxLayout::Lp64,
+            0,
+            0,
+            true,
+            read,
+        ));
+        assert_eq!(reads.get(), 1, "foreign phase reads nothing");
+        // An unjoined return on a live READY row refuses before any
+        // read: loss of continuity never advances the row. Both
+        // families; the S1 verdict is irrelevant to the gate.
+        for encapsulate in [true, false] {
+            let lrow = kem_row(encapsulate);
+            let ldescriptor = kem_descriptor(encapsulate);
+            let mut lspy = KemSpy::new(
+                [
+                    (2, Some(0x1111)),
+                    (3, Some(0x5000)),
+                    (4, Some(2)),
+                    (5, Some(0x8000)),
+                    (6, Some(0x6000)),
+                    (7, None),
+                    (0, None),
+                ],
+                Ok(0x7000),
+            );
+            let mut lside = ObjectStart {
+                phase: 1,
+                ..ObjectStart::default()
+            };
+            assert!(lspy.run(
+                Some(&mut lside),
+                ldescriptor,
+                Some(&lrow),
+                LinuxLayout::Lp64,
+                0x1000,
+                true,
+                true,
+                false,
+            ));
+            assert_eq!(lside.phase, 2);
+            let lreads = core::cell::Cell::new(0u32);
+            assert!(!adapter_fill_return(
+                Some(&mut lside),
+                ldescriptor,
+                Some(&lrow),
+                0,
+                LinuxLayout::Lp64,
+                0,
+                0,
+                false,
+                |_: u64| {
+                    lreads.set(lreads.get() + 1);
+                    Ok(0x777)
+                },
+            ));
+            assert_eq!(lreads.get(), 0, "unjoined loss reads nothing");
+            assert_eq!(lside.phase, 2, "unjoined loss advances nothing");
+        }
+        // Full-width boundary twins: the return read preserves full
+        // words exactly (no truncation, no masking); over-wide words
+        // on Ilp32 mark INVALID_SPAN with a zero word. The read itself
+        // is attempted once in every leg.
+        for (encapsulate, layout, word, status) in [
+            (
+                true,
+                LinuxLayout::Lp64,
+                0xFFFF_FFFF_FFFF_FFFFu64,
+                hst::VALUE,
+            ),
+            (
+                true,
+                LinuxLayout::Lp64,
+                0x8000_0000_0000_0000u64,
+                hst::VALUE,
+            ),
+            (
+                false,
+                LinuxLayout::Lp64,
+                0xFFFF_FFFF_FFFF_FFFFu64,
+                hst::VALUE,
+            ),
+            (
+                false,
+                LinuxLayout::Lp64,
+                0x8000_0000_0000_0000u64,
+                hst::VALUE,
+            ),
+            (true, LinuxLayout::Ilp32, 0xFFFF_FFFFu64, hst::VALUE),
+            (
+                true,
+                LinuxLayout::Ilp32,
+                0x1_0000_0000u64,
+                hst::INVALID_SPAN,
+            ),
+            (false, LinuxLayout::Ilp32, 0xFFFF_FFFFu64, hst::VALUE),
+            (
+                false,
+                LinuxLayout::Ilp32,
+                0x1_0000_0000u64,
+                hst::INVALID_SPAN,
+            ),
+        ] {
+            let brow = kem_row(encapsulate);
+            let bdescriptor = kem_descriptor(encapsulate);
+            let mut bspy = KemSpy::new(
+                [
+                    (2, Some(0x1111)),
+                    (3, Some(0x5000)),
+                    (4, Some(2)),
+                    (5, Some(0x8000)),
+                    (6, Some(0x6000)),
+                    (7, None),
+                    (0, None),
+                ],
+                Ok(0x7000),
+            );
+            let mut bside = ObjectStart {
+                phase: 1,
+                ..ObjectStart::default()
+            };
+            assert!(bspy.run(
+                Some(&mut bside),
+                bdescriptor,
+                Some(&brow),
+                layout,
+                0x1000,
+                true,
+                true,
+                false,
+            ));
+            assert_eq!(bside.phase, 2);
+            let breads = core::cell::Cell::new(0u32);
+            assert!(adapter_fill_return(
+                Some(&mut bside),
+                bdescriptor,
+                Some(&brow),
+                0,
+                layout,
+                0,
+                0,
+                true,
+                |address: u64| {
+                    breads.set(breads.get() + 1);
+                    assert_eq!(address, 0x7000);
+                    Ok(word)
+                },
+            ));
+            assert_eq!(breads.get(), 1, "boundary word read once");
+            assert_eq!(
+                bside.result_statuses,
+                [status, hst::ABSENT],
+                "boundary status"
+            );
+            assert_eq!(
+                bside.result_ptrs,
+                [if status == hst::VALUE { word } else { 0 }, 0],
+                "boundary word preserved or zeroed"
+            );
+            assert_eq!(bside.phase, 3);
+        }
+    }
+
+    /// Emission-tail custody gate: malformed custody refuses without
+    /// touching the tail; field values pass through verbatim for
+    /// downstream validation. Both KEM families; the tail carries no
+    /// find/requested sections for KEM rows.
+    #[test]
+    fn kem_tail_fill_refuses_malformed_custody() {
+        use crate::object_capture::handle_status as hst;
+        use crate::object_wire::ObjectCallWire;
+        for encapsulate in [true, false] {
+            let row = kem_row(encapsulate);
+            let descriptor = kem_descriptor(encapsulate);
+            let mut side = ObjectStart {
+                phase: 3,
+                descriptor_index: descriptor,
+                layout: crate::object_wire::OBJECT_LAYOUT_LP64,
+                action: row.action,
+                inputs: [0x1111, 0],
+                input_statuses: [hst::VALUE, hst::ABSENT],
+                result_ptrs: [0x42, 0],
+                result_statuses: [hst::VALUE, hst::ABSENT],
+                ..ObjectStart::default()
+            };
+            // Healthy RETURNING side fills: header, handles and
+            // statuses carried verbatim; KEM sections stay zero.
+            let mut tail = ObjectCallWire::default();
+            assert!(unsafe {
+                adapter_tail_fill(&mut tail as *mut _, Some(&side), descriptor, Some(&row))
+            });
+            assert_eq!((tail.version, tail.bytes), (1, 240));
+            assert_eq!(tail.descriptor_index, descriptor);
+            assert_eq!(tail.action, row.action);
+            assert_eq!(tail.input_handles, [0x1111, 0]);
+            assert_eq!(tail.input_status, [hst::VALUE, hst::ABSENT]);
+            assert_eq!(tail.result_handles, [0x42, 0]);
+            assert_eq!(tail.result_status, [hst::VALUE, hst::ABSENT]);
+            assert_eq!(tail.find_handles, [0; 8]);
+            assert_eq!(tail.find_len, 0);
+            // Malformed custody refuses; the tail stays untouched.
+            for phase in [1u8, 2, 9] {
+                side.phase = phase;
+                let mut refused = ObjectCallWire::default();
+                assert!(!unsafe {
+                    adapter_tail_fill(&mut refused as *mut _, Some(&side), descriptor, Some(&row))
+                });
+                assert_eq!(refused.version, 0, "phase {phase} writes nothing");
+            }
+            side.phase = 3;
+            let mut refused = ObjectCallWire::default();
+            assert!(!unsafe {
+                adapter_tail_fill(&mut refused as *mut _, None, descriptor, Some(&row))
+            });
+            assert_eq!(refused.version, 0, "lost side writes nothing");
+            assert!(!unsafe {
+                adapter_tail_fill(core::ptr::null_mut(), Some(&side), descriptor, Some(&row))
+            });
+            let mut refused = ObjectCallWire::default();
+            assert!(!unsafe {
+                adapter_tail_fill(
+                    &mut refused as *mut _,
+                    Some(&side),
+                    descriptor + 1,
+                    Some(&row),
+                )
+            });
+            assert_eq!(refused.version, 0, "descriptor mismatch writes nothing");
+            let mut refused = ObjectCallWire::default();
+            assert!(!unsafe {
+                adapter_tail_fill(&mut refused as *mut _, Some(&side), descriptor, None)
+            });
+            assert_eq!(refused.version, 0, "missing row writes nothing");
+            let mut refused = ObjectCallWire::default();
+            assert!(!unsafe {
+                adapter_tail_fill(
+                    &mut refused as *mut _,
+                    Some(&side),
+                    descriptor,
+                    Some(&kem_row(!encapsulate)),
+                )
+            });
+            assert_eq!(refused.version, 0, "sibling-family row writes nothing");
+        }
+    }
+
     /// P0-only ship vehicle: the default build wires FULL object
     /// attribute capture. Only the `stub-object-attributes` BPF build
     /// shuts the gate; its qualification is the P0 artifact contract
-    /// plus the live 1M-kernel load, never this host suite.
+    /// plus the live 1M-kernel load, never this host suite. Gated
+    /// out of P0 builds so the feature-selected cell compiles and
+    /// runs its actual-constant and finite controls.
     #[test]
+    #[cfg(not(feature = "stub-object-attributes"))]
     fn default_build_wires_attribute_capture() {
         const {
             assert!(

@@ -1055,6 +1055,14 @@ fn object_producer_sweep_path_within_jump_budget() {
 }
 
 #[test]
+fn object_kem_owned_pointer_and_guard_clearing_matrix() {
+    owner_fixture::run_object_subcommand(
+        "object_kem_owned_pointer_and_guard_clearing_matrix",
+        "object custody KEM clearing matrix passed",
+    );
+}
+
+#[test]
 fn object_producer_scrub_preserves_whole_side_and_neighbors() {
     owner_fixture::run_object_subcommand(
         "object_producer_scrub_preserves_whole_side_and_neighbors",

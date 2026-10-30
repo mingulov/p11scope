@@ -1981,6 +1981,263 @@ static void object_producer_scrub_preserves_whole_side_and_neighbors(void)
     }
     puts("object custody complete scrub passed");
 }
+/* H7 KEM owned clearing matrix: recognizable input/result/guard state
+ * under both KEM descriptors clears through every fixture-callable
+ * native path. The KEM descriptor rows are installed fixture-locally
+ * (shared setup untouched); without them the bind leg misbinds
+ * (RED anchor: not a KEM row). Journal-gated reason codes (loss 9,
+ * exec/exit 6) funnel through the same tested removal; exec, exit and
+ * teardown all enter through p11_owner_cleanup, covered as
+ * abandon/idle/failure legs below. The required=0 quiet retire is the
+ * owner-level cancel-style path (C_SessionCancel itself stops at S1).
+ * Every leg requires pre-scrubbed side deletes and counts them (once-only).
+ * struct object_start offsets: inputs@32, result_ptrs@48, span guards
+ * (template base, header end, capacity, count)@64, slots@96, input
+ * statuses@424, result statuses@426. */
+static void kem_install_descriptor_rows(void)
+{
+    unsigned char desc[16];
+    u32 key;
+    object_desc_row(desc, 92, 13);
+    key = 93;
+    assert(!update(&OBJECT_DESCRIPTORS, &key, desc, 0));
+    object_desc_row(desc, 93, 14);
+    key = 94;
+    assert(!update(&OBJECT_DESCRIPTORS, &key, desc, 0));
+}
+static void kem_seed_recognizable_side(const struct owner_start_key *key)
+{
+    struct row *side = row(&OBJECT_START, key);
+    assert(side);
+    memset(side->value + 32, 0xB1, 16);
+    memset(side->value + 48, 0xB2, 16);
+    memset(side->value + 64, 0xB3, 32);
+    memset(side->value + 96, 0xB4, 64);
+    side->value[424] = 1;
+    side->value[425] = 1;
+    side->value[426] = 1;
+    side->value[427] = 0;
+}
+static void kem_expect_seeded_side(const struct owner_start_key *key)
+{
+    struct row *side = row(&OBJECT_START, key);
+    unsigned i;
+    assert(side);
+    for (i = 0; i < 16; i++) assert(side->value[32 + i] == 0xB1);
+    for (i = 0; i < 16; i++) assert(side->value[48 + i] == 0xB2);
+    for (i = 0; i < 32; i++) assert(side->value[64 + i] == 0xB3);
+    for (i = 0; i < 64; i++) assert(side->value[96 + i] == 0xB4);
+}
+static void kem_expect_no_side(const struct owner_start_key *key, u32 descriptor)
+{
+    /* Quiet paths only: a required query with no live owner reports
+     * OWNER_LOOKUP_UNKNOWN (pinned once in the no-reread leg). */
+    assert(!row(&OBJECT_START, key) && !row(&START, key));
+    assert(!p11_object_side_get(key, descriptor, 0));
+    assert(!p11_owner_start_get(key, 0));
+    assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
+}
+static void object_kem_owned_pointer_and_guard_clearing_matrix(void)
+{
+    static const struct { u32 function; u32 descriptor; unsigned char action; } kem[2] = {
+        { 92, 93, 13 },
+        { 93, 94, 14 },
+    };
+    struct owner_start_key key = { .pid_tgid = 0, .slot = 7 };
+    unsigned k;
+    for (k = 0; k < 2; k++) {
+        u32 descriptor = kem[k].descriptor;
+        u32 other = kem[1 - k].descriptor;
+        /* Bind: the KEM START allocates a subordinate row carrying the
+         * KEM descriptor, action and ENTRY phase; the sibling KEM
+         * descriptor observes nothing. */
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        object_expect_binding(object_side_copy(&key), descriptor, kem[k].action);
+        assert(!p11_object_side_get(&key, other, 0));
+        kem_seed_recognizable_side(&key);
+        kem_expect_seeded_side(&key);
+        assert(!p11_owner_start_remove(&key, 1));
+        assert(checked_side_deletes == 1);
+        /* Successful terminal: READY and RETURNING phases drain with
+         * their phase; the seeded bytes scrub, the rows delete. */
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        kem_seed_recognizable_side(&key);
+        row(&OBJECT_START, &key)->value[31] = 2;
+        assert(drain_via_query(&key, descriptor, 1) == 2);
+        kem_expect_no_side(&key, descriptor);
+        assert(!ctl.outstanding && !ctl.poison && checked_side_deletes == 1);
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        kem_seed_recognizable_side(&key);
+        row(&OBJECT_START, &key)->value[31] = 3;
+        assert(drain_via_query(&key, descriptor, 1) == 3);
+        kem_expect_no_side(&key, descriptor);
+        assert(!ctl.outstanding && !ctl.poison && checked_side_deletes == 1);
+        /* Failed terminals retire with a fault verdict, still scrubbed:
+         * cross-KEM descriptor mismatch and retained-ABI mismatch. */
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        kem_seed_recognizable_side(&key);
+        assert(!drain_via_query(&key, other, 1));
+        kem_expect_no_side(&key, descriptor);
+        assert(!ctl.outstanding && !ctl.poison && checked_side_deletes == 1);
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        kem_seed_recognizable_side(&key);
+        row(&OBJECT_START, &key)->value[28] = 2;
+        assert(!drain_via_query(&key, descriptor, 1));
+        kem_expect_no_side(&key, descriptor);
+        assert(!ctl.outstanding && !ctl.poison && checked_side_deletes == 1);
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        row(&OBJECT_START, &key)->value[28] = 2;
+        assert(drain_via_query(&key, descriptor, 2) == 1);
+        assert(!ctl.poison && checked_side_deletes == 1);
+        /* Direct required and quiet (cancel-style) removals clear. */
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        kem_seed_recognizable_side(&key);
+        assert(!p11_owner_start_remove(&key, 1));
+        kem_expect_no_side(&key, descriptor);
+        assert(!ctl.outstanding && !ctl.poison && checked_side_deletes == 1);
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        kem_seed_recognizable_side(&key);
+        assert(!p11_owner_start_remove(&key, 0));
+        kem_expect_no_side(&key, descriptor);
+        assert(!ctl.outstanding && !ctl.poison && checked_side_deletes == 1);
+        /* Recursive collision invalidates the older invocation. */
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        kem_seed_recognizable_side(&key);
+        assert(p11_owner_start_insert(&key, value) == -17);
+        kem_expect_no_side(&key, descriptor);
+        assert(!owners[0].start_count && !ctl.outstanding && !ctl.poison);
+        assert(checked_side_deletes == 1);
+        /* Abandon: teardown cleanup retires the live START, scrubbed. */
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        kem_seed_recognizable_side(&key);
+        assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
+        kem_expect_no_side(&key, descriptor);
+        assert(!ctl.outstanding && ctl.abandoned_start == 1 && !ctl.poison);
+        assert(!owners[0].start_count && checked_side_deletes == 1);
+        /* Idle teardown is quiet. */
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        assert(!p11_owner_cleanup() && !ctl.poison && !checked_side_deletes);
+        /* Deletion failure keeps the row but the bytes still scrub; a
+         * retry converges. Poison is sticky, the debt settles. */
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        kem_seed_recognizable_side(&key);
+        fail_object_side_delete = -16;
+        assert(p11_owner_cleanup() == 1);
+        assert(row(&OBJECT_START, &key) && row(&START, &key));
+        assert(object_bytes_zeroed(row(&OBJECT_START, &key)->value));
+        assert(ctl.outstanding == 1 && (ctl.poison & OWNER_STATE_DELETE_FAILED));
+        assert(checked_side_deletes == 1);
+        fail_object_side_delete = 0;
+        assert(p11_owner_cleanup() == 1);
+        kem_expect_no_side(&key, descriptor);
+        assert(!ctl.outstanding && ctl.abandoned_start == 1);
+        assert(checked_side_deletes == 2);
+        /* Once-only: a settled removal never deletes twice. */
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        assert(!p11_owner_start_remove(&key, 1));
+        assert(checked_side_deletes == 1);
+        assert(p11_owner_start_remove(&key, 0) == -2 && !ctl.poison);
+        assert(checked_side_deletes == 1);
+        assert(!p11_owner_cleanup() && !ctl.poison && checked_side_deletes == 1);
+        /* Neighbor: a foreign-owned poisoned side survives our abandon. */
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        {
+            struct owner_start_key foreign = key;
+            unsigned char poison[432];
+            foreign.pid_tgid ^= 1ULL << 32;
+            memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+            assert(!p11_owner_start_insert(&key, value));
+            kem_seed_recognizable_side(&key);
+            memset(poison, 0x5A, sizeof(poison));
+            assert(!update(&OBJECT_START, &foreign, poison, 1));
+            assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
+            kem_expect_no_side(&key, descriptor);
+            assert(checked_side_deletes == 1);
+            assert(row(&OBJECT_START, &foreign));
+            assert(!memcmp(row(&OBJECT_START, &foreign)->value, poison, 432));
+        }
+        /* No reread: after abandon the side is gone; a fresh insert at
+         * the same key carries no old pointer and drains cleanly. */
+        reset(); object_setup(); kem_install_descriptor_rows();
+        require_scrubbed_side_delete = 1;
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        kem_seed_recognizable_side(&key);
+        assert(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START);
+        assert(!p11_object_side_get(&key, descriptor, 0));
+        memset(value, 0, sizeof(value)); object_write_start(value, descriptor + 1);
+        assert(!p11_owner_start_insert(&key, value));
+        {
+            struct object_start fresh = object_side_copy(&key);
+            unsigned i;
+            assert(fresh.descriptor_index == descriptor && fresh.action == kem[k].action);
+            assert(fresh.phase == 1);
+            for (i = 0; i < 2; i++) assert(!fresh.inputs[i] && !fresh.result_ptrs[i]);
+            assert(!fresh.get_template_base && !fresh.inspected_header_end);
+            assert(!fresh.find_capacity && !fresh.find_count_ptr);
+            assert(!fresh.input_statuses[0] && !fresh.result_statuses[0]);
+        }
+        row(&OBJECT_START, &key)->value[31] = 2;
+        assert(drain_via_query(&key, descriptor, 1) == 2);
+        assert(!ctl.poison && checked_side_deletes == 2);
+        /* A required query with no live owner refuses and reports it. */
+        assert(!p11_object_side_get(&key, descriptor, 1));
+        assert(ctl.poison == OWNER_LOOKUP_UNKNOWN);
+    }
+    puts("object custody KEM clearing matrix passed");
+}
 /* H7-E2 root-refusal mirror: replicates the FIXED BPF return root object
  * arms (`p11_return_impl`) through the real native owner transactions:
  * every refusal arm attempts the checked removal before returning, image
@@ -3238,6 +3495,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "object_producer_missing_side_state_faults_before_return")) object_producer_missing_side_state_faults_before_return();
         else if (!strcmp(argv[1], "object_producer_cleanup_result_reaches_exec_exit_fault")) object_producer_cleanup_result_reaches_exec_exit_fault();
         else if (!strcmp(argv[1], "object_producer_scrub_preserves_whole_side_and_neighbors")) object_producer_scrub_preserves_whole_side_and_neighbors();
+        else if (!strcmp(argv[1], "object_kem_owned_pointer_and_guard_clearing_matrix")) object_kem_owned_pointer_and_guard_clearing_matrix();
         else if (!strcmp(argv[1], "object_producer_return_refusals_retire_owned_state")) object_producer_return_refusals_retire_owned_state();
         else if (!strcmp(argv[1], "object_producer_alloc_readback_failure_preserves_cleanup_authority")) object_producer_alloc_readback_failure_preserves_cleanup_authority();
         else if (!strcmp(argv[1], "object_producer_orphan_delete_failure_keeps_cleanup_authority")) object_producer_orphan_delete_failure_keeps_cleanup_authority();
@@ -3281,6 +3539,7 @@ int main(int argc, char **argv)
         object_producer_owner_terminal_matrix(); object_producer_side_state_n_and_n_plus_one();
         object_producer_missing_side_state_faults_before_return(); object_producer_cleanup_result_reaches_exec_exit_fault();
         object_producer_scrub_preserves_whole_side_and_neighbors();
+        object_kem_owned_pointer_and_guard_clearing_matrix();
         object_producer_return_refusals_retire_owned_state(); object_producer_alloc_readback_failure_preserves_cleanup_authority();
         object_producer_orphan_delete_failure_keeps_cleanup_authority();
         object_producer_empty_lease_refund_failure_remains_visible(); object_owner_sweep_adjacent_lookup_preserves_custody();

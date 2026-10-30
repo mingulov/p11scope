@@ -19,6 +19,7 @@
 use crate::discovery::identity::PinnedObjects;
 use crate::process::ProcessView;
 use p11scope_ebpf_common::DiscoveryRecord;
+use p11scope_manifest::identity::open_regular;
 use p11scope_manifest::maps::{Device, ObjectKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -458,7 +459,10 @@ impl ExtensiveState {
         let Some(path) = path else {
             return StaticHint::Unknown;
         };
-        let Ok(exe) = File::open(&path) else {
+        // FIFO-safe open: O_PATH-pin, refuse non-regular, then read the
+        // same inode. A plain open would block on a writerless FIFO
+        // before the identity check below could refuse it.
+        let Ok(exe) = open_regular(&path) else {
             return StaticHint::Unknown;
         };
         let Ok(identity) = identity_of(&exe) else {
@@ -548,7 +552,9 @@ impl ExtensiveState {
         let Some(path) = self.learned_path(dev, ino) else {
             return false;
         };
-        let Ok(file) = File::open(path) else {
+        // FIFO-safe open (see analyze_executable): a plain open would
+        // block on a writerless FIFO before identity could refuse it.
+        let Ok(file) = open_regular(&path) else {
             return false;
         };
         let Ok(identity) = identity_of(&file) else {
@@ -694,7 +700,9 @@ impl ExtensiveState {
                 continue;
             }
             proof.objects += 1;
-            let Ok(file) = File::open(&path) else {
+            // FIFO-safe open (see analyze_executable): a plain open would
+            // block on a writerless FIFO before identity could refuse it.
+            let Ok(file) = open_regular(&path) else {
                 proof.clean = false;
                 continue;
             };
@@ -2833,12 +2841,22 @@ mod tests {
         );
         let charged = state.capture_bytes_charged_for_test();
         assert_eq!(state.verdicts_len_for_test(), 1);
+        // Unlearned-helper twin: measures the executable-only spans a
+        // stale-hit re-analysis legitimately re-reads. The FIFO helper
+        // itself must contribute nothing beyond that.
+        let mut twin = ExtensiveState::new();
+        twin.set_enabled(true);
+        twin.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        twin.learn_scan_path(cache_key_of(&exe), &exe);
+        twin.learn_scan_path(cache_key_of(&provider), &provider);
+        assert_eq!(twin.analyze_executable(dev, ino), StaticHint::Unknown);
+        let exe_only = twin.capture_bytes_charged_for_test();
         replace_with_fifo(&helper);
         assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
         assert_eq!(
             state.capture_bytes_charged_for_test(),
-            charged,
-            "cached fifo helper must be refused before any ELF read"
+            charged + exe_only,
+            "re-analysis must re-read only the executable, never the fifo helper"
         );
         assert_eq!(state.verdicts_len_for_test(), 0, "stale verdict dropped");
         assert_eq!(state.analyses_run_for_test(), 2);

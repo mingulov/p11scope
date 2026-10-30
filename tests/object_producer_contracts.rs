@@ -72,6 +72,45 @@ fn object_producer_aliases_require_both_protocols() {
     );
 }
 
+/// 6.07c item 15: the two KEM functions differ in their S1 shape
+/// (distinct direct kinds; encapsulation carries an output
+/// marker), so a KEM slot aliased with a disagreeing name is
+/// S1-ambiguous and fails closed to count-only.
+#[test]
+fn object_producer_kem_alias_is_s1_ambiguous() {
+    assert_eq!(
+        kinds::descriptor_index_with_object_agreement(&names(&[
+            "C_EncapsulateKey",
+            "C_DecapsulateKey"
+        ])),
+        (0, AliasAgreement::S1Ambiguous)
+    );
+    assert_eq!(
+        kinds::descriptor_index_with_object_agreement(&names(&[
+            "C_DecapsulateKey",
+            "C_EncapsulateKey"
+        ])),
+        (0, AliasAgreement::S1Ambiguous)
+    );
+    assert_eq!(
+        kinds::descriptor_index_with_object_agreement(&names(&[
+            "C_EncapsulateKey",
+            "C_EncapsulateKey",
+            "C_DecapsulateKey"
+        ])),
+        (0, AliasAgreement::S1Ambiguous)
+    );
+    // Each KEM name alone agrees with itself on its canonical index.
+    assert_eq!(
+        kinds::descriptor_index_with_object_agreement(&names(&["C_EncapsulateKey"])),
+        (93, AliasAgreement::Agree)
+    );
+    assert_eq!(
+        kinds::descriptor_index_with_object_agreement(&names(&["C_DecapsulateKey"])),
+        (94, AliasAgreement::Agree)
+    );
+}
+
 #[test]
 fn object_producer_unit_fixture_ids_match_canonical_catalog() {
     // Every function ordinal hardcoded in unit tests and canary vectors.

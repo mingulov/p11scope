@@ -10626,6 +10626,119 @@ fn structurally_valid_orphan_table_record_is_rejected_and_never_lowered() {
     assert!(plan.slots.iter().all(|slot| slot.file_offset != base + 90));
 }
 
+/// 6.07c item 16: KEM ordinals stay unwalked outside a resolved
+/// 3.2 extent. v3.0 selection evidence never lists the KEM names;
+/// all-NULL KEM resolutions lower no KEM targets while neighbors
+/// survive; a partial 3.2 extent preserves its neighbors.
+#[test]
+fn manifest_selection_kem_ordinals_need_resolved_32_extent() {
+    // Catalog structure: KEM lives only in the 3.2 extra fields,
+    // past the v3.0 walk extent.
+    let v30: Vec<&str> = pkcs11_module::FUNCTION_LIST_FIELDS
+        .iter()
+        .chain(pkcs11_module::FUNCTION_LIST_3_0_EXTRA_FIELDS)
+        .map(|field| field.name)
+        .collect();
+    assert_eq!(v30.len(), 92, "v3.0 walks ordinals 0..92");
+    assert!(!v30.contains(&"C_EncapsulateKey"));
+    assert!(!v30.contains(&"C_DecapsulateKey"));
+    let extra32: Vec<&str> = pkcs11_module::FUNCTION_LIST_3_2_EXTRA_FIELDS
+        .iter()
+        .map(|field| field.name)
+        .collect();
+    assert!(extra32.contains(&"C_EncapsulateKey"));
+    assert!(extra32.contains(&"C_DecapsulateKey"));
+
+    // v3.0 evidence lists no KEM function: nothing to lower.
+    let evidence30 =
+        manifest_selection_evidence(Version { major: 3, minor: 0 }, &[("C_GetInfo", 0x1000)]);
+    assert!(
+        !evidence30.tables[0].functions.iter().any(|function| {
+            function.name == "C_EncapsulateKey" || function.name == "C_DecapsulateKey"
+        }),
+        "v3.0 selection never names KEM"
+    );
+
+    // v3.2 evidence with all-NULL KEM resolutions lowers the resolved
+    // neighbor only: no KEM target enters the plan.
+    let dir = tempfile::tempdir().unwrap();
+    let provider = dir.path().join("provider.so");
+    std::fs::copy("/bin/sh", &provider).unwrap();
+    let base = object_facts(&provider).2;
+    let mut manifest = valid_manifest_for(std::slice::from_ref(&provider), &[0; 67]);
+    manifest.selection_evidence = manifest_selection_evidence(
+        Version { major: 3, minor: 2 },
+        &[("C_GetInfo", base + 80)],
+    );
+    let problems = crate::manifest_input::validate_structure(&manifest);
+    assert!(problems.is_empty(), "{problems:?}");
+    let pins = pin_manifest_objects(&manifest).unwrap();
+    let mut plan = plan::build_from_sources(&[], std::slice::from_ref(&manifest), &pins);
+    let allocated = plan.clone();
+    let (admissions, refused) = lower_manifest_selection_tables(
+        &mut plan,
+        &allocated,
+        std::slice::from_ref(&manifest),
+        &[0],
+        &pins,
+    );
+    assert!(refused.is_empty());
+    assert!(!admissions.is_empty(), "the neighbor admits");
+    assert!(
+        plan.slots.iter().all(|slot| {
+            !slot.names.iter().any(|name| {
+                name == "C_EncapsulateKey" || name == "C_DecapsulateKey"
+            })
+        }),
+        "NULL KEM resolutions lower no KEM targets"
+    );
+    assert!(
+        plan.slots.iter().any(|slot| slot.names.iter().any(|name| name == "C_GetInfo")),
+        "the resolved neighbor survives"
+    );
+
+    // Partial 3.2 extent: one resolved KEM target lowers alongside
+    // its neighbor; the NULL sibling stays out.
+    let mut manifest = valid_manifest_for(std::slice::from_ref(&provider), &[0; 67]);
+    manifest.selection_evidence = manifest_selection_evidence(
+        Version { major: 3, minor: 2 },
+        &[
+            ("C_GetInfo", base + 80),
+            ("C_EncapsulateKey", base + 96),
+        ],
+    );
+    let problems = crate::manifest_input::validate_structure(&manifest);
+    assert!(problems.is_empty(), "{problems:?}");
+    let pins = pin_manifest_objects(&manifest).unwrap();
+    let mut plan = plan::build_from_sources(&[], std::slice::from_ref(&manifest), &pins);
+    let allocated = plan.clone();
+    let (_, refused) = lower_manifest_selection_tables(
+        &mut plan,
+        &allocated,
+        std::slice::from_ref(&manifest),
+        &[0],
+        &pins,
+    );
+    assert!(refused.is_empty());
+    assert!(
+        plan.slots.iter().any(|slot| slot
+            .names
+            .iter()
+            .any(|name| name == "C_EncapsulateKey")),
+        "the resolved KEM target lowers"
+    );
+    assert!(
+        plan.slots.iter().any(|slot| slot.names.iter().any(|name| name == "C_GetInfo")),
+        "the neighbor survives the partial extent"
+    );
+    assert!(
+        plan.slots.iter().all(|slot| {
+            !slot.names.iter().any(|name| name == "C_DecapsulateKey")
+        }),
+        "the NULL KEM sibling stays out"
+    );
+}
+
 #[test]
 fn stale_manifest_selection_does_not_transfer_to_scan_replacement() {
     let dir = tempfile::tempdir().unwrap();

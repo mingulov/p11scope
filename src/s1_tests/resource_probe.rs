@@ -796,11 +796,16 @@ fn native_semantic_resource_final_types_pinned() {
     pin!(crate::semantics_objects::journal::JournalBirthCut, 40);
     pin!(RetainedBirth, 64);
     // +32 over 424: the retained target carries the entry's probed maps
-    // key (pre-6.8 overlay split rendering). Re-audited with the joint
-    // machine reservation: the worst-case transaction still binds.
+    // key (pre-6.8 overlay split rendering). +40 over 520 (packet 6.13):
+    // the entry carries the per-object change-bracket cells
+    // (`last_ok_ns`/`detected_ns`, +32) and the pre-arm raw-source marker
+    // (+8; `changed` packs into the bool tail). Re-audited with the joint
+    // machine reservation: the worst-case transaction still binds (the
+    // N/N+1 population and the 1,024-partition full-spread transaction
+    // pass at 560 bytes on this candidate).
     pin!(
         crate::semantic_capture::CurrentPartitionReceipt,
-        456 + size_of::<RetainedBirth>()
+        496 + size_of::<RetainedBirth>()
     );
     pin!(crate::semantic_capture::Invalidation, 72);
     pin!(crate::semantic_capture::InvalidationScope, 48);

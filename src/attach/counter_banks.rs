@@ -4906,6 +4906,22 @@ impl CounterDetailWindow {
 }
 
 impl CounterBanks {
+    /// Poison the directory mutex so the next reserve or close refuses
+    /// `Quarantined`: the unit seam for accepted-then-refused close
+    /// twins in the selected-detail adapter (which cannot name the
+    /// private lock). Mirrors the gate's own poison helper.
+    #[cfg(test)]
+    pub(crate) fn poison_directory_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.directory.lock().unwrap();
+            panic!("intentional close-test poison");
+        }));
+        assert!(
+            self.directory.is_poisoned(),
+            "the mutex stays poisoned for the refused close"
+        );
+    }
+
     /// Reserve a selected-detail window (6.15 split, phase 1): validate
     /// the published selection and the child slots, charge the child's
     /// maps/FDs/links at start plus the retained bind-time identity,

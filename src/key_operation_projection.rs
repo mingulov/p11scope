@@ -992,6 +992,8 @@ pub(crate) mod producer {
                 ViewOrigin::Created(CreationFamily::GeneratePair) => Some("generate_pair"),
                 ViewOrigin::Created(CreationFamily::Derive) => Some("derive"),
                 ViewOrigin::Created(CreationFamily::Unwrap) => Some("unwrap"),
+                ViewOrigin::Created(CreationFamily::Encapsulate) => Some("encapsulate"),
+                ViewOrigin::Created(CreationFamily::Decapsulate) => Some("decapsulate"),
                 ViewOrigin::FirstObserved => None,
             },
             birth: match view.birth {

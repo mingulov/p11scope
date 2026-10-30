@@ -6951,6 +6951,7 @@ fn key_operation_n1c_shared_owner_unsettled_census() {
         requested: [None, None],
         entry_mechanism: crate::semantics_objects::MechanismEvidence::NotCaptured,
         scope: crate::semantics_objects::SlotScope::Unknown,
+        entry_output: crate::semantics_objects::OutputEvidence::NotCaptured,
     };
     assert_eq!(
         scene.model.begin(model_origin, scene.adapter.ledger_mut()),
@@ -10843,7 +10844,7 @@ fn key_operation_kem_stale_input_is_never_replaced() {
         function,
         session: HandleInput::Value(session),
         inputs,
-        requested: [[0u8; 36]; 2],
+        requested: [None, None],
         entry_mechanism: MechanismEvidence::Value(0x17),
         scope,
         entry_output: crate::semantics_objects::OutputEvidence::NonNull,
@@ -11352,22 +11353,19 @@ fn key_operation_kem_abandoned_call_clears_without_proof() {
 
 // ==================== Checkbox 5: ledger, PQC, measurement ====================
 
-/// H9-§4: executed KEM operations stay `role_unavailable` with S1
-/// mechanism activity qualified separately: KEM endpoints are
-/// negative-only (staging refuses them explicitly — no KEM object
-/// read exists to join), while S1Only-direct execution with real PQC
-/// mechanism ids advances S1 mechanism counters and outcomes
-/// unchanged, and the projection carries no proved rows and no
-/// invented object facts.
+/// H9-§4: KEM endpoints are modeled (packet 6.07c stages and joins
+/// them), while receipt-less S1Only-direct execution with real PQC
+/// mechanism ids still partitions `role_unavailable` with S1
+/// mechanism activity qualified separately: S1 mechanism counters
+/// and outcomes advance unchanged, and the projection carries no
+/// proved rows and no invented object facts.
 #[test]
 fn key_operation_pqc_matrix_negative() {
     let mut assoc_ledger = StagingLedger::new();
     use crate::semantics_key_use::StagingRefusal;
 
-    // KEM never stages: no KEM object descriptor exists, so the
-    // frozen endpoint table leaves KEM negative-only (KEM is not
-    // even fixture-admittable), and the feed refuses KEM-shaped
-    // facts loudly instead of joining thin air.
+    // KEM stages now that object descriptors exist; the still-negative
+    // authenticated wrap keeps the explicit Unsealable control.
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -11378,17 +11376,30 @@ fn key_operation_pqc_matrix_negative() {
         let fid = crate::kinds::function_id(name).unwrap();
         assert_eq!(
             crate::semantics_objects::journal::endpoint_class(fid),
-            Some(crate::semantics_objects::journal::EndpointClass::NegativeOnlyAffecting),
-            "{name} withholds proof: absent prerequisite, explicit"
+            Some(crate::semantics_objects::journal::EndpointClass::ModeledAffecting),
+            "{name} is modeled"
         );
         let facts = op(name, 9, 700_000 + n as u64);
         let origin = EffectOrigin::from(&facts);
         assert_eq!(
             staging.stage(facts, origin, 100 + n as u64, scene.adapter.ledger_mut()),
-            Err(StagingRefusal::Unsealable),
-            "{name} is explicitly unstageable"
+            Ok(()),
+            "{name} stages"
         );
     }
+    let auth_wrap = crate::kinds::function_id("C_WrapKeyAuthenticated").unwrap();
+    assert_eq!(
+        crate::semantics_objects::journal::endpoint_class(auth_wrap),
+        Some(crate::semantics_objects::journal::EndpointClass::NegativeOnlyAffecting),
+        "authenticated wrap withholds proof: absent prerequisite, explicit"
+    );
+    let facts = op("C_WrapKeyAuthenticated", 9, 700_010);
+    let origin = EffectOrigin::from(&facts);
+    assert_eq!(
+        staging.stage(facts, origin, 110, scene.adapter.ledger_mut()),
+        Err(StagingRefusal::Unsealable),
+        "authenticated wrap is explicitly unstageable"
+    );
 
     // S1Only-direct execution with real PQC mechanism ids: S1
     // mechanism activity advances; the key side reports role

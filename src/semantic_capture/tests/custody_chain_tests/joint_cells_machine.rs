@@ -2175,15 +2175,18 @@ fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
         scene.scene.drain.source_mut().push_record(begin_a.to_vec());
         scene.scene.drain.source_mut().push_record(begin_a.to_vec());
     } else {
+        // KEM used to be the still-negative control here; it is
+        // modeled now, so the still-negative authenticated wrap
+        // carries the control.
         assert_eq!(
-            endpoint_class(function_id("C_EncapsulateKey")),
+            endpoint_class(function_id("C_WrapKeyAuthenticated")),
             Some(EndpointClass::NegativeOnlyAffecting)
         );
         assert_ne!(
-            crate::kinds::descriptor("C_EncapsulateKey").unwrap(),
+            crate::kinds::descriptor("C_WrapKeyAuthenticated").unwrap(),
             p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
         );
-        let (mut begin_a, _) = scene.scene.encoded(child_a.id(), 0, "C_EncapsulateKey", 2);
+        let (mut begin_a, _) = scene.scene.encoded(child_a.id(), 0, "C_WrapKeyAuthenticated", 2);
         begin_a[5] = p11scope_ebpf_common::object_journal::JOURNAL_BEGIN_NO_END;
         assert!(
             p11scope_ebpf_common::object_journal::validate_begin(&begin_a, None)

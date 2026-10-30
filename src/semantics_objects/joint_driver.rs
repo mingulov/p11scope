@@ -3394,8 +3394,8 @@ mod tests {
     fn joint_capture_owner_parts_lends_disjoint_adapter_and_model() {
         use crate::kinds::function_id;
         use crate::semantics_objects::{
-            CallKey, HandleInput, LostOutcome, MechanismEvidence, ObjectDomain, OriginFact, RefCut,
-            SlotScope,
+            CallKey, HandleInput, LostOutcome, MechanismEvidence, ObjectDomain, OriginFact,
+            OutputEvidence, RefCut, SlotScope,
         };
 
         let pool = SemanticResourcePool::default();
@@ -3419,6 +3419,7 @@ mod tests {
             requested: [None, None],
             entry_mechanism: MechanismEvidence::NotCaptured,
             scope: SlotScope::Unknown,
+            entry_output: OutputEvidence::NotCaptured,
         };
         let token = model
             .begin(origin, adapter.ledger_mut())
@@ -3450,7 +3451,8 @@ mod tests {
     fn joint_capture_owner_populated_drop_refunds_pool_exactly_once() {
         use crate::kinds::function_id;
         use crate::semantics_objects::{
-            CallKey, HandleInput, MechanismEvidence, ObjectDomain, OriginFact, RefCut, SlotScope,
+            CallKey, HandleInput, MechanismEvidence, ObjectDomain, OriginFact, OutputEvidence,
+            RefCut, SlotScope,
         };
 
         let pool = SemanticResourcePool::default();
@@ -3476,6 +3478,7 @@ mod tests {
                 requested: [None, None],
                 entry_mechanism: MechanismEvidence::NotCaptured,
                 scope: SlotScope::Unknown,
+                entry_output: OutputEvidence::NotCaptured,
             };
             model
                 .begin(origin, adapter.ledger_mut())

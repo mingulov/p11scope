@@ -637,6 +637,21 @@ pub(crate) struct OriginFact {
     pub(crate) entry_mechanism: MechanismEvidence,
     /// Slot/token scope evidence (OpenSession, CloseAllSessions).
     pub(crate) scope: SlotScope,
+    /// Entry-time S1 output-pointer decision (encapsulation query
+    /// guard): only a positively non-null decision authorizes an
+    /// encapsulation output. Finite class only, never an address.
+    pub(crate) entry_output: OutputEvidence,
+}
+
+/// Captured S1 output-pointer decision (`capture::OUTPUT_*`
+/// vocabulary): null/unreadable/not-captured decisions authorize no
+/// KEM output. Carries no address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputEvidence {
+    NotCaptured,
+    Null,
+    Unreadable,
+    NonNull,
 }
 
 /// One call's matched reference completion evidence.
@@ -742,6 +757,8 @@ pub(crate) enum CreationFamily {
     GeneratePair,
     Derive,
     Unwrap,
+    Encapsulate,
+    Decapsulate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

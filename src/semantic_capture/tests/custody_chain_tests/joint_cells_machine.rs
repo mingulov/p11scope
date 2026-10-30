@@ -2026,6 +2026,9 @@ fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
             "C_SignFinal",
             "C_GetSessionInfo",
             "C_EncapsulateKey",
+            // Packet 6.07c: the still-negative control (appended so
+            // existing slots never shift).
+            "C_WrapKeyAuthenticated",
         ],
         true,
     );

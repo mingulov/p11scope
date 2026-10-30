@@ -8407,15 +8407,11 @@ fn key_operation_schema_contract() {
             UNKNOWN_REASONS.contains(&unbound_reason_for(category)),
             "{category}"
         );
-        let applicable = ![
-            "generate_key",
-            "generate_key_pair",
-            "digest",
-            "direct",
-            "encapsulate",
-            "decapsulate",
-        ]
-        .contains(&category);
+        // Packet 6.07c: KEM binds its qualified receipts
+        // (receipt-less terminals still partition
+        // role_unavailable via unbound_reason_for).
+        let applicable =
+            !["generate_key", "generate_key_pair", "digest", "direct"].contains(&category);
         assert_eq!(binds_keys(category), applicable, "{category}");
         let message = matches!(
             category,
@@ -9337,13 +9333,14 @@ fn key_operation_kem_encapsulate_binds_input_role() {
                 .any(|row| row.category == "decapsulate"),
         "decapsulate ledger untouched"
     );
-    // The key use counted on the input object row exactly once.
+    // The key use counted on the input object row exactly once
+    // (the GET reference plus the KEM reference).
     let input_row = committed
         .objects
         .iter()
         .find(|row| row.successful_key_references == 1)
         .expect("one key use on the input");
-    assert_eq!(input_row.successful_references, 1);
+    assert_eq!(input_row.successful_references, 2);
 }
 
 /// Item 1 twins: receipt-less and unproved encapsulation stays
@@ -10317,13 +10314,14 @@ fn key_operation_kem_pending_and_ambiguous_gaps() {
             "{name}: the pending gap lands"
         );
         // Each named ambiguous RV: nothing but its gap.
+        // (CRYPTOKI_NOT_INITIALIZED is not ambiguous: unseen
+        // finalize contradicts, asserted separately below.)
         for rv in [
             CkRv::GENERAL_ERROR.0,
             CkRv::DEVICE_ERROR.0,
             CkRv::DEVICE_MEMORY.0,
             CkRv::DEVICE_REMOVED.0,
             CkRv::TOKEN_NOT_PRESENT.0,
-            CkRv::CRYPTOKI_NOT_INITIALIZED.0,
         ] {
             let mut scene = JointScene::new();
             let bootstrap = scene.bootstrap();
@@ -10372,6 +10370,47 @@ fn key_operation_kem_pending_and_ambiguous_gaps() {
                 "{name} {rv:#x}: no creation published"
             );
         }
+        // CRYPTOKI_NOT_INITIALIZED contradicts with unseen
+        // finalize (generic finalize semantics, not ambiguity).
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        let uninit = ShapedS1 {
+            kem_result: Some((0, 7)),
+            ..ShapedS1::shaped(name, CkRv::CRYPTOKI_NOT_INITIALIZED.0, 0x17, capture)
+        };
+        let (_, _, success) = drive_kem_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &uninit,
+        );
+        assert!(
+            referenced_effects(&success).is_empty(),
+            "{name}: no input use"
+        );
+        assert!(direct_receipts(&sink).is_empty());
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert!(
+            committed
+                .gaps
+                .iter()
+                .any(|row| row.reason == "unseen_finalize"),
+            "{name}: the finalize contradiction lands"
+        );
     }
 }
 
@@ -10416,14 +10455,19 @@ fn key_operation_kem_session_invalid_contradicts_session() {
                 referenced_effects(&success).is_empty(),
                 "{name} {rv:#x}: no input use"
             );
-            let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
             assert!(
-                committed
-                    .gaps
-                    .iter()
-                    .any(|row| row.reason == "session_contradiction"),
-                "{name} {rv:#x}: the contradiction gap lands"
+                success.effects.effects.iter().any(|effect| matches!(
+                    effect,
+                    crate::semantics_objects::ObjectEffect::SessionEnded {
+                        end: crate::semantics_objects::SessionEnd::Uncertain(
+                            crate::semantics_objects::ObjectGap::SessionContradiction
+                        ),
+                        ..
+                    }
+                )),
+                "{name} {rv:#x}: the contradiction ends the session"
             );
+            let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
             assert_eq!(
                 committed.sessions.len(),
                 1,
@@ -10529,6 +10573,7 @@ fn key_operation_kem_query_corner_refuses_use_and_output() {
             &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
         );
         let before = scene.model.project().objects.len();
+        let s1_before = (joint.started(), joint.completed());
         let query = ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, capture);
         let (_, _, success) = drive_kem_quantum(
             &mut scene,
@@ -10570,7 +10615,11 @@ fn key_operation_kem_query_corner_refuses_use_and_output() {
         );
         // S1 still completes the observed successful call: S1
         // accounting is unchanged by the object refusal.
-        assert_eq!((joint.started(), joint.completed()), (2, 2));
+        assert_eq!(
+            (joint.started(), joint.completed()),
+            (s1_before.0 + 1, s1_before.1 + 1),
+            "capture {capture:#x}: S1 completes the refused query"
+        );
     }
     // Healthy twin: the non-null owned call uses and creates.
     let mut scene = JointScene::new();
@@ -10696,12 +10745,12 @@ fn key_operation_kem_hostile_input_establishes_no_use() {
 /// output while the proved input use stands.
 #[test]
 fn key_operation_kem_hostile_result_mints_nothing() {
-    // (word, status, gap): unreadable and zero cells report
-    // output_unreadable; protocol-unavailable stays uncaptured.
+    // (word, status, gap): every non-handle cell shape reports
+    // output_unreadable while the proved input use stands.
     for (word, status, gap) in [
         (0u64, 2u8, "output_unreadable"),
         (0u64, 3u8, "output_unreadable"),
-        (0u64, 7u8, "unexpected_output"),
+        (0u64, 7u8, "output_unreadable"),
     ] {
         for (name, capture) in [
             ("C_EncapsulateKey", kem_encap_capture()),
@@ -10844,10 +10893,10 @@ fn key_operation_kem_single_result_is_never_a_pair() {
 }
 
 /// Item 17: retirement. A KEM input retired between the call's
-/// begin snapshot and its completion never joins: the stale
-/// original is not replaced by the current equal handle, no
-/// reference binds, and the successful S1 operation stays in the
-/// role_unavailable unknown summary.
+/// begin snapshot and its completion never joins: the overlapping
+/// same-session destroy is interference, so the stale original
+/// binds no reference, gains no replacement view, and mints no
+/// output (the completion's output handle tombstones).
 #[test]
 fn key_operation_kem_stale_input_is_never_replaced() {
     use crate::semantics_objects::journal::StagingLedger;
@@ -10966,12 +11015,12 @@ fn key_operation_kem_stale_input_is_never_replaced() {
             .any(|effect| matches!(effect, ObjectEffect::Referenced { .. })),
         "the stale input binds no reference"
     );
-    // The retired input's access stays ended; the independently
-    // observed output still mints. Exactly two views (no rebound
-    // third view for the stale handle), the input one retired with
-    // no reference bound.
+    // The retired input's access stays ended; the interfered
+    // output never mints. Exactly one view (no rebound view for
+    // the stale handle, no output view), the input one retired
+    // with no reference bound.
     let views = model.project().objects;
-    assert_eq!(views.len(), 2);
+    assert_eq!(views.len(), 1);
     let stale = views
         .iter()
         .find(|view| view.id == created[0])
@@ -10982,13 +11031,25 @@ fn key_operation_kem_stale_input_is_never_replaced() {
     );
     assert_eq!(stale.references, 0, "the stale input binds no reference");
     assert_eq!(stale.key_uses, 0, "the stale input counts no key use");
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Created { .. } | ObjectEffect::FirstObserved { .. }
+        )),
+        "the interfered completion mints nothing"
+    );
 }
 
-/// Item 17 (Joint leg): a KEM call against an already-retired
-/// input completes its S1 operation into the role_unavailable
-/// summary; no receipt binds.
+/// Item 17 (Joint leg): an OK-returning KEM call against an
+/// already-retired input first-observes (generic rebound
+/// semantics, shared with derive/unwrap): the retired object
+/// itself gains no reference and stays destroyed, while the
+/// fresh first-observed input binds a receipt with unknown
+/// metadata. (Truly unprovable inputs stay receipt-less per the
+/// unproved twins; INVALID_HANDLE ends access per bad_handle.)
 #[test]
 fn key_operation_kem_retired_input_stays_unavailable() {
+    use crate::semantics_objects::ObjectEffect;
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -11011,6 +11072,7 @@ fn key_operation_kem_retired_input_stays_unavailable() {
         &mut sink,
         &ShapedS1::shaped("C_DestroyObject", CkRv::OK.0, 0, 0),
     );
+    let retired_id = scene.model.project().objects[0].id;
     let (_, _, success) = drive_kem_quantum(
         &mut scene,
         &mut staging,
@@ -11019,15 +11081,47 @@ fn key_operation_kem_retired_input_stays_unavailable() {
         &mut sink,
         &ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture()),
     );
-    assert!(referenced_effects(&success).is_empty());
-    assert!(direct_receipts(&sink).is_empty());
+    // The join targets a fresh first-observed view, never the
+    // retired object.
+    assert!(
+        success
+            .effects
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ObjectEffect::FirstObserved { .. })),
+        "the rebound handle first-observes"
+    );
+    let referenced = referenced_effects(&success);
+    assert_eq!(referenced.len(), 1);
+    match &referenced[0] {
+        ObjectEffect::Referenced { object, .. } => {
+            assert_ne!(*object, retired_id, "the retired object gains no reference")
+        }
+        other => panic!("expected Referenced, got {other:?}"),
+    }
+    let views = scene.model.project().objects;
+    let retired = views
+        .iter()
+        .find(|view| view.id == retired_id)
+        .expect("the retired view survives");
+    assert!(
+        matches!(
+            retired.lifetime,
+            crate::semantics_objects::Lifetime::Destroyed
+        ),
+        "the retired view stays destroyed"
+    );
+    assert_eq!(retired.references, 0);
+    assert_eq!(retired.key_uses, 0);
+    let receipts = direct_receipts(&sink);
+    assert_eq!(receipts.len(), 1);
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
     let unknown: Vec<_> = committed
         .unknown_key_operations
         .iter()
         .map(|row| (row.category, row.reason, row.completed))
         .collect();
-    assert_eq!(unknown, vec![("encapsulate", "role_unavailable", 1)]);
+    assert_eq!(unknown, vec![("encapsulate", "metadata_unknown", 1)]);
 }
 
 /// Item 18: later qualification is forward-only. A KEM output's
@@ -11352,6 +11446,10 @@ fn key_operation_kem_abandoned_call_clears_without_proof() {
         call.flags,
     );
     assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+    assert_eq!(
+        scene.ingest_ordinary(ordinary_for(&begin, CkRv::OK.0)),
+        JournalDisposition::ReturnObserved
+    );
     assert_eq!(
         scene.ingest(&abandon_bytes(
             scene.thread,

@@ -10666,10 +10666,8 @@ fn manifest_selection_kem_ordinals_need_resolved_32_extent() {
     std::fs::copy("/bin/sh", &provider).unwrap();
     let base = object_facts(&provider).2;
     let mut manifest = valid_manifest_for(std::slice::from_ref(&provider), &[0; 67]);
-    manifest.selection_evidence = manifest_selection_evidence(
-        Version { major: 3, minor: 2 },
-        &[("C_GetInfo", base + 80)],
-    );
+    manifest.selection_evidence =
+        manifest_selection_evidence(Version { major: 3, minor: 2 }, &[("C_GetInfo", base + 80)]);
     let problems = crate::manifest_input::validate_structure(&manifest);
     assert!(problems.is_empty(), "{problems:?}");
     let pins = pin_manifest_objects(&manifest).unwrap();
@@ -10686,14 +10684,17 @@ fn manifest_selection_kem_ordinals_need_resolved_32_extent() {
     assert!(!admissions.is_empty(), "the neighbor admits");
     assert!(
         plan.slots.iter().all(|slot| {
-            !slot.names.iter().any(|name| {
-                name == "C_EncapsulateKey" || name == "C_DecapsulateKey"
-            })
+            !slot
+                .names
+                .iter()
+                .any(|name| name == "C_EncapsulateKey" || name == "C_DecapsulateKey")
         }),
         "NULL KEM resolutions lower no KEM targets"
     );
     assert!(
-        plan.slots.iter().any(|slot| slot.names.iter().any(|name| name == "C_GetInfo")),
+        plan.slots
+            .iter()
+            .any(|slot| slot.names.iter().any(|name| name == "C_GetInfo")),
         "the resolved neighbor survives"
     );
 
@@ -10702,10 +10703,7 @@ fn manifest_selection_kem_ordinals_need_resolved_32_extent() {
     let mut manifest = valid_manifest_for(std::slice::from_ref(&provider), &[0; 67]);
     manifest.selection_evidence = manifest_selection_evidence(
         Version { major: 3, minor: 2 },
-        &[
-            ("C_GetInfo", base + 80),
-            ("C_EncapsulateKey", base + 96),
-        ],
+        &[("C_GetInfo", base + 80), ("C_EncapsulateKey", base + 96)],
     );
     let problems = crate::manifest_input::validate_structure(&manifest);
     assert!(problems.is_empty(), "{problems:?}");
@@ -10721,20 +10719,21 @@ fn manifest_selection_kem_ordinals_need_resolved_32_extent() {
     );
     assert!(refused.is_empty());
     assert!(
-        plan.slots.iter().any(|slot| slot
-            .names
+        plan.slots
             .iter()
-            .any(|name| name == "C_EncapsulateKey")),
+            .any(|slot| slot.names.iter().any(|name| name == "C_EncapsulateKey")),
         "the resolved KEM target lowers"
     );
     assert!(
-        plan.slots.iter().any(|slot| slot.names.iter().any(|name| name == "C_GetInfo")),
+        plan.slots
+            .iter()
+            .any(|slot| slot.names.iter().any(|name| name == "C_GetInfo")),
         "the neighbor survives the partial extent"
     );
     assert!(
-        plan.slots.iter().all(|slot| {
-            !slot.names.iter().any(|name| name == "C_DecapsulateKey")
-        }),
+        plan.slots
+            .iter()
+            .all(|slot| { !slot.names.iter().any(|name| name == "C_DecapsulateKey") }),
         "the NULL KEM sibling stays out"
     );
 }

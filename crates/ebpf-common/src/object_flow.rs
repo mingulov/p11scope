@@ -1527,7 +1527,11 @@ mod tests {
     }
 
     fn kem_descriptor(encapsulate: bool) -> u32 {
-        if encapsulate { 93 } else { 94 }
+        if encapsulate {
+            93
+        } else {
+            94
+        }
     }
 
     // Mutation caught: a KEM input/result acquisition outside FULL, a
@@ -1763,14 +1767,7 @@ mod tests {
                 1,
             ),
             // Unreadable length-cell address withholds.
-            (
-                Some(0x5000u64),
-                Some(2u64),
-                None,
-                Ok(0x7000u64),
-                false,
-                1,
-            ),
+            (Some(0x5000u64), Some(2u64), None, Ok(0x7000u64), false, 1),
             // NULL length cell has no span: healthy retention.
             (
                 Some(0x5000u64),
@@ -1941,14 +1938,14 @@ mod tests {
         use crate::object_capture::handle_status as hst;
         use crate::object_capture::object_flag as ofl;
         for (input, layout, status, word, flags) in [
-            (None, LinuxLayout::Lp64, hst::UNREADABLE, 0, ofl::ARG_READ_FAILURE),
             (
-                Some(0),
+                None,
                 LinuxLayout::Lp64,
-                hst::INVALID_ZERO,
+                hst::UNREADABLE,
                 0,
-                0,
+                ofl::ARG_READ_FAILURE,
             ),
+            (Some(0), LinuxLayout::Lp64, hst::INVALID_ZERO, 0, 0),
             (
                 Some(0x1_0000_0001),
                 LinuxLayout::Ilp32,
@@ -2171,8 +2168,15 @@ mod tests {
                     assert!(ok);
                     assert_eq!(reads.get(), 1);
                     assert_eq!(side.result_statuses, [status, hst::ABSENT]);
-                    assert_eq!(side.result_ptrs, [if status == hst::VALUE { cell } else { 0 }, 0]);
-                    assert_eq!(side.flags & (ofl::ALIAS | ofl::DUPLICATE_RESULT | ofl::PARTIAL_RESULT) as u16, 0);
+                    assert_eq!(
+                        side.result_ptrs,
+                        [if status == hst::VALUE { cell } else { 0 }, 0]
+                    );
+                    assert_eq!(
+                        side.flags
+                            & (ofl::ALIAS | ofl::DUPLICATE_RESULT | ofl::PARTIAL_RESULT) as u16,
+                        0
+                    );
                     assert_eq!(side.phase, 3);
                 }
                 // Unreadable cell: finite status, never a value.

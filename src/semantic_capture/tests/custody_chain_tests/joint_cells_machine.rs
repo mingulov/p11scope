@@ -2186,7 +2186,9 @@ fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
             crate::kinds::descriptor("C_WrapKeyAuthenticated").unwrap(),
             p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
         );
-        let (mut begin_a, _) = scene.scene.encoded(child_a.id(), 0, "C_WrapKeyAuthenticated", 2);
+        let (mut begin_a, _) = scene
+            .scene
+            .encoded(child_a.id(), 0, "C_WrapKeyAuthenticated", 2);
         begin_a[5] = p11scope_ebpf_common::object_journal::JOURNAL_BEGIN_NO_END;
         assert!(
             p11scope_ebpf_common::object_journal::validate_begin(&begin_a, None)

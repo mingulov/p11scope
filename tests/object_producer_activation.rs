@@ -1069,21 +1069,12 @@ fn object_marker_arms_only_under_allowlisted_policy() {
 #[test]
 fn object_kem_entry_runs_only_through_the_shared_adapter() {
     let source = bpf_source();
-    let fill = source_between(
-        &source,
-        "fn object_fill_entry(",
-        "fn object_entry_derive(",
-    );
+    let fill = source_between(&source, "fn object_fill_entry(", "fn object_entry_derive(");
     assert!(
-        fill.contains("OBJECT_ACTION_ENCAPSULATE")
-            && fill.contains("OBJECT_ACTION_DECAPSULATE"),
+        fill.contains("OBJECT_ACTION_ENCAPSULATE") && fill.contains("OBJECT_ACTION_DECAPSULATE"),
         "generic input acquisition must skip both KEM actions"
     );
-    let results = source_between(
-        &source,
-        "fn object_entry_results(",
-        "fn object_entry_find(",
-    );
+    let results = source_between(&source, "fn object_entry_results(", "fn object_entry_find(");
     assert!(
         results.contains("OBJECT_ACTION_ENCAPSULATE")
             && results.contains("OBJECT_ACTION_DECAPSULATE"),

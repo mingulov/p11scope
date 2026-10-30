@@ -11561,7 +11561,7 @@ fn key_operation_kem_contracts_audit() {
     )
     .expect("v1 schema parses");
     assert_eq!(v1["properties"]["version"]["const"], 1);
-    let v1_roles = v1["properties"]["key_operations"]["items"]["properties"]["role"]["enum"]
+    let v1_roles = v1["$defs"]["role"]["enum"]
         .as_array()
         .expect("v1 role enum");
     assert_eq!(v1_roles.len(), 6);
@@ -11571,6 +11571,15 @@ fn key_operation_kem_contracts_audit() {
             .is_some_and(|label| label.contains("capsulat"))),
         "v1 roles exclude KEM"
     );
+    let v1_creations = v1["$defs"]["object_row"]["properties"]["creation"]["enum"]
+        .as_array()
+        .expect("v1 creation enum");
+    assert!(
+        !v1_creations.iter().any(|label| label
+            .as_str()
+            .is_some_and(|label| label.contains("capsulat"))),
+        "v1 creations exclude KEM"
+    );
     // v2 schema: version 2, v1 plus exactly the KEM labels.
     let v2: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string("docs/schema/inventory-v1-object-observations-v2.schema.json")
@@ -11578,7 +11587,7 @@ fn key_operation_kem_contracts_audit() {
     )
     .expect("v2 schema parses");
     assert_eq!(v2["properties"]["version"]["const"], 2);
-    let v2_roles = v2["properties"]["key_operations"]["items"]["properties"]["role"]["enum"]
+    let v2_roles = v2["$defs"]["role"]["enum"]
         .as_array()
         .expect("v2 role enum");
     assert_eq!(
@@ -11588,7 +11597,7 @@ fn key_operation_kem_contracts_audit() {
             .collect::<Vec<_>>(),
         ROLE_LABELS_V2,
     );
-    let v2_creations = v2["properties"]["objects"]["items"]["properties"]["creation"]["enum"]
+    let v2_creations = v2["$defs"]["object_row"]["properties"]["creation"]["enum"]
         .as_array()
         .expect("v2 creation enum");
     assert_eq!(v2_creations.len(), 9, "8 creations plus null");

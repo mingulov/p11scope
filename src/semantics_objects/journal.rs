@@ -6366,7 +6366,7 @@ pub(crate) mod tests {
                 },
             },
             pkcs11_module::Surface::StandardInterface {
-                version: cryptoki_sys::CK_VERSION { major: 3, minor: 0 },
+                version: cryptoki_sys::CK_VERSION { major: 3, minor: 2 },
             },
         ];
         let mut functions = Vec::new();
@@ -7116,7 +7116,7 @@ pub(crate) mod tests {
     /// manifest: every modeled function journal tests stage needs an
     /// admittable plan slot, since each staged call converts only
     /// under its own H3 admission claim.
-    const ADMITTABLE_FUNCTIONS: [&str; 23] = [
+    const ADMITTABLE_FUNCTIONS: [&str; 25] = [
         "C_CreateObject",
         "C_GetAttributeValue",
         "C_SignInit",
@@ -7144,16 +7144,23 @@ pub(crate) mod tests {
         "C_FindObjectsFinal",
         "C_CloseAllSessions",
         "C_Finalize",
+        // Packet 6.07c KEM extension, appended for the same reason.
+        "C_EncapsulateKey",
+        "C_DecapsulateKey",
     ];
 
     /// v3-only functions, resolved on the 3.0 interface surface
     /// (they ride no legacy table) at `start + 64 + stride`, clear of
     /// the legacy `start + index` band.
-    const V3_ONLY_FUNCTIONS: [&str; 4] = [
+    const V3_ONLY_FUNCTIONS: [&str; 6] = [
         "C_SignMessage",
         "C_MessageSignInit",
         "C_MessageSignFinal",
         "C_SessionCancel",
+        // Packet 6.07c KEM (v3.2 surface): appended so existing
+        // strides (and their offsets) never shift.
+        "C_EncapsulateKey",
+        "C_DecapsulateKey",
     ];
 
     /// Genuine-bind identity answers: the cookie queries the bind
@@ -7400,12 +7407,12 @@ pub(crate) mod tests {
                     _ => panic!("2.40 is a full standard table"),
                 };
             // The v3-only functions ride no legacy table: resolve
-            // each on a v3 interface surface (canonical V3_0 walk
-            // order) at `start + 64 + stride`, clear of the legacy
-            // `start + index` band.
+            // each on a v3 interface surface (canonical V3_2 walk
+            // order, a strict superset of V3_0) at `start + 64 +
+            // stride`, clear of the legacy `start + index` band.
             let message_functions: Vec<FunctionRecord> =
                 match pkcs11_module::tables_for(pkcs11_module::Surface::StandardInterface {
-                    version: cryptoki_sys::CK_VERSION { major: 3, minor: 0 },
+                    version: cryptoki_sys::CK_VERSION { major: 3, minor: 2 },
                 }) {
                     pkcs11_module::TableSet::Walk(spans) => spans
                         .iter()
@@ -7425,7 +7432,7 @@ pub(crate) mod tests {
                             }
                         })
                         .collect(),
-                    _ => panic!("3.0 is a full standard table"),
+                    _ => panic!("3.2 is a full standard table"),
                 };
             let path = path.to_str().unwrap().to_string();
             let manifest = Manifest {
@@ -7465,7 +7472,7 @@ pub(crate) mod tests {
                             classification: InterfaceClassification::ExactStandard,
                         },
                         acquisition: Acquisition::Ok,
-                        version: Some(Version { major: 3, minor: 0 }),
+                        version: Some(Version { major: 3, minor: 2 }),
                         walk: WalkOutcome::Full,
                         functions: message_functions,
                     },

@@ -2047,8 +2047,10 @@ mod tests {
             ],
             Ok(0x7000),
         );
-        let mut side = ObjectStart::default();
-        side.inputs = [0xAAAA, 0xBBBB];
+        let mut side = ObjectStart {
+            inputs: [0xAAAA, 0xBBBB],
+            ..ObjectStart::default()
+        };
         assert!(spy.run(
             Some(&mut side),
             21,
@@ -2140,10 +2142,12 @@ mod tests {
                 // Healthy CKR_OK: exactly one read at the retained
                 // pointer; slot 1 stays absent; no pair flags.
                 for (cell, status) in [(0x777u64, hst::VALUE), (0, hst::INVALID_ZERO)] {
-                    let mut side = ObjectStart::default();
-                    side.descriptor_index = descriptor;
-                    side.phase = 2;
-                    side.result_ptrs = [0x7000, 0];
+                    let mut side = ObjectStart {
+                        descriptor_index: descriptor,
+                        phase: 2,
+                        result_ptrs: [0x7000, 0],
+                        ..ObjectStart::default()
+                    };
                     let reads = core::cell::Cell::new(0u32);
                     let ok = adapter_fill_return(
                         Some(&mut side),
@@ -2175,10 +2179,12 @@ mod tests {
                     assert_eq!(side.phase, 3);
                 }
                 // Unreadable cell: finite status, never a value.
-                let mut side = ObjectStart::default();
-                side.descriptor_index = descriptor;
-                side.phase = 2;
-                side.result_ptrs = [0x7000, 0];
+                let mut side = ObjectStart {
+                    descriptor_index: descriptor,
+                    phase: 2,
+                    result_ptrs: [0x7000, 0],
+                    ..ObjectStart::default()
+                };
                 assert!(adapter_fill_return(
                     Some(&mut side),
                     descriptor,
@@ -2201,10 +2207,12 @@ mod tests {
                     (0u64, true, 0u64),
                     (0u64, true, u64::MAX),
                 ] {
-                    let mut side = ObjectStart::default();
-                    side.descriptor_index = descriptor;
-                    side.phase = 2;
-                    side.result_ptrs = [ptr, 0];
+                    let mut side = ObjectStart {
+                        descriptor_index: descriptor,
+                        phase: 2,
+                        result_ptrs: [ptr, 0],
+                        ..ObjectStart::default()
+                    };
                     let reads = core::cell::Cell::new(0u32);
                     let ok = adapter_fill_return(
                         Some(&mut side),

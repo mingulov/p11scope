@@ -56,7 +56,7 @@ use crate::inventory_promotion::lifecycle::{
 use crate::inventory_promotion::{PromotionRequest, RequestId};
 use crate::inventory_semantics::AttestedSubset;
 use crate::inventory_semantics::selected::ProvisionalSelectedLane;
-use crate::plan::{AdmissionPolicy, AttachKey, AttachPlan};
+use crate::plan::{AdmissionPolicy, AttachKey, AttachPlan, Slot};
 use crate::process::PidPin;
 use crate::semantics_edge::resources::SemanticResourceReserver;
 use p11scope_ebpf_common::CounterMode;
@@ -732,75 +732,194 @@ pub(super) fn accept_after_bracket(
     }
 }
 
+/// The broad session gate abstracted for shared receipt handling:
+/// production passes `&Session` (live banks, generation and stopped
+/// state), unit tests pass [`BanksBroad`] (staged banks with scripted
+/// facts). Both run the SAME [`reserve_detail_window`] and
+/// [`close_detail_window`] bodies, so accepted-receipt preservation
+/// cannot diverge between Session and injected-banks paths.
+pub(crate) trait BroadSession {
+    fn generation(&self) -> NonZeroU64;
+    fn reserve_gate(
+        &self,
+        broad_plan: &AttachPlan,
+        child_objects: &PinnedObjects,
+        selected: u32,
+        child_slots: &[Slot],
+        read_seq_before: u64,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<DetailWindowReservation, DetailToggleRefusal>;
+    fn close_window(
+        &self,
+        window: CounterDetailWindow,
+        read_seq_after: u64,
+    ) -> Result<(CounterDetailLineage, Option<DetailToggleDrift>), DetailToggleRefusal>;
+}
+
+impl BroadSession for Session {
+    fn generation(&self) -> NonZeroU64 {
+        self.counter_collection_generation()
+    }
+    fn reserve_gate(
+        &self,
+        broad_plan: &AttachPlan,
+        child_objects: &PinnedObjects,
+        selected: u32,
+        child_slots: &[Slot],
+        read_seq_before: u64,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<DetailWindowReservation, DetailToggleRefusal> {
+        self.reserve_gate_window(
+            broad_plan,
+            child_objects,
+            selected,
+            child_slots,
+            read_seq_before,
+            reserve,
+        )
+    }
+    fn close_window(
+        &self,
+        window: CounterDetailWindow,
+        read_seq_after: u64,
+    ) -> Result<(CounterDetailLineage, Option<DetailToggleDrift>), DetailToggleRefusal> {
+        window.close_on(self, read_seq_after)
+    }
+}
+
+/// Staged-banks broad for the shared Session implementation: the same
+/// gate/close the [`Session`] wrapper reads live, with scripted facts.
+/// `banks: None` simulates a broad Session without counter banks
+/// (`BroadNotCounter`). Production [`Session`] and unit [`BanksBroad`]
+/// both run [`reserve_detail_window`]/[`close_detail_window`].
+pub(crate) struct BanksBroad<'a> {
+    pub(crate) banks: Option<&'a CounterBanks>,
+    pub(crate) facts: BroadToggleFacts,
+}
+
+impl BroadSession for BanksBroad<'_> {
+    fn generation(&self) -> NonZeroU64 {
+        self.facts.generation
+    }
+    fn reserve_gate(
+        &self,
+        broad_plan: &AttachPlan,
+        child_objects: &PinnedObjects,
+        selected: u32,
+        child_slots: &[Slot],
+        read_seq_before: u64,
+        reserve: &SemanticResourceReserver,
+    ) -> Result<DetailWindowReservation, DetailToggleRefusal> {
+        let Some(banks) = self.banks else {
+            return Err(DetailToggleRefusal::BroadNotCounter);
+        };
+        banks.reserve_detail_window(
+            self.facts,
+            broad_plan,
+            child_objects,
+            selected,
+            child_slots,
+            read_seq_before,
+            reserve,
+        )
+    }
+    fn close_window(
+        &self,
+        window: CounterDetailWindow,
+        read_seq_after: u64,
+    ) -> Result<(CounterDetailLineage, Option<DetailToggleDrift>), DetailToggleRefusal> {
+        let Some(banks) = self.banks else {
+            return Err(DetailToggleRefusal::BroadNotCounter);
+        };
+        window.close(banks, self.facts.generation, read_seq_after)
+    }
+}
+
 /// Phase 1 (driver tick, BEFORE `SelectedLifecycleService::start`):
 /// resolve the endpoint receipt, validate the broad plan, observe the
-/// live bracketing acquisition through the bracket collector, charge
-/// and mark through the gate, and place the reservation in custody.
-/// Refusal records the [`SelectedDetailRefusal`], queues nothing and
-/// starts no worker; aggregate capture is untouched. The bracket seq
-/// assigns only on actual collector acceptance (the read-seq rule:
-/// seqs count successful observes only, minted here, never by the
-/// gate) and returns with the accepted receipt; `seq` is untouched on
-/// refusal. STAGED (6.15): the live bracketing read needs running
-/// maps; unit coverage runs through
-/// [`reserve_detail_window_on_banks`] with an injected accepted read
-/// over the same shared checks, plus [`accept_before_bracket`].
+/// bracketing acquisition through the bracket collector, charge and
+/// mark through the gate, and place the reservation in custody.
+/// The driver performs the live bracketing read (`read_banked`) and
+/// passes it as `source`; unit tests pass a scripted read with
+/// [`BanksBroad`]. Production `&Session` and test `BanksBroad` run
+/// this SAME body via [`BroadSession`], so receipt handling cannot
+/// diverge. Refusal records the [`ReserveRefusal`], queues nothing
+/// and starts no worker; aggregate capture is untouched. The bracket
+/// seq assigns only on actual collector acceptance (the read-seq
+/// rule: seqs count successful observes only, minted here, never by
+/// the gate) and returns with the accepted receipt; `seq` advances on
+/// acceptance even when a later gate/custody step refuses (only
+/// pre-acceptance refusals leave `seq` untouched). A gate or custody
+/// refusal after acceptance carries `Some` with that interval's
+/// deltas for aggregate rendering; pre-acceptance refusals carry
+/// `None`. STAGED (6.15): the driver packet calls this with its live
+/// read; unit coverage runs this same body with staged banks.
 #[allow(clippy::too_many_arguments)] // One driver orchestration over all retained inputs; the bundle keeps preparation inputs together.
-#[allow(dead_code)] // STAGED (6.15): the driver packet calls this; unit coverage runs banks-level.
-pub(crate) fn reserve_detail_window(
-    broad: &Session,
+#[allow(dead_code)] // STAGED (6.15): the driver packet calls this; unit coverage runs this same body with BanksBroad.
+#[allow(clippy::result_large_err)] // Cold refuse path: the failure returns the accepted receipt for aggregate rendering.
+pub(super) fn reserve_detail_window<B: BroadSession>(
+    broad: &B,
     broad_plan: &AttachPlan,
     broad_objects: &PinnedObjects,
     request: &PromotionRequest,
     bundle: &PreparationBundle,
     brackets: &mut BroadBracketCollector,
     seq: &mut u64,
+    source: Result<CounterRead, ReadStage>,
     reserve: &SemanticResourceReserver,
     custody: &DetailWindowCustody,
-) -> Result<AcceptedBracket, SelectedDetailRefusal> {
-    let resolved = verify_reserve_inputs(request, bundle, broad_plan, broad_objects, custody)?;
+) -> Result<AcceptedBracket, ReserveRefusal> {
+    let resolved = verify_reserve_inputs(request, bundle, broad_plan, broad_objects, custody)
+        .map_err(|refusal| ReserveRefusal {
+            refusal,
+            bracket: None,
+        })?;
     // The sealed prepared-child identity travels with the reservation
     // (R2-D2-B): a bundle that cannot seal it (ambiguous, empty or
     // unpinned subset) never reserves, before any charge.
-    let receipt =
-        PreparedChildReceipt::of_bundle(bundle).ok_or(SelectedDetailRefusal::EndpointUnresolved)?;
-    // The live bracketing acquisition (R2-D2-C): the metrics
-    // orchestration observes the EXACT acquisition through the broad
-    // collector and assigns the bracket seq only on actual acceptance.
-    let limits = CounterLimits {
-        rows: broad_plan.slots.len(),
-        rv_keys: crate::attach::counter_banks::COUNTER_RV_KEY_POOL,
-    };
-    let acquired =
-        super::counter_reader::read_banked(broad, broad_plan, broad_objects, limits, reserve);
-    let bracket = accept_before_bracket(
-        brackets,
-        acquired,
-        broad_plan,
-        broad.counter_collection_generation(),
-        seq,
-    )?;
+    let receipt = PreparedChildReceipt::of_bundle(bundle).ok_or(ReserveRefusal {
+        refusal: SelectedDetailRefusal::EndpointUnresolved,
+        bracket: None,
+    })?;
+    // The bracketing acquisition (R2-D2-C): the metrics orchestration
+    // observes the EXACT acquisition through the broad collector and
+    // assigns the bracket seq only on actual acceptance.
+    let bracket = accept_before_bracket(brackets, source, broad_plan, broad.generation(), seq)
+        .map_err(|refusal| ReserveRefusal {
+            refusal,
+            bracket: None,
+        })?;
     // The gate resolves child slot ids in the CONVERT store (its own
     // id space); broad objects only narrowed the bridge. Passing the
     // broad store here would misresolve every split-store child.
-    let reservation = broad
-        .reserve_gate_window(
-            broad_plan,
-            bundle.convert_subset().pins(),
-            resolved.selected,
-            bundle.convert_subset().plan().slots.as_slice(),
-            bracket.seq,
-            reserve,
-        )
-        .map_err(SelectedDetailRefusal::Gate)?;
+    let seq_assigned = bracket.seq;
+    let reservation = match broad.reserve_gate(
+        broad_plan,
+        bundle.convert_subset().pins(),
+        resolved.selected,
+        bundle.convert_subset().plan().slots.as_slice(),
+        seq_assigned,
+        reserve,
+    ) {
+        Ok(reservation) => reservation,
+        Err(gate) => {
+            return Err(ReserveRefusal {
+                refusal: SelectedDetailRefusal::Gate(gate),
+                bracket: Some(bracket),
+            });
+        }
+    };
     // Custody owns the reservation from before the worker starts; on
     // the impossible occupied race, abandon immediately (never a
-    // silent drop) and report WindowActive.
+    // silent drop) and report WindowActive with the accepted receipt.
     match custody.place_reserved(ReservedDetailWindow::new(reservation, receipt)) {
         Ok(()) => Ok(bracket),
         Err(reserved) => {
             reserved.abandon();
-            Err(SelectedDetailRefusal::WindowActive)
+            Err(ReserveRefusal {
+                refusal: SelectedDetailRefusal::WindowActive,
+                bracket: Some(bracket),
+            })
         }
     }
 }
@@ -808,8 +927,8 @@ pub(crate) fn reserve_detail_window(
 /// Banks-level phase 1 with an injected accepted bracketing read: the
 /// unit seam for the full reserve matrix (live Session/maps are
 /// unavailable to unit tests). Production reaches the same shared
-/// checks through [`reserve_detail_window`], which performs the
-/// bracketing read internally.
+/// checks through [`reserve_detail_window`], with the driver
+/// performing the live bracketing read and passing it as `source`.
 #[allow(clippy::too_many_arguments)] // Test seam mirroring the driver orchestration above.
 pub(super) fn reserve_detail_window_on_banks(
     banks: &CounterBanks,
@@ -852,10 +971,9 @@ pub(super) fn reserve_detail_window_on_banks(
 
 /// Banks-level phase 1 with collector observation: the unit seam for
 /// accepted-read-then-refusal (live Session/maps are unavailable to
-/// unit tests). Mirrors [`reserve_detail_window`]'s ordering —
-/// shared checks, then [`accept_before_bracket`], then the gate, then
-/// custody — and publishes the accepted bracket even when the gate or
-/// custody refuses after the collector advanced.
+/// unit tests). Delegates to the SAME [`reserve_detail_window`] body
+/// production runs via [`BroadSession`], with staged banks and
+/// scripted facts — never an independent duplicate.
 #[allow(clippy::too_many_arguments)] // Test seam mirroring the driver orchestration above.
 #[allow(clippy::result_large_err)] // Cold refuse path: the failure returns the accepted receipt for aggregate rendering.
 pub(super) fn reserve_detail_window_on_banks_collecting(
@@ -871,48 +989,22 @@ pub(super) fn reserve_detail_window_on_banks_collecting(
     reserve: &SemanticResourceReserver,
     custody: &DetailWindowCustody,
 ) -> Result<AcceptedBracket, ReserveRefusal> {
-    let resolved = verify_reserve_inputs(request, bundle, broad_plan, broad_objects, custody)
-        .map_err(|refusal| ReserveRefusal {
-            refusal,
-            bracket: None,
-        })?;
-    let receipt = PreparedChildReceipt::of_bundle(bundle).ok_or(ReserveRefusal {
-        refusal: SelectedDetailRefusal::EndpointUnresolved,
-        bracket: None,
-    })?;
-    let bracket = accept_before_bracket(brackets, source, broad_plan, facts.generation, seq)
-        .map_err(|refusal| ReserveRefusal {
-            refusal,
-            bracket: None,
-        })?;
-    let seq_assigned = bracket.seq;
-    let reservation = match banks.reserve_detail_window(
+    let broad = BanksBroad {
+        banks: Some(banks),
         facts,
-        broad_plan,
-        bundle.convert_subset().pins(),
-        resolved.selected,
-        bundle.convert_subset().plan().slots.as_slice(),
-        seq_assigned,
-        reserve,
-    ) {
-        Ok(reservation) => reservation,
-        Err(gate) => {
-            return Err(ReserveRefusal {
-                refusal: SelectedDetailRefusal::Gate(gate),
-                bracket: Some(bracket),
-            });
-        }
     };
-    match custody.place_reserved(ReservedDetailWindow::new(reservation, receipt)) {
-        Ok(()) => Ok(bracket),
-        Err(reserved) => {
-            reserved.abandon();
-            Err(ReserveRefusal {
-                refusal: SelectedDetailRefusal::WindowActive,
-                bracket: Some(bracket),
-            })
-        }
-    }
+    reserve_detail_window(
+        &broad,
+        broad_plan,
+        broad_objects,
+        request,
+        bundle,
+        brackets,
+        seq,
+        source,
+        reserve,
+        custody,
+    )
 }
 
 /// The shared reserve checks both entry points run: custody vacancy,
@@ -1319,40 +1411,52 @@ fn map_after_acceptance(
 /// mismatched — the last accepted read never masquerades as fresh. A
 /// quarantined close refuses with no lineage (the driver records a
 /// [`render_close_refused_row`] entry instead) — never a fabricated
-/// after-mark. STAGED (6.15): the live after read needs running
-/// maps; unit coverage runs through
-/// [`close_detail_window_on_banks`] with an injected bracket over
-/// the same shared verdict, plus [`accept_after_bracket`].
+/// after-mark. The driver performs the live after read and passes it
+/// as `source`; unit tests pass a scripted read with [`BanksBroad`].
+/// Production `&Session` and test `BanksBroad` run this SAME body via
+/// [`BroadSession`]. `seq` advances on acceptance even when the close
+/// then refuses (only unavailable/mismatched leave `seq` untouched).
+/// A close refusal after a fresh acceptance carries `Some` with that
+/// interval's deltas; unavailable/mismatched carry `None` — never
+/// silent zeros. The verdict and both sequence boundaries travel with
+/// every close refusal without inventing lineage. STAGED (6.15): the
+/// driver packet calls this with its live read; unit coverage runs
+/// this same body with staged banks.
 #[allow(clippy::too_many_arguments)]
 // One driver orchestration over all retained inputs; the bracket collector and seq travel together.
-#[allow(dead_code)] // STAGED (6.15): the driver packet calls this; unit coverage runs banks-level.
-pub(crate) fn close_detail_window(
+#[allow(dead_code)] // STAGED (6.15): the driver packet calls this; unit coverage runs this same body with BanksBroad.
+#[allow(clippy::result_large_err)] // Cold refuse path: the failure returns the accepted after receipt for aggregate rendering.
+pub(super) fn close_detail_window<B: BroadSession>(
     window: CounterDetailWindow,
-    broad: &Session,
+    broad: &B,
     broad_plan: &AttachPlan,
-    broad_objects: &PinnedObjects,
     mode: CounterMode,
     brackets: &mut BroadBracketCollector,
     seq: &mut u64,
-    reserve: &SemanticResourceReserver,
-) -> Result<DetailCloseReport, DetailToggleRefusal> {
-    let generation = broad.counter_collection_generation();
+    source: Result<CounterRead, ReadStage>,
+) -> Result<DetailCloseReport, DetailCloseRefusal> {
     let seq_before = window.mark_before().seq;
-    // The live after acquisition when the final scrape runs: observed
+    // The after acquisition when the final scrape runs: observed
     // through the collector, with the close seq assigned only on
     // actual acceptance.
-    let limits = CounterLimits {
-        rows: broad_plan.slots.len(),
-        rv_keys: crate::attach::counter_banks::COUNTER_RV_KEY_POOL,
-    };
-    let acquired =
-        super::counter_reader::read_banked(broad, broad_plan, broad_objects, limits, reserve);
-    let acceptance = accept_after_bracket(brackets, acquired, broad_plan, mode, generation, seq);
+    let acceptance =
+        accept_after_bracket(brackets, source, broad_plan, mode, broad.generation(), seq);
     let (bracket, after_receipt) = map_after_acceptance(acceptance);
     // On rejection `seq` is untouched: the last accepted seq brackets
     // the close, explicitly not fresh.
     let seq_after = *seq;
-    let (lineage, drift) = window.close_on(broad, seq_after)?;
+    let (lineage, drift) = match broad.close_window(window, seq_after) {
+        Ok(ok) => ok,
+        Err(refusal) => {
+            return Err(DetailCloseRefusal {
+                refusal,
+                after_receipt,
+                bracket,
+                seq_before,
+                seq_after,
+            });
+        }
+    };
     Ok(DetailCloseReport {
         lineage,
         drift,
@@ -1366,7 +1470,8 @@ pub(crate) fn close_detail_window(
 /// Banks-level phase 3 with an injected after bracket: the unit seam
 /// for the full close matrix (live Session/maps are unavailable to
 /// unit tests). Production reaches the same shared verdict through
-/// [`close_detail_window`], which performs the after read internally.
+/// [`close_detail_window`], with the driver performing the live after
+/// read and passing it as `source`.
 pub(super) fn close_detail_window_on_banks(
     window: CounterDetailWindow,
     banks: &CounterBanks,
@@ -1393,10 +1498,9 @@ pub(super) fn close_detail_window_on_banks(
 
 /// Banks-level phase 3 with collector observation: the unit seam for
 /// accepted-after-then-refusal (live Session/maps are unavailable to
-/// unit tests). Mirrors [`close_detail_window`]'s ordering — observe
-/// the after acquisition through [`accept_after_bracket`], then close
-/// — and publishes the after receipt even when the close refuses
-/// after the collector advanced.
+/// unit tests). Delegates to the SAME [`close_detail_window`] body
+/// production runs via [`BroadSession`], with staged banks and the
+/// scripted generation — never an independent duplicate.
 #[allow(clippy::too_many_arguments)] // Test seam mirroring the driver orchestration above.
 #[allow(clippy::result_large_err)] // Cold refuse path: the failure returns the accepted after receipt for aggregate rendering.
 pub(super) fn close_detail_window_on_banks_collecting(
@@ -1409,30 +1513,14 @@ pub(super) fn close_detail_window_on_banks_collecting(
     mode: CounterMode,
     generation: NonZeroU64,
 ) -> Result<DetailCloseReport, DetailCloseRefusal> {
-    let seq_before = window.mark_before().seq;
-    let acceptance = accept_after_bracket(brackets, source, broad_plan, mode, generation, seq);
-    let (bracket, after_receipt) = map_after_acceptance(acceptance);
-    let seq_after = *seq;
-    let (lineage, drift) = match window.close(banks, generation, seq_after) {
-        Ok(ok) => ok,
-        Err(refusal) => {
-            return Err(DetailCloseRefusal {
-                refusal,
-                after_receipt,
-                bracket,
-                seq_before,
-                seq_after,
-            });
-        }
+    let broad = BanksBroad {
+        banks: Some(banks),
+        facts: BroadToggleFacts {
+            generation,
+            stopped: false,
+        },
     };
-    Ok(DetailCloseReport {
-        lineage,
-        drift,
-        seq_before,
-        seq_after,
-        bracket,
-        after_receipt,
-    })
+    close_detail_window(window, &broad, broad_plan, mode, brackets, seq, source)
 }
 
 /// The first defect of an offered after read, if any (generation,
@@ -5813,5 +5901,1081 @@ mod tests {
             render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, after.seq);
         assert_eq!(aggregate["rows"][0]["entered"], serde_json::json!(10));
         assert!(aggregate.get("total").is_none());
+    }
+
+    #[test]
+    fn selected_detail_session_reserve_budget_refusal_publishes_accepted_deltas() {
+        // Session-path accepted-read-then-refusal (gate Budget): the
+        // before acquisition accepts through the collector (100→110,
+        // nonzero deltas, seq 2), then the Session gate refuses
+        // Budget; the refusal must publish the accepted receipt with
+        // its exact interval — never None, never silent zeros.
+        // Through [`reserve_detail_window`] with [`BanksBroad`], not
+        // the banks helper.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let before = accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("baseline accepts");
+        assert_eq!((seq, before.seq), (1, 1));
+        assert!(
+            before.deltas().is_none(),
+            "Initial installs the baseline with no interval"
+        );
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let tiny = SemanticResourcePool::reference_limit(1024 * 1024);
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: broad_facts(BROAD_GENERATION, false),
+        };
+        let err = reserve_detail_window(
+            &broad,
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &mut brackets,
+            &mut seq,
+            Ok(r1),
+            &tiny.reserver(),
+            &custody,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.refusal,
+            SelectedDetailRefusal::Gate(DetailToggleRefusal::Budget),
+            "the exhausted pool refuses at the Session gate"
+        );
+        assert_eq!(
+            seq, 2,
+            "the accepted read advanced the collector before the Session gate refused"
+        );
+        let bracket = err
+            .bracket
+            .expect("the Session Budget refusal publishes its accepted bracket");
+        assert_eq!(bracket.seq, 2);
+        assert_eq!(bracket.window, Some((20, 30)));
+        let deltas = bracket
+            .deltas()
+            .expect("the 100→110 interval carries its deltas");
+        assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
+        assert_eq!((deltas[3].entered, deltas[3].returned), (10, 10));
+        let aggregate =
+            render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, bracket.seq);
+        assert_eq!(aggregate["rows"][0]["entered"], serde_json::json!(10));
+        assert_eq!(aggregate["rows"][0]["returned"], serde_json::json!(10));
+        assert!(aggregate.get("total").is_none());
+        assert!(
+            custody.take_reserved().is_none(),
+            "a refused reserve queues nothing"
+        );
+    }
+
+    #[test]
+    fn selected_detail_session_close_quarantined_refusal_publishes_accepted_after_deltas() {
+        // Session-path accepted-after-then-refusal (close Quarantined):
+        // the after acquisition accepts through the collector
+        // (100→110, nonzero deltas, seq 2), then the Session close
+        // refuses Quarantined; the refusal must publish the after
+        // receipt with its exact interval — never None, never silent
+        // zeros. Through [`close_detail_window`] with [`BanksBroad`],
+        // not the banks helper.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let before = accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("baseline accepts");
+        assert_eq!((seq, before.seq), (1, 1));
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before_read = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before_read,
+            seq,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("proved request reserves");
+        let reservation = custody.take_reserved().expect("placed");
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        scene.banks.poison_directory_for_test();
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: broad_facts(BROAD_GENERATION, false),
+        };
+        let err = close_detail_window(
+            window,
+            &broad,
+            &scene.plan,
+            CounterMode::Counts,
+            &mut brackets,
+            &mut seq,
+            Ok(r1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.refusal,
+            DetailToggleRefusal::Quarantined,
+            "the poisoned Session close refuses Quarantined"
+        );
+        assert_eq!(err.bracket, CloseBracketVerdict::Matched);
+        assert_eq!((err.seq_before, err.seq_after), (1, 2));
+        assert_eq!(
+            seq, 2,
+            "the accepted after read advanced the collector before the Session close refused"
+        );
+        let after = err
+            .after_receipt
+            .expect("the Session Quarantined refusal publishes its after receipt");
+        assert_eq!(after.seq, 2);
+        assert_eq!(after.window, Some((20, 30)));
+        let deltas = after
+            .deltas()
+            .expect("the 100→110 interval carries its deltas");
+        assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
+        let aggregate =
+            render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, after.seq);
+        assert_eq!(aggregate["rows"][0]["entered"], serde_json::json!(10));
+        assert!(aggregate.get("total").is_none());
+    }
+
+    /// Broad that occupies custody during the gate: the unit seam for
+    /// post-acceptance custody placement refusal (the impossible
+    /// occupied race). The outer reserve verifies vacant, accepts
+    /// (seq advances), then the gate occupies with a dummy
+    /// reservation before returning the real one; the outer placement
+    /// then fails with the accepted receipt, abandoning the real
+    /// reservation while the dummy stays placed.
+    struct OccupyingBroad<'a> {
+        inner: BanksBroad<'a>,
+        custody: DetailWindowCustody,
+        bundle: &'a crate::inventory_promotion::lifecycle::PreparationBundle,
+    }
+
+    impl BroadSession for OccupyingBroad<'_> {
+        fn generation(&self) -> NonZeroU64 {
+            self.inner.generation()
+        }
+        fn reserve_gate(
+            &self,
+            broad_plan: &AttachPlan,
+            child_objects: &PinnedObjects,
+            selected: u32,
+            child_slots: &[Slot],
+            read_seq_before: u64,
+            reserve: &SemanticResourceReserver,
+        ) -> Result<DetailWindowReservation, DetailToggleRefusal> {
+            let real = self.inner.reserve_gate(
+                broad_plan,
+                child_objects,
+                selected,
+                child_slots,
+                read_seq_before,
+                reserve,
+            )?;
+            let dummy = self.inner.reserve_gate(
+                broad_plan,
+                child_objects,
+                selected,
+                child_slots,
+                read_seq_before,
+                reserve,
+            )?;
+            let receipt =
+                PreparedChildReceipt::of_bundle(self.bundle).expect("bundle seals dummy receipt");
+            self.custody
+                .place_reserved(ReservedDetailWindow::new(dummy, receipt))
+                .expect("dummy occupies vacant custody during gate");
+            Ok(real)
+        }
+        fn close_window(
+            &self,
+            window: CounterDetailWindow,
+            read_seq_after: u64,
+        ) -> Result<(CounterDetailLineage, Option<DetailToggleDrift>), DetailToggleRefusal>
+        {
+            self.inner.close_window(window, read_seq_after)
+        }
+    }
+
+    #[test]
+    fn selected_detail_session_reserve_custody_refusal_publishes_accepted_deltas() {
+        // Post-acceptance custody placement refusal (impossible
+        // occupied race): verify passes vacant, the before acquisition
+        // accepts (100→110, seq 2), the gate succeeds, then placement
+        // fails occupied; the refusal must publish the accepted
+        // receipt and abandon the real reservation (dummy stays).
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let before = accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("baseline accepts");
+        assert_eq!((seq, before.seq), (1, 1));
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let occupying = OccupyingBroad {
+            inner: BanksBroad {
+                banks: Some(&scene.banks),
+                facts: broad_facts(BROAD_GENERATION, false),
+            },
+            custody: custody.clone(),
+            bundle: &proved.bundle,
+        };
+        let err = reserve_detail_window(
+            &occupying,
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &mut brackets,
+            &mut seq,
+            Ok(r1),
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.refusal,
+            SelectedDetailRefusal::WindowActive,
+            "the occupied race refuses at custody placement"
+        );
+        assert_eq!(seq, 2, "the accepted read advanced before custody refused");
+        let bracket = err
+            .bracket
+            .expect("the custody refusal publishes its accepted bracket");
+        assert_eq!(bracket.seq, 2);
+        assert_eq!(bracket.window, Some((20, 30)));
+        let deltas = bracket
+            .deltas()
+            .expect("the 100→110 interval carries its deltas");
+        assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
+        let aggregate =
+            render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, bracket.seq);
+        assert_eq!(aggregate["rows"][0]["entered"], serde_json::json!(10));
+        assert!(aggregate.get("total").is_none());
+        let charged_after_reserve = scene.pool.snapshot().charged_bytes;
+        assert!(
+            custody.is_occupied(),
+            "the dummy holds custody after the real abandons"
+        );
+        let dummy = custody.take_reserved().expect("dummy placed during gate");
+        assert_eq!(dummy.selected(), 0);
+        dummy.abandon();
+        let charged_after_cleanup = scene.pool.snapshot().charged_bytes;
+        assert!(
+            charged_after_cleanup < charged_after_reserve,
+            "abandoning the dummy releases its charge (real already released)"
+        );
+        assert!(!custody.is_occupied());
+    }
+
+    #[test]
+    fn selected_detail_session_reserve_broad_stopping_refusal_publishes_accepted_deltas() {
+        // Non-Budget gate refusal (BroadStopping) through the same
+        // generic post-acceptance arm: the before acquisition accepts
+        // (100→110, seq 2), then the stopped gate refuses; the
+        // refusal must publish the accepted receipt.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let before = accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("baseline accepts");
+        assert_eq!((seq, before.seq), (1, 1));
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: broad_facts(BROAD_GENERATION, true),
+        };
+        let err = reserve_detail_window(
+            &broad,
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &mut brackets,
+            &mut seq,
+            Ok(r1),
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.refusal,
+            SelectedDetailRefusal::Gate(DetailToggleRefusal::BroadStopping),
+            "the stopped gate refuses after acceptance"
+        );
+        assert_eq!(seq, 2);
+        let bracket = err
+            .bracket
+            .expect("the BroadStopping refusal publishes its accepted bracket");
+        assert_eq!(bracket.seq, 2);
+        let deltas = bracket
+            .deltas()
+            .expect("the 100→110 interval carries its deltas");
+        assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
+        let aggregate =
+            render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, bracket.seq);
+        assert_eq!(aggregate["rows"][0]["entered"], serde_json::json!(10));
+        assert!(aggregate.get("total").is_none());
+        assert!(custody.take_reserved().is_none());
+    }
+
+    #[test]
+    fn selected_detail_session_reserve_window_active_preacceptance_carries_no_receipt() {
+        // Pre-acceptance WindowActive (occupied custody): verify fails
+        // before any observation, so no receipt is minted and `seq`
+        // stays untouched.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("baseline accepts");
+        assert_eq!(seq, 1);
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let first = promotion_scene(
+            convert_a.clone(),
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before_read = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &first.request,
+            &first.bundle,
+            &before_read,
+            seq,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("first reserve places");
+        assert!(custody.is_occupied());
+        let second = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x90),
+            0xC00,
+            0xE9E,
+        );
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: broad_facts(BROAD_GENERATION, false),
+        };
+        let err = reserve_detail_window(
+            &broad,
+            &scene.plan,
+            &scene.objects,
+            &second.request,
+            &second.bundle,
+            &mut brackets,
+            &mut seq,
+            Ok(r1),
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .unwrap_err();
+        assert_eq!(err.refusal, SelectedDetailRefusal::WindowActive);
+        assert!(
+            err.bracket.is_none(),
+            "pre-acceptance refusal mints no receipt"
+        );
+        assert_eq!(seq, 1, "pre-acceptance refusal leaves seq untouched");
+        assert!(custody.is_occupied(), "the first window still holds");
+        custody.take_reserved().expect("first survives").abandon();
+        assert!(!custody.is_occupied());
+    }
+
+    #[test]
+    fn selected_detail_session_reserve_foreign_generation_preacceptance_carries_no_receipt() {
+        // Pre-acceptance foreign generation: the offered read is not
+        // this broad capture, so acceptance refuses without observing,
+        // with no receipt and `seq` untouched (and no sticky poisoning).
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("baseline accepts");
+        assert_eq!(seq, 1);
+        let foreign_gen = NonZeroU64::new(999).unwrap();
+        let r_foreign = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            foreign_gen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: broad_facts(BROAD_GENERATION, false),
+        };
+        let err = reserve_detail_window(
+            &broad,
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &mut brackets,
+            &mut seq,
+            Ok(r_foreign),
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .unwrap_err();
+        assert_eq!(err.refusal, SelectedDetailRefusal::BroadPlanTopology);
+        assert!(err.bracket.is_none(), "foreign read mints no receipt");
+        assert_eq!(seq, 1, "foreign refusal leaves seq untouched");
+        assert!(custody.take_reserved().is_none());
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let bracket = accept_before_bracket(&mut brackets, Ok(r1), &scene.plan, brgen, &mut seq)
+            .expect("healthy read still accepts after foreign refusal");
+        assert_eq!((seq, bracket.seq), (2, 2));
+    }
+
+    #[test]
+    fn selected_detail_session_close_unavailable_refusal_carries_no_receipt() {
+        // Close refusal with unavailable after acquisition: the failed
+        // final scrape assigns no seq, so the refused close carries no
+        // fabricated receipt, with truthful AfterUnavailable verdict
+        // and last-accepted seq boundaries.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("baseline accepts");
+        assert_eq!(seq, 1);
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before_read = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before_read,
+            seq,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("proved request reserves");
+        let reservation = custody.take_reserved().expect("placed");
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        scene.banks.poison_directory_for_test();
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: broad_facts(BROAD_GENERATION, false),
+        };
+        let err = close_detail_window(
+            window,
+            &broad,
+            &scene.plan,
+            CounterMode::Counts,
+            &mut brackets,
+            &mut seq,
+            Err(ReadStage::BankRouting),
+        )
+        .unwrap_err();
+        assert_eq!(err.refusal, DetailToggleRefusal::Quarantined);
+        assert_eq!(err.bracket, CloseBracketVerdict::AfterUnavailable);
+        assert_eq!((err.seq_before, err.seq_after), (1, 1));
+        assert_eq!(seq, 1, "unavailable after read leaves seq untouched");
+        assert!(
+            err.after_receipt.is_none(),
+            "no receipt is fabricated for loss"
+        );
+    }
+
+    #[test]
+    fn selected_detail_session_close_mismatched_refusal_carries_no_receipt() {
+        // Close refusal with mismatched after acquisition (wrong
+        // generation): the defective read assigns no seq, so the
+        // refused close carries no fabricated receipt, with truthful
+        // Mismatched verdict and last-accepted seq boundaries.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("baseline accepts");
+        assert_eq!(seq, 1);
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before_read = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before_read,
+            seq,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("proved request reserves");
+        let reservation = custody.take_reserved().expect("placed");
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        let wrong_gen = NonZeroU64::new(999).unwrap();
+        let r_bad = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            wrong_gen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        scene.banks.poison_directory_for_test();
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: broad_facts(BROAD_GENERATION, false),
+        };
+        let err = close_detail_window(
+            window,
+            &broad,
+            &scene.plan,
+            CounterMode::Counts,
+            &mut brackets,
+            &mut seq,
+            Ok(r_bad),
+        )
+        .unwrap_err();
+        assert_eq!(err.refusal, DetailToggleRefusal::Quarantined);
+        assert_eq!(err.bracket, CloseBracketVerdict::Mismatched("generation"));
+        assert_eq!((err.seq_before, err.seq_after), (1, 1));
+        assert_eq!(seq, 1, "mismatched after read leaves seq untouched");
+        assert!(
+            err.after_receipt.is_none(),
+            "no receipt is fabricated for mismatch"
+        );
+    }
+
+    #[test]
+    fn selected_detail_session_reserve_success_publishes_accepted_deltas() {
+        // Healthy Session reserve success control: the before
+        // acquisition accepts (100→110, seq 2), the gate charges and
+        // custody places; the Ok receipt carries the exact interval.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let before = accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("baseline accepts");
+        assert_eq!((seq, before.seq), (1, 1));
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: broad_facts(BROAD_GENERATION, false),
+        };
+        let bracket = reserve_detail_window(
+            &broad,
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &mut brackets,
+            &mut seq,
+            Ok(r1),
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("healthy Session reserve succeeds");
+        assert_eq!((seq, bracket.seq), (2, 2));
+        assert_eq!(bracket.window, Some((20, 30)));
+        let deltas = bracket
+            .deltas()
+            .expect("the 100→110 interval carries its deltas");
+        assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
+        let aggregate =
+            render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, bracket.seq);
+        assert_eq!(aggregate["rows"][0]["entered"], serde_json::json!(10));
+        assert!(aggregate.get("total").is_none());
+        assert!(custody.is_occupied(), "success places the reservation");
+        let placed = custody.take_reserved().expect("placed");
+        assert_eq!(placed.selected(), 0);
+        placed.abandon();
+        assert!(!custody.is_occupied());
+    }
+
+    #[test]
+    fn selected_detail_session_close_success_delivers_lineage_and_after_receipt() {
+        // Healthy Session close success control: the after acquisition
+        // accepts (100→110, seq 2) and the close delivers lineage with
+        // the exact after interval (no combined totals).
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let before = accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("baseline accepts");
+        assert_eq!((seq, before.seq), (1, 1));
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before_read = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &before_read,
+            seq,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("proved request reserves");
+        let reservation = custody.take_reserved().expect("placed");
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: broad_facts(BROAD_GENERATION, false),
+        };
+        let report = close_detail_window(
+            window,
+            &broad,
+            &scene.plan,
+            CounterMode::Counts,
+            &mut brackets,
+            &mut seq,
+            Ok(r1),
+        )
+        .expect("healthy Session close succeeds");
+        assert_eq!((report.seq_before, report.seq_after), (1, 2));
+        assert_eq!(report.bracket, CloseBracketVerdict::Matched);
+        assert_eq!(seq, 2);
+        assert_eq!(report.lineage.broad_read_seq_before, 1);
+        assert_eq!(report.lineage.broad_read_seq_after, 2);
+        let after = report
+            .after_receipt
+            .as_ref()
+            .expect("the Matched close carries its after receipt");
+        assert_eq!(after.seq, 2);
+        let deltas = after
+            .deltas()
+            .expect("the 100→110 interval carries its deltas");
+        assert_eq!((deltas[0].entered, deltas[0].returned), (10, 10));
+        let aggregate =
+            render_aggregate_bracket(deltas, CounterMode::Counts, before.seq, after.seq);
+        assert_eq!(aggregate["rows"][0]["entered"], serde_json::json!(10));
+        assert!(aggregate.get("total").is_none());
+    }
+
+    #[test]
+    fn selected_detail_session_refused_interval_conserved_through_next_acquisition() {
+        // Conservation across the refusal boundary: the refused
+        // 100→110 interval (Budget, seq 2) and the next successful
+        // 110→120 interval (seq 3) are each available exactly once,
+        // with no dropped or duplicated counts. Ties the error
+        // receipt to the collector's continuing baseline.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let before = accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("baseline accepts");
+        assert_eq!((seq, before.seq), (1, 1));
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let tiny = SemanticResourcePool::reference_limit(1024 * 1024);
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: broad_facts(BROAD_GENERATION, false),
+        };
+        let refused = reserve_detail_window(
+            &broad,
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &mut brackets,
+            &mut seq,
+            Ok(r1),
+            &tiny.reserver(),
+            &custody,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused.refusal,
+            SelectedDetailRefusal::Gate(DetailToggleRefusal::Budget)
+        );
+        assert_eq!(seq, 2);
+        let first = refused
+            .bracket
+            .expect("the refused 100→110 interval publishes its receipt");
+        assert_eq!(first.seq, 2);
+        assert_eq!(first.window, Some((20, 30)));
+        let first_deltas = first
+            .deltas()
+            .expect("the refused interval carries its deltas");
+        assert_eq!(
+            (first_deltas[0].entered, first_deltas[0].returned),
+            (10, 10)
+        );
+        assert!(custody.take_reserved().is_none());
+        let r2 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 120, 120),
+            window_of(30, 40),
+        );
+        let second = reserve_detail_window(
+            &broad,
+            &scene.plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &mut brackets,
+            &mut seq,
+            Ok(r2),
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("the next 110→120 acquisition succeeds");
+        assert_eq!((seq, second.seq), (3, 3));
+        assert_eq!(second.window, Some((30, 40)));
+        let second_deltas = second
+            .deltas()
+            .expect("the next interval carries its deltas");
+        assert_eq!(
+            (second_deltas[0].entered, second_deltas[0].returned),
+            (10, 10)
+        );
+        let first_rendered =
+            render_aggregate_bracket(first_deltas, CounterMode::Counts, before.seq, first.seq);
+        let second_rendered =
+            render_aggregate_bracket(second_deltas, CounterMode::Counts, first.seq, second.seq);
+        assert_eq!(first_rendered["rows"][0]["entered"], serde_json::json!(10));
+        assert_eq!(second_rendered["rows"][0]["entered"], serde_json::json!(10));
+        assert!(first_rendered.get("total").is_none());
+        assert!(second_rendered.get("total").is_none());
+        assert!(custody.is_occupied());
+        custody.take_reserved().expect("second placed").abandon();
+        assert!(!custody.is_occupied());
     }
 }

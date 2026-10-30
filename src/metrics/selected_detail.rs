@@ -886,27 +886,30 @@ pub(super) fn reserve_detail_window_on_banks_collecting(
             bracket: None,
         })?;
     let seq_assigned = bracket.seq;
-    let reservation = banks
-        .reserve_detail_window(
-            facts,
-            broad_plan,
-            bundle.convert_subset().pins(),
-            resolved.selected,
-            bundle.convert_subset().plan().slots.as_slice(),
-            seq_assigned,
-            reserve,
-        )
-        .map_err(|gate| ReserveRefusal {
-            refusal: SelectedDetailRefusal::Gate(gate),
-            bracket: None,
-        })?;
+    let reservation = match banks.reserve_detail_window(
+        facts,
+        broad_plan,
+        bundle.convert_subset().pins(),
+        resolved.selected,
+        bundle.convert_subset().plan().slots.as_slice(),
+        seq_assigned,
+        reserve,
+    ) {
+        Ok(reservation) => reservation,
+        Err(gate) => {
+            return Err(ReserveRefusal {
+                refusal: SelectedDetailRefusal::Gate(gate),
+                bracket: Some(bracket),
+            });
+        }
+    };
     match custody.place_reserved(ReservedDetailWindow::new(reservation, receipt)) {
         Ok(()) => Ok(bracket),
         Err(reserved) => {
             reserved.abandon();
             Err(ReserveRefusal {
                 refusal: SelectedDetailRefusal::WindowActive,
-                bracket: None,
+                bracket: Some(bracket),
             })
         }
     }
@@ -1410,15 +1413,18 @@ pub(super) fn close_detail_window_on_banks_collecting(
     let acceptance = accept_after_bracket(brackets, source, broad_plan, mode, generation, seq);
     let (bracket, after_receipt) = map_after_acceptance(acceptance);
     let seq_after = *seq;
-    let (lineage, drift) = window
-        .close(banks, generation, seq_after)
-        .map_err(|refusal| DetailCloseRefusal {
-            refusal,
-            after_receipt: None,
-            bracket,
-            seq_before,
-            seq_after,
-        })?;
+    let (lineage, drift) = match window.close(banks, generation, seq_after) {
+        Ok(ok) => ok,
+        Err(refusal) => {
+            return Err(DetailCloseRefusal {
+                refusal,
+                after_receipt,
+                bracket,
+                seq_before,
+                seq_after,
+            });
+        }
+    };
     Ok(DetailCloseReport {
         lineage,
         drift,

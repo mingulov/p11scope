@@ -1233,7 +1233,8 @@ impl ObjectSemantics {
     /// 6.07b deferred custody: move one origin pending→detached
     /// (GetID mint). Seal-path (Q2) primitive; only tests drive it
     /// until the journal P1 packet lands.
-    #[cfg_attr(not(test), allow(dead_code))] // First Q2 seal-path caller lands with journal P1.
+    // First Q2 seal-path caller lands with journal P1; unit tests drive the state fn directly.
+    #[allow(dead_code)]
     pub(crate) fn detach_deferred(
         &mut self,
         session: SessionIncarnation,
@@ -1246,7 +1247,8 @@ impl ObjectSemantics {
     /// 6.07b deferred custody: move whole detached custody to the
     /// joiner (Join transfer). Seal-path (Q2) primitive; only tests
     /// drive it until the journal P1 packet lands.
-    #[cfg_attr(not(test), allow(dead_code))] // First Q2 seal-path caller lands with journal P1.
+    // First Q2 seal-path caller lands with journal P1; unit tests drive the state fn directly.
+    #[allow(dead_code)]
     pub(crate) fn join_deferred_holder(
         &mut self,
         domain: ObjectDomain,

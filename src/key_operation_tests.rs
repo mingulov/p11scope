@@ -13721,15 +13721,22 @@ fn key_operation_async_join_moves_whole_custody() {
         &mut sink,
         &call("C_CloseSession", 7, CkRv::OK.0, 220),
     );
+    // Fresh joiner: session 8 owns a live machine from the first
+    // half's replay, so a completion by 8 would stale-orphan (F2).
     feed(
         &mut edge,
         &mut sink,
-        &async_control("C_AsyncJoin", 8, target, 43, 230),
+        &call("C_OpenSession", 9, CkRv::OK.0, 225),
+    );
+    feed(
+        &mut edge,
+        &mut sink,
+        &async_control("C_AsyncJoin", 9, target, 43, 230),
     );
     let effects = feed(
         &mut edge,
         &mut sink,
-        &async_control("C_AsyncComplete", 8, target, 0, 240),
+        &async_control("C_AsyncComplete", 9, target, 0, 240),
     );
     assert_eq!(effects.len(), 1);
     let (_, _, _, origin) = started(&effects[0]);

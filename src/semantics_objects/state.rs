@@ -625,7 +625,7 @@ struct DetachedDeferred {
 /// Why a deferred custody move was refused (6.07b). Refusals keep the
 /// first origin intact and count ambiguity; they never overwrite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DeferredRefusal {
+pub(crate) enum DeferredRefusal {
     /// No live record for the named key.
     NoRecord,
     /// The detached key already names a live origin: first wins.
@@ -4356,7 +4356,7 @@ mod tests {
             self.state.pending.insert(token, call);
             self.state.apply_begin(token);
             let mut effects = ObjectEffects::default();
-            let mut ledger = super::journal::StagingLedger::new();
+            let mut ledger = super::super::journal::StagingLedger::new();
             self.state.apply_end(token, &mut effects, &mut ledger);
             (token, effects)
         }
@@ -4499,7 +4499,7 @@ mod tests {
             None,
         );
         let mut effects = ObjectEffects::default();
-        let mut ledger = super::journal::StagingLedger::new();
+        let mut ledger = super::super::journal::StagingLedger::new();
         fx.state.apply_end(token, &mut effects, &mut ledger);
         assert!(DeferredFixture::minted(&effects, token), "mint effect");
         let record = fx
@@ -4671,7 +4671,7 @@ mod tests {
         );
         assert_eq!(fx.state.usage().deferred_origins, 1);
         let mut effects = ObjectEffects::default();
-        let mut ledger = super::journal::StagingLedger::new();
+        let mut ledger = super::super::journal::StagingLedger::new();
         fx.state
             .end_domain(fx.domain, ObjectGap::Finalize, &mut effects, &mut ledger);
         assert!(
@@ -4906,7 +4906,7 @@ mod tests {
         fx.state.pending.insert(token, call);
         fx.state.apply_begin(token);
         let mut effects = ObjectEffects::default();
-        let mut ledger = super::journal::StagingLedger::new();
+        let mut ledger = super::super::journal::StagingLedger::new();
         fx.state.apply_end(token, &mut effects, &mut ledger);
         assert!(DeferredFixture::minted(&effects, token), "mint effect");
         let record = fx

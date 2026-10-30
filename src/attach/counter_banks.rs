@@ -2,7 +2,7 @@
 //! Private counter publication, retained native custody and charged collection.
 
 use super::{BpfLoopVerdict, CapturePolicy, Scope, Session};
-use crate::discovery::identity::{PinnedObjects, RetainedInventoryTarget};
+use crate::discovery::identity::{PinnedObjectId, PinnedObjects, RetainedInventoryTarget};
 use crate::plan::{AttachKey, AttachPlan, Slot};
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourcePool, SemanticResourceReserver,
@@ -18,7 +18,7 @@ use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::MetadataExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) const BANK_CONFIG: u64 = 0x1800_0102;
@@ -4557,22 +4557,60 @@ fn admit_detail_child_fds(
     check_fd_headroom_with(file_descriptors, read).map_err(|_| DetailToggleRefusal::Budget)
 }
 
+/// One outstanding detail-window admission (M3 product rule): the
+/// custody attaches one when it places a reservation, and it travels
+/// with the reservation/window through take, bind and park until the
+/// terminal close/abandon — so a taken window still occupies
+/// admission. Move-only (no `Clone`): exactly one holder per
+/// admission. Dropping releases admission (fail-safe against a
+/// permanent `WindowActive`) but emits no ledger event: the driver
+/// still owes exactly one explicit terminal (close, abandon, or a
+/// recorded close-refused entry) for the window ledger.
+pub(crate) struct AdmissionGuard {
+    live: Arc<AtomicUsize>,
+}
+
+impl AdmissionGuard {
+    /// Mint one admission against the custody's shared counter.
+    pub(crate) fn mint(shared: &Arc<AtomicUsize>) -> Self {
+        shared.fetch_add(1, Ordering::SeqCst);
+        Self {
+            live: Arc::clone(shared),
+        }
+    }
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Debug for AdmissionGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AdmissionGuard(<held>)")
+    }
+}
+
 /// A reserved (not yet bound) selected-detail window (6.15 split): the
 /// before-mark, the selection and the start-charge lease, plus the
 /// retained identity needed to re-validate at bind time WITHOUT banks
 /// access (the bind seam holds no broad handle): the child slot keys,
-/// a clone of the child pin store (shared live file handles, so
-/// unchanged checks stay live), and a share of the broad retained
-/// target the selection was proved against. Binding assigns the
-/// sealed detail generation; abandoning releases the charge with no
-/// lineage (a never-bound reservation joins nothing).
+/// one retained live target per distinct child object (shared live
+/// file handles, so unchanged checks stay live), and a share of the
+/// broad retained target the selection was proved against. Binding
+/// assigns the sealed detail generation; abandoning releases the
+/// charge with no lineage (a never-bound reservation joins nothing).
+/// The admission guard (attached at custody placement) travels into
+/// the bound window.
 pub(crate) struct DetailWindowReservation {
     before: BroadReadMark,
     selected: u32,
     physical: AttachKey,
     child_keys: Vec<AttachKey>,
-    child_pins: PinnedObjects,
+    child_targets: Vec<(PinnedObjectId, RetainedInventoryTarget)>,
     broad: RetainedInventoryTarget,
+    admission: Option<AdmissionGuard>,
     _charge: ResourceLease,
 }
 
@@ -4583,6 +4621,7 @@ impl std::fmt::Debug for DetailWindowReservation {
             .field("selected", &self.selected)
             .field("physical", &self.physical)
             .field("retained", &"<held>")
+            .field("admitted", &self.admission.is_some())
             .field("_charge", &"<held>")
             .finish()
     }
@@ -4611,29 +4650,42 @@ impl DetailWindowReservation {
         &self.before
     }
 
+    /// Attach the custody's admission guard at placement (the gate
+    /// mints none: admission starts when the reservation is placed,
+    /// never while it is still a local value).
+    pub(crate) fn admit(&mut self, guard: AdmissionGuard) {
+        assert!(
+            self.admission.is_none(),
+            "a reservation admits exactly once, at placement"
+        );
+        self.admission = Some(guard);
+    }
+
     /// Bind the sealed detail generation (R2-D2-B order: generation
     /// first, then validate). Pure assignment: moves the marks, the
-    /// selection, the retained identity and the charge into the
-    /// window. Every check runs after, in
+    /// selection, the retained identity, the admission guard and the
+    /// charge into the window. Every check runs after, in
     /// [`CounterDetailWindow::validate_live_match`] plus the
     /// adapter's own binding checks, so a refused bind still parks a
     /// closeable `Unactivated` window instead of dropping the lease.
-    pub(crate) fn bind_generation(self, generation: u64) -> CounterDetailWindow {
+    pub(crate) fn bind_generation(mut self, generation: u64) -> CounterDetailWindow {
         CounterDetailWindow {
             before: self.before,
             selected: self.selected,
             physical: self.physical,
             detail_generation: generation,
             child_keys: self.child_keys,
-            child_pins: self.child_pins,
+            child_targets: self.child_targets,
             broad: self.broad,
+            admission: self.admission.take(),
             _charge: self._charge,
         }
     }
 
     /// Abandon a never-bound reservation (cancel / preparation
     /// failure / refused reselect): return the held selection for the
-    /// ledger and release the charge. No lineage: nothing ran.
+    /// ledger and release the charge and the admission. No lineage:
+    /// nothing ran.
     pub(crate) fn abandon(self) -> ReservationAbandonment {
         ReservationAbandonment {
             before: self.before,
@@ -4643,18 +4695,50 @@ impl DetailWindowReservation {
     }
 }
 
+/// Whether a retained child target is the broad retained object:
+/// equal non-empty digest, equal pin, and the same kernel file behind
+/// both fds. The pin-store comparison's target-vs-target form (the
+/// store form additionally short-circuits on equal mappings, which
+/// implies the same kernel file; an fstat failure here refuses
+/// fail-closed instead).
+fn retained_same_object(child: &RetainedInventoryTarget, broad: &RetainedInventoryTarget) -> bool {
+    let (_, child_digest) = child.borrowed_file_and_digest();
+    let (_, broad_digest) = broad.borrowed_file_and_digest();
+    !broad_digest.is_empty()
+        && child_digest == broad_digest
+        && child.content_key() == broad.content_key()
+        && retained_same_kernel_file(child, broad)
+}
+
+/// Whether two retained targets name the same kernel file (an fstat
+/// pair on the two fds), whatever their pins or digests say. An
+/// in-place rewrite keeps the kernel file; anything else does not.
+/// Unreadable state refuses fail-closed.
+fn retained_same_kernel_file(
+    left: &RetainedInventoryTarget,
+    right: &RetainedInventoryTarget,
+) -> bool {
+    let (left_file, _) = left.borrowed_file_and_digest();
+    let (right_file, _) = right.borrowed_file_and_digest();
+    match (left_file.metadata(), right_file.metadata()) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
 /// An open selected-detail window against one broad counter Session: the
 /// before-mark, the selection, the bound detail generation, the
 /// retained bind-time identity and the start-charge lease, held until
-/// close.
+/// close. The admission guard travels with the window until close.
 pub(crate) struct CounterDetailWindow {
     before: BroadReadMark,
     selected: u32,
     physical: AttachKey,
     detail_generation: u64,
     child_keys: Vec<AttachKey>,
-    child_pins: PinnedObjects,
+    child_targets: Vec<(PinnedObjectId, RetainedInventoryTarget)>,
     broad: RetainedInventoryTarget,
+    admission: Option<AdmissionGuard>,
     _charge: ResourceLease,
 }
 
@@ -4666,6 +4750,7 @@ impl std::fmt::Debug for CounterDetailWindow {
             .field("physical", &self.physical)
             .field("detail_generation", &self.detail_generation)
             .field("retained", &"<held>")
+            .field("admitted", &self.admission.is_some())
             .field("_charge", &"<held>")
             .finish()
     }
@@ -4688,9 +4773,18 @@ impl CounterDetailWindow {
         &self.before
     }
 
+    /// Attach the custody's admission guard when parking a window that
+    /// arrived without one (bound windows normally inherit it from
+    /// their reservation; this covers only defensively built ones).
+    pub(crate) fn admit_unadmitted(&mut self, guard: AdmissionGuard) {
+        if self.admission.is_none() {
+            self.admission = Some(guard);
+        }
+    }
+
     /// Re-validate the reservation against live files at bind time
     /// (R2-D2-B, owned-data half): the broad retained target is
-    /// unchanged, every retained child slot is unchanged and still
+    /// unchanged, every retained child target is unchanged and still
     /// names the same retained object, some child slot still covers
     /// the reserved physical key, and FD headroom still admits the
     /// child. What this cannot see (no banks access at the bind seam
@@ -4704,14 +4798,20 @@ impl CounterDetailWindow {
         }
         // Per retained child slot: unchanged, then same retained
         // object (a changed same-file digest reports Changed;
-        // another file is Foreign) — the reserve checks, re-run.
+        // another file is Foreign) — the reserve checks, re-run
+        // against the retained per-object targets.
         let mut covered = false;
         for key in &self.child_keys {
-            if self.child_pins.object_unchanged(key.object) != Ok(true) {
+            let (_, target) = self
+                .child_targets
+                .iter()
+                .find(|(id, _)| *id == key.object)
+                .expect("retained targets cover every distinct child id");
+            if target.check_unchanged() != Ok(true) {
                 return Err(DetailToggleRefusal::Changed);
             }
-            if !self.broad.same_object_as(&self.child_pins, key.object) {
-                if self.broad.same_kernel_file_as(&self.child_pins, key.object) {
+            if !retained_same_object(target, &self.broad) {
+                if retained_same_kernel_file(target, &self.broad) {
                     return Err(DetailToggleRefusal::Changed);
                 }
                 return Err(DetailToggleRefusal::Foreign);
@@ -4889,9 +4989,12 @@ impl CounterBanks {
         let cpus = aya::util::nr_cpus().map_err(|_| DetailToggleRefusal::Budget)?;
         let envelope = detail_child_envelope(child_slots, objects, cpus)?;
         // Retention for the bind-time re-validation: the child slot
-        // keys, one pin-store clone, one broad share, plus slop.
-        // Sized here (from the live inputs), charged with the
-        // envelope in one lease, cloned after the charge lands.
+        // keys, one retained live target per distinct child object
+        // (never the whole pin store: retention stays bounded to the
+        // selected subset however large the convert store is), one
+        // broad share, plus slop. Sized here (from the live inputs),
+        // charged with the envelope in one lease; the targets retain
+        // after the charge lands.
         let mut distinct = std::collections::BTreeSet::new();
         for candidate in child_slots {
             distinct.insert(candidate.object);
@@ -4900,9 +5003,17 @@ impl CounterBanks {
             .len()
             .checked_mul(size_of::<AttachKey>())
             .ok_or(DetailToggleRefusal::Budget)?;
-        for id in distinct {
+        retention = retention
+            .checked_add(
+                distinct
+                    .len()
+                    .checked_mul(size_of::<(PinnedObjectId, RetainedInventoryTarget)>())
+                    .ok_or(DetailToggleRefusal::Budget)?,
+            )
+            .ok_or(DetailToggleRefusal::Budget)?;
+        for id in &distinct {
             let copy = objects
-                .retained_target_copy_allocation_charge(id)
+                .retained_target_copy_allocation_charge(*id)
                 .ok_or(DetailToggleRefusal::Budget)?;
             retention = retention
                 .checked_add(copy)
@@ -4943,13 +5054,25 @@ impl CounterBanks {
             object: candidate.object,
             file_offset: candidate.file_offset,
         }));
+        // Retain after the charge lands (the lease drops on refusal):
+        // one live target per distinct child object. A target that
+        // changed between the checks above and this retention refuses
+        // Changed — fail-closed, never a stale retention.
+        let mut child_targets = Vec::with_capacity(distinct.len());
+        for id in distinct {
+            let target = objects
+                .retain_inventory_target(id)
+                .map_err(|_| DetailToggleRefusal::Changed)?;
+            child_targets.push((id, target));
+        }
         Ok(DetailWindowReservation {
             before,
             selected,
             physical,
             child_keys,
-            child_pins: objects.clone(),
+            child_targets,
             broad: held.share(),
+            admission: None,
             _charge: charge,
         })
     }
@@ -11655,8 +11778,14 @@ pub(crate) mod tests {
             super::detail_child_envelope(&child_slots, &objects, aya::util::nr_cpus().unwrap())
                 .unwrap();
         // Reserve additionally retains the bind-time identity: the
-        // child slot keys, the child pin clone and the broad share.
+        // child slot keys, one retained live target for the distinct
+        // child object (never the whole pin store), and the broad
+        // share.
         let retained = child_slots.len() * std::mem::size_of::<crate::plan::AttachKey>()
+            + std::mem::size_of::<(
+                crate::discovery::identity::PinnedObjectId,
+                crate::discovery::identity::RetainedInventoryTarget,
+            )>()
             + objects
                 .retained_target_copy_allocation_charge(object)
                 .expect("provider copy charge sizes")
@@ -12918,18 +13047,23 @@ pub(crate) mod tests {
             file_offset: 0x80 + 9 * 0x10,
         };
         // Same-module forgery: identical marks and selection, but the
-        // retained child clone names another kernel file.
+        // retained child target names another kernel file.
+        let foreign_id = foreign_objects.pinned().next().unwrap().id;
         let forged = super::CounterDetailWindow {
             before: window.mark_before().clone(),
             selected: window.selected(),
             physical: window.physical(),
             detail_generation: window.detail_generation(),
             child_keys: vec![foreign_key],
-            child_pins: foreign_objects,
+            child_targets: vec![(
+                foreign_id,
+                foreign_objects.retain_inventory_target(foreign_id).unwrap(),
+            )],
             broad: fresh_banks.keepalive.custody.lock().unwrap().providers[9]
                 .as_ref()
                 .unwrap()
                 .share(),
+            admission: None,
             _charge: fresh_pool.reserver().reserve(1).unwrap(),
         };
         drop(window);
@@ -13043,5 +13177,124 @@ pub(crate) mod tests {
                 .unwrap_err(),
             super::DetailToggleRefusal::Quarantined
         );
+    }
+
+    #[test]
+    fn counter_detail_retention_covers_only_the_selected_child() {
+        // Retention must cover the selected subset only: a small child
+        // selected from a store with many unrelated pins retains just
+        // its own objects, never the whole store.
+        let dir = tempfile::tempdir().unwrap();
+        let path = toggle_provider(&dir, "provider.so", b"toggle retention provider bytes");
+        let mut objects = crate::discovery::identity::test_fixture::real_scan_pin(
+            &path,
+            None,
+            1,
+            "toggle-digest",
+        );
+        for index in 0..32 {
+            let other = toggle_provider(
+                &dir,
+                &format!("unrelated-{index}.so"),
+                b"toggle unrelated provider bytes",
+            );
+            let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+                &other,
+                None,
+                1,
+                "toggle-unrelated",
+            );
+            assert!(
+                objects.absorb(pins).is_empty(),
+                "distinct files merge without skips"
+            );
+        }
+        let object = objects
+            .pinned()
+            .find(|pin| pin.path.ends_with("provider.so"))
+            .unwrap()
+            .id;
+        assert_eq!(
+            objects.pinned().count(),
+            33,
+            "the premise: one provider plus 32 unrelated pins"
+        );
+        let pool = SemanticResourcePool::reference_limit(64 * 1024 * 1024);
+        let mut history = toggle_object_plan(object, 513);
+        let banks = stage_toggle_banks(&pool, &objects, &mut history);
+        let child_slots = history.slots[512..513].to_vec();
+        let before = pool.snapshot().charged_bytes;
+        let reservation = banks
+            .reserve_detail_window(
+                super::BroadToggleFacts {
+                    generation: NonZeroU64::new(7).unwrap(),
+                    stopped: false,
+                },
+                &history,
+                &objects,
+                512,
+                child_slots.as_slice(),
+                41,
+                &pool.reserver(),
+            )
+            .unwrap();
+        let wide_charge = pool.snapshot().charged_bytes - before;
+        assert_eq!(
+            reservation.child_targets.len(),
+            1,
+            "retention holds the selected object only, not the whole store"
+        );
+        assert_eq!(
+            reservation.child_targets[0].0, object,
+            "the retained target is the selected provider"
+        );
+        reservation.abandon();
+        // Absorbing 32 MORE unrelated pins into the same store changes
+        // neither the retained set nor the charge: retention is bounded
+        // to the selected subset, never to the store.
+        for index in 32..64 {
+            let other = toggle_provider(
+                &dir,
+                &format!("extra-{index}.so"),
+                b"toggle extra unrelated bytes",
+            );
+            let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+                &other,
+                None,
+                1,
+                "toggle-extra",
+            );
+            assert!(
+                objects.absorb(pins).is_empty(),
+                "distinct files merge without skips"
+            );
+        }
+        assert_eq!(objects.pinned().count(), 65, "the store doubled");
+        let before = pool.snapshot().charged_bytes;
+        let again = banks
+            .reserve_detail_window(
+                super::BroadToggleFacts {
+                    generation: NonZeroU64::new(7).unwrap(),
+                    stopped: false,
+                },
+                &history,
+                &objects,
+                512,
+                child_slots.as_slice(),
+                41,
+                &pool.reserver(),
+            )
+            .unwrap();
+        assert_eq!(
+            pool.snapshot().charged_bytes - before,
+            wide_charge,
+            "doubling the unrelated pins charges not one byte more"
+        );
+        assert_eq!(
+            again.child_targets.len(),
+            1,
+            "doubling the unrelated pins retains not one object more"
+        );
+        again.abandon();
     }
 }

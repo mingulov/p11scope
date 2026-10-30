@@ -36,16 +36,19 @@
 //! `Unactivated`, explicit `close_refused` ledger entry} — never a silent
 //! charge drop with the source.
 
-use super::counter_collector::{CounterDeltas, CounterLimits, CounterRead};
+use super::counter_collector::{
+    CounterCollector, CounterDeltas, CounterLimits, CounterObservation, CounterRead, ReadStage,
+};
 use crate::attach::Session;
 use crate::attach::capture::NativeDomainId;
 use crate::attach::counter_banks::{
-    BroadReadMark, BroadToggleFacts, CounterBanks, CounterDetailLineage, CounterDetailWindow,
-    DetailToggleDrift, DetailToggleRefusal, DetailWindowReservation,
+    AdmissionGuard, BroadReadMark, BroadToggleFacts, CounterBanks, CounterDetailLineage,
+    CounterDetailWindow, DetailToggleDrift, DetailToggleRefusal, DetailWindowReservation,
+    ReservationAbandonment,
 };
 use crate::attach::selected_detailed::baseline::PromotionImageBaseline;
 use crate::discovery::caller_registry::{CallerId, ModuleId};
-use crate::discovery::identity::PinnedObjects;
+use crate::discovery::identity::{PinnedContentKey, PinnedObjects};
 use crate::inventory_promotion::lifecycle::{
     NativeActivationRefusal, NativeActivationSource, NativeCasReceipt, PreparationBundle,
     SelectedActivationBinding,
@@ -57,6 +60,7 @@ use crate::process::PidPin;
 use crate::semantics_edge::resources::SemanticResourceReserver;
 use p11scope_ebpf_common::CounterMode;
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Why the adapter refused before/without touching the lifecycle service.
@@ -188,10 +192,141 @@ pub(crate) enum BoundWindow {
     Unactivated(CounterDetailWindow),
 }
 
+/// The sealed prepared-child identity for one reservation (R2-D2-B):
+/// the original custody, the pre-view baseline, and the required
+/// provider/endpoint coverage the reservation was proved against.
+/// Minted ONLY from a [`PreparationBundle`]: the reserve side seals one
+/// into custody and the worker side carries one in the activation
+/// source, and the bind refuses unless the two agree — so a reservation
+/// for provider A can never bind a prepared child for provider B, even
+/// with an identical original and image. Numeric object ids are never
+/// compared: they are store-local.
+pub(crate) struct PreparedChildReceipt {
+    original: Arc<PidPin>,
+    baseline: PromotionImageBaseline,
+    required: PinnedContentKey,
+    slots: Vec<(PinnedContentKey, u64)>,
+}
+
+impl PreparedChildReceipt {
+    /// Seal the bundle's prepared-child identity: the original custody,
+    /// the pre-view baseline, the one required provider's content key
+    /// and every child slot's (content key, offset), sorted. `None`
+    /// when the subset is not exactly one pinned provider (ambiguous,
+    /// empty or unpinned): such a bundle never seals a reservation.
+    pub(crate) fn of_bundle(bundle: &PreparationBundle) -> Option<Self> {
+        let convert = bundle.convert_subset();
+        if convert.required().len() != 1 {
+            return None;
+        }
+        let (&required_object, _) = convert
+            .required()
+            .iter()
+            .next()
+            .expect("exactly one required object");
+        let required = convert.pins().content_key(required_object)?;
+        let mut slots = Vec::with_capacity(convert.plan().slots.len());
+        for slot in &convert.plan().slots {
+            slots.push((convert.pins().content_key(slot.object)?, slot.file_offset));
+        }
+        slots.sort();
+        Some(Self {
+            original: Arc::clone(&bundle.original),
+            baseline: bundle.baseline.clone(),
+            required,
+            slots,
+        })
+    }
+
+    /// Whether two sealed identities name the same prepared child: the
+    /// SAME original custody (one `Arc`, never re-pinned numbers — the
+    /// reserve, source and worker share one bundle), the same required
+    /// provider file and the same child slot coverage. The baseline
+    /// rides along for the bind-time image check; same-bundle
+    /// construction (proved by custody plus coverage) implies it.
+    pub(crate) fn agrees_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.original, &other.original)
+            && self.required == other.required
+            && self.slots == other.slots
+    }
+
+    pub(crate) fn baseline(&self) -> &PromotionImageBaseline {
+        &self.baseline
+    }
+
+    pub(crate) fn original(&self) -> &Arc<PidPin> {
+        &self.original
+    }
+}
+
+impl std::fmt::Debug for PreparedChildReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedChildReceipt(<retained>)")
+    }
+}
+
+/// A placed reservation plus its sealed prepared-child identity: the two
+/// move together through custody (take-once), so the bind always
+/// compares the worker-side identity against the identity sealed at
+/// reserve — never against re-derived or caller-supplied values.
+#[derive(Debug)]
+pub(crate) struct ReservedDetailWindow {
+    reservation: DetailWindowReservation,
+    receipt: PreparedChildReceipt,
+}
+
+impl ReservedDetailWindow {
+    pub(crate) fn new(reservation: DetailWindowReservation, receipt: PreparedChildReceipt) -> Self {
+        Self {
+            reservation,
+            receipt,
+        }
+    }
+
+    pub(crate) fn selected(&self) -> u32 {
+        self.reservation.selected()
+    }
+
+    pub(crate) fn physical(&self) -> AttachKey {
+        self.reservation.physical()
+    }
+
+    pub(crate) fn mark_before(&self) -> &BroadReadMark {
+        self.reservation.mark_before()
+    }
+
+    /// Attach the custody's admission guard at placement.
+    pub(crate) fn admit(&mut self, guard: AdmissionGuard) {
+        self.reservation.admit(guard);
+    }
+
+    /// Abandon a never-bound reservation (releases the charge and the
+    /// admission; the seal drops with it — nothing was ever bound).
+    pub(crate) fn abandon(self) -> ReservationAbandonment {
+        self.reservation.abandon()
+    }
+
+    /// Bind the sealed detail generation, dropping the seal: for direct
+    /// binds outside the CAS seam (tests, never-bound paths). The bind
+    /// seam compares through [`bind_with_receipt`] instead.
+    pub(crate) fn bind_generation(self, generation: u64) -> CounterDetailWindow {
+        self.reservation.bind_generation(generation)
+    }
+
+    /// Bind for the CAS seam, keeping the sealed identity for the
+    /// agreement check.
+    pub(crate) fn bind_with_receipt(
+        self,
+        generation: u64,
+    ) -> (CounterDetailWindow, PreparedChildReceipt) {
+        (self.reservation.bind_generation(generation), self.receipt)
+    }
+}
+
 #[derive(Debug)]
 enum DetailWindowSlot {
     Vacant,
-    Reserved(DetailWindowReservation),
+    Reserved(ReservedDetailWindow),
     Bound(BoundWindow),
 }
 
@@ -201,15 +336,26 @@ enum DetailWindowSlot {
 /// activation source holds a clone of this handle, takes the
 /// reservation exactly once at the CAS seam, and parks the bound
 /// window back for the driver. `PendingInstall` stays untouched.
+///
+/// Driver-ownership boundary: custody assumes a single-threaded
+/// driver tick (reserve → take → park → take → close). The
+/// `Arc`/`Mutex`/`AtomicUsize` make sharing safe, but they do NOT
+/// serialize multi-step operations: concurrent drivers must serialize
+/// externally, or a take-bind-park sequence races. Ordinary drop of a
+/// taken value releases admission (fail-safe) but emits no ledger
+/// event: the driver still owes exactly one explicit terminal
+/// (close, abandon, or a recorded close-refused entry).
 #[derive(Debug, Clone)]
 pub(crate) struct DetailWindowCustody {
     slot: Arc<Mutex<DetailWindowSlot>>,
+    admissions: Arc<AtomicUsize>,
 }
 
 impl DetailWindowCustody {
     pub(crate) fn new() -> Self {
         Self {
             slot: Arc::new(Mutex::new(DetailWindowSlot::Vacant)),
+            admissions: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -217,31 +363,38 @@ impl DetailWindowCustody {
         self.slot.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    /// Whether custody currently holds a reservation or a bound window.
-    /// The reserve-time `WindowActive` product rule reads this.
+    /// Whether a window is admitted: custody holds a reservation or a
+    /// bound window, OR a taken reservation/window is still alive (its
+    /// admission guard travels with the value until the terminal
+    /// close/abandon). The reserve-time `WindowActive` product rule
+    /// reads this.
     pub(crate) fn is_occupied(&self) -> bool {
         !matches!(*self.lock(), DetailWindowSlot::Vacant)
+            || self.admissions.load(Ordering::SeqCst) > 0
     }
 
-    /// Place a fresh reservation; fails (returning it) when occupied.
+    /// Place a fresh reservation; fails (returning it) when occupied —
+    /// including while a taken reservation/window is still alive. On
+    /// success the reservation is admitted: its guard travels with it
+    /// through take, bind and park until the terminal disposition.
     #[allow(clippy::result_large_err)] // Cold path returning the unplaced reservation for explicit handling.
     pub(crate) fn place_reserved(
         &self,
-        reservation: DetailWindowReservation,
-    ) -> Result<(), DetailWindowReservation> {
+        mut reservation: ReservedDetailWindow,
+    ) -> Result<(), ReservedDetailWindow> {
         let mut slot = self.lock();
-        match *slot {
-            DetailWindowSlot::Vacant => {
-                *slot = DetailWindowSlot::Reserved(reservation);
-                Ok(())
-            }
-            _ => Err(reservation),
+        if !matches!(*slot, DetailWindowSlot::Vacant) || self.admissions.load(Ordering::SeqCst) > 0
+        {
+            return Err(reservation);
         }
+        reservation.admit(AdmissionGuard::mint(&self.admissions));
+        *slot = DetailWindowSlot::Reserved(reservation);
+        Ok(())
     }
 
     /// Take the reservation exactly once; `None` unless reserved.
     /// A bound window is never taken through this path.
-    pub(crate) fn take_reserved(&self) -> Option<DetailWindowReservation> {
+    pub(crate) fn take_reserved(&self) -> Option<ReservedDetailWindow> {
         let mut slot = self.lock();
         match std::mem::replace(&mut *slot, DetailWindowSlot::Vacant) {
             DetailWindowSlot::Reserved(reservation) => Some(reservation),
@@ -252,12 +405,20 @@ impl DetailWindowCustody {
         }
     }
 
-    /// Park a bound window; fails (returning it) when occupied.
+    /// Park a bound window; fails (returning it) when the slot is
+    /// occupied. The window normally inherits its admission guard
+    /// from its reservation; a guard-less window is admitted here so
+    /// parking never creates an untracked window.
     #[allow(clippy::result_large_err)] // Cold path returning the unparked window for explicit handling.
-    pub(crate) fn place_bound(&self, window: BoundWindow) -> Result<(), BoundWindow> {
+    pub(crate) fn place_bound(&self, mut window: BoundWindow) -> Result<(), BoundWindow> {
         let mut slot = self.lock();
         match *slot {
             DetailWindowSlot::Vacant => {
+                match &mut window {
+                    BoundWindow::Active(inner) | BoundWindow::Unactivated(inner) => {
+                        inner.admit_unadmitted(AdmissionGuard::mint(&self.admissions));
+                    }
+                }
                 *slot = DetailWindowSlot::Bound(window);
                 Ok(())
             }
@@ -284,18 +445,215 @@ impl Default for DetailWindowCustody {
     }
 }
 
+/// The driver's bracket collector: the broad [`CounterCollector`] the
+/// window's before/after acquisitions observe through, owned by the
+/// driver across the window (one collector, so latch state is shared
+/// between the brackets). A metrics-private collector behind a
+/// driver-visible handle: only metrics code observes through it, via
+/// [`accept_before_bracket`]/[`accept_after_bracket`].
+pub(crate) struct BroadBracketCollector {
+    collector: CounterCollector,
+}
+
+impl BroadBracketCollector {
+    /// One bracket collector over the broad plan's shape (`rows` plan
+    /// slots, `rv_keys` return-value keys) with a reserver handle for
+    /// the collector's own baseline storage (handles are cheap:
+    /// `pool.reserver()` mints them on demand).
+    pub(crate) fn new(rows: usize, rv_keys: usize, reserve: SemanticResourceReserver) -> Self {
+        Self {
+            collector: CounterCollector::new(CounterLimits { rows, rv_keys }, reserve),
+        }
+    }
+
+    /// Tests-only direct observe: drives the collector into latched
+    /// state exactly as a production read path would, so twins prove
+    /// acceptance refuses on pre-latched collectors. Production
+    /// observes only through the accept functions.
+    #[cfg(test)]
+    pub(super) fn observe_for_test(
+        &mut self,
+        source: Result<CounterRead, ReadStage>,
+    ) -> CounterObservation {
+        self.collector.observe(source)
+    }
+}
+
+impl std::fmt::Debug for BroadBracketCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BroadBracketCollector(<held>)")
+    }
+}
+
+/// An accepted bracketing acquisition: the seq assigned to it plus its
+/// real acquisition identity (generation, mode, window, row count).
+/// Minted ONLY by observing the exact acquisition through the broad
+/// collector ([`accept_before_bracket`]/[`accept_after_bracket`]); the
+/// session reserve path brackets on these, never on driver counts or
+/// discarded reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AcceptedBracket {
+    pub(crate) seq: u64,
+    pub(crate) generation: NonZeroU64,
+    pub(crate) mode: CounterMode,
+    pub(crate) window: Option<(u64, u64)>,
+    pub(crate) rows: usize,
+}
+
+/// How the final acquisition checked at close: fresh (seq assigned),
+/// explicitly unavailable (the acquisition failed — the last accepted
+/// seq brackets the close but never masquerades as fresh), or
+/// mismatched (acquired but defective or collector-rejected, disclosed
+/// and never promoted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterBracketAcceptance {
+    Fresh(AcceptedBracket),
+    Unavailable,
+    Mismatched(&'static str),
+}
+
+/// Map an acquisition-stage failure to the adapter refusal (reads the
+/// banks never produced): a missing counter binding and quarantine
+/// keep their gate word; anything else is an unbracketable topology.
+fn read_stage_refusal(stage: ReadStage) -> SelectedDetailRefusal {
+    use super::counter_collector::ReadStage as Stage;
+    use super::counter_reader::ReaderShapeCause;
+    match stage {
+        Stage::Shape(ReaderShapeCause::BindingAbsent) => {
+            SelectedDetailRefusal::Gate(DetailToggleRefusal::BroadNotCounter)
+        }
+        Stage::BankQuarantined => SelectedDetailRefusal::Gate(DetailToggleRefusal::Quarantined),
+        _ => SelectedDetailRefusal::BroadPlanTopology,
+    }
+}
+
+/// Read the accepted receipt off the collector's installed baseline:
+/// the real acquisition window and identity of the exact read the
+/// collector just accepted — never a reconstructed or earlier read.
+fn accepted_receipt(collector: &CounterCollector, assigned: u64) -> AcceptedBracket {
+    let installed = collector
+        .current()
+        .expect("acceptance installs the observed read");
+    let view = installed.view();
+    AcceptedBracket {
+        seq: assigned,
+        generation: view.generation,
+        mode: view.mode,
+        window: view
+            .window
+            .map(|window| (window.started_ns, window.finished_ns)),
+        rows: view.rows.map(|rows| rows.len()).unwrap_or(0),
+    }
+}
+
+/// Observe the exact before acquisition through the broad collector
+/// and assign its bracket seq (R2-D2-C): the seq advances ONLY on
+/// actual acceptance (`Initial`/`Advanced`/`GenerationChanged`). A
+/// failed or foreign acquisition, an unhealthy one, or a collector
+/// rejection (latched issue, failed differences) refuses reserve with
+/// the collector baseline and the seq untouched.
+pub(super) fn accept_before_bracket(
+    brackets: &mut BroadBracketCollector,
+    source: Result<CounterRead, ReadStage>,
+    broad_plan: &AttachPlan,
+    facts_generation: NonZeroU64,
+    seq: &mut u64,
+) -> Result<AcceptedBracket, SelectedDetailRefusal> {
+    let read = match source {
+        Ok(read) => read,
+        Err(stage) => {
+            brackets.collector.observe(Err(stage));
+            return Err(read_stage_refusal(stage));
+        }
+    };
+    // Bracket-shape failures refuse WITHOUT observing: the collector
+    // baseline and the seq stay pristine for the next acquisition.
+    {
+        let view = read.view();
+        if view.generation != facts_generation {
+            return Err(SelectedDetailRefusal::BroadPlanTopology);
+        }
+        let rows = view
+            .rows
+            .map_err(|_| SelectedDetailRefusal::BroadPlanTopology)?;
+        if bracket_signal_defect(view).is_some() {
+            return Err(SelectedDetailRefusal::BroadPlanTopology);
+        }
+        if !bracket_rows_match_plan(rows, broad_plan) {
+            return Err(SelectedDetailRefusal::BroadPlanTopology);
+        }
+    }
+    // The u64 seq space is effectively inexhaustible; refusing rather
+    // than reusing a seq keeps exhaustion fail-closed.
+    let assigned = seq
+        .checked_add(1)
+        .ok_or(SelectedDetailRefusal::BroadPlanTopology)?;
+    match brackets.collector.observe(Ok(read)) {
+        CounterObservation::Initial
+        | CounterObservation::Advanced { .. }
+        | CounterObservation::GenerationChanged { .. } => {
+            *seq = assigned;
+            Ok(accepted_receipt(&brackets.collector, assigned))
+        }
+        CounterObservation::ReadFailed(stage) => Err(read_stage_refusal(stage)),
+        CounterObservation::Unavailable(_) => Err(SelectedDetailRefusal::BroadPlanTopology),
+    }
+}
+
+/// Observe the exact after acquisition through the broad collector
+/// (R2-D2-C): a fresh acceptance assigns the close seq; a failed
+/// acquisition is explicitly unavailable; a defective or
+/// collector-rejected acquisition is mismatched — never Matched,
+/// never promoted to fresh. The seq advances only on acceptance.
+pub(super) fn accept_after_bracket(
+    brackets: &mut BroadBracketCollector,
+    source: Result<CounterRead, ReadStage>,
+    broad_plan: &AttachPlan,
+    mode: CounterMode,
+    generation: NonZeroU64,
+    seq: &mut u64,
+) -> AfterBracketAcceptance {
+    let read = match source {
+        Ok(read) => read,
+        Err(stage) => {
+            brackets.collector.observe(Err(stage));
+            return AfterBracketAcceptance::Unavailable;
+        }
+    };
+    if let Some(reason) = after_bracket_mismatch(&read, mode, generation, broad_plan) {
+        return AfterBracketAcceptance::Mismatched(reason);
+    }
+    let Some(assigned) = seq.checked_add(1) else {
+        // u64 seq space exhausted (unreachable): disclose as rejected
+        // without advancing or promoting anything.
+        return AfterBracketAcceptance::Mismatched("rejected");
+    };
+    match brackets.collector.observe(Ok(read)) {
+        CounterObservation::Initial
+        | CounterObservation::Advanced { .. }
+        | CounterObservation::GenerationChanged { .. } => {
+            *seq = assigned;
+            AfterBracketAcceptance::Fresh(accepted_receipt(&brackets.collector, assigned))
+        }
+        CounterObservation::ReadFailed(_) | CounterObservation::Unavailable(_) => {
+            AfterBracketAcceptance::Mismatched("rejected")
+        }
+    }
+}
+
 /// Phase 1 (driver tick, BEFORE `SelectedLifecycleService::start`):
-/// resolve the endpoint receipt, validate the broad plan, take a live
-/// validated bracketing read, charge and mark through the gate, and
-/// place the reservation in custody. Refusal records the
-/// [`SelectedDetailRefusal`], queues nothing and starts no worker;
-/// aggregate capture is untouched. `read_seq_before` is the driver's
-/// count of successful broad `observe` accepts through its own
-/// bracketing read (the read-seq rule: seqs count successful observes
-/// only, minted by the driver, never by the gate). STAGED (6.15):
-/// the live bracketing read needs running maps; unit coverage runs
-/// through [`reserve_detail_window_on_banks`] with an injected
-/// accepted read over the same shared checks.
+/// resolve the endpoint receipt, validate the broad plan, observe the
+/// live bracketing acquisition through the bracket collector, charge
+/// and mark through the gate, and place the reservation in custody.
+/// Refusal records the [`SelectedDetailRefusal`], queues nothing and
+/// starts no worker; aggregate capture is untouched. The bracket seq
+/// assigns only on actual collector acceptance (the read-seq rule:
+/// seqs count successful observes only, minted here, never by the
+/// gate) and returns with the accepted receipt; `seq` is untouched on
+/// refusal. STAGED (6.15): the live bracketing read needs running
+/// maps; unit coverage runs through
+/// [`reserve_detail_window_on_banks`] with an injected accepted read
+/// over the same shared checks, plus [`accept_before_bracket`].
 #[allow(clippy::too_many_arguments)] // One driver orchestration over all retained inputs; the bundle keeps preparation inputs together.
 #[allow(dead_code)] // STAGED (6.15): the driver packet calls this; unit coverage runs banks-level.
 pub(crate) fn reserve_detail_window(
@@ -304,34 +662,32 @@ pub(crate) fn reserve_detail_window(
     broad_objects: &PinnedObjects,
     request: &PromotionRequest,
     bundle: &PreparationBundle,
-    read_seq_before: u64,
+    brackets: &mut BroadBracketCollector,
+    seq: &mut u64,
     reserve: &SemanticResourceReserver,
     custody: &DetailWindowCustody,
-) -> Result<(), SelectedDetailRefusal> {
-    use super::counter_collector::ReadStage;
-    use super::counter_reader::ReaderShapeCause;
+) -> Result<AcceptedBracket, SelectedDetailRefusal> {
     let resolved = verify_reserve_inputs(request, bundle, broad_plan, broad_objects, custody)?;
-    // The live validated bracketing read (R2-D2-C): reserve needs an
-    // accepted broad acquisition, fresh for this capture.
+    // The sealed prepared-child identity travels with the reservation
+    // (R2-D2-B): a bundle that cannot seal it (ambiguous, empty or
+    // unpinned subset) never reserves, before any charge.
+    let receipt =
+        PreparedChildReceipt::of_bundle(bundle).ok_or(SelectedDetailRefusal::EndpointUnresolved)?;
+    // The live bracketing acquisition (R2-D2-C): the metrics
+    // orchestration observes the EXACT acquisition through the broad
+    // collector and assigns the bracket seq only on actual acceptance.
     let limits = CounterLimits {
         rows: broad_plan.slots.len(),
         rv_keys: crate::attach::counter_banks::COUNTER_RV_KEY_POOL,
     };
-    let before_read =
-        super::counter_reader::read_banked(broad, broad_plan, broad_objects, limits, reserve)
-            .map_err(|stage| match stage {
-                ReadStage::Shape(ReaderShapeCause::BindingAbsent) => {
-                    SelectedDetailRefusal::Gate(DetailToggleRefusal::BroadNotCounter)
-                }
-                ReadStage::BankQuarantined => {
-                    SelectedDetailRefusal::Gate(DetailToggleRefusal::Quarantined)
-                }
-                _ => SelectedDetailRefusal::BroadPlanTopology,
-            })?;
-    verify_before_bracket(
-        &before_read,
-        broad.counter_collection_generation(),
+    let acquired =
+        super::counter_reader::read_banked(broad, broad_plan, broad_objects, limits, reserve);
+    let bracket = accept_before_bracket(
+        brackets,
+        acquired,
         broad_plan,
+        broad.counter_collection_generation(),
+        seq,
     )?;
     // The gate resolves child slot ids in the CONVERT store (its own
     // id space); broad objects only narrowed the bridge. Passing the
@@ -342,17 +698,17 @@ pub(crate) fn reserve_detail_window(
             bundle.convert_subset().pins(),
             resolved.selected,
             bundle.convert_subset().plan().slots.as_slice(),
-            read_seq_before,
+            bracket.seq,
             reserve,
         )
         .map_err(SelectedDetailRefusal::Gate)?;
     // Custody owns the reservation from before the worker starts; on
     // the impossible occupied race, abandon immediately (never a
     // silent drop) and report WindowActive.
-    match custody.place_reserved(reservation) {
-        Ok(()) => Ok(()),
-        Err(reservation) => {
-            reservation.abandon();
+    match custody.place_reserved(ReservedDetailWindow::new(reservation, receipt)) {
+        Ok(()) => Ok(bracket),
+        Err(reserved) => {
+            reserved.abandon();
             Err(SelectedDetailRefusal::WindowActive)
         }
     }
@@ -377,6 +733,8 @@ pub(super) fn reserve_detail_window_on_banks(
     custody: &DetailWindowCustody,
 ) -> Result<(), SelectedDetailRefusal> {
     let resolved = verify_reserve_inputs(request, bundle, broad_plan, broad_objects, custody)?;
+    let receipt =
+        PreparedChildReceipt::of_bundle(bundle).ok_or(SelectedDetailRefusal::EndpointUnresolved)?;
     verify_before_bracket(before_read, facts.generation, broad_plan)?;
     // The gate resolves child slot ids in the CONVERT store (its own
     // id space); broad objects only narrowed the bridge. Passing the
@@ -392,10 +750,10 @@ pub(super) fn reserve_detail_window_on_banks(
             reserve,
         )
         .map_err(SelectedDetailRefusal::Gate)?;
-    match custody.place_reserved(reservation) {
+    match custody.place_reserved(ReservedDetailWindow::new(reservation, receipt)) {
         Ok(()) => Ok(()),
-        Err(reservation) => {
-            reservation.abandon();
+        Err(reserved) => {
+            reserved.abandon();
             Err(SelectedDetailRefusal::WindowActive)
         }
     }
@@ -441,10 +799,70 @@ pub(crate) fn verify_reserve_inputs(
     resolve_endpoint(request, bundle.convert_subset(), broad_plan, broad_objects)
 }
 
+/// Read-intrinsic rejection of a bracketing acquisition, mirroring
+/// the fail-closed inputs of the collector's own validation: a
+/// saturated or contended producer, or nonzero kernel loss/control
+/// evidence. `Some(reason)` names the defect for the after bracket;
+/// the before bracket refuses on any of them. The session path
+/// observes through the collector itself, which rejects these same
+/// reads; this is the shared read-intrinsic half both paths enforce.
+fn bracket_signal_defect(
+    view: super::counter_collector::CounterReadView<'_>,
+) -> Option<&'static str> {
+    if view.health.saturated || view.health.contended {
+        return Some("health");
+    }
+    // Exactly the evidence list the collector's validation rejects on
+    // (counter_collector.rs): any nonzero count fails the read.
+    let kernel = &view.kernel;
+    if [
+        kernel.ring_loss,
+        kernel.start_insert_failures,
+        kernel.unmatched_returns,
+        kernel.rv_update_failures,
+        kernel.cgroup_scope_failures,
+        kernel.semantic_capture_failures,
+        kernel.template_tail_failures,
+        kernel.unregistered_mechanisms,
+        kernel.abi_refusals,
+        kernel.control.owner_poison,
+        kernel.control.owner_admission_failures,
+        kernel.control.identity_unavailable,
+        kernel.control.root_failures,
+    ]
+    .into_iter()
+    .any(|count| count != 0)
+    {
+        return Some("kernel");
+    }
+    None
+}
+
+/// Every row of a bracketing read names its plan slot exactly
+/// (subset-tolerant like the gate's prefix rule: unpublished holes
+/// legitimately read no row, but no row may name another broad's
+/// slot).
+fn bracket_rows_match_plan(
+    rows: &[super::counter_collector::CounterRow],
+    broad_plan: &AttachPlan,
+) -> bool {
+    rows.iter().all(|row| {
+        let cell = row.view();
+        broad_plan
+            .slots
+            .get(cell.slot as usize)
+            .is_some_and(|slot| {
+                slot.index == cell.slot
+                    && slot.object == cell.target.object
+                    && slot.file_offset == cell.target.file_offset
+            })
+    })
+}
+
 /// The shared before-bracket check: the offered read must be an
-/// accepted read of this broad capture (generation, rows and plan
-/// all agree). A failed or foreign read refuses; reserve never
-/// opens on an unbracketed mark.
+/// accepted read of this broad capture (generation, health, kernel
+/// evidence, rows and plan all agree). A failed, foreign or unhealthy
+/// read refuses; reserve never opens on an unbracketed mark.
 pub(super) fn verify_before_bracket(
     before_read: &CounterRead,
     facts_generation: NonZeroU64,
@@ -460,22 +878,12 @@ pub(super) fn verify_before_bracket(
     let rows = view
         .rows
         .map_err(|_| SelectedDetailRefusal::BroadPlanTopology)?;
-    // Every row names its plan slot exactly (subset-tolerant like the
-    // gate's prefix rule: unpublished holes legitimately read no row,
-    // but no row may name another broad's slot).
-    for row in rows {
-        let cell = row.view();
-        let matches = broad_plan
-            .slots
-            .get(cell.slot as usize)
-            .is_some_and(|slot| {
-                slot.index == cell.slot
-                    && slot.object == cell.target.object
-                    && slot.file_offset == cell.target.file_offset
-            });
-        if !matches {
-            return Err(SelectedDetailRefusal::BroadPlanTopology);
-        }
+    // A read the collector would reject is no bracket either.
+    if bracket_signal_defect(view).is_some() {
+        return Err(SelectedDetailRefusal::BroadPlanTopology);
+    }
+    if !bracket_rows_match_plan(rows, broad_plan) {
+        return Err(SelectedDetailRefusal::BroadPlanTopology);
     }
     Ok(())
 }
@@ -485,13 +893,13 @@ pub(super) fn verify_before_bracket(
 /// [`NativeActivationSource`] in the packet; the raw donor Session
 /// path is never used. The source holds no broad handle (`'static`
 /// service ownership): bind validation runs on owned retained data
-/// (reservation clones with live file checks, baseline receipt,
-/// original custody) plus the presented child session and binding.
+/// (per-object retained targets with live file checks, the sealed
+/// prepared-child receipt) plus the presented child session and
+/// binding.
 pub(crate) struct GatedActivationSource {
     inner: Box<dyn NativeActivationSource>,
     custody: DetailWindowCustody,
-    baseline: PromotionImageBaseline,
-    original: Arc<PidPin>,
+    prepared: PreparedChildReceipt,
 }
 
 impl std::fmt::Debug for GatedActivationSource {
@@ -501,31 +909,35 @@ impl std::fmt::Debug for GatedActivationSource {
 }
 
 impl GatedActivationSource {
+    /// The worker-side prepared-child identity comes sealed from the
+    /// same bundle the worker prepares — never as loose baseline and
+    /// original values independent of the reservation.
     pub(crate) fn new(
         inner: Box<dyn NativeActivationSource>,
         custody: DetailWindowCustody,
-        baseline: PromotionImageBaseline,
-        original: Arc<PidPin>,
+        prepared: PreparedChildReceipt,
     ) -> Self {
         Self {
             inner,
             custody,
-            baseline,
-            original,
+            prepared,
         }
     }
 
     /// Bind validation (R2-D2-B) without the native CAS: takes the
     /// reservation exactly once, binds `expected.generation()`, then
-    /// requires the binding's domain to name the presented child
-    /// session, the binding image's exec to still match the pre-view
-    /// baseline row for the resolved original, and the retained child
-    /// slots to still cover the reserved physical key on the same
-    /// retained object (live file checks). Any mismatch parks the
-    /// window `Unactivated` and refuses WITHOUT running the CAS; the
-    /// lifecycle maps the refusal to its unchanged `ActivationFailed`
-    /// path. Factored out of [`NativeActivationSource::activate`] so
-    /// the full validation matrix runs without a live child Session.
+    /// requires the worker-side prepared child to agree with the
+    /// reservation's sealed identity (same original custody, same
+    /// provider/endpoint coverage), the binding's domain to name the
+    /// presented child session, the binding image's exec to still match
+    /// the pre-view baseline row for the resolved original, and the
+    /// retained child slots to still cover the reserved physical key on
+    /// the same retained object (live file checks). Any mismatch parks
+    /// the window `Unactivated` and refuses WITHOUT running the CAS;
+    /// the lifecycle maps the refusal to its unchanged
+    /// `ActivationFailed` path. Factored out of
+    /// [`NativeActivationSource::activate`] so the full validation
+    /// matrix runs without a live child Session.
     pub(crate) fn validate_and_bind(
         &mut self,
         expected: &SelectedActivationBinding,
@@ -534,12 +946,20 @@ impl GatedActivationSource {
         // Take the reservation exactly once: a missing reservation
         // (double activation, or a driver that never reserved)
         // refuses without a CAS and parks nothing.
-        let Some(reservation) = self.custody.take_reserved() else {
+        let Some(reserved) = self.custody.take_reserved() else {
             return Err(NativeActivationRefusal::BindingMismatch);
         };
         // Bind first (infallible): every failure below parks a
         // closeable Unactivated window instead of dropping the lease.
-        let window = reservation.bind_generation(expected.generation());
+        let (window, sealed) = reserved.bind_with_receipt(expected.generation());
+        // The prepared child the worker was built for must agree with
+        // the reservation (same original custody, same provider and
+        // endpoint coverage): an A-reservation never binds a B-child,
+        // even with an identical original and image.
+        if !sealed.agrees_with(&self.prepared) {
+            self.park_unactivated(window);
+            return Err(NativeActivationRefusal::BindingMismatch);
+        }
         // The binding's domain must name the presented child session
         // (the inner minter re-checks this at the CAS; the adapter
         // pre-check parks Unactivated without attempting it).
@@ -554,8 +974,9 @@ impl GatedActivationSource {
         // and the minter's (against the live child), not the
         // reservation's.
         if !self
-            .baseline
-            .matches_original_and_exec(&self.original, expected.image().exec_id)
+            .prepared
+            .baseline()
+            .matches_original_and_exec(self.prepared.original(), expected.image().exec_id)
         {
             self.park_unactivated(window);
             return Err(NativeActivationRefusal::BindingMismatch);
@@ -630,17 +1051,18 @@ impl<'a> CloseBracket<'a> {
 /// How the after bracket checked against the live close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseBracketVerdict {
-    /// The after read is fresh for this broad (generation, rows and
-    /// mode all match the close).
+    /// The after read is fresh for this broad (generation, rows, mode,
+    /// health and kernel evidence all match the close).
     Matched,
     /// No accepted final read (acquisition failed): the lineage still
     /// delivers with the live after-mark, but the read bracket is
     /// explicitly unavailable.
     AfterUnavailable,
     /// The offered after read does not bracket this close. The static
-    /// names the first mismatch (`generation`, `rows`, `mode`, or
-    /// `read_failed`); the close still delivers its true live marks,
-    /// and the report carries the defect — never a quiet mismatch.
+    /// names the first mismatch (`generation`, `rows`, `mode`,
+    /// `read_failed`, `health`, `kernel`, or `rejected`); the close
+    /// still delivers its true live marks, and the report carries the
+    /// defect — never a quiet mismatch.
     Mismatched(&'static str),
 }
 
@@ -661,15 +1083,19 @@ pub(crate) struct DetailCloseReport {
 /// Phase 3 (driver tick): close exactly once, after the child's own
 /// terminal state is genuine (installed lane wound down / disposal
 /// settled / reclaim settled). Consumes the window; the after-mark
-/// comes from live banks plus a live validated after read when the
-/// final acquisition is accepted (R2-D2-C). A failed final
-/// acquisition closes with an explicit unavailable bracket; a
+/// comes from live banks, and the after acquisition is observed
+/// through the bracket collector (R2-D2-C): a fresh acceptance
+/// assigns the close seq, a failed final acquisition closes with an
+/// explicit unavailable bracket, and a rejected one is disclosed as
+/// mismatched — the last accepted read never masquerades as fresh. A
 /// quarantined close refuses with no lineage (the driver records a
 /// [`render_close_refused_row`] entry instead) — never a fabricated
 /// after-mark. STAGED (6.15): the live after read needs running
 /// maps; unit coverage runs through
 /// [`close_detail_window_on_banks`] with an injected bracket over
-/// the same shared verdict.
+/// the same shared verdict, plus [`accept_after_bracket`].
+#[allow(clippy::too_many_arguments)]
+// One driver orchestration over all retained inputs; the bracket collector and seq travel together.
 #[allow(dead_code)] // STAGED (6.15): the driver packet calls this; unit coverage runs banks-level.
 pub(crate) fn close_detail_window(
     window: CounterDetailWindow,
@@ -677,34 +1103,37 @@ pub(crate) fn close_detail_window(
     broad_plan: &AttachPlan,
     broad_objects: &PinnedObjects,
     mode: CounterMode,
-    seq_after: u64,
+    brackets: &mut BroadBracketCollector,
+    seq: &mut u64,
     reserve: &SemanticResourceReserver,
 ) -> Result<DetailCloseReport, DetailToggleRefusal> {
     let generation = broad.counter_collection_generation();
     let seq_before = window.mark_before().seq;
-    // The live after read when the final acquisition is accepted; a
-    // failed acquisition closes with an explicit unavailable bracket
-    // (the last accepted seq brackets the close but never masquerades
-    // as a fresh after-read).
+    // The live after acquisition when the final scrape runs: observed
+    // through the collector, with the close seq assigned only on
+    // actual acceptance.
     let limits = CounterLimits {
         rows: broad_plan.slots.len(),
         rv_keys: crate::attach::counter_banks::COUNTER_RV_KEY_POOL,
     };
-    let read =
-        super::counter_reader::read_banked(broad, broad_plan, broad_objects, limits, reserve).ok();
-    let bracket = CloseBracket {
-        seq_after,
-        mode,
-        read: read.as_ref(),
+    let acquired =
+        super::counter_reader::read_banked(broad, broad_plan, broad_objects, limits, reserve);
+    let bracket = match accept_after_bracket(brackets, acquired, broad_plan, mode, generation, seq)
+    {
+        AfterBracketAcceptance::Fresh(_) => CloseBracketVerdict::Matched,
+        AfterBracketAcceptance::Unavailable => CloseBracketVerdict::AfterUnavailable,
+        AfterBracketAcceptance::Mismatched(reason) => CloseBracketVerdict::Mismatched(reason),
     };
-    let verdict = verify_after_bracket(&bracket, generation, broad_plan);
+    // On rejection `seq` is untouched: the last accepted seq brackets
+    // the close, explicitly not fresh.
+    let seq_after = *seq;
     let (lineage, drift) = window.close_on(broad, seq_after)?;
     Ok(DetailCloseReport {
         lineage,
         drift,
         seq_before,
         seq_after,
-        bracket: verdict,
+        bracket,
     })
 }
 
@@ -733,11 +1162,41 @@ pub(super) fn close_detail_window_on_banks(
     })
 }
 
+/// The first defect of an offered after read, if any (generation,
+/// mode, failed rows, unhealthy signals, foreign rows), shared by the
+/// banks-level verdict and the session path's acceptance.
+fn after_bracket_mismatch(
+    read: &CounterRead,
+    mode: CounterMode,
+    generation: NonZeroU64,
+    broad_plan: &AttachPlan,
+) -> Option<&'static str> {
+    let view = read.view();
+    if view.generation != generation {
+        return Some("generation");
+    }
+    if view.mode != mode {
+        return Some("mode");
+    }
+    let rows = match view.rows {
+        Ok(rows) => rows,
+        Err(_) => return Some("read_failed"),
+    };
+    if let Some(reason) = bracket_signal_defect(view) {
+        return Some(reason);
+    }
+    if !bracket_rows_match_plan(rows, broad_plan) {
+        return Some("rows");
+    }
+    None
+}
+
 /// The shared after-bracket verdict both close paths report: the
-/// offered read must be fresh for this broad (generation, rows and
-/// mode all agree) for [`CloseBracketVerdict::Matched`]; no offered
-/// read is [`CloseBracketVerdict::AfterUnavailable`]; anything else
-/// names its first mismatch.
+/// offered read must be fresh for this broad (generation, rows, mode,
+/// health and kernel evidence all agree) for
+/// [`CloseBracketVerdict::Matched`]; no offered read is
+/// [`CloseBracketVerdict::AfterUnavailable`]; anything else names its
+/// first mismatch.
 pub(super) fn verify_after_bracket(
     bracket: &CloseBracket<'_>,
     generation: NonZeroU64,
@@ -746,32 +1205,10 @@ pub(super) fn verify_after_bracket(
     let Some(read) = bracket.read else {
         return CloseBracketVerdict::AfterUnavailable;
     };
-    let view = read.view();
-    if view.generation != generation {
-        return CloseBracketVerdict::Mismatched("generation");
+    match after_bracket_mismatch(read, bracket.mode, generation, broad_plan) {
+        None => CloseBracketVerdict::Matched,
+        Some(reason) => CloseBracketVerdict::Mismatched(reason),
     }
-    if view.mode != bracket.mode {
-        return CloseBracketVerdict::Mismatched("mode");
-    }
-    let rows = match view.rows {
-        Ok(rows) => rows,
-        Err(_) => return CloseBracketVerdict::Mismatched("read_failed"),
-    };
-    for row in rows {
-        let cell = row.view();
-        let matches = broad_plan
-            .slots
-            .get(cell.slot as usize)
-            .is_some_and(|slot| {
-                slot.index == cell.slot
-                    && slot.object == cell.target.object
-                    && slot.file_offset == cell.target.file_offset
-            });
-        if !matches {
-            return CloseBracketVerdict::Mismatched("rows");
-        }
-    }
-    CloseBracketVerdict::Matched
 }
 
 /// The window-lifecycle events the driver records in the normal
@@ -1061,6 +1498,32 @@ mod tests {
         counts: &[(u64, u64, u64)],
         window: Option<ReadWindow>,
     ) -> CounterRead {
+        scripted_read_with_signals(
+            pool,
+            plan,
+            generation,
+            mode,
+            counts,
+            window,
+            CounterHealth::default(),
+            KernelEvidence::default(),
+        )
+    }
+
+    /// [`scripted_read`] with explicit producer/kernel signals: the rows
+    /// stay valid while the health/kernel evidence varies, so bracket
+    /// twins offer reads the collector would reject for their signals.
+    #[allow(clippy::too_many_arguments)] // Test seam mirroring scripted_read plus the two signal inputs.
+    fn scripted_read_with_signals(
+        pool: &SemanticResourcePool,
+        plan: &AttachPlan,
+        generation: NonZeroU64,
+        mode: CounterMode,
+        counts: &[(u64, u64, u64)],
+        window: Option<ReadWindow>,
+        health: CounterHealth,
+        kernel: KernelEvidence,
+    ) -> CounterRead {
         assert_eq!(
             counts.len(),
             plan.slots.len(),
@@ -1120,8 +1583,8 @@ mod tests {
             mode,
             window,
             Ok(rows),
-            CounterHealth::default(),
-            KernelEvidence::default(),
+            health,
+            kernel,
             reservation,
         )
         .expect("scripted read packs")
@@ -1289,8 +1752,32 @@ mod tests {
         cookie: u64,
         exec_id: u64,
     ) -> PromotionScene {
-        use crate::discovery::caller_registry::{CallerId, ModuleId};
         let pin = Arc::new(crate::process::PidPin::open(std::process::id()).expect("self pins"));
+        promotion_scene_with_pin(
+            pin,
+            convert_plan,
+            convert_pins,
+            required_map,
+            endpoint,
+            cookie,
+            exec_id,
+        )
+    }
+
+    /// [`promotion_scene_with_required`] over a caller-held original:
+    /// two bundles sharing one pin isolate provider/coverage checks
+    /// from original-custody checks (identical original, same image).
+    #[allow(clippy::too_many_arguments)] // Test seam mirroring promotion_scene_with_required plus the shared pin.
+    fn promotion_scene_with_pin(
+        pin: Arc<PidPin>,
+        convert_plan: AttachPlan,
+        convert_pins: PinnedObjects,
+        required_map: BTreeMap<PinnedObjectId, BTreeSet<u32>>,
+        endpoint: Option<u64>,
+        cookie: u64,
+        exec_id: u64,
+    ) -> PromotionScene {
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
         let custody = crate::process::WeakProcessCustody::pinned_for_test(&pin);
         let view = scripted_promotion_view_with_baseline_for_test(
             pin.pid(),
@@ -1739,7 +2226,12 @@ mod tests {
         assert!(custody.take_bound().is_none(), "reserved is not bound");
         let reservation = custody.take_reserved().expect("take-once yields it");
         assert_eq!(reservation.selected(), 512);
-        assert!(!custody.is_occupied(), "take drains the slot");
+        // Take moves the value but NOT the admission: the live
+        // reservation still occupies until its terminal disposition.
+        assert!(
+            custody.is_occupied(),
+            "take moves the reservation; admission follows it"
+        );
         assert!(custody.take_reserved().is_none(), "no second take");
         // A parked bound window takes through the bound path only.
         let window = reservation.bind_generation(DETAIL_GENERATION);
@@ -1753,8 +2245,16 @@ mod tests {
             matches!(parked, BoundWindow::Active(_)),
             "the parked state survives the take"
         );
-        assert!(!custody.is_occupied());
+        assert!(
+            custody.is_occupied(),
+            "a taken window still occupies until its terminal"
+        );
         assert!(custody.take_bound().is_none(), "no second bound take");
+        // Dropping the taken window releases admission (fail-safe
+        // against a permanent WindowActive); the ledger still needs
+        // its explicit terminal, which the lifecycle twins prove.
+        drop(parked);
+        assert!(!custody.is_occupied());
     }
 
     #[test]
@@ -1854,8 +2354,8 @@ mod tests {
         let mut source = GatedActivationSource::new(
             Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
             custody.clone(),
-            proved.bundle.baseline.clone(),
-            Arc::clone(&proved.pin),
+            PreparedChildReceipt::of_bundle(&proved.bundle)
+                .expect("scene seals its prepared child"),
         );
         let window = source
             .validate_and_bind(&expected, Some(domain))
@@ -2077,8 +2577,8 @@ mod tests {
         let source = GatedActivationSource::new(
             Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
             custody.clone(),
-            proved.bundle.baseline.clone(),
-            Arc::clone(&proved.pin),
+            PreparedChildReceipt::of_bundle(&proved.bundle)
+                .expect("scene seals its prepared child"),
         );
         let mut service = SelectedLifecycleService::new();
         service
@@ -2218,8 +2718,8 @@ mod tests {
             let mut source = GatedActivationSource::new(
                 Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
                 custody.clone(),
-                proved.bundle.baseline.clone(),
-                Arc::clone(&proved.pin),
+                PreparedChildReceipt::of_bundle(&proved.bundle)
+                    .expect("scene seals its prepared child"),
             );
             assert_eq!(
                 source
@@ -2302,8 +2802,8 @@ mod tests {
         let mut source = GatedActivationSource::new(
             Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
             custody.clone(),
-            proved.bundle.baseline.clone(),
-            Arc::clone(&proved.pin),
+            PreparedChildReceipt::of_bundle(&proved.bundle)
+                .expect("scene seals its prepared child"),
         );
         source
             .validate_and_bind(&expected, Some(domain))
@@ -3603,5 +4103,709 @@ mod tests {
         assert_eq!(reservation.selected(), 0);
         reservation.abandon();
         assert!(!custody.is_occupied());
+    }
+
+    #[test]
+    fn selected_detail_bind_refuses_reservation_for_other_provider() {
+        use crate::inventory_promotion::lifecycle::NativeActivationRefusal;
+        // A reservation for provider A must never bind a prepared child
+        // for provider B, even with identical original custody and
+        // image. Healthy A→A binds; A→B refuses WITHOUT a CAS and
+        // parks Unactivated. Both bundles share one pin so only the
+        // provider/coverage identity distinguishes them.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let pin = Arc::new(crate::process::PidPin::open(std::process::id()).expect("self pins"));
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let convert_b = convert_for(&scene.plan, scene.id_b);
+        let proved_a = promotion_scene_with_pin(
+            Arc::clone(&pin),
+            convert_a,
+            scene.objects.clone(),
+            BTreeMap::from([(scene.id_a, BTreeSet::from([0]))]),
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let proved_b = promotion_scene_with_pin(
+            Arc::clone(&pin),
+            convert_b,
+            scene.objects.clone(),
+            BTreeMap::from([(scene.id_b, BTreeSet::from([0]))]),
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved_a.request,
+            &proved_a.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("A reserves");
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("domain mints");
+        let expected = expected_binding(domain, DETAIL_GENERATION, 0xC00, 0xE9E);
+        let cas_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut healthy = GatedActivationSource::new(
+            Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
+            custody.clone(),
+            PreparedChildReceipt::of_bundle(&proved_a.bundle)
+                .expect("scene seals its prepared child"),
+        );
+        healthy
+            .validate_and_bind(&expected, Some(domain))
+            .expect("A-reservation→A-child binds");
+        assert_eq!(
+            cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "bind validation never attempts the CAS"
+        );
+        // The healthy bind took the reservation; reserve A again, then
+        // offer B's prepared child with the identical original/image.
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &proved_a.request,
+            &proved_a.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("A reserves again");
+        let mut mixed = GatedActivationSource::new(
+            Box::new(StubInner::succeeding(Arc::clone(&cas_attempts))),
+            custody.clone(),
+            PreparedChildReceipt::of_bundle(&proved_b.bundle)
+                .expect("scene seals its prepared child"),
+        );
+        assert_eq!(
+            mixed
+                .validate_and_bind(&expected, Some(domain))
+                .unwrap_err(),
+            NativeActivationRefusal::BindingMismatch,
+            "A-reservation→B-child refuses before the CAS"
+        );
+        assert_eq!(
+            cas_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused bind never attempts the CAS"
+        );
+        let parked = custody.take_bound().expect("the refusal parks");
+        assert!(
+            matches!(parked, BoundWindow::Unactivated(_)),
+            "a refused bind parks Unactivated, never Active"
+        );
+    }
+
+    #[test]
+    fn selected_detail_before_bracket_refuses_unhealthy_acquisitions() {
+        // A bracketing read the collector would reject — saturated or
+        // contended producer, nonzero kernel loss — must refuse reserve,
+        // never open a window on it.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        let proved = promotion_scene(
+            convert_a,
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let base = counts_for(&scene.plan, 8, 9);
+        for (label, health, kernel) in [
+            (
+                "saturated",
+                CounterHealth {
+                    saturated: true,
+                    contended: false,
+                },
+                KernelEvidence::default(),
+            ),
+            (
+                "contended",
+                CounterHealth {
+                    saturated: false,
+                    contended: true,
+                },
+                KernelEvidence::default(),
+            ),
+            (
+                "kernel-loss",
+                CounterHealth::default(),
+                KernelEvidence {
+                    ring_loss: 1,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let custody = DetailWindowCustody::new();
+            let read = scripted_read_with_signals(
+                &scene.pool,
+                &scene.plan,
+                NonZeroU64::new(BROAD_GENERATION).unwrap(),
+                CounterMode::Counts,
+                &base,
+                window_of(30, 40),
+                health,
+                kernel,
+            );
+            assert_eq!(
+                reserve_detail_window_on_banks(
+                    &scene.banks,
+                    broad_facts(BROAD_GENERATION, false),
+                    &scene.plan,
+                    &scene.objects,
+                    &proved.request,
+                    &proved.bundle,
+                    &read,
+                    SEQ_BEFORE,
+                    &scene.pool.reserver(),
+                    &custody,
+                )
+                .unwrap_err(),
+                SelectedDetailRefusal::BroadPlanTopology,
+                "case {label} refuses reserve"
+            );
+            assert!(
+                !custody.is_occupied(),
+                "case {label}: a refused reserve places nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_detail_after_bracket_discloses_unhealthy_acquisitions() {
+        // An after-bracket read the collector would reject must never
+        // verify Matched: the close discloses the defect and still
+        // delivers its true live marks and seqs.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let convert_a = convert_for(&scene.plan, scene.id_a);
+        for (label, health, kernel, expected) in [
+            (
+                "saturated",
+                CounterHealth {
+                    saturated: true,
+                    contended: false,
+                },
+                KernelEvidence::default(),
+                "health",
+            ),
+            (
+                "kernel-loss",
+                CounterHealth::default(),
+                KernelEvidence {
+                    ring_loss: 1,
+                    ..Default::default()
+                },
+                "kernel",
+            ),
+        ] {
+            let proved = promotion_scene(
+                convert_a.clone(),
+                scene.objects.clone(),
+                scene.id_a,
+                Some(0x80),
+                0xC00,
+                0xE9E,
+            );
+            let custody = DetailWindowCustody::new();
+            let before = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                NonZeroU64::new(BROAD_GENERATION).unwrap(),
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 8, 9),
+                window_of(30, 40),
+            );
+            reserve_detail_window_on_banks(
+                &scene.banks,
+                broad_facts(BROAD_GENERATION, false),
+                &scene.plan,
+                &scene.objects,
+                &proved.request,
+                &proved.bundle,
+                &before,
+                SEQ_BEFORE,
+                &scene.pool.reserver(),
+                &custody,
+            )
+            .expect("proved request reserves");
+            let reservation = custody.take_reserved().expect("placed");
+            let window = reservation.bind_generation(DETAIL_GENERATION);
+            let after = scripted_read_with_signals(
+                &scene.pool,
+                &scene.plan,
+                NonZeroU64::new(BROAD_GENERATION).unwrap(),
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 11, 12),
+                window_of(40, 50),
+                health,
+                kernel,
+            );
+            let bracket = CloseBracket::new(SEQ_AFTER, CounterMode::Counts, Some(&after));
+            let report = close_detail_window_on_banks(
+                window,
+                &scene.banks,
+                NonZeroU64::new(BROAD_GENERATION).unwrap(),
+                &scene.plan,
+                &bracket,
+            )
+            .expect("close delivers its true marks");
+            assert_eq!(
+                report.bracket,
+                CloseBracketVerdict::Mismatched(expected),
+                "case {label} names its mismatch, never Matched"
+            );
+            assert_eq!(
+                (report.seq_before, report.seq_after),
+                (SEQ_BEFORE, SEQ_AFTER),
+                "case {label}: the close still delivers its true seqs"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_detail_taken_active_window_blocks_second_reserve() {
+        // An Active window taken for install still occupies admission
+        // until its terminal close: a second reserve refuses WindowActive
+        // with the first charge intact, and reselect succeeds after the
+        // close.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 513);
+        let convert = convert_tail(&scene.plan, scene.object, 13);
+        let first = promotion_scene(
+            convert.clone(),
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80 + 512 * 0x10),
+            0xC00,
+            0xE9E,
+        );
+        let custody = DetailWindowCustody::new();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &first.request,
+            &first.bundle,
+            &before,
+            SEQ_BEFORE,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("first reserves");
+        let reservation = custody.take_reserved().expect("placed");
+        let window = reservation.bind_generation(DETAIL_GENERATION);
+        custody
+            .place_bound(BoundWindow::Active(window))
+            .expect("FORGED-ACTIVE parks (CAS is live-only)");
+        let taken = custody.take_bound().expect("Install takes Active");
+        let BoundWindow::Active(active) = taken else {
+            panic!("a CAS-won window installs Active, never Unactivated");
+        };
+        // A second request while the first Active window is still open.
+        let second = promotion_scene(
+            convert,
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80 + 511 * 0x10),
+            0xC00,
+            0xE9E,
+        );
+        let before2 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 8, 9),
+            window_of(30, 40),
+        );
+        let charged_before_second = scene.pool.snapshot().charged_bytes;
+        assert_eq!(
+            reserve_detail_window_on_banks(
+                &scene.banks,
+                broad_facts(BROAD_GENERATION, false),
+                &scene.plan,
+                &scene.objects,
+                &second.request,
+                &second.bundle,
+                &before2,
+                SEQ_BEFORE + 1,
+                &scene.pool.reserver(),
+                &custody,
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::WindowActive,
+            "a taken Active window still occupies admission"
+        );
+        assert_eq!(
+            scene.pool.snapshot().charged_bytes,
+            charged_before_second,
+            "a refused reserve charges nothing"
+        );
+        // The terminal close releases admission; reselect then succeeds.
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 11, 12),
+            window_of(40, 50),
+        );
+        let bracket = CloseBracket::new(SEQ_AFTER, CounterMode::Counts, Some(&after));
+        let report = close_detail_window_on_banks(
+            active,
+            &scene.banks,
+            NonZeroU64::new(BROAD_GENERATION).unwrap(),
+            &scene.plan,
+            &bracket,
+        )
+        .expect("ordered close delivers");
+        assert_eq!(report.bracket, CloseBracketVerdict::Matched);
+        reserve_detail_window_on_banks(
+            &scene.banks,
+            broad_facts(BROAD_GENERATION, false),
+            &scene.plan,
+            &scene.objects,
+            &second.request,
+            &second.bundle,
+            &before2,
+            SEQ_BEFORE + 1,
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("reselect reserves after close");
+        let reselect = custody.take_reserved().expect("reselect placed");
+        assert_eq!(reselect.selected(), 511);
+        reselect.abandon();
+        assert!(!custody.is_occupied());
+    }
+
+    #[test]
+    fn selected_detail_bracket_acceptance_assigns_seq_on_observe_only() {
+        use super::super::counter_collector::ReadStage;
+        // The session path's shared orchestration: seqs assign only on
+        // actual collector acceptance of the exact acquisition. Every
+        // failure leaves the collector baseline and the seq untouched —
+        // proved by the next acceptance advancing from the same
+        // baseline; collector-rejected acquisitions assign nothing.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        // Positive control: the accepted read assigns seq 1 and
+        // retains its real acquisition window and identity.
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+        );
+        let receipt = accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("healthy acquisition accepts");
+        assert_eq!(seq, 1);
+        assert_eq!(receipt.seq, 1);
+        assert_eq!(receipt.generation, brgen);
+        assert_eq!(receipt.mode, CounterMode::Counts);
+        assert_eq!(receipt.window, Some((10, 20)));
+        assert_eq!(receipt.rows, 4);
+        // A failed acquisition refuses with seq and baseline untouched.
+        assert_eq!(
+            accept_before_bracket(
+                &mut brackets,
+                Err(ReadStage::Budget),
+                &scene.plan,
+                brgen,
+                &mut seq
+            )
+            .unwrap_err(),
+            SelectedDetailRefusal::BroadPlanTopology
+        );
+        assert_eq!(seq, 1, "a failed acquisition assigns no seq");
+        // A foreign generation refuses without observing (no pollution).
+        let foreign = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            NonZeroU64::new(BROAD_GENERATION + 1).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+        );
+        assert_eq!(
+            accept_before_bracket(&mut brackets, Ok(foreign), &scene.plan, brgen, &mut seq)
+                .unwrap_err(),
+            SelectedDetailRefusal::BroadPlanTopology
+        );
+        assert_eq!(seq, 1, "a foreign acquisition assigns no seq");
+        // An unhealthy acquisition refuses without observing.
+        let saturated = scripted_read_with_signals(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+            CounterHealth {
+                saturated: true,
+                contended: false,
+            },
+            KernelEvidence::default(),
+        );
+        assert_eq!(
+            accept_before_bracket(&mut brackets, Ok(saturated), &scene.plan, brgen, &mut seq)
+                .unwrap_err(),
+            SelectedDetailRefusal::BroadPlanTopology
+        );
+        assert_eq!(seq, 1, "an unhealthy acquisition assigns no seq");
+        // The next healthy acquisition still advances from the r0
+        // baseline: none of the rejections polluted it or the seq.
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 7),
+            window_of(20, 30),
+        );
+        let receipt = accept_before_bracket(&mut brackets, Ok(r1), &scene.plan, brgen, &mut seq)
+            .expect("the baseline is still r0");
+        assert_eq!((seq, receipt.seq), (2, 2));
+        assert_eq!(receipt.window, Some((20, 30)));
+        // A shape-correct acquisition the collector rejects (failed
+        // differences: fewer rows than the baseline) refuses with the
+        // seq untouched.
+        let short_plan = AttachPlan::from_slots(scene.plan.slots[..2].to_vec());
+        let short = scripted_read(
+            &scene.pool,
+            &short_plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&short_plan, 9, 9),
+            window_of(30, 40),
+        );
+        assert_eq!(
+            accept_before_bracket(&mut brackets, Ok(short), &scene.plan, brgen, &mut seq)
+                .unwrap_err(),
+            SelectedDetailRefusal::BroadPlanTopology
+        );
+        assert_eq!(seq, 2, "a collector-rejected acquisition assigns no seq");
+        // A restarted broad capture adopts cleanly: the collector moves
+        // to the fresh generation (superseding the latched one) and the
+        // bracket assigns.
+        let brgen8 = NonZeroU64::new(BROAD_GENERATION + 1).unwrap();
+        let r8 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen8,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 9, 9),
+            window_of(40, 50),
+        );
+        let receipt = accept_before_bracket(&mut brackets, Ok(r8), &scene.plan, brgen8, &mut seq)
+            .expect("the fresh generation adopts");
+        assert_eq!((seq, receipt.seq), (3, 3));
+        assert_eq!(receipt.generation, brgen8);
+        // A shape-correct acquisition refused by pre-latched collector
+        // state assigns nothing and installs nothing.
+        let mut stuck =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut stuck_seq = 0;
+        let bad = scripted_read_with_signals(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+            CounterHealth {
+                saturated: true,
+                contended: false,
+            },
+            KernelEvidence::default(),
+        );
+        assert!(
+            matches!(
+                stuck.observe_for_test(Ok(bad)),
+                CounterObservation::Unavailable(_)
+            ),
+            "the premise: the collector latches on the bad read"
+        );
+        let good = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 7),
+            window_of(20, 30),
+        );
+        assert_eq!(
+            accept_before_bracket(&mut stuck, Ok(good), &scene.plan, brgen, &mut stuck_seq)
+                .unwrap_err(),
+            SelectedDetailRefusal::BroadPlanTopology
+        );
+        assert_eq!(stuck_seq, 0, "a latched-out acquisition assigns no seq");
+    }
+
+    #[test]
+    fn selected_detail_after_bracket_acceptance_discloses_without_promotion() {
+        use super::super::counter_collector::ReadStage;
+        // accept_after_bracket: a fresh acceptance assigns; a failed
+        // acquisition is explicitly unavailable; a defective or
+        // collector-rejected one is mismatched — never Matched, never
+        // promoted to fresh. The seq advances only on acceptance.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        // Chain a before-accept first, as the session path does.
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+        );
+        accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("before accepts");
+        assert_eq!(seq, 1);
+        // Fresh final acquisition: assigns and returns its identity.
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 7),
+            window_of(20, 30),
+        );
+        let fresh = accept_after_bracket(
+            &mut brackets,
+            Ok(r1),
+            &scene.plan,
+            CounterMode::Counts,
+            brgen,
+            &mut seq,
+        );
+        let AfterBracketAcceptance::Fresh(receipt) = fresh else {
+            panic!("a fresh acquisition accepts: {fresh:?}");
+        };
+        assert_eq!((seq, receipt.seq), (2, 2));
+        assert_eq!(receipt.window, Some((20, 30)));
+        // Failed acquisition: explicitly unavailable with the seq
+        // untouched (the preserved failed-final-acquisition boundary:
+        // the last accepted seq brackets, never fresh).
+        assert_eq!(
+            accept_after_bracket(
+                &mut brackets,
+                Err(ReadStage::Budget),
+                &scene.plan,
+                CounterMode::Counts,
+                brgen,
+                &mut seq
+            ),
+            AfterBracketAcceptance::Unavailable
+        );
+        assert_eq!(seq, 2, "a failed acquisition assigns no seq");
+        // Collector-rejected acquisition: mismatched, never Matched.
+        let mut stuck =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut stuck_seq = 0;
+        let bad = scripted_read_with_signals(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+            CounterHealth {
+                saturated: true,
+                contended: false,
+            },
+            KernelEvidence::default(),
+        );
+        assert!(
+            matches!(
+                stuck.observe_for_test(Ok(bad)),
+                CounterObservation::Unavailable(_)
+            ),
+            "the premise: the collector latches on the bad read"
+        );
+        let good = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 7),
+            window_of(20, 30),
+        );
+        assert_eq!(
+            accept_after_bracket(
+                &mut stuck,
+                Ok(good),
+                &scene.plan,
+                CounterMode::Counts,
+                brgen,
+                &mut stuck_seq
+            ),
+            AfterBracketAcceptance::Mismatched("rejected")
+        );
+        assert_eq!(stuck_seq, 0, "a latched-out acquisition assigns no seq");
+        // Wrong-mode acquisition: mismatched without observing.
+        let wrong = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 9, 9),
+            window_of(30, 40),
+        );
+        assert_eq!(
+            accept_after_bracket(
+                &mut brackets,
+                Ok(wrong),
+                &scene.plan,
+                CounterMode::Latency,
+                brgen,
+                &mut seq
+            ),
+            AfterBracketAcceptance::Mismatched("mode")
+        );
+        assert_eq!(seq, 2, "a mismatched acquisition assigns no seq");
     }
 }

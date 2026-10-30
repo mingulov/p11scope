@@ -8541,6 +8541,183 @@ fn prearm_object_change_detected_after_stop_never_exceeds_first_stop() {
     );
 }
 
+/// Packet 6.13 round-4 (re-audit finding 1): an object change detected
+/// during terminal cleanup after an *unknown* first stop must not publish
+/// a numeric coverage end — the detection ran in the blind tail past the
+/// stop, so it cannot bound coverage. The watch still ends
+/// `object_changed` with the exact held-FD bracket, but `until_ns` stays
+/// unknown.
+#[test]
+fn prearm_unknown_first_stop_keeps_end_unknown_after_object_change() {
+    use crate::render::{PrearmWatchEnd, PrearmWatchState};
+    use std::io::Write as _;
+
+    let fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_prearm_before_load();
+    assert!(engine.has_prearm_watches());
+    let watch_id = engine
+        .prearm
+        .watches()
+        .keys()
+        .next()
+        .copied()
+        .expect("one pre-arm watch");
+    let mut session = ScriptedSession::default();
+    for slot in engine.plan().slots.iter() {
+        session.scripted_links.insert(slot.index);
+        session.scripted_stamps.insert(slot.index, 1000);
+    }
+    // A last successful held-FD check before dirtying: the published
+    // bracket must preserve it, even though the coverage end is unknown.
+    assert_eq!(engine.pinned().check_object_unchanged(watch_id), Ok(true));
+    // Dirty the pinned provider after arming so the terminal refresh
+    // detects the change at real-clock time, in the blind tail.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    {
+        let provider = fixture.provider_path();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(provider)
+            .expect("dirty the pinned provider");
+        file.write_all(b"x").expect("extend the pinned provider");
+        file.sync_all().expect("persist the change");
+    }
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        None,
+        &crate::metrics::KernelEvidence::default(),
+        0,
+    );
+    let watch = engine.discovery.modules[0]
+        .watch
+        .as_ref()
+        .expect("finish renders every watch");
+    assert_eq!(watch.state, PrearmWatchState::Ended);
+    assert_eq!(watch.ended_by, Some(PrearmWatchEnd::ObjectChanged));
+    assert_eq!(watch.since_ns, Some(1000));
+    assert_eq!(
+        watch.until_ns, None,
+        "a blind-tail detection must not publish a numeric coverage end"
+    );
+    let real = engine
+        .pinned()
+        .change_bracket(watch_id)
+        .expect("detection latched a real held-FD bracket");
+    assert_eq!(
+        watch.changed,
+        Some(real),
+        "published bracket must equal the held-FD evidence"
+    );
+}
+
+/// Packet 6.13 round-4 (re-audit finding 1, control): a healthy watch
+/// closed at an unknown first stop ends with an unknown boundary and no
+/// change bracket.
+#[test]
+fn prearm_unknown_first_stop_healthy_watch_ends_unknown() {
+    use crate::render::{PrearmWatchEnd, PrearmWatchState};
+
+    let fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_prearm_before_load();
+    assert!(engine.has_prearm_watches());
+    let mut session = ScriptedSession::default();
+    for slot in engine.plan().slots.iter() {
+        session.scripted_links.insert(slot.index);
+        session.scripted_stamps.insert(slot.index, 1000);
+    }
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        None,
+        &crate::metrics::KernelEvidence::default(),
+        0,
+    );
+    let watch = engine.discovery.modules[0]
+        .watch
+        .as_ref()
+        .expect("finish renders every watch");
+    assert_eq!(watch.state, PrearmWatchState::ArmedIdle);
+    assert_eq!(watch.ended_by, Some(PrearmWatchEnd::ScopeEnd));
+    assert_eq!(watch.since_ns, Some(1000));
+    assert_eq!(watch.until_ns, None);
+    assert_eq!(watch.changed, None);
+}
+
+/// Packet 6.13 round-4 (re-audit finding 1, distinction): a watch already
+/// closed by a mid-capture object change keeps its real numeric end and
+/// bracket through an unknown-stop terminal close. Only watches still
+/// open at the stop get the unknown boundary.
+#[test]
+fn prearm_unknown_first_stop_preserves_pre_stop_close() {
+    use crate::render::{PrearmWatchEnd, PrearmWatchState};
+    use std::io::Write as _;
+
+    let fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_prearm_before_load();
+    assert!(engine.has_prearm_watches());
+    let watch_id = engine
+        .prearm
+        .watches()
+        .keys()
+        .next()
+        .copied()
+        .expect("one pre-arm watch");
+    let mut session = ScriptedSession::default();
+    for slot in engine.plan().slots.iter() {
+        session.scripted_links.insert(slot.index);
+        session.scripted_stamps.insert(slot.index, 1000);
+    }
+    engine.refresh_prearm_liveness(&session, Some(1000));
+    assert_eq!(engine.pinned().check_object_unchanged(watch_id), Ok(true));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    {
+        let provider = fixture.provider_path();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(provider)
+            .expect("dirty the pinned provider");
+        file.write_all(b"x").expect("extend the pinned provider");
+        file.sync_all().expect("persist the change");
+    }
+    // The mid-capture refresh — before any stop — latches the real end.
+    assert_eq!(engine.refresh_prearm_object_changes(), vec![watch_id]);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        None,
+        &crate::metrics::KernelEvidence::default(),
+        0,
+    );
+    let watch = engine.discovery.modules[0]
+        .watch
+        .as_ref()
+        .expect("finish renders every watch");
+    assert_eq!(watch.state, PrearmWatchState::Ended);
+    assert_eq!(watch.ended_by, Some(PrearmWatchEnd::ObjectChanged));
+    assert_eq!(watch.since_ns, Some(1000));
+    let real = engine
+        .pinned()
+        .change_bracket(watch_id)
+        .expect("detection latched a real held-FD bracket");
+    assert_eq!(
+        watch.until_ns,
+        Some(real.detected_ns),
+        "a pre-stop close keeps its real numeric end"
+    );
+    assert_eq!(
+        watch.changed,
+        Some(real),
+        "published bracket must equal the held-FD evidence"
+    );
+}
+
 /// Packet 6.13 residual: generic captures assemble their late-discovery
 /// window too. Scan-only before any mapping admits nothing; after the real
 /// load the terminal merge discloses the nonempty `late_discovery` window.

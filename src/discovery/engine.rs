@@ -27510,6 +27510,17 @@ impl Engine {
     /// not returned again). An `fstat` failure records nothing here — the
     /// attach path's global check is the backstop that surfaces it.
     pub fn refresh_prearm_object_changes(&mut self) -> Vec<PinnedObjectId> {
+        self.refresh_prearm_object_changes_inner(false)
+    }
+
+    /// Held-FD change poll shared by mid-capture refreshes and terminal
+    /// close. Under an unknown terminal stop (`unknown_stop`) a newly
+    /// detected change still ends the watch with its exact bracket, but
+    /// the coverage end stays unknown: the detection ran in the blind
+    /// tail after the stop (packet 6.13 round-4, re-audit finding 1).
+    /// Watches already closed before the stop keep their first end either
+    /// way.
+    fn refresh_prearm_object_changes_inner(&mut self, unknown_stop: bool) -> Vec<PinnedObjectId> {
         let ids: Vec<PinnedObjectId> = self.prearm.watches().keys().copied().collect();
         let mut newly = Vec::new();
         for id in ids {
@@ -27520,14 +27531,24 @@ impl Engine {
                     if let Some(watch) = self.prearm.get_mut(id) {
                         let was_ended = watch.is_ended();
                         match bracket {
+                            Some(bracket) if unknown_stop => {
+                                watch.note_object_changed_unknown_stop(bracket)
+                            }
                             Some(bracket) => watch.note_object_changed(bracket),
                             // Detected but the clock never yielded the
                             // bounds: the end is still disclosed, only its
                             // instants are not.
-                            None => watch.end(
-                                crate::render::PrearmWatchEnd::ObjectChanged,
-                                crate::attach::monotonic_ns(),
-                            ),
+                            None => {
+                                // Under an unknown stop the terminal
+                                // detection ran in the blind tail: disclose
+                                // the end, never a bound sampled past it.
+                                let bound = if unknown_stop {
+                                    None
+                                } else {
+                                    crate::attach::monotonic_ns()
+                                };
+                                watch.end(crate::render::PrearmWatchEnd::ObjectChanged, bound)
+                            }
                         }
                         if !was_ended {
                             newly.push(id);
@@ -27635,7 +27656,10 @@ impl Engine {
     /// round-2, F2): watches whose terminal health is already dirty verify
     /// link presence without advancing `last_verified_ns`, so a later
     /// health truncation closes at the last proven-clean bound instead of
-    /// riding a link-only snapshot to the stop.
+    /// riding a link-only snapshot to the stop. Under an unknown stop
+    /// (`now` is `None`) a newly detected object change still ends its
+    /// watch with the exact bracket, but the coverage end stays unknown
+    /// (round-4, re-audit finding 1).
     fn refresh_prearm_liveness_gated(
         &mut self,
         session: &impl EngineSession,
@@ -27658,7 +27682,7 @@ impl Engine {
                 watch.verify_links(&links, if clean { now } else { None });
             }
         }
-        self.refresh_prearm_object_changes();
+        self.refresh_prearm_object_changes_inner(now.is_none());
         self.rerender_prearm_watches();
     }
 

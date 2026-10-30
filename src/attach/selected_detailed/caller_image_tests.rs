@@ -19,28 +19,7 @@ fn observation(
     cookie: u64,
     exec_id: u64,
 ) -> CallerImageObservation {
-    let mut bytes = Vec::new();
-    for (cookie, exec_id, visits, slot, status) in
-        [(cookie, exec_id, 1u64, 0u32, 1u32), (0, 0, 2, 1, 2)]
-    {
-        for word in [generation, cookie, exec_id, visits] {
-            bytes.extend_from_slice(&word.to_ne_bytes());
-        }
-        bytes.extend_from_slice(&slot.to_ne_bytes());
-        bytes.extend_from_slice(&status.to_ne_bytes());
-    }
-    let image = super::super::super::wire::parse_baseline(&bytes, generation, 1, 65536)
-        .unwrap()
-        .images
-        .pop()
-        .unwrap();
-    CallerImageObservation {
-        domain,
-        generation,
-        original: Arc::clone(original),
-        cookie: image.cookie,
-        exec_id: image.exec_id,
-    }
+    super::scripted_observation(domain, original, generation, cookie, exec_id).unwrap()
 }
 
 #[test]
@@ -106,6 +85,58 @@ fn caller_image_observation_retains_same_charged_original_without_extra_custody_
     drop(image);
     drop(weak);
     assert_eq!(pool.snapshot().charged_bytes, initial);
+}
+
+#[test]
+fn caller_image_compare_binding_classifies_provenance_before_mismatch() {
+    let pool = SemanticResourcePool::default();
+    let pin = original(&pool);
+    let replacement = original(&pool);
+    assert_eq!(pin.pid(), replacement.pid());
+    assert_eq!(pin.start_time(), replacement.start_time());
+    let domain = NativeDomainId::mint();
+    let image = observation(domain, &pin, 1, 17, 0);
+    let binding = DomainCookie::new(domain, 17);
+    assert_eq!(
+        image.compare_binding(&pin, binding, 0),
+        BindingObservation::Match
+    );
+    // A foreign domain, a foreign original allocation, or an invalid
+    // generation is Unavailable, never a terminal image verdict — even
+    // when the numbers also mismatch.
+    assert_eq!(
+        image.compare_binding(&pin, DomainCookie::new(NativeDomainId::mint(), 17), 0),
+        BindingObservation::Unavailable
+    );
+    assert_eq!(
+        image.compare_binding(&replacement, binding, 0),
+        BindingObservation::Unavailable
+    );
+    let stale = CallerImageObservation {
+        domain,
+        generation: 0,
+        original: Arc::clone(&pin),
+        cookie: 17,
+        exec_id: 0,
+    };
+    assert_eq!(
+        stale.compare_binding(&pin, binding, 0),
+        BindingObservation::Unavailable
+    );
+    // Only a well-formed observation of the correct original in the
+    // correct domain may report a genuine image difference.
+    assert_eq!(
+        image.compare_binding(&pin, DomainCookie::new(domain, 18), 0),
+        BindingObservation::DifferentImage
+    );
+    assert_eq!(
+        image.compare_binding(&pin, binding, 1),
+        BindingObservation::DifferentImage
+    );
+    // The scripted constructor decodes like the genuine path: invalid
+    // generations and cookies fail instead of building observations.
+    assert!(super::scripted_observation(domain, &pin, 0, 17, 0).is_err());
+    assert!(super::scripted_observation(domain, &pin, 1, 0, 0).is_err());
 }
 
 #[test]

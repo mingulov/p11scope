@@ -1432,7 +1432,7 @@ use crate::discovery::engine::inventory_coordinator::semantics::SemanticBindingR
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::instances::{MAX_INSTANCES, MAX_PENDING};
 use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
-use crate::discovery::native_binding::{NativeIdentity, UnboundReason};
+use crate::discovery::native_binding::{BoundImage, NativeIdentity, UnboundReason};
 use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
 use crate::process::PidPin;
 use p11scope_ebpf_common::ImageIdentity;
@@ -1448,7 +1448,7 @@ struct ScriptedPidIdentity {
 }
 
 impl NativeIdentity<PidPin> for ScriptedPidIdentity {
-    fn owner_image(&mut self, _pid: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _pid: u32) -> Option<BoundImage> {
         None
     }
 
@@ -8253,7 +8253,7 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
         }
         struct H6NoLane;
         impl NativeIdentity<H6Pin> for H6NoLane {
-            fn owner_image(&mut self, _pid: u32) -> Option<ImageIdentity> {
+            fn owner_image(&mut self, _pid: u32) -> Option<BoundImage> {
                 unreachable!("the wiring probe runs without a lane")
             }
             fn query_cookie(&mut self, _domain: NativeDomainId, _pin: &H6Pin) -> CookieQuery {

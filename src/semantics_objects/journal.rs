@@ -7146,7 +7146,10 @@ pub(crate) mod tests {
     }
 
     impl crate::discovery::native_binding::NativeIdentity<crate::process::PidPin> for BindIdentity {
-        fn owner_image(&mut self, _pid: u32) -> Option<ImageIdentity> {
+        fn owner_image(
+            &mut self,
+            _pid: u32,
+        ) -> Option<crate::discovery::native_binding::BoundImage> {
             None
         }
 

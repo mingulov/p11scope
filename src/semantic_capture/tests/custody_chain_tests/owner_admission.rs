@@ -7,6 +7,7 @@ use super::*;
 use crate::discovery::engine::inventory_coordinator::{
     InventoryScope, tests::cgroup_provider_scene,
 };
+use crate::discovery::native_binding::BoundImage;
 use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
 use crate::inventory_capture::CollectedPass;
 use crate::inventory_semantics::LaneNegative;
@@ -33,7 +34,7 @@ enum Selection {
 struct InventoryIdentity(NativeDomainId);
 
 impl NativeIdentity<PidPin> for InventoryIdentity {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
     fn query_cookie(&mut self, domain: NativeDomainId, _: &PidPin) -> CookieQuery {

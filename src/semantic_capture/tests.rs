@@ -4746,7 +4746,10 @@ mod custody_chain_tests {
     }
 
     impl NativeIdentity<PidPin> for ChainIdentity {
-        fn owner_image(&mut self, _pid: u32) -> Option<ImageIdentity> {
+        fn owner_image(
+            &mut self,
+            _pid: u32,
+        ) -> Option<crate::discovery::native_binding::BoundImage> {
             None
         }
 

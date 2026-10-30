@@ -24,7 +24,7 @@ use instance_input::{
     AdmittedInstance, AdmittedInstanceCall, InstanceRetirement, InstanceSemanticLoss,
 };
 
-use crate::discovery::native_binding::{BindingCensus, UnboundReason};
+use crate::discovery::native_binding::{BindingCensus, BoundImage, UnboundReason};
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::scan::CaptureWorkBudget;
 use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
@@ -99,8 +99,9 @@ pub(crate) struct ExeIdentity {
 /// Which authority backs a caller incarnation's image reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImageAuthority {
-    /// BPF task-cookie/exec-ID identity (the native lifecycle adapter).
-    NativeExact { task_cookie: u64, exec_id: u64 },
+    /// Opaque expected native image (the native lifecycle adapter),
+    /// installed only after a successful guarded owner opening.
+    NativeExact { image: BoundImage },
     /// pidfd/start-time pin with exe-identity exec detection. Exact for
     /// lifetime (reuse-proof); exec detection is a best-effort change
     /// detector, and any uncertainty retires rather than merges.

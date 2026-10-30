@@ -57,29 +57,104 @@
 //! [`ExecTransition`]: the coordinator retires `X` and mints its successor.
 //! The proving row itself stays unbound: the successor is admitted after it.
 //!
-//! What this does not claim: the `ImageGuard` `Exact` contract (the current
-//! exec sequence is never read from userspace), so the mapping lane stays
-//! scan-pinned.
+//! What this does not claim: the `ImageGuard` `Exact` contract. The
+//! specifically approved inventory-owner guard may check an independently
+//! supplied expected binding through a fresh observation; cached binder
+//! state is never currency evidence, so the mapping lane stays
+//! scan-pinned until packet 2 wires preparation.
 
 use crate::attach::capture::{
-    CookieQuery, DiscoveryBatch, DomainCookie, ExecCoverage, InventoryCapture, NativeDomainId,
-    RetiredCapture, RetiringCapture, WitnessBatch, WitnessRow,
+    BindingObservation, CallerImageObservation, CookieQuery, DiscoveryBatch, DomainCookie,
+    ExecCoverage, InventoryCapture, NativeDomainId, RetiredCapture, RetiringCapture, WitnessBatch,
+    WitnessRow,
 };
 use crate::discovery::caller_registry::{CallerAdapter, CallerId, ProcessSource};
 use crate::process::PidPin;
-use p11scope_ebpf_common::{DISCOVERY_KIND_EXEC, ImageIdentity};
+use p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 mod metadata;
 pub(crate) use metadata::{BinderMetadataImage, BinderMetadataKey};
 
-/// Where native identity comes from: the owner lane's exact image (the
+/// Expected native image identity for one owner: the domain-tagged ticket
+/// plus the full exec sequence the binder settled for one caller. This is
+/// the image to check, never evidence the process still runs it: only a
+/// fresh observation through the retained pin can prove currency. Equality
+/// only; there is no numeric accessor, tuple conversion, `Deref`, `Display`,
+/// serde form, `Default`, ordering, or production conversion from wire
+/// identity.
+// RED: derived field-printing `Debug` (the leak the redaction twin rejects);
+// GREEN replaces it with a redacted manual impl.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
+pub(crate) struct BoundImage {
+    ticket: DomainCookie,
+    full_exec_id: u64,
+}
+
+// RED: domain-blind numeric equality (the old aliasing semantics the twins
+// reject); GREEN derives domain-sensitive equality and drops `red_raw`.
+impl PartialEq for BoundImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.ticket.red_raw_cookie() == other.ticket.red_raw_cookie()
+            && self.full_exec_id == other.full_exec_id
+    }
+}
+
+impl Eq for BoundImage {}
+
+#[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
+impl BoundImage {
+    /// The settled binder association only: the production factory below.
+    fn from_settled(ticket: DomainCookie, full_exec_id: u64) -> Self {
+        Self {
+            ticket,
+            full_exec_id,
+        }
+    }
+
+    /// A scripted expected image for owner/guard tests (never a host read).
+    /// Zero is unavailable, never an expected image; exec zero is valid.
+    #[cfg(test)]
+    pub(crate) fn scripted(domain: NativeDomainId, ticket: u64, full_exec_id: u64) -> Option<Self> {
+        (ticket != 0).then(|| Self::from_settled(DomainCookie::new(domain, ticket), full_exec_id))
+    }
+
+    /// Whether this expected image belongs to `domain`: an equality
+    /// coordinate, never a number.
+    pub(crate) fn belongs_to(&self, _domain: NativeDomainId) -> bool {
+        // RED: always true (the naive membership the cross-domain twin
+        // rejects); GREEN compares the ticket's domain.
+        let _ = self.ticket;
+        true
+    }
+
+    /// Compare a fresh observation of `original` against this expected
+    /// image, passing the private fields through without returning them.
+    pub(crate) fn compare_observation(
+        &self,
+        original: &Arc<PidPin>,
+        observation: &CallerImageObservation,
+    ) -> BindingObservation {
+        observation.compare_binding(original, self.ticket, self.full_exec_id)
+    }
+
+    /// RED-only numeric escape for the RED renderer; GREEN removes this
+    /// (the renderer must not read numbers).
+    pub(crate) fn red_raw(&self) -> (u64, u64) {
+        (self.ticket.red_raw_cookie(), self.full_exec_id)
+    }
+}
+
+/// Where native identity comes from: the owner lane's expected image (the
 /// `ImageGuard` contract; `None` everywhere in production) and the cookie
 /// queries the binder makes through a caller's retained pin.
 pub(crate) trait NativeIdentity<Pin> {
-    /// Exact image identity for the native owner lane, or `None` (the
-    /// scan lane).
-    fn owner_image(&mut self, pid: u32) -> Option<ImageIdentity>;
+    /// Expected image identity for the native owner lane, or `None` (the
+    /// scan lane). A cookie-only capture query never supplies this: the
+    /// full expected image comes only from a settled binder association.
+    fn owner_image(&mut self, pid: u32) -> Option<BoundImage>;
     /// The `domain` object's ticket for the process `pin` holds. A source
     /// without that domain answers `Unavailable`.
     fn query_cookie(&mut self, domain: NativeDomainId, pin: &Pin) -> CookieQuery;
@@ -89,7 +164,7 @@ pub(crate) trait NativeIdentity<Pin> {
 pub(crate) struct ScanOnlyIdentity;
 
 impl<Pin> NativeIdentity<Pin> for ScanOnlyIdentity {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 
@@ -99,12 +174,14 @@ impl<Pin> NativeIdentity<Pin> for ScanOnlyIdentity {
 }
 
 /// Test seam: the owner lane's scripted exact images, no cookie queries.
+/// Scenes share one stable domain per `expected` helper; minting a fresh
+/// domain inside every call would break equality for the wrong reason.
 #[cfg(test)]
-pub(crate) struct OwnerImages(pub fn(u32) -> Option<ImageIdentity>);
+pub(crate) struct OwnerImages(pub fn(u32) -> Option<BoundImage>);
 
 #[cfg(test)]
 impl<Pin> NativeIdentity<Pin> for OwnerImages {
-    fn owner_image(&mut self, pid: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, pid: u32) -> Option<BoundImage> {
         (self.0)(pid)
     }
 
@@ -120,7 +197,7 @@ fn foreign_domain() -> CookieQuery {
 }
 
 impl NativeIdentity<PidPin> for InventoryCapture {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 
@@ -134,7 +211,7 @@ impl NativeIdentity<PidPin> for InventoryCapture {
 }
 
 impl NativeIdentity<PidPin> for RetiringCapture {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 
@@ -148,7 +225,7 @@ impl NativeIdentity<PidPin> for RetiringCapture {
 }
 
 impl NativeIdentity<PidPin> for RetiredCapture {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 
@@ -802,6 +879,35 @@ impl NativeBinder {
         self.domain_indices
             .get(&domain)
             .is_some_and(|index| !self.domains[*index].finished)
+    }
+
+    /// The expected image for one settled caller binding: which
+    /// `(domain, ticket, exec)` to check, never proof it is current. Reads
+    /// the explicitly selected domain only (never the first), requires the
+    /// live PID lookup to still name `caller`, and refuses finished,
+    /// ended, absent, conflicting, or known-invalidated bindings. A
+    /// surviving value stays just an expected image after its source
+    /// domain ends; the active-domain check is a separate veto at use
+    /// time. This is not a proof factory for `Exact`: cached bindings
+    /// deliberately keep attributing historical rows after retirement.
+    #[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
+    pub(crate) fn expected_owner_image<Pin>(
+        &self,
+        domain: NativeDomainId,
+        caller: CallerId,
+        pid: u32,
+        lookup: &dyn CallerLookup<Pin>,
+    ) -> Option<BoundImage> {
+        // RED: settled association only (the naive factory the
+        // finished-domain twin rejects); GREEN adds every refusal below.
+        let _ = lookup;
+        let state = self
+            .domain_indices
+            .get(&domain)
+            .map(|index| &self.domains[*index])?;
+        let _ = (caller, pid);
+        let &(ticket, exec) = state.callers.get(&caller)?;
+        Some(BoundImage::from_settled(ticket, exec))
     }
 
     pub(crate) fn sight_current_binding<Pin>(

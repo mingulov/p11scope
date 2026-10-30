@@ -1,8 +1,14 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::*;
+use crate::attach::capture::{ExecCoverage, NativeDomainId, ReadWindow};
+use crate::discovery::engine::inventory::image_guard::ScriptedAcquisition;
 use crate::discovery::engine::tests::DiscoveryLifecycleFixture;
+use crate::discovery::native_binding::{BinderLimits, NativeBinder};
 use crate::discovery::scan::{InventoryRetainedLimits, InventoryWindowLimits, WindowId};
+use crate::process::PidPin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn config(owners: usize, leases: usize) -> InventoryDiscoveryConfig {
     InventoryDiscoveryConfig::new(
@@ -31,18 +37,22 @@ fn engine(owners: usize, leases: usize) -> Engine {
 // task-storage identity map or qualify a running Inventory capture.
 struct ScriptedImage(ImageCheck);
 impl ImageGuard for ScriptedImage {
-    fn check(&mut self, view: &ProcessView, image: ImageIdentity) -> ImageCheck {
+    fn check(&mut self, view: &ProcessView, image: BoundImage) -> ImageCheck {
         assert!(view.still_the_same());
         assert_eq!(image, expected());
         self.0
     }
 }
 
-fn expected() -> ImageIdentity {
-    ImageIdentity {
-        task_cookie: 42,
-        exec_id: 0,
-    }
+/// One stable scripted domain for this module's expected images; a fresh
+/// domain per call would break equality for the wrong reason.
+fn expected_domain() -> NativeDomainId {
+    static DOMAIN: std::sync::OnceLock<NativeDomainId> = std::sync::OnceLock::new();
+    *DOMAIN.get_or_init(NativeDomainId::mint)
+}
+
+fn expected() -> BoundImage {
+    BoundImage::scripted(expected_domain(), 42, 0).unwrap()
 }
 
 fn open(engine: &mut Engine) -> ProcessViewId {
@@ -149,16 +159,10 @@ fn pre_window_warm_owner_keeps_original_inactive_inventory_operation() {
 
 #[test]
 fn absent_cookie_or_wrong_pid_scope_cannot_admit_an_owner() {
+    // A zero ticket is unavailable: it cannot even construct an expected
+    // image, so the growth path never sees it.
+    assert!(BoundImage::scripted(expected_domain(), 0, 0).is_none());
     let mut engine = engine(2, 1);
-    assert!(
-        engine
-            .open_inventory_owner(
-                std::process::id(),
-                ImageIdentity::default(),
-                &mut ScriptedImage(ImageCheck::Exact)
-            )
-            .is_err()
-    );
     assert!(
         engine
             .open_inventory_owner(
@@ -321,6 +325,405 @@ fn pid_scoped_engine(pid: u32) -> Engine {
 
 fn open_pid_owner(engine: &mut Engine, pid: u32, guard: &mut dyn ImageGuard) -> ProcessViewId {
     engine.open_inventory_owner(pid, expected(), guard).unwrap()
+}
+
+/// Call-counting scripted guard: proves whether the engine consulted the
+/// guard at all (a refusal before invocation leaves `calls` at zero).
+struct CountingGuard {
+    reply: ImageCheck,
+    calls: usize,
+}
+
+impl ImageGuard for CountingGuard {
+    fn check(&mut self, _: &ProcessView, _: BoundImage) -> ImageCheck {
+        self.calls += 1;
+        self.reply
+    }
+}
+
+/// Fresh-guard owner scene: a self-scoped engine, an active but rowless
+/// binder domain, and the expected image for one scripted ticket/exec.
+fn guard_owner_scene(ticket: u64, exec: u64) -> (Engine, NativeBinder, NativeDomainId, BoundImage) {
+    let domain = NativeDomainId::mint();
+    let mut binder = NativeBinder::new(BinderLimits::default());
+    binder.note_exec_coverage(ExecCoverage::scripted(domain, 0));
+    let expected = BoundImage::scripted(domain, ticket, exec).unwrap();
+    (engine(2, 1), binder, domain, expected)
+}
+
+fn guard_window() -> ReadWindow {
+    ReadWindow::new(1, Instant::now() + Duration::from_secs(30)).unwrap()
+}
+
+fn expired_window() -> ReadWindow {
+    ReadWindow::new(1, Instant::now() - Duration::from_secs(1)).unwrap()
+}
+
+fn assert_no_owner(engine: &Engine) {
+    assert!(engine.views.is_empty());
+    let state = engine.inventory_state().unwrap();
+    assert!(state.owners.is_empty());
+    assert!(state.reservations.is_empty());
+}
+
+/// One scripted empty-module scan through the production scan path.
+fn scan_empty(
+    engine: &mut Engine,
+    owner: ProcessViewId,
+    guard: &mut dyn ImageGuard,
+    id: u64,
+) -> anyhow::Result<ScanReceipt> {
+    let lease = engine.acquire_inventory_scan(owner).unwrap();
+    let window = engine
+        .budget
+        .begin_window(WindowId::new(id), u64::MAX)
+        .unwrap();
+    let checkpoint = engine.budget.checkpoint(window.clone()).unwrap();
+    let result = engine.scan_inventory_owner_with(&lease, guard, |_, _, _| {
+        Ok(ScanOutcome::Scanned {
+            modules: Vec::new(),
+            skipped: Vec::new(),
+            scan_ms: 0,
+        })
+    });
+    engine.budget.finish_scan(checkpoint).unwrap();
+    engine.budget.finish_window(window).unwrap();
+    engine.release_inventory_scan(&lease).unwrap();
+    result
+}
+
+#[test]
+fn foreign_native_image_receipt_is_rejected_before_query() {
+    let mut engine = engine(2, 1);
+    let owner = open(&mut engine);
+    // The exact same opaque image proceeds (control).
+    let identity = engine.inventory_receipt_identity(owner).unwrap();
+    let mut control = CountingGuard {
+        reply: ImageCheck::Exact,
+        calls: 0,
+    };
+    engine
+        .check_inventory_image(&identity, &mut control)
+        .unwrap();
+    assert_eq!(control.calls, 1);
+    // An equal-number foreign-domain value (the same 42/0 `expected`
+    // carries, tagged elsewhere) rejects before guard invocation.
+    let mut foreign = engine.inventory_receipt_identity(owner).unwrap();
+    foreign.image = BoundImage::scripted(NativeDomainId::mint(), 42, 0).unwrap();
+    let mut probe = CountingGuard {
+        reply: ImageCheck::Exact,
+        calls: 0,
+    };
+    assert!(engine.check_inventory_image(&foreign, &mut probe).is_err());
+    assert_eq!(probe.calls, 0, "the receipt refuses before any guard query");
+}
+
+#[test]
+fn same_binary_exec_without_lifecycle_row_refuses_complete() {
+    const TICKET: u64 = 41;
+    const E: u64 = 9;
+    let pid = std::process::id();
+
+    // Only the fresh post-scan exec advances; the scan refuses with
+    // Changed and commits nothing, although PID, pin, domain, and ticket
+    // are unchanged and no lifecycle row was delivered.
+    let (mut engine, binder, domain, expected) = guard_owner_scene(TICKET, E);
+    let mut source = ScriptedAcquisition::new(domain);
+    source.script_observe(1, TICKET, E);
+    source.script_observe(2, TICKET, E);
+    source.script_observe(3, TICKET, E + 1);
+    let mut guard = FreshImageGuard::new(&mut source, &binder, guard_window());
+    let owner = engine
+        .open_inventory_owner(pid, expected, &mut guard)
+        .unwrap();
+    let error = scan_empty(&mut engine, owner, &mut guard, 0)
+        .err()
+        .expect("the post-scan exec advance must refuse the scan");
+    assert!(
+        format!("{error:#}").contains("Changed"),
+        "the refusal names the changed image: {error:#}"
+    );
+    assert_eq!(
+        engine.inventory_owner_epochs(owner).unwrap().image_state,
+        ImageCheck::Changed
+    );
+    assert_eq!(engine.inventory_last_complete(owner).unwrap(), None);
+    assert!(
+        engine.acquire_inventory_scan(owner).is_err(),
+        "an ended image scans nothing new"
+    );
+    drop(guard);
+    assert_eq!(source.calls(), 3);
+    assert_eq!(source.generations(), &[1, 2, 3]);
+    assert_eq!(binder.census().rows, 0);
+    assert_eq!(binder.census().pending, 0);
+
+    // Control: a stable direct exec before and after the scan commits
+    // complete.
+    let (mut engine, binder, domain, expected) = guard_owner_scene(TICKET, E);
+    let mut source = ScriptedAcquisition::new(domain);
+    for generation in 1..=6 {
+        source.script_observe(generation, TICKET, E);
+    }
+    let mut guard = FreshImageGuard::new(&mut source, &binder, guard_window());
+    let owner = engine
+        .open_inventory_owner(pid, expected, &mut guard)
+        .unwrap();
+    let receipt = scan_empty(&mut engine, owner, &mut guard, 0).unwrap();
+    assert!(receipt_is_complete(&receipt, "stable post-scan exec"));
+    let prepared = engine
+        .prepare_inventory_reconciliation(receipt, &mut guard)
+        .unwrap();
+    let commit = engine
+        .commit_inventory_reconciliation(prepared, &mut guard)
+        .unwrap();
+    assert!(commit.complete);
+    assert_eq!(engine.inventory_last_complete(owner).unwrap(), Some(0));
+    drop(guard);
+    assert_eq!(source.calls(), 6);
+    assert_eq!(source.generations(), &[1, 2, 3, 4, 5, 6]);
+    assert_eq!(binder.census().rows, 0, "no use row reached the binder");
+}
+
+#[test]
+fn fresh_guard_unavailable_never_scans_or_consumes_owner_capacity() {
+    const TICKET: u64 = 41;
+    const E: u64 = 9;
+    let pid = std::process::id();
+
+    // A failed pre-scan query refuses before the scanner runs.
+    {
+        let (mut engine, binder, domain, expected) = guard_owner_scene(TICKET, E);
+        let mut source = ScriptedAcquisition::new(domain);
+        source.script_observe(1, TICKET, E);
+        source.script_fail("query failed");
+        let mut guard = FreshImageGuard::new(&mut source, &binder, guard_window());
+        let owner = engine
+            .open_inventory_owner(pid, expected, &mut guard)
+            .unwrap();
+        let lease = engine.acquire_inventory_scan(owner).unwrap();
+        assert!(
+            engine
+                .scan_inventory_owner_with(&lease, &mut guard, |_, _, _| panic!(
+                    "unavailable image authority must prevent scanning"
+                ))
+                .is_err()
+        );
+        assert_eq!(
+            engine.inventory_owner_epochs(owner).unwrap().image_state,
+            ImageCheck::Unavailable
+        );
+        assert_eq!(engine.views.len(), 1);
+        assert!(engine.retirement_intents.is_empty());
+        engine.release_inventory_scan(&lease).unwrap();
+        drop(guard);
+        assert_eq!(source.calls(), 2);
+        assert_eq!(binder.census().rows, 0);
+    }
+
+    // A stopped source fails the open and retains nothing.
+    {
+        let (mut engine, binder, domain, expected) = guard_owner_scene(TICKET, E);
+        let mut source = ScriptedAcquisition::new(domain);
+        source.script_fail("Inventory is stopping");
+        let mut guard = FreshImageGuard::new(&mut source, &binder, guard_window());
+        assert!(
+            engine
+                .open_inventory_owner(pid, expected, &mut guard)
+                .is_err()
+        );
+        drop(guard);
+        assert_no_owner(&engine);
+        assert_eq!(source.calls(), 1);
+    }
+
+    // An expired window fails the open before any scripted answer.
+    {
+        let (mut engine, binder, domain, expected) = guard_owner_scene(TICKET, E);
+        let mut source = ScriptedAcquisition::new(domain);
+        source.script_observe(1, TICKET, E);
+        let mut guard = FreshImageGuard::new(&mut source, &binder, expired_window());
+        assert!(
+            engine
+                .open_inventory_owner(pid, expected, &mut guard)
+                .is_err()
+        );
+        drop(guard);
+        assert_no_owner(&engine);
+        assert_eq!(source.calls(), 1);
+    }
+
+    // A stale (zero-generation) answer fails decoding and the open.
+    {
+        let (mut engine, binder, domain, expected) = guard_owner_scene(TICKET, E);
+        let mut source = ScriptedAcquisition::new(domain);
+        source.script_observe(0, TICKET, E);
+        let mut guard = FreshImageGuard::new(&mut source, &binder, guard_window());
+        assert!(
+            engine
+                .open_inventory_owner(pid, expected, &mut guard)
+                .is_err()
+        );
+        drop(guard);
+        assert_no_owner(&engine);
+        assert_eq!(source.calls(), 1);
+        assert!(source.generations().is_empty());
+    }
+
+    // An answer built on a replacement original fails the open.
+    {
+        let (mut engine, binder, domain, expected) = guard_owner_scene(TICKET, E);
+        let replacement = Arc::new(PidPin::open(pid).unwrap());
+        let mut source = ScriptedAcquisition::new(domain);
+        source.script_observe_on(1, TICKET, E, replacement);
+        let mut guard = FreshImageGuard::new(&mut source, &binder, guard_window());
+        assert!(
+            engine
+                .open_inventory_owner(pid, expected, &mut guard)
+                .is_err()
+        );
+        drop(guard);
+        assert_no_owner(&engine);
+        assert_eq!(source.calls(), 1);
+    }
+
+    // A post-scan failure preserves the prior complete commit.
+    {
+        let (mut engine, binder, domain, expected) = guard_owner_scene(TICKET, E);
+        let mut source = ScriptedAcquisition::new(domain);
+        for generation in 1..=7 {
+            source.script_observe(generation, TICKET, E);
+        }
+        source.script_fail("post-scan query failed");
+        let mut guard = FreshImageGuard::new(&mut source, &binder, guard_window());
+        let owner = engine
+            .open_inventory_owner(pid, expected, &mut guard)
+            .unwrap();
+        let first = scan_empty(&mut engine, owner, &mut guard, 0).unwrap();
+        assert!(receipt_is_complete(&first, "first"));
+        let prepared = engine
+            .prepare_inventory_reconciliation(first, &mut guard)
+            .unwrap();
+        let commit = engine
+            .commit_inventory_reconciliation(prepared, &mut guard)
+            .unwrap();
+        assert!(commit.complete);
+        assert_eq!(engine.inventory_last_complete(owner).unwrap(), Some(0));
+        let modules_before = engine.modules.clone();
+        engine
+            .request_inventory_refresh(owner, RefreshCause::Periodic)
+            .unwrap();
+        assert!(scan_empty(&mut engine, owner, &mut guard, 1).is_err());
+        assert_eq!(engine.inventory_last_complete(owner).unwrap(), Some(0));
+        assert_eq!(engine.modules, modules_before);
+        assert_eq!(
+            engine.inventory_owner_epochs(owner).unwrap().image_state,
+            ImageCheck::Unavailable
+        );
+        drop(guard);
+        assert_eq!(source.calls(), 8);
+    }
+
+    // A prepare failure preserves the prior complete commit.
+    {
+        let (mut engine, binder, domain, expected) = guard_owner_scene(TICKET, E);
+        let mut source = ScriptedAcquisition::new(domain);
+        for generation in 1..=8 {
+            source.script_observe(generation, TICKET, E);
+        }
+        source.script_fail("prepare query failed");
+        let mut guard = FreshImageGuard::new(&mut source, &binder, guard_window());
+        let owner = engine
+            .open_inventory_owner(pid, expected, &mut guard)
+            .unwrap();
+        let first = scan_empty(&mut engine, owner, &mut guard, 0).unwrap();
+        let prepared = engine
+            .prepare_inventory_reconciliation(first, &mut guard)
+            .unwrap();
+        let commit = engine
+            .commit_inventory_reconciliation(prepared, &mut guard)
+            .unwrap();
+        assert!(commit.complete);
+        let modules_before = engine.modules.clone();
+        engine
+            .request_inventory_refresh(owner, RefreshCause::Periodic)
+            .unwrap();
+        let second = scan_empty(&mut engine, owner, &mut guard, 1).unwrap();
+        assert!(
+            engine
+                .prepare_inventory_reconciliation(second, &mut guard)
+                .is_err()
+        );
+        assert_eq!(engine.inventory_last_complete(owner).unwrap(), Some(0));
+        assert_eq!(engine.modules, modules_before);
+        assert_eq!(
+            engine.inventory_owner_epochs(owner).unwrap().image_state,
+            ImageCheck::Unavailable
+        );
+        drop(guard);
+        assert_eq!(source.calls(), 9);
+    }
+
+    // A publication (commit revalidation) failure preserves the commit.
+    {
+        let (mut engine, binder, domain, expected) = guard_owner_scene(TICKET, E);
+        let mut source = ScriptedAcquisition::new(domain);
+        for generation in 1..=10 {
+            source.script_observe(generation, TICKET, E);
+        }
+        source.script_fail("publication query failed");
+        let mut guard = FreshImageGuard::new(&mut source, &binder, guard_window());
+        let owner = engine
+            .open_inventory_owner(pid, expected, &mut guard)
+            .unwrap();
+        let first = scan_empty(&mut engine, owner, &mut guard, 0).unwrap();
+        let prepared = engine
+            .prepare_inventory_reconciliation(first, &mut guard)
+            .unwrap();
+        let commit = engine
+            .commit_inventory_reconciliation(prepared, &mut guard)
+            .unwrap();
+        assert!(commit.complete);
+        let modules_before = engine.modules.clone();
+        engine
+            .request_inventory_refresh(owner, RefreshCause::Periodic)
+            .unwrap();
+        let second = scan_empty(&mut engine, owner, &mut guard, 1).unwrap();
+        let prepared = engine
+            .prepare_inventory_reconciliation(second, &mut guard)
+            .unwrap();
+        assert!(
+            engine
+                .commit_inventory_reconciliation(prepared, &mut guard)
+                .is_err()
+        );
+        assert_eq!(engine.inventory_last_complete(owner).unwrap(), Some(0));
+        assert_eq!(engine.modules, modules_before);
+        assert_eq!(
+            engine.inventory_owner_epochs(owner).unwrap().image_state,
+            ImageCheck::Unavailable
+        );
+        drop(guard);
+        assert_eq!(source.calls(), 11);
+    }
+
+    // Control, last: a genuine match admits and scans.
+    {
+        let (mut engine, binder, domain, expected) = guard_owner_scene(TICKET, E);
+        let mut source = ScriptedAcquisition::new(domain);
+        for generation in 1..=3 {
+            source.script_observe(generation, TICKET, E);
+        }
+        let mut guard = FreshImageGuard::new(&mut source, &binder, guard_window());
+        let owner = engine
+            .open_inventory_owner(pid, expected, &mut guard)
+            .unwrap();
+        let receipt = scan_empty(&mut engine, owner, &mut guard, 0).unwrap();
+        assert!(receipt_is_complete(&receipt, "genuine match"));
+        drop(guard);
+        assert_eq!(source.calls(), 3);
+        assert_eq!(binder.census().rows, 0);
+    }
 }
 
 /// Real receipts only: a deferred or unavailable scan is a failed

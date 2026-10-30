@@ -16,7 +16,6 @@ use crate::discovery::caller_registry::UseCoverage;
 use crate::discovery::inventory_attach_set::TargetDelta;
 use crate::inventory_capture::{CaptureLane, Retirement, RetirementLoad, Stopped};
 use anyhow::{bail, ensure};
-use p11scope_ebpf_common::ImageIdentity;
 use std::cell::{Cell, RefCell};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
@@ -231,7 +230,7 @@ impl<L> Probe<L> {
 }
 
 impl<L: CaptureLane<PidPin>> NativeIdentity<PidPin> for Probe<L> {
-    fn owner_image(&mut self, pid: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, pid: u32) -> Option<crate::discovery::native_binding::BoundImage> {
         self.inner.owner_image(pid)
     }
 

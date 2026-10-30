@@ -7183,14 +7183,16 @@ fn caller_json(
     metadata: &crate::caller_metadata::runtime::MetadataFrame,
 ) -> serde_json::Value {
     let record = caller;
+    // RED: numeric rendering through the RED-only escape (the leak the null
+    // twin rejects); GREEN emits null for both authority variants.
     let (task_cookie, exec_id) = match record.authority {
-        ImageAuthority::NativeExact {
-            task_cookie,
-            exec_id,
-        } => (
-            serde_json::Value::from(task_cookie),
-            serde_json::Value::from(exec_id),
-        ),
+        ImageAuthority::NativeExact { image } => {
+            let (task_cookie, exec_id) = image.red_raw();
+            (
+                serde_json::Value::from(task_cookie),
+                serde_json::Value::from(exec_id),
+            )
+        }
         ImageAuthority::ScanPinned => (serde_json::Value::Null, serde_json::Value::Null),
     };
     let exe = record.exe.as_ref().map(|exe| {
@@ -10264,8 +10266,12 @@ mod tests {
     fn stream_inline_identity_exact_privacy_keys() {
         let (mut view, events) = stream_identity_fixture(1);
         view.callers[0].authority = ImageAuthority::NativeExact {
-            task_cookie: 0xfedc_ba98_7654_3210,
-            exec_id: 0xabcd_ef01_2345_6789,
+            image: crate::discovery::native_binding::BoundImage::scripted(
+                crate::attach::capture::NativeDomainId::mint(),
+                0xfedc_ba98_7654_3210,
+                0xabcd_ef01_2345_6789,
+            )
+            .unwrap(),
         };
         view.callers[0].lifecycle_reason = Some("FORBIDDEN_ARGV_ENV_COMM".into());
         view.modules[0].admission_reasons = vec!["FORBIDDEN_MODULE_REASON".into()];
@@ -15621,7 +15627,10 @@ mod promotion_driver_tests {
     }
 
     impl<L: NativeIdentity<PidPin>> NativeIdentity<PidPin> for BaselineStub<L> {
-        fn owner_image(&mut self, pid: u32) -> Option<ImageIdentity> {
+        fn owner_image(
+            &mut self,
+            pid: u32,
+        ) -> Option<crate::discovery::native_binding::BoundImage> {
             self.inner.owner_image(pid)
         }
 

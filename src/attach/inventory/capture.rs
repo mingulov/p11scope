@@ -83,7 +83,11 @@ use super::activation::{
 };
 use super::callers::{CallerRowFault, CallerUseCursor, CallerUseIo};
 use super::{AttachBackend, PreparedInventory, Scope};
-pub(crate) use crate::attach::selected_detailed::baseline::CallerImageObservation;
+#[cfg(test)]
+pub(crate) use crate::attach::selected_detailed::baseline::scripted_observation;
+pub(crate) use crate::attach::selected_detailed::baseline::{
+    BindingObservation, CallerImageObservation,
+};
 use crate::capacity::{CallerBudget, InventoryBudget};
 use crate::discovery::identity::{PinnedObjectId, RetainedInventoryTarget};
 use crate::discovery::inventory_attach_set::{
@@ -516,6 +520,12 @@ impl DomainCookie {
     #[cfg(test)]
     pub(crate) fn scripted(domain: NativeDomainId, cookie: u64) -> Self {
         Self::new(domain, cookie)
+    }
+
+    /// RED-only numeric escape for the RED renderer and RED equality;
+    /// GREEN removes this (tickets are never numbers).
+    pub(crate) fn red_raw_cookie(&self) -> u64 {
+        self.cookie
     }
 }
 
@@ -2463,7 +2473,9 @@ impl InventoryCapture {
     /// One genuine identity-only endpoint sample under the same exclusive
     /// native owner/generation as promotion baselines. No Presentation or
     /// permission-bearing receipt is involved. Metadata workers never receive
-    /// a mutable query handle and must already name an admitted NativeExact row.
+    /// a mutable query handle and must already name an admitted NativeExact
+    /// row; the specifically approved inventory-owner guard is this
+    /// operation's one admission-adjacent consumer.
     pub(crate) fn observe_caller_image(
         &mut self,
         original: &Arc<PidPin>,

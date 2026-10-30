@@ -85,7 +85,7 @@ struct PhysicalIdentity {
 }
 
 impl NativeIdentity<PidPin> for PhysicalIdentity {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 

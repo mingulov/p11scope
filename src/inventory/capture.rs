@@ -57,13 +57,12 @@ use crate::discovery::engine::inventory_coordinator::{
     InventoryCoordinator, NativeBatch, NativeReceipt, PassReport,
 };
 use crate::discovery::inventory_attach_set::TargetDelta;
-use crate::discovery::native_binding::{NativeIdentity, ScanOnlyIdentity};
+use crate::discovery::native_binding::{BoundImage, NativeIdentity, ScanOnlyIdentity};
 use crate::inspect_system::Catalog;
 use crate::inspect_system::inventory_cgroup::CgroupCollection;
 use crate::process::PidPin;
 use crate::scope::inventory_cgroup::CollectionControl;
 use anyhow::{Result, anyhow};
-use p11scope_ebpf_common::ImageIdentity;
 use std::time::{Duration, Instant};
 
 /// The per-pass and per-tick windows (ruling D9: provisional until the M1
@@ -385,8 +384,11 @@ pub(crate) use crate::attach::multi_functional_probe;
 /// own; `begin_stop` and `poll_retirement` hide the typestate moves.
 pub(crate) trait CaptureLane<Pin>: NativeIdentity<Pin> {
     fn domain(&self) -> NativeDomainId;
-    /// One serialized identity-only metadata observation through the retained
-    /// capture owner. This grants no Detailed or semantic admission authority.
+    /// One serialized identity-only observation through the retained capture
+    /// owner. This grants no Detailed or semantic admission authority; its
+    /// one admission-adjacent consumer is the specifically approved
+    /// inventory-owner guard, which checks an independently supplied
+    /// expected binding through a fresh observation.
     fn observe_caller_image(
         &mut self,
         _original: &std::sync::Arc<PidPin>,
@@ -3725,7 +3727,7 @@ impl FacadeLane {
 }
 
 impl NativeIdentity<PidPin> for FacadeLane {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 
@@ -4134,7 +4136,7 @@ mod stop_latch_tests {
         }
     }
     impl NativeIdentity<F9Pin> for F9Lane {
-        fn owner_image(&mut self, _pid: u32) -> Option<ImageIdentity> {
+        fn owner_image(&mut self, _pid: u32) -> Option<BoundImage> {
             None
         }
         fn query_cookie(&mut self, _domain: NativeDomainId, _pin: &F9Pin) -> CookieQuery {

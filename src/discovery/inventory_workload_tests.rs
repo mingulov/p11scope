@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::attach::Scope;
+use crate::attach::capture::NativeDomainId;
 use crate::capacity::{AttachCost, InventoryBudget};
 use crate::discovery::caller_registry::{
     AdmissionState, CallerEvent, CallerId, DEFAULT_MAX_CALLERS, DEFAULT_MAX_EDGES,
@@ -13,6 +14,7 @@ use crate::discovery::caller_registry::{
 use crate::discovery::engine::inventory::{ImageCheck, ImageGuard, UnavailableImageGuard};
 use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, InventoryScope};
 use crate::discovery::hooks::HookRegistry;
+use crate::discovery::native_binding::BoundImage;
 use p11scope_ebpf_common::ImageIdentity;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -536,16 +538,20 @@ impl Drop for ChildReaper {
 struct AcceptAllImages;
 
 impl ImageGuard for AcceptAllImages {
-    fn check(&mut self, _: &crate::process::ProcessView, _: ImageIdentity) -> ImageCheck {
+    fn check(&mut self, _: &crate::process::ProcessView, _: BoundImage) -> ImageCheck {
         ImageCheck::Exact
     }
 }
 
-fn owner_image(pid: u32) -> ImageIdentity {
-    ImageIdentity {
-        task_cookie: u64::from(pid) + 1,
-        exec_id: 7,
-    }
+/// One stable scripted domain for this module's owner images; a fresh
+/// domain per call would break equality for the wrong reason.
+fn owner_domain() -> NativeDomainId {
+    static DOMAIN: std::sync::OnceLock<NativeDomainId> = std::sync::OnceLock::new();
+    *DOMAIN.get_or_init(NativeDomainId::mint)
+}
+
+fn owner_image(pid: u32) -> BoundImage {
+    BoundImage::scripted(owner_domain(), u64::from(pid) + 1, 7).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -1788,7 +1794,7 @@ fn native_owner_growth_failure_accounts_loss_exactly() {
 /// Native-owner growth-path failure injection, run in the
 /// `owner-growth-failure` worker with its owned-pidfd accounting.
 fn inject_native_owner_growth_failure() {
-    fn some_image(pid: u32) -> Option<ImageIdentity> {
+    fn some_image(pid: u32) -> Option<BoundImage> {
         Some(owner_image(pid))
     }
     // One owned sleeper behind a real scan pass: BPF-style image
@@ -1879,27 +1885,9 @@ fn inject_native_owner_growth_failure() {
     );
     assert_eq!(document["gaps_suppressed"], 0);
     assert_settled(&document, 0);
-    // The bad-image shape, direct: a zero task cookie never reaches the
-    // open — the growth path refuses it with no state change.
-    let mut harness = harness();
-    let now = harness.now_ns();
-    let mut guard = AcceptAllImages;
-    let error = harness
-        .coordinator_mut()
-        .test_open_native_owner(
-            pid,
-            ImageIdentity {
-                task_cookie: 0,
-                exec_id: 7,
-            },
-            &mut guard,
-            now,
-        )
-        .expect_err("a zero task cookie refuses the growth path");
-    assert!(
-        format!("{error:#}").contains("lacks image identity"),
-        "the error names the missing identity: {error:#}"
-    );
+    // The bad-image shape, direct: a zero task cookie cannot construct an
+    // expected image, so the growth path never sees it.
+    assert!(BoundImage::scripted(owner_domain(), 0, 7).is_none());
 }
 
 #[test]

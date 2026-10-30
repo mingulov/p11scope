@@ -179,21 +179,16 @@ struct AuthorityResolver<'a, Pin> {
 
 impl<Pin> AuthorityResolver<'_, Pin> {
     fn resolve(&mut self, pid: u32) -> ImageAuthority {
-        match self
-            .identity
-            .owner_image(pid)
-            .filter(|image| image.task_cookie != 0)
-        {
+        // An invalid expected image cannot be manufactured, so no numeric
+        // filter remains: `Some` is a genuine open attempt.
+        match self.identity.owner_image(pid) {
             Some(image) => match self
                 .engine
                 .open_inventory_owner(pid, image, &mut *self.guard)
             {
                 Ok(owner) => {
                     self.pending.insert(pid, owner);
-                    ImageAuthority::NativeExact {
-                        task_cookie: image.task_cookie,
-                        exec_id: image.exec_id,
-                    }
+                    ImageAuthority::NativeExact { image }
                 }
                 Err(error) => {
                     self.native_failures.push((pid, format!("{error:#}")));
@@ -2298,15 +2293,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn test_open_native_owner(
         &mut self,
         pid: u32,
-        image: p11scope_ebpf_common::ImageIdentity,
+        image: crate::discovery::native_binding::BoundImage,
         guard: &mut dyn super::inventory::ImageGuard,
         now_ns: u64,
     ) -> Result<CallerId> {
         let owner = self.engine.open_inventory_owner(pid, image, guard)?;
-        let authority = ImageAuthority::NativeExact {
-            task_cookie: image.task_cookie,
-            exec_id: image.exec_id,
-        };
+        let authority = ImageAuthority::NativeExact { image };
         match self.adapter.admit(pid, authority, now_ns) {
             Ok(caller) => {
                 self.owners.insert(caller, owner);
@@ -7578,7 +7570,7 @@ pub(crate) mod tests {
     use super::super::inventory::{ImageCheck, UnavailableImageGuard};
     use super::*;
     use crate::discovery::caller_registry::OsProcessSource;
-    use crate::discovery::native_binding::{OwnerImages, ScanOnlyIdentity};
+    use crate::discovery::native_binding::{BoundImage, OwnerImages, ScanOnlyIdentity};
     use p11scope_ebpf_common::ImageIdentity;
     use std::cell::Cell;
 
@@ -7586,16 +7578,20 @@ pub(crate) mod tests {
     // host's task-storage identity map or qualify a running capture.
     struct FixtureImages;
 
-    fn fixture_image(pid: u32) -> Option<ImageIdentity> {
-        Some(ImageIdentity {
-            task_cookie: u64::from(pid) + 1,
-            exec_id: 7,
-        })
+    /// One stable scripted domain for this module's fixture images; a
+    /// fresh domain per call would break equality for the wrong reason.
+    fn fixture_domain() -> NativeDomainId {
+        static DOMAIN: std::sync::OnceLock<NativeDomainId> = std::sync::OnceLock::new();
+        *DOMAIN.get_or_init(NativeDomainId::mint)
+    }
+
+    fn fixture_image(pid: u32) -> Option<BoundImage> {
+        BoundImage::scripted(fixture_domain(), u64::from(pid) + 1, 7)
     }
 
     impl ImageGuard for FixtureImages {
-        fn check(&mut self, view: &ProcessView, expected: ImageIdentity) -> ImageCheck {
-            assert_eq!(expected.task_cookie, u64::from(view.pid()) + 1);
+        fn check(&mut self, view: &ProcessView, expected: BoundImage) -> ImageCheck {
+            assert_eq!(expected, fixture_image(view.pid()).unwrap());
             ImageCheck::Exact
         }
     }
@@ -8693,6 +8689,83 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn native_authority_snapshot_keeps_private_image_null() {
+        use std::process::{Command, Stdio};
+        struct Reaper(std::process::Child);
+        impl Drop for Reaper {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        // Two native callers with two different opaque images.
+        let child = Reaper(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let other = child.0.id();
+        let this = std::process::id();
+        assert_ne!(this, other);
+        let image_this = fixture_image(this).unwrap();
+        let image_other = fixture_image(other).unwrap();
+        assert_ne!(image_this, image_other);
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::System,
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let now = crate::discovery::caller_registry::now_ns();
+        let mut guard = FixtureImages;
+        for (pid, image) in [(this, image_this), (other, image_other)] {
+            let caller = coordinator
+                .test_open_native_owner(pid, image, &mut guard, now)
+                .unwrap();
+            assert!(
+                matches!(
+                    coordinator.adapter().record(caller).unwrap().authority,
+                    ImageAuthority::NativeExact { .. }
+                ),
+                "the opened owner installs native authority"
+            );
+        }
+        coordinator.commit_batch(true).unwrap();
+        let document = crate::inventory::render_json(
+            &coordinator,
+            "native",
+            now,
+            crate::discovery::caller_registry::now_ns(),
+            1,
+        );
+        let callers = document["callers"].as_array().unwrap();
+        assert_eq!(callers.len(), 2);
+        let mut pids = Vec::new();
+        for caller in callers {
+            assert_eq!(caller["image"]["authority"], "native_exact");
+            assert!(
+                caller["image"]["task_cookie"].is_null(),
+                "private ticket never renders: {caller}"
+            );
+            assert!(
+                caller["image"]["exec_id"].is_null(),
+                "private exec never renders: {caller}"
+            );
+            pids.push(caller["pid"].as_u64().unwrap());
+        }
+        pids.sort_unstable();
+        let mut expected = [u64::from(this), u64::from(other)];
+        expected.sort_unstable();
+        assert_eq!(pids, expected, "caller identity fields stay");
+    }
+
+    #[test]
     fn staged_lifecycle_batches_fold_their_high_water_maximum() {
         let mut coordinator = coordinator();
         assert_eq!(coordinator.lifecycle_high_water_bytes(), None);
@@ -8822,7 +8895,7 @@ pub(crate) mod tests {
             exact: Cell<bool>,
         }
         impl ImageGuard for FlipGuard {
-            fn check(&mut self, _: &ProcessView, _: ImageIdentity) -> ImageCheck {
+            fn check(&mut self, _: &ProcessView, _: BoundImage) -> ImageCheck {
                 if self.exact.get() {
                     ImageCheck::Exact
                 } else {
@@ -13064,7 +13137,7 @@ exit 0
     }
 
     impl NativeIdentity<ScriptedPin> for ScriptedCookies {
-        fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+        fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
             None
         }
 
@@ -17703,7 +17776,7 @@ exit 0
     }
 
     impl NativeIdentity<crate::process::PidPin> for OneTicket {
-        fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+        fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
             None
         }
 
@@ -17948,13 +18021,20 @@ exit 0
         // Fresh successor authority comes from its own validated admission:
         // LoaderHint/Periodic touch neither image state nor the revision, and
         // the successor scans usefully with no manifest and no H0 receipt.
-        let image2 = ImageIdentity {
-            task_cookie: u64::from(pid) + 1,
-            exec_id: 9,
-        };
+        // The successor carries its own expected image (a different exec
+        // from the fixture), so it gets its own exact guard.
+        struct ExactImage(BoundImage);
+        impl ImageGuard for ExactImage {
+            fn check(&mut self, view: &ProcessView, expected: BoundImage) -> ImageCheck {
+                assert!(view.still_the_same());
+                assert_eq!(expected, self.0);
+                ImageCheck::Exact
+            }
+        }
+        let image2 = BoundImage::scripted(fixture_domain(), u64::from(pid) + 1, 9).unwrap();
         let owner2 = coordinator
             .engine
-            .open_inventory_owner(pid, image2, &mut FixtureImages)
+            .open_inventory_owner(pid, image2, &mut ExactImage(image2))
             .unwrap();
         coordinator.owners.insert(successor, owner2);
         for cause in [RefreshCause::LoaderHint, RefreshCause::Periodic] {
@@ -17973,7 +18053,7 @@ exit 0
             "generic hints grant nothing exact and change nothing proven"
         );
         let commit2 = coordinator
-            .scan_owner(owner2, &mut FixtureImages, u64::MAX, now + 100)
+            .scan_owner(owner2, &mut ExactImage(image2), u64::MAX, now + 100)
             .unwrap();
         assert!(commit2.complete, "the successor scan commits");
         assert!(
@@ -18121,7 +18201,7 @@ exit 0
         // assigns no Detailed cookie.
         struct CountingGuard(std::cell::Cell<usize>);
         impl ImageGuard for CountingGuard {
-            fn check(&mut self, _: &ProcessView, _: ImageIdentity) -> ImageCheck {
+            fn check(&mut self, _: &ProcessView, _: BoundImage) -> ImageCheck {
                 self.0.set(self.0.get() + 1);
                 ImageCheck::Exact
             }

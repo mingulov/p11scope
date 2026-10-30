@@ -20,7 +20,7 @@ struct InventoryReplay {
 }
 
 impl NativeIdentity<PidPin> for InventoryReplay {
-    fn owner_image(&mut self, _: u32) -> Option<ImageIdentity> {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
         None
     }
 

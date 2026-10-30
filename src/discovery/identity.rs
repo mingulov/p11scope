@@ -9245,7 +9245,8 @@ mod tests {
         let (_dir, path, manifest, _) = count_manifest_file();
         let mut budget = count_manifest_read_budget();
         assert!(std::fs::metadata(path).unwrap().len() > budget.limits().total_bytes);
-        let result = pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0);
+        let result =
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0);
         assert!(
             result.is_err(),
             "a cold identity hash cannot bypass the read allowance"
@@ -9259,7 +9260,8 @@ mod tests {
         let mut budget = count_manifest_read_budget();
         cache_count_inspection(&path, inspected, &mut budget);
         let result =
-            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0).unwrap();
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0)
+                .unwrap();
         assert!(result.stale.is_empty());
         assert_eq!(result.pins.pinned().count(), 1);
         assert!(budget.attempted_io_bytes() < std::fs::metadata(path).unwrap().len());
@@ -9278,7 +9280,8 @@ mod tests {
             .write_all(&[1])
             .unwrap();
         let result =
-            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0).unwrap();
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0)
+                .unwrap();
         assert_eq!(result.stale.len(), 1);
         assert_eq!(result.pins.pinned().count(), 0);
         assert!(
@@ -9463,7 +9466,8 @@ mod tests {
         manifest.provenance_objects[0].device_minor = key.device.minor;
         manifest.provenance_objects[0].inode = key.inode;
         assert!(
-            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0).is_err(),
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0)
+                .is_err(),
             "digest equality is not an exact opened-file cache witness"
         );
     }

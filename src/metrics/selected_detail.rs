@@ -549,9 +549,12 @@ fn accepted_receipt(collector: &CounterCollector, assigned: u64) -> AcceptedBrac
 /// Observe the exact before acquisition through the broad collector
 /// and assign its bracket seq (R2-D2-C): the seq advances ONLY on
 /// actual acceptance (`Initial`/`Advanced`/`GenerationChanged`). A
-/// failed or foreign acquisition, an unhealthy one, or a collector
-/// rejection (latched issue, failed differences) refuses reserve with
-/// the collector baseline and the seq untouched.
+/// failed, foreign, or healthy-topology mismatch refuses with the
+/// collector baseline and the seq untouched. A same-generation
+/// unhealthy or failed-rows acquisition also refuses with the seq
+/// untouched, but latches the collector's sticky loss first: a later
+/// healthy same-generation read must stay unavailable, per the
+/// collector contract. Only a fresh generation recovers.
 pub(super) fn accept_before_bracket(
     brackets: &mut BroadBracketCollector,
     source: Result<CounterRead, ReadStage>,
@@ -566,20 +569,30 @@ pub(super) fn accept_before_bracket(
             return Err(read_stage_refusal(stage));
         }
     };
-    // Bracket-shape failures refuse WITHOUT observing: the collector
-    // baseline and the seq stay pristine for the next acquisition.
     {
         let view = read.view();
         if view.generation != facts_generation {
+            // Foreign generation: refuse without observing, so a
+            // foreign input can never poison the owner's sticky state.
             return Err(SelectedDetailRefusal::BroadPlanTopology);
         }
-        let rows = view
-            .rows
-            .map_err(|_| SelectedDetailRefusal::BroadPlanTopology)?;
+        let rows = match view.rows {
+            Ok(rows) => rows,
+            Err(_) => {
+                // Same-generation failed rows: latch the sticky loss
+                // with the seq untouched.
+                let _ = brackets.collector.observe(Ok(read));
+                return Err(SelectedDetailRefusal::BroadPlanTopology);
+            }
+        };
         if bracket_signal_defect(view).is_some() {
+            // Same-generation unhealthy signals: latch the sticky loss
+            // with the seq untouched.
+            let _ = brackets.collector.observe(Ok(read));
             return Err(SelectedDetailRefusal::BroadPlanTopology);
         }
         if !bracket_rows_match_plan(rows, broad_plan) {
+            // Healthy topology mismatch: refuse without observing.
             return Err(SelectedDetailRefusal::BroadPlanTopology);
         }
     }
@@ -604,7 +617,11 @@ pub(super) fn accept_before_bracket(
 /// (R2-D2-C): a fresh acceptance assigns the close seq; a failed
 /// acquisition is explicitly unavailable; a defective or
 /// collector-rejected acquisition is mismatched — never Matched,
-/// never promoted to fresh. The seq advances only on acceptance.
+/// never promoted to fresh. The seq advances only on acceptance. A
+/// same-generation unhealthy or failed-rows acquisition latches the
+/// collector's sticky loss first (seq untouched), so a later healthy
+/// same-generation read stays mismatched; foreign and
+/// healthy-topology mismatches disclose without observing.
 pub(super) fn accept_after_bracket(
     brackets: &mut BroadBracketCollector,
     source: Result<CounterRead, ReadStage>,
@@ -621,6 +638,15 @@ pub(super) fn accept_after_bracket(
         }
     };
     if let Some(reason) = after_bracket_mismatch(&read, mode, generation, broad_plan) {
+        // Same-generation genuine loss evidence latches the sticky
+        // state with the seq untouched; anything else discloses
+        // without observing.
+        let view = read.view();
+        if view.generation == generation
+            && (view.rows.is_err() || bracket_signal_defect(view).is_some())
+        {
+            let _ = brackets.collector.observe(Ok(read));
+        }
         return AfterBracketAcceptance::Mismatched(reason);
     }
     let Some(assigned) = seq.checked_add(1) else {
@@ -4515,10 +4541,13 @@ mod tests {
     fn selected_detail_bracket_acceptance_assigns_seq_on_observe_only() {
         use super::super::counter_collector::ReadStage;
         // The session path's shared orchestration: seqs assign only on
-        // actual collector acceptance of the exact acquisition. Every
-        // failure leaves the collector baseline and the seq untouched —
-        // proved by the next acceptance advancing from the same
-        // baseline; collector-rejected acquisitions assign nothing.
+        // actual collector acceptance of the exact acquisition. Failed
+        // and foreign acquisitions leave the collector baseline and
+        // the seq untouched (the next healthy acceptance still
+        // advances); same-generation unhealthy acquisitions latch the
+        // collector's sticky loss (the next healthy same-generation
+        // read stays unavailable) with the seq still untouched; only
+        // a fresh generation recovers.
         let pool = test_pool();
         let scene = stage_two_providers(pool);
         let mut brackets =
@@ -4571,7 +4600,10 @@ mod tests {
             SelectedDetailRefusal::BroadPlanTopology
         );
         assert_eq!(seq, 1, "a foreign acquisition assigns no seq");
-        // An unhealthy acquisition refuses without observing.
+        // A same-generation unhealthy acquisition refuses (seq
+        // untouched) but latches the collector's sticky loss: the
+        // failed and foreign rejections above left the baseline
+        // pristine, this one does not.
         let saturated = scripted_read_with_signals(
             &scene.pool,
             &scene.plan,
@@ -4591,8 +4623,8 @@ mod tests {
             SelectedDetailRefusal::BroadPlanTopology
         );
         assert_eq!(seq, 1, "an unhealthy acquisition assigns no seq");
-        // The next healthy acquisition still advances from the r0
-        // baseline: none of the rejections polluted it or the seq.
+        // Sticky loss: the next healthy same-generation acquisition
+        // stays unavailable (it must not erase the observed loss).
         let r1 = scripted_read(
             &scene.pool,
             &scene.plan,
@@ -4601,13 +4633,37 @@ mod tests {
             &counts_for(&scene.plan, 5, 7),
             window_of(20, 30),
         );
-        let receipt = accept_before_bracket(&mut brackets, Ok(r1), &scene.plan, brgen, &mut seq)
-            .expect("the baseline is still r0");
-        assert_eq!((seq, receipt.seq), (2, 2));
-        assert_eq!(receipt.window, Some((20, 30)));
+        assert_eq!(
+            accept_before_bracket(&mut brackets, Ok(r1), &scene.plan, brgen, &mut seq)
+                .unwrap_err(),
+            SelectedDetailRefusal::BroadPlanTopology,
+            "healthy after unhealthy in one generation stays unavailable"
+        );
+        assert_eq!(seq, 1, "a latched-out acquisition assigns no seq");
         // A shape-correct acquisition the collector rejects (failed
         // differences: fewer rows than the baseline) refuses with the
-        // seq untouched.
+        // seq untouched. Fresh collector, so the sticky latch above
+        // cannot satisfy this case for it.
+        let mut diff_brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut diff_seq = 0;
+        let diff_r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+        );
+        accept_before_bracket(
+            &mut diff_brackets,
+            Ok(diff_r0),
+            &scene.plan,
+            brgen,
+            &mut diff_seq,
+        )
+        .expect("diff collector accepts its baseline");
+        assert_eq!(diff_seq, 1);
         let short_plan = AttachPlan::from_slots(scene.plan.slots[..2].to_vec());
         let short = scripted_read(
             &scene.pool,
@@ -4618,11 +4674,14 @@ mod tests {
             window_of(30, 40),
         );
         assert_eq!(
-            accept_before_bracket(&mut brackets, Ok(short), &scene.plan, brgen, &mut seq)
+            accept_before_bracket(&mut diff_brackets, Ok(short), &scene.plan, brgen, &mut diff_seq)
                 .unwrap_err(),
             SelectedDetailRefusal::BroadPlanTopology
         );
-        assert_eq!(seq, 2, "a collector-rejected acquisition assigns no seq");
+        assert_eq!(
+            diff_seq, 1,
+            "a collector-rejected acquisition assigns no seq"
+        );
         // A restarted broad capture adopts cleanly: the collector moves
         // to the fresh generation (superseding the latched one) and the
         // bracket assigns.
@@ -4637,7 +4696,7 @@ mod tests {
         );
         let receipt = accept_before_bracket(&mut brackets, Ok(r8), &scene.plan, brgen8, &mut seq)
             .expect("the fresh generation adopts");
-        assert_eq!((seq, receipt.seq), (3, 3));
+        assert_eq!((seq, receipt.seq), (2, 2));
         assert_eq!(receipt.generation, brgen8);
         // A shape-correct acquisition refused by pre-latched collector
         // state assigns nothing and installs nothing.
@@ -4807,5 +4866,120 @@ mod tests {
             AfterBracketAcceptance::Mismatched("mode")
         );
         assert_eq!(seq, 2, "a mismatched acquisition assigns no seq");
+    }
+
+    #[test]
+    fn selected_detail_after_bracket_sticky_loss_persists() {
+        // Healthy → unhealthy → healthy in one generation: the
+        // unhealthy after bracket discloses its defect (seq untouched)
+        // and latches the collector's sticky loss, so the next
+        // healthy same-generation after bracket stays mismatched
+        // (never Fresh). Only a fresh generation recovers.
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut brackets =
+            BroadBracketCollector::new(scene.plan.slots.len(), 0, scene.pool.reserver());
+        let mut seq = 0;
+        let brgen = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let r0 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 3, 5),
+            window_of(10, 20),
+        );
+        accept_before_bracket(&mut brackets, Ok(r0), &scene.plan, brgen, &mut seq)
+            .expect("before accepts");
+        assert_eq!(seq, 1);
+        let r1 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 7),
+            window_of(20, 30),
+        );
+        let fresh = accept_after_bracket(
+            &mut brackets,
+            Ok(r1),
+            &scene.plan,
+            CounterMode::Counts,
+            brgen,
+            &mut seq,
+        );
+        let AfterBracketAcceptance::Fresh(receipt) = fresh else {
+            panic!("a fresh acquisition accepts: {fresh:?}");
+        };
+        assert_eq!((seq, receipt.seq), (2, 2));
+        let saturated = scripted_read_with_signals(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 5, 7),
+            window_of(30, 40),
+            CounterHealth {
+                saturated: true,
+                contended: false,
+            },
+            KernelEvidence::default(),
+        );
+        assert_eq!(
+            accept_after_bracket(
+                &mut brackets,
+                Ok(saturated),
+                &scene.plan,
+                CounterMode::Counts,
+                brgen,
+                &mut seq
+            ),
+            AfterBracketAcceptance::Mismatched("health"),
+            "an unhealthy after bracket names its defect"
+        );
+        assert_eq!(seq, 2, "an unhealthy acquisition assigns no seq");
+        let r2 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 9, 9),
+            window_of(30, 40),
+        );
+        assert_eq!(
+            accept_after_bracket(
+                &mut brackets,
+                Ok(r2),
+                &scene.plan,
+                CounterMode::Counts,
+                brgen,
+                &mut seq
+            ),
+            AfterBracketAcceptance::Mismatched("rejected"),
+            "healthy after unhealthy in one generation stays mismatched"
+        );
+        assert_eq!(seq, 2, "a latched-out acquisition assigns no seq");
+        let brgen8 = NonZeroU64::new(BROAD_GENERATION + 1).unwrap();
+        let r8 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            brgen8,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 9, 9),
+            window_of(40, 50),
+        );
+        let fresh = accept_after_bracket(
+            &mut brackets,
+            Ok(r8),
+            &scene.plan,
+            CounterMode::Counts,
+            brgen8,
+            &mut seq,
+        );
+        let AfterBracketAcceptance::Fresh(receipt) = fresh else {
+            panic!("the fresh generation adopts: {fresh:?}");
+        };
+        assert_eq!((seq, receipt.seq), (3, 3));
+        assert_eq!(receipt.generation, brgen8);
     }
 }

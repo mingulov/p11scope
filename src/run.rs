@@ -1989,12 +1989,16 @@ fn prearm_report_owners(
 /// The terminal watch-close boundary (packet 6.13 round-2, F3): the first
 /// effective STOP when the gate recorded one, else the loop-end stamp. The
 /// minimum wins, so a later publication sample never extends the published
-/// interval past the earliest stop.
-fn prearm_stop_ns(first_stop_ns: Option<u64>, loop_end_ns: Option<u64>) -> Option<u64> {
-    match (first_stop_ns, loop_end_ns) {
-        (Some(first), Some(loop_end)) => Some(first.min(loop_end)),
-        (Some(first), None) => Some(first),
-        (None, loop_end) => loop_end,
+/// interval past the earliest stop. A stop requested at an unknown instant
+/// stays unknown (round-3 re-audit finding 2): the blind tail is never
+/// backfilled with a later request or the loop-end sample.
+fn prearm_stop_ns(first_stop: crate::attach::FirstStop, loop_end_ns: Option<u64>) -> Option<u64> {
+    use crate::attach::FirstStop;
+    match (first_stop, loop_end_ns) {
+        (FirstStop::Known(first), Some(loop_end)) => Some(first.min(loop_end)),
+        (FirstStop::Known(first), None) => Some(first),
+        (FirstStop::NotRequested, loop_end) => loop_end,
+        (FirstStop::Unknown, _) => None,
     }
 }
 
@@ -5319,7 +5323,7 @@ fn capture_profile(
     let loop_end_ns = crate::attach::monotonic_ns();
     // F3: watches close at the first effective STOP, not at this later
     // loop-end sample.
-    let watch_stop_ns = prearm_stop_ns(session.stop_gate().first_stop_ns(), loop_end_ns);
+    let watch_stop_ns = prearm_stop_ns(session.stop_gate().first_stop(), loop_end_ns);
     let loop_end_reason = match &loop_result {
         Ok(end) => end.reason_label(),
         Err(_) => render::LOOP_END_ERROR,
@@ -6241,7 +6245,7 @@ fn capture_trace(
     let loop_end_ns = crate::attach::monotonic_ns();
     // F3: watches close at the first effective STOP, not at this later
     // loop-end sample (which follows the identity stop).
-    let watch_stop_ns = prearm_stop_ns(session.stop_gate().first_stop_ns(), loop_end_ns);
+    let watch_stop_ns = prearm_stop_ns(session.stop_gate().first_stop(), loop_end_ns);
     let loop_end_reason = match &loop_result {
         Ok(end) => end.reason_label(),
         Err(_) => render::LOOP_END_ERROR,
@@ -12431,12 +12435,26 @@ mod tests {
 
     #[test]
     fn prearm_stop_uses_first_stop_not_later_loop_end() {
+        use crate::attach::FirstStop;
         // The earliest stop wins; a later loop-end sample never extends it.
-        assert_eq!(prearm_stop_ns(Some(1000), Some(5000)), Some(1000));
-        assert_eq!(prearm_stop_ns(Some(5000), Some(1000)), Some(1000));
-        assert_eq!(prearm_stop_ns(Some(1000), None), Some(1000));
-        assert_eq!(prearm_stop_ns(None, Some(5000)), Some(5000));
-        assert_eq!(prearm_stop_ns(None, None), None);
+        assert_eq!(
+            prearm_stop_ns(FirstStop::Known(1000), Some(5000)),
+            Some(1000)
+        );
+        assert_eq!(
+            prearm_stop_ns(FirstStop::Known(5000), Some(1000)),
+            Some(1000)
+        );
+        assert_eq!(prearm_stop_ns(FirstStop::Known(1000), None), Some(1000));
+        assert_eq!(
+            prearm_stop_ns(FirstStop::NotRequested, Some(5000)),
+            Some(5000)
+        );
+        assert_eq!(prearm_stop_ns(FirstStop::NotRequested, None), None);
+        // Round-3 (re-audit finding 2): a stop requested at an unknown
+        // instant stays unknown — never backfilled with a later value.
+        assert_eq!(prearm_stop_ns(FirstStop::Unknown, Some(5000)), None);
+        assert_eq!(prearm_stop_ns(FirstStop::Unknown, None), None);
     }
 
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {

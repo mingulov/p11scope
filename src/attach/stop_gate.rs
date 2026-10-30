@@ -30,16 +30,33 @@ pub(crate) fn validate_stop_gate(ebpf: &Ebpf) -> Result<()> {
     )
 }
 
+/// First-stop state (packet 6.13 round-3, re-audit finding 2): "no stop
+/// requested" and "stop requested but its instant is unknown" are distinct.
+/// A clock failure at the first request latches `Unknown` once — a later
+/// request or loop-end sample must never backfill it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirstStop {
+    NotRequested,
+    Unknown,
+    Known(u64),
+}
+
+/// Raw `first_stop` encoding of [`FirstStop::Unknown`]: unreachable from
+/// `CLOCK_MONOTONIC` (2^64-1ns ≈ 585 years), reserved so the unknown case
+/// latches once in the same atomic as the known instant. Zero stays "none";
+/// known instants clamp below the sentinel.
+const FIRST_STOP_UNKNOWN: u64 = u64::MAX;
+
 /// Mmap of the STOP_GATE cell, owned by the `Session` for its lifetime.
 /// Every access is atomic; the mapping unmaps on drop.
 pub(crate) struct StopGate {
     cell: NonNull<AtomicU64>,
     len: usize,
-    /// First `CLOCK_MONOTONIC` stop-request instant (packet 6.13 round-2,
-    /// F3): latched once at the first effective STOP, never overwritten,
-    /// so terminal watch bounds use the earliest stop instead of a later
-    /// publication read. Zero means no stop was requested yet.
-    first_stop_ns: AtomicU64,
+    /// First stop-request state (packet 6.13 round-2, F3): latched once at
+    /// the first effective STOP, never overwritten, so terminal watch
+    /// bounds use the earliest stop instead of a later publication read.
+    /// Raw [`FirstStop`] encoding: 0 none, `FIRST_STOP_UNKNOWN` unknown.
+    first_stop: AtomicU64,
 }
 
 // SAFETY: the mapping is owned exclusively and every access is atomic.
@@ -76,29 +93,40 @@ impl StopGate {
         Ok(StopGate {
             cell,
             len,
-            first_stop_ns: AtomicU64::new(0),
+            first_stop: AtomicU64::new(0),
         })
     }
 
     /// Publish the stop request: set the stop bit, keep the count. The
     /// first call also latches its `CLOCK_MONOTONIC` instant (read before
-    /// the bit is set, so the stamp is at or before the effective stop);
-    /// later calls never move it.
+    /// the bit is set, so the stamp is at or before the effective stop),
+    /// or `Unknown` when the clock read fails; later calls never move it.
     pub(crate) fn request_stop(&self) {
-        if let Some(now) = super::monotonic_ns() {
-            let now = now.max(1);
-            let _ = self
-                .first_stop_ns
-                .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst);
-        }
+        self.request_stop_with(super::monotonic_ns());
+    }
+
+    /// [`request_stop`] with an injected clock reading, so tests can script
+    /// a failed first read. Production always passes the live clock. Both
+    /// outcomes latch once: a failed read records `Unknown`, never a
+    /// later request's instant.
+    pub(crate) fn request_stop_with(&self, now: Option<u64>) {
+        let stamped = match now {
+            Some(ns) => ns.max(1).min(FIRST_STOP_UNKNOWN - 1),
+            None => FIRST_STOP_UNKNOWN,
+        };
+        let _ = self
+            .first_stop
+            .compare_exchange(0, stamped, Ordering::SeqCst, Ordering::SeqCst);
         self.word().fetch_or(STOP_GATE_STOP, Ordering::SeqCst);
     }
 
-    /// The first stop-request instant, when any stop was requested.
-    pub(crate) fn first_stop_ns(&self) -> Option<u64> {
-        match self.first_stop_ns.load(Ordering::SeqCst) {
-            0 => None,
-            ns => Some(ns),
+    /// The first stop-request state: nothing requested yet, requested with
+    /// an unknown instant, or the latched known instant.
+    pub(crate) fn first_stop(&self) -> FirstStop {
+        match self.first_stop.load(Ordering::SeqCst) {
+            0 => FirstStop::NotRequested,
+            FIRST_STOP_UNKNOWN => FirstStop::Unknown,
+            ns => FirstStop::Known(ns),
         }
     }
 
@@ -142,8 +170,7 @@ impl Drop for StopGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn pid_continuity_stop_bit_refuses_with_bodies_in_flight() {
+    fn test_gate() -> StopGate {
         let len = 4096;
         let base = unsafe {
             libc::mmap(
@@ -156,14 +183,19 @@ mod tests {
             )
         };
         assert_ne!(base, libc::MAP_FAILED);
-        let gate = StopGate {
+        StopGate {
             cell: NonNull::new(base.cast()).unwrap(),
             len,
-            first_stop_ns: AtomicU64::new(0),
-        };
+            first_stop: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn pid_continuity_stop_bit_refuses_with_bodies_in_flight() {
+        let gate = test_gate();
         gate.word().store(3, Ordering::SeqCst);
         assert!(!gate.stop_requested());
-        assert_eq!(gate.first_stop_ns(), None);
+        assert_eq!(gate.first_stop(), FirstStop::NotRequested);
         gate.request_stop();
         assert_eq!(gate.in_flight(), 3);
         assert!(!gate.quiescent());
@@ -172,10 +204,39 @@ mod tests {
             "STOP must refuse before admitted bodies become quiescent"
         );
         // The first stop latches its instant; a later request never moves it.
-        let first = gate.first_stop_ns().expect("the stop latches its instant");
+        let FirstStop::Known(first) = gate.first_stop() else {
+            panic!("the stop latches its instant");
+        };
         assert!(first > 0);
         std::thread::sleep(std::time::Duration::from_millis(2));
         gate.request_stop();
-        assert_eq!(gate.first_stop_ns(), Some(first));
+        assert_eq!(gate.first_stop(), FirstStop::Known(first));
+    }
+
+    #[test]
+    fn first_stop_failure_then_success_stays_unknown() {
+        // Packet 6.13 round-3 (re-audit finding 2): a failed clock read at
+        // the first request latches "stop requested, instant unknown" once —
+        // a later request with a working clock must not backfill it.
+        let gate = test_gate();
+        assert_eq!(gate.first_stop(), FirstStop::NotRequested);
+        gate.request_stop_with(None);
+        assert!(gate.stop_requested());
+        assert_eq!(gate.first_stop(), FirstStop::Unknown);
+        gate.request_stop_with(Some(5000));
+        assert_eq!(gate.first_stop(), FirstStop::Unknown);
+    }
+
+    #[test]
+    fn first_stop_known_instant_latches_once() {
+        // Healthy twin: the first known instant latches; later requests —
+        // known or clock-failed — never move it.
+        let gate = test_gate();
+        gate.request_stop_with(Some(1000));
+        assert_eq!(gate.first_stop(), FirstStop::Known(1000));
+        gate.request_stop_with(Some(5000));
+        assert_eq!(gate.first_stop(), FirstStop::Known(1000));
+        gate.request_stop_with(None);
+        assert_eq!(gate.first_stop(), FirstStop::Known(1000));
     }
 }

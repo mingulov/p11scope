@@ -95,7 +95,7 @@ pub(crate) use inventory::capture;
 #[allow(dead_code)] // Closed preparation; activation CAS is native, its promotion proof is joint.
 pub(crate) mod selected_detailed;
 mod stop_gate;
-pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
+pub(crate) use stop_gate::{FirstStop, StopGate, stop_gate_map_data, validate_stop_gate};
 // Task 3 Stage A: the readers are consumed by the Task 6 native seam
 // (`stage_native`, DR-T3A-1) and today by the privileged instance gates.
 pub(crate) mod host_btf;

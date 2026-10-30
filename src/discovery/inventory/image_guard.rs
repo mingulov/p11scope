@@ -668,4 +668,141 @@ mod tests {
         guard.release();
         assert_eq!(source.calls(), 1);
     }
+
+    #[test]
+    fn fresh_guard_rejects_preissued_image_after_domain_finish() {
+        const TICKET: u64 = 41;
+        const EXEC: u64 = 7;
+        const T1: u32 = 4242;
+        const T2: u32 = 4243;
+        let d1 = NativeDomainId::mint();
+        let d2 = NativeDomainId::mint();
+        let mut scene = BinderScene::new();
+        let c1 = scene.settle(d1, T1, 0, TICKET, EXEC);
+        let c2 = scene.settle(d2, T2, 1, TICKET, EXEC);
+        let expected1 = scene
+            .binder
+            .expected_owner_image(d1, c1, T1, &scene.lookup())
+            .expect("D1 supplies its expected image while active");
+        let expected2 = scene
+            .binder
+            .expected_owner_image(d2, c2, T2, &scene.lookup())
+            .expect("D2 supplies its expected image while active");
+        assert_ne!(expected1, expected2);
+        let view = self_view();
+
+        // Prove Exact while D1 is active.
+        let mut source = ScriptedAcquisition::new(d1);
+        source.script_observe(1, TICKET, EXEC);
+        let mut guard = FreshImageGuard::new(&mut source, &scene.binder, window());
+        assert_eq!(guard.check(&view, expected1), ImageCheck::Exact);
+        guard.release();
+        assert_eq!(source.calls(), 1);
+
+        // Finish D1 while retaining the same image and original pin.
+        scene.binder.finish(d1);
+        assert!(!scene.binder.domain_active(d1));
+        assert!(scene.binder.domain_active(d2));
+
+        // Active D2 control with coincident numbers still matches.
+        let mut source = ScriptedAcquisition::new(d2);
+        source.script_observe(2, TICKET, EXEC);
+        let mut guard = FreshImageGuard::new(&mut source, &scene.binder, window());
+        assert_eq!(guard.check(&view, expected2), ImageCheck::Exact);
+        guard.release();
+        assert_eq!(source.calls(), 1);
+
+        // The retained preissued image must refuse without acquiring,
+        // even for a matching scripted observation.
+        let mut source = ScriptedAcquisition::new(d1);
+        source.script_observe(3, TICKET, EXEC);
+        let mut guard = FreshImageGuard::new(&mut source, &scene.binder, window());
+        assert_eq!(
+            guard.check(&view, expected1),
+            ImageCheck::Unavailable,
+            "a finished domain cannot supply fresh authority for its retained image"
+        );
+        guard.release();
+        assert_eq!(
+            source.calls(),
+            0,
+            "the finished-domain veto runs before acquisition"
+        );
+    }
+
+    #[test]
+    fn expected_owner_image_rejects_replaced_live_caller_at_same_pid() {
+        const TICKET_OLD: u64 = 41;
+        const TICKET_NEW: u64 = 42;
+        const EXEC: u64 = 7;
+        const T: u32 = 4242;
+        let domain = NativeDomainId::mint();
+        let mut scene = BinderScene::new();
+        let old = scene.settle(domain, T, 0, TICKET_OLD, EXEC);
+        assert!(
+            scene
+                .binder
+                .expected_owner_image(domain, old, T, &scene.lookup())
+                .is_some(),
+            "the old binding supplies while it is still live"
+        );
+
+        // Replace the PID's live caller: a new CallerId, pin generation
+        // and ticket. The old settled association stays in the binder.
+        let replacement = CallerId(1);
+        let first_seen = scene.tick();
+        let new_pin: TestPin = (T, 1);
+        scene.live.insert(T, (replacement, first_seen, new_pin));
+        scene.answers.insert(
+            (new_pin, domain),
+            CookieQuery::Cookie(DomainCookie::scripted(domain, TICKET_NEW)),
+        );
+        let t0 = scene.tick();
+        scene.read_rows(
+            domain,
+            vec![WitnessRow::scripted(
+                domain,
+                TICKET_NEW,
+                EXEC,
+                AttachObjectId::scripted(1),
+                EndpointId(1),
+                T,
+                t0,
+            )],
+        );
+        scene.drain(domain, &[]);
+        scene.read_rows(domain, Vec::new());
+        let verdicts: Vec<Binding> = scene
+            .binder
+            .take_decisions()
+            .into_iter()
+            .map(|decision| decision.binding)
+            .collect();
+        assert_eq!(verdicts, [Binding::Bound(replacement)]);
+        assert!(scene.binder.domain_active(domain));
+        assert_eq!(
+            scene.lookup().live_caller(T).map(|live| live.id),
+            Some(replacement),
+            "the PID stays present and now names the replacement"
+        );
+        assert!(scene.binder.holds_image(domain, old));
+        assert!(scene.binder.holds_image(domain, replacement));
+
+        // The genuinely settled replacement supplies.
+        assert!(
+            scene
+                .binder
+                .expected_owner_image(domain, replacement, T, &scene.lookup())
+                .is_some(),
+            "the settled replacement supplies its own expected image"
+        );
+        // The old caller no longer supplies: the live PID names another.
+        assert!(
+            scene
+                .binder
+                .expected_owner_image(domain, old, T, &scene.lookup())
+                .is_none(),
+            "a replaced live caller cannot supply the old caller's expected image"
+        );
+    }
 }

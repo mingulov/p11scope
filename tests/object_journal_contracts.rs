@@ -966,7 +966,11 @@ fn object_journal_native_producer_preserves_wire_and_custody() {
         }
         // The small flavor's one-entry side map admits one fewer live
         // BEGIN (and its cleanup ABANDON) in the multi-slot cleanup case.
-        let expected = if name == "small" { [33, 1, 20] } else { [34, 1, 21] };
+        let expected = if name == "small" {
+            [33, 1, 20]
+        } else {
+            [34, 1, 21]
+        };
         assert_eq!(counts, expected, "exact producer record selection");
     }
     assert_eq!(
@@ -2068,8 +2072,8 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
     use p11scope_ebpf_common::object_journal::{
         JOURNAL_REASON_ABI_REFUSED, JOURNAL_REASON_ENTRY_COLLISION, JOURNAL_REASON_EXEC_EXIT,
         JOURNAL_REASON_IDENTITY_REFUSED, JOURNAL_REASON_INSERT_FAILED,
-        JOURNAL_REASON_PARTIAL_TRANSACTION, JOURNAL_REASON_SCOPE_LOST,
-        JOURNAL_REASON_STOP_CLEANUP, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        JOURNAL_REASON_PARTIAL_TRANSACTION, JOURNAL_REASON_SCOPE_LOST, JOURNAL_REASON_STOP_CLEANUP,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
     };
     assert_eq!(
         [
@@ -2093,8 +2097,14 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
     let journal_c = read("crates/ebpf/native/object_journal.c");
     let common = read("crates/ebpf-common/src/object_journal.rs");
     for (define, expected) in [
-        ("#define P11_OWNER_START_REASON_COLLISION", JOURNAL_REASON_ENTRY_COLLISION),
-        ("#define P11_OWNER_START_REASON_EXEC_EXIT", JOURNAL_REASON_EXEC_EXIT),
+        (
+            "#define P11_OWNER_START_REASON_COLLISION",
+            JOURNAL_REASON_ENTRY_COLLISION,
+        ),
+        (
+            "#define P11_OWNER_START_REASON_EXEC_EXIT",
+            JOURNAL_REASON_EXEC_EXIT,
+        ),
     ] {
         let line = owner_h
             .lines()
@@ -2115,7 +2125,10 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
         ("scope-lost", "JOURNAL_REASON_SCOPE_LOST"),
         ("abi-refused", "JOURNAL_REASON_ABI_REFUSED"),
         ("identity-refused", "JOURNAL_REASON_IDENTITY_REFUSED"),
-        ("sync-return-result-lost", "JOURNAL_REASON_SYNC_RETURN_RESULT_LOST"),
+        (
+            "sync-return-result-lost",
+            "JOURNAL_REASON_SYNC_RETURN_RESULT_LOST",
+        ),
     ] {
         assert!(main_rs.contains(token), "{reason} emitter token {token}");
     }
@@ -2128,14 +2141,18 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
         "JOURNAL_REASON_PARTIAL_TRANSACTION",
     ] {
         assert!(
-            !main_rs.contains(reserved) && !owner_c.contains(reserved)
+            !main_rs.contains(reserved)
+                && !owner_c.contains(reserved)
                 && !journal_c.contains(reserved),
             "{reserved} stays unemitted while it is reserved"
         );
-        let documented = common.lines().any(|line| {
-            line.contains(reserved) && line.to_lowercase().contains("reserved")
-        });
-        assert!(documented, "{reserved} carries its reservation in the shared contract");
+        let documented = common
+            .lines()
+            .any(|line| line.contains(reserved) && line.to_lowercase().contains("reserved"));
+        assert!(
+            documented,
+            "{reserved} carries its reservation in the shared contract"
+        );
     }
 }
 
@@ -2149,12 +2166,16 @@ fn object_journal_producer_mutants_are_causal() {
         .expect("read native journal");
     let work = tempfile::tempdir().expect("mutant work directory");
     // (label, mutation, production define, fixture argument)
-    let cases: [(&str, Option<(&str, &str)>, bool, Option<&str>); 5] = [
+    type MutantCase<'a> = (&'a str, Option<(&'a str, &'a str)>, bool, Option<&'a str>);
+    let cases: [MutantCase<'_>; 5] = [
         ("control-combined", None, false, None),
         ("control-producer", None, true, Some("producer")),
         (
             "finish-ignores-cleanup",
-            Some(("    if (cleanup_committed != 1) {", "    if (cleanup_committed == 99U) {")),
+            Some((
+                "    if (cleanup_committed != 1) {",
+                "    if (cleanup_committed == 99U) {",
+            )),
             true,
             Some("producer"),
         ),

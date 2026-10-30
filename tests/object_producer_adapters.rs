@@ -186,9 +186,23 @@ fn object_producer_adapters_entry_fill_shape() {
 #[test]
 fn object_producer_adapters_return_fill_shape() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF return root");
+    // The split ordinary copy carries the same shape under its concrete
+    // record type; the generic copy below is the journal-bearing one.
+    let ordinary_copy = source_between(
+        &source,
+        "fn object_return_ordinary(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    );
+    assert_eq!(
+        ordinary_copy
+            .matches("EVENTS.reserve::<ObjectEventRecord>")
+            .count(),
+        1,
+        "ordinary copy reserves its concrete object record exactly once"
+    );
     let returned = source_between(
         &source,
-        "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
     // Return (slice D): ready/agreement queries, then the complete
@@ -247,12 +261,13 @@ fn object_producer_adapters_return_fill_shape() {
         .find("p11_object_fault()")
         .expect("failed settle must fault");
     let _ = fault;
-    // Slice D emits behind the required-object marker: exactly the two
-    // record forms are reserved.
+    // Slice D emits behind the required-object marker: the generic copy
+    // reserves exactly its one record form (the ordinary copy's concrete
+    // reservation is pinned above).
     assert_eq!(
         returned.matches("EVENTS.reserve").count(),
-        2,
-        "return reserves exactly the ordinary and the object record forms"
+        1,
+        "generic return reserves exactly its object record form"
     );
 }
 
@@ -1072,29 +1087,47 @@ fn pin_root_refusals_retire() {
         "fn p11_return_impl<const JOURNAL: bool>(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
-    // Ready/agreement refusal arms retire ownership before returning.
-    for (arm, removal) in [
+    // Ready/agreement refusal arms retire ownership before returning, in
+    // the generic journal-bearing copy and in the split ordinary copy
+    // (which retires through the owned removal without a journal reason).
+    let generic = source_between(
+        &source,
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+        "pub extern \"C\" fn p11_link_fork_allowed",
+    );
+    let ordinary_copy = source_between(
+        &source,
+        "fn object_return_ordinary(",
+        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+    );
+    for (copy, region, removal) in [
         (
-            "if ready.is_none() {",
+            "generic",
+            generic,
             "start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)",
         ),
-        (
-            "if !agreed {",
-            "start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_ABI_REFUSED)",
-        ),
+        ("ordinary", ordinary_copy, "owned_start_remove(&key, true)"),
     ] {
-        let at = returned
-            .find(arm)
-            .unwrap_or_else(|| panic!("return must keep its {arm} refusal arm"));
-        let end = returned[at..]
-            .find("\n    }\n")
-            .expect("refusal arm closes");
-        let body = &returned[at..at + end];
-        assert!(body.contains(removal), "{arm} must retire ownership");
-        assert!(
-            body.contains("p11_object_fault()"),
-            "{arm} must fault visibly"
-        );
+        for arm in ["if ready.is_none() {", "if !agreed {"] {
+            let at = region
+                .find(arm)
+                .unwrap_or_else(|| panic!("{copy} return must keep its {arm} refusal arm"));
+            let end = region[at..].find("\n    }\n").expect("refusal arm closes");
+            let body = &region[at..at + end];
+            let expected = if copy == "generic" && arm == "if !agreed {" {
+                "start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_ABI_REFUSED)"
+            } else {
+                removal
+            };
+            assert!(
+                body.contains(expected),
+                "{copy} {arm} must retire ownership"
+            );
+            assert!(
+                body.contains("p11_object_fault()"),
+                "{copy} {arm} must fault visibly"
+            );
+        }
     }
     // The object branch alone owns late retirement; ordinary returns
     // already retired before accounting and cannot delete twice.
@@ -1120,7 +1153,7 @@ fn pin_root_refusals_retire() {
     let ordinary = source_between(
         returned,
         "fn ordinary_return(",
-        "fn object_return<const JOURNAL: bool, Record: ReturnPayload>(",
+        "fn object_return_ordinary(",
     );
     assert_eq!(
         ordinary.matches("owned_start_remove(&key, true)").count(),
@@ -1133,7 +1166,7 @@ fn pin_root_refusals_retire() {
     // mutant to short-circuit, and no read may run after a failed
     // emission.
     assert_eq!(
-        returned.matches("emission_finalize(").count(),
+        object.matches("emission_finalize(").count(),
         1,
         "emission must delegate its cleanup decision to the shared production function"
     );
@@ -1141,28 +1174,28 @@ fn pin_root_refusals_retire() {
         !returned.contains("let retired = "),
         "no inline retirement may bypass the shared decision"
     );
-    let finalize = returned
+    let finalize = object
         .find("emission_finalize(emitted")
         .expect("emission delegates with its chained stage result");
-    let stmt_end = returned[finalize..]
+    let stmt_end = object[finalize..]
         .find(';')
         .expect("delegated call terminates");
-    let stmt = &returned[finalize..finalize + stmt_end];
+    let stmt = &object[finalize..finalize + stmt_end];
     assert!(
         stmt.contains("start_remove_for::<JOURNAL>(&key, true, reason)"),
         "the delegated decision must carry the checked removal"
     );
-    let gate = returned
+    let gate = object
         .find("if !outcome.submitted")
         .expect("emission keeps its success gate");
     assert!(
         finalize < gate,
         "the delegated decision must precede the emission gate"
     );
-    let discard = returned
+    let discard = object
         .rfind("entry.discard(0)")
         .expect("failed emission discards");
-    let tail_region = &returned[finalize..discard];
+    let tail_region = &object[finalize..discard];
     for forbidden in [
         "p11_object_side_get",
         "object_fill_return(",

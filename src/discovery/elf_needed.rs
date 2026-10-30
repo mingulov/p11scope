@@ -2627,4 +2627,403 @@ mod tests {
         );
         assert_eq!(replaced.analyses_run_for_test(), 2);
     }
+
+    // 614b round-2 P2#1: a learned path replaced with a writerless FIFO
+    // must refuse promptly (Unknown) instead of blocking in open. The
+    // adverse analysis runs in an owned child with a bounded wait: the
+    // parent kills a blocked child and fails, so RED never hangs the
+    // suite. Cold/cached x executable/intermediate.
+    const FIFO_CHILD_MARKER: &str = "P11SCOPE_614B_FIFO_CHILD";
+    const FIFO_CHILD_DIR: &str = "P11SCOPE_614B_FIFO_DIR";
+    const FIFO_CHILD_TIMEOUT_SECS: u64 = 15;
+
+    fn replace_with_fifo(path: &Path) {
+        use std::os::unix::fs::FileTypeExt as _;
+        std::fs::remove_file(path).unwrap();
+        let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: NUL-free path, mode bits only.
+        let rc = unsafe { libc::mkfifo(raw.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo {}", path.display());
+        assert!(
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    /// Parent side: respawn this same test in an owned child with a
+    /// bounded wait; child side: run `child` in the parent-owned dir.
+    /// A blocked child is killed and fails the test instead of hanging
+    /// it. The `1 passed` plus marker assertions keep a misnamed
+    /// `--exact` selector (zero tests run) from passing vacuously.
+    fn fifo_child_or_spawn(test_name: &str, case: &str, child: fn(&Path)) {
+        use std::process::{Command, Stdio};
+        if std::env::var_os(FIFO_CHILD_MARKER).is_some() {
+            let dir = std::env::var_os(FIFO_CHILD_DIR).expect("fifo child dir");
+            child(Path::new(&dir));
+            println!("FIFO-CASE {case} DONE");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut spawned = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(format!("discovery::elf_needed::tests::{test_name}"))
+            .arg("--nocapture")
+            .env(FIFO_CHILD_MARKER, "1")
+            .env(FIFO_CHILD_DIR, dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(FIFO_CHILD_TIMEOUT_SECS);
+        loop {
+            match spawned.try_wait().unwrap() {
+                Some(status) => {
+                    let mut stdout = String::new();
+                    use std::io::Read as _;
+                    spawned
+                        .stdout
+                        .take()
+                        .unwrap()
+                        .read_to_string(&mut stdout)
+                        .unwrap();
+                    assert!(
+                        status.success()
+                            && stdout.contains("1 passed")
+                            && stdout.contains(&format!("FIFO-CASE {case} DONE")),
+                        "fifo case {case} child failed: status={status} stdout={stdout:?}"
+                    );
+                    return;
+                }
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = spawned.kill();
+                        let _ = spawned.wait();
+                        panic!(
+                            "fifo case {case} blocked: a replaced-path open must refuse a \
+                             writerless FIFO promptly"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    fn fifo_case_exe_cold(dir: &Path) {
+        let provider = write_elf(
+            dir,
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let exe = write_elf(dir, "exe", &build_elf(&ElfSpec::exe(&[b"libprov.so.1"])));
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        state.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        state.learn_scan_path(cache_key_of(&exe), &exe);
+        state.learn_scan_path(cache_key_of(&provider), &provider);
+        let (dev, ino) = record_identity_of(&exe);
+        replace_with_fifo(&exe);
+        assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
+        assert_eq!(
+            state.capture_bytes_charged_for_test(),
+            0,
+            "fifo exe must be refused before any ELF read"
+        );
+        assert_eq!(state.verdicts_len_for_test(), 0);
+        assert_eq!(state.analyses_run_for_test(), 1);
+    }
+
+    fn fifo_case_exe_cached(dir: &Path) {
+        let provider = write_elf(
+            dir,
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let exe = write_elf(dir, "exe", &build_elf(&ElfSpec::exe(&[b"libprov.so.1"])));
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        state.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        state.learn_scan_path(cache_key_of(&exe), &exe);
+        state.learn_scan_path(cache_key_of(&provider), &provider);
+        let (dev, ino) = record_identity_of(&exe);
+        assert_eq!(
+            state.analyze_executable(dev, ino),
+            StaticHint::LinksProvider
+        );
+        let charged = state.capture_bytes_charged_for_test();
+        assert!(charged > 0);
+        assert_eq!(state.verdicts_len_for_test(), 1);
+        replace_with_fifo(&exe);
+        assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
+        assert_eq!(
+            state.capture_bytes_charged_for_test(),
+            charged,
+            "cached fifo exe must be refused before any ELF read"
+        );
+        assert_eq!(state.verdicts_len_for_test(), 0, "stale verdict dropped");
+        assert_eq!(state.analyses_run_for_test(), 2);
+    }
+
+    fn fifo_case_helper_cold(dir: &Path) {
+        let provider = write_elf(
+            dir,
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let helper = write_elf(
+            dir,
+            "libhelper.so.1",
+            &build_elf(&ElfSpec::lib(b"libhelper.so.1", &[b"libprov.so.1"])),
+        );
+        let exe = write_elf(dir, "exe", &build_elf(&ElfSpec::exe(&[b"libhelper.so.1"])));
+        // Unlearned-helper twin: the same shape with the helper never
+        // learned, so the refusal reads only the executable.
+        let mut twin = ExtensiveState::new();
+        twin.set_enabled(true);
+        twin.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        twin.learn_scan_path(cache_key_of(&exe), &exe);
+        twin.learn_scan_path(cache_key_of(&provider), &provider);
+        let (dev, ino) = record_identity_of(&exe);
+        assert_eq!(twin.analyze_executable(dev, ino), StaticHint::Unknown);
+        let twin_charged = twin.capture_bytes_charged_for_test();
+
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        state.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        state.learn_scan_path(cache_key_of(&exe), &exe);
+        state.learn_scan_path(cache_key_of(&helper), &helper);
+        state.learn_scan_path(cache_key_of(&provider), &provider);
+        replace_with_fifo(&helper);
+        assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
+        assert_eq!(
+            state.capture_bytes_charged_for_test(),
+            twin_charged,
+            "fifo helper must be refused before any of its spans are read"
+        );
+        assert_eq!(state.verdicts_len_for_test(), 0);
+        assert_eq!(state.analyses_run_for_test(), 1);
+    }
+
+    fn fifo_case_helper_cached(dir: &Path) {
+        let provider = write_elf(
+            dir,
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let helper = write_elf(
+            dir,
+            "libhelper.so.1",
+            &build_elf(&ElfSpec::lib(b"libhelper.so.1", &[b"libprov.so.1"])),
+        );
+        let exe = write_elf(dir, "exe", &build_elf(&ElfSpec::exe(&[b"libhelper.so.1"])));
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        state.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        state.learn_scan_path(cache_key_of(&exe), &exe);
+        state.learn_scan_path(cache_key_of(&helper), &helper);
+        state.learn_scan_path(cache_key_of(&provider), &provider);
+        let (dev, ino) = record_identity_of(&exe);
+        assert_eq!(
+            state.analyze_executable(dev, ino),
+            StaticHint::LinksProvider
+        );
+        let charged = state.capture_bytes_charged_for_test();
+        assert_eq!(state.verdicts_len_for_test(), 1);
+        replace_with_fifo(&helper);
+        assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
+        assert_eq!(
+            state.capture_bytes_charged_for_test(),
+            charged,
+            "cached fifo helper must be refused before any ELF read"
+        );
+        assert_eq!(state.verdicts_len_for_test(), 0, "stale verdict dropped");
+        assert_eq!(state.analyses_run_for_test(), 2);
+    }
+
+    #[test]
+    fn elf_needed_fifo_exe_cold_refuses_promptly() {
+        fifo_child_or_spawn(
+            "elf_needed_fifo_exe_cold_refuses_promptly",
+            "exe-cold",
+            fifo_case_exe_cold,
+        );
+    }
+
+    #[test]
+    fn elf_needed_fifo_exe_cached_refuses_promptly() {
+        fifo_child_or_spawn(
+            "elf_needed_fifo_exe_cached_refuses_promptly",
+            "exe-cached",
+            fifo_case_exe_cached,
+        );
+    }
+
+    #[test]
+    fn elf_needed_fifo_intermediate_cold_refuses_promptly() {
+        fifo_child_or_spawn(
+            "elf_needed_fifo_intermediate_cold_refuses_promptly",
+            "helper-cold",
+            fifo_case_helper_cold,
+        );
+    }
+
+    #[test]
+    fn elf_needed_fifo_intermediate_cached_refuses_promptly() {
+        fifo_child_or_spawn(
+            "elf_needed_fifo_intermediate_cached_refuses_promptly",
+            "helper-cached",
+            fifo_case_helper_cached,
+        );
+    }
+
+    // 614b round-2 P2#1 controls: a learned path that is a normal
+    // symlink to a regular file still analyzes (pinning follows it,
+    // then the same-FD checks run), and a regular-file replacement of
+    // an intermediate still refuses promptly in-process.
+    #[test]
+    fn elf_needed_reopen_symlink_and_regular_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = write_elf(
+            dir.path(),
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let helper_real = write_elf(
+            dir.path(),
+            "helper.real",
+            &build_elf(&ElfSpec::lib(b"libhelper.so.1", &[b"libprov.so.1"])),
+        );
+        let helper_link = dir.path().join("libhelper.so.1");
+        std::os::unix::fs::symlink(&helper_real, &helper_link).unwrap();
+        let exe_real = write_elf(
+            dir.path(),
+            "exe.real",
+            &build_elf(&ElfSpec::exe(&[b"libhelper.so.1"])),
+        );
+        let exe_link = dir.path().join("exe");
+        std::os::unix::fs::symlink(&exe_real, &exe_link).unwrap();
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        state.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        state.learn_scan_path(cache_key_of(&exe_link), &exe_link);
+        state.learn_scan_path(cache_key_of(&helper_link), &helper_link);
+        state.learn_scan_path(cache_key_of(&provider), &provider);
+        let (dev, ino) = record_identity_of(&exe_link);
+        assert_eq!(
+            state.analyze_executable(dev, ino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(
+            state.analyze_executable(dev, ino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(state.analyses_run_for_test(), 1);
+        // Regular-file replacement of the intermediate refuses promptly.
+        std::fs::remove_file(&helper_real).unwrap();
+        std::fs::write(
+            &helper_real,
+            build_elf(&ElfSpec::lib(b"libhelper.so.1", &[b"libprov.so.1"])),
+        )
+        .unwrap();
+        assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
+        assert_eq!(state.analyses_run_for_test(), 2);
+    }
+
+    // 614b round-2 P2#2: strtab file-offset translation must use
+    // checked arithmetic and validate the full DT_STRSZ span against
+    // the containing load's file-backed range. An overflowing offset,
+    // a span past the segment end, and a wildly overlong DT_STRSZ are
+    // Malformed before any strtab read or charge — in both debug and
+    // optimized profiles. Fixture layout notes: the 64-bit builder
+    // places PT_LOAD p_offset at file 72 and the DT_STRSZ value at
+    // file 216 (dynamic array at 176, third entry); the 32-bit
+    // builder places the DT_STRSZ value at file 136 (dynamic array
+    // at 116, third entry). Pre-strtab charges are therefore 64 +
+    // 112 + 64 (64-bit) and 64 + 64 + 32 (32-bit): the header span
+    // is always 64 bytes.
+    fn patch_le64(bytes: &mut [u8], at: usize, value: u64) {
+        bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn patch_le32(bytes: &mut [u8], at: usize, value: u32) {
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Read one fixture's bytes through the bounded parser with ample
+    /// budgets. A translation panic fails the test at the production
+    /// line; the parser must return Malformed, never panic.
+    fn read_fixture(bytes: &[u8]) -> (Result<ElfNeeded, ElfReadFailure>, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_elf(dir.path(), "case", bytes);
+        let file = std::fs::File::open(&path).unwrap();
+        let mut charge = 0u64;
+        let result = read_elf_needed(&file, &mut charge, 0);
+        (result, charge)
+    }
+
+    #[test]
+    fn elf_needed_strtab_offset_overflow_is_malformed() {
+        let mut bytes = build_elf(&ElfSpec::exe(&[b"libprov.so.1"]));
+        // PT_LOAD p_offset overflows u64 once the in-range vaddr delta
+        // is added; every surrounding span stays small and valid.
+        patch_le64(&mut bytes, 72, u64::MAX - 50);
+        let (result, charge) = read_fixture(&bytes);
+        assert_eq!(result, Err(ElfReadFailure::Malformed));
+        assert_eq!(charge, 64 + 112 + 64, "refused strtab span charges nothing");
+    }
+
+    #[test]
+    fn elf_needed_strtab_span_past_load_end_is_malformed() {
+        // Overlong by 100: the span starts in-range but ends past the
+        // load's file-backed range.
+        let mut bytes = build_elf(&ElfSpec::exe(&[b"libprov.so.1"]));
+        patch_le64(&mut bytes, 216, 14 + 100);
+        let (result, charge) = read_fixture(&bytes);
+        assert_eq!(result, Err(ElfReadFailure::Malformed));
+        assert_eq!(charge, 64 + 112 + 64, "refused strtab span charges nothing");
+    }
+
+    #[test]
+    fn elf_needed_strtab_wildly_overlong_strsz_is_malformed() {
+        // 8 MiB of string table claimed inside a ~254-byte load: the
+        // span check refuses before the byte budget is even consulted.
+        let mut bytes = build_elf(&ElfSpec::exe(&[b"libprov.so.1"]));
+        patch_le64(&mut bytes, 216, 8 * 1024 * 1024);
+        let (result, charge) = read_fixture(&bytes);
+        assert_eq!(result, Err(ElfReadFailure::Malformed));
+        assert_eq!(charge, 64 + 112 + 64, "refused strtab span charges nothing");
+    }
+
+    #[test]
+    fn elf_needed_strtab_span_checked_32bit() {
+        let mut spec = ElfSpec::exe(&[b"libprov.so.1"]);
+        spec.bits32 = true;
+        spec.vaddr_bias = 0x0804_8000;
+        let mut bytes = build_elf(&spec);
+        patch_le32(&mut bytes, 136, 14 + 100);
+        let (result, charge) = read_fixture(&bytes);
+        assert_eq!(result, Err(ElfReadFailure::Malformed));
+        assert_eq!(charge, 64 + 64 + 32, "refused strtab span charges nothing");
+    }
+
+    #[test]
+    fn elf_needed_malformed_strtab_stays_unknown_uncached() {
+        let mut bytes = build_elf(&ElfSpec::exe(&[b"libprov.so.1"]));
+        patch_le64(&mut bytes, 72, u64::MAX - 50);
+        let dir = tempfile::tempdir().unwrap();
+        let exe = write_elf(dir.path(), "badstr", &bytes);
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        state.learn_scan_path(cache_key_of(&exe), &exe);
+        let (dev, ino) = record_identity_of(&exe);
+        assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
+        assert_eq!(state.verdicts_len_for_test(), 0);
+        assert_eq!(state.analyses_run_for_test(), 1);
+        assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
+        assert_eq!(state.analyses_run_for_test(), 2, "unknown is never cached");
+    }
 }

@@ -22,6 +22,7 @@
 //! inventory facts publish through the same batch boundary the Phase 2
 //! ordering test pins.
 
+use super::inventory::image_guard::ImageAcquisition;
 use super::inventory::{
     ExecProof, ImageGuard, InventoryCommit, InventoryDiscoveryConfig, InventoryOwnerLimits,
     RefreshCause, ScanReceipt,
@@ -275,6 +276,15 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// The native witness binder (Task 6 C4): every native row enters
     /// through `stage_native`.
     binder: NativeBinder,
+    /// The retained native image-acquisition handle the scoped owner
+    /// preparation (packet 6.11p2) acquires fresh caller-image
+    /// observations through, before the final membership sample.
+    /// `None` (production until the capture handoff is wired, and the
+    /// scan lane) keeps scan-pinned fallback with a named gap; tests
+    /// install a scripted acquisition whose observations decode
+    /// through the real baseline decoder.
+    #[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation reads this.
+    native_image_acquisition: Option<Box<dyn ImageAcquisition>>,
     /// Accepted semantic caller bindings (H3 Task 3): one stable custody
     /// Arc per accepted caller, owned by the coordinator semantic child.
     semantic_bindings: semantics::SemanticBindingSet,
@@ -488,6 +498,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_targets: TargetDelta::default(),
             capture: None,
             binder: NativeBinder::new(BinderLimits::default()),
+            native_image_acquisition: None,
             semantic_bindings: semantics::SemanticBindingSet::new(),
             semantic_finalizer: None,
             joint_capture,
@@ -2325,6 +2336,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg(test)]
     pub(crate) fn owner_of(&self, caller: CallerId) -> Option<ProcessViewId> {
         self.owners.get(&caller).copied()
+    }
+
+    /// Install the image-acquisition handle the scoped owner
+    /// preparation acquires fresh observations through. Twins install
+    /// a scripted acquisition; production wiring (handing over the
+    /// active capture) is future work — see the packet 2 seam note.
+    #[cfg_attr(not(test), allow(dead_code))] // Twin seam; production sets nothing yet.
+    pub(crate) fn set_native_image_acquisition(&mut self, acquisition: Box<dyn ImageAcquisition>) {
+        self.native_image_acquisition = Some(acquisition);
     }
 
     /// Owned-fixture growth path: open one native owner through the real

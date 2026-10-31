@@ -3040,24 +3040,25 @@ pub(crate) fn seal_attached_subset_native(
     owned_sides: &BTreeSet<StaticEndpoint>,
     watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
 ) -> std::result::Result<AttachedSemanticSet, crate::inventory_semantics::SemanticRefusal> {
-    let mut attached = AttachedSemanticSet {
-        domain,
-        subset,
-        generation: 0,
-        // Derived from the actually loaded pair, never a literal or a
-        // copied flag: only a session whose loaded object carries both
-        // journal roots seals linked.
-        journal_linked: journal_pair_present(&ebpf.programs().map(|(name, _)| name).collect()),
-    };
-    attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
-    // Only a successful sealing mints, from native: the generation
-    // always names a complete validated endpoint set published to the
-    // attach cell, never a refused one or a bare counter value.
+    // Native reads for the seal core: the actually loaded program inventory
+    // and the attach-cell mint. Derivation, validation and construction live
+    // in the core, shared with the host twins' scripted inventory and mint.
+    let programs: BTreeSet<&str> = ebpf.programs().map(|(name, _)| name).collect();
     let maps = instance::InstanceMaps { ebpf };
-    attached.generation = maps
-        .mint_attach_generation()
-        .map_err(|_| crate::inventory_semantics::SemanticRefusal::Attachment)?;
-    Ok(attached)
+    seal_attached_subset_from_programs(
+        subset,
+        domain,
+        policy,
+        descriptors,
+        retained,
+        owned_sides,
+        watched,
+        &programs,
+        || {
+            maps.mint_attach_generation()
+                .map_err(|_| crate::inventory_semantics::SemanticRefusal::Attachment)
+        },
+    )
 }
 
 /// Production seal core over an already-read loaded program inventory with an
@@ -3068,31 +3069,48 @@ pub(crate) fn seal_attached_subset_native(
 /// both cases; only the two native reads differ.
 #[allow(clippy::too_many_arguments)]
 fn seal_attached_subset_from_programs(
-    _subset: crate::inventory_semantics::AttestedSubset,
-    _domain: crate::attach::capture::NativeDomainId,
-    _policy: CapturePolicy,
-    _descriptors: Result<Vec<SlotSemantics>>,
-    _retained: &BTreeMap<u32, RetainedStaticTarget>,
-    _owned_sides: &BTreeSet<StaticEndpoint>,
-    _watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
-    _programs: &BTreeSet<&str>,
-    _mint: impl FnOnce() -> std::result::Result<u64, crate::inventory_semantics::SemanticRefusal>,
+    subset: crate::inventory_semantics::AttestedSubset,
+    domain: crate::attach::capture::NativeDomainId,
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+    retained: &BTreeMap<u32, RetainedStaticTarget>,
+    owned_sides: &BTreeSet<StaticEndpoint>,
+    watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+    programs: &BTreeSet<&str>,
+    mint: impl FnOnce() -> std::result::Result<u64, crate::inventory_semantics::SemanticRefusal>,
 ) -> std::result::Result<AttachedSemanticSet, crate::inventory_semantics::SemanticRefusal> {
-    Err(crate::inventory_semantics::SemanticRefusal::Attachment)
+    let mut attached = AttachedSemanticSet {
+        domain,
+        subset,
+        generation: 0,
+        // Derived from the actually loaded pair, never a literal or a
+        // copied flag: only a session whose loaded object carries both
+        // journal roots seals linked.
+        journal_linked: journal_pair_present(programs),
+    };
+    attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
+    // Only a successful sealing mints: the generation always names a
+    // complete validated endpoint set, never a refused one or a bare
+    // counter value. Production mints from the attach cell; host twins
+    // observe their scripted mint.
+    attached.generation = mint()?;
+    Ok(attached)
 }
 
 /// Retain a successful seal's derived linkage in the Session's sealed cell:
 /// only a successful attested seal retains; a refused seal keeps no linkage.
 /// `Session::start_attested` retains through this; host twins retain the same
 /// sealed fact through this.
-fn retain_sealed_linkage(_cell: &mut Option<bool>, _attached: &AttachedSemanticSet) {}
+fn retain_sealed_linkage(cell: &mut Option<bool>, attached: &AttachedSemanticSet) {
+    *cell = Some(attached.journal_linked());
+}
 
 /// Derive producers-drain linkage from the Session's retained sealed fact: a
 /// sealed attachment carries its derived linkage to the drain, while a
 /// never-sealed session drains unlinked. `Session::drain_producers` derives
 /// through this; host twins derive the same returned linkage through this.
-fn drain_linkage_from_sealed(_sealed: Option<bool>) -> bool {
-    false
+fn drain_linkage_from_sealed(sealed: Option<bool>) -> bool {
+    sealed.unwrap_or(false)
 }
 
 /// Test-only seal over fixture-built maps through the same validation:
@@ -6460,7 +6478,7 @@ impl Session {
         .map_err(|reason| anyhow!("attested semantic attachment refused: {reason}"))?;
         // Only a successful seal retains: the producers drain derives its
         // linkage from this sealed fact. A refused seal keeps no linkage.
-        session.sealed_journal_linked = Some(attached.journal_linked());
+        retain_sealed_linkage(&mut session.sealed_journal_linked, &attached);
         Ok((session, attached))
     }
 
@@ -9256,7 +9274,7 @@ impl Session {
             // Derived from the retained sealed fact, never a literal: a
             // sealed attachment carries its derived linkage to the drain,
             // while a never-sealed session drains unlinked.
-            journal_linked: self.sealed_journal_linked.unwrap_or(false),
+            journal_linked: drain_linkage_from_sealed(self.sealed_journal_linked),
         })
     }
 

@@ -338,10 +338,91 @@ fn private_roots_reach_no_void_global_callee() {
     print!("{}", String::from_utf8_lossy(&output.stdout));
 }
 
+#[test]
+fn checker_depth_metric_sees_deep_low_stack_branch() {
+    let (_, rest) = ROOT_CHECKER
+        .split_once("# == DEPTH-CONTROL-BEGIN ==\n")
+        .expect("depth control begin marker");
+    let (control, _) = rest
+        .split_once("\n# == DEPTH-CONTROL-END ==")
+        .expect("depth control end marker");
+    let output = Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["-I", "-c", control])
+        .output()
+        .expect("run synthetic depth control");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("synthetic depth control: depth=9"),
+        "synthetic depth control did not run to completion"
+    );
+}
+
 const ROOT_CHECKER: &str = r#"
 from pathlib import Path
 import struct
 import sys
+# == DEPTH-CONTROL-BEGIN ==
+def chain(key, path=()):
+    assert key not in path, 'recursive journal BPF graph'
+    paths = [chain(child, path + (key,)) for child in children(key)]
+    cost, subpath = max(paths, default=(0, ()))
+    return frame(key) + cost, (names.get(key, bodies[key][0]),) + subpath
+
+def depth(key, path=()):
+    assert key not in path, 'recursive journal BPF graph'
+    kids = children(key)
+    if not kids:
+        return 1
+    return 1 + max(depth(child, path + (key,)) for child in kids)
+
+# Synthetic control: a 9-frame low-stack branch beside a 3-frame high-stack
+# branch. chain() selects by stack cost, so its path length cannot prove the
+# frame bound; depth() must report the deep branch independently. The real
+# bodies/names/children/frame definitions below replace these fabrications.
+syn_bodies = {name: (name,) for name in (
+    'syn_root', 'syn_high1', 'syn_high2',
+    'syn_low1', 'syn_low2', 'syn_low3', 'syn_low4',
+    'syn_low5', 'syn_low6', 'syn_low7', 'syn_low8')}
+syn_calls = {
+    'syn_root': ['syn_low1', 'syn_high1'],
+    'syn_high1': ['syn_high2'], 'syn_high2': [],
+    'syn_low1': ['syn_low2'], 'syn_low2': ['syn_low3'],
+    'syn_low3': ['syn_low4'], 'syn_low4': ['syn_low5'],
+    'syn_low5': ['syn_low6'], 'syn_low6': ['syn_low7'],
+    'syn_low7': ['syn_low8'], 'syn_low8': [],
+}
+syn_frames = {name: 32 for name in syn_bodies}
+syn_frames['syn_high1'] = 160
+syn_frames['syn_high2'] = 160
+bodies, names = syn_bodies, {}
+def children(key):
+    return syn_calls[key]
+def frame(key):
+    return syn_frames[key]
+syn_cost, syn_path = chain('syn_root')
+print(f'synthetic stack selection: path={syn_path}, cost={syn_cost}')
+assert syn_path == ('syn_root', 'syn_high1', 'syn_high2'), syn_path
+assert syn_cost == 352, syn_cost
+assert len(syn_path) <= 8, syn_path
+assert depth('syn_root') == 9, 'depth must see the 9-frame low-stack branch'
+assert depth('syn_high1') == 2 and depth('syn_low8') == 1
+syn_calls['syn_high2'] = ['syn_root']
+for metric in (chain, depth):
+    try:
+        metric('syn_root')
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('recursive synthetic graph was not refused')
+print('synthetic depth control: depth=9, max-stack path len=3, cost=352')
+# == DEPTH-CONTROL-END ==
 sys.path.insert(0, str(Path('scripts').resolve()))
 from _loader import load_path
 reader = load_path(Path('scripts/check-bpf-map-defs.py'), 'journal_root_elf')
@@ -428,12 +509,6 @@ def frame(key):
             depth = max(depth, -immediate)
     return ((max(depth, 1) + 31) // 32) * 32
 
-def chain(key, path=()):
-    assert key not in path, 'recursive journal BPF graph'
-    paths = [chain(child, path + (key,)) for child in children(key)]
-    cost, subpath = max(paths, default=(0, ()))
-    return frame(key) + cost, (names.get(key, bodies[key][0]),) + subpath
-
 for name, required in {
     'p11_entry_journal': {'p11_journal_begin', 'p11_owner_start_begin', 'p11_instance_entry'},
     'p11_return_journal': {'p11_journal_returning', 'p11_owner_start_remove_reason',
@@ -447,7 +522,9 @@ for name, required in {
     cost, path = chain(root)
     assert cost <= 480, f'{name} stack chain {cost} lacks >=5% headroom: {" > ".join(path)}'
     assert len(path) <= 8, f'{name} exceeds eight call frames: {path}'
-    print(f'{name}: stack-chain={cost}/512, path={" > ".join(path)}')
+    frames = depth(root)
+    assert frames <= 8, f'{name} call depth {frames} exceeds eight frames'
+    print(f'{name}: stack-chain={cost}/512, depth={frames}/8, path={" > ".join(path)}')
 for name in ('p11_entry', 'p11_return'):
     assert not any(symbol[0] == name for symbol in bodies.values()), \
         f'private ELF retained the inapplicable duplicate ordinary root {name}'
@@ -457,7 +534,10 @@ for root in programs:
     cost, path = chain(root)
     assert cost <= 480, f'exported {bodies[root][0]} chain {cost} lacks >=5% headroom: {" > ".join(path)}'
     assert len(path) <= 8, f'exported {bodies[root][0]} exceeds eight call frames'
-print(f'all {len(programs)} exported private-ELF program chains <=480/512 and <=8 frames')
+    frames = depth(root)
+    assert frames <= 8, f'exported {bodies[root][0]} call depth {frames} exceeds eight frames'
+    print(f'exported {bodies[root][0]}: stack-chain={cost}/512, depth={frames}/8, path={" > ".join(path)}')
+print(f'all {len(programs)} exported private-ELF program chains <=480/512 and depth <=8 frames')
 functions = [node for node in btf.types[1:] if node[0] == 12]
 assert functions
 for function in functions:

@@ -258,8 +258,10 @@ mod tests {
 
     /// The production mapping follows the frozen classifier: descriptor 0
     /// and out-of-range stay 0, and the configured census matches the
-    /// proof-pinned `[0, 19, 76, 9]`. Zero marks exactly the unconfigured
-    /// slots, never a misclassified gap.
+    /// proof-pinned `[0, 19, 79, 6]`. Zero marks exactly the unconfigured
+    /// slots, never a misclassified gap. The modeled count rose from 76
+    /// when the KEM pair (ordinals 92/93, packet 6.07c) and C_Initialize
+    /// (ordinal 0, lifecycle eras) moved from negative-only to modeled.
     #[test]
     fn journal_class_values_follow_the_frozen_classifier() {
         assert_eq!(journal_class_for_descriptor(0), 0);
@@ -271,7 +273,7 @@ mod tests {
             let class = journal_class_for_descriptor(descriptor);
             counts[class as usize] += 1;
         }
-        assert_eq!(counts, [0, 19, 76, 9]);
+        assert_eq!(counts, [0, 19, 79, 6]);
         for descriptor in 0..MAX_DESCRIPTORS {
             assert_eq!(
                 journal_class_for_descriptor(descriptor) == 0,

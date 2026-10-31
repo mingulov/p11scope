@@ -1160,7 +1160,7 @@ awk '/^READY /{n++} n>=2' "$WORK/logs-b-post.txt" >"$WORK/logs-b-post-run.txt"
 ledger_is "$WORK/logs-b-post-run.txt" "$ITERS_B" || fail_cell "restarted B ledger is not 6x$ITERS_B"
 grep -h '^LEDGER ' "$WORK/logs-b-post.txt" >>"$FACTS"
 
-printf '%s\n' "copy-up-stale-caller: after B's same-bytes copy-up, B's pre-copy-up process is attributed to the upper copy on both identity backends (known issue, disclosed). The second mapper in B is attributed to the upper copy on both backends. No named identity loss is expected on any leg." >"$WORK/dc73-note.txt"
+printf '%s\n' "copy-up-stale-caller: after B's same-bytes copy-up, B's pre-copy-up process is attributed to the upper copy on both identity backends (known issue, disclosed). The second mapper in B is attributed to the upper copy on both backends. No named identity loss is expected on any leg. The second mapper's span entries coverage is a per-capture observation that may honestly differ across backends (watched_no_use vs unknown/use_before_admission) while its mapping, count, and module keys agree." >"$WORK/dc73-note.txt"
 fact "dc73-note=$(cat "$WORK/dc73-note.txt")"
 
 say "=== oracle ==="

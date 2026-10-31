@@ -202,7 +202,7 @@ def edge_shapes_by_key(records, keys):
 
 
 def assert_backends_agree(phase, kernel_document, userspace_document,
-                          cell_pids, module_suffix=PROVIDER):
+                          cell_pids, module_suffix=PROVIDER, *, b2_pid=None):
     """One phase's legs agree on the cell's own provider modules and edges.
 
     Only edges from cell pids and the provider modules they reference
@@ -212,7 +212,8 @@ def assert_backends_agree(phase, kernel_document, userspace_document,
     and inventory runs --system, so ambient host PKCS#11 users keep
     calling across the two windows and their entries.count legitimately
     differs. A divergence on the cell itself is product news, never
-    silently accepted.
+    silently accepted, except the span phase's honest B2 coverage split
+    (see below), which `b2_pid` scopes to the second mapper.
     """
     def cell_view(document):
         keys = module_keys(document, module_suffix)
@@ -232,7 +233,28 @@ def assert_backends_agree(phase, kernel_document, userspace_document,
     divergent = sorted(pid_key
                        for pid_key in set(kernel_shapes) | set(userspace_shapes)
                        if kernel_shapes.get(pid_key) != userspace_shapes.get(pid_key))
-    assert kernel_shapes == userspace_shapes, \
+    if phase == "span" and b2_pid is not None:
+        # B2's span entries coverage is a per-capture observation: the leg
+        # that attaches the upper copy after B2's setup rows watches a
+        # clean window, while the leg that records those rows before B2's
+        # admission reports pre-admission use. Excuse exactly that split.
+        kept = []
+        for pid_key in divergent:
+            pid, _key = pid_key
+            kernel_shape = kernel_shapes.get(pid_key)
+            userspace_shape = userspace_shapes.get(pid_key)
+            split = (pid == b2_pid
+                     and kernel_shape is not None
+                     and userspace_shape is not None
+                     and kernel_shape[:3] == userspace_shape[:3]
+                     and kernel_shape[3] == userspace_shape[3] == 0
+                     and {kernel_shape[4:6], userspace_shape[4:6]}
+                     == {("watched_no_use", None),
+                         ("unknown", "use_before_admission")})
+            if not split:
+                kept.append(pid_key)
+        divergent = kept
+    assert not divergent, \
         (phase, "backends disagree on provider edges", divergent)
 
 
@@ -598,7 +620,8 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
         if phase == "fresh" and lane != "B":
             continue
         assert_backends_agree(phase, kernel_document, userspace_document,
-                              cell_pids, module_suffix)
+                              cell_pids, module_suffix,
+                              b2_pid=pid_b_span if phase == "span" else None)
 
     assert "copy-up-stale-caller" in dc73_note, \
         "run log without the copy-up-stale-caller disclosure"
@@ -893,6 +916,12 @@ def refuses_with(label, text, check):
     raise SystemExit(f"container-cells mutation accepted: {label}")
 
 
+def accepts(label, check):
+    """The check must pass (an accepts-case); a refusal fails the self-test."""
+    check()
+    print(f"container-cells mutation accepted: {label}")
+
+
 def self_test():
     healthy = copy_up(**good_copy_up("B"))
     assert healthy["lane"] == "B"
@@ -970,6 +999,39 @@ def self_test():
         modules=ST_MODULES_SPAN)
     refuses_with("fallback null without backend agreement", "disagree",
                  lambda: copy_up(**none_split))
+    # B2's span entries coverage is a per-capture observation: one leg may
+    # watch B2's edge while the other records B2's setup rows before B2's
+    # admission. That honest split passes; any other reason still refuses.
+    b2_split = good_copy_up("B")
+    for key in ("pre_kernel", "span_kernel", "fresh_kernel"):
+        b2_split[key]["observation"]["identity"]["fallback"] = None
+    b2_split_edges = [item if (item["pid"], item["module"]) != (104, "m8")
+                    else st_edge(104, "m8", evidence="maps_match",
+                                 cov="unknown", since=3000, first_seen=2000)
+                    for item in st_span_edges()]
+    b2_split["span_userspace"] = good_inventory(
+        b2_split_edges, [st_collapse()], backend="userspace", fallback=None,
+        modules=ST_MODULES_SPAN)
+    b2_split_caller = {caller["pid"]: caller["id"]
+                       for caller in b2_split["span_userspace"]["callers"]}[104]
+    for record in b2_split["span_userspace"]["edges"]:
+        if record["caller"] == b2_split_caller and record["module"] == "m8":
+            record["entries"]["coverage"]["reason"] = "use_before_admission"
+    accepts("B2 span coverage split watched vs pre-admission",
+            lambda: copy_up(**b2_split))
+    b2_loss = good_copy_up("B")
+    for key in ("pre_kernel", "span_kernel", "fresh_kernel"):
+        b2_loss[key]["observation"]["identity"]["fallback"] = None
+    b2_loss["span_userspace"] = good_inventory(
+        b2_split_edges, [st_collapse()], backend="userspace", fallback=None,
+        modules=ST_MODULES_SPAN)
+    b2_loss_caller = {caller["pid"]: caller["id"]
+                      for caller in b2_loss["span_userspace"]["callers"]}[104]
+    for record in b2_loss["span_userspace"]["edges"]:
+        if record["caller"] == b2_loss_caller and record["module"] == "m8":
+            record["entries"]["coverage"]["reason"] = "loss"
+    refuses_with("B2 span coverage split with a loss reason", "disagree",
+                 lambda: copy_up(**b2_loss))
     # Ambient host PKCS#11 users keep calling across the sequential legs,
     # so an ambient-only count split (or an ambient-only module) passes.
     ambient_split = good_copy_up("B")

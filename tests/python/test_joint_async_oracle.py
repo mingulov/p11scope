@@ -1562,6 +1562,177 @@ unsigned long C_GetFunctionList(void **out) {
 """
 
 
+class AsyncVersionDispatchTwins(unittest.TestCase):
+    """H9 version dispatch through the async script entry (packet 6.07c).
+
+    The async oracle must dispatch role AND creation vocabularies from
+    the snapshot version and independently from each row's own version,
+    refusing unknown versions before row consumption; v1 tables stay
+    frozen. Every twin below runs the actual script entry (subprocess
+    CLI), not helpers alone.
+    """
+
+    def run_cli(self, joint, single, joint_stream=None, single_stream=None):
+        """Run the script entry on a healthy poll_msg pair."""
+        rows_a = build_ledger(SCEN["owner_poll"], plan_poll_owner(2),
+                              pid=4242)
+        rows_b = build_ledger(SCEN["chal_message"],
+                              plan_message_challenger(2), pid=4343)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_a = Path(tmp) / "a.jsonl"
+            ledger_b = Path(tmp) / "b.jsonl"
+            snap_joint = Path(tmp) / "joint.json"
+            snap_single = Path(tmp) / "s1only.json"
+            write_jsonl(ledger_a, rows_a)
+            write_jsonl(ledger_b, rows_b)
+            write_json(snap_joint, joint)
+            write_json(snap_single, single)
+            argv = ["python3", "-I", str(ORACLE_PATH), str(ledger_a),
+                   str(ledger_b), str(snap_joint), str(snap_single)]
+            if joint_stream is not None:
+                events_joint = Path(tmp) / "joint.jsonl"
+                write_jsonl(events_joint, joint_stream)
+                argv.append(str(events_joint))
+            if single_stream is not None:
+                events_single = Path(tmp) / "s1only.jsonl"
+                write_jsonl(events_single, single_stream)
+                argv.append(str(events_single))
+            return subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=60)
+
+    def test_cli_v2_creation_only_kem_accepted(self):
+        require_oracle(self)
+        oracle = ORACLE
+        collision, joint, single = paired(oracle, "poll_msg")
+        joint["version"] = 2
+        joint["objects"][0]["creation"] = "encapsulate"
+        single["version"] = 2
+        joint_stream = healthy_stream(collision, joint)
+        for line in joint_stream:
+            # Mixed row versions in one stream: object rows ride v2
+            # (their creation needs it) while v1 key rows stay v1.
+            if line["kind"] == "object_observed":
+                line["event"]["version"] = 2
+            elif line["kind"] == "key_operations_observed":
+                line["event"]["version"] = 1
+            elif line["kind"] == "pass_committed":
+                line["event"]["object_version"] = 2
+        single_stream = healthy_s1only_stream(collision, single)
+        for line in single_stream:
+            # v2 rows carrying v1 content validate (superset tables).
+            if line["kind"] == "key_operations_observed":
+                line["event"]["version"] = 2
+            elif line["kind"] == "pass_committed":
+                line["event"]["object_version"] = 2
+        completed = self.run_cli(joint, single, joint_stream, single_stream)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_cli_v1_creation_only_kem_refused(self):
+        require_oracle(self)
+        oracle = ORACLE
+        collision, joint, single = paired(oracle, "poll_msg")
+        joint["objects"][0]["creation"] = "encapsulate"
+        joint_stream = healthy_stream(collision, joint)
+        single_stream = healthy_s1only_stream(collision, single)
+        completed = self.run_cli(joint, single, joint_stream, single_stream)
+        self.assertEqual(completed.returncode, 1)
+        self.assertRegex(completed.stderr, r"object creation invalid")
+
+    def test_cli_v2_role_only_kem_reaches_reconciliation(self):
+        require_oracle(self)
+        oracle = ORACLE
+        _collision, joint, single = paired(oracle, "poll_msg")
+        joint["version"] = 2
+        joint["key_operations"][0]["role"] = "encapsulation_key"
+        completed = self.run_cli(joint, single)
+        # The v2 role passes validation, so the entry reaches joint
+        # reconciliation, which correctly refuses the unclaimed row
+        # (async collisions only join operation/key rows).
+        self.assertEqual(completed.returncode, 1)
+        self.assertRegex(completed.stderr, r"missing key row for owner")
+        self.assertNotRegex(completed.stderr,
+                            r"role invalid|version mismatch")
+
+    def test_cli_v1_role_only_kem_refused(self):
+        require_oracle(self)
+        oracle = ORACLE
+        _collision, joint, single = paired(oracle, "poll_msg")
+        joint["key_operations"][0]["role"] = "encapsulation_key"
+        completed = self.run_cli(joint, single)
+        self.assertEqual(completed.returncode, 1)
+        self.assertRegex(completed.stderr, r"key row role invalid")
+
+    def test_cli_unknown_snapshot_version_refused_before_rows(self):
+        require_oracle(self)
+        oracle = ORACLE
+        for version in (0, 3, 99, True, "2"):
+            with self.subTest(version=version):
+                _collision, joint, single = paired(oracle, "poll_msg")
+                joint["version"] = version
+                # A poisoned row must never surface: the version
+                # refusal precedes row consumption.
+                joint["key_operations"][0]["role"] = "bogus"
+                completed = self.run_cli(joint, single)
+                self.assertEqual(completed.returncode, 1)
+                self.assertRegex(completed.stderr,
+                                 r"snapshot version mismatch")
+                self.assertNotRegex(completed.stderr, r"role invalid")
+
+    def test_cli_unknown_row_version_refused(self):
+        require_oracle(self)
+        oracle = ORACLE
+        for version in (99, True):
+            with self.subTest(version=version):
+                collision, joint, single = paired(oracle, "poll_msg")
+                joint_stream = healthy_stream(collision, joint)
+                joint_stream[0]["event"]["version"] = version
+                single_stream = healthy_s1only_stream(collision, single)
+                completed = self.run_cli(joint, single, joint_stream,
+                                         single_stream)
+                self.assertEqual(completed.returncode, 1)
+                self.assertRegex(completed.stderr,
+                                 r"unsupported H9 row version")
+
+    def test_cli_unknown_marker_version_refused(self):
+        require_oracle(self)
+        oracle = ORACLE
+        for version in (99, True):
+            with self.subTest(version=version):
+                collision, joint, single = paired(oracle, "poll_msg")
+                joint_stream = healthy_stream(collision, joint)
+                marker = next(line for line in joint_stream
+                              if line["kind"] == "pass_committed")
+                marker["event"]["object_version"] = version
+                single_stream = healthy_s1only_stream(collision, single)
+                completed = self.run_cli(joint, single, joint_stream,
+                                         single_stream)
+                self.assertEqual(completed.returncode, 1)
+                self.assertRegex(completed.stderr,
+                                 r"unsupported H9 marker version")
+
+    def test_cli_stream_row_version_governs_independently(self):
+        require_oracle(self)
+        oracle = ORACLE
+        collision, joint, single = paired(oracle, "poll_msg")
+        joint["version"] = 2
+        joint["objects"][0]["creation"] = "encapsulate"
+        single["version"] = 2
+        joint_stream = healthy_stream(collision, joint)
+        for line in joint_stream:
+            if line["kind"] == "object_observed":
+                # A v2 snapshot never licenses v2 content on a v1 row:
+                # each row's own version governs.
+                line["event"]["version"] = 1
+            elif line["kind"] == "key_operations_observed":
+                line["event"]["version"] = 2
+            elif line["kind"] == "pass_committed":
+                line["event"]["object_version"] = 2
+        single_stream = healthy_s1only_stream(collision, single)
+        completed = self.run_cli(joint, single, joint_stream, single_stream)
+        self.assertEqual(completed.returncode, 1)
+        self.assertRegex(completed.stderr, r"object creation invalid")
+
+
 class CollisionEmissionTests(unittest.TestCase):
     def build_provider(self, tmp, m32=False):
         if not shutil.which("gcc"):

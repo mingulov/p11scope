@@ -4681,6 +4681,7 @@ mod tests {
                 requested: [None, None],
                 derive_protocol: DeriveResultProtocol::Unavailable,
                 entry_mechanism: MechClass::Value,
+                entry_output: OutputEvidence::NotCaptured,
                 scope: SlotScope::Unknown,
                 completion: Some(Completion {
                     cut: 11,

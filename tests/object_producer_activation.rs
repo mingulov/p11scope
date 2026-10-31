@@ -3135,11 +3135,18 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// threading through the entry/return roots, outlined capture with an
 /// explicit completion token, and the reason-aware removal wrapper:
 /// 131833 B, sha256 below, measured with the unchanged executable lexer.
-/// Re-baselined for packet 6.07c: the T0 KEM entry wrapper
-/// (`object_entry_kem` plus the two generic-path KEM skips and the
-/// KEM imports) is the only main.rs delta atop the combined-tree
-/// baseline: 133820 B, sha256 below, measured with the unchanged
-/// executable lexer.
+/// Re-baselined for packet 6.07c on its branch: the T0 KEM entry
+/// wrapper (`object_entry_kem` plus the two generic-path KEM skips,
+/// the entry-root KEM call and the KEM imports): 133820 B, sha256
+/// below, measured with the unchanged executable lexer. (That value
+/// was branch-measured, not combined-tree measured.)
+/// Re-baselined on the combined tree at pick I-13 (controller
+/// ruling): the pin was already stale pre-pick (actual 137641 B vs
+/// pinned 132203 B — intervening main.rs changes never re-pinned),
+/// and the pick adds exactly the KEM delta above (+1617 stripped B,
+/// matching the branch-measured KEM step; stripped diff shows only
+/// KEM content): 139258 B, sha256 below, measured with the unchanged
+/// executable lexer and reproduced byte-exact by standalone lexing.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3149,8 +3156,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            133820,
-            "8d2510b9e22721477fb7e6e0c3f668ed03fe25cb92035013d829012bd40e0c73"
+            139258,
+            "d75401418981ac221b9585c3980d2384785613c50c4f319f9dbd89ab94ceccbc"
         ),
         "stripped BPF dump must stay byte-identical"
     );

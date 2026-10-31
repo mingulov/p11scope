@@ -535,10 +535,9 @@ use p11scope_ebpf_common::object_journal::{
     JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, decode_journal_record,
 };
 use p11scope_ebpf_common::object_wire::{
-    OBJECT_ACTION_ACCESS, OBJECT_ACTION_COPY, OBJECT_ACTION_CREATE,
-    OBJECT_ACTION_DECAPSULATE, OBJECT_ACTION_DESTROY, OBJECT_ACTION_ENCAPSULATE,
-    OBJECT_ACTION_FIND, ObjectDescriptorWire, publish_object_descriptors,
-    verify_object_descriptors,
+    OBJECT_ACTION_ACCESS, OBJECT_ACTION_COPY, OBJECT_ACTION_CREATE, OBJECT_ACTION_DECAPSULATE,
+    OBJECT_ACTION_DESTROY, OBJECT_ACTION_ENCAPSULATE, OBJECT_ACTION_FIND, ObjectDescriptorWire,
+    publish_object_descriptors, verify_object_descriptors,
 };
 use p11scope_ebpf_common::{Event, ImageIdentity, InstanceStamp, MAX_DESCRIPTORS};
 

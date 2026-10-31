@@ -91,6 +91,21 @@ pub(crate) enum SelectedDetailRefusal {
     WindowActive,
 }
 
+impl SelectedDetailRefusal {
+    /// Stable static words for the driver packet's window ledger
+    /// (ASCII, no escapes). The gate's own words pass through
+    /// unchanged; adapter pre-checks add their own.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Gate(gate) => refusal_name(*gate),
+            Self::EndpointUnresolved => "endpoint_unresolved",
+            Self::ChildForeignSlot => "child_foreign_slot",
+            Self::BroadPlanTopology => "broad_plan_topology",
+            Self::WindowActive => "window_active",
+        }
+    }
+}
+
 /// Why a collecting reserve refused, with the accepted bracket when
 /// the refusal came after the collector advanced. Pre-acceptance
 /// refusals carry `None` (no receipt was minted); a gate or custody
@@ -856,7 +871,6 @@ impl BroadSession for BanksBroad<'_> {
 /// `None`. STAGED (6.15): the driver packet calls this with its live
 /// read; unit coverage runs this same body with staged banks.
 #[allow(clippy::too_many_arguments)] // One driver orchestration over all retained inputs; the bundle keeps preparation inputs together.
-#[allow(dead_code)] // STAGED (6.15): the driver packet calls this; unit coverage runs this same body with BanksBroad.
 #[allow(clippy::result_large_err)] // Cold refuse path: the failure returns the accepted receipt for aggregate rendering.
 pub(super) fn reserve_detail_window<B: BroadSession>(
     broad: &B,
@@ -1425,7 +1439,6 @@ fn map_after_acceptance(
 /// this same body with staged banks.
 #[allow(clippy::too_many_arguments)]
 // One driver orchestration over all retained inputs; the bracket collector and seq travel together.
-#[allow(dead_code)] // STAGED (6.15): the driver packet calls this; unit coverage runs this same body with BanksBroad.
 #[allow(clippy::result_large_err)] // Cold refuse path: the failure returns the accepted after receipt for aggregate rendering.
 pub(super) fn close_detail_window<B: BroadSession>(
     window: CounterDetailWindow,

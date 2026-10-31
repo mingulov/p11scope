@@ -5859,6 +5859,7 @@ mod tests {
                 policy,
                 duration,
                 &out_path,
+                None,
             )
             .expect("profile loop completes"),
         );

@@ -43,6 +43,18 @@ An unavailable initial read cannot produce zero measurements, and a terminal
 report requires a new successful collection and projection. This metadata
 does not select a backend or add capture fields.
 
+When a metrics+counter capture carries an endpoint selection (`--select-endpoint`),
+the terminal evidence also contains an optional additive `selected_detail`
+envelope. Captures without the flag omit it. Its keys are `selection` (the
+requested endpoint plus its resolved slot, or the named refusal when the
+resolve attempt failed), `events` (window and driver rows in tick order),
+and the close products `lineage`, `aggregate`, and `detail`, which are
+absent until a window closes and detail deltas record. The envelope never
+merges into `counter_summary` — aggregate and detail ledgers stay
+independent, so promotion and demotion cannot double-count. If any
+resolve or promote step cannot complete, the envelope names the refusal
+and the aggregate alone carries the capture.
+
 Under the default `allowlisted` policy, every emitted mechanism has
 `params: null` with `params_omitted: "policy"` beside it, and
 `templates.operations` is always empty. Every `params: null` carries a

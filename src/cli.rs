@@ -3609,10 +3609,7 @@ mod tests {
             assert_eq!(profile.kind, Kind::Profile);
             assert!(profile.metrics);
             assert!(profile.counter_mode.is_some());
-            assert_eq!(
-                profile.select_endpoint.as_ref().map(|name| name.as_str()),
-                Some("C_Sign")
-            );
+            assert_eq!(profile.select_endpoint.as_deref(), Some("C_Sign"));
         }
         // The child owns everything after `--`: its flags and bytes are
         // never consumed as an endpoint selection.
@@ -3656,10 +3653,7 @@ mod tests {
         };
         assert_eq!(run.kind, Kind::Profile);
         assert!(run.metrics);
-        assert_eq!(
-            run.select_endpoint.as_ref().map(|name| name.as_str()),
-            Some("C_Encrypt")
-        );
+        assert_eq!(run.select_endpoint.as_deref(), Some("C_Encrypt"));
         // Omission keeps the legacy path: no selection rides along.
         let Command::Profile(legacy) = parse(args(&[
             "profile",

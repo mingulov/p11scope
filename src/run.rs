@@ -2427,6 +2427,7 @@ fn capture_with_host(
         a.ring_bytes,
         uretprobe_override,
         resource_start,
+        a.select_endpoint.as_deref(),
     )?;
     // A non-child's exit and explicit risk acceptance are observable facts.
     // Neither establishes its seccomp state, an affected kernel, or causation.
@@ -2628,6 +2629,7 @@ fn run_loop(
     ring_bytes: Option<u32>,
     uretprobe_override: Option<render::UretprobeOverride>,
     resource_start: crate::timing::ResourceSample,
+    select_endpoint: Option<&str>,
 ) -> Result<render::Evidence> {
     report_attach_failures(session);
     // Authoritative attach stamp (T2, G-14): the session is fully attached
@@ -2659,6 +2661,7 @@ fn run_loop(
                 uretprobe_override,
                 resource_start,
                 counter_inputs,
+                select_endpoint,
             )
         }
         Kind::Trace => {
@@ -2701,6 +2704,7 @@ pub(crate) fn run_profile_loop_for_test(
     policy: CapturePolicy,
     duration: Duration,
     out_path: &std::path::Path,
+    select_endpoint: Option<&str>,
 ) -> Result<render::Evidence> {
     let stop = SignalState::new();
     let out = OutputSink::open(Kind::Profile, Some(out_path))?;
@@ -2720,6 +2724,7 @@ pub(crate) fn run_profile_loop_for_test(
         None,
         None,
         resource_start,
+        select_endpoint,
     )
 }
 
@@ -3577,6 +3582,7 @@ fn run_owned_inner_with_host(
         args.ring_bytes,
         uretprobe_override,
         resource_start,
+        args.select_endpoint.as_deref(),
     )
     .map_err(|error| {
         combine_handoff_failure(error, abort_pending_handoff(&mut owned.pending_handoff))
@@ -4995,10 +5001,24 @@ fn capture_profile(
     uretprobe_override: Option<render::UretprobeOverride>,
     resource_start: crate::timing::ResourceSample,
     counter_inputs: Option<metrics::CounterCaptureInputs>,
+    select_endpoint: Option<&str>,
 ) -> Result<render::Evidence> {
     // Opened by the caller before the attach; published by `commit()` only
     // once the final report is written.
     let has_output = output.is_some();
+    // 6.15: resolve the CLI endpoint selection once, against the live
+    // broad plan, before the loop. The attempt — resolved slot or named
+    // refusal — records into the additive ledger the report composes;
+    // aggregate capture is untouched on every path.
+    let mut selection_ledger = metrics::selected_detail_driver::SelectionLedger::new();
+    if let Some(name) = select_endpoint {
+        metrics::selected_detail_driver::run_metrics_selection_stage(
+            name,
+            engine.plan(),
+            scope,
+            &mut selection_ledger,
+        );
+    }
     let cancellation = CaptureCancellation::default();
     let live_display = LiveDisplay::for_stdout();
     let mut stdout_sink = crate::sink::stdout_sink()?;
@@ -5587,6 +5607,7 @@ fn capture_profile(
                         // stopped, never as a clean scope end.
                         CaptureEnd::Error,
                         watch_stop_ns,
+                        select_endpoint.map(|_| &selection_ledger),
                     )
                     .map(|_| ())
                 },
@@ -5751,6 +5772,7 @@ fn capture_profile(
                         &poll_terminal_cancellation,
                         end,
                         watch_stop_ns,
+                        select_endpoint.map(|_| &selection_ledger),
                     )
                 },
             )
@@ -5781,6 +5803,7 @@ fn capture_profile(
         poll_terminal_cancellation: &impl Fn(),
         end: CaptureEnd,
         stop_ns: Option<u64>,
+        selected_detail: Option<&metrics::selected_detail_driver::SelectionLedger>,
     ) -> Result<render::Evidence> {
         poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
@@ -5929,6 +5952,10 @@ fn capture_profile(
                 render::json(reports, &ev, &capture)
             };
             let j = render::with_counter_snapshot(j, &snapshot);
+            let j = match selected_detail {
+                Some(ledger) => metrics::selected_detail_driver::with_selected_detail(j, ledger),
+                None => j,
+            };
             poll_terminal_cancellation();
             write_json_report(out_file.file(), &j)?;
             poll_terminal_cancellation();
@@ -13098,6 +13125,53 @@ mod tests {
         assert!(
             !call.contains("None"),
             "no None literal in the inputs position"
+        );
+    }
+
+    #[test]
+    fn run_loop_forwards_endpoint_selection_to_capture_profile() {
+        // 6.15: the CLI selection rides run_loop into capture_profile
+        // as the operator's variable (never a None literal), where the
+        // metrics selection stage resolves it and the composer adds
+        // the additive ledger. The stage/composer behavior is proven
+        // by the driver twins; this pins the wiring in source.
+        let source = include_str!("run.rs");
+        let profile_arm = source
+            .split_once("fn run_loop(")
+            .expect("run loop")
+            .1
+            .split_once("Kind::Trace =>")
+            .expect("profile arm")
+            .0;
+        let call = profile_arm
+            .split_once("capture_profile(")
+            .expect("profile call")
+            .1
+            .split_once(')')
+            .expect("call end")
+            .0;
+        assert!(
+            call.contains("select_endpoint,"),
+            "forward the operator selection, not None"
+        );
+        assert!(
+            !call.contains("None"),
+            "no None literal in the forwarded positions"
+        );
+        let profile = source
+            .split_once("fn capture_profile(")
+            .expect("profile loop")
+            .1
+            .split_once("fn write_json_report")
+            .expect("report site")
+            .0;
+        assert!(
+            profile.contains("run_metrics_selection_stage("),
+            "capture_profile must resolve the selection before the loop"
+        );
+        assert!(
+            profile.contains("with_selected_detail(j, ledger)"),
+            "capture_profile must compose the additive ledger"
         );
     }
 

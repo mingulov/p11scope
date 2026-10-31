@@ -125,6 +125,13 @@ struct {
     __type(value, u32);
 } BANK_PROGS_BIRTH SEC(".maps");
 
+#ifdef P11SCOPE_LOADER_GATE
+/* Promoted bank B: the ticket maps live in image_identity.c
+ * (production) once the gate define is on, so proof issues feed the
+ * shared watermarks the L4b producer sums. */
+extern unsigned char TASK_COOKIE_B;
+extern unsigned char COOKIE_CTL_B;
+#else
 struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
@@ -139,6 +146,7 @@ struct {
     __type(key, u32);
     __type(value, struct control);
 } COOKIE_CTL_B SEC(".maps");
+#endif
 
 struct {
     __uint(type, BANK_HASH);

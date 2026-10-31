@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* T-L2c token-keyed loader gate (see loader_gate.h). Single-owner by
  * construction: only the attach path admits a slot, only the owning
- * producer reports its end, and only the T-L3 acknowledgement (not this
- * packet) empties a retired row. Same-slot admit/retire transitions are
+ * producer reports its end, and only the native acknowledgement empties
+ * a retired row once userspace arms reuse with the T-L3 flag. Same-slot
+ * admit/retire transitions are
  * NOT atomic -- they are check-then-write sequences, so two concurrent
  * same-slot admits (or two concurrent retires) can both succeed. A
  * sequential double admission refuses, but that refusal is not a
@@ -44,6 +45,41 @@ static __always_inline long gate_refuse(struct loader_gate_control *ctl)
         return -1;
     }
     return -2;
+}
+
+/* Bounded gauge updates: 4 CAS tries keep concurrent admits and retires
+ * from losing a live row without an unbounded retry loop. The peak only
+ * ever moves up, so a lost race merely delays it. */
+#define GATE_GAUGE_TRIES 4
+
+static __always_inline void gate_retained_add(struct loader_gate_control *ctl)
+{
+    int i;
+    u64 live, seen;
+
+    gate_count(&ctl->retained);
+    live = *(volatile u64 *)&ctl->retained;
+    for (i = 0; i < GATE_GAUGE_TRIES; i++) {
+        seen = *(volatile u64 *)&ctl->retained_peak;
+        if (live <= seen)
+            break;
+        if (__sync_val_compare_and_swap(&ctl->retained_peak, seen, live) == seen)
+            break;
+    }
+}
+
+static __always_inline void gate_retained_drop(struct loader_gate_control *ctl)
+{
+    int i;
+    u64 live;
+
+    for (i = 0; i < GATE_GAUGE_TRIES; i++) {
+        live = *(volatile u64 *)&ctl->retained;
+        if (live == 0)
+            break;
+        if (__sync_val_compare_and_swap(&ctl->retained, live, live - 1) == live)
+            break;
+    }
 }
 
 /* Resolve the ARMED row for a token cookie. 0 with *row_out set on
@@ -93,6 +129,7 @@ __attribute__((noinline)) long p11_loader_gate_admit(u32 slot, u64 generation)
     row->state = LOADER_GATE_ARMED;
     row->disposition = LOADER_GATE_DISP_NONE;
     gate_count(&ctl->admitted);
+    gate_retained_add(ctl);
     return 0;
 }
 
@@ -132,6 +169,7 @@ __attribute__((noinline)) long p11_loader_gate_note_producer_end(u64 cookie, u32
     row->disposition = disposition;
     row->state = LOADER_GATE_RETIRED;
     gate_count(&ctl->retired);
+    gate_retained_drop(ctl);
     return 0;
 }
 
@@ -144,4 +182,65 @@ __attribute__((noinline)) long p11_loader_gate_cutover(void)
         return -1;
     observed = __sync_val_compare_and_swap(&ctl->cutover, 0, 1);
     return observed == 0 ? 0 : -1;
+}
+
+__attribute__((noinline)) long p11_loader_gate_ack(u64 cookie)
+{
+    struct loader_gate_control *ctl = gate_control();
+    struct loader_gate_row *row;
+    u32 slot;
+
+    if (!ctl)
+        return -1;
+    if (!cookie || cookie > LOADER_GATE_TOKEN_MAX || (cookie >> 8) == 0)
+        return gate_refuse(ctl);
+    slot = (u32)(cookie & 0xff);
+    if (slot >= LOADER_GATE_SLOTS)
+        return gate_refuse(ctl);
+    row = loader_gate_map_lookup(&LOADER_GATE, &slot);
+    if (!row)
+        return gate_refuse(ctl);
+    /* Strict first: malformed, wrong-state, wrong-generation and
+     * corrupted-disposition cookies refuse counted, so only a
+     * well-formed unarmed acknowledgement falls through to -2. */
+    if (row->state != LOADER_GATE_RETIRED || row->generation != (cookie >> 8) ||
+        row->disposition == LOADER_GATE_DISP_NONE)
+        return gate_refuse(ctl);
+    if (!row->acked)
+        return -2;
+    row->generation = 0;
+    row->state = LOADER_GATE_EMPTY;
+    row->disposition = LOADER_GATE_DISP_NONE;
+    row->acked = 0;
+    gate_count(&ctl->reclaims);
+    return 0;
+}
+
+__attribute__((noinline)) long p11_loader_gate_row_generation(u32 slot, u64 *generation_out)
+{
+    struct loader_gate_control *ctl = gate_control();
+    struct loader_gate_row *row;
+    u32 key;
+
+    if (!ctl || !generation_out)
+        return -1;
+    if (slot >= LOADER_GATE_SLOTS)
+        return -1;
+    key = slot;
+    row = loader_gate_map_lookup(&LOADER_GATE, &key);
+    if (!row)
+        return -1;
+    if (row->state != LOADER_GATE_ARMED && row->state != LOADER_GATE_RETIRED)
+        return -1;
+    *generation_out = row->generation;
+    return 0;
+}
+
+__attribute__((noinline)) long p11_loader_gate_cutover_latched(void)
+{
+    struct loader_gate_control *ctl = gate_control();
+
+    if (!ctl)
+        return -1;
+    return *(volatile u64 *)&ctl->cutover ? 1 : 0;
 }

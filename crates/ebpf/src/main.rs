@@ -145,6 +145,11 @@ use p11scope_ebpf_common::{
     EVIDENCE_TEMPLATE_TAIL_FAILURES, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, MAX_ATTRS,
     PAIR_CALLS_ENTRIES, PAIR_CALLS_SECOND_SLOT,
 };
+// Staged token hit path (activation builds only): the pending status and
+// the token shape rule. Undeclared until the build wires the gate.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+use p11scope_ebpf_common::{DISCOVERY_STATUS_LOADER_ACK_PENDING, valid_loader_token};
 
 // Package G: the BPF slot universe and the native task-owner bound are one
 // literal. Changing either without the other corrupts START ownership.
@@ -1875,6 +1880,14 @@ fn dl_debug_state_impl(ctx: ProbeContext) -> u32 {
     let raw = entry.as_mut_ptr();
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
     let cookie = loader_cookie_of(&ctx);
+    // Staged token path (activation builds only): once the gate latch
+    // flips, hits decode as tokens. Before the latch the old decode
+    // below runs unchanged, and nothing admits.
+    #[allow(unexpected_cfgs)]
+    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+    if loader_gate_latched_for_producer() {
+        return emit_loader_token_record(ctx, scope, layout, cookie);
+    }
     let state_present = cookie & LOADER_STATE_PRESENT != 0;
     if !valid_loader_cookie(cookie) {
         // SAFETY: invalid-cookie records stay zero outside these finite fields.
@@ -1926,9 +1939,116 @@ fn dl_debug_state_impl(ctx: ProbeContext) -> u32 {
             core::ptr::addr_of_mut!((*raw).case_id),
             (cookie & 0xff) as u8,
         );
+        // The full cookie word rides along for the token path; the old
+        // decode still keys on the slot byte above.
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), cookie);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).announced_count), r_state);
     }
     finish_discovery_record(entry, scope, true, pid_tgid, 0);
+    0
+}
+
+/// Staged producer latch read (activation builds only): true once the
+/// gate cutover has flipped, selecting token decode in the hit path.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+fn loader_gate_latched_for_producer() -> bool {
+    // SAFETY: the latch entry point only reads the control word.
+    unsafe { p11_loader_gate_cutover_latched() == 1 }
+}
+
+/// Staged token hit path (activation builds only): resolve the token
+/// through the gate, admitting on first hit and reusing a retired slot
+/// only after userspace arms the acknowledgement. Same-generation
+/// misses are stale hits on a retired incarnation and never re-admit;
+/// unarmed reuse waits as acknowledgement-pending instead of resolving.
+/// Straight-line with bounded re-reads: no loops for the verifier.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+fn emit_loader_token_record(
+    ctx: ProbeContext,
+    scope: ScopeAuth,
+    layout: LinuxLayout,
+    cookie: u64,
+) -> u32 {
+    // SAFETY: every gate entry point validates its arguments and fails
+    // closed; nonzero returns below never wrote a row.
+    let slot = (cookie & 0xff) as u32;
+    let generation = cookie >> 8;
+    let mut status = DISCOVERY_STATUS_LOADER_CONTEXT_INVALID;
+    let mut publish = false;
+    if valid_loader_token(cookie) {
+        if unsafe { p11_loader_gate_lookup(cookie) } >= 0 {
+            status = 0;
+            publish = true;
+        } else if unsafe { p11_loader_gate_admit(slot, generation) } == 0 {
+            status = 0;
+            publish = true;
+        } else if unsafe { p11_loader_gate_lookup(cookie) } >= 0 {
+            // Lost race: a same-incarnation hit admitted first.
+            status = 0;
+            publish = true;
+        } else {
+            let mut row_generation = 0u64;
+            let read = unsafe { p11_loader_gate_row_generation(slot, &mut row_generation) };
+            if read == 0 && row_generation != generation {
+                let retired = (row_generation << 8) | slot as u64;
+                let acked = unsafe { p11_loader_gate_ack(retired) };
+                if acked == 0 {
+                    if unsafe { p11_loader_gate_admit(slot, generation) } == 0 {
+                        status = 0;
+                        publish = true;
+                    } else if unsafe { p11_loader_gate_lookup(cookie) } >= 0 {
+                        status = 0;
+                        publish = true;
+                    }
+                } else if acked == -2 {
+                    status = DISCOVERY_STATUS_LOADER_ACK_PENDING;
+                    publish = true;
+                }
+            }
+        }
+    }
+    if !publish {
+        let Some(mut entry) = reserve_discovery() else {
+            return 0;
+        };
+        let raw = entry.as_mut_ptr();
+        // SAFETY: invalid-cookie records stay zero outside these finite fields.
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), DISCOVERY_KIND_LOADER);
+        }
+        let pid_tgid = helpers::bpf_get_current_pid_tgid();
+        finish_discovery_record(
+            entry,
+            scope,
+            false,
+            pid_tgid,
+            DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
+        );
+        return 0;
+    }
+    let hook_ip = normalize_target_word(loader_runtime_ip(&ctx), layout);
+    if hook_ip == 0 {
+        bump_discovery_counter(DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES);
+        return 0;
+    }
+    let Some(mut entry) = reserve_discovery() else {
+        return 0;
+    };
+    let raw = entry.as_mut_ptr();
+    let pid_tgid = helpers::bpf_get_current_pid_tgid();
+    // SAFETY: the shared initializer completed before every field write.
+    // Token records carry no runtime-state read: announced stays zero
+    // and the runtime signal is restored on the userspace side.
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).table_ptr), hook_ip);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), DISCOVERY_KIND_LOADER);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).case_id), slot as u8);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), cookie);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).announced_count), 0);
+    }
+    finish_discovery_record(entry, scope, true, pid_tgid, status);
     0
 }
 
@@ -3001,6 +3121,26 @@ unsafe extern "C" {
         flags: u64,
     ) -> i64;
     fn p11_owner_discovery_remove(key: *const StateKey, required: u32) -> i64;
+    /// Staged loader gate (native loader_gate.c, activation builds only):
+    /// token lookup/admit/ack plus the row-generation read that feeds
+    /// the acknowledgement capability and the latch read that selects
+    /// the producer decode. Every entry point validates and fails
+    /// closed; nonzero returns never wrote a row.
+    #[allow(unexpected_cfgs)]
+    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+    fn p11_loader_gate_lookup(cookie: u64) -> i64;
+    #[allow(unexpected_cfgs)]
+    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+    fn p11_loader_gate_admit(slot: u32, generation: u64) -> i64;
+    #[allow(unexpected_cfgs)]
+    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+    fn p11_loader_gate_ack(cookie: u64) -> i64;
+    #[allow(unexpected_cfgs)]
+    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+    fn p11_loader_gate_row_generation(slot: u32, generation_out: *mut u64) -> i64;
+    #[allow(unexpected_cfgs)]
+    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+    fn p11_loader_gate_cutover_latched() -> i64;
 }
 
 // All pairing map access is mediated by the native current-task owner. These

@@ -3,17 +3,17 @@
  * storage and drives producer-shaped admit/lookup/retire/cutover scenarios.
  * Only the map helpers are stubbed; there is no second gate algorithm. */
 #include "loader_gate.h"
-#include "loader_gate.c"
-#include <stdio.h>
-#include <string.h>
-
 /* Weak so the pre-implementation scenarios fail at the actual missing
  * acknowledgement assertion, without a link error masquerading as
- * runtime RED (same trick as the ticket fixture). */
+ * runtime RED (same trick as the ticket fixture). The declarations
+ * precede the implementation include, like the ticket fixture. */
 extern long p11_loader_gate_ack(u64 cookie) __attribute__((weak));
 extern long p11_loader_gate_row_generation(u32 slot, u64 *generation_out)
     __attribute__((weak));
 extern long p11_loader_gate_cutover_latched(void) __attribute__((weak));
+#include "loader_gate.c"
+#include <stdio.h>
+#include <string.h>
 
 unsigned char LOADER_GATE, LOADER_GATE_CTL;
 static struct loader_gate_row gate_rows[LOADER_GATE_SLOTS];

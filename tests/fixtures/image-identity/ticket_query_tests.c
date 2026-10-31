@@ -8,11 +8,8 @@ extern u32 p11_link_task_ticket(struct task_struct *task, u64 *ticket_out)
 extern u32 p11_image_identity_issued(u64 *watermark_out) __attribute__((weak));
 extern u32 p11_image_bank_select(void) __attribute__((weak));
 extern u32 p11_image_bank_cut(u64 target) __attribute__((weak));
-/* Weak map externs: NULL until the bank promotion lands. Addresses are
- * compared for stub routing only, never dereferenced here. */
-extern unsigned char TASK_COOKIE_B __attribute__((weak));
-extern unsigned char COOKIE_CTL_B __attribute__((weak));
-extern unsigned char IMAGE_BANK_SELECT __attribute__((weak));
+/* Map presence is compile-enforced now: the stub routing below
+ * references the bank maps, so an ifdefed-out bank fails the build. */
 #include "image_identity.c"
 #include <assert.h>
 #include <stddef.h>
@@ -278,9 +275,6 @@ static void bank_cut_once(void)
     u64 n;
     assert(&p11_image_bank_select && "bank promotion needs select");
     assert(&p11_image_bank_cut && "bank promotion needs cut");
-    assert(&TASK_COOKIE_B && "bank promotion needs bank-B maps");
-    assert(&COOKIE_CTL_B && "bank promotion needs bank-B control");
-    assert(&IMAGE_BANK_SELECT && "bank promotion needs the SELECT word");
     reset();
     /* The Session prepares B before A fills, as the contract requires. */
     select_stub.prepared[1] = 1;
@@ -407,7 +401,9 @@ static void bank_select_validation(void)
     assert(ticket == 0);
     assert(storage_calls == calls);
     puts("ASSERT missing_select_refuses");
-    assert(select_stub.refusals == 3);
+    /* Only the two present-word refusals count: a missing SELECT has no
+     * cell, so like the gate's missing control it refuses uncounted. */
+    assert(select_stub.refusals == 2);
     puts("ASSERT bad_select_counted");
     select_present = 1;
     assert(p11_image_bank_cut(7) == IMAGE_BANK_NO_SLOT);

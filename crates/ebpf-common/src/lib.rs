@@ -519,8 +519,11 @@ pub const DISCOVERY_STATUS_EXIT_MAP_OVERFLOW: u8 = 0x10;
 pub const DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT: u8 = 0x20;
 /// Kind 7 only: instance hooks were refused or off in this session, so
 /// an empty summary is `unknown`, never a watched-provider negative.
-/// Bit 0x80 stays free.
 pub const DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED: u8 = 0x40;
+/// Kind 3 only: the loader hit names a token whose slot is retired but
+/// userspace has not armed reuse yet. The binding word carries the
+/// token; the record waits for the acknowledgement instead of resolving.
+pub const DISCOVERY_STATUS_LOADER_ACK_PENDING: u8 = 0x80;
 
 pub const DISCOVERY_COUNTER_RING_LOSS: u32 = 0;
 pub const DISCOVERY_COUNTER_EXPORT_STATE_FAILURES: u32 = 1;
@@ -627,6 +630,23 @@ pub const fn valid_loader_cookie(cookie: u64) -> bool {
     let state_present = cookie & LOADER_STATE_PRESENT != 0;
     let payload = cookie >> LOADER_STATE_SHIFT;
     cookie != 0 && (state_present || payload == LOADER_STATE_ABSENT_SENTINEL)
+}
+
+/// Widest 40-bit loader token: 32 generation bits over 8 slot bits.
+/// Mirrors the native gate's token ceiling.
+pub const LOADER_TOKEN_MAX: u64 = 0xffffffffff;
+
+/// A token cookie names a nonzero generation in 40 bits. Old-format
+/// cookies that coincide numerically stay valid under their own rule;
+/// only the cutover latch tells the producer which reading applies.
+pub const fn valid_loader_token(cookie: u64) -> bool {
+    cookie != 0 && cookie <= LOADER_TOKEN_MAX && cookie >> 8 != 0
+}
+
+/// The kind-3 binding word: zero on records the old producer wrote, a
+/// valid old-format cookie before the latch, or the full token after.
+pub const fn valid_loader_binding(binding: u64) -> bool {
+    binding == 0 || valid_loader_cookie(binding) || valid_loader_token(binding)
 }
 
 pub const fn discovery_pause_enabled(eligible: bool, flags: u64, generation_token: u64) -> bool {
@@ -736,8 +756,11 @@ pub struct DiscoveryRecord {
     pub request_flags: u64,
     /// Full-width private selection binding id for kind4. For kind5 only,
     /// the original producer's group-leader TASK_COOKIE ticket (zero means
-    /// unavailable). Every other kind keeps this word zero. Neither value
-    /// is a public identity or proof of an exact executable image.
+    /// unavailable). For kind3, the loader cookie word: the full token
+    /// once the gate latches, a valid old-format cookie before, or zero
+    /// on records the old producer wrote. Every other kind keeps this
+    /// word zero. None of these values is a public identity or proof of
+    /// an exact executable image.
     pub binding_id: u64,
 }
 
@@ -921,7 +944,10 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
                 && record.version_major == 0
                 && record.version_minor == 0
                 && record.symbol_id == 0
-                && zero_selection_payload(record)
+                && record.return_rv == 0
+                && record.request_flags == 0
+                && valid_loader_binding(record.binding_id)
+                && record.selection_version_class == 0
                 && match record.status_flags {
                     0 | DISCOVERY_STATUS_COALESCED_NO_HELPER => {
                         record.table_ptr != 0 && record.announced_count <= 2
@@ -931,6 +957,12 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
                             && record.case_id == 0
                             && record.announced_count == 0
                             && record.send_signal_rc == 0
+                            && record.binding_id == 0
+                    }
+                    DISCOVERY_STATUS_LOADER_ACK_PENDING => {
+                        record.table_ptr != 0
+                            && record.announced_count == 0
+                            && valid_loader_token(record.binding_id)
                     }
                     _ => false,
                 }
@@ -3202,11 +3234,11 @@ mod tests {
         base.table_ptr = 0x3000;
         for binding in [
             0,
-            0x100,                 // twin: delta-0 old cookie and gen-1 token coincide
-            0x201,                 // old absent cookie, context 2
-            0x0000_0200_0000_0001, // wide token: nonzero generation, slot 1
-            0xffffffffff,          // widest token: generation 2^32 - 1, slot 255
-            0xb00,                 // old present cookie, delta 5
+            0x100,            // twin: delta-0 old cookie and gen-1 token coincide
+            0x201,            // old absent cookie, context 2
+            0x0080_0000_0000, // wide token-only: generation 2^31, slot 0
+            0xffffffffff,     // widest token: generation 2^32 - 1, slot 255
+            0xb00,            // old present cookie, delta 5
         ] {
             base.binding_id = binding;
             assert!(valid_discovery_record(&base), "binding={binding:#x}");
@@ -3217,7 +3249,7 @@ mod tests {
     fn loader_binding_rejects_garbage_and_invalid_arm_pins_zero() {
         let mut base = discovery_record(DISCOVERY_KIND_LOADER);
         base.table_ptr = 0x3000;
-        for binding in [0x1, 0xff, 0x1_0000_0000_0000] {
+        for binding in [0x1, 0xff, 0x1_0000_0000_0000, 0x0100_0000_0000] {
             base.binding_id = binding;
             assert!(!valid_discovery_record(&base), "binding={binding:#x}");
         }

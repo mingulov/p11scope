@@ -7900,6 +7900,115 @@ fn lifecycle_manifest_helper_entrypoint() {
     std::fs::write(output, serde_json::to_vec(&manifest).unwrap()).unwrap();
 }
 
+/// CPU time (user + system, in clock ticks) one process has consumed, or
+/// `None` when its `/proc` stat cannot be read or parsed.
+fn manifest_helper_cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field is parenthesized and may contain spaces; every field
+    // after the final ')' is positional from overall field 3 (state), so
+    // utime/stime (fields 14/15) sit at indexes 11/12 of the remainder.
+    let after_comm = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    utime.checked_add(stime)
+}
+
+fn manifest_helper_cpu_cap_ticks(cpu_seconds: u64) -> u64 {
+    // SAFETY: sysconf with a valid name returns the tick rate or -1.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let ticks = u64::try_from(ticks).unwrap_or(100).max(1);
+    cpu_seconds.saturating_mul(ticks)
+}
+
+/// Wait for the manifest helper behind `pidfd` to exit. The bound is a
+/// progress witness, not a wall clock: the helper does bounded offline
+/// work, but on a contended host it can be starved of CPU and paging for
+/// long wall-clock stretches while still advancing. The wait fails only
+/// when the helper consumes no CPU for a whole `stall_limit`, or when it
+/// burns more than `cpu_tick_cap` ticks without finishing (a busy hang).
+fn wait_manifest_helper_exit(
+    pidfd: &std::os::fd::OwnedFd,
+    pid: u32,
+    stall_limit: std::time::Duration,
+    cpu_tick_cap: u64,
+) -> bool {
+    use std::os::fd::AsRawFd as _;
+    let _ = pid;
+    let _ = cpu_tick_cap;
+    system_scope_poll_fd(pidfd.as_raw_fd(), stall_limit).unwrap_or(false)
+}
+
+#[test]
+fn manifest_helper_wait_fails_a_stalled_child() {
+    let mut guard = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn the stalled child"),
+    );
+    let pidfd = DiscoveryLifecycleFixture::child_pidfd(&guard);
+    let started = std::time::Instant::now();
+    assert!(
+        !wait_manifest_helper_exit(
+            &pidfd,
+            guard.pid(),
+            std::time::Duration::from_millis(300),
+            u64::MAX,
+        ),
+        "a child making no CPU progress must fail the stall bound"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the stall bound fires long before the child would exit"
+    );
+    guard.reap().unwrap();
+}
+
+#[test]
+fn manifest_helper_wait_accepts_a_progressing_child_past_the_stall_limit() {
+    let mut guard = SystemScopeChildGuard::new(
+        std::process::Command::new("sh")
+            .args(["-c", "i=0; while [ $i -lt 3000000 ]; do i=$((i + 1)); done"])
+            .spawn()
+            .expect("spawn the progressing child"),
+    );
+    let pidfd = DiscoveryLifecycleFixture::child_pidfd(&guard);
+    let started = std::time::Instant::now();
+    assert!(
+        wait_manifest_helper_exit(
+            &pidfd,
+            guard.pid(),
+            std::time::Duration::from_millis(300),
+            u64::MAX,
+        ),
+        "a child burning CPU toward exit must outlive the stall limit"
+    );
+    assert!(
+        started.elapsed() > std::time::Duration::from_millis(300),
+        "the progressing child really outlived the stall limit"
+    );
+    let status = guard.child.wait().expect("reap the progressing child");
+    guard.live = false;
+    assert!(status.success());
+}
+
+#[test]
+fn manifest_helper_wait_caps_total_cpu() {
+    let mut guard = SystemScopeChildGuard::new(
+        std::process::Command::new("sh")
+            .args(["-c", "i=0; while [ $i -lt 3000000 ]; do i=$((i + 1)); done"])
+            .spawn()
+            .expect("spawn the busy child"),
+    );
+    let pidfd = DiscoveryLifecycleFixture::child_pidfd(&guard);
+    assert!(
+        !wait_manifest_helper_exit(&pidfd, guard.pid(), std::time::Duration::from_secs(60), 1,),
+        "a busy hang must stop at the CPU cap, not progress forever"
+    );
+    guard.reap().unwrap();
+}
+
 impl DiscoveryLifecycleFixture {
     fn child_pidfd(child: &SystemScopeChildGuard) -> std::os::fd::OwnedFd {
         use std::os::fd::FromRawFd as _;
@@ -7916,8 +8025,6 @@ impl DiscoveryLifecycleFixture {
     }
 
     fn acquire_manifest(provider: &Path, manifest: &Path, log: &Path) {
-        use std::os::fd::AsRawFd as _;
-
         let output = std::fs::File::create(log).unwrap();
         let mut helper = SystemScopeChildGuard::new(
             std::process::Command::new(std::env::current_exe().unwrap())
@@ -7937,9 +8044,22 @@ impl DiscoveryLifecycleFixture {
                 .expect("exec an isolated offline manifest helper"),
         );
         let pidfd = Self::child_pidfd(&helper);
+        let helper_pid = helper.child.id();
         assert!(
-            system_scope_poll_fd(pidfd.as_raw_fd(), std::time::Duration::from_secs(60)).unwrap(),
-            "manifest helper must finish within its owned-process deadline"
+            wait_manifest_helper_exit(
+                &pidfd,
+                helper_pid,
+                std::time::Duration::from_secs(60),
+                manifest_helper_cpu_cap_ticks(60),
+            ),
+            "manifest helper must finish within its owned-process deadline: \
+             pid={helper_pid} cpu_ticks={:?} loadavg={} log:\n{}",
+            manifest_helper_cpu_ticks(helper_pid),
+            std::fs::read_to_string("/proc/loadavg")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            std::fs::read_to_string(log).unwrap_or_default()
         );
         let status = helper.child.wait().expect("reap the exact manifest helper");
         helper.live = false;

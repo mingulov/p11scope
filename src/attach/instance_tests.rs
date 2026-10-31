@@ -868,6 +868,54 @@ fn ready_exec_of(record: &Option<InstanceRecord>, what: &str) -> Result<u64> {
     }
 }
 
+/// 6.05 step 2 R52 retention/live readback wiring (unprivileged): the
+/// same helpers the nine privileged retention/live cells use to read
+/// back marker rows — wired here over fixture rows so the readback
+/// contract stays GREEN without a quiet window. No row infers no flag
+/// (word 0, never DIRTY/READY); READY flips to its exec; every other
+/// shape refuses loudly.
+#[test]
+fn r52_marker_readback_helpers_wire_retention_over_fixture_rows() -> Result<()> {
+    let row = |word: u64, generation: u64| {
+        Some(InstanceRecord {
+            journal_bootstrap: word,
+            exec_attach_gen: generation,
+            ..Default::default()
+        })
+    };
+    // No row: no flag. The empty map reads as word 0 and summarizes
+    // as absent; READY extraction refuses.
+    assert_eq!(marker_word_of(&None), 0);
+    assert_eq!(marker_summary(&None), "no row");
+    assert!(ready_exec_of(&None, "the absent row").is_err());
+    // Unpublished, DIRTY and corrupt shapes refuse with the word named.
+    for (word, generation, what) in [
+        (journal_marker::MARKER_UNPUBLISHED, 7, "unpublished"),
+        (journal_marker::MARKER_DIRTY, 7, "DIRTY"),
+        (3, 7, "low bits 11"),
+        (4, 7, "low bits 00 with high bits"),
+        (u64::MAX, 7, "all bits"),
+    ] {
+        let record = row(word, generation);
+        assert_eq!(marker_word_of(&record), word);
+        assert_eq!(
+            marker_summary(&record),
+            format!("word {word:#x} gen {generation}")
+        );
+        let refusal = ready_exec_of(&record, what).expect_err("must refuse");
+        let text = format!("{refusal:?}");
+        assert!(text.contains("must publish READY"), "{what}: {text}");
+    }
+    // READY flips to its exec and retains it across rereads.
+    for exec in [0, 1, 7, (1 << 62) - 1] {
+        let record = row(journal_marker::ready_word(exec), 7);
+        assert_eq!(marker_word_of(&record), journal_marker::ready_word(exec));
+        assert_eq!(ready_exec_of(&record, "the READY row")?, exec);
+        assert_eq!(ready_exec_of(&record, "the retained row")?, exec);
+    }
+    Ok(())
+}
+
 /// Pumps `rounds` ticks and returns whatever routed. For pins where the
 /// expected outcome is silence (an out-of-scope return emits no call).
 fn pump_rounds(harness: &mut Harness, target: &Target, rounds: u32) -> Result<Vec<Routed>> {

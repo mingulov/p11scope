@@ -1941,6 +1941,33 @@ mod tests {
     }
 
     #[test]
+    fn loader_only_doctor_result_carries_no_marker_flag() {
+        // 6.05 step 2 negative twin (loader-only doctor): the doctor's
+        // target-availability preflight reads no marker row, observes no
+        // birth and publishes no marker flag. A loader-only doctor result
+        // must never be mistaken for birth evidence: no marker word,
+        // birth observation or native birth leaf is referenced.
+        let doctor = std::fs::read_to_string("src/doctor.rs").expect("doctor source reads");
+        for linkage in [
+            "journal_bootstrap",
+            "observe_exec_birth",
+            "observe_retained_birth",
+            "BirthAdmissionBinding",
+            "MARKER_READY",
+            "MARKER_DIRTY",
+            "ready_word",
+            "p11_instance_exec_birth",
+            "p11_instance_scope_gap",
+            "JOURNAL_MARKER_CTL",
+        ] {
+            assert!(
+                !doctor.contains(linkage),
+                "loader-only doctor must not reference {linkage}"
+            );
+        }
+    }
+
+    #[test]
     fn attach_mint_is_native_monotonic_and_exact() {
         // C1: production closure mints from the mmapable attach cell
         // (the cell BPF stamps into exec records), never the interim

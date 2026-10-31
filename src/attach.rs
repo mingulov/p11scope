@@ -1648,6 +1648,17 @@ pub struct Session {
     /// `Topology`, `None` otherwise. Lets an Engine counter start say which
     /// check failed; refusal values are unchanged.
     last_counter_stage_check: Option<&'static str>,
+    /// This session prepared with the production journal object (entry/return
+    /// roots swapped for the journal pair). Retained from the successful
+    /// preparation; attach naming resolves the journal pair for journal
+    /// sessions. Nothing selects journal yet, so this stays false until the
+    /// activation packet threads a journal selection.
+    journal: bool,
+    /// Linkage of the attachment the attested start sealed: `None` until a
+    /// successful native seal retains its derived linkage. The producers
+    /// drain derives its linkage from this retained sealed fact, never from
+    /// a literal.
+    sealed_journal_linked: Option<bool>,
     /// Last: synchronous Aya links/maps/pins drop before the reservation.
     /// Every asynchronous transferred link also carries the same keepalive.
     counter_banks: Option<counter_banks::CounterBanks>,
@@ -2393,12 +2404,13 @@ fn export_programs(abi: HookAbi) -> (&'static str, &'static str) {
 
 fn static_probe_side(program: &str) -> Option<ProbeSide> {
     match program {
-        "p11_return" | "p11_counter_bank_return" => Some(ProbeSide::Return),
+        "p11_return" | "p11_counter_bank_return" | "p11_return_journal" => Some(ProbeSide::Return),
         "p11_entry"
         | "p11_entry_ia32"
         | "p11_entry_template"
         | "p11_entry_template_types"
         | "p11_entry_template_pair"
+        | "p11_entry_journal"
         | "p11_counter_bank_entry" => Some(ProbeSide::Entry),
         _ => None,
     }
@@ -2471,10 +2483,9 @@ pub(crate) struct AttachedSemanticSet {
     subset: crate::inventory_semantics::AttestedSubset,
     generation: u64,
     /// Whether a journal producer is linked for this attachment: only a
-    /// linked attachment may install key-operation (Joint) feeds. OD33/R-50:
-    /// v0.5.0 links the object-journal producer into no BPF flavor, so the
-    /// production seal marks every attachment unlinked; the test sealer
-    /// marks its attachments linked for the 0.6.0 Joint suites.
+    /// linked attachment may install key-operation (Joint) feeds. The
+    /// production seal derives this from the actually loaded journal pair;
+    /// the test sealer marks its attachments linked for the Joint suites.
     journal_linked: bool,
 }
 
@@ -2498,9 +2509,8 @@ impl AttachedSemanticSet {
     }
 
     /// Whether a journal producer is linked for this attachment. The
-    /// v0.5.0 production seal always marks false (OD33/R-50); 0.6.0
-    /// wires the sealed value through to the lane.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// attested start retains the sealed value on the Session, and the
+    /// producers drain derives its linkage from that retained fact.
     pub(crate) fn journal_linked(&self) -> bool {
         self.journal_linked
     }
@@ -2516,10 +2526,10 @@ pub(crate) struct SessionDrainProducers {
     native: crate::attach::capture::NativeDomainId,
     events: events::EventsDomain,
     /// Whether a journal producer is linked for this lane: only a
-    /// linked lane may install key-operation (Joint) feeds. OD33/R-50:
-    /// v0.5.0 links the object-journal producer into no BPF flavor, so
-    /// production producers are never linked. A capability, not
-    /// identity: [`SessionDrainProducers::same_producers`] ignores it.
+    /// linked lane may install key-operation (Joint) feeds. The producers
+    /// drain derives this from the Session's retained sealed fact. A
+    /// capability, not identity: [`SessionDrainProducers::same_producers`]
+    /// ignores it.
     journal_linked: bool,
 }
 
@@ -2677,8 +2687,8 @@ impl SessionDrainProducers {
         self.events.id()
     }
 
-    /// Whether a journal producer is linked for this lane. Production
-    /// producers are never linked in v0.5.0 (OD33/R-50).
+    /// Whether a journal producer is linked for this lane, as derived by
+    /// the producers drain from the Session's retained sealed fact.
     pub(crate) fn journal_linked(&self) -> bool {
         self.journal_linked
     }
@@ -3001,6 +3011,15 @@ where
     }
 }
 
+/// Whether a loaded program inventory carries the actually linked journal
+/// pair: BOTH journal roots present. The production seal derives its linkage
+/// from the live loaded inventory through this predicate, so a missing root
+/// (partial attach) seals unlinked; naming a missing root stays the inventory
+/// seams' job.
+fn journal_pair_present(programs: &BTreeSet<&str>) -> bool {
+    journal::PROGRAMS.iter().all(|root| programs.contains(root))
+}
+
 /// Seal one operator-attested subset into Session-owned attachment
 /// authority with a NATIVE mint: validates exactly like the test
 /// sealer, then mints the generation from the mmapable attach cell
@@ -3021,23 +3040,77 @@ pub(crate) fn seal_attached_subset_native(
     owned_sides: &BTreeSet<StaticEndpoint>,
     watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
 ) -> std::result::Result<AttachedSemanticSet, crate::inventory_semantics::SemanticRefusal> {
+    // Native reads for the seal core: the actually loaded program inventory
+    // and the attach-cell mint. Derivation, validation and construction live
+    // in the core, shared with the host twins' scripted inventory and mint.
+    let programs: BTreeSet<&str> = ebpf.programs().map(|(name, _)| name).collect();
+    let maps = instance::InstanceMaps { ebpf };
+    seal_attached_subset_from_programs(
+        subset,
+        domain,
+        policy,
+        descriptors,
+        retained,
+        owned_sides,
+        watched,
+        &programs,
+        || {
+            maps.mint_attach_generation()
+                .map_err(|_| crate::inventory_semantics::SemanticRefusal::Attachment)
+        },
+    )
+}
+
+/// Production seal core over an already-read loaded program inventory with an
+/// injected generation mint. The native wrapper reads the inventory from the
+/// live object and mints from the attach cell; host twins substitute a
+/// scripted inventory (parsed from the real embedded bytes) and a scripted
+/// mint. Validation, linkage derivation and construction are production in
+/// both cases; only the two native reads differ.
+#[allow(clippy::too_many_arguments)]
+fn seal_attached_subset_from_programs(
+    subset: crate::inventory_semantics::AttestedSubset,
+    domain: crate::attach::capture::NativeDomainId,
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+    retained: &BTreeMap<u32, RetainedStaticTarget>,
+    owned_sides: &BTreeSet<StaticEndpoint>,
+    watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+    programs: &BTreeSet<&str>,
+    mint: impl FnOnce() -> std::result::Result<u64, crate::inventory_semantics::SemanticRefusal>,
+) -> std::result::Result<AttachedSemanticSet, crate::inventory_semantics::SemanticRefusal> {
     let mut attached = AttachedSemanticSet {
         domain,
         subset,
         generation: 0,
-        // OD33/R-50: v0.5.0 links the object-journal producer into no
-        // BPF flavor, so no production attachment is journal-linked.
-        journal_linked: false,
+        // Derived from the actually loaded pair, never a literal or a
+        // copied flag: only a session whose loaded object carries both
+        // journal roots seals linked.
+        journal_linked: journal_pair_present(programs),
     };
     attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
-    // Only a successful sealing mints, from native: the generation
-    // always names a complete validated endpoint set published to the
-    // attach cell, never a refused one or a bare counter value.
-    let maps = instance::InstanceMaps { ebpf };
-    attached.generation = maps
-        .mint_attach_generation()
-        .map_err(|_| crate::inventory_semantics::SemanticRefusal::Attachment)?;
+    // Only a successful sealing mints: the generation always names a
+    // complete validated endpoint set, never a refused one or a bare
+    // counter value. Production mints from the attach cell; host twins
+    // observe their scripted mint.
+    attached.generation = mint()?;
     Ok(attached)
+}
+
+/// Retain a successful seal's derived linkage in the Session's sealed cell:
+/// only a successful attested seal retains; a refused seal keeps no linkage.
+/// `Session::start_attested` retains through this; host twins retain the same
+/// sealed fact through this.
+fn retain_sealed_linkage(cell: &mut Option<bool>, attached: &AttachedSemanticSet) {
+    *cell = Some(attached.journal_linked());
+}
+
+/// Derive producers-drain linkage from the Session's retained sealed fact: a
+/// sealed attachment carries its derived linkage to the drain, while a
+/// never-sealed session drains unlinked. `Session::drain_producers` derives
+/// through this; host twins derive the same returned linkage through this.
+fn drain_linkage_from_sealed(sealed: Option<bool>) -> bool {
+    sealed.unwrap_or(false)
 }
 
 /// Test-only seal over fixture-built maps through the same validation:
@@ -3361,6 +3434,9 @@ fn prune_linkless_retained(
     retained.retain(|slot, _| links_cover_slot(links, *slot));
 }
 
+/// Ordinary Detailed grouping for host tests: production regroups through
+/// [`group_static_slots_with_roots`] with the session's journal selection.
+#[cfg(test)]
 fn group_static_slots(
     slots: &[Slot],
     policy: CapturePolicy,
@@ -3374,6 +3450,7 @@ fn group_static_slots(
         attach_targets,
         StaticRoots::Detailed,
         None,
+        false,
     )
     .expect("every selected Detailed target has retained pinned facts")
 }
@@ -3399,6 +3476,7 @@ fn group_static_slots_with_roots(
     attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
     roots: StaticRoots,
     expected_counter_mode: Option<CounterMode>,
+    journal: bool,
 ) -> Result<Vec<StaticGroup>> {
     if roots == StaticRoots::CounterBanks {
         if policy.counter_mode() != expected_counter_mode || object_has_unsafe {
@@ -3421,7 +3499,13 @@ fn group_static_slots_with_roots(
             }
         }
     }
-    let return_program = if roots == StaticRoots::CounterBanks {
+    // Journal sessions reuse Detailed roots with the pair swapped: the
+    // journal build carries no unsafe/ia32 entry variants, so every slot
+    // resolves the single journal entry program. A counter/journal
+    // combination is refused at preparation; journal takes precedence here.
+    let return_program = if journal {
+        "p11_return_journal"
+    } else if roots == StaticRoots::CounterBanks {
         "p11_counter_bank_return"
     } else {
         "p11_return"
@@ -3438,7 +3522,9 @@ fn group_static_slots_with_roots(
         else {
             unreachable!("static attach points are absolute with cookies");
         };
-        let program = if roots == StaticRoots::CounterBanks {
+        let program = if journal {
+            "p11_entry_journal"
+        } else if roots == StaticRoots::CounterBanks {
             "p11_counter_bank_entry"
         } else {
             entry_program(&slot.semantics, policy, object_has_unsafe, *abi)
@@ -4213,13 +4299,47 @@ fn attach_targets_observed_with(
     )
 }
 
-#[allow(clippy::too_many_arguments)] // The prepared counter mode joins the existing explicit attach seam; bundling would churn both ends for no gain.
+/// Ordinary/counter attach scheduling over injected link I/O, without a
+/// journal selection: every caller through this entry stays on ordinary
+/// roots. Production singles sessions and journal tests call
+/// [`attach_targets_observed_with_roots_journal`] with the session's
+/// journal selection instead.
+#[allow(clippy::too_many_arguments)] // Same explicit seam as the journal entry below.
 fn attach_targets_observed_with_roots(
     slots: &[Slot],
     policy: CapturePolicy,
     object_has_unsafe: bool,
     roots: StaticRoots,
     expected_counter_mode: Option<CounterMode>,
+    abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
+    attach: impl FnMut(
+        &'static str,
+        &Slot,
+        UProbeAttachPoint<'static>,
+    ) -> pid_continuity::NativeAttempt<(), anyhow::Error>,
+    completed_at: impl FnMut(&Slot) -> Option<u64>,
+) -> Result<AttachOutcome> {
+    attach_targets_observed_with_roots_journal(
+        slots,
+        policy,
+        object_has_unsafe,
+        roots,
+        expected_counter_mode,
+        false,
+        abi_for,
+        attach,
+        completed_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // The prepared counter mode joins the existing explicit attach seam; bundling would churn both ends for no gain.
+fn attach_targets_observed_with_roots_journal(
+    slots: &[Slot],
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    roots: StaticRoots,
+    expected_counter_mode: Option<CounterMode>,
+    journal: bool,
     mut abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
     mut attach: impl FnMut(
         &'static str,
@@ -4245,6 +4365,14 @@ fn attach_targets_observed_with_roots(
         "p11_counter_bank_return"
     } else {
         "p11_return"
+    };
+    // Journal sessions reuse Detailed roots with the pair swapped: the
+    // journal return overrides the pinned ordinary selection above. A
+    // counter/journal combination is refused at preparation.
+    let return_program = if journal {
+        "p11_return_journal"
+    } else {
+        return_program
     };
     let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
@@ -4309,7 +4437,9 @@ fn attach_targets_observed_with_roots(
         }
     }
 
-    let entry_programs: &[&str] = if roots == StaticRoots::CounterBanks {
+    let entry_programs: &[&str] = if journal {
+        &["p11_entry_journal"]
+    } else if roots == StaticRoots::CounterBanks {
         &["p11_counter_bank_entry"]
     } else if object_has_unsafe {
         &[
@@ -4325,7 +4455,8 @@ fn attach_targets_observed_with_roots(
     for program in entry_programs {
         for (slot, abi) in &targets {
             if !return_attached.contains(&slot.index)
-                || (roots == StaticRoots::Detailed
+                || (!journal
+                    && roots == StaticRoots::Detailed
                     && entry_program(&slot.semantics, policy, object_has_unsafe, *abi) != *program)
             {
                 continue;
@@ -6345,6 +6476,9 @@ impl Session {
             },
         )
         .map_err(|reason| anyhow!("attested semantic attachment refused: {reason}"))?;
+        // Only a successful seal retains: the producers drain derives its
+        // linkage from this sealed fact. A refused seal keeps no linkage.
+        retain_sealed_linkage(&mut session.sealed_journal_linked, &attached);
         Ok((session, attached))
     }
 
@@ -6982,6 +7116,8 @@ impl Session {
                 #[cfg(feature = "h6-reexec-diagnostic")]
                 reexec_diagnostic: None,
                 last_counter_stage_check: None,
+                journal,
+                sealed_journal_linked: None,
                 counter_banks: counter.map(|prepared| prepared.banks),
             },
             prepared_instance.expect("preparation established image program load result"),
@@ -7791,84 +7927,102 @@ impl Session {
             .as_ref()
             .map(|banks| banks.geometry_mode());
         let outcome = if self.backend == AttachBackend::Multi {
-            self.attach_targets_multi(targets, &attach_targets, roots)?
+            self.attach_targets_multi(targets, &attach_targets, roots, self.journal)?
         } else {
             let ebpf = &mut self.ebpf;
             let links = &mut self.links;
             let pairs = &mut self.pid_pairs;
-            attach_targets_observed_with_roots(
-                targets,
-                self.policy,
-                self.embedded_flavor.unsafe_present,
-                roots,
-                counter_mode,
-                |slot| {
-                    Ok(attach_targets
+            // Named once: both scheduler entries below share this link
+            // I/O; only the selected roots differ.
+            let abi_for = |slot: &Slot| {
+                Ok(attach_targets
+                    .get(&slot.index)
+                    .expect("every selected target has retained pinned facts")
+                    .1)
+            };
+            let attach = |program: &'static str, slot: &Slot, point: UProbeAttachPoint<'static>| {
+                let prepared = (|| -> Result<pid_continuity::NativeAttempt<(), anyhow::Error>> {
+                    let path = &attach_targets
                         .get(&slot.index)
                         .expect("every selected target has retained pinned facts")
-                        .1)
-                },
-                |program, slot, point| {
-                    let prepared =
-                        (|| -> Result<pid_continuity::NativeAttempt<(), anyhow::Error>> {
-                            let path = &attach_targets
-                                .get(&slot.index)
-                                .expect("every selected target has retained pinned facts")
-                                .0;
-                            let prog: &mut UProbe = ebpf
-                                .program_mut(program)
-                                .with_context(|| format!("program {program} missing from object"))?
-                                .try_into()?;
-                            #[cfg(feature = "h6-reexec-diagnostic")]
-                            let diagnostic_span = diagnostic
-                                .as_ref()
-                                .filter(|diag| diag.active())
-                                .map(|diag| {
-                                    diag.begin(
-                                        if program == "p11_return" {
-                                            DiagnosticPhase::NativeReturn
-                                        } else {
-                                            DiagnosticPhase::NativeEntry
-                                        },
-                                        [
-                                            Some(1),
-                                            Some(u64::from(
-                                                slot.names.iter().any(|name| name == "C_GetInfo"),
-                                            )),
-                                            None,
-                                            None,
-                                        ],
-                                    )
-                                });
-                            let attempt = pid_continuity::NativeAttempt::run(
-                                pid_continuity::comparable_monotonic_ns,
-                                || prog.attach([point], path, scope),
-                            );
-                            #[cfg(feature = "h6-reexec-diagnostic")]
-                            if let Some(span) = diagnostic_span {
-                                span.finish_result(&attempt.result);
-                            }
-                            let result = match attempt.result {
-                                Ok(id) => {
-                                    links.push(RegisteredLink::UProbe {
-                                        program,
-                                        slot: slot.index,
-                                        id,
-                                        registration: pairs.register(),
-                                    });
-                                    Ok(())
-                                }
-                                Err(error) => Err(static_attach_error(program, slot, error)),
-                            };
-                            Ok(pid_continuity::NativeAttempt {
-                                started_ns: attempt.started_ns,
-                                result,
-                            })
-                        })();
-                    prepared.unwrap_or_else(pid_continuity::NativeAttempt::not_attempted)
-                },
-                |_| monotonic_ns(),
-            )?
+                        .0;
+                    let prog: &mut UProbe = ebpf
+                        .program_mut(program)
+                        .with_context(|| format!("program {program} missing from object"))?
+                        .try_into()?;
+                    #[cfg(feature = "h6-reexec-diagnostic")]
+                    let diagnostic_span =
+                        diagnostic
+                            .as_ref()
+                            .filter(|diag| diag.active())
+                            .map(|diag| {
+                                diag.begin(
+                                    if program == "p11_return" || program == "p11_return_journal" {
+                                        DiagnosticPhase::NativeReturn
+                                    } else {
+                                        DiagnosticPhase::NativeEntry
+                                    },
+                                    [
+                                        Some(1),
+                                        Some(u64::from(
+                                            slot.names.iter().any(|name| name == "C_GetInfo"),
+                                        )),
+                                        None,
+                                        None,
+                                    ],
+                                )
+                            });
+                    let attempt = pid_continuity::NativeAttempt::run(
+                        pid_continuity::comparable_monotonic_ns,
+                        || prog.attach([point], path, scope),
+                    );
+                    #[cfg(feature = "h6-reexec-diagnostic")]
+                    if let Some(span) = diagnostic_span {
+                        span.finish_result(&attempt.result);
+                    }
+                    let result = match attempt.result {
+                        Ok(id) => {
+                            links.push(RegisteredLink::UProbe {
+                                program,
+                                slot: slot.index,
+                                id,
+                                registration: pairs.register(),
+                            });
+                            Ok(())
+                        }
+                        Err(error) => Err(static_attach_error(program, slot, error)),
+                    };
+                    Ok(pid_continuity::NativeAttempt {
+                        started_ns: attempt.started_ns,
+                        result,
+                    })
+                })();
+                prepared.unwrap_or_else(pid_continuity::NativeAttempt::not_attempted)
+            };
+            if self.journal {
+                attach_targets_observed_with_roots_journal(
+                    targets,
+                    self.policy,
+                    self.embedded_flavor.unsafe_present,
+                    roots,
+                    counter_mode,
+                    true,
+                    abi_for,
+                    attach,
+                    |_| monotonic_ns(),
+                )?
+            } else {
+                attach_targets_observed_with_roots(
+                    targets,
+                    self.policy,
+                    self.embedded_flavor.unsafe_present,
+                    roots,
+                    counter_mode,
+                    abi_for,
+                    attach,
+                    |_| monotonic_ns(),
+                )?
+            }
         };
         let AttachOutcome {
             successful,
@@ -7960,6 +8114,7 @@ impl Session {
         targets: &[Slot],
         attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
         roots: StaticRoots,
+        journal: bool,
     ) -> Result<AttachOutcome> {
         let counter_mode = self
             .counter_banks
@@ -7972,6 +8127,7 @@ impl Session {
             attach_targets,
             roots,
             counter_mode,
+            journal,
         )?;
         let mut programs: BTreeSet<&'static str> =
             groups.iter().map(|group| group.entry_program).collect();
@@ -8544,16 +8700,24 @@ impl Session {
             .iter()
             .map(|target| (target.slot.index, (target.path.clone(), target.abi)))
             .collect();
-        let groups = group_static_slots(
+        let groups = group_static_slots_with_roots(
             &regrouped,
             self.policy,
             self.embedded_flavor.unsafe_present,
             &targets,
-        );
+            StaticRoots::Detailed,
+            None,
+            self.journal,
+        )
+        .expect("every selected Detailed target has retained pinned facts");
         let rebuilt_groups = affected_group_count(&self.links, affected);
         let mut programs: BTreeSet<&'static str> =
             groups.iter().map(|group| group.entry_program).collect();
-        programs.insert("p11_return");
+        programs.insert(if self.journal {
+            "p11_return_journal"
+        } else {
+            "p11_return"
+        });
         let mut prog_fds = BTreeMap::new();
         for program in programs {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
@@ -9038,7 +9202,7 @@ impl Session {
             .map(|diag| {
                 let phase = match &link {
                     RegisteredLink::UProbe {
-                        program: "p11_return",
+                        program: "p11_return" | "p11_return_journal",
                         ..
                     } => DiagnosticPhase::NativeReturn,
                     RegisteredLink::UProbe { .. } => DiagnosticPhase::NativeEntry,
@@ -9107,9 +9271,10 @@ impl Session {
         Some(SessionDrainProducers {
             native: self.native_domain()?,
             events: self.events_domain(),
-            // OD33/R-50: v0.5.0 links the object-journal producer into
-            // no BPF flavor, so production producers are never linked.
-            journal_linked: false,
+            // Derived from the retained sealed fact, never a literal: a
+            // sealed attachment carries its derived linkage to the drain,
+            // while a never-sealed session drains unlinked.
+            journal_linked: drain_linkage_from_sealed(self.sealed_journal_linked),
         })
     }
 
@@ -10001,6 +10166,7 @@ mod capture_policy {
                 &std::collections::BTreeMap::new(),
                 StaticRoots::CounterBanks,
                 Some(CounterMode::Counts),
+                false,
             );
             assert!(refused.is_err(), "{policy:?} must not take bank roots");
         }
@@ -10016,6 +10182,7 @@ mod capture_policy {
                 &std::collections::BTreeMap::new(),
                 StaticRoots::CounterBanks,
                 Some(mode),
+                false,
             );
             assert!(accepted.is_ok(), "{mode:?} takes bank roots");
             for other in [
@@ -10033,6 +10200,7 @@ mod capture_policy {
                     &std::collections::BTreeMap::new(),
                     StaticRoots::CounterBanks,
                     Some(other),
+                    false,
                 );
                 assert!(
                     refused.is_err(),
@@ -10046,6 +10214,7 @@ mod capture_policy {
                 &std::collections::BTreeMap::new(),
                 StaticRoots::CounterBanks,
                 None,
+                false,
             );
             assert!(
                 unprepared.is_err(),
@@ -11093,6 +11262,97 @@ mod tests {
         // The continuation loads with its caller's attach type but is never
         // attached: it is only installed into PAIR_CALLS.
         assert_eq!(static_probe_side("p11_entry_template_second"), None);
+    }
+
+    #[test]
+    fn journal_pair_resolves_journal_probe_sides() {
+        use super::ProbeSide;
+        use super::static_probe_side;
+        // The journal pair routes like the ordinary pair it replaces: the
+        // return root owns return links, the entry root owns entry links.
+        // Until these arms exist journal attach resolves ordinary names.
+        assert_eq!(
+            static_probe_side("p11_return_journal"),
+            Some(ProbeSide::Return)
+        );
+        assert_eq!(
+            static_probe_side("p11_entry_journal"),
+            Some(ProbeSide::Entry)
+        );
+        assert_eq!(
+            super::static_endpoint("p11_return_journal", 7),
+            Some((7, ProbeSide::Return))
+        );
+        assert_eq!(
+            super::static_endpoint("p11_entry_journal", 7),
+            Some((7, ProbeSide::Entry))
+        );
+    }
+
+    #[test]
+    fn journal_pair_takes_the_multi_load_flag() {
+        use super::AttachBackend;
+        use super::loads_with_multi_flag;
+        // The journal twins load with expected_attach_type=48 under multi so
+        // one program can own the group's return/entry links, exactly like
+        // the ordinary static endpoint twins they replace.
+        for program in ["p11_entry_journal", "p11_return_journal"] {
+            assert!(
+                loads_with_multi_flag(AttachBackend::Multi, program),
+                "{program} must load with the multi flag"
+            );
+            assert!(
+                !loads_with_multi_flag(AttachBackend::Singles, program),
+                "{program} must load plain under singles"
+            );
+        }
+    }
+
+    #[test]
+    fn journal_naming_covers_rebuild_and_diagnostic_sites() {
+        // The group rebuild regroups survivors through the roots-aware
+        // grouping with the session's journal selection and resolves the
+        // journal return fd on journal sessions; the two reexec-diagnostic
+        // phase maps classify the journal return as a return. All three
+        // sites need live Sessions, so this pins them in source.
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        fn body<'a>(production: &'a str, open: &str, close: &str) -> &'a str {
+            let start = production
+                .find(open)
+                .unwrap_or_else(|| panic!("{open} present"));
+            let end = production[start..]
+                .find(close)
+                .unwrap_or_else(|| panic!("{close} follows {open}"));
+            &production[start..start + end]
+        }
+        let rebuild = body(
+            production,
+            "fn rebuild_affected_groups(",
+            "pub(crate) fn begin_owned_producer_detach(",
+        );
+        assert!(
+            rebuild.contains("self.journal"),
+            "the rebuild regroups with the session's journal selection"
+        );
+        assert!(
+            rebuild.contains("p11_return_journal"),
+            "the rebuild resolves the journal return fd on journal sessions"
+        );
+        let attach = body(
+            production,
+            "pub(crate) fn attach_targets(",
+            "fn attach_targets_multi(",
+        );
+        assert!(
+            attach.contains("p11_return_journal"),
+            "the attach diagnostic phase classifies the journal return"
+        );
+        let detach = body(production, "fn detach_link(", "pub(crate) fn diagnostic(");
+        assert!(
+            detach.contains("p11_return_journal"),
+            "the detach diagnostic phase classifies the journal return"
+        );
     }
 
     /// DR-CLASSIC-PID0: the classic backend follows functional probes:
@@ -14417,6 +14677,7 @@ mod tests {
             &targets,
             StaticRoots::CounterBanks,
             Some(CounterMode::Counts),
+            false,
         )
         .unwrap();
         assert_eq!(groups.len(), 2);
@@ -14505,6 +14766,7 @@ mod tests {
                 &target_facts,
                 StaticRoots::CounterBanks,
                 Some(CounterMode::Counts),
+                false,
             );
             assert!(refused.is_err());
         }
@@ -14548,6 +14810,7 @@ mod tests {
                 &targets,
                 StaticRoots::CounterBanks,
                 Some(mode),
+                false,
             );
             assert!(accepted.is_ok(), "{mode:?} Lp64 twin groups");
             let mut ia32 = targets.clone();
@@ -14559,6 +14822,7 @@ mod tests {
                 &ia32,
                 StaticRoots::CounterBanks,
                 Some(mode),
+                false,
             )
             .expect_err("ia32 slot must refuse grouping");
             let text = format!("{error:#}");
@@ -14584,6 +14848,7 @@ mod tests {
                 &missing,
                 StaticRoots::CounterBanks,
                 Some(mode),
+                false,
             )
             .expect_err("missing facts must refuse grouping");
             let text = format!("{error:#}");
@@ -14619,6 +14884,7 @@ mod tests {
             &ia32,
             StaticRoots::CounterBanks,
             None,
+            false,
         )
         .expect_err("fallback must refuse grouping");
         let text = format!("{error:#}");
@@ -14667,6 +14933,7 @@ mod tests {
                 &all_targets,
                 StaticRoots::CounterBanks,
                 Some(CounterMode::Counts),
+                false,
             )
             .unwrap();
             let fresh_groups: Vec<StaticGroup> = group_static_slots_with_roots(
@@ -14676,6 +14943,7 @@ mod tests {
                 &all_targets,
                 StaticRoots::CounterBanks,
                 Some(CounterMode::Counts),
+                false,
             )
             .unwrap();
             assert_eq!(old_groups.len(), 1);
@@ -16011,6 +16279,63 @@ mod tests {
     }
 
     #[test]
+    fn journal_grouping_resolves_the_journal_pair() {
+        // Journal sessions group over the swapped pair: one journal entry
+        // link plus one journal return link per (path, entry program) group.
+        // The journal build carries no unsafe/ia32 entry variants, so template
+        // semantics, an unsafe policy and an Ilp32 ABI all still resolve the
+        // single journal entry program; members, offsets and cookies are the
+        // ordinary grouping facts.
+        let template = SlotSemantics {
+            template1_arg: 1,
+            ..SlotSemantics::COUNT_ONLY
+        };
+        let slots = vec![
+            group_slot(0, 1, SlotSemantics::COUNT_ONLY),
+            group_slot(1, 1, template),
+            group_slot(2, 2, SlotSemantics::COUNT_ONLY),
+        ];
+        let targets = group_targets(&[
+            (0, "/a.so", ElfAbi::Lp64),
+            (1, "/a.so", ElfAbi::Ilp32),
+            (2, "/b.so", ElfAbi::Lp64),
+        ]);
+        for policy in [
+            CapturePolicy::Allowlisted,
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        ] {
+            let groups = group_static_slots_with_roots(
+                &slots,
+                policy,
+                false,
+                &targets,
+                StaticRoots::Detailed,
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(groups.len(), 2, "{policy:?}: one group per path");
+            for group in &groups {
+                assert_eq!(group.entry_program, "p11_entry_journal", "{policy:?}");
+                assert_eq!(group.return_program, "p11_return_journal", "{policy:?}");
+            }
+            assert_eq!(group_member_indices(&groups[0]), vec![0, 1]);
+            assert_eq!(group_member_indices(&groups[1]), vec![2]);
+            assert_eq!(groups[0].path, PathBuf::from("/a.so"));
+            assert_eq!(groups[1].path, PathBuf::from("/b.so"));
+            for member in groups.iter().flat_map(|group| &group.members) {
+                assert_eq!(
+                    member.cookie,
+                    attach_cookie(member.slot.index, member.slot.descriptor_index),
+                    "slot {}",
+                    member.slot.index
+                );
+            }
+            assert_ne!(grouped_offset(&groups, 0), grouped_offset(&groups, 1));
+        }
+    }
+
+    #[test]
     fn only_static_slot_programs_have_endpoint_identities() {
         assert_eq!(
             static_endpoint("p11_return", 7),
@@ -16201,6 +16526,62 @@ mod tests {
                 [("p11_return", 0), ("p11_return", 1), (expected_entry, 1),]
             );
         }
+    }
+
+    #[test]
+    fn journal_singles_attach_attempts_the_journal_pair() {
+        // The singles half of Session::attach_targets over a journal session:
+        // every slot attempts its journal return then its journal entry, and
+        // ordinary root names are never attempted. Journal entry selection is
+        // the single journal program (no template/ia32 variants).
+        let slots = [test_slot(0), test_slot(1)];
+        let mut attempted = Vec::new();
+        let outcome = attach_targets_observed_with_roots_journal(
+            &slots,
+            CapturePolicy::Allowlisted,
+            false,
+            StaticRoots::Detailed,
+            None,
+            true,
+            |_| Ok(ElfAbi::Lp64),
+            |program, slot, _| {
+                pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
+                    attempted.push((program, slot.index));
+                    Ok(())
+                })
+            },
+            |_| Some(10),
+        )
+        .unwrap();
+        assert_eq!(
+            attempted,
+            [
+                ("p11_return_journal", 0),
+                ("p11_return_journal", 1),
+                ("p11_entry_journal", 0),
+                ("p11_entry_journal", 1),
+            ]
+        );
+        assert!(
+            attempted
+                .iter()
+                .all(|(program, _)| ["p11_entry_journal", "p11_return_journal"].contains(program)),
+            "no ordinary root is attempted: {attempted:?}"
+        );
+        assert_eq!(
+            outcome.successful,
+            [
+                (0, ProbeSide::Return),
+                (0, ProbeSide::Entry),
+                (1, ProbeSide::Return),
+                (1, ProbeSide::Entry),
+            ]
+            .into_iter()
+            .collect(),
+            "each slot gains its journal entry/return pair"
+        );
+        assert_eq!(outcome.completed, [(0, Some(10)), (1, Some(10))]);
+        assert!(outcome.failures.is_empty() && !outcome.exhausted);
     }
 
     #[test]
@@ -19286,13 +19667,106 @@ mod tests {
         }
     }
 
-    /// OD33/R-50: v0.5.0 links the object-journal producer into no BPF
-    /// flavor, so the one production seal marks its attachment not
-    /// journal-linked. The sealed flag gates the Joint birth path (0.6.0
-    /// wires seal to lane); the live BPF seal needs privilege, so this
-    /// pins the sealed literal in the production sealer instead.
+    /// The seal-linkage predicate links only the actually loaded journal
+    /// pair: both roots present. Extra programs never unlink a present pair
+    /// (object validity is the inventory seams' job, not the predicate's),
+    /// while ordinary and empty inventories stay unlinked.
     #[test]
-    fn production_seal_is_not_journal_linked() {
+    fn journal_pair_present_links_only_the_loaded_pair() {
+        use super::journal_pair_present;
+        use std::collections::BTreeSet;
+        assert!(journal_pair_present(&BTreeSet::from([
+            "p11_entry_journal",
+            "p11_return_journal",
+        ])));
+        assert!(journal_pair_present(&BTreeSet::from([
+            "p11_entry_journal",
+            "p11_return_journal",
+            "p11_entry",
+            "task_newtask",
+        ])));
+        assert!(!journal_pair_present(&BTreeSet::from([
+            "p11_entry",
+            "p11_return",
+        ])));
+        assert!(!journal_pair_present(&BTreeSet::new()));
+    }
+
+    /// The predicate over real object inventories: the ordinary embedded
+    /// object carries no journal root, so a seal over it derives unlinked;
+    /// the production journal object carries both roots, so a seal over it
+    /// derives linked. Omitted-object builds assert the omission and skip
+    /// (the scripted twin above pins the predicate either way).
+    #[test]
+    fn seal_derivation_reads_real_object_inventories() {
+        use super::journal_pair_present;
+        use std::collections::BTreeSet;
+        let ordinary = aya_obj::Object::parse(crate::EBPF_OBJECT).expect("ordinary bytes parse");
+        let names: BTreeSet<&str> = ordinary.programs.keys().map(String::as_str).collect();
+        assert!(names.contains("p11_entry") && names.contains("p11_return"));
+        assert!(
+            !journal_pair_present(&names),
+            "no journal pair seals unlinked"
+        );
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_JOURNAL_OUTPUTS"), "");
+            return;
+        }
+        let journal =
+            aya_obj::Object::parse(super::journal::journal_object()).expect("journal bytes parse");
+        let names: BTreeSet<&str> = journal.programs.keys().map(String::as_str).collect();
+        assert!(
+            journal_pair_present(&names),
+            "the loaded journal pair seals linked"
+        );
+    }
+
+    /// Partial attach seals unlinked, either root missing: the derivation
+    /// side of the partial-attach twin. Naming the missing root stays the
+    /// inventory seams' job (covered beside this test).
+    #[test]
+    fn journal_pair_present_requires_both_roots() {
+        use super::journal_pair_present;
+        use std::collections::BTreeSet;
+        for present in ["p11_entry_journal", "p11_return_journal"] {
+            assert!(
+                !journal_pair_present(&BTreeSet::from([present])),
+                "{present} alone must not link"
+            );
+        }
+    }
+
+    /// The reason side of the partial-attach twin, entry-missing direction:
+    /// planting only the return root names the missing entry root. (The
+    /// return-missing direction is pinned by 6.06a's
+    /// `journal_flavor_refuses_pair_missing_from_inventory`; the
+    /// production-bytes twin covers both directions when built.)
+    #[test]
+    fn missing_journal_entry_root_is_named() {
+        let mut one = aya_obj::Object::parse(crate::EBPF_OBJECT).expect("ordinary bytes parse");
+        let program = one
+            .programs
+            .values()
+            .next()
+            .expect("ordinary bytes carry programs")
+            .clone();
+        one.programs
+            .insert("p11_return_journal".to_string(), program);
+        let error = super::journal::journal_flavor_from_parsed(&one).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("missing journal roots p11_entry_journal"),
+            "{text}"
+        );
+    }
+
+    /// The one production seal derives its linkage from the actually loaded
+    /// journal pair: both roots present links, anything less seals unlinked.
+    /// A literal or copied flag must not create production authority; the
+    /// live BPF seal needs privilege, so this pins the derivation call (plus
+    /// the construction counts and fences) in the production sealer instead.
+    #[test]
+    fn production_seal_derives_journal_linkage() {
         let source = include_str!("attach.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
         let start = production
@@ -19303,8 +19777,12 @@ mod tests {
             .expect("test sealer follows the production sealer");
         let body = &production[start..start + end];
         assert!(
-            body.contains("journal_linked: false"),
-            "production seal must mark the attachment not journal-linked"
+            body.contains("journal_pair_present("),
+            "production seal must derive linkage from the loaded pair"
+        );
+        assert!(
+            !body.contains("journal_linked: false"),
+            "production seal must not carry an unlinked literal"
         );
         assert!(
             !body.contains("journal_linked: true"),
@@ -19372,16 +19850,16 @@ mod tests {
         }
     }
 
-    /// OD33/R-50: the only production `SessionDrainProducers`
-    /// constructor marks its producers not journal-linked. The live
-    /// guard reads this flag (via `AttestedSemanticLane::initialize_joint`
-    /// and `prepare_joint_births`), while the sealed attachment flag has
-    /// no production reader in v0.5.0 (0.6.0 wires seal to lane), so a
-    /// flipped literal here would install Joint feeds on wedged lanes.
-    /// `Session` retains no sealed attachment, so this literal cannot
-    /// derive from the seal without a wider change; pin it instead.
+    /// The only production `SessionDrainProducers` constructor derives its
+    /// linkage from the Session's retained sealed fact: a sealed attachment
+    /// carries its derived linkage to the drain, while a never-sealed
+    /// session drains unlinked. The live guard reads this flag (via
+    /// `AttestedSemanticLane::initialize_joint` and `prepare_joint_births`),
+    /// so a literal here would install Joint feeds on wedged lanes; the live
+    /// drain needs privilege, so this pins the derivation (plus the
+    /// constructor counts and fences) in the production drain instead.
     #[test]
-    fn production_drain_producers_are_not_journal_linked() {
+    fn production_drain_derives_journal_linkage() {
         let source = include_str!("attach.rs");
         let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
         let start = production
@@ -19392,8 +19870,12 @@ mod tests {
             .expect("next drain follows the producers drain");
         let body = &production[start..start + end];
         assert!(
-            body.contains("journal_linked: false"),
-            "production producers must mark the lane not journal-linked"
+            body.contains("self.sealed_journal_linked"),
+            "production producers must derive linkage from the retained sealed fact"
+        );
+        assert!(
+            !body.contains("journal_linked: false"),
+            "production producers must not carry an unlinked literal"
         );
         assert!(
             !body.contains("journal_linked: true"),
@@ -19444,6 +19926,535 @@ mod tests {
         assert!(
             literals >= 2,
             "both test pairs still construct through Self"
+        );
+    }
+
+    use std::collections::BTreeSet;
+
+    /// Attested provider scene for the production seal-to-drain twins: a
+    /// genuinely attested two-slot subset over a pinned provider copy, with
+    /// the retained/static sides the production seal validates. The
+    /// scheduling/retention construction mirrors `seal_test_attachment`
+    /// (real attach scheduling, only link I/O scripted); the seal itself
+    /// goes through the production core, never the test sealer.
+    struct SealDrainScene {
+        _dir: tempfile::TempDir,
+        subset: crate::inventory_semantics::AttestedSubset,
+        pins: crate::discovery::identity::PinnedObjects,
+        domain: crate::attach::capture::NativeDomainId,
+        retained: BTreeMap<u32, super::RetainedStaticTarget>,
+        owned: BTreeSet<super::StaticEndpoint>,
+    }
+
+    impl SealDrainScene {
+        fn attest() -> Self {
+            use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
+            use p11scope_manifest::manifest::*;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("provider.so");
+            std::fs::copy("/bin/true", &path).unwrap();
+            let file = open_object(&path).unwrap();
+            let inspected = inspect_file(&file).unwrap();
+            let mapping = mapping_file_key(&file).unwrap();
+            let start = inspected
+                .executable_ranges
+                .iter()
+                .find(|(a, b)| b - a > 2)
+                .unwrap()
+                .0;
+            let offsets = [start, start + 1];
+            let functions =
+                match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
+                    version: cryptoki_sys::CK_VERSION {
+                        major: 2,
+                        minor: 40,
+                    },
+                }) {
+                    pkcs11_module::TableSet::Walk(spans) => spans
+                        .iter()
+                        .flat_map(|span| span.fields())
+                        .map(|field| {
+                            let resolution = match field.name {
+                                "C_SignInit" => Resolution::Resolved {
+                                    object: 0,
+                                    file_offset: offsets[0],
+                                },
+                                "C_Sign" => Resolution::Resolved {
+                                    object: 0,
+                                    file_offset: offsets[1],
+                                },
+                                _ => Resolution::NullPointer,
+                            };
+                            FunctionRecord {
+                                name: field.name.into(),
+                                resolution,
+                            }
+                        })
+                        .collect(),
+                    _ => panic!("2.40 is a full standard table"),
+                };
+            let path = path.to_str().unwrap().to_string();
+            let manifest = Manifest {
+                schema: SCHEMA.into(),
+                module_path: path.clone(),
+                objects: vec![ObjectRecord {
+                    id: 0,
+                    path: path.clone(),
+                    identity: inspected.identity.clone(),
+                }],
+                provenance_objects: vec![ProvenanceObject {
+                    path,
+                    device_major: mapping.device_major,
+                    device_minor: mapping.device_minor,
+                    inode: mapping.inode,
+                    identity: inspected.identity,
+                }],
+                interface_list: Acquisition::Absent,
+                surfaces: vec![SurfaceRecord {
+                    source: SurfaceSource::LegacyFunctionList,
+                    acquisition: Acquisition::Ok,
+                    version: Some(Version {
+                        major: 2,
+                        minor: 40,
+                    }),
+                    walk: WalkOutcome::Full,
+                    functions,
+                }],
+                vendor_interfaces: Vec::new(),
+                alias_groups: Vec::new(),
+                selection_evidence: Default::default(),
+            };
+            assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
+            let pinning =
+                crate::discovery::identity::pin_manifest_objects_deferred(&manifest).unwrap();
+            assert!(pinning.stale.is_empty());
+            let pins = pinning.pins;
+            let operator = dir.path().join("operator-input.json");
+            std::fs::write(&operator, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let engine =
+                crate::discovery::engine::inventory_coordinator::semantics::engine_for_test(
+                    Vec::new(),
+                    Vec::new(),
+                    pins.clone(),
+                );
+            let prepared =
+                crate::discovery::engine::inventory_coordinator::semantics::prepare_attested_subset(
+                    &engine,
+                    std::slice::from_ref(&operator),
+                );
+            let subset = prepared.subset.expect("nonempty validated operator subset");
+            assert_eq!(subset.plan().slots.len(), 2);
+            let domain = crate::attach::capture::NativeDomainId::mint();
+            let outcome = super::attach_targets_with(
+                subset.plan().slots.as_slice(),
+                super::CapturePolicy::Allowlisted,
+                false,
+                |slot| Ok(subset.pins().abi_for(slot.object).unwrap()),
+                |_, _, _| Ok(()),
+                |_| Some(1),
+            )
+            .unwrap();
+            let targets = subset
+                .plan()
+                .slots
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.index,
+                        (
+                            subset.pins().attach_path_for(slot.object).unwrap(),
+                            subset.pins().abi_for(slot.object).unwrap(),
+                        ),
+                    )
+                })
+                .collect();
+            let mut retained = BTreeMap::new();
+            super::retain_from_successful(
+                &mut retained,
+                &subset.plan().slots,
+                &targets,
+                &outcome.successful,
+            );
+            let owned = outcome.successful;
+            Self {
+                _dir: dir,
+                subset,
+                pins,
+                domain,
+                retained,
+                owned,
+            }
+        }
+
+        /// Seal through the production core over `programs` with a scripted
+        /// mint. Only the loaded-inventory read and the attach-cell mint are
+        /// substituted native I/O; validation, linkage derivation and
+        /// construction are production.
+        fn seal(
+            self,
+            programs: &BTreeSet<&str>,
+            mint: impl FnOnce() -> std::result::Result<u64, SemanticRefusal>,
+        ) -> std::result::Result<super::AttachedSemanticSet, SemanticRefusal> {
+            let Self {
+                subset,
+                pins,
+                domain,
+                retained,
+                owned,
+                _dir: _,
+            } = self;
+            super::seal_attached_subset_from_programs(
+                subset,
+                domain,
+                super::CapturePolicy::Allowlisted,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                &retained,
+                &owned,
+                |id| pins.retain_inventory_target(id).ok(),
+                programs,
+                mint,
+            )
+        }
+
+        /// Seal through the production core with scripted seal inputs, for
+        /// the refusal twin: the descriptors/policy refusal still reaches
+        /// production validation before any mint.
+        fn seal_with_inputs(
+            self,
+            programs: &BTreeSet<&str>,
+            policy: super::CapturePolicy,
+            descriptors: anyhow::Result<Vec<super::SlotSemantics>>,
+            mint: impl FnOnce() -> std::result::Result<u64, SemanticRefusal>,
+        ) -> std::result::Result<super::AttachedSemanticSet, SemanticRefusal> {
+            let Self {
+                subset,
+                pins,
+                domain,
+                retained,
+                owned,
+                _dir: _,
+            } = self;
+            super::seal_attached_subset_from_programs(
+                subset,
+                domain,
+                policy,
+                descriptors,
+                &retained,
+                &owned,
+                |id| pins.retain_inventory_target(id).ok(),
+                programs,
+                mint,
+            )
+        }
+    }
+
+    /// Linked seal drains linked: the production core seals linked over a
+    /// loaded inventory carrying both journal roots, retention keeps the
+    /// sealed fact, and the production drain derivation returns linked. The
+    /// sealed generation observes the scripted mint exactly once.
+    #[test]
+    fn sealed_journal_pair_drains_linked() {
+        let scene = SealDrainScene::attest();
+        let programs = BTreeSet::from([
+            "p11_entry",
+            "p11_return",
+            "p11_entry_journal",
+            "p11_return_journal",
+            "task_newtask",
+        ]);
+        let minted = std::cell::Cell::new(0u32);
+        let attached = scene
+            .seal(&programs, || {
+                minted.set(minted.get() + 1);
+                Ok(41)
+            })
+            .expect("a valid subset seals");
+        assert!(
+            attached.journal_linked(),
+            "the loaded journal pair seals linked"
+        );
+        assert_eq!(
+            attached.generation(),
+            41,
+            "the seal observes the scripted mint"
+        );
+        assert_eq!(minted.get(), 1, "one successful seal mints once");
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert_eq!(cell, Some(true), "retention keeps the sealed fact");
+        assert!(
+            super::drain_linkage_from_sealed(cell),
+            "the sealed journal pair drains linked"
+        );
+    }
+
+    /// Ordinary seal drains unlinked: the production core seals unlinked over
+    /// the real ordinary object inventory (no journal root), and the retained
+    /// fact drains unlinked.
+    #[test]
+    fn sealed_ordinary_inventory_drains_unlinked() {
+        let scene = SealDrainScene::attest();
+        let ordinary = aya_obj::Object::parse(crate::EBPF_OBJECT).expect("ordinary bytes parse");
+        let programs: BTreeSet<&str> = ordinary.programs.keys().map(String::as_str).collect();
+        let minted = std::cell::Cell::new(0u32);
+        let attached = scene
+            .seal(&programs, || {
+                minted.set(minted.get() + 1);
+                Ok(43)
+            })
+            .expect("a valid subset seals");
+        assert!(
+            !attached.journal_linked(),
+            "the ordinary inventory seals unlinked"
+        );
+        assert_eq!(
+            attached.generation(),
+            43,
+            "the seal observes the scripted mint"
+        );
+        assert_eq!(minted.get(), 1, "one successful seal mints once");
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert_eq!(cell, Some(false), "retention keeps the sealed fact");
+        assert!(
+            !super::drain_linkage_from_sealed(cell),
+            "the ordinary seal drains unlinked"
+        );
+    }
+
+    /// Partial attach seals unlinked in both directions: either journal root
+    /// alone seals unlinked through the production core, and the retained
+    /// fact drains unlinked.
+    #[test]
+    fn sealed_partial_journal_pair_drains_unlinked() {
+        for (present, generation) in [("p11_entry_journal", 47), ("p11_return_journal", 53)] {
+            let scene = SealDrainScene::attest();
+            let programs = BTreeSet::from(["p11_entry", "p11_return", present, "task_newtask"]);
+            let minted = std::cell::Cell::new(0u32);
+            let attached = scene
+                .seal(&programs, || {
+                    minted.set(minted.get() + 1);
+                    Ok(generation)
+                })
+                .expect("a valid subset seals");
+            assert!(!attached.journal_linked(), "{present} alone seals unlinked");
+            assert_eq!(
+                attached.generation(),
+                generation,
+                "the seal observes the scripted mint"
+            );
+            assert_eq!(minted.get(), 1, "one successful seal mints once");
+            let mut cell = None;
+            super::retain_sealed_linkage(&mut cell, &attached);
+            assert_eq!(cell, Some(false), "retention keeps the sealed fact");
+            assert!(
+                !super::drain_linkage_from_sealed(cell),
+                "{present} alone drains unlinked"
+            );
+        }
+    }
+
+    /// A refused seal retains no linkage and mints nothing: the descriptor
+    /// refusal and the policy refusal each fail production validation before
+    /// the mint, keep the sealed cell empty, and drain unlinked. A valid
+    /// control seals through the same core in the same test.
+    #[test]
+    fn refused_seal_retains_no_linkage() {
+        let programs = BTreeSet::from(["p11_entry", "p11_return", "task_newtask"]);
+        let control = SealDrainScene::attest()
+            .seal(&programs, || Ok(59))
+            .expect("the valid control seals");
+        assert!(!control.journal_linked(), "the control seals unlinked");
+        for (name, policy, descriptors) in [
+            (
+                "descriptors",
+                super::CapturePolicy::Allowlisted,
+                Err(anyhow::anyhow!("scripted descriptors read failure")),
+            ),
+            (
+                "policy",
+                super::CapturePolicy::AggregateOnly,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+            ),
+        ] {
+            let minted = std::cell::Cell::new(0u32);
+            let refused =
+                SealDrainScene::attest().seal_with_inputs(&programs, policy, descriptors, || {
+                    minted.set(minted.get() + 1);
+                    Ok(61)
+                });
+            assert!(refused.is_err(), "the {name} refusal must refuse the seal");
+            assert_eq!(minted.get(), 0, "a refused seal mints nothing");
+            let cell = None;
+            assert!(
+                !super::drain_linkage_from_sealed(cell),
+                "a refused seal drains unlinked"
+            );
+        }
+    }
+
+    /// Retention is load-bearing: the same linked seal drains linked once
+    /// retained, but an unretained (never-sealed) cell drains unlinked.
+    /// Omitting the retention flips a linked seal to an unlinked drain.
+    #[test]
+    fn unretained_linked_seal_drains_unlinked() {
+        let programs = BTreeSet::from(["p11_entry_journal", "p11_return_journal"]);
+        let attached = SealDrainScene::attest()
+            .seal(&programs, || Ok(67))
+            .expect("a valid subset seals");
+        assert!(
+            attached.journal_linked(),
+            "the loaded journal pair seals linked"
+        );
+        assert!(
+            !super::drain_linkage_from_sealed(None),
+            "an unretained seal drains unlinked"
+        );
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert!(
+            super::drain_linkage_from_sealed(cell),
+            "the retained seal drains linked"
+        );
+    }
+
+    /// The drain derivation follows the sealed fact exactly: linked stays
+    /// linked, unlinked stays unlinked, and a never-sealed session drains
+    /// unlinked.
+    #[test]
+    fn drain_linkage_follows_the_sealed_fact() {
+        assert!(
+            super::drain_linkage_from_sealed(Some(true)),
+            "a linked seal drains linked"
+        );
+        assert!(
+            !super::drain_linkage_from_sealed(Some(false)),
+            "an unlinked seal drains unlinked"
+        );
+        assert!(
+            !super::drain_linkage_from_sealed(None),
+            "a never-sealed session drains unlinked"
+        );
+    }
+
+    /// Linked seal over the real journal object: when the build carries the
+    /// production journal bytes, the production core seals linked over its
+    /// parsed program inventory, and the retained fact drains linked.
+    /// Omitted-object builds assert the omission and skip.
+    #[test]
+    fn sealed_real_journal_object_drains_linked() {
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_JOURNAL_OUTPUTS"), "");
+            return;
+        }
+        let scene = SealDrainScene::attest();
+        let journal =
+            aya_obj::Object::parse(super::journal::journal_object()).expect("journal bytes parse");
+        let programs: BTreeSet<&str> = journal.programs.keys().map(String::as_str).collect();
+        let attached = scene
+            .seal(&programs, || Ok(71))
+            .expect("a valid subset seals");
+        assert!(
+            attached.journal_linked(),
+            "the real journal inventory seals linked"
+        );
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert!(
+            super::drain_linkage_from_sealed(cell),
+            "the real journal seal drains linked"
+        );
+    }
+
+    /// The native production sealer delegates to the inventory core: it reads
+    /// the loaded program inventory and the attach-cell mint from native I/O
+    /// and seals through the one production core.
+    #[test]
+    fn native_seal_delegates_to_the_inventory_core() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn seal_attached_subset_native(")
+            .expect("production sealer present");
+        let end = production[start..]
+            .find("fn seal_attached_subset_from_programs(")
+            .expect("production core follows the native sealer");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("seal_attached_subset_from_programs("),
+            "the native sealer must seal through the inventory core"
+        );
+        assert!(
+            body.contains("ebpf.programs()"),
+            "the native sealer reads the loaded inventory"
+        );
+        assert!(
+            body.contains("mint_attach_generation()"),
+            "the native sealer mints from the attach cell"
+        );
+        assert!(
+            body.contains("&programs,"),
+            "the native sealer must seal the live loaded inventory"
+        );
+    }
+
+    /// The attested start retains its successful seal through the retention
+    /// seam, so the producers drain observes the sealed fact. Retention is a
+    /// single site on the sealed cell, placed after the seal's success: a
+    /// refused seal (`?`) never reaches it.
+    #[test]
+    fn attested_start_retains_through_the_seam() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn start_attested(")
+            .expect("attested start present");
+        let end = production[start..]
+            .find("fn semantic_descriptors(")
+            .expect("descriptors read follows the attested start");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("retain_sealed_linkage("),
+            "the attested start must retain through the seam"
+        );
+        assert_eq!(
+            body.matches("retain_sealed_linkage(").count(),
+            1,
+            "retention is a single site"
+        );
+        assert!(
+            body.contains("sealed_journal_linked"),
+            "the attested start retains the sealed cell"
+        );
+        let sealed = body
+            .find("seal_attached_subset_native(")
+            .expect("the attested start seals");
+        let retained = body
+            .find("retain_sealed_linkage(")
+            .expect("the attested start retains");
+        assert!(sealed < retained, "retention follows the successful seal");
+    }
+
+    /// The production producers drain derives through the linkage seam from
+    /// the Session's retained sealed fact.
+    #[test]
+    fn production_drain_uses_the_linkage_seam() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn drain_producers(")
+            .expect("production drain present");
+        let end = production[start..]
+            .find("pub fn event_drain(")
+            .expect("next drain follows the producers drain");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("drain_linkage_from_sealed("),
+            "the production drain must derive through the linkage seam"
+        );
+        assert!(
+            body.contains("journal_linked: drain_linkage_from_sealed(self.sealed_journal_linked)"),
+            "the production drain must wire the seam result into the returned linkage"
         );
     }
 

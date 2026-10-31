@@ -479,6 +479,62 @@ impl ImageGuard for ReplayImageGuard {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod scoped_commit_gate_test {
+    //! Observer for the scoped owner commit's decision points: the
+    //! transaction-outcome gate sample and the later per-member
+    //! permit/proof checks. Twins install a closure that lands an
+    //! external event (member death, operator stop) at one exact
+    //! phase, deterministically reproducing interleavings that
+    //! otherwise need a debugger. Notifications fire only where
+    //! `notify` is called under `cfg(test)`; production builds
+    //! contain neither the module nor the calls.
+
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Phase {
+        /// The pre-loop transaction outcome was just sampled.
+        GateSampled,
+        /// One staged refresh's final-sample permit was just polled.
+        RefreshPermitPolled,
+        /// One staged refresh's permit proof just validated.
+        RefreshProofValidated,
+    }
+
+    type Observer = Box<dyn FnMut(Phase)>;
+
+    thread_local! {
+        static OBSERVER: RefCell<Option<Observer>> = RefCell::new(None);
+    }
+
+    struct Restore(Option<Observer>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVER.with(|observer| *observer.borrow_mut() = self.0.take());
+        }
+    }
+
+    /// Run `action` with `observer(phase)` notified at every
+    /// scoped-commit decision point.
+    pub(crate) fn observe<T>(
+        observer: impl FnMut(Phase) + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        let _restore = Restore(OBSERVER.with(|slot| slot.replace(Some(Box::new(observer)))));
+        action()
+    }
+
+    pub(super) fn notify(phase: Phase) {
+        OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().as_mut() {
+                observer(phase);
+            }
+        });
+    }
+}
+
 /// At most four staged owner preparations per publication (mirrors the
 /// semantic-preparation bound): activation stays bounded work.
 const SCOPED_OWNER_PREPARATION_ATTEMPTS: usize = 4;
@@ -3727,6 +3783,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             );
             return;
         };
+        #[cfg(test)]
+        scoped_commit_gate_test::notify(scoped_commit_gate_test::Phase::RefreshProofValidated);
         let mut replay = ReplayImageGuard {
             original,
             observation,
@@ -7832,6 +7890,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // deterministically to a later pass with its staged state
             // released.
             let transaction_complete = collection.outcome() == ScopedCollectionOutcome::Complete;
+            #[cfg(test)]
+            scoped_commit_gate_test::notify(scoped_commit_gate_test::Phase::GateSampled);
             let mut commits_used = 0;
             for staged in staged_owners {
                 let permit = collection.permit(staged.pid);
@@ -7872,6 +7932,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             for staged in staged_refreshes {
                 let permit = collection.permit(staged.pid);
+                #[cfg(test)]
+                scoped_commit_gate_test::notify(
+                    scoped_commit_gate_test::Phase::RefreshPermitPolled,
+                );
                 match (permit, transaction_complete) {
                     (Some(permit), true) => {
                         if commits_used >= SCOPED_OWNER_COMMITS_PER_TRANSACTION {

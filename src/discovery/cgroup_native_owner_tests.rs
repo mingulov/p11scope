@@ -1294,6 +1294,31 @@ struct MetadataReads {
     post_sample: u64,
 }
 
+/// Kill and reap the owned fixture child named by `pid` from
+/// inside a commit hook: the synchronous reap makes later
+/// liveness checks in the same commit observe the death
+/// deterministically.
+fn kill_and_reap_owned_child(pid: u32) {
+    // SAFETY: pid named the scene's owned child; ESRCH/ECHILD
+    // mean it is already gone.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut status = 0;
+            let waited = libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG);
+            if waited == pid as libc::pid_t || waited < 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "killed fixture child did not reap"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
 impl ScopedNativeScene {
     /// One membership pass like `commit_membership_pass_for`, returning
     /// the batch receipt and the observed pre/post-sample provider
@@ -1442,6 +1467,52 @@ impl ScopedNativeScene {
         self.coordinator
             .commit_batch_with_acquisition(false, None, handle)
             .unwrap()
+    }
+
+    /// One membership pass whose scoped commit runs `at_gate` at
+    /// each commit decision point (see `scoped_commit_gate_test`):
+    /// an external event — member death, operator stop — lands at
+    /// one exact phase between the coordinator's own checks. The
+    /// caller supplies the collection control so a gate closure
+    /// can latch cancellation through a retained clone. Mirrors
+    /// `commit_membership_pass_for` without its caller cross-checks.
+    fn commit_gated_pass(
+        &mut self,
+        pid: u32,
+        control: CollectionControl,
+        at_gate: impl FnMut(super::scoped_commit_gate_test::Phase) + 'static,
+    ) -> CgroupCompletion {
+        let collection = self
+            .coordinator
+            .cgroup_collector(
+                std::mem::take(&mut self.state),
+                CgroupWalkLimits::default(),
+                control,
+                None,
+            )
+            .unwrap()();
+        let preparation = collection.preparation(pid).unwrap();
+        assert!(preparation.check());
+        self.coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        super::scoped_commit_gate_test::observe(at_gate, || self.commit_scene_batch());
+        let completion = self.coordinator.take_cgroup_completion().unwrap();
+        let CgroupCompletion {
+            state,
+            outcome,
+            events,
+            admitted,
+            scan_callers,
+        } = completion;
+        self.state = state;
+        CgroupCompletion {
+            state: CgroupWalkState::default(),
+            outcome,
+            events,
+            admitted,
+            scan_callers,
+        }
     }
 
     /// One pass over the membership file exactly as the twin last
@@ -3126,6 +3197,7 @@ const SUSPENDED_SUBJECT: &str = "native owner suspended";
 const SUSPENDED_ABSENT_REASON: &str = "the caller was absent from the complete cgroup transaction; its native owner was released and scan-pinned fallback retained";
 const SUSPENDED_RETIRED_REASON: &str = "the caller retired; its native owner was released";
 const SUSPENDED_EXEC_REASON: &str = "the caller's image changed; native authority was cancelled and its native owner was released; scan-pinned fallback retained";
+const SUSPENDED_LOST_REASON: &str = "the caller failed its final permit proof after admission; native authority was cancelled and its native owner was released; scan-pinned fallback retained";
 
 fn staged_counts(scene: &ScopedNativeScene) -> (usize, usize, usize) {
     scene
@@ -4165,4 +4237,269 @@ fn cgroup_native_owner_suspend_cycles_conserve_capacity() {
     );
     assert_eq!(acquired.borrow().calls(), 20);
     assert_eq!(staged_counts(&scene), (1, 0, 0));
+}
+
+/// The shared late-loss disposition: the refresh refused by name
+/// for `refusal_needle`, then the owner suspended in the same
+/// complete pass with the lost-member reason — authority back
+/// to scan-pinned, flag/lease/capacity released, the settled
+/// witness history kept.
+fn assert_late_permit_loss_suspended(scene: &ScopedNativeScene, pid: u32, refusal_needle: &str) {
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == REFRESH_REFUSED_SUBJECT
+                && gap.caller == Some(scene.caller)
+                && gap.pid == Some(pid)
+                && gap.module.is_none()
+                && gap.budget.is_none()
+                && gap.reason.contains(refusal_needle)
+        }),
+        "the late refresh refusal names its stage: {:?}",
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        scene.coordinator.owner_of(scene.caller),
+        None,
+        "the lost member's owner releases in the same pass"
+    );
+    assert_suspended_gap(scene, scene.caller, pid, SUSPENDED_LOST_REASON);
+    assert_eq!(
+        scene
+            .coordinator
+            .adapter()
+            .record(scene.caller)
+            .unwrap()
+            .authority,
+        ImageAuthority::ScanPinned,
+        "native authority cancels back to scan-pinned"
+    );
+    assert!(
+        !scene.coordinator.engine.scoped_refresh_in_progress(),
+        "no refresh candidate flag survives"
+    );
+    assert_eq!(
+        staged_counts(scene),
+        (0, 0, 0),
+        "owner, reservation and lease capacity return"
+    );
+    assert_eq!(
+        scene.coordinator.registry().witness_census().bound,
+        1,
+        "the settled row stays bound for history"
+    );
+}
+
+#[test]
+fn cgroup_native_owner_refresh_permit_loss_after_admission_suspends() {
+    // The member dies between its admission permit and the staged
+    // refresh's later permit poll: the second poll grants nothing
+    // while the transaction stays complete, so the pass must
+    // withdraw the caller's earlier admission standing and
+    // suspend its owner in the same pass — refused and suspended
+    // gaps are both honest. The incomplete-transaction controls
+    // (migration/incomplete twins above) keep the opposite pin:
+    // a failed collection proves no absence and retains the owner.
+    let mut scene = ScopedNativeScene::new();
+    let script: Vec<_> = (1..=10).map(|generation| (generation, 41, 1)).collect();
+    let acquired = scene.set_scripted_acquisition(&script);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert!(
+        scene.coordinator.owner_of(scene.caller).is_some(),
+        "the stable member activates"
+    );
+    assert_eq!(acquired.borrow().calls(), 5);
+
+    let pid = scene.child_id();
+    let completion = scene.commit_gated_pass(pid, CollectionControl::new(None), move |phase| {
+        if phase == super::scoped_commit_gate_test::Phase::GateSampled {
+            kill_and_reap_owned_child(pid);
+        }
+    });
+    assert_eq!(
+        completion.outcome,
+        ScopedCollectionOutcome::Complete,
+        "the late death alone does not incomplete the transaction"
+    );
+    assert_eq!(
+        acquired.borrow().calls(),
+        10,
+        "the refresh fully prepared before the gate"
+    );
+    assert_late_permit_loss_suspended(&scene, pid, "final-sample permit was not granted");
+}
+
+#[test]
+fn cgroup_native_owner_refresh_proof_loss_after_admission_suspends() {
+    // The refresh permit itself is granted, then the member dies
+    // before the permit proof re-checks liveness: proof
+    // validation refuses after a granted permit, in a still
+    // complete transaction, so the owner suspends in the same
+    // pass as the refusal.
+    let mut scene = ScopedNativeScene::new();
+    let script: Vec<_> = (1..=10).map(|generation| (generation, 41, 1)).collect();
+    let acquired = scene.set_scripted_acquisition(&script);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert!(
+        scene.coordinator.owner_of(scene.caller).is_some(),
+        "the stable member activates"
+    );
+    assert_eq!(acquired.borrow().calls(), 5);
+
+    let pid = scene.child_id();
+    let completion = scene.commit_gated_pass(pid, CollectionControl::new(None), move |phase| {
+        if phase == super::scoped_commit_gate_test::Phase::RefreshPermitPolled {
+            kill_and_reap_owned_child(pid);
+        }
+    });
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(acquired.borrow().calls(), 10);
+    assert_late_permit_loss_suspended(&scene, pid, "does not match the final-sample permit");
+}
+
+#[test]
+fn cgroup_native_owner_refresh_commit_liveness_loss_suspends() {
+    // The proof validates, then the member dies before the
+    // engine commit re-checks the retained view's liveness: the
+    // commit refuses on liveness in a still complete
+    // transaction, so the owner suspends in the same pass —
+    // distinguished from unrelated commit failures, which keep
+    // the owner, and from a proven image change, which suspends
+    // with the exec reason (twins above).
+    let mut scene = ScopedNativeScene::new();
+    let script: Vec<_> = (1..=10).map(|generation| (generation, 41, 1)).collect();
+    let acquired = scene.set_scripted_acquisition(&script);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert!(
+        scene.coordinator.owner_of(scene.caller).is_some(),
+        "the stable member activates"
+    );
+    assert_eq!(acquired.borrow().calls(), 5);
+
+    let pid = scene.child_id();
+    let completion = scene.commit_gated_pass(pid, CollectionControl::new(None), move |phase| {
+        if phase == super::scoped_commit_gate_test::Phase::RefreshProofValidated {
+            kill_and_reap_owned_child(pid);
+        }
+    });
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(acquired.borrow().calls(), 10);
+    assert_late_permit_loss_suspended(&scene, pid, "liveness or pid changed at refresh commit");
+}
+
+#[test]
+fn cgroup_native_owner_cancellation_after_gate_suspends_nobody() {
+    // Cancellation latches after the transaction outcome was
+    // sampled complete but before teardown: the suspend decision
+    // must poll the current outcome, not the pre-loop sample, so
+    // the absent member's owner stands with its native
+    // authority, the resident owner stands with its refresh
+    // state cleared, and the pass reports the cancellation. The
+    // two-owner suspend twin above keeps the successful
+    // teardown control on the same scene shape.
+    let mut scene = ScopedNativeScene::new();
+    let second_child = scene.spawn_second_child("ready-b");
+    let (second_caller, second_pid, _) = scene.admit_and_settle_second_member(second_child, 42, 11);
+    let first_pid = scene.child_id();
+    let first_caller = scene.caller;
+    let (early_ticket, late_ticket) = if first_pid < second_pid {
+        (41, 42)
+    } else {
+        (42, 41)
+    };
+    let mut script = Vec::new();
+    let mut generation = 1u64;
+    for ticket in [early_ticket, late_ticket, late_ticket, 42] {
+        for _ in 0..5 {
+            script.push((generation, ticket, 1));
+            generation += 1;
+        }
+    }
+    let acquired = scene.set_scripted_acquisition(&script);
+    let (early_caller, early_pid) = if first_pid < second_pid {
+        (first_caller, first_pid)
+    } else {
+        (second_caller, second_pid)
+    };
+    let (late_caller, late_pid) = if first_pid < second_pid {
+        (second_caller, second_pid)
+    } else {
+        (first_caller, first_pid)
+    };
+    let (completion, _, _) =
+        scene.commit_observed_pass(Some(early_caller), early_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let (completion, _, _) =
+        scene.commit_observed_pass(Some(late_caller), late_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let first_owner = scene
+        .coordinator
+        .owner_of(first_caller)
+        .expect("first active");
+    let second_owner = scene
+        .coordinator
+        .owner_of(second_caller)
+        .expect("second active");
+    assert_eq!(acquired.borrow().calls(), 15);
+    assert_eq!(staged_counts(&scene), (2, 0, 0));
+
+    scene.rewrite_membership(&[second_pid]);
+    let control = CollectionControl::new(None);
+    let stop = control.clone();
+    let completion = scene.commit_gated_pass(second_pid, control, move |phase| {
+        if phase == super::scoped_commit_gate_test::Phase::GateSampled {
+            stop.cancel();
+        }
+    });
+    assert_eq!(
+        completion.outcome,
+        ScopedCollectionOutcome::Cancelled(
+            crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+        )
+    );
+    assert_eq!(
+        acquired.borrow().calls(),
+        20,
+        "the resident refresh prepared before the gate"
+    );
+    assert_eq!(
+        scene.coordinator.owner_of(first_caller),
+        Some(first_owner),
+        "a cancelled pass suspends nobody: the absent owner stands"
+    );
+    assert_eq!(
+        scene.coordinator.owner_of(second_caller),
+        Some(second_owner),
+        "the resident owner stands"
+    );
+    assert!(
+        matches!(
+            scene
+                .coordinator
+                .adapter()
+                .record(first_caller)
+                .unwrap()
+                .authority,
+            ImageAuthority::NativeExact { .. }
+        ),
+        "native authority stands unsuspended"
+    );
+    assert_no_suspended_gap(&scene);
+    assert!(
+        !scene.coordinator.engine.scoped_refresh_in_progress(),
+        "refresh state cleared"
+    );
+    assert_eq!(
+        staged_counts(&scene),
+        (2, 0, 0),
+        "both owners retain their capacity"
+    );
 }

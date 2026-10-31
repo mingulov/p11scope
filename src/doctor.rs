@@ -2923,9 +2923,7 @@ mod tests {
         use crate::attach::JournalPairPreflight;
         for (shape, needle) in [
             (
-                JournalPairPreflight::PairMissing(
-                    "p11_entry_journal, p11_return_journal".into(),
-                ),
+                JournalPairPreflight::PairMissing("p11_entry_journal, p11_return_journal".into()),
                 "pair missing",
             ),
             (
@@ -3026,8 +3024,7 @@ mod tests {
                 "unparseable bytes are a load error"
             );
         }
-        let ordinary =
-            aya_obj::Object::parse(crate::EBPF_OBJECT).expect("ordinary bytes parse");
+        let ordinary = aya_obj::Object::parse(crate::EBPF_OBJECT).expect("ordinary bytes parse");
         match crate::attach::journal_pair_preflight_from_parsed(&ordinary) {
             JournalPairPreflight::PairMissing(names) => {
                 assert!(names.contains("p11_entry_journal"), "{names}");

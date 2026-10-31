@@ -3124,7 +3124,12 @@ fn unlinked_joint_services_dd_without_repolling_original() {
     let dd = fixture.live_discovery.as_ref().unwrap();
     assert!(dd.calls >= 1, "unlinked DD services inline");
     assert_eq!(dd.remaining(), 0);
-    assert!(fixture.machine.retained_original_for_test().is_none_or(|held| held == original));
+    assert!(
+        fixture
+            .machine
+            .retained_original_for_test()
+            .is_none_or(|held| held == original)
+    );
     if progress != crate::inventory_semantics::JointServiceProgress::Published {
         fixture.published();
     }
@@ -3143,8 +3148,13 @@ fn unlinked_joint_services_dd_without_repolling_original() {
 /// Returns (polls, published?) — the refusal case surfaces as Err.
 fn finish_beyond_one_poll(
     fixture: &mut MachineScene,
-) -> Result<(usize, crate::discovery::engine::inventory_coordinator::BatchReceipt), SemanticRefusal>
-{
+) -> Result<
+    (
+        usize,
+        crate::discovery::engine::inventory_coordinator::BatchReceipt,
+    ),
+    SemanticRefusal,
+> {
     use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
     let mut polls = 0;
     for _ in 0..512 {
@@ -3153,7 +3163,12 @@ fn finish_beyond_one_poll(
             JointCommitProgress::Published(receipt) => return Ok((polls, receipt)),
             JointCommitProgress::Pending => {
                 assert!(
-                    fixture.scene.real.lane.begin_owned_terminal_cleanup().is_err(),
+                    fixture
+                        .scene
+                        .real
+                        .lane
+                        .begin_owned_terminal_cleanup()
+                        .is_err(),
                     "detach stays pending while Finish owns the lane"
                 );
                 if polls == 1 {

@@ -3067,9 +3067,7 @@ pub(crate) fn journal_pair_preflight_from_bytes(object: &[u8]) -> JournalPairPre
 /// through the seal's own pair predicate, and a present pair must
 /// still pass the full journal flavor contract (no ordinary roots,
 /// exact journal maps) before it reads as available.
-pub(crate) fn journal_pair_preflight_from_parsed(
-    parsed: &aya_obj::Object,
-) -> JournalPairPreflight {
+pub(crate) fn journal_pair_preflight_from_parsed(parsed: &aya_obj::Object) -> JournalPairPreflight {
     let programs: BTreeSet<&str> = parsed.programs.keys().map(String::as_str).collect();
     if !journal_pair_present(&programs) {
         let missing: Vec<&str> = journal::PROGRAMS

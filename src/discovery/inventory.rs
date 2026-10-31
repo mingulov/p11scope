@@ -264,6 +264,17 @@ impl PreparedReconciliation {
     }
 }
 
+/// A prepared reconciliation whose provider pins were validated before
+/// the final membership sample, sealed for the pure permit-backed
+/// apply. Constructible only through
+/// [`Engine::preflight_scoped_reconciliation`], which completes the
+/// pin validation I/O the generic commit re-runs at its boundary.
+/// The scoped apply trusts this evidence and performs no provider
+/// I/O; the generic path keeps its own revalidation contract.
+pub(crate) struct PreflightedReconciliation {
+    prepared: PreparedReconciliation,
+}
+
 impl Engine {
     pub(crate) fn inventory(
         config: InventoryDiscoveryConfig,
@@ -412,16 +423,18 @@ impl Engine {
 
     /// Activate one staged owner under the permit-backed proof: pure
     /// commit work only. Validates the staged view's pid and liveness
-    /// against the proof, commits the prepared reconciliation (which
-    /// revalidates the image through the passed guard — the commit's
-    /// replay guard over the stored observation), flips the record to
-    /// active, and releases the scan lease. A refused activation
-    /// releases the staged record, view, reservation, and lease as
-    /// well: nothing staged survives a failure.
+    /// against the proof, commits the preflighted reconciliation (the
+    /// image revalidates through the passed guard — the commit's
+    /// replay guard over the stored observation — while the provider
+    /// pins stand on their pre-sample preflight evidence, with no new
+    /// provider I/O), flips the record to active, and releases the
+    /// scan lease. A refused activation releases the staged record,
+    /// view, reservation, and lease as well: nothing staged survives
+    /// a failure.
     pub(crate) fn activate_staged_owner(
         &mut self,
         owner: ProcessViewId,
-        prepared: PreparedReconciliation,
+        preflighted: PreflightedReconciliation,
         lease: &ScanLease,
         proof: &crate::discovery::caller_registry::ScopedOwnerProof<'_>,
         guard: &mut dyn ImageGuard,
@@ -451,7 +464,7 @@ impl Engine {
         }
         // The record stays staged through the commit: the staged scope
         // exception carries it, and a failed commit releases below.
-        let commit = match self.commit_inventory_reconciliation(prepared, guard) {
+        let commit = match self.commit_preflighted_reconciliation(preflighted, guard) {
             Ok(commit) => commit,
             Err(error) => {
                 return match self.abandon_staged_owner(owner, lease) {
@@ -896,9 +909,10 @@ impl Engine {
         Ok(())
     }
 
-    /// Staged-owner counts for the activation twins: (retained
-    /// owners, reservations, active scan leases). A refused commit
-    /// leaves all three at their pre-commit values.
+    /// Staged-owner counts for the activation twins: (owners
+    /// including staged provisionals, reservations, active scan
+    /// leases). A refused commit leaves all three at their
+    /// pre-commit values.
     #[cfg(test)]
     pub(crate) fn inventory_staged_counts_for_test(&self) -> Result<(usize, usize, usize)> {
         let state = self.inventory_state()?;
@@ -972,6 +986,56 @@ impl Engine {
     ) -> Result<InventoryCommit> {
         self.note_graph_inputs_mutated();
         self.revalidate_inventory_reconciliation(&prepared, guard)?;
+        self.commit_validated_reconciliation(prepared)
+    }
+
+    /// Seal a prepared reconciliation for the scoped permit-backed
+    /// apply: complete the provider pin validation (held-fd fstat)
+    /// here, before the final membership sample, and retain the held
+    /// FDs with the prepared evidence. The coordinator calls this at
+    /// the end of its pre-sample preparation; the apply trusts the
+    /// seal and performs no provider I/O. A changed or unreadable
+    /// pin refuses here, before anything commits.
+    pub(crate) fn preflight_scoped_reconciliation(
+        prepared: PreparedReconciliation,
+    ) -> Result<PreflightedReconciliation> {
+        if !prepared
+            .candidate
+            .pinned
+            .check_unchanged()
+            .map_err(anyhow::Error::msg)?
+        {
+            bail!("prepared inventory pins changed; existing claims retained");
+        }
+        Ok(PreflightedReconciliation { prepared })
+    }
+
+    /// The scoped permit-backed apply for a preflighted
+    /// reconciliation: bounded pure work only. Revalidates the owner
+    /// image, identity, revision, and liveness through the passed
+    /// guard (the commit's replay guard over the stored observation),
+    /// then applies the candidate. The provider pins stand on their
+    /// pre-sample preflight seal — no `check_unchanged` runs here —
+    /// while the generic entry above keeps its own boundary check.
+    pub(crate) fn commit_preflighted_reconciliation(
+        &mut self,
+        preflighted: PreflightedReconciliation,
+        guard: &mut dyn ImageGuard,
+    ) -> Result<InventoryCommit> {
+        self.note_graph_inputs_mutated();
+        self.check_inventory_image(&preflighted.prepared.identity, guard)?;
+        self.commit_validated_reconciliation(preflighted.prepared)
+    }
+
+    /// Apply a reconciliation whose boundary checks already passed:
+    /// fallible eligibility first, then the exact-state swap and
+    /// owner bookkeeping. Shared by the generic commit (which
+    /// revalidates pins at its boundary) and the scoped apply (whose
+    /// pins stand on the pre-sample preflight seal).
+    fn commit_validated_reconciliation(
+        &mut self,
+        prepared: PreparedReconciliation,
+    ) -> Result<InventoryCommit> {
         self.inventory_state()?;
         self.preflight_candidate_publication(&prepared.candidate)?;
         let PreparedReconciliation {

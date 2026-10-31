@@ -25,7 +25,7 @@
 use super::inventory::image_guard::{FreshImageGuard, ImageAcquisition};
 use super::inventory::{
     ExecProof, ImageCheck, ImageGuard, InventoryCommit, InventoryDiscoveryConfig,
-    InventoryOwnerLimits, PreparedReconciliation, RefreshCause, ScanLease, ScanReceipt,
+    InventoryOwnerLimits, PreflightedReconciliation, RefreshCause, ScanLease, ScanReceipt,
 };
 use super::*;
 #[cfg(test)]
@@ -388,7 +388,6 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     next_window: u64,
     passes: u64,
     authority_gap_recorded: bool,
-    native_acquisition_gap_recorded: bool,
     /// The run's lifecycle-ring high-water: the maximum fill any staged
     /// drain reported. Timings telemetry only (the stage-timings pass
     /// lines), never schema.
@@ -447,10 +446,11 @@ fn exit_clocks_comparable_with(
 }
 
 /// One staged native owner: all preparation I/O (fresh observation,
-/// warm view, guarded scan, prepared reconciliation) complete before
-/// the final membership sample, awaiting the permit-backed commit.
-/// Owns its evidence; the commit judges it through the real invoked
-/// paths and either activates or releases everything.
+/// warm view, guarded scan, prepared reconciliation, pin preflight)
+/// complete before the final membership sample, awaiting the
+/// permit-backed commit. Owns its evidence; the commit judges it
+/// through the real invoked paths and either activates or releases
+/// everything.
 struct StagedNativeOwner {
     caller: CallerId,
     pid: u32,
@@ -460,7 +460,7 @@ struct StagedNativeOwner {
     original: Arc<PidPin>,
     owner: ProcessViewId,
     lease: ScanLease,
-    prepared: PreparedReconciliation,
+    preflighted: PreflightedReconciliation,
 }
 
 /// Pure commit-time image guard: replays the preparation's stored
@@ -491,6 +491,13 @@ impl ImageGuard for ReplayImageGuard {
 /// At most four staged owner preparations per publication (mirrors the
 /// semantic-preparation bound): activation stays bounded work.
 const SCOPED_OWNER_PREPARATION_ATTEMPTS: usize = 4;
+
+/// Interim one-owner-per-transaction gate: preparations share one
+/// committed snapshot and each commit replaces the whole engine
+/// state, so at most one staged owner may commit per transaction;
+/// further permitted members defer deterministically to a later
+/// pass with their staged state released.
+const SCOPED_OWNER_COMMITS_PER_TRANSACTION: usize = 1;
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
     // Retain the default constructor for existing internal harness callers;
@@ -589,7 +596,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             next_window: 0,
             passes: 0,
             authority_gap_recorded: false,
-            native_acquisition_gap_recorded: false,
             lifecycle_high_water_bytes: None,
             diagnostics: None,
             diagnostic_health: None,
@@ -3196,22 +3202,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Already active: refresh and suspend belong to packet 3.
             return None;
         }
-        if self.native_image_acquisition.is_none() {
-            if !self.native_acquisition_gap_recorded {
-                self.native_acquisition_gap_recorded = true;
-                self.registry.record_gap(RegistryGap {
-                    caller: None,
-                    module: None,
-                    pid: None,
-                    subject: "native owner activation unavailable".into(),
-                    reason:
-                        "no image acquisition handle is installed; scan-pinned fallback retained"
-                            .into(),
-                    budget: None,
-                });
-            }
-            return None;
-        }
+        // The caller prepares only with a handle installed; the
+        // handle-less path keeps the standing deferral disclosure.
         let domain = self
             .native_image_acquisition
             .as_ref()
@@ -3379,6 +3371,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 return None;
             }
         };
+        // Pin preflight seals the prepared reconciliation before the
+        // final membership sample: the commit-time apply trusts this
+        // evidence and performs no provider I/O.
+        let preflighted = match Engine::preflight_scoped_reconciliation(prepared) {
+            Ok(preflighted) => preflighted,
+            Err(error) => {
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("staged reconciliation preflight failed: {error:#}"),
+                );
+                return None;
+            }
+        };
         guard.release();
         Some(StagedNativeOwner {
             caller,
@@ -3389,7 +3398,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             original,
             owner,
             lease,
-            prepared,
+            preflighted,
         })
     }
 
@@ -3397,19 +3406,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// permit: bounded pure work only. Validates the staged pid and
     /// generation against the permit, installs native-exact caller
     /// authority, activates the staged owner (which replays the stored
-    /// observation through the real binding comparison and commits the
-    /// prepared reconciliation), binds owner to caller, and projects
-    /// the commit. Returns whether the owner activated (a revision
-    /// signal for the engine tail). Any failure releases the staged
-    /// reservation and lease with a named gap; an installed authority
-    /// rolls back when the engine commit refuses.
+    /// observation through the real binding comparison and applies the
+    /// preflighted reconciliation with no provider I/O), binds owner
+    /// to caller, and projects the commit. Any failure releases the
+    /// staged reservation and lease with a named gap; an installed
+    /// authority rolls back when the engine commit refuses.
     fn commit_staged_native_owner(
         &mut self,
         staged: StagedNativeOwner,
         permit: &CgroupAdmissionPermit<'_>,
         verdicts: &BTreeMap<AttachModuleKey, AttachVerdict>,
         now_ns: u64,
-    ) -> bool {
+    ) {
         let StagedNativeOwner {
             caller,
             pid,
@@ -3419,7 +3427,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             original,
             owner,
             lease,
-            prepared,
+            preflighted,
         } = staged;
         let Some(proof) = ScopedOwnerProof::validate(pid, &generation, permit) else {
             self.abandon_staged_native_owner(
@@ -3429,7 +3437,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Some(&lease),
                 "the staged member does not match the final-sample permit; scan-pinned fallback retained",
             );
-            return false;
+            return;
         };
         if let Err(failure) = self
             .adapter
@@ -3442,7 +3450,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Some(&lease),
                 format!("native authority installation refused: {}", failure.reason),
             );
-            return false;
+            return;
         }
         let mut replay = ReplayImageGuard {
             original,
@@ -3450,7 +3458,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         match self
             .engine
-            .activate_staged_owner(owner, prepared, &lease, &proof, &mut replay)
+            .activate_staged_owner(owner, preflighted, &lease, &proof, &mut replay)
         {
             Ok(commit) => {
                 self.owners.insert(caller, owner);
@@ -3458,7 +3466,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 if commit.complete {
                     self.complete_scanned.insert(caller);
                 }
-                true
             }
             Err(error) => {
                 if let Err(rollback) = self
@@ -3472,19 +3479,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     pid,
                     format!("staged owner activation failed: {error:#}"),
                 );
-                false
             }
         }
     }
 
-    /// Revise the engine tail after late owner activation: the batch
-    /// tail already ran at this publication's start, and activation
-    /// dirtied its inputs, so republish before the publication's
-    /// revisions are cut. Infallible by construction — the scoped
-    /// region allows no later fallible tail — so a failed revision
-    /// keeps the previous publication with a named gap and never
-    /// unwinds the committed activation.
-    fn revise_engine_tail_for_activation(&mut self) {
+    /// Revise the engine tail after scoped owner work: the batch
+    /// tail already ran at this publication's start, and owner
+    /// preparation dirtied its inputs whether or not any activation
+    /// committed, so republish before the publication's revisions are
+    /// cut. Infallible by construction — the scoped region allows no
+    /// later fallible tail — so a failed revision keeps the previous
+    /// publication with a named gap and never unwinds committed work.
+    fn revise_engine_tail_after_scoped_owners(&mut self) {
         if let Err(error) = self.engine.publish_batch_tail(true) {
             self.registry.record_gap(RegistryGap {
                 caller: None,
@@ -3492,7 +3498,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 pid: None,
                 subject: "engine tail revision failed".into(),
                 reason: format!(
-                    "late owner activation could not revise the engine tail: {error:#}; the previous publication stands"
+                    "scoped owner work could not revise the engine tail: {error:#}; the previous publication stands"
                 ),
                 budget: None,
             });
@@ -7078,8 +7084,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Native owner preparation (packet 6.11p2): all owner I/O
             // completes here, before the final membership sample. Only
             // prepared members with a live caller qualify; the commit
-            // below activates each staged owner under its borrowed
-            // final-sample permit, or releases it.
+            // below activates at most one staged owner under its
+            // borrowed final-sample permit and releases the rest.
+            // Without an acquisition handle nothing prepares: the
+            // commit keeps the standing deferral disclosure.
             let owner_candidates: Vec<(u32, CallerId, crate::inspect_system::MemberGeneration)> =
                 prepared
                     .iter()
@@ -7088,7 +7096,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             .map(|caller| (*pid, caller, pin.generation().clone()))
                     })
                     .collect();
-            let staged_owners = self.prepare_scoped_native_owners(owner_candidates, &work);
+            let staged_owners = if self.native_image_acquisition.is_none() {
+                Vec::new()
+            } else {
+                self.prepare_scoped_native_owners(owner_candidates, &work)
+            };
             // Prepare every provider read while retaining exclusive attach-set
             // custody. No aliases/endpoints/memberships are published here.
             let provider = if collection.reserve_projection(self.registry.edge_count()) {
@@ -7246,21 +7258,44 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     lane.deliver_admission_receipt(receipt);
                 }
             }
+            // Without an acquisition handle (production until the
+            // capture handoff is wired): keep the standing deferral
+            // disclosure the installed consumer recognizes; its
+            // replacement is coordinated separately.
+            if self.native_image_acquisition.is_none() {
+                self.registry.record_gap(RegistryGap { caller: None, module: None, pid: None,
+                    subject: "scoped native owner admission deferred".into(),
+                    reason: "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; sampled scan-pinned callers and retained native totals remain available".into(), budget: None });
+            }
             // Native owner activation (packet 6.11p2): commit staged
             // owners under their borrowed final-sample permits. A
             // commit requires both its member permit and a complete
             // transaction (the outcome gates the fence); a missing
             // permit reports the member-precise reason, a permitted
             // member of an incomplete transaction the fence reason.
-            // Refresh and suspend stay deferred (packet 3).
+            // At most one staged owner commits per transaction: each
+            // commit replaces the whole engine state, so a further
+            // permitted member defers deterministically to a later
+            // pass with its staged state released. Refresh and suspend
+            // stay deferred (packet 3).
             let transaction_complete = collection.outcome() == ScopedCollectionOutcome::Complete;
-            let mut activated = false;
+            let mut commits_used = 0;
             for staged in staged_owners {
                 let permit = collection.permit(staged.pid);
                 match (permit, transaction_complete) {
                     (Some(permit), true) => {
-                        activated |=
+                        if commits_used >= SCOPED_OWNER_COMMITS_PER_TRANSACTION {
+                            self.abandon_staged_native_owner(
+                                staged.caller,
+                                staged.pid,
+                                staged.owner,
+                                Some(&staged.lease),
+                                "only one native owner activation per transaction; the staged owner is deferred to a later pass; scan-pinned fallback retained",
+                            );
+                        } else {
+                            commits_used += 1;
                             self.commit_staged_native_owner(staged, &permit, &verdicts, *now_ns);
+                        }
                     }
                     (None, _) => {
                         self.abandon_staged_native_owner(
@@ -7282,9 +7317,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     }
                 }
             }
-            if activated {
-                self.revise_engine_tail_for_activation();
-            }
+            // Preparation dirtied engine facts after the first tail
+            // whether or not any activation committed: revise through
+            // the non-unwinding handler before revisions are cut.
+            self.revise_engine_tail_after_scoped_owners();
             let outcome = collection.outcome(); // final cancellation/deadline poll
             if outcome != ScopedCollectionOutcome::Complete {
                 allowed_callers.clear();

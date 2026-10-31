@@ -3147,6 +3147,11 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// matching the branch-measured KEM step; stripped diff shows only
 /// KEM content): 139258 B, sha256 below, measured with the unchanged
 /// executable lexer and reproduced byte-exact by standalone lexing.
+/// Re-baselined for the loader hit-transaction series (token/legacy
+/// record emission, loader-path selection before ring reservation,
+/// serialized admission) and the object_return journal Option-reason
+/// migration (c4d87451, 81fef0a2, 4f48d083, f2432aa2): 143211 B,
+/// sha256 below, measured with the unchanged executable lexer.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3156,8 +3161,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            139258,
-            "d75401418981ac221b9585c3980d2384785613c50c4f319f9dbd89ab94ceccbc"
+            143211,
+            "84cfd3487db717f0e91eda53d408101cba451232ebd063442fc7da39dfe2ac7e"
         ),
         "stripped BPF dump must stay byte-identical"
     );

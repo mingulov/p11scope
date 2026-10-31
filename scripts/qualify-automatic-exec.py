@@ -2527,7 +2527,8 @@ def inventory_sibling_s1_errors(doc, ledger, receipt, records):
     return errors, summaries
 
 
-CGROUP_DISCLOSURE_SUBJECTS = {"scoped native owner admission deferred", "semantic admission refused"}
+CGROUP_DISCLOSURE_SUBJECTS = {"scoped native owner admission deferred",
+                              "native owner activation unavailable", "semantic admission refused"}
 SYSTEM_DISCLOSURE_SUBJECTS = {"discovery capped", "capture discovery", "semantic admission refused",
     "process maps sweep", "semantic input refused", "native capture retirement unsettled"}
 SEMANTIC_EARLY_SUBJECTS = {"physical provider use preceded first observed semantic registration",
@@ -2547,6 +2548,14 @@ SYSTEM_UNSETTLED_RETIREMENT = (
 SCOPED_OWNER_DEFERRAL = (
     "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; "
     "sampled scan-pinned callers and retained native totals remain available")
+# Exact (subject, reason) pairs for the caller-less standing cgroup
+# disclosures. The deferral pair is recognized for old reports only;
+# current producers emit the unavailable pair on handle-less passes.
+CGROUP_DISCLOSURE_REASONS = {
+    "scoped native owner admission deferred": SCOPED_OWNER_DEFERRAL,
+    "native owner activation unavailable":
+        "no image acquisition handle is installed; scan-pinned fallback retained",
+}
 
 
 def inventory_target_preuse_disclosure(doc, ledgers, receipt, gap, publication, caller):
@@ -3020,7 +3029,17 @@ def inventory_semantic_early_disclosure(doc, records, index, validated):
 
 
 def inventory_cgroup_disclosure(doc, ledgers, receipt, index):
-    """Recognize retained limitations, without granting positive capture authority."""
+    """Recognize retained limitations, without granting positive capture authority.
+
+    The unavailable subject is the coordinated standing disclosure for
+    handle-less cgroup passes (exact subject and reason, no caller,
+    module, pid or budget, one publication, repeats bounded by the
+    pass count). Recognition never widens to refusal or suspend
+    disclosures, and the pass-capability allowlist cannot bypass it:
+    recognized subjects are stripped from the allowed set first, so a
+    malformed standing gap is an unexpected inventory gap even when
+    its subject is named in the allowlist.
+    """
     gap = doc["gaps"][index]
     records = receipt["inventory_control"]["final_records"]
     observation = doc.get("observation") or {}
@@ -3039,8 +3058,8 @@ def inventory_cgroup_disclosure(doc, ledgers, receipt, index):
     expected = {**{key: value for key, value in gap.items() if key != "repeats"}, "index": index}
     if len(publication) != 1 or publication[0]["event"] != expected:
         return False
-    if gap["subject"] == "scoped native owner admission deferred":
-        return gap["caller"] is None and gap["reason"] == SCOPED_OWNER_DEFERRAL
+    if gap["subject"] in CGROUP_DISCLOSURE_REASONS:
+        return gap["caller"] is None and gap["reason"] == CGROUP_DISCLOSURE_REASONS[gap["subject"]]
     if gap["subject"] != "semantic admission refused" or gap["reason"] != "semantic_unavailable":
         return False
     callers = [row for row in doc["callers"] if row["id"] == gap["caller"]]

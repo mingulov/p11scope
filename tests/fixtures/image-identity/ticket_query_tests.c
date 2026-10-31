@@ -834,6 +834,200 @@ static void binding_stays_local(void)
     puts("ASSERT binding_a_stays_local");
 }
 
+/* A healthy B admission folds the claimed bank: fold help is not
+ * quota-gated. The pending-fold watermark excludes the retired bank
+ * (its count already lives in folded_issued), the retired epoch still
+ * serves its true identities, and the later re-prepare completes
+ * without cutting while the current bank still has room. */
+static void fold_pending_excludes(void)
+{
+    struct image_identity got;
+    u64 ticket = 0, watermark = 0;
+    u64 n;
+    int i;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    for (n = 1; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present[0] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+        assert(ticket == n + 1);
+    }
+    present[0] = 0;
+    present_b[2] = 0;
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[2], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    select_stub.prepared[0] = 0;
+    present_b[3] = 0;
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[3], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 2);
+    assert(select_stub.folded[0] == 1);
+    assert(select_stub.folds == 1);
+    assert(select_stub.folded_issued == IMAGE_IDENTITY_TICKET_LIMIT);
+    puts("ASSERT fold_runs_on_healthy_admission");
+    assert(p11_image_identity_issued(&watermark) == COOKIE_STATUS_OK);
+    assert(watermark == IMAGE_IDENTITY_TICKET_LIMIT + 2);
+    puts("ASSERT pending_fold_excluded_from_watermark");
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    assert(p11_link_task_identity(&leaders[1], &got) == COOKIE_STATUS_OK);
+    assert(got.task_cookie == 1);
+    puts("ASSERT retired_epoch_still_serves");
+    for (i = 0; i < TASK_COUNT; i++) {
+        present[i] = 0;
+        stored[i] = 0;
+    }
+    select_stub.incarnation[0] = 1;
+    select_stub.prepared[0] = 1;
+    present_b[4] = 0;
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[4], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 3);
+    assert(select_stub.bank == 1);
+    assert(select_stub.folded[0] == 0);
+    assert(ctl.next_ticket == 0);
+    puts("ASSERT reprepare_without_cut_stays");
+}
+
+/* The incarnation guard refuses before spending: no ticket burns, the
+ * refusal charges the corrupt bank once. */
+static void guard_spends_nothing(void)
+{
+    u64 ticket = 99;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    select_stub.incarnation[0] = 1ULL << 48;
+    present[1] = 0;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ticket == 0);
+    assert(ctl.next_ticket == 0);
+    assert(ctl.unavailable == 1);
+    puts("ASSERT guard_spends_nothing");
+}
+
+/* A corrupt retained cell charges the bank that owns the corruption,
+ * not the current bank. */
+static void retained_zero_charges_source(void)
+{
+    u64 ticket = 0;
+    u64 n;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    for (n = 1; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present[0] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    }
+    present[0] = 0;
+    present_b[2] = 0;
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[2], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    assert(select_stub.bank == 1);
+    present[0] = 1;
+    stored[0] = 0;
+    present_b[0] = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_ZERO_CELL);
+    assert(ticket == 0);
+    assert(ctl.unavailable == 1);
+    assert(ctl_b.unavailable == 0);
+    puts("ASSERT retained_zero_charges_source");
+}
+
+/* A retained re-query validates the source domain: a corrupt source
+ * bank refuses instead of serving from it. */
+static void retained_validates_source(void)
+{
+    u64 ticket = 0;
+    u64 n;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    for (n = 1; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present[0] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    }
+    present[0] = 0;
+    present_b[2] = 0;
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[2], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    ctl.limit = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ticket == 0);
+    assert(ctl.unavailable == 1);
+    puts("ASSERT retained_validates_source");
+}
+
+/* A prepared cut target with an overflowed epoch is not a cut target:
+ * the quota refuses without cutting into the corrupt epoch. */
+static void cut_refuses_corrupt_target(void)
+{
+    u64 ticket = 0;
+    u64 n;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    for (n = 1; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present[0] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    }
+    select_stub.incarnation[1] = 1ULL << 48;
+    present[0] = 0;
+    present_b[0] = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_QUOTA);
+    assert(ticket == 0);
+    assert(select_stub.bank == 0);
+    assert(select_stub.cuts == 0);
+    assert(select_stub.refusals == 1);
+    assert(ctl.unavailable == 1);
+    puts("ASSERT cut_refuses_corrupt_target");
+}
+
+/* Fold help is not gated on the current bank's health: with the
+ * current bank corrupt, the admission still retires the claimed bank
+ * before refusing. */
+static void fold_despite_corrupt_current(void)
+{
+    u64 ticket = 99;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    select_stub.bank = 1;
+    ctl.next_ticket = 7;
+    ctl_b.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
+    select_stub.prepared[0] = 0;
+    ctl_b.limit = 0;
+    present[0] = 0;
+    present_b[0] = 0;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ticket == 0);
+    assert(select_stub.folded[0] == 1);
+    assert(select_stub.folds == 1);
+    assert(select_stub.folded_issued == 7);
+    assert(ctl_b.unavailable == 1);
+    puts("ASSERT fold_despite_corrupt_current");
+}
+
 #ifdef IMAGE_HOST_CAS_HOOK
 /* Exhaustion twin: with every identity saturating-counter CAS forced
  * to fail, settled updates still land through the fallback and every
@@ -923,6 +1117,18 @@ int main(int argc, char **argv)
         fold_skips_empty();
     } else if (!strcmp(argv[1], "binding-stays-local")) {
         binding_stays_local();
+    } else if (!strcmp(argv[1], "fold-pending-excludes")) {
+        fold_pending_excludes();
+    } else if (!strcmp(argv[1], "guard-spends-nothing")) {
+        guard_spends_nothing();
+    } else if (!strcmp(argv[1], "retained-zero-charges-source")) {
+        retained_zero_charges_source();
+    } else if (!strcmp(argv[1], "retained-validates-source")) {
+        retained_validates_source();
+    } else if (!strcmp(argv[1], "cut-refuses-corrupt-target")) {
+        cut_refuses_corrupt_target();
+    } else if (!strcmp(argv[1], "fold-despite-corrupt-current")) {
+        fold_despite_corrupt_current();
 #ifdef IMAGE_HOST_CAS_HOOK
     } else if (!strcmp(argv[1], "identity-cas-exhaustion")) {
         identity_cas_exhaustion();

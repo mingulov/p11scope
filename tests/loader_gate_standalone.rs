@@ -677,6 +677,64 @@ fn loader_ticket_harness_bank_binding_stays_local() {
     );
 }
 
+/// Pending-fold watermark: a healthy admission folds the claimed
+/// bank, the retired count is excluded while pending, the retired
+/// epoch still serves, and re-prepare completes without cutting.
+#[test]
+fn loader_ticket_harness_bank_fold_pending_excludes() {
+    drive_tickets(
+        "fold-pending-excludes",
+        &[
+            "ASSERT fold_runs_on_healthy_admission",
+            "ASSERT pending_fold_excluded_from_watermark",
+            "ASSERT retired_epoch_still_serves",
+            "ASSERT reprepare_without_cut_stays",
+        ],
+    );
+}
+
+/// The incarnation guard refuses before spending a ticket.
+#[test]
+fn loader_ticket_harness_bank_guard_spends_nothing() {
+    drive_tickets("guard-spends-nothing", &["ASSERT guard_spends_nothing"]);
+}
+
+/// A corrupt retained cell charges its owning bank, not the current one.
+#[test]
+fn loader_ticket_harness_bank_retained_zero_charges_source() {
+    drive_tickets(
+        "retained-zero-charges-source",
+        &["ASSERT retained_zero_charges_source"],
+    );
+}
+
+/// A retained re-query validates the source domain before serving.
+#[test]
+fn loader_ticket_harness_bank_retained_validates_source() {
+    drive_tickets(
+        "retained-validates-source",
+        &["ASSERT retained_validates_source"],
+    );
+}
+
+/// A quota never cuts into a prepared target with a corrupt epoch.
+#[test]
+fn loader_ticket_harness_bank_cut_refuses_corrupt_target() {
+    drive_tickets(
+        "cut-refuses-corrupt-target",
+        &["ASSERT cut_refuses_corrupt_target"],
+    );
+}
+
+/// Fold help runs even when the current bank refuses as corrupt.
+#[test]
+fn loader_ticket_harness_bank_fold_despite_corrupt_current() {
+    drive_tickets(
+        "fold-despite-corrupt-current",
+        &["ASSERT fold_despite_corrupt_current"],
+    );
+}
+
 /// Selection validation: unpublished, corrupt or missing SELECT
 /// refuses new issues; cut validates its target and prepared bit.
 #[test]

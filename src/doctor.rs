@@ -231,6 +231,45 @@ fn probe_with_host(
 /// real preparation path, never attached.
 const INVENTORY_PREFLIGHT_ROW: &str = "inventory program preflight";
 
+/// Name of the journal-pair availability row: preflight only. It
+/// reports whether this build's production journal object carries a
+/// clean pair; it loads nothing, seals nothing, and its result never
+/// enables linked mode (the seal derives linkage from the actually
+/// loaded pair, not from doctor).
+const JOURNAL_PAIR_ROW: &str = "journal pair preflight";
+
+/// The one build-limit detail for the journal row: a build that omits
+/// the production journal object reports exactly this token on every
+/// host, so extra-strict qualification lists it without counting it.
+const JOURNAL_UNAVAILABLE_IN_BUILD: &str = "unavailable-in-build";
+
+/// Render the attach-derived pair fact as one doctor row. Only a
+/// present, flavor-clean pair reads "available"; every other shape
+/// reads "unavailable" with its finite reason and warns, because the
+/// journal lane is opt-in and its absence must never fail a verdict.
+fn journal_pair_check(preflight: crate::attach::JournalPairPreflight) -> Check {
+    use crate::attach::JournalPairPreflight;
+    let status = match preflight {
+        JournalPairPreflight::Available => Status::Ok("available".into()),
+        JournalPairPreflight::UnavailableInBuild => {
+            Status::Warn(JOURNAL_UNAVAILABLE_IN_BUILD.into())
+        }
+        JournalPairPreflight::PairMissing(reason) => {
+            Status::Warn(format!("unavailable: pair missing ({reason})"))
+        }
+        JournalPairPreflight::LoadError(reason) => {
+            Status::Warn(format!("unavailable: load error ({reason})"))
+        }
+        JournalPairPreflight::WrongDomain(reason) => {
+            Status::Warn(format!("unavailable: wrong domain ({reason})"))
+        }
+    };
+    Check {
+        name: JOURNAL_PAIR_ROW.into(),
+        status,
+    }
+}
+
 /// Load-and-release preflight of the embedded Inventory object:
 /// `inventory --system` needs it, and doctor once reported OK on kernels
 /// where it failed to load. The prepared object drops before return, so
@@ -312,6 +351,7 @@ fn attach_preflight_checks(pid: Option<u32>, cgroup: Option<&Path>) -> Vec<Check
     vec![
         host_check,
         inventory_preflight_check(),
+        journal_pair_check(crate::attach::journal_pair_preflight()),
         Check {
             name: "lifecycle preflight".into(),
             status: status(lifecycle),
@@ -1685,11 +1725,14 @@ pub fn verdict(checks: &[Check]) -> i32 {
 /// No host can clear them, so `--extra-strict` — a host qualification —
 /// lists them without counting them (HIGH-5). Only these exact by-design
 /// values are exempt: any other value (a future catalog) counts as usual.
-const BUILD_LIMIT_ROWS: [(&str, &[&str]); 4] = [
+const BUILD_LIMIT_ROWS: [(&str, &[&str]); 5] = [
     ("loader timing (initial_set)", &["unproven", "none"]),
     ("loader timing (dlopen)", &["unproven", "none"]),
     ("run initial-set capture", &["none"]),
     ("object-attribute capture", &[OBJECT_CAPTURE_P0]),
+    // A build that omits the opt-in production journal object reports
+    // this one token on every host; only this exact value is exempt.
+    (JOURNAL_PAIR_ROW, &[JOURNAL_UNAVAILABLE_IN_BUILD]),
 ];
 
 fn is_build_limit(check: &Check) -> bool {
@@ -2818,11 +2861,11 @@ mod tests {
             &checks.iter().find(|c| c.name == name).unwrap().status
         }
         let checks = probe(None, None);
-        // 13 host/target rows, eight §10.1 rows, four finite preflight rows
-        // (host, inventory, lifecycle, scope), the cgroup version row, the
-        // uprobe-multi self-link row, the PID namespace row, and the
-        // object-attribute capture build row.
-        assert_eq!(checks.len(), 29, "{checks:?}");
+        // 13 host/target rows, eight §10.1 rows, five finite preflight rows
+        // (host, inventory, journal pair, lifecycle, scope), the cgroup
+        // version row, the uprobe-multi self-link row, the PID namespace
+        // row, and the object-attribute capture build row.
+        assert_eq!(checks.len(), 30, "{checks:?}");
         // Never FAIL without --pid: a nested observer only warns here.
         assert!(!matches!(
             by_name_status(&checks, PID_NAMESPACE_ROW),

@@ -23,9 +23,9 @@
 
 use super::counter_collector::{CounterDeltas, CounterRead, ReadStage};
 use super::selected_detail::{
-    AcceptedBracket, BroadBracketCollector, BroadSession, DetailCloseRefusal, DetailCloseReport,
-    DetailWindowCustody, DetailWindowEvent, GatedActivationSource, PreparedChildReceipt,
-    ReserveRefusal, SelectedDetailRefusal,
+    AcceptedBracket, BoundWindow, BroadBracketCollector, BroadSession, DetailCloseRefusal,
+    DetailCloseReport, DetailWindowCustody, DetailWindowEvent, GatedActivationSource,
+    PreparedChildReceipt, ReserveRefusal, SelectedDetailRefusal,
 };
 use crate::attach::Scope;
 use crate::attach::counter_banks::CounterDetailWindow;
@@ -401,7 +401,6 @@ impl PromotionDriver {
     /// (Active installs; anything else reclaims for genuine
     /// disposal). Status events pass to the host's promoter.
     pub(crate) fn poll(&mut self, out: &mut dyn std::io::Write) -> Option<DriverEvent> {
-        use super::selected_detail::BoundWindow;
         match self.lifecycle.poll(out)? {
             LifecycleEvent::Status(update) => {
                 // The flight ended without delivery: abandon the
@@ -529,11 +528,22 @@ impl PromotionDriver {
         Some(update)
     }
 
+    /// Whether an open window awaits its close: an installed lane
+    /// winding down, a reclaim settling, or a bound window a
+    /// terminal status just transferred. The host's next call must be
+    /// [`close`](Self::close), which records the terminal result and
+    /// releases the window's charges and admission; only close clears
+    /// this. Single-flight: the host closes before it reselects.
+    pub(crate) fn pending_close(&self) -> bool {
+        self.open_window.is_some()
+    }
+
     /// Tests-only pose of the open context over state staged
     /// through the real adapter body (reservation, bind downstream of
     /// it, bracket collector, capture seq, current request): stands
     /// in for the CAS-win park (unrunnable unprivileged). Close-path
     /// scenes only: the window must close, never fabricate a CAS.
+    /// Consumes the reservation like the Install arm does.
     #[cfg(test)]
     fn stage_open_window_for_test(
         &mut self,
@@ -545,6 +555,17 @@ impl PromotionDriver {
         self.open_window = Some(window);
         self.brackets = Some(brackets);
         self.seq = seq;
+        self.current = Some(request);
+        self.reserved_for = None;
+    }
+
+    /// Tests-only pose of the flight's current request for a
+    /// bound-completion scene: stands in for [`start`](Self::start)
+    /// recording the request (the worker half stays posed). The
+    /// request must be the flight's own: close joins it to the
+    /// window.
+    #[cfg(test)]
+    fn stage_current_for_test(&mut self, request: PromotionRequest) {
         self.current = Some(request);
     }
 
@@ -1394,29 +1415,22 @@ mod tests {
         )
     }
 
-    /// A taken request over the same viewed pair for posing the
-    /// `Installing` state (the reclaim scene's own request serial).
-    fn take_request_like(proved: &PromotionScene) -> PromotionRequest {
-        use crate::discovery::caller_registry::{CallerId, ModuleId};
-        let mut promoter = Promoter::new();
-        assert!(promoter.enable(crate::inventory_promotion::CaptureId::new(11)));
-        let receipt = crate::inventory_promotion::SelectedEndpointReceipt::new(
-            proved.request.viewed().revision(),
-            proved
-                .request
-                .endpoint()
-                .expect("scene carries a receipt")
-                .file_offset(),
-        );
-        promoter
-            .request_with_endpoint(
-                Arc::clone(proved.request.viewed()),
-                CallerId(3),
-                ModuleId(5),
-                receipt,
-            )
-            .expect("same pair queues again");
-        promoter.take_request().expect("mailbox holds it")
+    /// A posed install handoff over the scene's sealed lane for the
+    /// given binding: reclaim-path scenes only (I4) — the handoff
+    /// must dispose, never install.
+    fn scripted_pending_for(
+        proved: &PromotionScene,
+        binding: SelectedActivationBinding,
+    ) -> crate::inventory_promotion::lifecycle::PendingInstall {
+        use crate::inventory_promotion::lifecycle::{PendingInstall, SelectedActivationProof};
+        let lane = scripted_lane_for(proved, binding);
+        let proof = SelectedActivationProof::mint(
+            &proved.request,
+            binding,
+            crate::inventory_promotion::lifecycle::NativeCasReceipt::scripted(binding),
+        )
+        .expect("matching receipt mints");
+        PendingInstall::from_parts(proof, lane, capacity())
     }
 
     fn settled_failure() -> crate::inventory_promotion::lifecycle::PreparationOutcome {
@@ -2504,16 +2518,11 @@ mod tests {
 
     #[test]
     fn promotion_driver_stop_races_disclose_once_and_never_install() {
-        // Two stop races through the driver. (a) Stop during
-        // preparation: the worker runs to its genuine end, its
-        // outcome is disposed (never CASed), and the stop confirms
-        // exactly once with the orphan abandoned. (b) A host-refused
-        // install: the posed handoff reclaims for genuine disposal,
-        // the settled stop confirms, and the staged window closes
-        // Unactivated with its lineage.
+        // Stop during preparation: the worker runs to its genuine
+        // end, its outcome is disposed (never CASed), and the stop
+        // confirms exactly once with the orphan abandoned.
         use crate::attach::counter_banks::BroadToggleFacts;
         use crate::inventory_promotion::PromotionOutcome;
-        use crate::inventory_promotion::lifecycle::{PendingInstall, SelectedActivationProof};
         let pool = test_pool();
         let scene = stage_single_provider(pool, 4);
         let convert = convert_for(&scene.plan, scene.object);
@@ -2608,14 +2617,30 @@ mod tests {
             vec!["reserved", "cancelled_unactivated", "promotion_outcome"],
             "stop rows order: {names:?}"
         );
+    }
 
-        // (b) The host refuses the posed install through the
-        // driver: reclaim for genuine disposal, settle to the
-        // terminal status, then close the staged Unactivated window
-        // with its lineage. Reclaim with nothing outstanding fails
-        // closed, returning the handoff.
+    #[test]
+    fn promotion_driver_refused_binding_transfers_parked_window_to_close() {
+        // An activation refusal parks its bound window in custody
+        // BEFORE the terminal status: the status transfers the
+        // parked window to the pending-close context (never strands
+        // it), and the close records the terminal result — one
+        // outcome row, one close row, released charges and admission,
+        // and a reselect that succeeds.
+        use crate::attach::counter_banks::BroadToggleFacts;
+        use crate::inventory_promotion::PromotionOutcome;
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
         let mut driver = PromotionDriver::new();
-        let proved_b = promotion_scene(
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: BroadToggleFacts {
+                generation: broad_generation(),
+                stopped: false,
+            },
+        };
+        let rows = scene.plan.slots.len();
+        let proved_b1 = promotion_scene(
             convert_for(&scene.plan, scene.object),
             scene.objects.clone(),
             scene.object,
@@ -2623,49 +2648,8 @@ mod tests {
             0xC01,
             0xE9F,
         );
-        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("domain mints");
-        let binding = expected_binding(domain, 9, 0xC01, 0xE9F);
-        let lane = scripted_lane_for(&proved_b, binding);
-        let proof = SelectedActivationProof::mint(
-            &proved_b.request,
-            binding,
-            crate::inventory_promotion::lifecycle::NativeCasReceipt::scripted(binding),
-        )
-        .expect("matching receipt mints");
-        let pending = PendingInstall::from_parts(proof, lane, capacity());
-        driver
-            .reclaim(pending, Some(PromotionEnd::Cancelled))
-            .expect_err("nothing outstanding, nothing reclaims");
-        driver.seed_installing_for_test(take_request_like(&proved_b));
-        let lane = scripted_lane_for(&proved_b, binding);
-        let proof = SelectedActivationProof::mint(
-            &proved_b.request,
-            binding,
-            crate::inventory_promotion::lifecycle::NativeCasReceipt::scripted(binding),
-        )
-        .expect("matching receipt mints");
-        let pending = PendingInstall::from_parts(proof, lane, capacity());
-        driver
-            .reclaim(pending, Some(PromotionEnd::Cancelled))
-            .expect("posed handoff reclaims");
-        let DriverEvent::Status(update) =
-            driver_poll_until(&mut driver, Duration::from_secs(30)).expect("reclaim settles")
-        else {
-            panic!("a reclaimed handoff never installs");
-        };
-        assert!(matches!(
-            update.outcome,
-            PromotionOutcome::Ended {
-                reason: PromotionEnd::Cancelled,
-            }
-        ));
-        assert!(driver.is_idle());
-        // The staged window closes Unactivated with its lineage.
-        use super::super::selected_detail::reserve_detail_window_on_banks_collecting;
-        let custody = DetailWindowCustody::new();
-        let mut brackets = BroadBracketCollector::new(4, 0, scene.pool.reserver());
-        let mut seq = 0u64;
-        let before = scripted_read(
+        let charged_b1 = scene.pool.snapshot().charged_bytes;
+        let before_b1 = scripted_read(
             &scene.pool,
             &scene.plan,
             broad_generation(),
@@ -2673,31 +2657,63 @@ mod tests {
             &counts_for(&scene.plan, 7, 7),
             window_of(50, 60),
         );
-        reserve_detail_window_on_banks_collecting(
-            &scene.banks,
-            BroadToggleFacts {
-                generation: broad_generation(),
-                stopped: false,
-            },
-            &scene.plan,
-            &scene.objects,
-            &proved_b.request,
-            &proved_b.bundle,
-            &mut brackets,
-            &mut seq,
-            Ok(before),
-            &scene.pool.reserver(),
-            &custody,
-        )
-        .expect("reclaim scene reserves");
-        let reservation = custody.take_reserved().expect("reservation parks");
-        driver.stage_open_window_for_test(
-            reservation.bind_generation(9),
-            brackets,
-            seq,
-            proved_b.request,
+        driver
+            .reserve(
+                &broad,
+                &scene.plan,
+                &scene.objects,
+                &proved_b1.request,
+                &proved_b1.bundle,
+                Ok(before_b1),
+                rows,
+                0,
+                &scene.pool,
+            )
+            .expect("refusal scene reserves");
+        // The CAS seam's park, through the driver's own custody: take
+        // the reservation once, bind its sealed generation, park
+        // Unactivated — exactly the state a binding refusal leaves.
+        let reservation = driver.custody.take_reserved().expect("reservation parks");
+        driver
+            .custody
+            .place_bound(BoundWindow::Unactivated(reservation.bind_generation(9)))
+            .expect("vacant slot parks the bound window");
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("domain mints");
+        let pending = scripted_pending_for(&proved_b1, expected_binding(domain, 9, 0xC01, 0xE9F));
+        let request_b1 = proved_b1.request.id();
+        // `start` would have recorded the flight's request; the
+        // worker half stays posed, so the request poses with it.
+        driver.stage_current_for_test(proved_b1.request.clone());
+        driver.seed_installing_for_test(proved_b1.request);
+        driver
+            .reclaim(pending, None)
+            .expect("activation failure reclaims for genuine disposal");
+        assert!(
+            !driver.pending_close(),
+            "nothing awaits its close before the terminal status"
         );
-        let after = scripted_read(
+        let DriverEvent::Status(update) =
+            driver_poll_until(&mut driver, Duration::from_secs(30)).expect("reclaim settles")
+        else {
+            panic!("a reclaimed handoff never installs");
+        };
+        assert!(
+            matches!(
+                update.outcome,
+                PromotionOutcome::Refused {
+                    reason: PromotionRefusal::ActivationFailed,
+                }
+            ),
+            "activation failure refuses by name: {:?}",
+            update.outcome
+        );
+        assert_eq!(update.request, request_b1);
+        assert!(driver.is_idle(), "settled refusal idles the service");
+        assert!(
+            driver.pending_close(),
+            "the terminal status transfers the parked window to its close"
+        );
+        let after_b1 = scripted_read(
             &scene.pool,
             &scene.plan,
             broad_generation(),
@@ -2706,9 +2722,13 @@ mod tests {
             window_of(60, 70),
         );
         let report = driver
-            .close(&broad, &scene.plan, CounterMode::Counts, Ok(after))
-            .expect("Unactivated close delivers");
+            .close(&broad, &scene.plan, CounterMode::Counts, Ok(after_b1))
+            .expect("transferred window closes");
         assert_eq!((report.seq_before, report.seq_after), (1, 2));
+        assert!(
+            !driver.pending_close(),
+            "the close consumes the pending context"
+        );
         let names: Vec<&str> = driver
             .ledger()
             .events
@@ -2717,9 +2737,213 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["promotion_outcome", "closed"],
+            vec!["reserved", "promotion_outcome", "closed"],
+            "refusal rows order: {names:?}"
+        );
+        assert_eq!(
+            scene.pool.snapshot().charged_bytes,
+            charged_b1,
+            "the terminal close releases every charge"
+        );
+        assert!(
+            !driver.custody.is_occupied(),
+            "the terminal close releases admission"
+        );
+        // A reselect reserves: nothing stranded, nothing wedged.
+        let proved_b1_next = promotion_scene(
+            convert_for(&scene.plan, scene.object),
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80),
+            0xC02,
+            0xEA0,
+        );
+        let before_next = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            broad_generation(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 11, 11),
+            window_of(70, 80),
+        );
+        driver
+            .reserve(
+                &broad,
+                &scene.plan,
+                &scene.objects,
+                &proved_b1_next.request,
+                &proved_b1_next.bundle,
+                Ok(before_next),
+                rows,
+                0,
+                &scene.pool,
+            )
+            .expect("reselect reserves after the terminal close");
+
+    }
+
+    #[test]
+    fn promotion_driver_reclaimed_open_window_closes_after_terminal_status() {
+        // A host-refused install with the open window already in
+        // place BEFORE disposal settles (as the Install arm leaves
+        // it): the terminal status keeps the window's context, and
+        // the close records it directly — no post-status restore.
+        // Reclaim with nothing outstanding still fails closed,
+        // returning the handoff.
+        use crate::attach::counter_banks::BroadToggleFacts;
+        use crate::inventory_promotion::PromotionOutcome;
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut driver = PromotionDriver::new();
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts: BroadToggleFacts {
+                generation: broad_generation(),
+                stopped: false,
+            },
+        };
+        let rows = scene.plan.slots.len();
+        let proved_b2 = promotion_scene(
+            convert_for(&scene.plan, scene.object),
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80),
+            0xC03,
+            0xEA1,
+        );
+        let charged_b2 = scene.pool.snapshot().charged_bytes;
+        let before_b2 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            broad_generation(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 7, 7),
+            window_of(50, 60),
+        );
+        driver
+            .reserve(
+                &broad,
+                &scene.plan,
+                &scene.objects,
+                &proved_b2.request,
+                &proved_b2.bundle,
+                Ok(before_b2),
+                rows,
+                0,
+                &scene.pool,
+            )
+            .expect("reclaim scene reserves");
+        // Open through the driver's own custody, as the CAS seam and
+        // Install arm do: take once, bind, hold open with the
+        // reserve's own brackets, seq and request.
+        let reservation = driver.custody.take_reserved().expect("reservation parks");
+        let window = reservation.bind_generation(9);
+        let brackets = driver.brackets.take().expect("reserve staged brackets");
+        let seq = driver.seq;
+        let request_b2 = proved_b2.request.id();
+        driver.stage_open_window_for_test(window, brackets, seq, proved_b2.request.clone());
+        let domain = crate::attach::capture::NativeDomainId::try_mint().expect("domain mints");
+        let binding = expected_binding(domain, 9, 0xC03, 0xEA1);
+        let probe = scripted_pending_for(&proved_b2, binding);
+        driver
+            .reclaim(probe, Some(PromotionEnd::Cancelled))
+            .expect_err("nothing outstanding, nothing reclaims");
+        let pending = scripted_pending_for(&proved_b2, binding);
+        driver.seed_installing_for_test(proved_b2.request);
+        driver
+            .reclaim(pending, Some(PromotionEnd::Cancelled))
+            .expect("posed handoff reclaims");
+        assert!(
+            driver.pending_close(),
+            "the open window awaits its close across disposal"
+        );
+        let DriverEvent::Status(update) =
+            driver_poll_until(&mut driver, Duration::from_secs(30)).expect("reclaim settles")
+        else {
+            panic!("a reclaimed handoff never installs");
+        };
+        assert!(
+            matches!(
+                update.outcome,
+                PromotionOutcome::Ended {
+                    reason: PromotionEnd::Cancelled,
+                }
+            ),
+            "reclaim confirms by name: {:?}",
+            update.outcome
+        );
+        assert_eq!(update.request, request_b2);
+        assert!(driver.is_idle(), "settled reclaim idles the service");
+        assert!(
+            driver.pending_close(),
+            "the terminal status keeps the open context"
+        );
+        let after_b2 = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            broad_generation(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 10, 10),
+            window_of(60, 70),
+        );
+        let report = driver
+            .close(&broad, &scene.plan, CounterMode::Counts, Ok(after_b2))
+            .expect("open window closes after its terminal status");
+        assert_eq!((report.seq_before, report.seq_after), (1, 2));
+        assert!(
+            !driver.pending_close(),
+            "the close consumes the pending context"
+        );
+        let names: Vec<&str> = driver
+            .ledger()
+            .events
+            .iter()
+            .map(|row| row["event"].as_str().unwrap_or("<?>"))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["reserved", "promotion_outcome", "closed"],
             "reclaim rows order: {names:?}"
         );
+        assert_eq!(
+            scene.pool.snapshot().charged_bytes,
+            charged_b2,
+            "the terminal close releases every charge"
+        );
+        assert!(
+            !driver.custody.is_occupied(),
+            "the terminal close releases admission"
+        );
+        // A reselect reserves: nothing stranded, nothing wedged.
+        let proved_b2_next = promotion_scene(
+            convert_for(&scene.plan, scene.object),
+            scene.objects.clone(),
+            scene.object,
+            Some(0x80),
+            0xC04,
+            0xEA2,
+        );
+        let before_next = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            broad_generation(),
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 11, 11),
+            window_of(70, 80),
+        );
+        driver
+            .reserve(
+                &broad,
+                &scene.plan,
+                &scene.objects,
+                &proved_b2_next.request,
+                &proved_b2_next.bundle,
+                Ok(before_next),
+                rows,
+                0,
+                &scene.pool,
+            )
+            .expect("reselect reserves after the terminal close");
     }
 
     #[test]

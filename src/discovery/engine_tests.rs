@@ -7934,9 +7934,30 @@ fn wait_manifest_helper_exit(
     cpu_tick_cap: u64,
 ) -> bool {
     use std::os::fd::AsRawFd as _;
-    let _ = pid;
-    let _ = cpu_tick_cap;
-    system_scope_poll_fd(pidfd.as_raw_fd(), stall_limit).unwrap_or(false)
+    let slice = std::time::Duration::from_millis(250);
+    let first_cpu = manifest_helper_cpu_ticks(pid);
+    let mut last_cpu = first_cpu;
+    let mut stalled_since = std::time::Instant::now();
+    loop {
+        match system_scope_poll_fd(pidfd.as_raw_fd(), slice) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+        let cpu = manifest_helper_cpu_ticks(pid);
+        if cpu != last_cpu {
+            last_cpu = cpu;
+            stalled_since = std::time::Instant::now();
+        }
+        if let (Some(cpu), Some(first)) = (cpu, first_cpu)
+            && cpu.saturating_sub(first) > cpu_tick_cap
+        {
+            return false;
+        }
+        if stalled_since.elapsed() >= stall_limit {
+            return false;
+        }
+    }
 }
 
 #[test]

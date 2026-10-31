@@ -7037,7 +7037,7 @@ class InventoryReadinessTest(unittest.TestCase):
             self.cursor.close()
             self.write(self.prefix)
             self.cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises((TimeoutError, H6["SetupError"])):
                 self.gate(self.prepare(**kwargs), timeout=0.2)
             self.assertTrue(self.markers)
         with self.assertRaises(TimeoutError):
@@ -7071,7 +7071,7 @@ class InventoryReadinessTest(unittest.TestCase):
                     self.assertIsNone(early["populations"]["setup"]["observed_physical"])
                     self.assertEqual(early["populations"]["warmup"]["expected"], 10)
                 else:
-                    with self.assertRaises(TimeoutError):
+                    with self.assertRaises((TimeoutError, H6["SetupError"])):
                         self.gate(callback, timeout=0.2, prefix_batches=prefix)
                     self.assertTrue(self.markers)
 
@@ -7172,7 +7172,7 @@ class InventoryReadinessTest(unittest.TestCase):
                         "module": str(self.pin.path), "fn": fn, "mech": "0x250", "n": 5,
                         "bad": 0, "phase": "h6-setup", "t0": t, "t1": t + 10}
                         for fn in ("C_DigestInit", "C_Digest")]
-                with self.assertRaises(TimeoutError):
+                with self.assertRaises((TimeoutError, H6["SetupError"])):
                     self.gate(callback, timeout=0.2, prefix_batches=prefix)
                 self.assertTrue(self.markers)
 

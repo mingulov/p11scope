@@ -9571,6 +9571,18 @@ impl LoadedSeedProvider {
         wait_loaded_seed_peer(self.peers.last_mut().unwrap(), &runner, &library, |_| {});
         pid
     }
+
+    fn respawn_peer(&mut self, pid: u32) -> u32 {
+        let position = self
+            .peers
+            .iter()
+            .position(|child| child.id() == pid)
+            .unwrap_or_else(|| panic!("respawn target {pid} is not a fixture peer"));
+        let mut child = self.peers.remove(position);
+        let _ = child.kill();
+        let _ = child.wait();
+        self.spawn_peer()
+    }
 }
 
 fn wait_loaded_seed_peer(
@@ -37172,6 +37184,169 @@ fn wait_peer_mapped(pid: u32, soname: &str) {
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+/// Normalized `/proc/<pid>/maps` census of one seed peer: one
+/// `(permissions, path, path length)` entry per maps line, sorted.
+/// Addresses and fixture tempdir names are ignored (file paths reduce to
+/// their final component); every line counts, because a deep scan charges
+/// work per maps line in several places, so two peers whose censuses
+/// differ by one line cannot charge identical scan work.
+type PeerMapsCensus = Vec<(String, String, usize)>;
+
+fn maps_census_of_text(maps: &str) -> PeerMapsCensus {
+    let mut census: PeerMapsCensus = maps
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let _address = fields.next();
+            let permissions = fields.next().unwrap_or_default().to_string();
+            let _offset = fields.next();
+            let _device = fields.next();
+            let _inode = fields.next();
+            let raw_path = fields.collect::<Vec<_>>().join(" ");
+            let normalized = if raw_path.starts_with('/') {
+                raw_path.rsplit('/').next().unwrap_or(&raw_path).to_string()
+            } else {
+                raw_path.clone()
+            };
+            (permissions, normalized, raw_path.len())
+        })
+        .collect();
+    census.sort();
+    census
+}
+
+fn peer_maps_census(pid: u32) -> PeerMapsCensus {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+        .unwrap_or_else(|_| panic!("owned peer {pid} must stay alive"));
+    maps_census_of_text(&maps)
+}
+
+/// Respawn fixture peers until every peer's maps census equals the target
+/// census (`expected`, or the first peer's census when none is given), and
+/// return that census. Peers are only replaced before any view is opened
+/// on them. The settle wait in `spawn_peer` proves a peer's maps hold
+/// still; it does not prove two peers settled on the same census, because
+/// the loader occasionally merges one anonymous mapping in one peer.
+fn align_peer_census(
+    fixture: &mut LoadedSeedProvider,
+    peers: &mut [u32],
+    expected: Option<&PeerMapsCensus>,
+) -> PeerMapsCensus {
+    assert!(!peers.is_empty(), "census alignment needs a peer");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut target: Option<PeerMapsCensus> = expected.cloned();
+    // Censuses produced by peers that missed a freely chosen target,
+    // counted as they are observed. If one alternative keeps recurring,
+    // the anchor peer is the odd one out and the target re-anchors to it
+    // instead of respawning every other peer looking for a rare census.
+    let mut misses: BTreeMap<PeerMapsCensus, usize> = BTreeMap::new();
+    loop {
+        let censuses: Vec<PeerMapsCensus> =
+            peers.iter().map(|pid| peer_maps_census(*pid)).collect();
+        let target = target.get_or_insert_with(|| censuses[0].clone());
+        if censuses.iter().all(|census| census == target) {
+            return target.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "peer maps censuses never aligned to {target:?}: {censuses:?}"
+        );
+        if expected.is_none()
+            && let Some((alternative, count)) = misses
+                .iter()
+                .filter(|(census, _)| *census != target)
+                .max_by_key(|(_, count)| *count)
+            && *count >= 4
+        {
+            let alternative = alternative.clone();
+            target.clone_from(&alternative);
+            continue;
+        }
+        let mismatched = censuses
+            .iter()
+            .position(|census| census != target)
+            .expect("a mismatch was just observed");
+        if expected.is_none() {
+            *misses.entry(censuses[mismatched].clone()).or_default() += 1;
+        }
+        let target = target.clone();
+        peers[mismatched] = fixture.respawn_peer(peers[mismatched]);
+        if expected.is_none() {
+            let fresh = peer_maps_census(peers[mismatched]);
+            if fresh != target {
+                *misses.entry(fresh).or_default() += 1;
+            }
+        }
+    }
+}
+
+#[test]
+fn peer_maps_census_normalizes_addresses_but_counts_every_line() {
+    let one = "00001000-00002000 r-xp 00001000 00:23 10 /var/tmp/aaaa/seed-provider.so\n\
+               00002000-00003000 rw-p 00000000 00:00 0\n\
+               00003000-00004000 rw-p 00000000 00:00 0 [heap]\n";
+    let same = "0000a000-0000b000 r-xp 00001000 00:23 99 /var/tmp/bbbb/seed-provider.so\n\
+                0000c000-0000d000 rw-p 00000000 00:00 0\n\
+                0000e000-0000f000 rw-p 00000000 00:00 0 [heap]\n";
+    assert_eq!(
+        maps_census_of_text(one),
+        maps_census_of_text(same),
+        "addresses, inodes and tempdir names do not charge scan work"
+    );
+    let one_more_line = format!("{one}00005000-00006000 rw-p 00000000 00:00 0\n");
+    assert_ne!(
+        maps_census_of_text(one),
+        maps_census_of_text(&one_more_line),
+        "one more maps line charges scan work and must change the census"
+    );
+    let longer_path = one.replace("aaaa", "aaaaa");
+    assert_ne!(
+        maps_census_of_text(one),
+        maps_census_of_text(&longer_path),
+        "dependency validation charges per path byte"
+    );
+}
+
+#[test]
+fn peer_census_alignment_respawns_a_mismatched_peer() {
+    let (mut fixture, _view, _module, _pins) = loaded_seed_provider();
+    let good = fixture.spawn_peer();
+    let expected = peer_maps_census(good);
+    // A foreign owned child is a peer with a proven different census.
+    let alien = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn the mismatched peer");
+    let alien_pid = alien.id();
+    fixture.peers.push(alien);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_link(format!("/proc/{alien_pid}/exe"))
+        .is_ok_and(|exe| exe.ends_with("sleep"))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mismatched peer {alien_pid} never exec'd sleep"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_ne!(
+        peer_maps_census(alien_pid),
+        expected,
+        "the injected peer must start mismatched"
+    );
+    let mut peers = [good, alien_pid];
+    let aligned = align_peer_census(&mut fixture, &mut peers, Some(&expected));
+    assert_eq!(aligned, expected);
+    assert_eq!(peers[0], good, "the matching peer is left alone");
+    assert_ne!(peers[1], alien_pid, "the mismatched peer was respawned");
+    assert_eq!(peer_maps_census(peers[1]), expected);
+    // Healthy control: aligning an already aligned pair respawns nothing.
+    let settled = peers;
+    let again = align_peer_census(&mut fixture, &mut peers, Some(&expected));
+    assert_eq!(again, expected);
+    assert_eq!(peers, settled, "aligned peers are never respawned");
 }
 
 /// H5 positive: a fresh EXEC head parked at a full request map waits while

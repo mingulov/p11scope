@@ -621,7 +621,248 @@
           }
         },
         "pid_descendant_gaps": {"type": "integer", "minimum": 0},
-        "multi_rebuild_gaps": {"type": "integer", "minimum": 0}
+        "multi_rebuild_gaps": {"type": "integer", "minimum": 0},
+        "selected_detail": {
+          "description": "Optional additive 6.15 endpoint-selection envelope (--select-endpoint beside counter captures). Closed nested shape; the release oracle is the enforcement behind this file. Never carries process identity.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["events"],
+          "properties": {
+            "selection": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["endpoint"],
+              "properties": {
+                "endpoint": {"type": "string", "minLength": 1},
+                "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "names": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                "refusal": {"enum": [
+                  "promotion_disabled", "promotion_busy", "promotion_duplicate",
+                  "promotion_already_detailed", "promotion_exhausted",
+                  "promotion_foreign_capture", "promotion_stale_view",
+                  "promotion_unknown_caller", "promotion_caller_retired",
+                  "promotion_caller_changed", "promotion_provider_changed",
+                  "promotion_provider_unloaded", "promotion_manifest_unavailable",
+                  "promotion_endpoint_ambiguous", "promotion_endpoint_dependency",
+                  "promotion_scope_ended", "promotion_scope_unsupported",
+                  "promotion_preparation_failed", "promotion_activation_failed",
+                  "promotion_capacity", "broad_not_counter", "broad_stopping",
+                  "child_shape", "not_published", "foreign", "changed",
+                  "quarantined", "budget", "endpoint_unresolved",
+                  "child_foreign_slot", "broad_plan_topology", "window_active",
+                  "endpoint_unknown", "bundle_unavailable"
+                ]}
+              },
+              "allOf": [
+                {"if": {"required": ["slot"]}, "then": {"required": ["endpoint", "slot", "file_offset"]}},
+                {"if": {"required": ["file_offset"]}, "then": {"required": ["endpoint", "slot", "file_offset"]}}
+              ]
+            },
+            "events": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "seq"],
+                    "properties": {
+                      "event": {"enum": ["reserved", "bound", "cas_won", "cas_refused", "closed", "cancelled_unactivated"]},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "seq": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "note": {"type": "string"}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "view", "endpoint_offset", "refusal"],
+                    "properties": {
+                      "event": {"const": "close_refused"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "view": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "endpoint_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "refusal": {"enum": ["broad_not_counter", "broad_stopping", "child_shape", "not_published", "foreign", "changed", "quarantined", "budget"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "refusal", "seq"],
+                    "properties": {
+                      "event": {"const": "reserve_refused"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "refusal": {"enum": ["broad_not_counter", "broad_stopping", "child_shape", "not_published", "foreign", "changed", "quarantined", "budget", "endpoint_unresolved", "child_foreign_slot", "broad_plan_topology", "window_active"]},
+                      "seq": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "caller", "provider", "reason"],
+                    "properties": {
+                      "event": {"const": "start_refused"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "reason": {"enum": ["control disabled", "another promotion is outstanding", "same pair already requested", "pair already detailed", "request serials exhausted", "foreign capture", "view expired", "unknown caller", "caller retired", "caller identity changed", "provider changed", "provider unloaded", "no manifest permission", "ambiguous endpoints", "dependency endpoints outside closure", "parent scope ended", "parent scope unsupported", "preparation failed", "activation failed", "install capacity unavailable"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "outcome", "reason"],
+                    "properties": {
+                      "event": {"const": "promotion_outcome"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "outcome": {"const": "refused"},
+                      "reason": {"enum": ["control disabled", "another promotion is outstanding", "same pair already requested", "pair already detailed", "request serials exhausted", "foreign capture", "view expired", "unknown caller", "caller retired", "caller identity changed", "provider changed", "provider unloaded", "no manifest permission", "ambiguous endpoints", "dependency endpoints outside closure", "parent scope ended", "parent scope unsupported", "preparation failed", "activation failed", "install capacity unavailable"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "outcome", "reason"],
+                    "properties": {
+                      "event": {"const": "promotion_outcome"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "outcome": {"const": "ended"},
+                      "reason": {"enum": ["cancelled by operator", "run stopped", "lane closed"]}
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["event", "request", "outcome", "caller", "provider"],
+                    "properties": {
+                      "event": {"const": "promotion_outcome"},
+                      "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                      "outcome": {"const": "active"},
+                      "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                      "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+                    }
+                  }
+                ]
+              }
+            },
+            "lineage": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["request", "caller", "provider", "view", "endpoint_offset", "broad_original_index", "broad_generation", "detail_generation", "broad_read_seq_before", "broad_read_seq_after", "broad_mark_before", "broad_mark_after", "drift", "after_read"],
+              "properties": {
+                "request": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "caller": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "provider": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "view": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "endpoint_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_original_index": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "broad_generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+                "detail_generation": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_read_seq_before": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_read_seq_after": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "broad_mark_before": {"$ref": "#/$defs/selected_detail_bracket_mark"},
+                "broad_mark_after": {"$ref": "#/$defs/selected_detail_bracket_mark"},
+                "drift": {
+                  "anyOf": [
+                    {"type": "null"},
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "generation"},
+                        "before": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+                        "after": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "indices"},
+                        "before": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}},
+                        "after": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "bank", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "bank_ids"},
+                        "bank": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                        "before": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295},
+                        "after": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "before", "after"],
+                      "properties": {
+                        "kind": {"const": "transaction"},
+                        "before": {"type": ["integer", "null"], "minimum": 1, "maximum": 18446744073709551615},
+                        "after": {"type": ["integer", "null"], "minimum": 1, "maximum": 18446744073709551615}
+                      }
+                    }
+                  ]
+                },
+                "after_read": {"enum": ["matched", "unavailable", "mismatched:generation", "mismatched:mode", "mismatched:read_failed", "mismatched:health", "mismatched:kernel", "mismatched:rows", "mismatched:rejected"]}
+              }
+            },
+            "aggregate": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["scope", "unit", "mode", "seq_before", "seq_after", "mode_mixed", "rows"],
+              "properties": {
+                "scope": {"const": "broad"},
+                "unit": {"const": "calls"},
+                "mode": {"enum": ["counts", "timestamps", "latency"]},
+                "seq_before": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "seq_after": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "mode_mixed": {"type": "boolean"},
+                "rows": {
+                  "type": "array",
+                  "items": {"anyOf": [{"$ref": "#/$defs/selected_detail_row_counts"}, {"$ref": "#/$defs/selected_detail_row_timestamps"}, {"$ref": "#/$defs/selected_detail_row_latency"}]}
+                }
+              },
+              "allOf": [
+                {"if": {"properties": {"mode": {"const": "counts"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_counts"}}}}},
+                {"if": {"properties": {"mode": {"const": "timestamps"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_timestamps"}}}}},
+                {"if": {"properties": {"mode": {"const": "latency"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_latency"}}}}}
+              ]
+            },
+            "detail": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["scope", "unit", "mode", "detail_generation", "mode_mixed", "rows"],
+              "properties": {
+                "scope": {"const": "detail"},
+                "unit": {"const": "calls"},
+                "mode": {"enum": ["counts", "timestamps", "latency"]},
+                "detail_generation": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "mode_mixed": {"type": "boolean"},
+                "rows": {
+                  "type": "array",
+                  "items": {"anyOf": [{"$ref": "#/$defs/selected_detail_row_counts"}, {"$ref": "#/$defs/selected_detail_row_timestamps"}, {"$ref": "#/$defs/selected_detail_row_latency"}]}
+                }
+              },
+              "allOf": [
+                {"if": {"properties": {"mode": {"const": "counts"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_counts"}}}}},
+                {"if": {"properties": {"mode": {"const": "timestamps"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_timestamps"}}}}},
+                {"if": {"properties": {"mode": {"const": "latency"}}}, "then": {"properties": {"rows": {"items": {"$ref": "#/$defs/selected_detail_row_latency"}}}}}
+              ]
+            }
+          }
+        }
       }
     },
     "functions": {
@@ -815,6 +1056,80 @@
         "name": {"enum": ["null", "exact_standard", "other", "unreadable"]},
         "version": {"enum": ["null", "unreadable", "v2_40", "v3_0", "v3_1", "v3_2", "other"]},
         "flags": {"enum": ["zero", "fork_safe", "other"]}
+      }
+    },
+    "selected_detail_bracket_mark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq", "generation", "indices", "bank_ids", "transaction"],
+      "properties": {
+        "seq": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "indices": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}},
+        "bank_ids": {
+          "type": "array",
+          "items": {
+            "type": "array", "minItems": 2, "maxItems": 2,
+            "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+          }
+        },
+        "transaction": {"type": ["integer", "null"], "minimum": 1, "maximum": 18446744073709551615}
+      }
+    },
+    "selected_detail_rv_counts": {
+      "description": "Return-value rows keyed by the canonical decimal u64 the collector renders; possibly empty.",
+      "type": "object",
+      "propertyNames": {"pattern": "^(0|[1-9][0-9]*)$"},
+      "additionalProperties": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+    },
+    "selected_detail_row_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "object", "file_offset", "entered", "returned", "errors", "rv_counts"],
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "object": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "entered": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "returned": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "errors": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "rv_counts": {"$ref": "#/$defs/selected_detail_rv_counts"}
+      }
+    },
+    "selected_detail_row_timestamps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "object", "file_offset", "entered", "returned", "errors", "rv_counts", "total_ns", "max_ns"],
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "object": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "entered": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "returned": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "errors": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "rv_counts": {"$ref": "#/$defs/selected_detail_rv_counts"},
+        "total_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "max_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+      }
+    },
+    "selected_detail_row_latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "object", "file_offset", "entered", "returned", "errors", "rv_counts", "total_ns", "max_ns", "buckets"],
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "object": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "file_offset": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "entered": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "returned": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "errors": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "rv_counts": {"$ref": "#/$defs/selected_detail_rv_counts"},
+        "total_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "max_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "buckets": {
+          "type": "array", "minItems": 32, "maxItems": 32,
+          "items": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+        }
       }
     }
   }

@@ -302,6 +302,106 @@ COUNTER_COLLECTION_FAILURES = {
     "mode", "generation_rollback", "limits", "saturated", "contended",
     "kernel_evidence", "fold_overflow", "regressed", "projection",
 }
+# 6.15 endpoint selection: the additive `selected_detail` envelope the
+# metrics composer adds beside --select-endpoint captures
+# (src/metrics/selected_detail_driver.rs is the producer authority).
+# Closed nested shape, finite vocabularies. The envelope never carries
+# raw PID/TID (allowlist-v1): `original_pid` is not a permitted key
+# anywhere below, and no nested field publishes process identity.
+SELECTED_DETAIL_KEYS = {"selection", "events", "lineage", "aggregate", "detail"}
+SELECTED_DETAIL_REQUIRED = {"events"}
+SELECTED_DETAIL_SELECTION_KEYS = {"endpoint", "slot", "file_offset", "names", "refusal"}
+SELECTED_DETAIL_SELECTION_REQUIRED = {"endpoint"}
+# SelectedDriverRefusal::name: the promotion_* snake words, the adapter
+# words (gate words plus endpoint/child/topology/window), and the two
+# driver words. Every selection refusal is one of these, never a label.
+SELECTED_DETAIL_GATE_WORDS = {
+    "broad_not_counter", "broad_stopping", "child_shape", "not_published",
+    "foreign", "changed", "quarantined", "budget",
+}
+SELECTED_DETAIL_ADAPTER_WORDS = SELECTED_DETAIL_GATE_WORDS | {
+    "endpoint_unresolved", "child_foreign_slot", "broad_plan_topology",
+    "window_active",
+}
+SELECTED_DETAIL_SELECTION_REFUSALS = {
+    "promotion_disabled", "promotion_busy", "promotion_duplicate",
+    "promotion_already_detailed", "promotion_exhausted",
+    "promotion_foreign_capture", "promotion_stale_view",
+    "promotion_unknown_caller", "promotion_caller_retired",
+    "promotion_caller_changed", "promotion_provider_changed",
+    "promotion_provider_unloaded", "promotion_manifest_unavailable",
+    "promotion_endpoint_ambiguous", "promotion_endpoint_dependency",
+    "promotion_scope_ended", "promotion_scope_unsupported",
+    "promotion_preparation_failed", "promotion_activation_failed",
+    "promotion_capacity",
+    *SELECTED_DETAIL_ADAPTER_WORDS,
+    "endpoint_unknown", "bundle_unavailable",
+}
+# DetailWindowEvent::name: the seq-shaped window rows. `close_refused`
+# has its own row shape (view/endpoint_offset/refusal, no seq) from
+# render_close_refused_row; the other six share the window-event shape.
+SELECTED_DETAIL_WINDOW_EVENTS = {
+    "reserved", "bound", "cas_won", "cas_refused", "closed",
+    "cancelled_unactivated",
+}
+SELECTED_DETAIL_WINDOW_ROW_KEYS = {"event", "request", "caller", "provider", "seq"}
+SELECTED_DETAIL_CLOSE_REFUSED_KEYS = {
+    "event", "request", "caller", "provider", "view", "endpoint_offset",
+    "refusal",
+}
+SELECTED_DETAIL_RESERVE_REFUSED_KEYS = {
+    "event", "request", "caller", "provider", "refusal", "seq",
+}
+SELECTED_DETAIL_START_REFUSED_KEYS = {
+    "event", "request", "caller", "provider", "reason",
+}
+# PromotionRefusal::label / PromotionEnd::label: the human reason words
+# the outcome and start-refused rows carry (distinct from the snake
+# refusal words the selection record carries).
+SELECTED_DETAIL_REFUSAL_LABELS = {
+    "control disabled", "another promotion is outstanding",
+    "same pair already requested", "pair already detailed",
+    "request serials exhausted", "foreign capture", "view expired",
+    "unknown caller", "caller retired", "caller identity changed",
+    "provider changed", "provider unloaded", "no manifest permission",
+    "ambiguous endpoints", "dependency endpoints outside closure",
+    "parent scope ended", "parent scope unsupported", "preparation failed",
+    "activation failed", "install capacity unavailable",
+}
+SELECTED_DETAIL_END_LABELS = {
+    "cancelled by operator", "run stopped", "lane closed",
+}
+SELECTED_DETAIL_OUTCOMES = {"refused", "ended", "active"}
+SELECTED_DETAIL_LINEAGE_KEYS = {
+    "request", "caller", "provider", "view", "endpoint_offset",
+    "broad_original_index", "broad_generation", "detail_generation",
+    "broad_read_seq_before", "broad_read_seq_after",
+    "broad_mark_before", "broad_mark_after", "drift", "after_read",
+}
+SELECTED_DETAIL_MARK_KEYS = {
+    "seq", "generation", "indices", "bank_ids", "transaction",
+}
+SELECTED_DETAIL_DRIFT_KINDS = {"generation", "indices", "bank_ids", "transaction"}
+# CloseBracketVerdict rendering: matched, unavailable, or the first
+# mismatch (after_bracket_mismatch plus the collector "rejected").
+SELECTED_DETAIL_AFTER_READS = {
+    "matched", "unavailable", "mismatched:generation", "mismatched:mode",
+    "mismatched:read_failed", "mismatched:health", "mismatched:kernel",
+    "mismatched:rows", "mismatched:rejected",
+}
+SELECTED_DETAIL_AGGREGATE_KEYS = {
+    "scope", "unit", "mode", "seq_before", "seq_after", "mode_mixed",
+    "rows",
+}
+SELECTED_DETAIL_DETAIL_KEYS = {
+    "scope", "unit", "mode", "detail_generation", "mode_mixed", "rows",
+}
+SELECTED_DETAIL_MODES = {"counts", "timestamps", "latency"}
+SELECTED_DETAIL_ROW_BASE_KEYS = {
+    "slot", "object", "file_offset", "entered", "returned", "errors",
+    "rv_counts",
+}
+SELECTED_DETAIL_LATENCY_BUCKETS = 32
 BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "kernel_control", "attach_backend", "object_capture",
     "authority", "discovery", "manifest_object_fallbacks", "modules_skipped",
@@ -866,6 +966,9 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if not historical and not terminal and "counter_collection" in evidence:
         wanted.add("counter_collection")
         exact_counter_collection(evidence["counter_collection"])
+    if not historical and not terminal and "selected_detail" in evidence:
+        wanted.add("selected_detail")
+        exact_selected_detail(evidence["selected_detail"])
     actual = set(evidence)
     if child:
         wanted.add("child_still_running")
@@ -910,6 +1013,258 @@ def exact_counter_collection(collection):
     else:
         require(failure is not None and health is None,
                 f"stale counter collection must retain a failure and unknown attempt health: {collection!r}")
+
+
+def exact_selected_detail(section):
+    """The additive 6.15 selection envelope: closed keys, finite refusal
+    and event vocabularies, no process identity. The selection record
+    names the requested endpoint plus its resolved slot (or the named
+    refusal); the window ledger rows, lineage and brackets follow."""
+    require(isinstance(section, dict), "selected_detail must be an object")
+    require(set(section) <= SELECTED_DETAIL_KEYS,
+            f"unexpected selected_detail keys: {sorted(set(section) - SELECTED_DETAIL_KEYS)}")
+    require(SELECTED_DETAIL_REQUIRED <= set(section),
+            f"missing selected_detail keys: {sorted(SELECTED_DETAIL_REQUIRED - set(section))}")
+    if "selection" in section:
+        exact_selected_detail_selection(section["selection"])
+    events = section["events"]
+    require(isinstance(events, list), "selected_detail events must be an array")
+    for row in events:
+        exact_selected_detail_event(row)
+    if "lineage" in section:
+        exact_selected_detail_lineage(section["lineage"])
+    if "aggregate" in section:
+        exact_selected_detail_bracket(section["aggregate"], detail=False)
+    if "detail" in section:
+        exact_selected_detail_bracket(section["detail"], detail=True)
+
+
+def exact_selected_detail_selection(selection):
+    require(isinstance(selection, dict), "selected_detail selection must be an object")
+    require(set(selection) <= SELECTED_DETAIL_SELECTION_KEYS,
+            f"unexpected selected_detail selection keys: "
+            f"{sorted(set(selection) - SELECTED_DETAIL_SELECTION_KEYS)}")
+    require(SELECTED_DETAIL_SELECTION_REQUIRED <= set(selection),
+            "selected_detail selection must name its endpoint")
+    require(isinstance(selection["endpoint"], str) and selection["endpoint"],
+            f"invalid selected endpoint: {selection!r}")
+    require(("slot" in selection) == ("file_offset" in selection),
+            f"selected slot and file_offset arrive together: {selection!r}")
+    if "slot" in selection:
+        uint(selection["slot"], U32_MAX, "selected_detail selection.slot")
+    if "file_offset" in selection:
+        require(u64(selection["file_offset"]),
+                f"invalid selected_detail selection.file_offset: {selection!r}")
+    if "names" in selection:
+        names = selection["names"]
+        require(isinstance(names, list) and names
+                and all(isinstance(name, str) and name for name in names),
+                f"invalid selected_detail selection.names: {selection!r}")
+    if "refusal" in selection:
+        require(selection["refusal"] in SELECTED_DETAIL_SELECTION_REFUSALS,
+                f"invalid selected_detail selection.refusal: {selection!r}")
+
+
+def exact_selected_detail_ids(row, label):
+    """The stable numeric ids every ledger row carries: the u64 request
+    serial plus the u32 caller/provider registry ids (never PIDs)."""
+    require(u64(row["request"]), f"invalid {label}.request: {row!r}")
+    uint(row["caller"], U32_MAX, f"{label}.caller")
+    uint(row["provider"], U32_MAX, f"{label}.provider")
+
+
+def exact_selected_detail_event(row):
+    require(isinstance(row, dict) and isinstance(row.get("event"), str),
+            f"selected_detail event must name itself: {row!r}")
+    event = row["event"]
+    if event in SELECTED_DETAIL_WINDOW_EVENTS:
+        allowed = set(SELECTED_DETAIL_WINDOW_ROW_KEYS) | {"note"}
+        require(set(row) <= allowed,
+                f"unexpected selected_detail {event} keys: {sorted(set(row) - allowed)}")
+        require(set(SELECTED_DETAIL_WINDOW_ROW_KEYS) <= set(row),
+                f"missing selected_detail {event} keys: {row!r}")
+        exact_selected_detail_ids(row, f"selected_detail {event}")
+        require(u64(row["seq"]), f"invalid selected_detail {event}.seq: {row!r}")
+        if "note" in row:
+            require(isinstance(row["note"], str),
+                    f"invalid selected_detail {event}.note: {row!r}")
+    elif event == "close_refused":
+        exact_keys(row, SELECTED_DETAIL_CLOSE_REFUSED_KEYS, "selected_detail close_refused")
+        exact_selected_detail_ids(row, "selected_detail close_refused")
+        require(u64(row["view"]), f"invalid selected_detail close_refused.view: {row!r}")
+        require(u64(row["endpoint_offset"]),
+                f"invalid selected_detail close_refused.endpoint_offset: {row!r}")
+        require(row["refusal"] in SELECTED_DETAIL_GATE_WORDS,
+                f"invalid selected_detail close_refused.refusal: {row!r}")
+    elif event == "reserve_refused":
+        exact_keys(row, SELECTED_DETAIL_RESERVE_REFUSED_KEYS, "selected_detail reserve_refused")
+        exact_selected_detail_ids(row, "selected_detail reserve_refused")
+        require(row["refusal"] in SELECTED_DETAIL_ADAPTER_WORDS,
+                f"invalid selected_detail reserve_refused.refusal: {row!r}")
+        require(row["seq"] is None or u64(row["seq"]),
+                f"invalid selected_detail reserve_refused.seq: {row!r}")
+    elif event == "start_refused":
+        exact_keys(row, SELECTED_DETAIL_START_REFUSED_KEYS, "selected_detail start_refused")
+        exact_selected_detail_ids(row, "selected_detail start_refused")
+        require(row["reason"] in SELECTED_DETAIL_REFUSAL_LABELS,
+                f"invalid selected_detail start_refused.reason: {row!r}")
+    elif event == "promotion_outcome":
+        require(row.get("outcome") in SELECTED_DETAIL_OUTCOMES,
+                f"invalid selected_detail promotion_outcome.outcome: {row!r}")
+        outcome = row["outcome"]
+        if outcome == "active":
+            exact_keys(row, {"event", "request", "outcome", "caller", "provider"},
+                       "selected_detail promotion_outcome")
+            require(u64(row["request"]),
+                    f"invalid selected_detail promotion_outcome.request: {row!r}")
+            uint(row["caller"], U32_MAX, "selected_detail promotion_outcome.caller")
+            uint(row["provider"], U32_MAX, "selected_detail promotion_outcome.provider")
+        else:
+            exact_keys(row, {"event", "request", "outcome", "reason"},
+                       "selected_detail promotion_outcome")
+            require(u64(row["request"]),
+                    f"invalid selected_detail promotion_outcome.request: {row!r}")
+            vocabulary = (SELECTED_DETAIL_REFUSAL_LABELS if outcome == "refused"
+                          else SELECTED_DETAIL_END_LABELS)
+            require(row["reason"] in vocabulary,
+                    f"invalid selected_detail promotion_outcome.reason: {row!r}")
+    else:
+        raise AssertionError(f"unknown selected_detail event: {event!r}")
+
+
+def exact_selected_detail_mark(mark, label):
+    exact_keys(mark, SELECTED_DETAIL_MARK_KEYS, label)
+    require(u64(mark["seq"]), f"invalid {label}.seq: {mark!r}")
+    require(u64(mark["generation"], positive=True),
+            f"invalid {label}.generation: {mark!r}")
+    require(isinstance(mark["indices"], list)
+            and all(isinstance(index, int) and not isinstance(index, bool)
+                    and 0 <= index <= U32_MAX for index in mark["indices"]),
+            f"invalid {label}.indices: {mark!r}")
+    require(isinstance(mark["bank_ids"], list)
+            and all(isinstance(pair, list) and len(pair) == 2
+                    and all(isinstance(bank, int) and not isinstance(bank, bool)
+                            and 0 <= bank <= U32_MAX for bank in pair)
+                    for pair in mark["bank_ids"]),
+            f"invalid {label}.bank_ids: {mark!r}")
+    require(mark["transaction"] is None or u64(mark["transaction"], positive=True),
+            f"invalid {label}.transaction: {mark!r}")
+
+
+def exact_selected_detail_drift(drift):
+    require(isinstance(drift, dict) and drift.get("kind") in SELECTED_DETAIL_DRIFT_KINDS,
+            f"invalid selected_detail lineage.drift: {drift!r}")
+    kind = drift["kind"]
+    if kind == "generation":
+        exact_keys(drift, {"kind", "before", "after"}, "selected_detail drift")
+        require(u64(drift["before"], positive=True) and u64(drift["after"], positive=True),
+                f"invalid selected_detail drift: {drift!r}")
+    elif kind == "indices":
+        exact_keys(drift, {"kind", "before", "after"}, "selected_detail drift")
+        for side in ("before", "after"):
+            require(isinstance(drift[side], list)
+                    and all(isinstance(index, int) and not isinstance(index, bool)
+                            and 0 <= index <= U32_MAX for index in drift[side]),
+                    f"invalid selected_detail drift.{side}: {drift!r}")
+    elif kind == "bank_ids":
+        exact_keys(drift, {"kind", "bank", "before", "after"}, "selected_detail drift")
+        uint(drift["bank"], U32_MAX, "selected_detail drift.bank")
+        for side in ("before", "after"):
+            require(drift[side] is None
+                    or (isinstance(drift[side], int) and not isinstance(drift[side], bool)
+                        and 0 <= drift[side] <= U32_MAX),
+                    f"invalid selected_detail drift.{side}: {drift!r}")
+    else:
+        exact_keys(drift, {"kind", "before", "after"}, "selected_detail drift")
+        for side in ("before", "after"):
+            require(drift[side] is None or u64(drift[side], positive=True),
+                    f"invalid selected_detail drift.{side}: {drift!r}")
+
+
+def exact_selected_detail_lineage(lineage):
+    exact_keys(lineage, SELECTED_DETAIL_LINEAGE_KEYS, "selected_detail lineage")
+    require(u64(lineage["request"]), f"invalid selected_detail lineage.request: {lineage!r}")
+    uint(lineage["caller"], U32_MAX, "selected_detail lineage.caller")
+    uint(lineage["provider"], U32_MAX, "selected_detail lineage.provider")
+    require(u64(lineage["view"]), f"invalid selected_detail lineage.view: {lineage!r}")
+    require(u64(lineage["endpoint_offset"]),
+            f"invalid selected_detail lineage.endpoint_offset: {lineage!r}")
+    uint(lineage["broad_original_index"], U32_MAX, "selected_detail lineage.broad_original_index")
+    require(u64(lineage["broad_generation"], positive=True),
+            f"invalid selected_detail lineage.broad_generation: {lineage!r}")
+    require(u64(lineage["detail_generation"]),
+            f"invalid selected_detail lineage.detail_generation: {lineage!r}")
+    require(u64(lineage["broad_read_seq_before"]),
+            f"invalid selected_detail lineage.broad_read_seq_before: {lineage!r}")
+    require(u64(lineage["broad_read_seq_after"]),
+            f"invalid selected_detail lineage.broad_read_seq_after: {lineage!r}")
+    exact_selected_detail_mark(lineage["broad_mark_before"], "selected_detail lineage.mark_before")
+    exact_selected_detail_mark(lineage["broad_mark_after"], "selected_detail lineage.mark_after")
+    require(lineage["drift"] is None or isinstance(lineage["drift"], dict),
+            f"invalid selected_detail lineage.drift: {lineage!r}")
+    if lineage["drift"] is not None:
+        exact_selected_detail_drift(lineage["drift"])
+    require(lineage["after_read"] in SELECTED_DETAIL_AFTER_READS,
+            f"invalid selected_detail lineage.after_read: {lineage!r}")
+
+
+def exact_selected_detail_rv_counts(counts, label):
+    """Return-value rows keyed by the canonical decimal u64 the
+    collector renders (serde integer-map keys, no leading zeros);
+    possibly empty, never negative."""
+    require(isinstance(counts, dict), f"invalid {label}: {counts!r}")
+    for key, value in counts.items():
+        require(isinstance(key, str) and len(key) <= 20
+                and re.fullmatch(r"0|[1-9][0-9]*", key) is not None
+                and int(key) <= U64_MAX and u64(value),
+                f"invalid {label}[{key!r}]: {value!r}")
+
+
+def exact_selected_detail_row(row, mode, label):
+    wanted = set(SELECTED_DETAIL_ROW_BASE_KEYS)
+    if mode in ("timestamps", "latency"):
+        wanted |= {"total_ns", "max_ns"}
+    if mode == "latency":
+        wanted.add("buckets")
+    exact_keys(row, wanted, label)
+    uint(row["slot"], U32_MAX, f"{label}.slot")
+    uint(row["object"], U32_MAX, f"{label}.object")
+    require(u64(row["file_offset"]), f"invalid {label}.file_offset: {row!r}")
+    for field in ("entered", "returned", "errors"):
+        require(u64(row[field]), f"invalid {label}.{field}: {row!r}")
+    exact_selected_detail_rv_counts(row["rv_counts"], f"{label}.rv_counts")
+    if mode in ("timestamps", "latency"):
+        require(u64(row["total_ns"]), f"invalid {label}.total_ns: {row!r}")
+        require(u64(row["max_ns"]), f"invalid {label}.max_ns: {row!r}")
+    if mode == "latency":
+        require(isinstance(row["buckets"], list)
+                and len(row["buckets"]) == SELECTED_DETAIL_LATENCY_BUCKETS
+                and all(u64(bucket) for bucket in row["buckets"]),
+                f"invalid {label}.buckets: {row!r}")
+
+
+def exact_selected_detail_bracket(fragment, *, detail):
+    """One close bracket: scope-wide aggregate rows or the selected
+    child's own detail rows. Same cells, separate units, never summed."""
+    keys = SELECTED_DETAIL_DETAIL_KEYS if detail else SELECTED_DETAIL_AGGREGATE_KEYS
+    exact_keys(fragment, keys, "selected_detail detail" if detail else "selected_detail aggregate")
+    label = "selected_detail detail" if detail else "selected_detail aggregate"
+    require(fragment["scope"] == ("detail" if detail else "broad"),
+            f"invalid {label}.scope: {fragment!r}")
+    require(fragment["unit"] == "calls", f"invalid {label}.unit: {fragment!r}")
+    require(fragment["mode"] in SELECTED_DETAIL_MODES,
+            f"invalid {label}.mode: {fragment!r}")
+    if detail:
+        require(u64(fragment["detail_generation"]),
+                f"invalid {label}.detail_generation: {fragment!r}")
+    else:
+        require(u64(fragment["seq_before"]), f"invalid {label}.seq_before: {fragment!r}")
+        require(u64(fragment["seq_after"]), f"invalid {label}.seq_after: {fragment!r}")
+    require(type(fragment["mode_mixed"]) is bool,
+            f"invalid {label}.mode_mixed: {fragment!r}")
+    require(isinstance(fragment["rows"], list), f"invalid {label}.rows: {fragment!r}")
+    for row in fragment["rows"]:
+        exact_selected_detail_row(row, fragment["mode"], f"{label}.row")
 
 
 def exact_counter_function_timing(document):

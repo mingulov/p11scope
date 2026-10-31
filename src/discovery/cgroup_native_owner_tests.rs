@@ -2079,7 +2079,7 @@ fn cgroup_native_owner_second_prepared_member_defers_with_first_intact() {
         // verified-absent (`scan.rs` hint skip), which keeps the receipt
         // from closing a complete revision (`inventory.rs` pinning gate).
         // Authority is still exact and the facts still commit; the
-        // shared-provider and single-member twins pin the complete case.
+        // single-member twins pin the complete case.
         assert_eq!(
             epochs.complete, None,
             "distinct-provider activation commits additions-only"
@@ -2642,5 +2642,403 @@ fn cgroup_native_owner_fresh_observation_mismatch_refuses_with_rollback() {
     assert_eq!(
         receipt.engine_facts, receipt.engine_published,
         "the replay refusal publishes the dirtied revisions"
+    );
+}
+
+// --- G9/F-10 activation-rollback twins --------------------------------------
+// The rollback miss is unreachable through the synchronous commit
+// (install, engine-only activation, cancel — no hook runs between),
+// so these twins drive the real failure seams directly: a real
+// scene, real binder images, a real final-sample permit and proof.
+
+use crate::discovery::caller_registry::CallerLifecycle;
+
+impl ScopedNativeScene {
+    /// One final-sampled collection for `pid` without committing: the
+    /// same `sample_end` + `permit` seam the commit uses, so the proof
+    /// below is a genuine final-sample permit proof.
+    fn final_sampled_collection(&mut self, pid: u32) -> CgroupCollection {
+        let mut collection = self
+            .coordinator
+            .cgroup_collector(
+                std::mem::take(&mut self.state),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        collection.sample_end(&BTreeSet::from([pid]));
+        collection
+    }
+}
+
+#[test]
+fn cgroup_native_owner_missed_rollback_after_failed_activation_retires_caller() {
+    // G9/F-10: activation fails after install AND the rollback misses
+    // its installed image (the authority was mutated between: rolled
+    // back, then re-installed with a rival domain image). The caller
+    // must retire with its evidence, so no live NativeExact caller
+    // lacks an activated owner. RED pre-fix: the caller stays live
+    // NativeExact with gaps only. The healthy leg (rollback lands)
+    // runs first on the same caller; the existing
+    // stored-observation-mismatch twin pins the real
+    // activation-failure text end to end.
+    let mut scene = ScopedNativeScene::new();
+    let rival_domain = NativeDomainId::mint();
+    scene.settle_alias_domain(rival_domain, 42, 1);
+    let pid = scene.child_id();
+    let caller = scene.caller;
+    let expected = scene
+        .coordinator
+        .binder
+        .expected_owner_image(scene.domain, caller, pid, scene.coordinator.adapter())
+        .expect("the scene domain settled the member image");
+    let rival = scene
+        .coordinator
+        .binder
+        .expected_owner_image(rival_domain, caller, pid, scene.coordinator.adapter())
+        .expect("the alias domain settled its rival image");
+    assert_ne!(
+        expected, rival,
+        "the rival image differs from the installed one"
+    );
+    let collection = scene.final_sampled_collection(pid);
+    let preparation = collection
+        .preparation(pid)
+        .expect("the live member prepares");
+    assert!(preparation.check());
+    let permit = collection
+        .permit(pid)
+        .expect("the live member holds its final-sample permit");
+    let proof = ScopedOwnerProof::validate(pid, preparation.generation(), &permit)
+        .expect("the proof validates for the live member");
+    let now_ns = crate::discovery::caller_registry::now_ns();
+    // The real activation-failure text (`inventory.rs`
+    // `check_inventory_image`; pinned end to end by the
+    // stored-observation-mismatch twin).
+    let error =
+        anyhow::anyhow!("inventory exact-image authority is Changed; existing claims retained");
+
+    // Healthy leg: install, then the failure handler with the
+    // installed image — the rollback lands, the caller stays live
+    // scan-pinned, and no retirement stages.
+    scene
+        .coordinator
+        .adapter
+        .install_scoped_native_authority(caller, expected, &proof)
+        .map_err(|failure| failure.reason)
+        .expect("install succeeds for the live member");
+    assert_eq!(
+        scene
+            .coordinator
+            .adapter()
+            .record(caller)
+            .unwrap()
+            .authority,
+        ImageAuthority::NativeExact { image: expected },
+    );
+    scene
+        .coordinator
+        .rollback_installed_native_authority(caller, pid, expected, &error, now_ns);
+    scene.coordinator.commit_batch(false).unwrap();
+    assert_eq!(
+        scene
+            .coordinator
+            .adapter()
+            .record(caller)
+            .unwrap()
+            .authority,
+        ImageAuthority::ScanPinned,
+        "the landed rollback restores the scan-pinned fallback"
+    );
+    assert!(
+        !scene.coordinator.adapter().record(caller).unwrap().retired,
+        "a landed rollback retires nothing"
+    );
+    assert!(
+        !scene.coordinator.staged_retirements.contains(&caller),
+        "a landed rollback stages no retirement"
+    );
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == "native owner activation refused"
+                && gap.reason.contains("staged owner activation failed")
+        }),
+        "the activation failure reports by name"
+    );
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| !gap.reason.contains("rollback missed")),
+        "the landed rollback reports no miss"
+    );
+    // Healthy callers refuse the poisoned-retire seam: live
+    // scan-pinned stays, unknown callers stay unknown.
+    assert!(
+        !scene
+            .coordinator
+            .adapter
+            .retire_native_caller_without_owner(
+                caller,
+                "probe: a healthy caller must not retire".into(),
+                now_ns,
+            ),
+        "a live scan-pinned caller is healthy and stays"
+    );
+    assert!(
+        !scene
+            .coordinator
+            .adapter
+            .retire_native_caller_without_owner(
+                CallerId(u32::MAX),
+                "probe: no retained caller".into(),
+                now_ns,
+            ),
+        "an unknown caller retires nothing"
+    );
+    assert_eq!(
+        scene.coordinator.adapter().live_id(pid),
+        Some(caller),
+        "the probes changed nothing"
+    );
+
+    // Failure leg: install, mutate the authority between (roll back,
+    // then re-install the rival image), then the failure handler with
+    // the stale installed image — the rollback misses.
+    scene
+        .coordinator
+        .adapter
+        .install_scoped_native_authority(caller, expected, &proof)
+        .map_err(|failure| failure.reason)
+        .expect("re-install succeeds for the live member");
+    scene
+        .coordinator
+        .adapter
+        .cancel_scoped_native_authority(caller, expected)
+        .expect("the intervening rollback lands");
+    scene
+        .coordinator
+        .adapter
+        .install_scoped_native_authority(caller, rival, &proof)
+        .map_err(|failure| failure.reason)
+        .expect("the rival image installs between");
+    assert_eq!(
+        scene
+            .coordinator
+            .adapter()
+            .record(caller)
+            .unwrap()
+            .authority,
+        ImageAuthority::NativeExact { image: rival },
+        "the authority was mutated between install and rollback"
+    );
+    scene
+        .coordinator
+        .rollback_installed_native_authority(caller, pid, expected, &error, now_ns);
+    scene.coordinator.commit_batch(false).unwrap();
+    let record = scene.coordinator.adapter().record(caller).unwrap();
+    assert!(
+        record.retired,
+        "a missed rollback retires the caller: no live NativeExact caller lacks an activated owner"
+    );
+    assert_eq!(
+        record.authority,
+        ImageAuthority::NativeExact { image: rival },
+        "the retired record keeps its installed authority as evidence"
+    );
+    assert_eq!(
+        record.lifecycle,
+        CallerLifecycle::Unknown,
+        "the poisoned retirement claims no proven turnover"
+    );
+    assert!(
+        record
+            .lifecycle_reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("rollback missed")),
+        "the retirement reason names the miss: {:?}",
+        record.lifecycle_reason
+    );
+    assert_eq!(
+        scene.coordinator.adapter().live_id(pid),
+        None,
+        "the retired caller leaves the live map"
+    );
+    assert_eq!(
+        scene.coordinator.owner_of(caller),
+        None,
+        "no activated owner stands behind the retired caller"
+    );
+    assert!(
+        scene
+            .coordinator
+            .adapter()
+            .shared_semantic_custody(caller)
+            .is_none(),
+        "the retired caller drops its pin"
+    );
+    assert!(
+        scene.coordinator.staged_retirements.contains(&caller),
+        "the retirement stages in the registry"
+    );
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == "native owner activation refused"
+                && gap.caller == Some(caller)
+                && gap.pid == Some(pid)
+                && gap.reason.contains("rollback missed")
+        }),
+        "the missed rollback reports by name"
+    );
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == "native owner activation refused"
+                && gap.caller == Some(caller)
+                && gap.reason.contains("retired with its evidence")
+        }),
+        "the poisoned retirement reports by name"
+    );
+    // An already retired caller refuses a second retirement: the
+    // first reason stands, nothing is overwritten.
+    let reason_before = scene
+        .coordinator
+        .adapter()
+        .record(caller)
+        .unwrap()
+        .lifecycle_reason
+        .clone();
+    assert!(
+        !scene
+            .coordinator
+            .adapter
+            .retire_native_caller_without_owner(
+                caller,
+                "probe: a second retirement must not land".into(),
+                now_ns,
+            ),
+        "an already retired caller retires nothing twice"
+    );
+    assert_eq!(
+        scene
+            .coordinator
+            .adapter()
+            .record(caller)
+            .unwrap()
+            .lifecycle_reason,
+        reason_before,
+        "the first retirement reason is preserved"
+    );
+}
+
+#[test]
+fn cgroup_native_owner_permit_death_between_validate_and_install_refuses_with_fallback() {
+    // G9/F-10 death twin: the permit dies after
+    // `ScopedOwnerProof::validate`, before install completes —
+    // install must refuse without touching the record, and the
+    // scan-pinned fallback stands. The live control leg proves the
+    // seam installs when alive, so the refusal is the death's doing.
+    // Pin: install revalidates custody instead of trusting the proof.
+    let mut dying = ScopedNativeScene::new();
+    let pid = dying.child_id();
+    let caller = dying.caller;
+    let expected = dying
+        .coordinator
+        .binder
+        .expected_owner_image(dying.domain, caller, pid, dying.coordinator.adapter())
+        .expect("the scene domain settled the member image");
+    let collection = dying.final_sampled_collection(pid);
+    let preparation = collection
+        .preparation(pid)
+        .expect("the live member prepares");
+    assert!(preparation.check());
+    let permit = collection
+        .permit(pid)
+        .expect("the live member holds its final-sample permit");
+    let proof = ScopedOwnerProof::validate(pid, preparation.generation(), &permit)
+        .expect("the proof validates for the live member");
+    // The permit dies after validation, before install completes.
+    assert_eq!(dying.kill_child(), pid);
+    let install = dying
+        .coordinator
+        .adapter
+        .install_scoped_native_authority(caller, expected, &proof);
+    let Err(failure) = install else {
+        panic!("install after the permit's death must refuse");
+    };
+    assert!(
+        failure.reason.contains("custody lapsed"),
+        "the refusal names the lapsed custody: {}",
+        failure.reason
+    );
+    assert_eq!(
+        dying
+            .coordinator
+            .adapter()
+            .record(caller)
+            .unwrap()
+            .authority,
+        ImageAuthority::ScanPinned,
+        "the scan-pinned fallback stands"
+    );
+    assert!(
+        !dying.coordinator.adapter().record(caller).unwrap().retired,
+        "an install refusal retires nothing: reconcile owns exit retirement"
+    );
+    assert_eq!(
+        dying.coordinator.owner_of(caller),
+        None,
+        "no owner activates on a refused install"
+    );
+
+    // Live control: the same seam installs when the member is alive,
+    // so the death leg's refusal is the death's doing, not setup.
+    let mut live = ScopedNativeScene::new();
+    let pid = live.child_id();
+    let caller = live.caller;
+    let expected = live
+        .coordinator
+        .binder
+        .expected_owner_image(live.domain, caller, pid, live.coordinator.adapter())
+        .expect("the scene domain settled the member image");
+    let collection = live.final_sampled_collection(pid);
+    let preparation = collection
+        .preparation(pid)
+        .expect("the live member prepares");
+    assert!(preparation.check());
+    let permit = collection
+        .permit(pid)
+        .expect("the live member holds its final-sample permit");
+    let proof = ScopedOwnerProof::validate(pid, preparation.generation(), &permit)
+        .expect("the proof validates for the live member");
+    live.coordinator
+        .adapter
+        .install_scoped_native_authority(caller, expected, &proof)
+        .map_err(|failure| failure.reason)
+        .expect("install succeeds for the live member");
+    assert_eq!(
+        live.coordinator.adapter().record(caller).unwrap().authority,
+        ImageAuthority::NativeExact { image: expected },
+        "the live control installs"
+    );
+    live.coordinator
+        .adapter
+        .cancel_scoped_native_authority(caller, expected)
+        .expect("the control cleanup rollback lands");
+    assert_eq!(
+        live.coordinator.adapter().record(caller).unwrap().authority,
+        ImageAuthority::ScanPinned,
+        "the control cleanup restores the fallback"
+    );
+    assert!(
+        !live.coordinator.adapter().record(caller).unwrap().retired,
+        "the control retires nothing"
+    );
+    assert_eq!(
+        live.coordinator.owner_of(caller),
+        None,
+        "the control binds no owner"
     );
 }

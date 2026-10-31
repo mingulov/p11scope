@@ -1234,6 +1234,34 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }
     }
 
+    /// Retire a live caller whose installed native-exact authority
+    /// survived a failed activation rollback with no activated owner:
+    /// the record keeps its evidence and authority, leaves the live
+    /// map, and drops its pin, so no live `NativeExact` caller lacks
+    /// its owner. Returns false — changing nothing — when the caller
+    /// is unknown, already retired, not live, or no longer
+    /// native-exact (an already rolled-back caller is healthy and
+    /// stays). Caller IDs are never reused, so the retirement cannot
+    /// land on a newer incarnation.
+    #[cfg_attr(not(test), allow(dead_code))] // Wired by the rollback fix; twins drive it first.
+    pub(crate) fn retire_native_caller_without_owner(
+        &mut self,
+        caller: CallerId,
+        reason: String,
+        now_ns: u64,
+    ) -> bool {
+        let stranded = self.callers.get(&caller).is_some_and(|tracked| {
+            !tracked.record.retired
+                && matches!(tracked.record.authority, ImageAuthority::NativeExact { .. })
+                && self.live_by_pid.get(&tracked.record.pid) == Some(&caller)
+        });
+        if !stranded {
+            return false;
+        }
+        self.retire(caller, CallerLifecycle::Unknown, reason, now_ns);
+        true
+    }
+
     /// Reconcile's admission: the budget refusal carries its
     /// resource/limit/requested structurally; pin failures stay bare.
     /// `detected` samples the admission detection time per incarnation,

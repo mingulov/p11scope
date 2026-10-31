@@ -3468,19 +3468,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
             Err(error) => {
-                if let Err(rollback) = self
-                    .adapter
-                    .cancel_scoped_native_authority(caller, expected)
-                {
-                    self.refuse_scoped_native_owner(caller, pid, rollback);
-                }
-                self.refuse_scoped_native_owner(
-                    caller,
-                    pid,
-                    format!("staged owner activation failed: {error:#}"),
-                );
+                self.rollback_installed_native_authority(caller, pid, expected, &error, now_ns);
             }
         }
+    }
+
+    /// Roll back one installed native authority after its staged
+    /// activation failed: restore scan-pinned authority when the
+    /// installed image still stands, and report the activation
+    /// failure by name. Bounded pure work: no provider I/O. Every
+    /// outcome reports its own named gap; nothing drops silently.
+    fn rollback_installed_native_authority(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        expected: BoundImage,
+        error: &anyhow::Error,
+        now_ns: u64,
+    ) {
+        let _ = now_ns;
+        if let Err(rollback) = self
+            .adapter
+            .cancel_scoped_native_authority(caller, expected)
+        {
+            self.refuse_scoped_native_owner(caller, pid, rollback);
+        }
+        self.refuse_scoped_native_owner(
+            caller,
+            pid,
+            format!("staged owner activation failed: {error:#}"),
+        );
     }
 
     /// Revise the engine tail after scoped owner work: the batch

@@ -566,6 +566,21 @@ fn loader_gate_harness_cas_exhaustion_counts() {
     );
 }
 
+/// Fallback interleave: a reclaim between the fallback add and the
+/// re-read understates the peak, and the fallback reports a loss.
+#[test]
+fn loader_gate_harness_retained_fallback_interleave() {
+    drive_gate_hook(
+        "retained-fallback-interleave",
+        &[
+            "ASSERT interleave_gauge_shows_drop",
+            "ASSERT interleave_peak_understates",
+            "ASSERT interleave_fallback_reports_loss",
+            "ASSERT interleave_no_further_loss",
+        ],
+    );
+}
+
 /// Bank-qualified identity: A holds its identity while B reissues
 /// the local ticket; identities stay distinct and stable.
 #[test]

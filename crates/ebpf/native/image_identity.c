@@ -1,6 +1,22 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include "image_identity.h"
 
+#ifdef IMAGE_HOST_CAS_HOOK
+/* Host-only contention hook: while image_cas_fail_all is set, every
+ * identity saturating-counter CAS fails so the exhaustion twin can
+ * prove settled updates still land through the fallback and every
+ * unsettled update reports. Ticket-issue and fold-mark CAS stay real;
+ * only counting-cell CAS routes through this wrapper. Never defined
+ * for BPF. */
+int image_cas_fail_all = 0;
+static __always_inline u64 image_sat_cas(u64 *ptr, u64 old, u64 desired)
+{
+    if (image_cas_fail_all)
+        return old ^ 1;
+    return __sync_val_compare_and_swap(ptr, old, desired);
+}
+#endif
+
 struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);

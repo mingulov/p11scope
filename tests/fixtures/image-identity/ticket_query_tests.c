@@ -12,11 +12,16 @@ extern u32 p11_image_bank_cut(u64 target) __attribute__((weak));
  * references the bank maps, so an ifdefed-out bank fails the build. */
 #include "image_identity.c"
 #include <assert.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#ifdef IMAGE_HOST_CAS_HOOK
+extern int image_cas_fail_all;
+#endif
 
 /* Eight tasks with distinct leaders; storage keyed by leader identity. */
 #define TASK_COUNT 8
@@ -424,6 +429,385 @@ static void bank_select_validation(void)
     puts("ASSERT cut_flips_once_ready");
 }
 
+/* A-bank task holds its identity while B reissues the local ticket:
+ * identities stay distinct, re-queries stay stable, the local ticket
+ * and the watermark keep their contracts. */
+static void identity_distinct(void)
+{
+    struct image_identity a_now, a_later, b_now, b_later;
+    u64 ticket = 0, watermark = 0;
+    u64 n;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    assert(p11_link_task_identity(&leaders[1], &a_now) == COOKIE_STATUS_OK);
+    assert(a_now.task_cookie == 1);
+    puts("ASSERT identity_a_legacy_cookie");
+    for (n = 1; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present[0] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+        assert(ticket == n + 1);
+    }
+    present_b[2] = 0;
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[2], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    assert(p11_link_task_identity(&leaders[2], &b_now) == COOKIE_STATUS_OK);
+    assert(b_now.task_cookie != a_now.task_cookie);
+    puts("ASSERT identity_b_disjoint");
+    assert(p11_link_task_identity(&leaders[1], &a_later) == COOKIE_STATUS_OK);
+    assert(a_later.task_cookie == a_now.task_cookie);
+    puts("ASSERT identity_a_survives_cut");
+    assert(p11_link_task_identity(&leaders[2], &b_later) == COOKIE_STATUS_OK);
+    assert(b_later.task_cookie == b_now.task_cookie);
+    puts("ASSERT identity_b_requery_stable");
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[2], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    puts("ASSERT identity_ticket_stays_local");
+    assert(p11_image_identity_issued(&watermark) == COOKIE_STATUS_OK);
+    assert(watermark == IMAGE_IDENTITY_TICKET_LIMIT + 1);
+    puts("ASSERT identity_watermark_monotonic");
+}
+
+/* Miniature consumer keyed by the full qualified cookie: one bank's
+ * exec/return cannot touch the other's rows. This pins the allocator
+ * seam (disjoint keys); the production query/continuation/
+ * invalidation honoring is dispatched separately. */
+#define ISO_ROWS 8
+static u64 iso_cookie[ISO_ROWS];
+static u64 iso_exec[ISO_ROWS];
+
+static void iso_reset(void)
+{
+    int i;
+    for (i = 0; i < ISO_ROWS; i++) {
+        iso_cookie[i] = 0;
+        iso_exec[i] = 0;
+    }
+}
+
+static void iso_seed(u64 cookie, u64 exec)
+{
+    int i;
+    for (i = 0; i < ISO_ROWS; i++) {
+        if (iso_cookie[i] == cookie) {
+            iso_exec[i] = exec;
+            return;
+        }
+    }
+    for (i = 0; i < ISO_ROWS; i++) {
+        if (!iso_cookie[i]) {
+            iso_cookie[i] = cookie;
+            iso_exec[i] = exec;
+            return;
+        }
+    }
+    assert(!"miniature consumer overflowed");
+}
+
+static int iso_live(u64 cookie)
+{
+    int i;
+    if (!cookie)
+        return 0;
+    for (i = 0; i < ISO_ROWS; i++) {
+        if (iso_cookie[i] == cookie)
+            return 1;
+    }
+    return 0;
+}
+
+static void iso_invalidate(u64 cookie)
+{
+    int i;
+    for (i = 0; i < ISO_ROWS; i++) {
+        if (iso_cookie[i] == cookie) {
+            iso_cookie[i] = 0;
+            iso_exec[i] = 0;
+        }
+    }
+}
+
+static int iso_match(u64 stored_cookie, u64 stored_exec, u64 fresh_cookie, u64 fresh_exec)
+{
+    return stored_cookie == fresh_cookie && stored_exec == fresh_exec;
+}
+
+/* Full bank lifecycle: fill both banks, refuse the stale cut, fold
+ * exactly once on the Session claim, re-prepare under the loader's
+ * fresh incarnation with fresh maps, cut back and reissue without
+ * ever repeating a cookie. The fixture plays the loader role (delete
+ * cells, publish incarnation, re-authorize) after observing the
+ * kernel fold mark. */
+static void bank_fold_lifecycle(void)
+{
+    struct image_identity first, adult;
+    u64 ticket = 0, watermark = 0;
+    u64 n;
+    int i;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    for (n = 1; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present[0] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+        assert(ticket == n + 1);
+    }
+    /* Drop the churn slot's last A cell so the B fill cannot take the
+     * retained path (the bank-cut twin does the same). */
+    present[0] = 0;
+    for (n = 0; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present_b[0] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+        assert(ticket == n + 1);
+    }
+    present_b[0] = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_QUOTA);
+    assert(select_stub.refusals == 1);
+    puts("ASSERT stale_cut_refuses_until_folded");
+    select_stub.prepared[0] = 0;
+    present_b[0] = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_QUOTA);
+    assert(select_stub.folded[0] == 1);
+    assert(select_stub.folds == 1);
+    assert(select_stub.folded_issued == IMAGE_IDENTITY_TICKET_LIMIT);
+    puts("ASSERT fold_claim_retires_once");
+    present_b[0] = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_QUOTA);
+    assert(select_stub.folds == 1);
+    assert(select_stub.folded_issued == IMAGE_IDENTITY_TICKET_LIMIT);
+    puts("ASSERT fold_never_repeats");
+    for (i = 0; i < TASK_COUNT; i++) {
+        present[i] = 0;
+        stored[i] = 0;
+    }
+    select_stub.incarnation[0] = 1;
+    select_stub.prepared[0] = 1;
+    present_b[0] = 0;
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    assert(select_stub.bank == 0);
+    assert(select_stub.folded[0] == 0);
+    assert(ctl.next_ticket == 1);
+    assert(select_stub.incarnation[0] == 1);
+    assert(select_stub.cuts == 2);
+    assert(select_stub.refusals == 3);
+    puts("ASSERT reprepare_cuts_back_fresh");
+    assert(p11_link_task_identity(&leaders[0], &first) == COOKIE_STATUS_OK);
+    assert(first.task_cookie == image_identity_qualify(1, 0, 1));
+    assert(first.task_cookie > IMAGE_IDENTITY_TICKET_LIMIT);
+    assert(p11_link_task_identity(&leaders[1], &adult) == COOKIE_STATUS_OK);
+    assert(adult.task_cookie == image_identity_qualify(2, 0, 1));
+    assert(!iso_match(1, 0, first.task_cookie, first.exec_id));
+    assert(!iso_match(2, 0, adult.task_cookie, adult.exec_id));
+    puts("ASSERT reissue_never_repeats_cookie");
+    assert(p11_image_identity_issued(&watermark) == COOKIE_STATUS_OK);
+    assert(watermark == 2 * IMAGE_IDENTITY_TICKET_LIMIT + 2);
+    puts("ASSERT watermark_monotonic_across_incarnations");
+}
+
+struct race_arg {
+    int id;
+    u32 status;
+    u64 ticket;
+    pthread_barrier_t *barrier;
+};
+
+static void *race_ticket(void *arg_raw)
+{
+    struct race_arg *arg = arg_raw;
+    u64 ticket = 0;
+    u32 status;
+    (void)pthread_barrier_wait(arg->barrier);
+    present[arg->id] = 0;
+    present_b[arg->id] = 0;
+    status = p11_link_task_ticket(&leaders[arg->id], &ticket);
+    arg->status = status;
+    arg->ticket = ticket;
+    return 0;
+}
+
+/* Eight threads race the fold claim and then the re-prepare: the fold
+ * applies once, the re-prepare applies once, and the reissued
+ * tickets are distinct and disjoint from every legacy cookie. */
+static void bank_reprepare_race(void)
+{
+    pthread_barrier_t barrier;
+    pthread_t threads[TASK_COUNT];
+    struct race_arg args[TASK_COUNT];
+    struct image_identity got;
+    u64 seen = 0;
+    int i;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    for (i = 0; i < TASK_COUNT; i++) {
+        present[i] = 0;
+        stored[i] = 0;
+    }
+    ctl.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
+    ctl_b.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
+    select_stub.bank = 1;
+    select_stub.cuts = 1;
+    select_stub.prepared[0] = 0;
+    assert(pthread_barrier_init(&barrier, 0, TASK_COUNT) == 0);
+    for (i = 0; i < TASK_COUNT; i++) {
+        args[i].id = i;
+        args[i].status = 0;
+        args[i].ticket = 0;
+        args[i].barrier = &barrier;
+        assert(pthread_create(&threads[i], 0, race_ticket, &args[i]) == 0);
+    }
+    for (i = 0; i < TASK_COUNT; i++)
+        assert(pthread_join(threads[i], 0) == 0);
+    assert(pthread_barrier_destroy(&barrier) == 0);
+    for (i = 0; i < TASK_COUNT; i++)
+        assert(args[i].status == COOKIE_STATUS_QUOTA);
+    assert(select_stub.folded[0] == 1);
+    assert(select_stub.folds == 1);
+    assert(select_stub.folded_issued == IMAGE_IDENTITY_TICKET_LIMIT);
+    assert(select_stub.refusals == TASK_COUNT);
+    assert(ctl_b.unavailable == TASK_COUNT);
+    assert(select_stub.update_losses == 0);
+    puts("ASSERT concurrent_fold_once");
+    for (i = 0; i < TASK_COUNT; i++) {
+        present[i] = 0;
+        stored[i] = 0;
+    }
+    select_stub.incarnation[0] = 1;
+    select_stub.prepared[0] = 1;
+    assert(pthread_barrier_init(&barrier, 0, TASK_COUNT) == 0);
+    for (i = 0; i < TASK_COUNT; i++) {
+        args[i].id = i;
+        args[i].status = 0;
+        args[i].ticket = 0;
+        args[i].barrier = &barrier;
+        assert(pthread_create(&threads[i], 0, race_ticket, &args[i]) == 0);
+    }
+    for (i = 0; i < TASK_COUNT; i++)
+        assert(pthread_join(threads[i], 0) == 0);
+    assert(pthread_barrier_destroy(&barrier) == 0);
+    for (i = 0; i < TASK_COUNT; i++) {
+        assert(args[i].status == COOKIE_STATUS_OK);
+        assert(args[i].ticket >= 1 && args[i].ticket <= TASK_COUNT);
+        assert(!(seen & (1ULL << args[i].ticket)));
+        seen |= 1ULL << args[i].ticket;
+    }
+    assert(select_stub.bank == 0);
+    assert(select_stub.folded[0] == 0);
+    assert(select_stub.cuts == 2);
+    assert(ctl.next_ticket == TASK_COUNT);
+    puts("ASSERT concurrent_reprepare_once");
+    for (i = 0; i < TASK_COUNT; i++) {
+        assert(p11_link_task_identity(&leaders[i], &got) == COOKIE_STATUS_OK);
+        assert(got.task_cookie == image_identity_qualify(args[i].ticket, 0, 1));
+        assert(got.task_cookie > IMAGE_IDENTITY_TICKET_LIMIT);
+    }
+    puts("ASSERT concurrent_reissue_disjoint");
+}
+
+/* Exec/return isolation at the seam: each bank's exec invalidates only
+ * its own rows, and returns join only identical identities. */
+static void exec_return_isolation(void)
+{
+    struct image_identity a, b, a2;
+    u64 ticket = 0;
+    u64 n;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    iso_reset();
+    assert(p11_link_task_identity(&leaders[1], &a) == COOKIE_STATUS_OK);
+    for (n = 1; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present[0] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    }
+    present_b[2] = 0;
+    assert(p11_link_task_identity(&leaders[2], &b) == COOKIE_STATUS_OK);
+    assert(a.task_cookie != b.task_cookie);
+    iso_seed(a.task_cookie, a.exec_id);
+    iso_seed(b.task_cookie, b.exec_id);
+    assert(iso_live(a.task_cookie) && iso_live(b.task_cookie));
+    iso_invalidate(a.task_cookie);
+    assert(!iso_live(a.task_cookie) && iso_live(b.task_cookie));
+    puts("ASSERT exec_invalidates_only_own_bank");
+    iso_seed(a.task_cookie, a.exec_id);
+    iso_invalidate(b.task_cookie);
+    assert(iso_live(a.task_cookie) && !iso_live(b.task_cookie));
+    puts("ASSERT exec_isolation_symmetric");
+    assert(p11_link_task_identity(&leaders[1], &a2) == COOKIE_STATUS_OK);
+    assert(iso_match(a.task_cookie, a.exec_id, a2.task_cookie, a2.exec_id));
+    assert(!iso_match(a.task_cookie, a.exec_id, b.task_cookie, b.exec_id));
+    assert(!iso_match(b.task_cookie, b.exec_id, a.task_cookie, a.exec_id));
+    puts("ASSERT return_mismatches_across_banks");
+}
+
+#ifdef IMAGE_HOST_CAS_HOOK
+/* Exhaustion twin: with every identity saturating-counter CAS forced
+ * to fail, settled updates still land through the fallback and every
+ * unsettled update reports through update_losses. */
+static void identity_cas_exhaustion(void)
+{
+    u64 ticket = 0, watermark = 0;
+
+    reset();
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    image_cas_fail_all = 1;
+    ctl.limit = 0;
+    present[1] = 0;
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ctl.unavailable == 1);
+    assert(select_stub.update_losses == 0);
+    puts("ASSERT identity_fallback_settles");
+    ctl.unavailable = ~0ULL - 1;
+    present[2] = 0;
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[2], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ctl.unavailable == ~0ULL - 1);
+    assert(select_stub.update_losses == 1);
+    puts("ASSERT identity_skip_reports");
+    ctl.limit = IMAGE_IDENTITY_TICKET_LIMIT;
+    ctl.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
+    ctl.unavailable = 0;
+    present[3] = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[3], &ticket) == COOKIE_STATUS_QUOTA);
+    assert(ctl.unavailable == 1);
+    assert(select_stub.refusals == 1);
+    assert(select_stub.update_losses == 1);
+    puts("ASSERT identity_bank_refusal_settles");
+    image_cas_fail_all = 0;
+    ctl_b.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
+    select_stub.bank = 1;
+    select_stub.prepared[0] = 0;
+    select_stub.folded_issued = ~0ULL - 1;
+    present[4] = 0;
+    present_b[4] = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[4], &ticket) == COOKIE_STATUS_QUOTA);
+    assert(select_stub.folded[0] == 1);
+    assert(select_stub.folds == 1);
+    assert(select_stub.folded_issued == ~0ULL);
+    puts("ASSERT identity_folded_saturates");
+    assert(p11_image_identity_issued(&watermark) == COOKIE_STATUS_OK);
+    assert(watermark == ~0ULL);
+    puts("ASSERT identity_watermark_saturates");
+}
+#endif
+
 int main(int argc, char **argv)
 {
     bpf_map_lookup_elem = lookup;
@@ -444,6 +828,18 @@ int main(int argc, char **argv)
         bank_query_routes();
     } else if (!strcmp(argv[1], "bank-select-validation")) {
         bank_select_validation();
+    } else if (!strcmp(argv[1], "identity-distinct")) {
+        identity_distinct();
+    } else if (!strcmp(argv[1], "bank-fold-lifecycle")) {
+        bank_fold_lifecycle();
+    } else if (!strcmp(argv[1], "bank-reprepare-race")) {
+        bank_reprepare_race();
+    } else if (!strcmp(argv[1], "exec-return-isolation")) {
+        exec_return_isolation();
+#ifdef IMAGE_HOST_CAS_HOOK
+    } else if (!strcmp(argv[1], "identity-cas-exhaustion")) {
+        identity_cas_exhaustion();
+#endif
     } else {
         return 2;
     }

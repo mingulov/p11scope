@@ -57,11 +57,14 @@ fn compile_harness(source_file: &str, tag: &str, scenario: &str) -> (PathBuf, Pa
         .arg(&source)
         .arg("-o")
         .arg(&binary);
-    if tag == "owner-gate" || tag == "tickets" {
+    if tag == "owner-gate" || tag == "tickets" || tag == "tickets-hook" {
         command.arg("-DP11SCOPE_LOADER_GATE");
     }
     if tag == "gate-hook" {
         command.arg("-DGATE_HOST_CAS_HOOK");
+    }
+    if tag == "tickets-hook" {
+        command.arg("-DIMAGE_HOST_CAS_HOOK");
     }
     let compile = command.output().expect("spawn host cc for the harness");
     assert!(
@@ -114,6 +117,16 @@ fn drive_tickets(scenario: &str, asserts: &[&str]) {
     let (work, binary) = compile_harness(
         "tests/fixtures/image-identity/ticket_query_tests.c",
         "tickets",
+        scenario,
+    );
+    run_scenario(&binary, scenario, asserts);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+fn drive_tickets_hook(scenario: &str, asserts: &[&str]) {
+    let (work, binary) = compile_harness(
+        "tests/fixtures/image-identity/ticket_query_tests.c",
+        "tickets-hook",
         scenario,
     );
     run_scenario(&binary, scenario, asserts);
@@ -549,6 +562,84 @@ fn loader_gate_harness_cas_exhaustion_counts() {
             "ASSERT skip_reports_loss",
             "ASSERT peak_loss_reported",
             "ASSERT drop_loss_reported",
+        ],
+    );
+}
+
+/// Bank-qualified identity: A holds its identity while B reissues
+/// the local ticket; identities stay distinct and stable.
+#[test]
+fn loader_ticket_harness_identity_distinct() {
+    drive_tickets(
+        "identity-distinct",
+        &[
+            "ASSERT identity_a_legacy_cookie",
+            "ASSERT identity_b_disjoint",
+            "ASSERT identity_a_survives_cut",
+            "ASSERT identity_b_requery_stable",
+            "ASSERT identity_ticket_stays_local",
+            "ASSERT identity_watermark_monotonic",
+        ],
+    );
+}
+
+/// Full bank lifecycle: stale-cut refusal, exactly-once fold,
+/// re-prepare under a fresh incarnation, reissue without repeats.
+#[test]
+fn loader_ticket_harness_bank_fold_lifecycle() {
+    drive_tickets(
+        "bank-fold-lifecycle",
+        &[
+            "ASSERT stale_cut_refuses_until_folded",
+            "ASSERT fold_claim_retires_once",
+            "ASSERT fold_never_repeats",
+            "ASSERT reprepare_cuts_back_fresh",
+            "ASSERT reissue_never_repeats_cookie",
+            "ASSERT watermark_monotonic_across_incarnations",
+        ],
+    );
+}
+
+/// Eight threads race the fold claim and the re-prepare: each
+/// applies once and reissued tickets stay distinct and disjoint.
+#[test]
+fn loader_ticket_harness_bank_reprepare_race() {
+    drive_tickets(
+        "bank-reprepare-race",
+        &[
+            "ASSERT concurrent_fold_once",
+            "ASSERT concurrent_reprepare_once",
+            "ASSERT concurrent_reissue_disjoint",
+        ],
+    );
+}
+
+/// Exec/return isolation at the seam: each bank's exec invalidates
+/// only its own rows, returns join only identical identities.
+#[test]
+fn loader_ticket_harness_exec_return_isolation() {
+    drive_tickets(
+        "exec-return-isolation",
+        &[
+            "ASSERT exec_invalidates_only_own_bank",
+            "ASSERT exec_isolation_symmetric",
+            "ASSERT return_mismatches_across_banks",
+        ],
+    );
+}
+
+/// Forced CAS exhaustion: settled updates land through the fallback
+/// and every unsettled update reports through update_losses.
+#[test]
+fn loader_ticket_harness_identity_cas_exhaustion() {
+    drive_tickets_hook(
+        "identity-cas-exhaustion",
+        &[
+            "ASSERT identity_fallback_settles",
+            "ASSERT identity_skip_reports",
+            "ASSERT identity_bank_refusal_settles",
+            "ASSERT identity_folded_saturates",
+            "ASSERT identity_watermark_saturates",
         ],
     );
 }

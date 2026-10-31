@@ -78,17 +78,48 @@ u32 p11_image_identity_issued(u64 *watermark_out);
  * needs a drain proof the production START rows cannot carry yet. */
 #define IMAGE_BANK_SLOTS 2U
 #define IMAGE_BANK_NO_SLOT 2U
+/* Lifecycle: after the cut the Session proves the retired bank drained
+ * (a Session-side drain proof, owned outside this unit), then clears
+ * that bank's prepared bit as the fold claim. The kernel folds the
+ * bank exactly once (retiring its issued count into folded_issued),
+ * the Session re-asserts prepared, and the kernel re-prepares the
+ * slot under a fresh incarnation. Admission helps fold and re-prepare
+ * work on its path, so the transitions complete idempotently under
+ * concurrency; a cut to a stale bank refuses until the Session drives
+ * the claim cycle. update_losses reports identity-accounting updates
+ * the bounded protocol could not settle. */
 struct image_bank_select {
     u64 bank;
     u64 prepared[2];
     u64 cuts;
     u64 refusals;
+    u64 incarnation[2];
+    u64 folded[2];
+    u64 folds;
+    u64 folded_issued;
+    u64 update_losses;
 };
-_Static_assert(sizeof(struct image_bank_select) == 40, "bank select ABI");
+/* Qualified identity cookie: the local ticket in bits 0..14, the bank
+ * in bit 15, the incarnation in bits 16+. Bank A incarnation 0 keeps
+ * legacy cookies identical to tickets; every other (bank,
+ * incarnation) issues disjoint cookies while each bank keeps its
+ * 1..16384 local budget. The ticket query and the EXEC binding keep
+ * returning the local ticket; only the task identity carries the
+ * qualifier. */
+static __always_inline u64 image_identity_qualify(u64 ticket, u64 bank, u64 incarnation)
+{
+    return ticket | (bank << 15) | (incarnation << 16);
+}
+_Static_assert(sizeof(struct image_bank_select) == 96, "bank select ABI");
 _Static_assert(__builtin_offsetof(struct image_bank_select, bank) == 0, "bank current");
 _Static_assert(__builtin_offsetof(struct image_bank_select, prepared) == 8, "bank prepared");
 _Static_assert(__builtin_offsetof(struct image_bank_select, cuts) == 24, "bank cuts");
 _Static_assert(__builtin_offsetof(struct image_bank_select, refusals) == 32, "bank refusals");
+_Static_assert(__builtin_offsetof(struct image_bank_select, incarnation) == 40, "bank incarnation");
+_Static_assert(__builtin_offsetof(struct image_bank_select, folded) == 56, "bank folded");
+_Static_assert(__builtin_offsetof(struct image_bank_select, folds) == 72, "bank folds");
+_Static_assert(__builtin_offsetof(struct image_bank_select, folded_issued) == 80, "bank folded issued");
+_Static_assert(__builtin_offsetof(struct image_bank_select, update_losses) == 88, "bank losses");
 /* Current prepared bank, or IMAGE_BANK_NO_SLOT when SELECT is missing,
  * malformed or names an unprepared bank. */
 u32 p11_image_bank_select(void);

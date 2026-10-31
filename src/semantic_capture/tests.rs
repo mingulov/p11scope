@@ -6482,3 +6482,145 @@ mod custody_chain_tests {
         }
     }
 }
+
+/// B17 W1 capture-level disclosure twins: the semantic-capture report must
+/// name a global-only continuation with `instance_reload_not_excluded` and
+/// stay silent on a same-triple refresh. The label assertions read the
+/// produced report's evidence rendering, so they fail while the drain is
+/// unwired and pass once the adapter publishes the disclosure.
+mod b17_capture_disclosure {
+    use super::*;
+
+    const BASE: u64 = 0x7f00_0000_0000;
+    const TEXT_OFF: u64 = 0x2000;
+    const COOKIE: u64 = 0x51;
+
+    fn ranges() -> Vec<MapRange> {
+        vec![
+            MapRange::new(BASE, BASE + 0x1000, 0, false),
+            MapRange::new(BASE + 0x1000, BASE + 0x3000, 0x1000, true),
+            MapRange::new(BASE + 0x3000, BASE + 0x4000, 0x3000, false),
+        ]
+    }
+
+    fn image() -> ImageIdentity {
+        ImageIdentity {
+            task_cookie: COOKIE,
+            exec_id: 7,
+        }
+    }
+
+    fn fixture() -> (SemanticCapture, ScriptIo, Endpoint) {
+        let domain = NativeDomainId::mint();
+        let io = ScriptIo::small(domain);
+        let capture = capture(&io);
+        let endpoint = io.endpoint(0).expect("slot 0 scripted");
+        (capture, io, endpoint)
+    }
+
+    fn scan(
+        capture: &mut SemanticCapture,
+        io: &mut ScriptIo,
+        endpoint: Endpoint,
+        local: u64,
+        global: u64,
+    ) -> TickReport {
+        let fence = capture.router.fence();
+        let proof = acquire_test_scan(
+            io.domain,
+            image(),
+            endpoint.file_slot,
+            CompleteEpochs {
+                local,
+                global,
+                fault: 0,
+                sticky: 0,
+                record_flags: 0,
+            },
+            ranges(),
+            fence,
+        )
+        .expect("stable acquisition");
+        let job = ScanJob {
+            image: image(),
+            endpoint,
+            slot: 0,
+            pin: io.pin.clone(),
+            deadline: io.now + Duration::from_secs(60),
+            birth_cut: None,
+        };
+        let mut report = TickReport::default();
+        capture.accept_scan(io, proof, &job, fence, &mut report);
+        report
+    }
+
+    fn stamp(local: u32, global: u32) -> InstanceStamp {
+        InstanceStamp {
+            epoch: local,
+            global,
+            fault: 0,
+            file_slot_plus1: 1,
+            flags: instance::STAMP_VALID,
+        }
+    }
+
+    fn route(capture: &mut SemanticCapture, token: u64, local: u32, global: u32) -> Route {
+        capture.router.route(CallFacts {
+            token,
+            domain: capture.router.domain(),
+            image: image(),
+            entry: stamp(local, global),
+            ret: stamp(local, global),
+            ip: EntryIp::new(BASE + TEXT_OFF),
+            attached_offset: Some(TEXT_OFF),
+        })
+    }
+
+    fn joined(route: Route) -> InstanceId {
+        match route {
+            Route::Joined(id) => id,
+            other => panic!("expected a join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn b17_capture_report_publishes_reload_disclosure() {
+        let (mut capture, mut io, endpoint) = fixture();
+        let first = scan(&mut capture, &mut io, endpoint, 2, 0);
+        assert_eq!(first.observations, vec![ObserveOutcome::New]);
+        let id = joined(route(&mut capture, 1, 2, 0));
+        let second = scan(&mut capture, &mut io, endpoint, 2, 1);
+        assert_eq!(second.observations, vec![ObserveOutcome::Continued]);
+        assert_eq!(joined(route(&mut capture, 2, 2, 1)), id);
+        let evidence = format!("{:?}", second);
+        assert!(
+            evidence.contains("instance_reload_not_excluded"),
+            "global-only continuation must disclose, got: {evidence}"
+        );
+        // A same-triple refresh over the tainted entry continues without
+        // re-yielding the disclosure.
+        let third = scan(&mut capture, &mut io, endpoint, 2, 1);
+        assert_eq!(third.observations, vec![ObserveOutcome::Continued]);
+        let refresh = format!("{:?}", third);
+        assert!(
+            !refresh.contains("instance_reload_not_excluded"),
+            "refresh must not re-yield, got: {refresh}"
+        );
+    }
+
+    #[test]
+    fn b17_capture_report_silent_on_same_triple_refresh() {
+        let (mut capture, mut io, endpoint) = fixture();
+        let first = scan(&mut capture, &mut io, endpoint, 2, 0);
+        assert_eq!(first.observations, vec![ObserveOutcome::New]);
+        let id = joined(route(&mut capture, 1, 2, 0));
+        let second = scan(&mut capture, &mut io, endpoint, 2, 0);
+        assert_eq!(second.observations, vec![ObserveOutcome::Continued]);
+        assert_eq!(joined(route(&mut capture, 2, 2, 0)), id);
+        let evidence = format!("{:?}", second);
+        assert!(
+            !evidence.contains("instance_reload_not_excluded"),
+            "same-triple refresh must stay silent, got: {evidence}"
+        );
+    }
+}

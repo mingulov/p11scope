@@ -56,6 +56,18 @@ impl NativeIdentity<PidPin> for OriginalNativeIdentity {
         } else {
             None
         };
+        // Hard allocation-identity gate: a query in a supported domain
+        // must arrive through the original retained allocation, or an
+        // explicitly registered extra member's retained allocation for
+        // that domain. A reopened or replacement allocation fails here
+        // instead of degrading into ordinary unavailable evidence.
+        // Only genuinely foreign domains stay unavailable.
+        assert!(
+            ticket.is_some()
+                || (domain != self.domain
+                    && !self.aliases.iter().any(|(alias, _)| *alias == domain)),
+            "native query in a supported domain arrived through an unexpected allocation"
+        );
         let Some(ticket) = ticket else {
             return CookieQuery::Unavailable("another native capture domain".into());
         };
@@ -402,14 +414,43 @@ impl ScopedNativeScene {
     /// directory, mirroring the scene's stopped-driver handshake under
     /// its own ready file.
     fn spawn_second_child(&self, ready_name: &str) -> OwnedStoppedChild {
-        let ready = self.dir.path().join(ready_name);
         let provider = self.dir.path().join("scoped-provider.so");
+        self.spawn_second_child_with_provider(ready_name, &provider)
+    }
+
+    /// Compile a second provider with distinct bytes and file identity
+    /// for the distinct-provider twin. Mirrors the scene's provider
+    /// build with a different legacy minor so the bytes differ too.
+    fn build_second_provider(&self) -> std::path::PathBuf {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let out = self.dir.path().join("scoped-provider-b.so");
+        let mut cmd = std::process::Command::new("gcc");
+        cmd.args(["-shared", "-fPIC", "-DLEGACY_MINOR=41"])
+            .arg("-o")
+            .arg(&out)
+            .arg(manifest.join("crates/discover/tests/fixture/version_matrix.c"));
+        assert!(
+            cmd.status().unwrap().success(),
+            "gcc failed for scoped-provider-b.so: {cmd:?}"
+        );
+        out
+    }
+
+    /// Spawn a second owned provider child mapping `provider`,
+    /// mirroring the scene's stopped-driver handshake under its own
+    /// ready file.
+    fn spawn_second_child_with_provider(
+        &self,
+        ready_name: &str,
+        provider: &std::path::Path,
+    ) -> OwnedStoppedChild {
+        let ready = self.dir.path().join(ready_name);
         OwnedStoppedChild::spawn_stopped(
             std::process::Command::new(self.dir.path().join("scoped-driver"))
                 .arg("--ready")
                 .arg(&ready)
                 .arg("--call")
-                .arg(&provider)
+                .arg(provider)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null()),
@@ -1489,6 +1530,157 @@ impl ScopedNativeScene {
         (second_caller, second_pid, self.witness_target)
     }
 
+    /// Admit an already spawned second member mapping a DIFFERENT
+    /// provider file (`provider`, already registered as a module hint),
+    /// and settle its native witness under `ticket` with `count`
+    /// physical uses naming the new attach target. Returns the
+    /// member's caller, pid, and its own witness target. The distinct
+    /// provider adds new attach targets and resolves to a distinct
+    /// module; the shared-provider twin keeps the helper above.
+    fn admit_and_settle_distinct_member(
+        &mut self,
+        child: OwnedStoppedChild,
+        provider: &std::path::Path,
+        ticket: u64,
+        count: u64,
+    ) -> (CallerId, u32, (AttachObjectId, EndpointId)) {
+        let second_pid = child.id();
+        self.extra_children.push(child);
+        let first_pid = self.child_id();
+        assert_ne!(first_pid, second_pid);
+        self.rewrite_membership(&[first_pid, second_pid]);
+        let (completion, _, _) = self.commit_observed_pass(None, second_pid, PassAction::Stable);
+        assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+        assert_eq!(completion.admitted, 1, "the second member is admitted");
+        assert_eq!(completion.scan_callers, 2);
+        let second_caller = self
+            .coordinator
+            .adapter()
+            .live_id(second_pid)
+            .expect("the second member is admitted");
+        assert_ne!(second_caller, self.caller);
+        assert_eq!(
+            self.coordinator
+                .adapter()
+                .record(second_caller)
+                .unwrap()
+                .authority,
+            ImageAuthority::ScanPinned,
+            "the second member starts scan-pinned"
+        );
+        assert_eq!(self.coordinator.owner_of(second_caller), None);
+        let second_pin = self
+            .coordinator
+            .adapter()
+            .shared_semantic_custody(second_caller)
+            .expect("retain the second member's original allocation without reopening its PID");
+        self.identity.extra_pins.push((second_pin, ticket));
+        let delta = self.coordinator.take_target_delta();
+        assert!(
+            !delta.is_empty(),
+            "the distinct provider adds new attach targets"
+        );
+        assert_eq!(
+            delta.objects.len(),
+            1,
+            "exactly one new attach object for the distinct provider: {:?}",
+            delta.objects
+        );
+        let (first_object, _) = self.witness_target;
+        assert_ne!(
+            delta.objects[0], first_object,
+            "the distinct provider resolves to a distinct attach object"
+        );
+        assert!(
+            !delta.endpoints.is_empty(),
+            "the distinct provider adds new endpoints"
+        );
+        for endpoint in &delta.endpoints {
+            assert_ne!(
+                endpoint.object, first_object,
+                "no new endpoint reuses the first provider's object"
+            );
+            let target = self
+                .coordinator
+                .attach_set
+                .target(endpoint.object)
+                .expect("a new endpoint names a retained target");
+            assert_eq!(
+                Path::new(target.path()),
+                provider,
+                "the new endpoints attach the distinct provider"
+            );
+        }
+        let target = (delta.endpoints[0].object, delta.endpoints[0].id);
+        let first_ns = crate::discovery::caller_registry::now_ns();
+        let mut row = WitnessRow::scripted(
+            self.domain,
+            ticket,
+            1,
+            target.0,
+            target.1,
+            second_pid,
+            first_ns,
+        );
+        row.entry_count = count;
+        let queries_before = self.identity.queries;
+        let mut decided = 0;
+        for batch in [
+            native_read(self.domain, vec![row], Vec::new()),
+            NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+                self.domain,
+                Vec::new(),
+                crate::discovery::caller_registry::now_ns(),
+            )),
+            native_read(
+                self.domain,
+                Vec::new(),
+                vec![CallerCountUpdate {
+                    image: p11scope_ebpf_common::ImageIdentity {
+                        task_cookie: ticket,
+                        exec_id: 1,
+                    },
+                    object: target.0,
+                    count,
+                }],
+            ),
+        ] {
+            let receipt = self.coordinator.stage_native(
+                batch,
+                &mut self.identity,
+                crate::discovery::caller_registry::now_ns(),
+            );
+            assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+            decided += receipt.decided;
+        }
+        assert_eq!(decided, 1, "the real binder decided the second witness");
+        assert!(self.identity.queries > queries_before);
+        self.coordinator.commit_batch(false).unwrap();
+        assert!(
+            self.coordinator
+                .binder
+                .holds_image(self.domain, second_caller),
+            "the second member's image settles for activation"
+        );
+        let edges: Vec<_> = self
+            .coordinator
+            .registry()
+            .edges_of(second_caller)
+            .collect();
+        assert_eq!(
+            edges.len(),
+            1,
+            "one distinct mapped provider feeds the twin"
+        );
+        assert_ne!(
+            edges[0].module, self.module,
+            "distinct providers resolve to distinct modules"
+        );
+        assert_eq!(edges[0].entry_count, count);
+        assert_eq!(edges[0].mapping, MappingState::Mapped);
+        (second_caller, second_pid, target)
+    }
+
     /// Committed engine module facts as (view, path) pairs.
     fn engine_module_facts(&self) -> BTreeSet<(u32, String)> {
         self.coordinator
@@ -1522,6 +1714,31 @@ impl ScopedNativeScene {
                     .is_some_and(|target| Path::new(target.path()) == provider)
             })
             .count()
+    }
+
+    /// Pin-claim object ids for `owner` mapped to their pinned paths:
+    /// which physical providers the owner's committed facts retain.
+    fn owner_claim_paths(&self, owner: ProcessViewId) -> BTreeSet<String> {
+        let claims = self
+            .coordinator
+            .engine
+            .pinned
+            .view_claims(owner)
+            .unwrap_or_else(|| panic!("owner {} retains pin claims", owner.0));
+        let by_id: std::collections::BTreeMap<_, _> = self
+            .coordinator
+            .engine
+            .pinned
+            .pinned()
+            .map(|summary| (summary.id, summary.path.to_string()))
+            .collect();
+        claims
+            .tables
+            .iter()
+            .chain(claims.targets.iter().map(|(id, _)| id))
+            .chain(&claims.pins)
+            .filter_map(|id| by_id.get(id).cloned())
+            .collect()
     }
 }
 
@@ -1659,25 +1876,49 @@ fn cgroup_native_owner_refused_pass_reads_no_provider_metadata_after_final_sampl
 
 #[test]
 fn cgroup_native_owner_second_prepared_member_defers_with_first_intact() {
-    // R2 two-member positive: both members prepare against the same
-    // committed state; the first (pid order) activates while the
-    // second defers with a named refusal and released state, and the
-    // first member's engine facts are not overwritten. A follow-up
-    // pass activates the deferred member; both members' distinct
-    // per-view facts survive with no pre-existing fact loss. RED
-    // while the second commit replaces the first member's facts.
+    // R2 distinct-provider positive: two members map DIFFERENT
+    // provider files with distinct nonempty physical identities. Both
+    // prepare against the same committed state; the first (pid order)
+    // activates while the second defers with a named refusal and
+    // released state, and the first member's engine facts are not
+    // overwritten. A follow-up pass activates the deferred member;
+    // both owners keep nonempty pin claims and modules on their own
+    // providers, their published facts survive, and no pre-existing
+    // fact is lost. The shared-provider control lives in the next
+    // twin. RED while the members share one provider or a commit
+    // replaces the other member's facts.
     let mut scene = ScopedNativeScene::new();
-    let provider = scene.dir.path().join("scoped-provider.so");
-    let second_child = scene.spawn_second_child("ready-b");
-    let (second_caller, second_pid, _) = scene.admit_and_settle_second_member(second_child, 42, 11);
-    // Fix A RED: this first two-member positive requires distinct
-    // physical providers per member; the shared setup must fail here.
-    let second_edges: Vec<_> = scene.coordinator.registry().edges_of(second_caller).collect();
-    assert_eq!(second_edges.len(), 1);
-    assert_ne!(
-        second_edges[0].module, scene.module,
-        "distinct providers resolve to distinct modules"
+    let provider_a = scene.dir.path().join("scoped-provider.so");
+    let provider_b = scene.build_second_provider();
+    assert_ne!(provider_a, provider_b, "the twin maps two provider files");
+    let bytes_a = std::fs::read(&provider_a).unwrap();
+    let bytes_b = std::fs::read(&provider_b).unwrap();
+    assert!(
+        !bytes_a.is_empty() && !bytes_b.is_empty(),
+        "both providers are nonempty"
     );
+    assert_ne!(bytes_a, bytes_b, "the two providers have distinct bytes");
+    let meta_a = std::fs::metadata(&provider_a).unwrap();
+    let meta_b = std::fs::metadata(&provider_b).unwrap();
+    assert_ne!(
+        (
+            std::os::unix::fs::MetadataExt::dev(&meta_a),
+            std::os::unix::fs::MetadataExt::ino(&meta_a)
+        ),
+        (
+            std::os::unix::fs::MetadataExt::dev(&meta_b),
+            std::os::unix::fs::MetadataExt::ino(&meta_b)
+        ),
+        "the two providers have distinct file identities"
+    );
+    scene
+        .coordinator
+        .engine
+        .module_hints
+        .push(provider_b.clone());
+    let second_child = scene.spawn_second_child_with_provider("ready-b", &provider_b);
+    let (second_caller, second_pid, _) =
+        scene.admit_and_settle_distinct_member(second_child, &provider_b, 42, 11);
     let first_pid = scene.child_id();
     let first_caller = scene.caller;
     // Preparation order follows pid order; script in that same order
@@ -1738,10 +1979,19 @@ fn cgroup_native_owner_second_prepared_member_defers_with_first_intact() {
         facts_before.iter().all(|fact| facts_race.contains(fact)),
         "no pre-existing fact lost: {facts_before:?} vs {facts_race:?}"
     );
+    let (early_provider, late_provider) = if first_member_first {
+        (&provider_a, &provider_b)
+    } else {
+        (&provider_b, &provider_a)
+    };
     assert_eq!(
-        scene.engine_module_views_for(&provider),
+        scene.engine_module_views_for(early_provider),
         BTreeSet::from([early_owner.0]),
-        "only the activated member's facts commit; the deferred member overwrites nothing"
+        "only the activated member's provider facts commit"
+    );
+    assert!(
+        scene.engine_module_views_for(late_provider).is_empty(),
+        "the deferred member's provider commits no facts"
     );
     let (owners, reservations, leases) = scene
         .coordinator
@@ -1772,11 +2022,47 @@ fn cgroup_native_owner_second_prepared_member_defers_with_first_intact() {
         facts_race.iter().all(|fact| facts_final.contains(fact)),
         "the first member's facts survive the second activation: {facts_race:?} vs {facts_final:?}"
     );
+    let (first_owner, second_owner) = if first_member_first {
+        (early_owner, late_owner)
+    } else {
+        (late_owner, early_owner)
+    };
     assert_eq!(
-        scene.engine_module_views_for(&provider),
-        BTreeSet::from([early_owner.0, late_owner.0]),
-        "both members' distinct per-view facts survive"
+        scene.engine_module_views_for(&provider_a),
+        BTreeSet::from([first_owner.0]),
+        "the first member's provider facts survive"
     );
+    assert_eq!(
+        scene.engine_module_views_for(&provider_b),
+        BTreeSet::from([second_owner.0]),
+        "the second member's provider facts survive"
+    );
+    for (owner, provider) in [(first_owner, &provider_a), (second_owner, &provider_b)] {
+        let claims = scene
+            .coordinator
+            .engine
+            .pinned
+            .view_claims(owner)
+            .unwrap_or_else(|| panic!("owner {} retains pin claims", owner.0));
+        assert!(
+            !claims.pins.is_empty() || !claims.tables.is_empty() || !claims.targets.is_empty(),
+            "owner {} keeps nonempty pin claims",
+            owner.0
+        );
+        let paths = scene.owner_claim_paths(owner);
+        assert!(
+            !paths.is_empty(),
+            "owner {} claims a nonempty provider identity",
+            owner.0
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| Path::new(path) == provider.as_path()),
+            "owner {} claims its own provider: {paths:?}",
+            owner.0
+        );
+    }
     for owner in [early_owner, late_owner] {
         let epochs = scene
             .coordinator
@@ -1787,7 +2073,17 @@ fn cgroup_native_owner_second_prepared_member_defers_with_first_intact() {
             epochs.image_state,
             super::super::inventory::ImageCheck::Exact
         );
-        assert!(epochs.complete.is_some());
+        assert_eq!(epochs.requested, epochs.serviced);
+        // Additions-only, not VerifiedAbsence: each member maps exactly
+        // one of the two hints, so its scan records the other hint as
+        // verified-absent (`scan.rs` hint skip), which keeps the receipt
+        // from closing a complete revision (`inventory.rs` pinning gate).
+        // Authority is still exact and the facts still commit; the
+        // shared-provider and single-member twins pin the complete case.
+        assert_eq!(
+            epochs.complete, None,
+            "distinct-provider activation commits additions-only"
+        );
     }
     let (owners, reservations, leases) = scene
         .coordinator
@@ -1804,11 +2100,24 @@ fn cgroup_native_owner_second_prepared_member_defers_with_first_intact() {
         15,
         "both members prepare in the race pass; the deferred member prepares again"
     );
-    for (caller, count) in [(first_caller, 7), (second_caller, 11)] {
-        let edges: Vec<_> = scene.coordinator.registry().edges_of(caller).collect();
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].entry_count, count, "physical use is conserved");
-    }
+    let first_edges: Vec<_> = scene
+        .coordinator
+        .registry()
+        .edges_of(first_caller)
+        .collect();
+    let second_edges: Vec<_> = scene
+        .coordinator
+        .registry()
+        .edges_of(second_caller)
+        .collect();
+    assert_eq!(first_edges.len(), 1);
+    assert_eq!(second_edges.len(), 1);
+    assert_ne!(
+        first_edges[0].module, second_edges[0].module,
+        "the members keep distinct modules"
+    );
+    assert_eq!(first_edges[0].entry_count, 7, "physical use is conserved");
+    assert_eq!(second_edges[0].entry_count, 11, "physical use is conserved");
 }
 
 #[test]

@@ -6171,4 +6171,97 @@ mod tests {
         // The record is still live custody (refusal consumes nothing).
         assert_eq!(fx.state.usage().deferred_origins, 1);
     }
+
+    // P4-M5 pin: contradiction on the live era needs no qualification —
+    // an unqualified-begin OK voids the era, fail-closed. Three phases
+    // pin the truth table: an unqualified first OK mints nothing and
+    // contradicts nothing; a qualified first OK mints; an unqualified
+    // second OK contradicts (UnseenFinalize gap plus void).
+    #[test]
+    fn initialize_second_ok_contradicts_on_unqualified_begin() {
+        let mut fx = DeferredFixture::new();
+        // Birth bootstrap above the straddler begins: begins below the
+        // cut replay unqualified.
+        fx.state
+            .domains
+            .get_mut(&fx.domain)
+            .expect("domain")
+            .bootstrap = Some(10);
+        let target = fx.target("C_Initialize");
+        let drive = |fx: &mut DeferredFixture, begin: u64, cut: u64| {
+            fx.next_key += 1;
+            fx.next_token += 1;
+            let token = CallToken(fx.next_token);
+            let call = PendingCall {
+                domain: fx.domain,
+                key: CallKey::reference(fx.next_key),
+                begin,
+                entry_ns: 100,
+                function: target,
+                kind: CallKind::Lifecycle(lifecycle::CRYPTOKI_INITIALIZE),
+                session: HandleInput::Absent,
+                inputs: [HandleInput::Absent, HandleInput::Absent],
+                requested: [None, None],
+                derive_protocol: DeriveResultProtocol::Unavailable,
+                entry_mechanism: MechClass::Value,
+                entry_output: OutputEvidence::NotCaptured,
+                scope: SlotScope::Unknown,
+                completion: Some(Completion {
+                    cut,
+                    end_ns: 110,
+                    rv: CkRv::OK.0,
+                    return_mechanism: MechanismEvidence::NotCaptured,
+                    results: [ResultSlot::NotCaptured, ResultSlot::NotCaptured],
+                    session_out: HandleInput::Absent,
+                    found: FindResult::NotCaptured,
+                    attributes: None,
+                    malformed: false,
+                }),
+                fenced: false,
+                begin_applied: false,
+                end_applied: false,
+                snapshot: EMPTY_SNAPSHOT,
+            };
+            fx.state.pending.insert(token, call);
+            fx.state.apply_begin(token);
+            let mut ledger = super::super::journal::StagingLedger::new();
+            let mut effects = ObjectEffects::default();
+            fx.state.apply_end(token, &mut effects, &mut ledger);
+        };
+        let gaps = |fx: &DeferredFixture| {
+            fx.state
+                .gaps
+                .get(&ObjectGap::UnseenFinalize)
+                .copied()
+                .unwrap_or(0)
+        };
+        // Phase 0: an unqualified first OK mints nothing and contradicts
+        // nothing — there is no live era yet.
+        drive(&mut fx, 5, 6);
+        assert_eq!(gaps(&fx), 0, "no contradiction before any era");
+        assert!(
+            !fx.state.domains[&fx.domain].initialized,
+            "no mint without qualification"
+        );
+        assert_eq!(fx.state.domains[&fx.domain].generation, 0);
+        // Phase 1: a qualified first OK mints the era.
+        drive(&mut fx, 10, 11);
+        assert!(
+            fx.state.domains[&fx.domain].initialized,
+            "qualified OK mints"
+        );
+        assert_eq!(fx.state.domains[&fx.domain].generation, 0);
+        assert_eq!(gaps(&fx), 0, "mint is not a contradiction");
+        // Phase 2: an unqualified second OK contradicts the live era.
+        drive(&mut fx, 6, 7);
+        assert_eq!(gaps(&fx), 1, "unqualified OK contradicts the live era");
+        assert_eq!(
+            fx.state.domains[&fx.domain].generation, 1,
+            "contradiction voids"
+        );
+        assert!(
+            !fx.state.domains[&fx.domain].initialized,
+            "void clears initialized"
+        );
+    }
 }

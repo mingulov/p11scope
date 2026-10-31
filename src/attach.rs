@@ -3381,6 +3381,9 @@ fn prune_linkless_retained(
     retained.retain(|slot, _| links_cover_slot(links, *slot));
 }
 
+/// Ordinary Detailed grouping for host tests: production regroups through
+/// [`group_static_slots_with_roots`] with the session's journal selection.
+#[cfg(test)]
 fn group_static_slots(
     slots: &[Slot],
     policy: CapturePolicy,

@@ -744,10 +744,7 @@ fn loader_ticket_harness_bank_hit_overflow_refuses() {
 /// Domain before row: the epoch guard fires before the zero-cell check.
 #[test]
 fn loader_ticket_harness_bank_guard_before_zero_cell() {
-    drive_tickets(
-        "guard-before-zero-cell",
-        &["ASSERT guard_before_zero_cell"],
-    );
+    drive_tickets("guard-before-zero-cell", &["ASSERT guard_before_zero_cell"]);
 }
 
 /// Selection validation: unpublished, corrupt or missing SELECT

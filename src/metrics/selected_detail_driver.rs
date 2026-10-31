@@ -3133,6 +3133,166 @@ mod tests {
     }
 
     #[test]
+    fn promotion_driver_selected_detail_isolates_unrelated_endpoint_by_identity() {
+        // Isolation twin with positive detail: provider A's endpoint
+        // carries genuine detail rows while provider B stays exact
+        // aggregate. B's slots appear in the aggregate rows with exact
+        // counts, and B is absent from the detail rows by structured
+        // endpoint identity (slot/object/file_offset) — the detail
+        // section is present and exact for A, so the absence proves
+        // isolation rather than globally disabled detail.
+        use super::super::selected_detail::reserve_detail_window_on_banks_collecting;
+        use crate::attach::counter_banks::BroadToggleFacts;
+        let pool = test_pool();
+        let scene = stage_two_providers(pool);
+        let mut plan = scene.plan.clone();
+        plan.slots[2].names = vec!["C_Other".into()];
+        plan.slots[3].names = vec!["C_OtherVerify".into()];
+        let proved = promotion_scene(
+            convert_for(&plan, scene.id_a),
+            scene.objects.clone(),
+            scene.id_a,
+            Some(0x80),
+            0xC00,
+            0xE9E,
+        );
+        let facts = BroadToggleFacts {
+            generation: broad_generation(),
+            stopped: false,
+        };
+        let custody = DetailWindowCustody::new();
+        let mut brackets = BroadBracketCollector::new(4, 0, scene.pool.reserver());
+        let mut seq = 0u64;
+        let before = scripted_read(
+            &scene.pool,
+            &plan,
+            broad_generation(),
+            CounterMode::Counts,
+            &counts_for(&plan, 1, 1),
+            window_of(10, 20),
+        );
+        reserve_detail_window_on_banks_collecting(
+            &scene.banks,
+            facts,
+            &plan,
+            &scene.objects,
+            &proved.request,
+            &proved.bundle,
+            &mut brackets,
+            &mut seq,
+            Ok(before),
+            &scene.pool.reserver(),
+            &custody,
+        )
+        .expect("provider A reserves");
+        let reservation = custody.take_reserved().expect("reservation parks");
+        let mut driver = PromotionDriver::new();
+        driver.stage_open_window_for_test(
+            reservation.bind_generation(9),
+            brackets,
+            seq,
+            proved.request,
+        );
+        let mut during = counts_for(&plan, 4, 4);
+        during[2] = (10, 10, 0);
+        during[3] = (10, 10, 0);
+        let after = scripted_read(
+            &scene.pool,
+            &plan,
+            broad_generation(),
+            CounterMode::Counts,
+            &during,
+            window_of(20, 30),
+        );
+        let broad = BanksBroad {
+            banks: Some(&scene.banks),
+            facts,
+        };
+        let report = driver
+            .close(&broad, &plan, CounterMode::Counts, Ok(after))
+            .expect("ordered close delivers");
+        drop(report);
+        // Positive detail for A alone: the collector observes two
+        // genuine reads over A's convert envelope and the interval
+        // records through the real detail renderer.
+        let convert_plan = proved.bundle.convert_subset().plan().clone();
+        let mut detail_collector =
+            CounterCollector::new(limits_for(&convert_plan), scene.pool.reserver());
+        let detail_first = scripted_read(
+            &scene.pool,
+            &convert_plan,
+            NonZeroU64::new(9).unwrap(),
+            CounterMode::Counts,
+            &counts_for(&convert_plan, 0, 0),
+            window_of(10, 20),
+        );
+        assert!(matches!(
+            detail_collector.observe(Ok(detail_first)),
+            CounterObservation::Initial
+        ));
+        let mut detail_counts = counts_for(&convert_plan, 0, 0);
+        detail_counts[0] = (5, 4, 0);
+        detail_counts[1] = (7, 7, 0);
+        let detail_second = scripted_read(
+            &scene.pool,
+            &convert_plan,
+            NonZeroU64::new(9).unwrap(),
+            CounterMode::Counts,
+            &detail_counts,
+            window_of(20, 30),
+        );
+        let CounterObservation::Advanced { deltas, .. } =
+            detail_collector.observe(Ok(detail_second))
+        else {
+            panic!("the detail interval advances");
+        };
+        driver.record_detail(&deltas, CounterMode::Counts, 9);
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), driver.ledger());
+        let section = &composed["evidence"]["selected_detail"];
+        // B stays exact aggregate beside the window.
+        assert_eq!(
+            section["aggregate"]["rows"][2]["entered"],
+            serde_json::json!(9),
+            "B's window counts stay in the aggregate rows"
+        );
+        assert_eq!(
+            section["aggregate"]["rows"][2]["returned"],
+            serde_json::json!(9)
+        );
+        // The detail section is present and exact for A.
+        let detail = section.get("detail").expect("A records detail");
+        assert_eq!(detail["scope"], serde_json::json!("detail"));
+        assert_eq!(detail["detail_generation"], serde_json::json!(9));
+        let rows = detail["rows"].as_array().expect("detail rows render");
+        assert_eq!(rows.len(), 2, "detail covers A's two slots: {rows:?}");
+        assert_eq!(rows[0]["entered"], serde_json::json!(5));
+        assert_eq!(rows[0]["returned"], serde_json::json!(4));
+        assert_eq!(rows[1]["entered"], serde_json::json!(7));
+        assert_eq!(rows[1]["returned"], serde_json::json!(7));
+        // Every detail row names A's endpoint identity, and no row
+        // names B's: A and B share file offsets, so the pinned
+        // object id carries the distinction.
+        for (row, offset) in rows.iter().zip([0x80u64, 0x90u64]) {
+            assert_eq!(
+                row["object"],
+                serde_json::json!(scene.id_a.0),
+                "detail row names A's object: {row:?}"
+            );
+            assert_eq!(row["file_offset"], serde_json::json!(offset));
+            assert_ne!(
+                row["object"],
+                serde_json::json!(scene.id_b.0),
+                "no detail row names B's object: {row:?}"
+            );
+        }
+        let text = serde_json::to_string(detail).expect("detail serializes");
+        assert!(
+            !text.contains("C_Other"),
+            "B's names appear nowhere in the detail record: {text}"
+        );
+    }
+
+    #[test]
     fn promotion_driver_child_envelope_refuses_past_detailed_ceiling() {
         // Negative twin: no de facto Detailed capacity expansion. A
         // convert envelope past the Detailed slot ceiling refuses at

@@ -20395,7 +20395,9 @@ mod tests {
     }
 
     /// The attested start retains its successful seal through the retention
-    /// seam, so the producers drain observes the sealed fact.
+    /// seam, so the producers drain observes the sealed fact. Retention is a
+    /// single site on the sealed cell, placed after the seal's success: a
+    /// refused seal (`?`) never reaches it.
     #[test]
     fn attested_start_retains_through_the_seam() {
         let source = include_str!("attach.rs");
@@ -20411,10 +20413,22 @@ mod tests {
             body.contains("retain_sealed_linkage("),
             "the attested start must retain through the seam"
         );
+        assert_eq!(
+            body.matches("retain_sealed_linkage(").count(),
+            1,
+            "retention is a single site"
+        );
         assert!(
             body.contains("sealed_journal_linked"),
             "the attested start retains the sealed cell"
         );
+        let sealed = body
+            .find("seal_attached_subset_native(")
+            .expect("the attested start seals");
+        let retained = body
+            .find("retain_sealed_linkage(")
+            .expect("the attested start retains");
+        assert!(sealed < retained, "retention follows the successful seal");
     }
 
     /// The production producers drain derives through the linkage seam from

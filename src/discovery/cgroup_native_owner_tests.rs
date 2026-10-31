@@ -1670,6 +1670,14 @@ fn cgroup_native_owner_second_prepared_member_defers_with_first_intact() {
     let provider = scene.dir.path().join("scoped-provider.so");
     let second_child = scene.spawn_second_child("ready-b");
     let (second_caller, second_pid, _) = scene.admit_and_settle_second_member(second_child, 42, 11);
+    // Fix A RED: this first two-member positive requires distinct
+    // physical providers per member; the shared setup must fail here.
+    let second_edges: Vec<_> = scene.coordinator.registry().edges_of(second_caller).collect();
+    assert_eq!(second_edges.len(), 1);
+    assert_ne!(
+        second_edges[0].module, scene.module,
+        "distinct providers resolve to distinct modules"
+    );
     let first_pid = scene.child_id();
     let first_caller = scene.caller;
     // Preparation order follows pid order; script in that same order

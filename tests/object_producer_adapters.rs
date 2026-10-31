@@ -237,15 +237,19 @@ fn object_producer_adapters_return_fill_shape() {
     let discards: Vec<_> = returned.match_indices("entry.discard(0)").collect();
     assert_eq!(
         discards.len(),
-        2,
-        "the continuity-gate arm and the failed-emission arm each discard"
+        3,
+        "the continuity-gate arm, the journal flag-conversion arm and the failed-emission arm each discard"
     );
     assert!(
         discards[0].0 < fill,
         "the gate arm must discard before any object read"
     );
     assert!(
-        drain < submit && drain < discards[1].0,
+        find < discards[1].0 && discards[1].0 < drain,
+        "the journal flag-conversion arm must discard after emission and before the drain retire"
+    );
+    assert!(
+        drain < submit && drain < discards[2].0,
         "the drain retire must precede submit and the emission discard"
     );
     // The drain still queries (required=0, all sane phases) and the

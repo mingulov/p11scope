@@ -611,6 +611,53 @@ impl<Pin> PreparedScopedCaller<Pin> {
     }
 }
 
+/// Permit-backed proof of current cgroup membership for one staged
+/// owner candidate: the final-sampled member's pid and generation,
+/// validated against the borrowed admission permit. Constructible
+/// only through `validate`, lifetime-bound to the permit borrow so it
+/// cannot span transactions, move-only (no `Clone`, `Default`, or
+/// serialization). The permit check re-reads custody liveness —
+/// refuses on mismatch, supplies no replacement identity. The job
+/// fence rides the transaction outcome gate beside this proof, never
+/// inside it: a permit proves its member, not the whole transaction.
+pub(crate) struct ScopedOwnerProof<'a> {
+    pid: u32,
+    generation: crate::inspect_system::MemberGeneration,
+    _permit: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> ScopedOwnerProof<'a> {
+    /// Validate staged (pid, generation) against the borrowed
+    /// final-sample permit: pid and generation match, custody live,
+    /// work finish polled. Anything else is `None`.
+    pub(crate) fn validate(
+        pid: u32,
+        generation: &crate::inspect_system::MemberGeneration,
+        permit: &'a crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
+    ) -> Option<Self> {
+        if pid != permit.pid()
+            || *generation != *permit.generation()
+            || !permit.check()
+            || !permit.finish_check()
+        {
+            return None;
+        }
+        Some(Self {
+            pid,
+            generation: generation.clone(),
+            _permit: std::marker::PhantomData,
+        })
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn generation(&self) -> &crate::inspect_system::MemberGeneration {
+        &self.generation
+    }
+}
+
 impl<Source: ProcessSource> CallerAdapter<Source> {
     /// Never reopen the PID: this is the source pin enclosed by the original
     /// scoped preparation, before the collection's final sample.
@@ -1106,6 +1153,85 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         );
         self.live_by_pid.insert(pid, id);
         Ok((id, true))
+    }
+
+    /// Install native-exact authority on an admitted caller after its
+    /// staged owner proved under the permit-backed proof. The caller
+    /// must be live, unretired, still scan-pinned, and name the
+    /// proof's pid and generation, with its held pin still the same;
+    /// anything else refuses without touching the record.
+    pub(crate) fn install_scoped_native_authority(
+        &mut self,
+        caller: CallerId,
+        image: BoundImage,
+        proof: &ScopedOwnerProof<'_>,
+    ) -> Result<(), AdmitFailure> {
+        let failed = |reason: &str| AdmitFailure {
+            reason: reason.into(),
+            budget: None,
+        };
+        let record = self
+            .record(caller)
+            .ok_or_else(|| failed("scoped native activation names no retained caller"))?;
+        if record.retired
+            || record.authority != ImageAuthority::ScanPinned
+            || record.pid != proof.pid()
+            || self.live_id(record.pid) != Some(caller)
+        {
+            return Err(failed(
+                "retained cgroup caller changed before native authority installation",
+            ));
+        }
+        if record.start_time != proof.generation().start_time
+            || record.exe != proof.generation().exe
+        {
+            return Err(failed(
+                "retained caller is a different generation from the scoped proof",
+            ));
+        }
+        let live = self
+            .callers
+            .get(&caller)
+            .and_then(|tracked| tracked.pin.as_ref())
+            .is_some_and(|pin| self.source.still_the_same(pin));
+        if !live {
+            return Err(failed(
+                "retained caller custody lapsed before native authority installation",
+            ));
+        }
+        self.callers
+            .get_mut(&caller)
+            .expect("validated retained caller")
+            .record
+            .authority = ImageAuthority::NativeExact { image };
+        Ok(())
+    }
+
+    /// Restore scan-pinned authority after a failed activation commit
+    /// that had already installed `image`. Only the exact installed
+    /// image flips back; anything else is left untouched and reported.
+    /// Caller IDs are never reused, so the flip cannot land on a
+    /// newer incarnation.
+    pub(crate) fn cancel_scoped_native_authority(
+        &mut self,
+        caller: CallerId,
+        image: BoundImage,
+    ) -> Result<(), String> {
+        let tracked = self.callers.get_mut(&caller).ok_or_else(|| {
+            format!(
+                "scoped native activation rollback names no retained caller {}",
+                caller.label()
+            )
+        })?;
+        if tracked.record.authority == (ImageAuthority::NativeExact { image }) {
+            tracked.record.authority = ImageAuthority::ScanPinned;
+            Ok(())
+        } else {
+            Err(format!(
+                "scoped native activation rollback missed its installed image for {}",
+                caller.label()
+            ))
+        }
     }
 
     /// Reconcile's admission: the budget refusal carries its

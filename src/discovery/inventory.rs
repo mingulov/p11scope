@@ -10,6 +10,7 @@ use super::*;
 use crate::capacity::InventoryBudget;
 use crate::discovery::native_binding::BoundImage;
 use crate::discovery::scan::{DiscoveryPolicy, InventoryDiscoveryLimits};
+use crate::process::PidPin;
 use std::sync::Arc;
 
 #[path = "inventory/image_guard.rs"]
@@ -138,6 +139,12 @@ const EXEC_INVALIDATED_DIRTY: u8 = 16;
 #[derive(Debug)]
 struct Owner {
     image: BoundImage,
+    /// Provisional record for the scoped commit path: staged before
+    /// the final membership sample, inert until the permit-backed
+    /// activation commit flips it. Staged records grant no receipt
+    /// authority and publish nothing; anything still staged at a
+    /// failure releases instead of activating.
+    staged: bool,
     revision: u64,
     requested_epoch: u64,
     serviced_epoch: u64,
@@ -343,6 +350,7 @@ impl Engine {
             id,
             Owner {
                 image,
+                staged: false,
                 revision: 0,
                 requested_epoch: 0,
                 serviced_epoch: 0,
@@ -354,6 +362,144 @@ impl Engine {
         );
         self.views.push(view);
         Ok(id)
+    }
+
+    /// Provision one staged (provisional) owner for the scoped commit
+    /// path: reserve, insert a staged record that grants no authority,
+    /// and open its warm view. The record's scope proof arrives only
+    /// with the permit-backed activation commit; until then the owner
+    /// is inert (no receipt authority, no publication) and must either
+    /// activate or release within the same commit. Returns the staged
+    /// id with its retained pin for the preparation's observation.
+    pub(crate) fn provision_staged_owner(
+        &mut self,
+        pid: u32,
+        image: BoundImage,
+    ) -> Result<(ProcessViewId, Arc<PidPin>)> {
+        self.note_graph_inputs_mutated();
+        self.inventory_state()?;
+        // No scope gate here: the staged record is provisional and
+        // grants nothing. `inventory_scope_contains` is not weakened;
+        // the permit-backed proof gates activation instead.
+        let id = self.allocate_view_id()?;
+        let view = match ProcessView::open_warm_only(id, pid) {
+            Ok(view) => view,
+            Err(error) => {
+                self.release_view_id(id);
+                return Err(anyhow::Error::msg(error));
+            }
+        };
+        let pin = Arc::clone(view.retained_pin_arc());
+        let state = self.inventory.as_mut().expect("checked Inventory state");
+        state.reservations.remove(&id);
+        state.owners.insert(
+            id,
+            Owner {
+                image,
+                staged: true,
+                revision: 0,
+                requested_epoch: 0,
+                serviced_epoch: 0,
+                last_complete_revision: None,
+                dirty: 0,
+                recovery_epoch: 0,
+                image_state: ImageCheck::Unavailable,
+            },
+        );
+        self.views.push(view);
+        Ok((id, pin))
+    }
+
+    /// Activate one staged owner under the permit-backed proof: pure
+    /// commit work only. Validates the staged view's pid and liveness
+    /// against the proof, commits the prepared reconciliation (which
+    /// revalidates the image through the passed guard — the commit's
+    /// replay guard over the stored observation), flips the record to
+    /// active, and releases the scan lease. A refused activation
+    /// releases the staged record, view, reservation, and lease as
+    /// well: nothing staged survives a failure.
+    pub(crate) fn activate_staged_owner(
+        &mut self,
+        owner: ProcessViewId,
+        prepared: PreparedReconciliation,
+        lease: &ScanLease,
+        proof: &crate::discovery::caller_registry::ScopedOwnerProof<'_>,
+        guard: &mut dyn ImageGuard,
+    ) -> Result<InventoryCommit> {
+        self.note_graph_inputs_mutated();
+        if !self
+            .inventory_state()?
+            .owners
+            .get(&owner)
+            .is_some_and(|record| record.staged)
+        {
+            bail!("inventory owner is not a staged provisional");
+        }
+        let view = self
+            .views
+            .iter()
+            .find(|view| view.id() == owner)
+            .ok_or_else(|| anyhow!("staged inventory owner has no retained view"))?;
+        if view.pid() != proof.pid() || !view.still_the_same() {
+            let error = anyhow!("staged owner liveness or pid changed at activation commit");
+            return match self.abandon_staged_owner(owner, lease) {
+                Ok(()) => Err(error),
+                Err(abandon) => Err(anyhow!(
+                    "{error:#}; staged release also failed: {abandon:#}"
+                )),
+            };
+        }
+        // The record stays staged through the commit: the staged scope
+        // exception carries it, and a failed commit releases below.
+        let commit = match self.commit_inventory_reconciliation(prepared, guard) {
+            Ok(commit) => commit,
+            Err(error) => {
+                return match self.abandon_staged_owner(owner, lease) {
+                    Ok(()) => Err(error),
+                    Err(abandon) => Err(anyhow!(
+                        "{error:#}; staged release also failed: {abandon:#}"
+                    )),
+                };
+            }
+        };
+        self.inventory
+            .as_mut()
+            .expect("checked Inventory state")
+            .owners
+            .get_mut(&owner)
+            .expect("committed staged owner")
+            .staged = false;
+        self.release_inventory_scan(lease)?;
+        Ok(commit)
+    }
+
+    /// Release one staged provisional owner that cannot commit: the
+    /// staged record, its view, and its ID occupancy. Refuses active
+    /// (non-staged) owners: retained owners are never removed here.
+    pub(crate) fn release_staged_owner(&mut self, owner: ProcessViewId) -> Result<()> {
+        self.note_graph_inputs_mutated();
+        self.inventory_state()?;
+        let state = self.inventory.as_mut().expect("checked Inventory state");
+        if !state.owners.get(&owner).is_some_and(|record| record.staged) {
+            bail!(
+                "inventory owner is not a staged provisional; retained owners are never released"
+            );
+        }
+        state.owners.remove(&owner);
+        self.views.retain(|view| view.id() != owner);
+        self.release_view_id(owner);
+        Ok(())
+    }
+
+    fn abandon_staged_owner(&mut self, owner: ProcessViewId, lease: &ScanLease) -> Result<()> {
+        let lease_result = self.release_inventory_scan(lease);
+        let staged_result = self.release_staged_owner(owner);
+        match (lease_result, staged_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(first), Err(second)) => Err(anyhow!("{first:#}; and {second:#}")),
+        }
     }
 
     pub(crate) fn acquire_inventory_scan(&mut self, owner: ProcessViewId) -> Result<ScanLease> {
@@ -496,12 +642,17 @@ impl Engine {
         if owner.image_state == ImageCheck::Changed {
             bail!("inventory owner image was already invalidated; existing claims retained");
         }
+        // A staged provisional defers its scope proof to the
+        // permit-backed activation commit; it publishes nothing
+        // before. `inventory_scope_contains` itself is not weakened.
+        let staged_provisional = owner.staged;
         let view = self
             .views
             .iter()
             .find(|view| view.id() == identity.owner)
             .ok_or_else(|| anyhow!("inventory owner has no retained lifetime pin"))?;
-        let checked = if view.still_the_same() && self.inventory_scope_contains(view.pid()) {
+        let scope_ok = staged_provisional || self.inventory_scope_contains(view.pid());
+        let checked = if view.still_the_same() && scope_ok {
             guard.check(view, identity.image)
         } else {
             ImageCheck::Unavailable
@@ -743,6 +894,19 @@ impl Engine {
             .ok_or_else(|| anyhow!("inventory owner is no longer retained"))?
             .revision = u64::MAX;
         Ok(())
+    }
+
+    /// Staged-owner counts for the activation twins: (retained
+    /// owners, reservations, active scan leases). A refused commit
+    /// leaves all three at their pre-commit values.
+    #[cfg(test)]
+    pub(crate) fn inventory_staged_counts_for_test(&self) -> Result<(usize, usize, usize)> {
+        let state = self.inventory_state()?;
+        Ok((
+            state.owners.len(),
+            state.reservations.len(),
+            state.leases.len(),
+        ))
     }
 
     /// Owner bookkeeping snapshot for tests: refresh epochs, dirty

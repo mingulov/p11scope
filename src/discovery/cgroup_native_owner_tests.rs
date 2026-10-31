@@ -106,6 +106,15 @@ struct ScopedNativeScene {
     dir: tempfile::TempDir,
 }
 
+/// What the provider-read hook does while the commit runs:
+/// nothing, migrate the member out, or kill and reap the child.
+#[derive(Clone, Copy)]
+enum PassAction {
+    Stable,
+    MigrateOut,
+    KillChild,
+}
+
 impl ScopedNativeScene {
     fn new() -> Self {
         let (dir, child, coordinator) = tests::cgroup_provider_scene();
@@ -318,7 +327,7 @@ impl ScopedNativeScene {
         let first_ns = crate::discovery::caller_registry::now_ns();
         assert!(first_ns > attached_ns);
         let mut row = WitnessRow::scripted(domain, ticket, exec, object, endpoint, pid, first_ns);
-        row.entry_count = 1;
+        row.entry_count = 9;
         let mut decided = 0;
         for batch in [
             native_read(domain, vec![row], Vec::new()),
@@ -336,7 +345,7 @@ impl ScopedNativeScene {
                         exec_id: exec,
                     },
                     object,
-                    count: 1,
+                    count: 9,
                 }],
             ),
         ] {
@@ -442,7 +451,12 @@ impl ScopedNativeScene {
     fn commit_membership_pass(&mut self, migrate_out: bool) -> CgroupCompletion {
         let caller = self.caller;
         let pid = self.child_id();
-        self.commit_membership_pass_for(Some(caller), pid, migrate_out)
+        let action = if migrate_out {
+            PassAction::MigrateOut
+        } else {
+            PassAction::Stable
+        };
+        self.commit_membership_pass_for(Some(caller), pid, action)
     }
 
     /// One membership pass for an explicit caller/pid, carrying the
@@ -454,7 +468,7 @@ impl ScopedNativeScene {
         &mut self,
         caller: Option<CallerId>,
         pid: u32,
-        migrate_out: bool,
+        action: PassAction,
     ) -> CgroupCompletion {
         use crate::discovery::inventory_attach_set::provider_read_test;
 
@@ -492,11 +506,45 @@ impl ScopedNativeScene {
         let reads = Rc::new(Cell::new(0));
         let returned_reads = Rc::clone(&reads);
         let membership = self.dir.path().join("cgroup.procs");
+        // Owned hook data only: the observer is 'static. The kill
+        // names the child by pid and reaps it; later hook fires find
+        // no process and pass through.
+        let hook_pid = self.child.as_ref().map(|child| child.id());
         provider_read_test::observe(
             move || {
                 returned_reads.set(returned_reads.get() + 1);
-                if migrate_out {
-                    std::fs::write(&membership, b"").unwrap();
+                match action {
+                    PassAction::Stable => {}
+                    PassAction::MigrateOut => {
+                        std::fs::write(&membership, b"").unwrap();
+                    }
+                    PassAction::KillChild => {
+                        if let Some(pid) = hook_pid {
+                            // SAFETY: pid named the scene's owned child;
+                            // ESRCH/ECHILD mean it is already gone.
+                            unsafe {
+                                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                                let deadline =
+                                    std::time::Instant::now() + std::time::Duration::from_secs(5);
+                                loop {
+                                    let mut status = 0;
+                                    let waited = libc::waitpid(
+                                        pid as libc::pid_t,
+                                        &mut status,
+                                        libc::WNOHANG,
+                                    );
+                                    if waited == pid as libc::pid_t || waited < 0 {
+                                        break;
+                                    }
+                                    assert!(
+                                        std::time::Instant::now() < deadline,
+                                        "killed fixture child did not reap"
+                                    );
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
+                        }
+                    }
                 }
             },
             || self.coordinator.commit_batch(false).unwrap(),
@@ -525,7 +573,7 @@ impl ScopedNativeScene {
 }
 
 #[test]
-#[ignore = "6.11 activation deferred per docs/superpowers/decisions/2026-10-29-611-bridge-decision.md; tracked RED cell, migration twin cgroup_native_owner_migration_during_provider_retention_refuses_activation stays running"]
+#[ignore = "6.11p2 revisions pending: activation commits but the engine tail is not revised yet; un-ignore with the revision handler"]
 fn cgroup_native_owner_stable_retained_member_activates_after_final_permit() {
     // A missing scoped owner path must fail here only after real original
     // binding, fallback and final sampled membership have all succeeded.
@@ -628,6 +676,64 @@ fn cgroup_native_owner_migration_during_provider_retention_refuses_activation() 
             .map(|gap| gap.subject.clone())
             .collect::<Vec<_>>()
     );
+    let (owners, reservations, leases) = scene
+        .coordinator
+        .engine
+        .inventory_staged_counts_for_test()
+        .unwrap();
+    assert_eq!(
+        (owners, reservations, leases),
+        (0, 0, 0),
+        "a refused commit releases its reservation and lease"
+    );
+
+    // Leg 1b (death during commit): the member dies while the
+    // commit runs, after full preparation. No permit can back it, so
+    // the commit releases everything with the member-precise reason.
+    let mut dying = ScopedNativeScene::new();
+    let acquired = dying.set_scripted_acquisition(&[
+        (1, 41, 1),
+        (2, 41, 1),
+        (3, 41, 1),
+        (4, 41, 1),
+        (5, 41, 1),
+    ]);
+    let caller = dying.caller;
+    let pid = dying.child_id();
+    // The outcome depends on which provider phase the hook fires
+    // in; the pins below hold either way.
+    let _completion = dying.commit_membership_pass_for(Some(caller), pid, PassAction::KillChild);
+    assert_eq!(dying.coordinator.owner_of(caller), None);
+    assert_eq!(
+        acquired.borrow().calls(),
+        5,
+        "preparation ran its owner I/O before the death"
+    );
+    assert!(
+        dying.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == "native owner activation refused"
+                && gap.reason.contains("final-sample permit")
+        }),
+        "a dead member refuses by name: {:?}",
+        dying
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| gap.subject.clone())
+            .collect::<Vec<_>>()
+    );
+    let (owners, reservations, leases) = dying
+        .coordinator
+        .engine
+        .inventory_staged_counts_for_test()
+        .unwrap();
+    assert_eq!(
+        (owners, reservations, leases),
+        (0, 0, 0),
+        "a death-refused commit releases its reservation and lease"
+    );
+    drop(dying);
 
     // Leg 2 (positive control): a stable member activates, proving the
     // commit path runs end to end. RED pre-fix.
@@ -659,6 +765,16 @@ fn cgroup_native_owner_migration_during_provider_retention_refuses_activation() 
     assert_eq!(epochs.requested, epochs.serviced);
     assert!(epochs.complete.is_some());
     assert_eq!(acquired.borrow().calls(), 5);
+    let (owners, reservations, leases) = control
+        .coordinator
+        .engine
+        .inventory_staged_counts_for_test()
+        .unwrap();
+    assert_eq!(
+        (owners, reservations, leases),
+        (1, 0, 0),
+        "activation retains exactly its owner"
+    );
 }
 
 #[test]
@@ -794,14 +910,17 @@ fn cgroup_native_owner_cross_domain_alias_activates_exact_domain() {
     );
     assert!(epochs.complete.is_some());
     assert_eq!(acquired.borrow().calls(), 5);
-    // Both settled images keep their physical use: 7 scene + 1 alias.
+    // Both settled images keep their physical use, max-wins across
+    // pairs (never summed): the alias pair's 9 surfaces over the
+    // scene pair's 7, while activation still binds the scene image.
     let edge = scene
         .coordinator
         .registry()
         .edge(scene.caller, scene.module)
         .unwrap();
-    assert_eq!(edge.entry_count, 8);
+    assert_eq!(edge.entry_count, 9);
     assert_eq!(scene.coordinator.registry().witness_census().bound, 2);
+    assert_eq!(scene.coordinator.registry().witness_placement().edge, 2);
 
     // Leg 2 (positive control): no alias, same activation.
     let mut control = ScopedNativeScene::new();
@@ -999,7 +1118,7 @@ fn cgroup_native_owner_reused_generation_never_inherits_native_image() {
     let successor_pid = successor.id();
     scene.child = Some(successor);
     scene.rewrite_membership(&[successor_pid]);
-    let completion = scene.commit_membership_pass_for(None, successor_pid, false);
+    let completion = scene.commit_membership_pass_for(None, successor_pid, PassAction::Stable);
     assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
     assert_eq!(
         completion.admitted, 1,
@@ -1045,6 +1164,20 @@ fn cgroup_native_owner_reused_generation_never_inherits_native_image() {
         1,
         "the settled row stays bound for history"
     );
+    assert!(
+        scene.coordinator.registry().gaps().iter().all(|gap| {
+            gap.subject != "native owner activation refused" || gap.pid != Some(successor_pid)
+        }),
+        "a fresh pid is not a candidate: no refusal spam, silence is honest"
+    );
+
+    // Leg 3: a further pass finds the successor with a caller but no
+    // settled image, and refuses it by name. The veto fires before
+    // any acquisition, so the exhausted script stays untouched.
+    let completion =
+        scene.commit_membership_pass_for(Some(successor_caller), successor_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(scene.coordinator.owner_of(successor_caller), None);
     assert!(
         scene.coordinator.registry().gaps().iter().any(|gap| {
             gap.subject == "native owner activation refused"

@@ -69,15 +69,18 @@ u32 p11_image_identity_issued(u64 *watermark_out);
  * loader publishes bank=0, prepared={1,0}, cuts=0, refusals=0 before
  * links. The Session prepares B (prepared[1]=1) before A fills; the
  * first A-quota then cuts to B exactly once and the issue lands there,
- * so a prepared cut refuses nothing. An unprepared quota refuses
- * honestly, and B quota (no third bank) refuses honestly too.
- * tickets_issued is derived (both watermarks summed), never a cell.
+ * so a prepared cut refuses nothing. A quota cuts back the same way
+ * once the other bank is re-prepared; any other quota (unprepared,
+ * stale, full or corrupt target) refuses honestly.
+ * tickets_issued is derived (folded_issued plus the live watermarks,
+ * pending-fold banks excluded), never a cell.
  * Continuity/index maps stay single-bank (A): B tickets are never
- * seeded there, so no key can alias across banks. Bank reuse (fold and
- * re-prepare with incarnation-safe replacement) is future work: it
- * needs a drain proof the production START rows cannot carry yet. */
+ * seeded there, so no key can alias across banks. */
 #define IMAGE_BANK_SLOTS 2U
 #define IMAGE_BANK_NO_SLOT 2U
+/* Incarnations are 48-bit: bit 16 + 48 fills the u64 exactly, so an
+ * incarnation at or past 2^48 would wrap the qualifier into an alias. */
+#define IMAGE_IDENTITY_INCARNATION_LIMIT (1ULL << 48)
 /* Lifecycle: after the cut the Session proves the retired bank drained
  * (a Session-side drain proof, owned outside this unit), then clears
  * that bank's prepared bit as the fold claim. The kernel folds the
@@ -105,7 +108,10 @@ struct image_bank_select {
  * incarnation) issues disjoint cookies while each bank keeps its
  * 1..16384 local budget. The ticket query and the EXEC binding keep
  * returning the local ticket; only the task identity carries the
- * qualifier. */
+ * qualifier. Incarnations past the 48-bit range refuse (BAD_CONFIG)
+ * instead of wrapping into an alias; re-queries read the epoch before
+ * the cell and issues bind the guard value, so the qualifier always
+ * matches the ticket's epoch. */
 static __always_inline u64 image_identity_qualify(u64 ticket, u64 bank, u64 incarnation)
 {
     return ticket | (bank << 15) | (incarnation << 16);

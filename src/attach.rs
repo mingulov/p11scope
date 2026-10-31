@@ -20560,6 +20560,152 @@ mod tests {
         );
     }
 
+    /// Behavioral drain linkage on a real Session (privileged): the
+    /// substring pins above cannot catch a dead-text copy whose live
+    /// wiring differs, so this cell seals over the actually loaded
+    /// program inventory with the native attach-cell mint and reads
+    /// the linkage back through the real `drain_producers`. A
+    /// never-sealed session drains unlinked; a session sealed over
+    /// the loaded journal pair drains linked with the same producer
+    /// identity; an ordinary session drains unlinked. Builds that
+    /// omit the journal object refuse the journal start with the
+    /// finite build reason instead. Runs in the installed linked
+    /// control cell (journal-on build, real Session).
+    #[ignore = "privileged: real Session seal-to-drain linkage (installed linked control)"]
+    #[test]
+    fn sealed_session_drain_linkage_is_behavioral() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        fn start_selected(
+            cell: &CollectedSessionCell,
+            journal: Option<&super::journal::JournalSpec>,
+        ) -> anyhow::Result<super::Session> {
+            let init = cell.provider_init_offset()?;
+            let (pins, plan) = cell.pin_and_plan(&[init])?;
+            super::Session::start_with_selected(
+                &plan,
+                &super::Scope::Pid(cell.child.id()),
+                &pins,
+                super::CapturePolicy::Allowlisted,
+                None,
+                None,
+                None,
+                super::BackendSelection::Multi,
+                None,
+                None,
+                journal,
+                false,
+                super::require_multi_capable_host(),
+                || crate::uretprobe_hazard::admit(None, false),
+            )
+        }
+
+        fn seal_over_loaded_inventory(
+            session: &super::Session,
+            scene: SealDrainScene,
+        ) -> std::result::Result<super::AttachedSemanticSet, SemanticRefusal> {
+            let SealDrainScene {
+                subset,
+                pins,
+                domain,
+                retained,
+                owned,
+                _dir: _,
+            } = scene;
+            let programs: std::collections::BTreeSet<&str> =
+                session.ebpf.programs().map(|(name, _)| name).collect();
+            let maps = super::instance::InstanceMaps {
+                ebpf: &session.ebpf,
+            };
+            super::seal_attached_subset_from_programs(
+                subset,
+                domain,
+                super::CapturePolicy::Allowlisted,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                &retained,
+                &owned,
+                |id| pins.retain_inventory_target(id).ok(),
+                &programs,
+                || {
+                    maps.mint_attach_generation()
+                        .map_err(|_| SemanticRefusal::Attachment)
+                },
+            )
+        }
+
+        let cell = CollectedSessionCell::build()?;
+        if env!("P11SCOPE_JOURNAL_ENABLED") == "1" {
+            let mut session = start_selected(&cell, Some(&super::journal::JournalSpec))?;
+            anyhow::ensure!(
+                session.attach_failures().is_empty(),
+                "attach failures: {:?}",
+                session.attach_failures()
+            );
+            let unsealed = session
+                .drain_producers()
+                .context("the started session retains producers")?;
+            anyhow::ensure!(
+                !unsealed.journal_linked(),
+                "a never-sealed session drains unlinked"
+            );
+            let attached = seal_over_loaded_inventory(&session, SealDrainScene::attest())
+                .map_err(|reason| anyhow::anyhow!("journal seal refused: {reason}"))?;
+            anyhow::ensure!(
+                attached.journal_linked(),
+                "the loaded journal pair seals linked"
+            );
+            // The one retention step `start_attested` performs, through
+            // the same production seam, then the real drain readback.
+            super::retain_sealed_linkage(&mut session.sealed_journal_linked, &attached);
+            let sealed = session
+                .drain_producers()
+                .context("the sealed session retains producers")?;
+            anyhow::ensure!(
+                sealed.journal_linked(),
+                "the sealed journal pair drains linked through the live wiring"
+            );
+            anyhow::ensure!(
+                sealed.same_producers(&unsealed),
+                "linkage is capability, not producer identity"
+            );
+            anyhow::ensure!(
+                session.event_drain()?.consumption_cut().is_ok(),
+                "the S1 EVENTS cursor stays live on the linked session"
+            );
+            session.detach_producers()?;
+        } else {
+            let refused = start_selected(&cell, Some(&super::journal::JournalSpec));
+            let error = refused.err().context("omitted journal build refuses")?;
+            anyhow::ensure!(
+                format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+                "the omitted build refuses with its finite reason: {error:#}"
+            );
+        }
+        // Ordinary arm in every build: a real ordinary session seals
+        // and drains unlinked.
+        let mut ordinary = start_selected(&cell, None)?;
+        anyhow::ensure!(
+            ordinary.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            ordinary.attach_failures()
+        );
+        let attached = seal_over_loaded_inventory(&ordinary, SealDrainScene::attest())
+            .map_err(|reason| anyhow::anyhow!("ordinary seal refused: {reason}"))?;
+        anyhow::ensure!(
+            !attached.journal_linked(),
+            "the ordinary loaded inventory seals unlinked"
+        );
+        super::retain_sealed_linkage(&mut ordinary.sealed_journal_linked, &attached);
+        let drained = ordinary
+            .drain_producers()
+            .context("the ordinary session retains producers")?;
+        anyhow::ensure!(
+            !drained.journal_linked(),
+            "the ordinary session drains unlinked through the live wiring"
+        );
+        ordinary.detach_producers()?;
+        Ok(())
+    }
+
     /// The #[cfg(test)] sealer marks its attachment journal-linked, so
     /// the Joint unit suites keep exercising the linked 0.6.0 world.
     #[test]

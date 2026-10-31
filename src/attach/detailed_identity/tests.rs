@@ -1169,3 +1169,145 @@ fn detailed_second_first_entry_for_same_pid_keeps_no_charge() {
     assert_eq!(proof.usage(), (1, "/owned/fixture".len()));
     drop(seed);
 }
+
+/// 6.05 step 2 sample source with a reused PID: the same PID number
+/// reports a different start time than the retained view.
+struct ReusedPidSample<'a> {
+    inner: FixtureSample<'a>,
+}
+impl SampleSource for ReusedPidSample<'_> {
+    fn exited(&mut self) -> Result<bool, TraceProofUnknown> {
+        self.inner.exited()
+    }
+    fn stat(&mut self) -> Result<ExeStat, TraceProofUnknown> {
+        self.inner.stat()
+    }
+    fn link(&mut self, buf: &mut [u8; IMAGE_PATH_CAP + 1]) -> Result<usize, TraceProofUnknown> {
+        self.inner.link(buf)
+    }
+    fn birth(
+        &mut self,
+        proof: &ProofSession,
+        work: &mut TraceWorkTicket,
+    ) -> Result<u64, TraceWorkError> {
+        // A PID reuse: the PID number survived but the process did not.
+        // Consistently different on every read (not flapping).
+        Ok(self.inner.birth(proof, work)?.wrapping_add(1))
+    }
+    fn namespace(&mut self) -> Result<crate::process::MountNamespaceId, TraceProofUnknown> {
+        self.inner.namespace()
+    }
+}
+
+#[test]
+fn detailed_pid_reuse_refuses_and_keeps_no_charge() {
+    // 6.05 step 2 mint gate (PID reuse): a first-entry sample whose
+    // start time differs from the retained view refuses TargetGone and
+    // keeps no reservation charge; the refusal is not sticky once a
+    // correctly bound sample arrives.
+    let (proof, view, mut work) = sample_fixture();
+    let mut reused = ReusedPidSample {
+        inner: FixtureSample {
+            view: &view,
+            proof: &proof,
+            link: b"/owned/fixture",
+            after_first_link: None,
+        },
+    };
+    assert!(matches!(
+        proof.sample_from(&view, &mut work, &mut reused),
+        Err(TraceWorkError::Unknown(TraceProofUnknown::TargetGone))
+    ));
+    assert_eq!(proof.usage(), (0, 0), "reused PID keeps no charge");
+    assert!(proof.ledger().unwrap().pending.is_empty());
+    assert!(!proof.ledger().unwrap().pids.contains_key(&view.pid()));
+    let mut reseed = TraceWorkTicket::test_new(
+        proof.clone(),
+        proof.test_time(),
+        proof.test_time() + 5_000_000,
+    );
+    let mut fresh = FixtureSample {
+        view: &view,
+        proof: &proof,
+        link: b"/owned/fixture",
+        after_first_link: None,
+    };
+    let seed = proof
+        .sample_from(&view, &mut reseed, &mut fresh)
+        .expect("correctly bound re-sample succeeds after reuse refusal");
+    assert_eq!(proof.usage(), (1, "/owned/fixture".len()));
+    drop(seed);
+}
+
+/// 6.05 step 2 sample source in a foreign mount namespace: every
+/// other read matches the retained view.
+struct ForeignNamespaceSample<'a> {
+    inner: FixtureSample<'a>,
+}
+impl SampleSource for ForeignNamespaceSample<'_> {
+    fn exited(&mut self) -> Result<bool, TraceProofUnknown> {
+        self.inner.exited()
+    }
+    fn stat(&mut self) -> Result<ExeStat, TraceProofUnknown> {
+        self.inner.stat()
+    }
+    fn link(&mut self, buf: &mut [u8; IMAGE_PATH_CAP + 1]) -> Result<usize, TraceProofUnknown> {
+        self.inner.link(buf)
+    }
+    fn birth(
+        &mut self,
+        proof: &ProofSession,
+        work: &mut TraceWorkTicket,
+    ) -> Result<u64, TraceWorkError> {
+        self.inner.birth(proof, work)
+    }
+    fn namespace(&mut self) -> Result<crate::process::MountNamespaceId, TraceProofUnknown> {
+        // Consistently foreign on every read (not flapping).
+        let current = self.inner.namespace()?;
+        Ok(crate::process::MountNamespaceId {
+            device: current.device.wrapping_add(1),
+            inode: current.inode.wrapping_add(1),
+        })
+    }
+}
+
+#[test]
+fn detailed_foreign_namespace_refuses_and_keeps_no_charge() {
+    // 6.05 step 2 mint gate (foreign query): a first-entry sample from
+    // another mount namespace refuses NamespaceMismatch and keeps no
+    // reservation charge; the refusal is not sticky.
+    let (proof, view, mut work) = sample_fixture();
+    let mut foreign = ForeignNamespaceSample {
+        inner: FixtureSample {
+            view: &view,
+            proof: &proof,
+            link: b"/owned/fixture",
+            after_first_link: None,
+        },
+    };
+    assert!(matches!(
+        proof.sample_from(&view, &mut work, &mut foreign),
+        Err(TraceWorkError::Unknown(
+            TraceProofUnknown::NamespaceMismatch
+        ))
+    ));
+    assert_eq!(proof.usage(), (0, 0), "foreign namespace keeps no charge");
+    assert!(proof.ledger().unwrap().pending.is_empty());
+    assert!(!proof.ledger().unwrap().pids.contains_key(&view.pid()));
+    let mut reseed = TraceWorkTicket::test_new(
+        proof.clone(),
+        proof.test_time(),
+        proof.test_time() + 5_000_000,
+    );
+    let mut fresh = FixtureSample {
+        view: &view,
+        proof: &proof,
+        link: b"/owned/fixture",
+        after_first_link: None,
+    };
+    let seed = proof
+        .sample_from(&view, &mut reseed, &mut fresh)
+        .expect("correctly bound re-sample succeeds after foreign refusal");
+    assert_eq!(proof.usage(), (1, "/owned/fixture".len()));
+    drop(seed);
+}

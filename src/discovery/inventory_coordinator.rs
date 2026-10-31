@@ -3399,16 +3399,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// authority, activates the staged owner (which replays the stored
     /// observation through the real binding comparison and commits the
     /// prepared reconciliation), binds owner to caller, and projects
-    /// the commit. Any failure releases the staged reservation and
-    /// lease with a named gap; an installed authority rolls back when
-    /// the engine commit refuses.
+    /// the commit. Returns whether the owner activated (a revision
+    /// signal for the engine tail). Any failure releases the staged
+    /// reservation and lease with a named gap; an installed authority
+    /// rolls back when the engine commit refuses.
     fn commit_staged_native_owner(
         &mut self,
         staged: StagedNativeOwner,
         permit: &CgroupAdmissionPermit<'_>,
         verdicts: &BTreeMap<AttachModuleKey, AttachVerdict>,
         now_ns: u64,
-    ) {
+    ) -> bool {
         let StagedNativeOwner {
             caller,
             pid,
@@ -3428,7 +3429,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Some(&lease),
                 "the staged member does not match the final-sample permit; scan-pinned fallback retained",
             );
-            return;
+            return false;
         };
         if let Err(failure) = self
             .adapter
@@ -3441,7 +3442,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Some(&lease),
                 format!("native authority installation refused: {}", failure.reason),
             );
-            return;
+            return false;
         }
         let mut replay = ReplayImageGuard {
             original,
@@ -3457,6 +3458,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 if commit.complete {
                     self.complete_scanned.insert(caller);
                 }
+                true
             }
             Err(error) => {
                 if let Err(rollback) = self
@@ -3470,7 +3472,30 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     pid,
                     format!("staged owner activation failed: {error:#}"),
                 );
+                false
             }
+        }
+    }
+
+    /// Revise the engine tail after late owner activation: the batch
+    /// tail already ran at this publication's start, and activation
+    /// dirtied its inputs, so republish before the publication's
+    /// revisions are cut. Infallible by construction — the scoped
+    /// region allows no later fallible tail — so a failed revision
+    /// keeps the previous publication with a named gap and never
+    /// unwinds the committed activation.
+    fn revise_engine_tail_for_activation(&mut self) {
+        if let Err(error) = self.engine.publish_batch_tail(true) {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "engine tail revision failed".into(),
+                reason: format!(
+                    "late owner activation could not revise the engine tail: {error:#}; the previous publication stands"
+                ),
+                budget: None,
+            });
         }
     }
 
@@ -7229,11 +7254,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // member of an incomplete transaction the fence reason.
             // Refresh and suspend stay deferred (packet 3).
             let transaction_complete = collection.outcome() == ScopedCollectionOutcome::Complete;
+            let mut activated = false;
             for staged in staged_owners {
                 let permit = collection.permit(staged.pid);
                 match (permit, transaction_complete) {
                     (Some(permit), true) => {
-                        self.commit_staged_native_owner(staged, &permit, &verdicts, *now_ns);
+                        activated |=
+                            self.commit_staged_native_owner(staged, &permit, &verdicts, *now_ns);
                     }
                     (None, _) => {
                         self.abandon_staged_native_owner(
@@ -7254,6 +7281,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         );
                     }
                 }
+            }
+            if activated {
+                self.revise_engine_tail_for_activation();
             }
             let outcome = collection.outcome(); // final cancellation/deadline poll
             if outcome != ScopedCollectionOutcome::Complete {

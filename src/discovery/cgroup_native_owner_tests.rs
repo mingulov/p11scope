@@ -573,7 +573,6 @@ impl ScopedNativeScene {
 }
 
 #[test]
-#[ignore = "6.11p2 revisions pending: activation commits but the engine tail is not revised yet; un-ignore with the revision handler"]
 fn cgroup_native_owner_stable_retained_member_activates_after_final_permit() {
     // A missing scoped owner path must fail here only after real original
     // binding, fallback and final sampled membership have all succeeded.

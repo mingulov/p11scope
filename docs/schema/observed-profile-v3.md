@@ -76,6 +76,31 @@ broad deltas over the window interval and `detail` the child's own rows;
 both carry per-mode cells (counts bare, timestamps with totals, latency
 with buckets) and never a combined total.
 
+When a Detailed capture's semantic lane discloses a global-only instance
+continuation, the terminal profile-lane evidence also contains an
+optional additive `instance_reload_not_excluded` object. Captures
+without a disclosing producer omit it (absent, never zero or null);
+the metrics lane never carries it, and the terminal trace `EVIDENCE`
+object carries it under the same rule. When the router counted tainted
+continuations but minted no identity to name (mint exhaustion), the key
+is still present with the exact snapshots and an empty `identities`
+list: the router is the producer then, so absent-never-zero does not
+apply. The `identities` entries may also be incomplete while the
+snapshots stay exact when the capture discloses a "reload disclosure
+identities shed" gap: past an accumulator cap, identities shed
+(counted) but the router totals still merge. Its keys are
+`continued_across_global` and `joined_across_global` (the
+capture-monotonic router snapshots: tainted continuations observed and
+calls joined through a tainted entry) and `identities` (one entry per
+tainted identity, in `(file_slot, ids)` order; empty under mint
+exhaustion). Each entry names the
+watched `file_slot` and the continued capture-local instance `ids`.
+Entries carry no task cookie, exec id, epoch, range or address: the
+private image key groups the ledger but never renders. The key is
+informational only: it never feeds shares, verdicts, `gap_classes` or
+`completeness`, and never forces `PARTIAL`. Like `selected_detail`, it
+is a v3-additive disclosure that introduces no new schema revision.
+
 Under the default `allowlisted` policy, every emitted mechanism has
 `params: null` with `params_omitted: "policy"` beside it, and
 `templates.operations` is always empty. Every `params: null` carries a

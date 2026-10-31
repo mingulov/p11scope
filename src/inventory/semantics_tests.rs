@@ -8457,3 +8457,187 @@ fn unavailable_admission_errors_carry_finite_site_labels() {
         assert_eq!(error.site(), None);
     }
 }
+
+// B17 W2 RED: the batch must carry the disclosure quadrant of the tick
+// report — the drained `instance_reload_not_excluded` identities plus the
+// capture-monotonic count snapshots — instead of swallowing them at
+// `into_parts`. A disclosure-only batch is evidence, never quiet.
+#[test]
+fn batch_carries_reload_disclosure_and_count_snapshots() {
+    use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+    use crate::semantic_capture::{ReloadNotExcludedReport, TickReport};
+    use p11scope_ebpf_common::ImageIdentity;
+
+    let conv = ConversionScene::new();
+    let domain = conv.detailed();
+    let image = ImageIdentity {
+        task_cookie: 0x51,
+        exec_id: 7,
+    };
+    let mut report = TickReport::default();
+    report.reload_not_excluded.push(ReloadNotExcludedReport {
+        label: RELOAD_NOT_EXCLUDED_LABEL,
+        image,
+        file_slot: 3,
+        ids: vec![InstanceId::from_raw(1)],
+    });
+    report.continued_across_global = 4;
+    report.joined_across_global = 2;
+    let batch = SemanticBatch::from_tick_report(domain, report, Vec::new(), 100)
+        .expect("a disclosed batch respects lane bounds");
+    assert_eq!(batch.reload_not_excluded().len(), 1);
+    let carried = &batch.reload_not_excluded()[0];
+    assert_eq!(carried.label, "instance_reload_not_excluded");
+    assert_eq!(carried.image, image);
+    assert_eq!(carried.file_slot, 3);
+    assert_eq!(carried.ids, vec![InstanceId::from_raw(1)]);
+    assert_eq!(batch.continued_across_global(), 4);
+    assert_eq!(batch.joined_across_global(), 2);
+    assert!(!batch.is_empty(), "a disclosure is evidence, never quiet");
+}
+
+// B17 W2 control twin: no disclosure in means no disclosure out, and a
+// quiet report still stages a quiet batch.
+#[test]
+fn batch_without_disclosure_stays_quiet() {
+    use crate::semantic_capture::TickReport;
+
+    let conv = ConversionScene::new();
+    let domain = conv.detailed();
+    let batch = SemanticBatch::from_tick_report(domain, TickReport::default(), Vec::new(), 100)
+        .expect("a quiet batch respects lane bounds");
+    assert!(batch.reload_not_excluded().is_empty());
+    assert_eq!(batch.continued_across_global(), 0);
+    assert_eq!(batch.joined_across_global(), 0);
+    assert!(batch.is_empty());
+}
+
+// The collected Stop union appends the stop report's disclosure
+// quadrant onto the accumulator's and maxes the count snapshots.
+#[test]
+fn stop_merge_appends_reload_disclosures_and_maxes_snapshots() {
+    use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+    use crate::semantic_capture::{
+        Invalidation, InvalidationScope, ReloadNotExcludedReport, TickOutcome, TickReport,
+    };
+    use p11scope_ebpf_common::ImageIdentity;
+
+    let conv = ConversionScene::new();
+    let domain = conv.detailed();
+    let disclosure = |cookie: u64, id: u64| ReloadNotExcludedReport {
+        label: RELOAD_NOT_EXCLUDED_LABEL,
+        image: ImageIdentity {
+            task_cookie: cookie,
+            exec_id: 7,
+        },
+        file_slot: 3,
+        ids: vec![InstanceId::from_raw(id)],
+    };
+    // The production accumulator holds its outcome capacity before
+    // the union; the scripted one reserves it explicitly.
+    let mut accumulated = TickReport::scripted(Vec::with_capacity(MAX_INSTANCES), Vec::new());
+    accumulated.reload_not_excluded.push(disclosure(0x51, 1));
+    accumulated.continued_across_global = 4;
+    accumulated.joined_across_global = 2;
+    let mut batch = SemanticBatch::from_tick_report(domain, accumulated, Vec::new(), 100)
+        .expect("the accumulator respects lane bounds");
+    let mut stop = TickReport::scripted(
+        vec![TickOutcome::Invalidation(Invalidation::scripted(
+            domain,
+            InvalidationScope::CoverageFailed,
+            None,
+        ))],
+        Vec::new(),
+    );
+    stop.reload_not_excluded.push(disclosure(0x52, 2));
+    stop.continued_across_global = 6;
+    stop.joined_across_global = 1;
+    batch
+        .merge_collected_stop(&mut stop)
+        .expect("a bounded stop union merges");
+    assert_eq!(batch.reload_not_excluded().len(), 2);
+    assert_eq!(batch.continued_across_global(), 6);
+    assert_eq!(batch.joined_across_global(), 2);
+    assert!(
+        stop.reload_not_excluded.is_empty(),
+        "the union takes the stop quadrant"
+    );
+}
+
+// The Stop union sheds an over-bound disclosure total instead of
+// refusing the semantic merge (controller bound-semantics ruling,
+// 2026-11-01: on overflow shed identities, never refuse the merge).
+// The stop outcome still merges, disclosures cap at MAX_INSTANCES
+// keeping the accumulator's side, the overflow counts on the
+// batch's carried shed, and the count snapshots max-merge. This
+// replaces the prior refusal pin the ruling overturns.
+#[test]
+fn stop_merge_sheds_overbound_reload_disclosures() {
+    use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+    use crate::semantic_capture::{
+        Invalidation, InvalidationScope, ReloadNotExcludedReport, TickOutcome, TickReport,
+    };
+    use p11scope_ebpf_common::ImageIdentity;
+
+    let conv = ConversionScene::new();
+    let domain = conv.detailed();
+    let disclosure = |cookie: u64| ReloadNotExcludedReport {
+        label: RELOAD_NOT_EXCLUDED_LABEL,
+        image: ImageIdentity {
+            task_cookie: cookie,
+            exec_id: 7,
+        },
+        file_slot: 3,
+        ids: vec![InstanceId::from_raw(cookie + 1)],
+    };
+    // The production accumulator holds its outcome capacity before
+    // the union; the scripted one reserves it explicitly.
+    let mut accumulated = TickReport::scripted(Vec::with_capacity(MAX_INSTANCES), Vec::new());
+    accumulated.reload_not_excluded = (0..MAX_INSTANCES as u64).map(disclosure).collect();
+    accumulated.continued_across_global = 4;
+    accumulated.joined_across_global = 2;
+    let mut batch = SemanticBatch::from_tick_report(domain, accumulated, Vec::new(), 100)
+        .expect("a full accumulator respects lane bounds");
+    let mut stop = TickReport::scripted(
+        vec![TickOutcome::Invalidation(Invalidation::scripted(
+            domain,
+            InvalidationScope::CoverageFailed,
+            None,
+        ))],
+        Vec::new(),
+    );
+    stop.reload_not_excluded.push(disclosure(10_000));
+    stop.continued_across_global = 9;
+    stop.joined_across_global = 1;
+    batch
+        .merge_collected_stop(&mut stop)
+        .expect("an over-bound disclosure total sheds, never refuses");
+    assert_eq!(
+        batch.reload_not_excluded().len(),
+        MAX_INSTANCES,
+        "the union caps at the batch bound"
+    );
+    assert_eq!(
+        batch.reload_not_excluded()[0].image.task_cookie,
+        0,
+        "the union keeps the accumulator's side"
+    );
+    assert_eq!(
+        batch.reload_not_excluded()[MAX_INSTANCES - 1]
+            .image
+            .task_cookie,
+        MAX_INSTANCES as u64 - 1,
+        "the overflow sheds the incoming tail"
+    );
+    assert_eq!(batch.continued_across_global(), 9);
+    assert_eq!(batch.joined_across_global(), 2);
+    assert_eq!(
+        batch.reload_shed(),
+        1,
+        "the shed tail counts on the carried shed"
+    );
+    assert!(
+        stop.reload_not_excluded.is_empty(),
+        "the union takes the stop quadrant"
+    );
+}

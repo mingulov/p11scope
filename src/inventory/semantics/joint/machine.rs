@@ -25,7 +25,8 @@ use crate::inventory_semantics::{
 };
 use crate::semantic_capture::{
     CommittedAbsenceBirth, CurrentPartitionReceipt, H0BirthCandidate, InvalidationScope,
-    RetainedBirthWitness, TickOutcome, TickReport,
+    ReloadNotExcludedReport, RetainedBirthWitness, TickOutcome, TickReport,
+    union_reload_disclosures,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
@@ -652,10 +653,26 @@ fn collected_budgets(
             .checked_mul(size_of::<InstanceId>())?
             .checked_add(MAX_INSTANCES.checked_mul(OWNED_ALLOCATION_PADDING)?)
     })()?;
+    // Disclosure-owned instance id lists merge into the accumulator
+    // with the collected unions' disclosures: same shape as the
+    // outcome lists (at most one list per disclosure, the union bound
+    // caps the lists at MAX_INSTANCES, the lists together name
+    // minted-pool ids, each collected with the pinned growth law).
+    // Covered unconditionally: the shared union truncates the
+    // incoming tail to the remaining room before appending, moving
+    // the lists without growth, so no merge-time charge applies.
+    let disclosure_nested = (|| {
+        MAX_INSTANCES
+            .checked_mul(2)?
+            .checked_add(MAX_INSTANCES.checked_mul(4)?)?
+            .checked_mul(size_of::<InstanceId>())?
+            .checked_add(MAX_INSTANCES.checked_mul(OWNED_ALLOCATION_PADDING)?)
+    })()?;
     let nested_limit = tick_nested
         .checked_add(stashed_nested)?
         .checked_add(binder_margin)?
-        .checked_add(outcome_nested)?;
+        .checked_add(outcome_nested)?
+        .checked_add(disclosure_nested)?;
     // Both the accumulator and the current callback's original buffers
     // coexist. Each Current keeps its actual IDs/watched-file allocation.
     // Empty-input retries resolve those same jobs, never add interests.
@@ -664,6 +681,7 @@ fn collected_budgets(
             .checked_add(array_bytes::<TickOutcome>(MAX_INSTANCES)?.checked_mul(2)?)?
             .checked_add(array_bytes::<CurrentPartitionReceipt>(allocation_limit)?.checked_mul(2)?)?
             .checked_add(array_bytes::<LaneNegative>(MAX_LANE_NEGATIVES)?.checked_mul(2)?)?
+            .checked_add(array_bytes::<ReloadNotExcludedReport>(MAX_INSTANCES)?.checked_mul(2)?)?
             .checked_add(nested_limit.checked_mul(2)?)
     })()?;
     Some(CollectedBudgets {
@@ -746,6 +764,7 @@ impl CollectedReports {
         let mut outcomes = Vec::new();
         let mut current = Vec::new();
         let mut negatives = Vec::new();
+        let mut reload_not_excluded = Vec::new();
         outcomes
             .try_reserve_exact(MAX_INSTANCES)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
@@ -755,9 +774,13 @@ impl CollectedReports {
         negatives
             .try_reserve_exact(MAX_LANE_NEGATIVES)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        reload_not_excluded
+            .try_reserve_exact(MAX_INSTANCES)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
         if outcomes.capacity() != MAX_INSTANCES
             || current.capacity() != budgets.receipt_limit
             || negatives.capacity() != MAX_LANE_NEGATIVES
+            || reload_not_excluded.capacity() != MAX_INSTANCES
         {
             return Err(SemanticRefusal::ProviderStorage);
         }
@@ -774,6 +797,10 @@ impl CollectedReports {
                 has_pending_scans: false,
                 awaited_jobs_pending: false,
                 awaited_hold_pending: false,
+                reload_not_excluded,
+                continued_across_global: 0,
+                joined_across_global: 0,
+                reload_shed: 0,
             }),
             refused: None,
             receipt_limit: budgets.receipt_limit,
@@ -793,6 +820,7 @@ impl CollectedReports {
         let mut outcomes = Vec::new();
         let mut current = Vec::new();
         let mut negatives = Vec::new();
+        let mut reload_not_excluded = Vec::new();
         outcomes
             .try_reserve_exact(MAX_INSTANCES)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
@@ -802,9 +830,13 @@ impl CollectedReports {
         negatives
             .try_reserve_exact(MAX_LANE_NEGATIVES)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        reload_not_excluded
+            .try_reserve_exact(MAX_INSTANCES)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
         if outcomes.capacity() != MAX_INSTANCES
             || current.capacity() != budgets.receipt_limit
             || negatives.capacity() != MAX_LANE_NEGATIVES
+            || reload_not_excluded.capacity() != MAX_INSTANCES
         {
             return Err(SemanticRefusal::ProviderStorage);
         }
@@ -821,6 +853,10 @@ impl CollectedReports {
                 has_pending_scans: false,
                 awaited_jobs_pending: false,
                 awaited_hold_pending: false,
+                reload_not_excluded,
+                continued_across_global: 0,
+                joined_across_global: 0,
+                reload_shed: 0,
             }),
             refused: None,
             receipt_limit: budgets.receipt_limit,
@@ -900,6 +936,23 @@ impl CollectedReports {
         batch.outcomes.append(&mut incoming.outcomes);
         batch.current.append(&mut incoming.current);
         batch.negatives.append(&mut incoming.negatives);
+        // The disclosure quadrant unions through the shared helper
+        // under the same cumulative cap: past the cap the incoming
+        // tail sheds (counted on the carried shed) and the merge
+        // still succeeds — disclosures never refuse the merge. The
+        // incoming batch is consumed, so its carried shed moves too.
+        let shed = union_reload_disclosures(
+            &mut batch.reload_not_excluded,
+            &mut batch.continued_across_global,
+            &mut batch.joined_across_global,
+            std::mem::take(&mut incoming.reload_not_excluded),
+            incoming.continued_across_global,
+            incoming.joined_across_global,
+        );
+        batch.reload_shed = batch
+            .reload_shed
+            .saturating_add(shed)
+            .saturating_add(std::mem::take(&mut incoming.reload_shed));
         batch.observed_ns = batch.observed_ns.max(incoming.observed_ns);
         // A resolved old floor must not strand its own collection forever.
         batch.awaiting_floor = incoming.awaiting_floor;
@@ -961,6 +1014,24 @@ impl CollectedReports {
         batch.observed_ns = batch
             .observed_ns
             .max(crate::discovery::caller_registry::now_ns());
+        // The pending report's disclosure quadrant joins the
+        // accumulator through the shared helper, like `merge`: shed
+        // instead of refuse past the cumulative cap, counts always
+        // max-merged, and the report's carried shed moves too.
+        let shed = union_reload_disclosures(
+            &mut batch.reload_not_excluded,
+            &mut batch.continued_across_global,
+            &mut batch.joined_across_global,
+            std::mem::take(&mut incoming.reload_not_excluded),
+            incoming.continued_across_global,
+            incoming.joined_across_global,
+        );
+        batch.reload_shed = batch
+            .reload_shed
+            .saturating_add(shed)
+            .saturating_add(std::mem::take(&mut incoming.reload_shed));
+        incoming.continued_across_global = 0;
+        incoming.joined_across_global = 0;
         let mut outcomes = incoming.take_outcomes();
         let mut current = incoming.take_current();
         batch.outcomes.append(&mut outcomes);
@@ -4656,5 +4727,158 @@ mod binding_reservation_tests {
             .merge_pending_q(domain, &mut report)
             .expect("honest invalidation saturation must merge");
         assert_eq!(reports.nested_used_for_test(), saturated_bytes);
+    }
+
+    /// A disclosing tick batch must land its disclosure quadrant in
+    /// the collected accumulator: the drained identity plus the
+    /// router count snapshots. Dropping the incoming batch here
+    /// loses drained-once disclosures for good.
+    #[test]
+    fn collected_merge_carries_reload_disclosure_quadrant() {
+        use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+
+        let domain = NativeDomainId::mint();
+        let watched = watched_target();
+        let watched_bound = watched
+            .retained_copy_allocation_charge()
+            .expect("a measurable watched copy");
+        let budgets = collected_budgets(0, 0, 0, watched_bound).expect("unpartitioned budgets");
+        let mut reports = accumulator(domain, budgets);
+        let mut tick = TickReport::scripted(Vec::new(), Vec::new());
+        tick.reload_not_excluded.push(ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: 0x51,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(1)],
+        });
+        tick.continued_across_global = 4;
+        tick.joined_across_global = 2;
+        let batch = SemanticBatch::from_tick_report(domain, tick, Vec::new(), 0)
+            .expect("a scripted batch respects lane bounds");
+        assert!(
+            reports.merge(batch).expect("a disclosing batch merges"),
+            "a batch with no awaiting floor completes the collection"
+        );
+        let kept = reports.batch.as_ref().expect("the accumulator is retained");
+        assert_eq!(
+            kept.reload_not_excluded().len(),
+            1,
+            "the collected union must keep the drained disclosure"
+        );
+        assert_eq!(kept.reload_not_excluded()[0].file_slot, 3);
+        assert_eq!(
+            kept.reload_not_excluded()[0].ids,
+            vec![InstanceId::from_raw(1)]
+        );
+        assert_eq!(kept.continued_across_global(), 4);
+        assert_eq!(kept.joined_across_global(), 2);
+    }
+
+    /// Control: a quiet batch merges nothing into the disclosure
+    /// quadrant; the union carries, never invents.
+    #[test]
+    fn collected_merge_keeps_quiet_batch_quiet() {
+        let domain = NativeDomainId::mint();
+        let watched = watched_target();
+        let watched_bound = watched
+            .retained_copy_allocation_charge()
+            .expect("a measurable watched copy");
+        let budgets = collected_budgets(0, 0, 0, watched_bound).expect("unpartitioned budgets");
+        let mut reports = accumulator(domain, budgets);
+        let batch = SemanticBatch::from_tick_report(
+            domain,
+            TickReport::scripted(Vec::new(), Vec::new()),
+            Vec::new(),
+            0,
+        )
+        .expect("a scripted batch respects lane bounds");
+        reports.merge(batch).expect("a quiet batch merges");
+        let kept = reports.batch.as_ref().expect("the accumulator is retained");
+        assert!(kept.reload_not_excluded().is_empty());
+        assert_eq!(kept.continued_across_global(), 0);
+        assert_eq!(kept.joined_across_global(), 0);
+    }
+
+    /// The pending-Q merge moves the same disclosure quadrant: the
+    /// incoming report's drained identity and count snapshots join
+    /// the accumulator, and the report is drained.
+    #[test]
+    fn pending_q_merge_carries_reload_disclosure_quadrant() {
+        use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+
+        let domain = NativeDomainId::mint();
+        let watched = watched_target();
+        let watched_bound = watched
+            .retained_copy_allocation_charge()
+            .expect("a measurable watched copy");
+        let budgets = collected_budgets(0, 0, 0, watched_bound).expect("unpartitioned budgets");
+        let mut reports = accumulator(domain, budgets);
+        let mut pending = TickReport::scripted(Vec::new(), Vec::new());
+        pending.reload_not_excluded.push(ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: 0x51,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(1)],
+        });
+        pending.continued_across_global = 4;
+        pending.joined_across_global = 2;
+        assert!(
+            reports
+                .merge_pending_q(domain, &mut pending)
+                .expect("a disclosing pending report merges"),
+            "a report with no awaiting floor completes the collection"
+        );
+        assert!(
+            pending.reload_not_excluded.is_empty(),
+            "the union takes the pending quadrant"
+        );
+        assert_eq!(
+            pending.continued_across_global, 0,
+            "the union takes the pending snapshots"
+        );
+        assert_eq!(
+            pending.joined_across_global, 0,
+            "the union takes the pending snapshots"
+        );
+        let kept = reports.batch.as_ref().expect("the accumulator is retained");
+        assert_eq!(
+            kept.reload_not_excluded().len(),
+            1,
+            "the pending-Q union must keep the drained disclosure"
+        );
+        assert_eq!(kept.reload_not_excluded()[0].file_slot, 3);
+        assert_eq!(
+            kept.reload_not_excluded()[0].ids,
+            vec![InstanceId::from_raw(1)]
+        );
+        assert_eq!(kept.continued_across_global(), 4);
+        assert_eq!(kept.joined_across_global(), 2);
+    }
+
+    /// Control: a quiet pending report merges nothing into the
+    /// disclosure quadrant.
+    #[test]
+    fn pending_q_merge_keeps_quiet_report_quiet() {
+        let domain = NativeDomainId::mint();
+        let watched = watched_target();
+        let watched_bound = watched
+            .retained_copy_allocation_charge()
+            .expect("a measurable watched copy");
+        let budgets = collected_budgets(0, 0, 0, watched_bound).expect("unpartitioned budgets");
+        let mut reports = accumulator(domain, budgets);
+        let mut pending = TickReport::scripted(Vec::new(), Vec::new());
+        reports
+            .merge_pending_q(domain, &mut pending)
+            .expect("a quiet pending report merges");
+        let kept = reports.batch.as_ref().expect("the accumulator is retained");
+        assert!(kept.reload_not_excluded().is_empty());
+        assert_eq!(kept.continued_across_global(), 0);
+        assert_eq!(kept.joined_across_global(), 0);
     }
 }

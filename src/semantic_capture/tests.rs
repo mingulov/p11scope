@@ -417,6 +417,206 @@ mod current_receipts_tests {
     }
 
     #[test]
+    fn refresh_disclosure_quadrant_survives_stash_roundtrip_into_batch() {
+        use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+        use crate::inventory_semantics::{
+            RefreshReceiptStash, SemanticBatch, merge_stash_into_report, stash_refresh_report,
+        };
+
+        // A refresh scan that discloses: router identities drain once,
+        // so the stash must take the quadrant beside the receipts and
+        // outcomes instead of dropping it.
+        let mut refresh = TickReport::default();
+        refresh.reload_not_excluded.push(ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: 0x51,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(1)],
+        });
+        refresh.continued_across_global = 4;
+        refresh.joined_across_global = 2;
+        let mut stash = RefreshReceiptStash::new();
+        let (_, shed) = stash_refresh_report(&mut stash, &mut refresh);
+        assert_eq!(shed, 0);
+        assert!(
+            refresh.reload_not_excluded.is_empty(),
+            "the stash takes the drained quadrant"
+        );
+        let mut tick = TickReport::default();
+        assert_eq!(merge_stash_into_report(&mut stash, &mut tick), 0);
+        assert_eq!(
+            tick.reload_not_excluded.len(),
+            1,
+            "the stashed disclosure must reach the tick batch"
+        );
+        assert_eq!(tick.reload_not_excluded[0].file_slot, 3);
+        assert_eq!(
+            tick.reload_not_excluded[0].ids,
+            vec![InstanceId::from_raw(1)]
+        );
+        assert_eq!(tick.continued_across_global, 4);
+        assert_eq!(tick.joined_across_global, 2);
+        let batch = SemanticBatch::from_tick_report(NativeDomainId::mint(), tick, Vec::new(), 100)
+            .expect("the merged quadrant respects lane bounds");
+        assert_eq!(batch.reload_not_excluded().len(), 1);
+        assert_eq!(batch.continued_across_global(), 4);
+        assert_eq!(batch.joined_across_global(), 2);
+    }
+
+    #[test]
+    fn stashed_disclosure_union_caps_without_growth_and_maxes_counts() {
+        use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+
+        let disclosure = |cookie: u64| ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(cookie + 1)],
+        };
+        // The prepaid shape: an exactly capped union must absorb an
+        // over-bound merge without growing past the cap it was given.
+        let mut tick = TickReport::default();
+        tick.reload_not_excluded.reserve_exact(MAX_INSTANCES);
+        for cookie in 0..MAX_INSTANCES as u64 {
+            tick.reload_not_excluded.push(disclosure(cookie));
+        }
+        assert_eq!(
+            tick.reload_not_excluded.capacity(),
+            MAX_INSTANCES,
+            "the twin needs exact prepaid capacity, like the collected accumulator"
+        );
+        tick.continued_across_global = 4;
+        tick.joined_across_global = 2;
+        let shed = tick.merge_stashed_disclosures(vec![disclosure(10_000)], 6, 1);
+        assert_eq!(shed, 1);
+        assert_eq!(tick.reload_not_excluded.len(), MAX_INSTANCES);
+        assert_eq!(
+            tick.reload_not_excluded.capacity(),
+            MAX_INSTANCES,
+            "the union must shed the incoming tail, never grow past the cap"
+        );
+        assert_eq!(tick.reload_not_excluded[0].image.task_cookie, 0);
+        assert_eq!(
+            tick.reload_not_excluded[MAX_INSTANCES - 1]
+                .image
+                .task_cookie,
+            MAX_INSTANCES as u64 - 1,
+            "the union keeps the kept side in order"
+        );
+        assert_eq!(tick.continued_across_global, 6);
+        assert_eq!(tick.joined_across_global, 2);
+    }
+
+    #[test]
+    fn disclosure_overflow_shed_stays_out_of_the_refused_endpoint_total() {
+        use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+        use crate::inventory_semantics::{RefreshReceiptStash, stash_refresh_report};
+
+        // A disclosure-only overflow: 4097 identities through a
+        // 4096-capped stash. The shed identity is disclosure loss,
+        // never a refused endpoint, so the refused-endpoints total
+        // stays zero on every push.
+        let mut stash = RefreshReceiptStash::new();
+        for cookie in 0..=MAX_INSTANCES as u64 {
+            let mut refresh = TickReport::default();
+            refresh.reload_not_excluded.push(ReloadNotExcludedReport {
+                label: RELOAD_NOT_EXCLUDED_LABEL,
+                image: ImageIdentity {
+                    task_cookie: cookie,
+                    exec_id: 7,
+                },
+                file_slot: 3,
+                ids: vec![InstanceId::from_raw(cookie + 1)],
+            });
+            let (_, shed) = stash_refresh_report(&mut stash, &mut refresh);
+            assert_eq!(
+                shed, 0,
+                "disclosure-identity shed is not a refused endpoint (push {cookie})"
+            );
+        }
+        assert_eq!(
+            stash.disclosure_shed(),
+            1,
+            "the shed identity counts on the carried disclosure shed"
+        );
+    }
+
+    #[test]
+    fn quiet_report_treats_snapshots_and_shed_as_content() {
+        use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+
+        assert!(TickReport::default().is_quiet(), "empty is quiet");
+        let continued = TickReport {
+            continued_across_global: 4,
+            ..Default::default()
+        };
+        assert!(
+            !continued.is_quiet(),
+            "a nonzero continued snapshot is evidence, never quiet"
+        );
+        let joined = TickReport {
+            joined_across_global: 2,
+            ..Default::default()
+        };
+        assert!(
+            !joined.is_quiet(),
+            "a nonzero joined snapshot is evidence, never quiet"
+        );
+        let shed = TickReport {
+            reload_shed: 1,
+            ..Default::default()
+        };
+        assert!(
+            !shed.is_quiet(),
+            "a nonzero carried shed is evidence, never quiet"
+        );
+        let mut disclosed = TickReport::default();
+        disclosed.reload_not_excluded.push(ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: 0x51,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(1)],
+        });
+        assert!(
+            !disclosed.is_quiet(),
+            "a disclosure is evidence, never quiet"
+        );
+    }
+
+    #[test]
+    fn reload_report_debug_redacts_image_cookies() {
+        use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+
+        let report = ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: 123_456_789,
+                exec_id: 987_654_321,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(1)],
+        };
+        let rendered = format!("{report:?}");
+        assert!(
+            rendered.contains("instance_reload_not_excluded"),
+            "the redaction must keep the label: {rendered}"
+        );
+        assert!(
+            !rendered.contains("123456789") && !rendered.contains("987654321"),
+            "cookies must not print: {rendered}"
+        );
+    }
+
+    #[test]
     fn drained_receipt_expires_inside_quiescence_wait_but_validates_promptly() {
         let mut io = ScriptIo::new(NativeDomainId::mint());
         let mut capture = capture(&io);
@@ -6646,6 +6846,542 @@ mod b17_capture_disclosure {
         assert!(
             !evidence.contains("instance_reload_not_excluded"),
             "same-triple refresh must stay silent, got: {evidence}"
+        );
+    }
+}
+
+/// B17 W2 wire twins: the disclosure quadrant must travel from the
+/// capture report through the batch and the coordinator ledger into the
+/// v3 profile-lane evidence render. One artifact carries the churned
+/// identity's IDs plus the capture counts, with the clean control
+/// identity of the same capture absent from the key; a clean-only
+/// capture omits the key entirely (absent, never zero).
+mod b17_wire_projection {
+    use super::*;
+    use crate::attach::{BackendSelection, Scope};
+    use crate::discovery::caller_registry::{OsProcessSource, RegistryLimits};
+    use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
+    use crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset;
+    use crate::discovery::hooks::HookRegistry;
+    use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
+    use crate::inventory_semantics::{AttestedSemanticLane, SemanticBatch};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const BASE: u64 = 0x7f00_0000_0000;
+    const TEXT_OFF: u64 = 0x2000;
+    const CHURNED: ImageIdentity = ImageIdentity {
+        task_cookie: 0x51,
+        exec_id: 7,
+    };
+    const CLEAN: ImageIdentity = ImageIdentity {
+        task_cookie: 0x52,
+        exec_id: 9,
+    };
+
+    fn ranges() -> Vec<MapRange> {
+        vec![
+            MapRange::new(BASE, BASE + 0x1000, 0, false),
+            MapRange::new(BASE + 0x1000, BASE + 0x3000, 0x1000, true),
+            MapRange::new(BASE + 0x3000, BASE + 0x4000, 0x3000, false),
+        ]
+    }
+
+    fn fixture() -> (SemanticCapture, ScriptIo, Endpoint) {
+        let domain = NativeDomainId::mint();
+        let io = ScriptIo::small(domain);
+        let capture = capture(&io);
+        let endpoint = io.endpoint(0).expect("slot 0 scripted");
+        (capture, io, endpoint)
+    }
+
+    fn scan(
+        capture: &mut SemanticCapture,
+        io: &mut ScriptIo,
+        endpoint: Endpoint,
+        image: ImageIdentity,
+        local: u64,
+        global: u64,
+    ) -> TickReport {
+        scan_ranges(capture, io, endpoint, image, local, global, ranges())
+    }
+
+    fn scan_ranges(
+        capture: &mut SemanticCapture,
+        io: &mut ScriptIo,
+        endpoint: Endpoint,
+        image: ImageIdentity,
+        local: u64,
+        global: u64,
+        scan_ranges: Vec<MapRange>,
+    ) -> TickReport {
+        let fence = capture.router.fence();
+        let proof = acquire_test_scan(
+            io.domain,
+            image,
+            endpoint.file_slot,
+            CompleteEpochs {
+                local,
+                global,
+                fault: 0,
+                sticky: 0,
+                record_flags: 0,
+            },
+            scan_ranges,
+            fence,
+        )
+        .expect("stable acquisition");
+        let job = ScanJob {
+            image,
+            endpoint,
+            slot: 0,
+            pin: io.pin.clone(),
+            deadline: io.now + Duration::from_secs(60),
+            birth_cut: None,
+        };
+        let mut report = TickReport::default();
+        capture.accept_scan(io, proof, &job, fence, &mut report);
+        report
+    }
+
+    fn stamp(local: u32, global: u32) -> InstanceStamp {
+        InstanceStamp {
+            epoch: local,
+            global,
+            fault: 0,
+            file_slot_plus1: 1,
+            flags: instance::STAMP_VALID,
+        }
+    }
+
+    fn route(
+        capture: &mut SemanticCapture,
+        image: ImageIdentity,
+        token: u64,
+        local: u32,
+        global: u32,
+    ) -> Route {
+        capture.router.route(CallFacts {
+            token,
+            domain: capture.router.domain(),
+            image,
+            entry: stamp(local, global),
+            ret: stamp(local, global),
+            ip: EntryIp::new(BASE + TEXT_OFF),
+            attached_offset: Some(TEXT_OFF),
+        })
+    }
+
+    fn joined(route: Route) -> InstanceId {
+        match route {
+            Route::Joined(id) => id,
+            other => panic!("expected a join, got {other:?}"),
+        }
+    }
+
+    fn coordinator() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap()
+    }
+
+    fn shell_lane() -> AttestedSemanticLane {
+        let slot = crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+            object: PinnedObjectId(0),
+            object_path: "/stub-provider.so".into(),
+            file_offset: 0x1200,
+            names: vec!["C_SignInit".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        };
+        let subset = AttestedSubset::scripted(
+            crate::plan::AttachPlan::from_slots(vec![slot]),
+            PinnedObjects::empty(),
+            BTreeMap::from([(PinnedObjectId(0), BTreeSet::from([0]))]),
+        );
+        AttestedSemanticLane::start(
+            subset,
+            &Scope::Pid(std::process::id()),
+            BackendSelection::Auto,
+        )
+        .expect("shell lane starts")
+    }
+
+    fn commit(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        lane: &mut AttestedSemanticLane,
+        report: TickReport,
+    ) {
+        let batch =
+            SemanticBatch::from_tick_report(lane.domain(), report, Vec::new(), 130).unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator.finalize_semantic_batches(Some(lane));
+    }
+
+    #[test]
+    fn b17_wire_projects_churned_identity_beside_clean_control() {
+        let (mut capture, mut io, endpoint) = fixture();
+        // Churned identity: New, join, a global-only continuation that
+        // discloses, a tainted join, then a silent refresh.
+        let churned_new = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 0);
+        assert_eq!(churned_new.observations, vec![ObserveOutcome::New]);
+        let id_churned = joined(route(&mut capture, CHURNED, 1, 2, 0));
+        let churned_tainted = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 1);
+        assert_eq!(
+            churned_tainted.observations,
+            vec![ObserveOutcome::Continued]
+        );
+        assert_eq!(
+            churned_tainted.reload_not_excluded.len(),
+            1,
+            "the churn must disclose"
+        );
+        assert_eq!(joined(route(&mut capture, CHURNED, 2, 2, 1)), id_churned);
+        let churned_refresh = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 1);
+        assert_eq!(
+            churned_refresh.observations,
+            vec![ObserveOutcome::Continued]
+        );
+        assert!(
+            churned_refresh.reload_not_excluded.is_empty(),
+            "no re-yield"
+        );
+        // Clean control, same capture: New, join, same-triple
+        // continuation, never disclosed.
+        let clean_new = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(clean_new.observations, vec![ObserveOutcome::New]);
+        let id_clean = joined(route(&mut capture, CLEAN, 3, 2, 0));
+        assert_ne!(id_clean, id_churned);
+        let clean_quiet = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(clean_quiet.observations, vec![ObserveOutcome::Continued]);
+        assert!(
+            clean_quiet.reload_not_excluded.is_empty(),
+            "the clean control must stay silent"
+        );
+
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        for report in [
+            churned_new,
+            churned_tainted,
+            churned_refresh,
+            clean_new,
+            clean_quiet,
+        ] {
+            commit(&mut coordinator, &mut lane, report);
+        }
+        let projected = coordinator
+            .reload_not_excluded_evidence()
+            .expect("the churned capture projects");
+        assert_eq!(projected.continued_across_global, 1);
+        assert_eq!(projected.joined_across_global, 1);
+        assert_eq!(projected.identities.len(), 1);
+        assert_eq!(projected.identities[0].file_slot, endpoint.file_slot);
+        assert_eq!(projected.identities[0].ids, vec![id_churned.get()]);
+        assert!(
+            !projected
+                .identities
+                .iter()
+                .flat_map(|entry| entry.ids.iter())
+                .any(|id| *id == id_clean.get()),
+            "the clean control must have no entry"
+        );
+
+        // One artifact, both directions: the churned IDs render under the
+        // ruled key with the capture counts, and the projection carries
+        // no private image key (exact closed key sets).
+        let mut evidence = crate::render::tests::evidence();
+        evidence.instance_reload_not_excluded = Some(projected);
+        let value = crate::render::versioned_evidence(&evidence);
+        assert_eq!(
+            value["instance_reload_not_excluded"],
+            serde_json::json!({
+                "continued_across_global": 1,
+                "joined_across_global": 1,
+                "identities": [{"file_slot": endpoint.file_slot, "ids": [id_churned.get()]}],
+            }),
+        );
+        let disclosed = value["instance_reload_not_excluded"].as_object().unwrap();
+        assert_eq!(
+            disclosed
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            [
+                "continued_across_global",
+                "joined_across_global",
+                "identities"
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        );
+        let entry = disclosed["identities"].as_array().unwrap();
+        assert_eq!(entry.len(), 1);
+        assert_eq!(
+            entry[0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            ["file_slot", "ids"].into_iter().collect::<BTreeSet<_>>(),
+        );
+    }
+
+    // Counts without identity still render: mint exhaustion is the
+    // honest empty-ledger shape. The filler scan mints the whole
+    // router budget through the real scan seam, so the churned
+    // identity mints nothing; its global-only continuation still
+    // counts (continued = 1) without queueing a disclosure, and the
+    // capture projects the ruled key with exact counts and an empty
+    // identities list. The router is the producer here, so the key
+    // must be present: absent-never-zero applies only without one.
+    #[test]
+    fn b17_wire_mint_exhaustion_projects_counts_with_empty_identities() {
+        use crate::discovery::instances::MAX_INSTANCES;
+
+        const FILLER: ImageIdentity = ImageIdentity {
+            task_cookie: 0x53,
+            exec_id: 11,
+        };
+        const FILL_BASE: u64 = 0x7000_0000_0000;
+        const FILL_STEP: u64 = 0x1_0000;
+
+        let (mut capture, mut io, endpoint) = fixture();
+        // Exhaust the mint budget in one fat New: every filler range
+        // sits at file offset 0, so each mints one instance ID.
+        let fat: Vec<MapRange> = (0..MAX_INSTANCES as u64)
+            .map(|i| {
+                MapRange::new(
+                    FILL_BASE + i * FILL_STEP,
+                    FILL_BASE + i * FILL_STEP + 0x1000,
+                    0,
+                    false,
+                )
+            })
+            .collect();
+        let filler = scan_ranges(&mut capture, &mut io, endpoint, FILLER, 2, 0, fat);
+        assert_eq!(filler.observations, vec![ObserveOutcome::New]);
+        assert_eq!(
+            capture.router.instances_minted(),
+            MAX_INSTANCES,
+            "the filler must exhaust the mint budget"
+        );
+        // The churned identity mints nothing now; its global-only
+        // continuation counts without disclosing.
+        let churned_new = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 0);
+        assert_eq!(churned_new.observations, vec![ObserveOutcome::New]);
+        assert!(churned_new.reload_not_excluded.is_empty());
+        let churned_tainted = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 1);
+        assert_eq!(
+            churned_tainted.observations,
+            vec![ObserveOutcome::Continued]
+        );
+        assert!(
+            churned_tainted.reload_not_excluded.is_empty(),
+            "exhausted mints disclose no identity"
+        );
+        assert_eq!(churned_tainted.continued_across_global, 1);
+        assert_eq!(churned_tainted.joined_across_global, 0);
+
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        for report in [filler, churned_new, churned_tainted] {
+            commit(&mut coordinator, &mut lane, report);
+        }
+        let projected = coordinator
+            .reload_not_excluded_evidence()
+            .expect("nonzero snapshots must project even with no identities");
+        assert_eq!(projected.continued_across_global, 1);
+        assert_eq!(projected.joined_across_global, 0);
+        assert!(
+            projected.identities.is_empty(),
+            "mint exhaustion names no identity"
+        );
+
+        // The ruled key renders with exact counts and an empty list.
+        let mut evidence = crate::render::tests::evidence();
+        evidence.instance_reload_not_excluded = Some(projected);
+        let value = crate::render::versioned_evidence(&evidence);
+        assert_eq!(
+            value["instance_reload_not_excluded"],
+            serde_json::json!({
+                "continued_across_global": 1,
+                "joined_across_global": 0,
+                "identities": [],
+            }),
+        );
+    }
+
+    #[test]
+    fn b17_wire_clean_capture_omits_the_key() {
+        let (mut capture, mut io, endpoint) = fixture();
+        let first = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(first.observations, vec![ObserveOutcome::New]);
+        let _ = joined(route(&mut capture, CLEAN, 1, 2, 0));
+        let second = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(second.observations, vec![ObserveOutcome::Continued]);
+        assert!(second.reload_not_excluded.is_empty());
+
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        for report in [first, second] {
+            commit(&mut coordinator, &mut lane, report);
+        }
+        assert!(
+            coordinator.reload_not_excluded_evidence().is_none(),
+            "a clean capture projects nothing"
+        );
+        let mut evidence = crate::render::tests::evidence();
+        evidence.instance_reload_not_excluded = None;
+        let value = crate::render::versioned_evidence(&evidence);
+        assert!(
+            value.get("instance_reload_not_excluded").is_none(),
+            "absent, never zero: {value}"
+        );
+    }
+
+    // Backpressure drops keep their disclosures: two disclosure
+    // batches staged without an intervening finalize both project,
+    // with maxed count snapshots.
+    #[test]
+    fn backpressure_stages_keep_both_disclosure_quadrants() {
+        use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+
+        let mut coordinator = coordinator();
+        let lane = shell_lane();
+        let report = |cookie: u64, id: u64, continued: u64, joined: u64| {
+            let mut report = TickReport::default();
+            report.reload_not_excluded.push(ReloadNotExcludedReport {
+                label: RELOAD_NOT_EXCLUDED_LABEL,
+                image: ImageIdentity {
+                    task_cookie: cookie,
+                    exec_id: 7,
+                },
+                file_slot: 3,
+                ids: vec![InstanceId::from_raw(id)],
+            });
+            report.continued_across_global = continued;
+            report.joined_across_global = joined;
+            report
+        };
+        for disclosed in [report(0x51, 1, 4, 2), report(0x52, 2, 6, 1)] {
+            let batch =
+                SemanticBatch::from_tick_report(lane.domain(), disclosed, Vec::new(), 130).unwrap();
+            coordinator.stage_semantic_batch(batch);
+        }
+        let projected = coordinator
+            .reload_not_excluded_evidence()
+            .expect("both staged quadrants project");
+        assert_eq!(projected.identities.len(), 2);
+        assert_eq!(projected.continued_across_global, 6);
+        assert_eq!(projected.joined_across_global, 2);
+    }
+
+    // The namespace ledger caps distinct disclosed identities at the
+    // batch bound: the 4097th new identity sheds with a named gap
+    // while the count snapshots stay exact.
+    #[test]
+    fn ledger_caps_reload_identities_and_names_shed() {
+        use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        let disclosure = |cookie: u64| ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(cookie + 1)],
+        };
+        let full = TickReport {
+            reload_not_excluded: (0..MAX_INSTANCES as u64).map(disclosure).collect(),
+            continued_across_global: 4,
+            joined_across_global: 2,
+            ..Default::default()
+        };
+        commit(&mut coordinator, &mut lane, full);
+        let overflow = TickReport {
+            reload_not_excluded: vec![disclosure(10_000)],
+            continued_across_global: 9,
+            joined_across_global: 3,
+            ..Default::default()
+        };
+        let batch =
+            SemanticBatch::from_tick_report(lane.domain(), overflow, Vec::new(), 130).unwrap();
+        coordinator.stage_semantic_batch(batch);
+        let projected = coordinator
+            .reload_not_excluded_evidence()
+            .expect("the capped ledger still projects");
+        assert_eq!(projected.identities.len(), MAX_INSTANCES);
+        assert_eq!(projected.continued_across_global, 9);
+        assert_eq!(projected.joined_across_global, 3);
+        let gaps = coordinator.registry().staged_scope_gaps_for_test();
+        assert!(
+            gaps.iter()
+                .any(|(subject, _)| subject == "reload disclosure identities shed"),
+            "the shed identity must be a named gap: {gaps:?}"
+        );
+    }
+
+    // Control: a quiet stage records no disclosure-shed gap. The gap
+    // fires only on real shed (see the carried-shed twin).
+    #[test]
+    fn staged_quiet_batch_records_no_disclosure_shed_gap() {
+        let mut coordinator = coordinator();
+        let lane = shell_lane();
+        let batch =
+            SemanticBatch::from_tick_report(lane.domain(), TickReport::default(), Vec::new(), 130)
+                .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        let gaps = coordinator.registry().staged_scope_gaps_for_test();
+        assert!(
+            !gaps
+                .iter()
+                .any(|(subject, _)| subject == "reload disclosure identities shed"),
+            "no shed, no gap: {gaps:?}"
+        );
+    }
+
+    // Carried upstream shed reaches the one cumulative ledger counter
+    // and the named gap: a batch whose unions shed upstream still
+    // discloses the loss at stage time, with a running total.
+    #[test]
+    fn staged_carried_shed_reaches_ledger_counter_and_gap() {
+        let mut coordinator = coordinator();
+        let lane = shell_lane();
+        for carried in [3u32, 2u32] {
+            let report = TickReport {
+                reload_shed: carried,
+                ..Default::default()
+            };
+            let batch =
+                SemanticBatch::from_tick_report(lane.domain(), report, Vec::new(), 130).unwrap();
+            assert_eq!(batch.reload_shed(), carried);
+            coordinator.stage_semantic_batch(batch);
+        }
+        let gaps = coordinator.registry().staged_scope_gaps_for_test();
+        let shed_gaps: Vec<_> = gaps
+            .iter()
+            .filter(|(subject, _)| subject == "reload disclosure identities shed")
+            .collect();
+        assert_eq!(shed_gaps.len(), 2, "each shed stage names a gap: {gaps:?}");
+        assert!(
+            shed_gaps[1].1.contains("(5 shed this capture)"),
+            "the counter is cumulative: {:?}",
+            shed_gaps[1].1
         );
     }
 }

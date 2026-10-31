@@ -2087,9 +2087,10 @@ fn privileged_instance_b17_counters_observe_sharer_churn() -> Result<()> {
     );
     let kernel = harness.session.instance_maps().counters()?;
     eprintln!(
-        "B17_COUNTERS a={a:?} after={after_sharer:?} counters={counters:?} kernel={kernel:?} scans={:?} minted={}",
+        "B17_COUNTERS a={a:?} after={after_sharer:?} counters={counters:?} kernel={kernel:?} scans={:?} minted={} sticky={}",
         harness.scan,
-        harness.capture.router().instances_minted()
+        harness.capture.router().instances_minted(),
+        harness.session.instance_maps().sticky()?
     );
     Ok(())
 }
@@ -2208,9 +2209,10 @@ fn privileged_instance_b17_drain_yields_identity_once_live() -> Result<()> {
     let counters = harness.capture.router().counters();
     let kernel = harness.session.instance_maps().counters()?;
     eprintln!(
-        "B17_DRAIN a={a:?} after={after_sharer:?} counters={counters:?} kernel={kernel:?} scans={:?} minted={}",
+        "B17_DRAIN a={a:?} after={after_sharer:?} counters={counters:?} kernel={kernel:?} scans={:?} minted={} sticky={}",
         harness.scan,
-        harness.capture.router().instances_minted()
+        harness.capture.router().instances_minted(),
+        harness.session.instance_maps().sticky()?
     );
     Ok(())
 }

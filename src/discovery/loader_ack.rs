@@ -14,58 +14,60 @@
 //! (take/drain) and returns without dispatch keeps its single charge —
 //! only fresh entries charge, only true exits dispose. Re-park and
 //! put-back sites are marked so activation never double-charges them.
-//! - `Collected`: `Engine::pending_discovery_records` (`engine.rs:391`);
+//! - `Collected`: `Engine::pending_discovery_records` (`engine.rs:395`);
 //!   charge once per fresh record at its ingress boundary, before
-//!   retention/dispatch: Finish pull (`:26466`), diverted-fresh rejoins
-//!   (`:20153`, `:20229`), backlog fresh pull (`:26878-26893`), ordinary
-//!   fresh suffix (`:27099-27103`). Dispose at per-record dispatch drain
-//!   (Finish `:26668-26673`). Shared first parks hold mixed provenance:
-//!   counter-failure put-back (`:26916`), ordinary counter/barrier parks
-//!   (`:27108`, `:27121`) and later carries (`:27168`) may hold fresh
+//!   retention/dispatch: Finish pull (`:26719`), diverted-fresh rejoins
+//!   (`:20400`, `:20476`), backlog fresh pull (`:27131-27146`), ordinary
+//!   fresh suffix (`:27352-27356`). Dispose at per-record dispatch drain
+//!   (Finish `:26921-26926`). Shared first parks hold mixed provenance:
+//!   counter-failure put-back (`:27169`), ordinary counter/barrier parks
+//!   (`:27361`, `:27374`) and later carries (`:27421`) may hold fresh
 //!   records (charge stays from ingress) or replays (never recharged).
 //!   The no-recharge rule below is conditioned on that ingress charge
 //!   having occurred. Internal moves, never a new charge: re-parks
-//!   (`:20002`, parked extends `:20152`, `:20162`, `:20172`, `:20187`),
-//!   take/put-backs (`:26683`, pending-prefix take `:26894-26899` with
-//!   `:26916`/`:26965`/`:26971`/`:26989`, pending take `:27098` with
-//!   `:27168`) and the deferred re-queue (`:22404`).
-//! - `Pending`: `Engine::pending_loader_arm_scans` (`engine.rs:620`, a
-//!   `BTreeSet`); charge only on new-key insert (`:17228-17231`),
-//!   dispose at serve (`:14905`, `:14920`, `:14923`, `:15522`),
-//!   retirement prune (`:18235`) or bulk dispose (capture-end clear
-//!   `:10458`, `release_view_id` retain `:10972`, shutdown clear `:17762`).
-//! - `Deferred`: `TerminalDispatch::deferred_mismatches` (`engine.rs:4686`);
-//!   charge at deferral (`:15475`), dispose at the ordinary settle
-//!   (`:20230` into `:19475`) or the terminal-path settle (`:18122-18123`).
-//! - `TerminalBatch`: `Engine::terminal_batch` (`engine.rs:389`); charge
-//!   at `retain_terminal_batch` (`:17822`, extends at `:17833`),
-//!   `TerminalBatch::extend` (`:4703`) and
-//!   `handoff_precharged_terminal_records` (`:17792`, extends at `:17807`);
-//!   dispose per record at `dispatch_terminal_batch` (`:18031`, removed
-//!   per credit `:18084-18087`, restored if incomplete `:18129-18131`).
-//!   Deferred transfer (`take_terminal_batch_for_deferred`, `:17945`,
-//!   via `:18169`/`:18322`) is not a dispose: the charge stays on the
+//!   (`:20249`, parked extends `:20399`, `:20409`, `:20419`, `:20434`),
+//!   take/put-backs (`:26936`, pending-prefix take `:27147-27152` with
+//!   `:27169`/`:27218`/`:27224`/`:27242`, pending take `:27351` with
+//!   `:27421`) and the deferred re-queue (`:22657`).
+//! - `Pending`: `Engine::pending_loader_arm_scans` (`engine.rs:628`, a
+//!   `BTreeSet`); charge only on new-key insert (`:17469-17472`),
+//!   dispose at serve (`:15144`, `:15159`, `:15162`, `:15763`),
+//!   retirement prune (`:18476`) or bulk dispose (capture-end clear
+//!   `:10650`, `release_view_id` retain `:11195`, shutdown clear `:18003`).
+//! - `Deferred`: `TerminalDispatch::deferred_mismatches` (`engine.rs:4729`);
+//!   charge at deferral (`:15716`), dispose at the ordinary settle
+//!   (`:20477` into `:19722`) or the terminal-path settle (`:18363-18364`).
+//! - `TerminalBatch`: `Engine::terminal_batch` (`engine.rs:393`); charge
+//!   at `retain_terminal_batch` (`:18063`, extends at `:18074`),
+//!   `TerminalBatch::extend` (`:4746`) and
+//!   `handoff_precharged_terminal_records` (`:18033`, extends at `:18048`);
+//!   dispose per record at `dispatch_terminal_batch` (`:18272`, removed
+//!   per credit `:18325-18328`, restored if incomplete `:18370-18372`).
+//!   Deferred transfer (`take_terminal_batch_for_deferred`, `:18186`,
+//!   via `:18410`/`:18563`) is not a dispose: the charge stays on the
 //!   token while the deferred item holds the batch, and disposition
 //!   happens only at terminal dispatch after
-//!   `reconcile_terminal_authority` (`:17951`) returns it.
-//! - `SelectionHandoff`: `TerminalSelectionHandoffs` (`engine.rs:2601`),
-//!   created empty per pass (`:20012`) and per graph-consume step
-//!   (`:25976`, always empty there — "no record dispatch fills them",
-//!   `:25961-25965`); charge per record at the dispatch push
-//!   (`:19828-19831`), dispose at the move into the batch (`:18302`,
-//!   after remove plus owner check `:18283-18292`), per-pass rejects
-//!   (`:18299`, `:18354`) or the reject-all dispose (`:20474-20478`).
-//! - scans: `Engine::pending_loader_scans` (`engine.rs:617`); charge only
-//!   on new-key insert (`:11893`; a dedup hit lowers the timestamp at
-//!   `:11883-11885` and a capacity drop at `:11887-11892` charges
-//!   nothing), settle at `:11911`, `:11928`, `:11945`, `:15317` and
-//!   `:15557` (`defer_loader_memory_scan` `:11882`, RT_ADD call `:15524`).
+//!   `reconcile_terminal_authority` (`:18192`) returns it.
+//! - `SelectionHandoff`: `TerminalSelectionHandoffs` (`engine.rs:2624`),
+//!   created empty per pass (`:20259`) and per graph-consume step
+//!   (`:26229`, always empty there — "no record dispatch fills them",
+//!   `:26214-26218`); charge per record at the dispatch push
+//!   (`:20075-20078`), dispose at the move into the batch (`:18543`,
+//!   after remove plus owner check `:18524-18533`), per-pass rejects
+//!   (`:18540`, `:18595`) or the reject-all dispose (`:20721-20725`).
+//! - scans: `Engine::pending_loader_scans` (`engine.rs:625`); charge only
+//!   on new-key insert (`:12116`; a dedup hit lowers the timestamp at
+//!   `:12106-12108` and a capacity drop at `:12110-12115` charges
+//!   nothing — the `:12110` bound check shares `MAX_LOADER_CONTEXTS`
+//!   with the L1/L2 256-context gate), settle at `:12134`, `:12151`,
+//!   `:12168`, `:15558` and `:15798` (`defer_loader_memory_scan`
+//!   `:12105`, RT_ADD call `:15765`).
 //! - descriptors: per-context dynamic export cookies (`attach_dynamic_export`,
-//!   `:16818`, success arm `:16835`); charge at attach success, release at
-//!   `detach_dynamic_context` (`:17555`, `:18250`), settle at terminal
-//!   dispatch completion (`loader_registry.remove(owner)`, `:18133`).
+//!   `:17059`, success arm `:17076`); charge at attach success, release at
+//!   `detach_dynamic_context` (`:17796`, `:18491`), settle at terminal
+//!   dispatch completion (`loader_registry.remove(owner)`, `:18374`).
 //! - link cleanup: the `EngineSession::detach_dynamic_context` verdict
-//!   (`:17555`, `:18250`): `record_link_cleanup(!detach_failed)`.
+//!   (`:17796`, `:18491`): `record_link_cleanup(!detach_failed)`.
 //! - native retirement: T-L2 `insert_state`/`remove_state`; a failed removal
 //!   keeps quarantine plus replacement refusal, never an automatic reclaim.
 //!

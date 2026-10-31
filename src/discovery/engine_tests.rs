@@ -55281,9 +55281,16 @@ fn gap_exe_identity_changed_inode_refuses_stale_path() {
     let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
     // Replace the executable at its learned path: the recorded
     // identity no longer matches, so the stale path is refused.
+    // Atomic rename-over: the path resolves to a provably different
+    // inode on every filesystem (remove+create reuses the freed inode
+    // on ext4, voiding the premise below).
     let exe = dir.path().join("gexe");
-    std::fs::remove_file(&exe).unwrap();
-    std::fs::write(&exe, exf::build_elf(&exf::ElfSpec::exe(&[]))).unwrap();
+    let fresh = exf::write_elf(
+        dir.path(),
+        "gexe.new",
+        &exf::build_elf(&exf::ElfSpec::exe(&[])),
+    );
+    std::fs::rename(&fresh, &exe).unwrap();
     let (new_dev, new_ino) = exf::record_identity_of(&exe);
     assert_ne!((dev, ino), (new_dev, new_ino), "replacement kept identity");
     dispatch_gap_exe(

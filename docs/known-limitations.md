@@ -85,7 +85,20 @@ when kernel identity is unavailable. A Fedora Linux 7.2.9 comparison of GNU
 builds using Rust 1.99.1, 400 processes and 8 mock providers on btrfs completed 10
 matched rounds with equal coverage. Against the earlier identity implementation,
 confirm-stage p95 rose from 66.600 to 84.055 ms (+26.21%); whole-pass p95 rose from
-255.444 to 288.012 ms (+12.75%). These are measured costs for that workload, not
+255.444 to 288.012 ms (+12.75%). Those figures are the 2026-10-27 campaign
+(POST `b58ef1b5ec41bcb793b8741c3fc5ba62ae849d8e`, PRE R-14 `96624556`;
+H4A FAIL with coverage ok; paired-median total +6.50%, bootstrap 95%
+upper +8.10% within its 10% bar, wall ok; record
+`tmp/codex-v050/h4a-b58-status.md`). A second 2026-10-31 campaign at
+POST `ba92b4e2c29fc4db97b870ec1f0b28d4acabebef` (same PRE, same
+400-process/8-provider Btrfs shape, 40/40 runs) is also H4A FAIL with
+coverage ok: confirm-stage p95 168.529 to 178.216 ms (+5.75%),
+whole-pass p95 612.2 to 850.9 ms (+39.00%; absolutes derived in the
+analysis, the gate prints only the percentage), paired-median total
++37.83%, CI95 upper +43.53%, wall ok (controller record
+`tmp/muse-jobs/h4a-qual-verdict.md`, analysis `tmp/muse-jobs/616-analysis.md`).
+Absolute times are not comparable across campaigns, only
+within-campaign ratios are. These are measured costs for that workload, not
 bounds for every host. The default `--identity-backend auto` uses kernel
 identity where available. Further userspace speed work is planned for 0.5.x.
 

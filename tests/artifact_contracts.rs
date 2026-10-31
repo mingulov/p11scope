@@ -612,7 +612,9 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
         "- name: Install packaged bpftool",
         "set -euo pipefail",
-        "BASELINE=b172bef608021943a317532771d051a632668124",
+        // Pinned baseline ba92b4e2: reviewed KEM + extensive-6.14 +
+        // journal delta since b172bef6; enumerated in the ci.yml comment.
+        "BASELINE=ba92b4e2c29fc4db97b870ec1f0b28d4acabebef",
         "python3 -I scripts/check-bpf-noninterference.py \\",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
@@ -9670,7 +9672,9 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         "needs: [dedupe, tests]",
         "!cancelled() && needs.dedupe.outputs.run == 'true'",
         "fetch-depth: 0",
-        "BASELINE=b172bef608021943a317532771d051a632668124",
+        // Pinned baseline ba92b4e2: reviewed KEM + extensive-6.14 +
+        // journal delta since b172bef6; enumerated in the ci.yml comment.
+        "BASELINE=ba92b4e2c29fc4db97b870ec1f0b28d4acabebef",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"\n",

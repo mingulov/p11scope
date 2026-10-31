@@ -154,7 +154,9 @@ fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
 "#;
     if !comparison
         .lines()
-        .any(|line| line == "          BASELINE=b172bef608021943a317532771d051a632668124")
+        // Pinned baseline ba92b4e2: reviewed KEM + extensive-6.14 +
+        // journal delta since b172bef6; enumerated in the ci.yml comment.
+        .any(|line| line == "          BASELINE=ba92b4e2c29fc4db97b870ec1f0b28d4acabebef")
         || !comparison.contains(repeat)
         || !comparison.contains(integration)
         || comparison.contains("--host-compiler-transition")
@@ -234,7 +236,9 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
         "a renamed comparison job must be rejected"
     );
     for marker in [
-        "BASELINE=b172bef608021943a317532771d051a632668124",
+        // Pinned baseline ba92b4e2: reviewed KEM + extensive-6.14 +
+        // journal delta since b172bef6; enumerated in the ci.yml comment.
+        "BASELINE=ba92b4e2c29fc4db97b870ec1f0b28d4acabebef",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"",

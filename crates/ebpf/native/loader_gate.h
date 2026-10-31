@@ -83,7 +83,10 @@ _Static_assert(P11_OWNER_START_REASON_EXEC_EXIT == P11_LOADER_START_REASON_EXEC_
  * a reclaimed incarnation, including across the u32 wrap. */
 struct loader_gate_row {
     u64 generation;
-    u32 state;
+    /* 64-bit state: BPF selects cmpxchg only at 64 bits, and the
+     * claim (EMPTY->ARMED) and retire (ARMED->RETIRED) transitions
+     * each need exactly one compare-and-swap winner. */
+    u64 state;
     u32 disposition;
     u32 acked;
     u32 last_gen;
@@ -108,12 +111,12 @@ struct loader_gate_control {
     u64 retained_peak;
     u64 update_losses;
 };
-_Static_assert(sizeof(struct loader_gate_row) == 24, "gate row ABI");
+_Static_assert(sizeof(struct loader_gate_row) == 32, "gate row ABI");
 _Static_assert(__builtin_offsetof(struct loader_gate_row, generation) == 0, "gate generation");
 _Static_assert(__builtin_offsetof(struct loader_gate_row, state) == 8, "gate state");
-_Static_assert(__builtin_offsetof(struct loader_gate_row, disposition) == 12, "gate disposition");
-_Static_assert(__builtin_offsetof(struct loader_gate_row, acked) == 16, "gate acked");
-_Static_assert(__builtin_offsetof(struct loader_gate_row, last_gen) == 20, "gate last generation");
+_Static_assert(__builtin_offsetof(struct loader_gate_row, disposition) == 16, "gate disposition");
+_Static_assert(__builtin_offsetof(struct loader_gate_row, acked) == 20, "gate acked");
+_Static_assert(__builtin_offsetof(struct loader_gate_row, last_gen) == 24, "gate last generation");
 _Static_assert(sizeof(struct loader_gate_control) == 72, "gate control ABI");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, limit) == 0, "gate limit");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, cutover) == 8, "gate cutover");

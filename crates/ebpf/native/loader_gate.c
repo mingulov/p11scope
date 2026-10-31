@@ -61,11 +61,14 @@ static __always_inline void gate_report_loss(struct loader_gate_control *ctl)
         __sync_fetch_and_add(losses, 1);
 }
 
-/* Saturating increment. Returns 1 with the exact post-increment value
- * when the increment lands (CAS winner or headroom fallback); returns
- * 0 with the saturated ceiling when the cell already saturates or the
- * near-ceiling update skips (the skip reports through update_losses,
- * never wraps, never vanishes). */
+/* Saturating increment. Returns 1 with the post-increment value when
+ * the increment lands: exact on the CAS-winner path, a re-read on the
+ * headroom-fallback path (BPF cannot use a fetch-add result at the
+ * link CPU, so the fallback add settles silently and the value is
+ * re-read: exact absent a concurrent drop, never above the true
+ * maximum). Returns 0 with the saturated ceiling when the cell
+ * already saturates or the near-ceiling update skips (the skip
+ * reports through update_losses, never wraps, never vanishes). */
 static __always_inline int gate_sat_inc(struct loader_gate_control *ctl, u64 *cell,
                                         u64 *out)
 {
@@ -86,9 +89,12 @@ static __always_inline int gate_sat_inc(struct loader_gate_control *ctl, u64 *ce
     }
     /* Exhausted: every failure is another thread's success. With
      * headroom below the ceiling the single fallback add cannot reach
-     * the maximum; within headroom of the ceiling skip and report. */
+     * the maximum; within headroom of the ceiling skip and report.
+     * The fallback result stays dead (BPF selects no fetch form at
+     * the link CPU) and the post-value is re-read instead. */
     if (seen < ~0ULL - GATE_SAT_HEADROOM) {
-        *out = __sync_fetch_and_add(cell, 1) + 1;
+        __sync_fetch_and_add(cell, 1);
+        *out = *(volatile u64 *)cell;
         return 1;
     }
     gate_report_loss(ctl);
@@ -126,9 +132,13 @@ static __always_inline long gate_refuse(struct loader_gate_control *ctl)
     return -2;
 }
 
-/* Raise the peak to at least newval, the exact post-increment live
- * count from the gauge add. A concurrent reclaim cannot hide the
- * crossing because the raiser carries the value, not a re-read. */
+/* Raise the peak to at least newval, the post-increment live count
+ * from the gauge add: carried exact on the CAS-winner path, re-read
+ * on the headroom-fallback path. A concurrent reclaim cannot hide
+ * the crossing on the CAS path because the raiser carries the value,
+ * not a re-read; on the fallback path a reclaim landing between the
+ * add and the re-read can understate the raise (never overstate it),
+ * and the peak still never falls. */
 static __always_inline void gate_peak_raise(struct loader_gate_control *ctl, u64 newval)
 {
     int tries;
@@ -195,15 +205,17 @@ static __always_inline int gate_claim_row(struct loader_gate_control *ctl,
      * straight line right after its own CAS, so the wait always
      * settles short of preemption. */
     for (tries = 0; tries < 4; tries++) {
-        u32 state = *(volatile u32 *)&row->state;
+        u64 state = *(volatile u64 *)&row->state;
         u64 check = *(volatile u64 *)&row->generation;
         if (check != gen)
             return -1;
-        /* Boolean 32-bit CAS: the host test double only models the
-         * 64-bit value CAS, and only success matters here. */
+        /* Value CAS on the 64-bit state: BPF selects cmpxchg only
+         * at 64 bits. Only success matters here; like the
+         * generation, reclaim and cutover CAS, this one stays real
+         * under the counting-cell failure hook. */
         if (state == LOADER_GATE_EMPTY &&
-            __sync_bool_compare_and_swap(&row->state, LOADER_GATE_EMPTY,
-                                         LOADER_GATE_ARMED))
+            __sync_val_compare_and_swap(&row->state, LOADER_GATE_EMPTY,
+                                        LOADER_GATE_ARMED) == LOADER_GATE_EMPTY)
             return 1;
     }
     /* Spin exhausted: roll the generation back so the row is claimable
@@ -299,9 +311,12 @@ __attribute__((noinline)) long p11_loader_gate_note_producer_end(u64 cookie, u32
     }
     /* One winner retires: the loser meets a retired row and refuses,
      * matching the sequential double-retire verdict. Retired rows stay
-     * charged until the acknowledged reclaim drops the gauge. */
-    if (!__sync_bool_compare_and_swap(&row->state, LOADER_GATE_ARMED,
-                                      LOADER_GATE_RETIRED))
+     * charged until the acknowledged reclaim drops the gauge. The
+     * 64-bit value CAS is the BPF-selectable spelling of the same
+     * single-winner transition; it stays real under the
+     * counting-cell failure hook. */
+    if (__sync_val_compare_and_swap(&row->state, LOADER_GATE_ARMED,
+                                    LOADER_GATE_RETIRED) != LOADER_GATE_ARMED)
         return gate_refuse(ctl);
     row->disposition = disposition;
     gate_count(ctl, &ctl->retired);
@@ -324,8 +339,8 @@ __attribute__((noinline)) long p11_loader_gate_ack(u64 cookie)
     struct loader_gate_control *ctl = gate_control();
     struct loader_gate_row *row;
     u32 slot;
-    u64 generation, gen;
-    u32 state, last;
+    u64 generation, gen, state;
+    u32 last;
 
     if (!ctl)
         return -1;
@@ -346,7 +361,7 @@ __attribute__((noinline)) long p11_loader_gate_ack(u64 cookie)
      * double-counts a reclaim (reclaim races are normal here, not
      * caller faults). */
     gen = *(volatile u64 *)&row->generation;
-    state = *(volatile u32 *)&row->state;
+    state = *(volatile u64 *)&row->state;
     last = *(volatile u32 *)&row->last_gen;
     if (gen == 0)
         return last == (u32)generation ? 0 : gate_refuse(ctl);
@@ -366,7 +381,7 @@ __attribute__((noinline)) long p11_loader_gate_ack(u64 cookie)
     row->acked = 0;
     if (__sync_val_compare_and_swap(&row->generation, generation, 0) != generation) {
         gen = *(volatile u64 *)&row->generation;
-        state = *(volatile u32 *)&row->state;
+        state = *(volatile u64 *)&row->state;
         last = *(volatile u32 *)&row->last_gen;
         if (gen == 0)
             return last == (u32)generation ? 0 : gate_refuse(ctl);
@@ -428,7 +443,7 @@ static __always_inline long gate_hit_spin(struct loader_gate_control *ctl,
 
     for (tries = 0; tries < 4; tries++) {
         u64 g = *(volatile u64 *)&row->generation;
-        u32 st = *(volatile u32 *)&row->state;
+        u64 st = *(volatile u64 *)&row->state;
         u32 last = *(volatile u32 *)&row->last_gen;
         if (g == gen && st == LOADER_GATE_ARMED)
             return (long)slot;
@@ -449,7 +464,7 @@ static __always_inline long gate_hit_tail(struct loader_gate_control *ctl,
                                           u64 gen, int allow_reuse)
 {
     u64 g = *(volatile u64 *)&row->generation;
-    u32 st = *(volatile u32 *)&row->state;
+    u64 st = *(volatile u64 *)&row->state;
     u32 last = *(volatile u32 *)&row->last_gen;
     u64 pred;
     long acked;

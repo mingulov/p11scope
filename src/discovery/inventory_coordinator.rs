@@ -567,6 +567,11 @@ const NATIVE_OWNER_SUSPENDED_RETIRED_REASON: &str =
 /// Suspend disposition for a live caller whose image changed:
 /// authority cancelled ahead of the release.
 const NATIVE_OWNER_SUSPENDED_EXEC_REASON: &str = "the caller's image changed; native authority was cancelled and its native owner was released; scan-pinned fallback retained";
+/// Suspend disposition for a caller admitted by the transaction
+/// whose later permit/proof check failed while the transaction
+/// stayed complete: its admission standing is withdrawn and the
+/// owner releases in the same pass.
+const NATIVE_OWNER_SUSPENDED_LOST_REASON: &str = "the caller failed its final permit proof after admission; native authority was cancelled and its native owner was released; scan-pinned fallback retained";
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
     // Retain the default constructor for existing internal harness callers;
@@ -3752,7 +3757,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// permit: bounded pure work only. The engine commit clears the
     /// candidate flag and releases the lease on every path; a
     /// refused commit keeps prior facts, reports by name, and routes
-    /// a changed image to this pass's suspend set.
+    /// a changed image to this pass's suspend set. Returns whether
+    /// the member was lost at a proof/liveness check after its
+    /// permit was granted (proof validation, or the engine
+    /// commit's liveness re-check): the caller then withdraws the
+    /// caller's admission standing if the transaction is still
+    /// complete. Other refused commits keep the owner.
     fn commit_scoped_native_refresh(
         &mut self,
         staged: StagedNativeOwner,
@@ -3760,7 +3770,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         verdicts: &BTreeMap<AttachModuleKey, AttachVerdict>,
         now_ns: u64,
         invalidated: &mut BTreeSet<CallerId>,
-    ) {
+    ) -> bool {
         let StagedNativeOwner {
             caller,
             pid,
@@ -3778,10 +3788,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 pid,
                 owner,
                 Some(&lease),
-                "the refreshed member does not match the final-sample permit; prior owner facts retained",
+                "the refreshed member does not match the final-sample permit",
                 invalidated,
             );
-            return;
+            return true;
         };
         #[cfg(test)]
         scoped_commit_gate_test::notify(scoped_commit_gate_test::Phase::RefreshProofValidated);
@@ -3802,6 +3812,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     self.complete_scanned.insert(caller);
                 }
                 self.scanned_owners.insert(owner);
+                false
             }
             Err(error) => {
                 self.refuse_scoped_native_refresh(
@@ -3811,6 +3822,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 );
                 if matches!(self.engine.inventory_owner_image_changed(owner), Ok(true)) {
                     invalidated.insert(caller);
+                    false
+                } else {
+                    !replay.original.still_the_same()
                 }
             }
         }
@@ -3818,24 +3832,37 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Suspend every active scoped owner its complete transaction
     /// left behind: callers absent from `allowed_callers`, plus
-    /// owners proven exec-changed this pass. Runs after the scoped
-    /// commit loop and before the engine-tail revision, because
-    /// release mutates engine facts. Complete outcomes only (the
-    /// caller gates): a failed collection proves no absence.
+    /// owners proven exec-changed this pass, plus admitted
+    /// members lost at their later permit proof. Runs after the
+    /// scoped commit loop and before the engine-tail revision,
+    /// because release mutates engine facts. Complete outcomes
+    /// only (the caller gates): a failed collection proves no
+    /// absence.
     fn suspend_absent_scoped_owners(
         &mut self,
         allowed_callers: &BTreeSet<CallerId>,
         invalidated: &BTreeSet<CallerId>,
+        lost: &BTreeSet<CallerId>,
         now_ns: u64,
     ) {
         let suspend: Vec<(CallerId, ProcessViewId)> = self
             .owners
             .iter()
-            .filter(|(caller, _)| !allowed_callers.contains(caller) || invalidated.contains(caller))
+            .filter(|(caller, _)| {
+                !allowed_callers.contains(caller)
+                    || invalidated.contains(caller)
+                    || lost.contains(caller)
+            })
             .map(|(caller, owner)| (*caller, *owner))
             .collect();
         for (caller, owner) in suspend {
-            self.suspend_one_scoped_owner(caller, owner, invalidated.contains(&caller), now_ns);
+            self.suspend_one_scoped_owner(
+                caller,
+                owner,
+                invalidated.contains(&caller),
+                lost.contains(&caller),
+                now_ns,
+            );
         }
     }
 
@@ -3851,6 +3878,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         caller: CallerId,
         owner: ProcessViewId,
         exec_changed: bool,
+        lost_member: bool,
         now_ns: u64,
     ) {
         let record = self.adapter.record(caller);
@@ -3861,6 +3889,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         } else {
             let fallback_reason = if exec_changed {
                 NATIVE_OWNER_SUSPENDED_EXEC_REASON
+            } else if lost_member {
+                NATIVE_OWNER_SUSPENDED_LOST_REASON
             } else {
                 NATIVE_OWNER_SUSPENDED_ABSENT_REASON
             };
@@ -7930,6 +7960,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     }
                 }
             }
+            let mut lost_owners = BTreeSet::new();
             for staged in staged_refreshes {
                 let permit = collection.permit(staged.pid);
                 #[cfg(test)]
@@ -7942,24 +7973,51 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             self.release_staged_native_refresh(staged);
                         } else {
                             commits_used += 1;
-                            self.commit_scoped_native_refresh(
+                            let caller = staged.caller;
+                            let lost = self.commit_scoped_native_refresh(
                                 staged,
                                 &permit,
                                 &verdicts,
                                 *now_ns,
                                 &mut invalidated_owners,
                             );
+                            if lost && collection.outcome() == ScopedCollectionOutcome::Complete {
+                                allowed_callers.remove(&caller);
+                                lost_owners.insert(caller);
+                            }
                         }
                     }
                     (None, _) => {
+                        // A permit missing while the transaction
+                        // is still complete was lost after the
+                        // final sample (earlier loss already
+                        // incompleted it): the member no longer
+                        // stands, so withdraw its admission
+                        // standing for this pass's teardown. A
+                        // permit refused through latched
+                        // cancellation or work exhaustion leaves
+                        // the outcome non-complete and marks
+                        // nobody; that is work state, not a lost
+                        // member, and never an exec change.
+                        let still_complete =
+                            collection.outcome() == ScopedCollectionOutcome::Complete;
+                        let caller = staged.caller;
                         self.abandon_scoped_native_refresh(
-                            staged.caller,
+                            caller,
                             staged.pid,
                             staged.owner,
                             Some(&staged.lease),
-                            "the final-sample permit was not granted; prior owner facts retained",
+                            if still_complete {
+                                "the final-sample permit was not granted"
+                            } else {
+                                "the final-sample permit was not granted; prior owner facts retained"
+                            },
                             &mut invalidated_owners,
                         );
+                        if still_complete {
+                            allowed_callers.remove(&caller);
+                            lost_owners.insert(caller);
+                        }
                     }
                     (Some(_), false) => {
                         self.release_staged_native_refresh(staged);
@@ -7967,11 +8025,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
             // Suspend owners the complete transaction left behind
-            // (absent members, retired callers, proven exec changes)
+            // (absent members, retired callers, proven exec changes,
+            // admitted members lost at their later permit proof)
             // before the tail revision: release mutates engine
             // facts. An incomplete outcome suspends nobody.
             if transaction_complete {
-                self.suspend_absent_scoped_owners(&allowed_callers, &invalidated_owners, *now_ns);
+                self.suspend_absent_scoped_owners(
+                    &allowed_callers,
+                    &invalidated_owners,
+                    &lost_owners,
+                    *now_ns,
+                );
             }
             debug_assert!(
                 !self.engine.scoped_refresh_in_progress(),

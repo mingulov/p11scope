@@ -894,6 +894,7 @@ fn r52_marker_readback_helpers_wire_retention_over_fixture_rows() -> Result<()> 
         (journal_marker::MARKER_DIRTY, 7, "DIRTY"),
         (3, 7, "low bits 11"),
         (4, 7, "low bits 00 with high bits"),
+        (7, 7, "low bits 11 with high bit"),
         (u64::MAX, 7, "all bits"),
     ] {
         let record = row(word, generation);

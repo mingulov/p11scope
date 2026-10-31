@@ -1959,6 +1959,11 @@ mod tests {
             "p11_instance_exec_birth",
             "p11_instance_scope_gap",
             "JOURNAL_MARKER_CTL",
+            "MARKER_UNPUBLISHED",
+            "MarkerRead",
+            "read_word",
+            "MARKER_ADMIT_CAP",
+            "JournalAdmissionControl",
         ] {
             assert!(
                 !doctor.contains(linkage),

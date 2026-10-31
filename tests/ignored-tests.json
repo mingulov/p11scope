@@ -649,6 +649,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/discovery/cgroup_native_owner_tests.rs",
+      "path": "discovery::engine::inventory_coordinator::cgroup_native_owner_tests::cgroup_native_owner_stable_retained_member_activates_after_final_permit",
+      "reason": "6.11 activation deferred per docs/superpowers/decisions/2026-10-29-611-bridge-decision.md; tracked RED cell, migration twin cgroup_native_owner_migration_during_provider_retention_refuses_activation stays running",
+      "cell": "performance"
+    },
+    {
       "file": "src/discovery/confirm_shards_tests.rs",
       "path": "discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_serial_production_probe",
       "reason": "root (map_files): proves real children's ranges",
@@ -700,6 +706,12 @@
       "file": "src/discovery/engine_tests.rs",
       "path": "discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale",
       "reason": "scale: system-population graph sizing, time measured not gated (R-40); run by exact selector at V2 and L",
+      "cell": "performance"
+    },
+    {
+      "file": "src/discovery/engine_tests.rs",
+      "path": "discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation",
+      "reason": "R57 future positive, expected RED until a provider-free transaction receipt lands (docs/notes/2026-10-29-r57-exit-receipt-boundary.md); draft has not been run; settlement is always a counted truncation; un-ignore when a settlement receipt lands",
       "cell": "performance"
     },
     {

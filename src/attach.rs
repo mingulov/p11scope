@@ -1658,7 +1658,6 @@ pub struct Session {
     /// successful native seal retains its derived linkage. The producers
     /// drain derives its linkage from this retained sealed fact, never from
     /// a literal.
-    #[allow(dead_code)] // RED scaffolding; GREEN wires the drain to it.
     sealed_journal_linked: Option<bool>,
     /// Last: synchronous Aya links/maps/pins drop before the reservation.
     /// Every asynchronous transferred link also carries the same keepalive.
@@ -2405,12 +2404,13 @@ fn export_programs(abi: HookAbi) -> (&'static str, &'static str) {
 
 fn static_probe_side(program: &str) -> Option<ProbeSide> {
     match program {
-        "p11_return" | "p11_counter_bank_return" => Some(ProbeSide::Return),
+        "p11_return" | "p11_counter_bank_return" | "p11_return_journal" => Some(ProbeSide::Return),
         "p11_entry"
         | "p11_entry_ia32"
         | "p11_entry_template"
         | "p11_entry_template_types"
         | "p11_entry_template_pair"
+        | "p11_entry_journal"
         | "p11_counter_bank_entry" => Some(ProbeSide::Entry),
         _ => None,
     }
@@ -2483,10 +2483,9 @@ pub(crate) struct AttachedSemanticSet {
     subset: crate::inventory_semantics::AttestedSubset,
     generation: u64,
     /// Whether a journal producer is linked for this attachment: only a
-    /// linked attachment may install key-operation (Joint) feeds. OD33/R-50:
-    /// v0.5.0 links the object-journal producer into no BPF flavor, so the
-    /// production seal marks every attachment unlinked; the test sealer
-    /// marks its attachments linked for the 0.6.0 Joint suites.
+    /// linked attachment may install key-operation (Joint) feeds. The
+    /// production seal derives this from the actually loaded journal pair;
+    /// the test sealer marks its attachments linked for the Joint suites.
     journal_linked: bool,
 }
 
@@ -2510,9 +2509,8 @@ impl AttachedSemanticSet {
     }
 
     /// Whether a journal producer is linked for this attachment. The
-    /// v0.5.0 production seal always marks false (OD33/R-50); 0.6.0
-    /// wires the sealed value through to the lane.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// attested start retains the sealed value on the Session, and the
+    /// producers drain derives its linkage from that retained fact.
     pub(crate) fn journal_linked(&self) -> bool {
         self.journal_linked
     }
@@ -2528,10 +2526,10 @@ pub(crate) struct SessionDrainProducers {
     native: crate::attach::capture::NativeDomainId,
     events: events::EventsDomain,
     /// Whether a journal producer is linked for this lane: only a
-    /// linked lane may install key-operation (Joint) feeds. OD33/R-50:
-    /// v0.5.0 links the object-journal producer into no BPF flavor, so
-    /// production producers are never linked. A capability, not
-    /// identity: [`SessionDrainProducers::same_producers`] ignores it.
+    /// linked lane may install key-operation (Joint) feeds. The producers
+    /// drain derives this from the Session's retained sealed fact. A
+    /// capability, not identity: [`SessionDrainProducers::same_producers`]
+    /// ignores it.
     journal_linked: bool,
 }
 
@@ -2689,8 +2687,8 @@ impl SessionDrainProducers {
         self.events.id()
     }
 
-    /// Whether a journal producer is linked for this lane. Production
-    /// producers are never linked in v0.5.0 (OD33/R-50).
+    /// Whether a journal producer is linked for this lane, as derived by
+    /// the producers drain from the Session's retained sealed fact.
     pub(crate) fn journal_linked(&self) -> bool {
         self.journal_linked
     }
@@ -3017,11 +3015,9 @@ where
 /// pair: BOTH journal roots present. The production seal derives its linkage
 /// from the live loaded inventory through this predicate, so a missing root
 /// (partial attach) seals unlinked; naming a missing root stays the inventory
-/// seams' job. RED stub: always false until GREEN derives it.
-#[allow(dead_code)] // RED stub; GREEN wires the seal to it.
+/// seams' job.
 fn journal_pair_present(programs: &BTreeSet<&str>) -> bool {
-    let _ = programs;
-    false
+    journal::PROGRAMS.iter().all(|root| programs.contains(root))
 }
 
 /// Seal one operator-attested subset into Session-owned attachment
@@ -3048,9 +3044,10 @@ pub(crate) fn seal_attached_subset_native(
         domain,
         subset,
         generation: 0,
-        // OD33/R-50: v0.5.0 links the object-journal producer into no
-        // BPF flavor, so no production attachment is journal-linked.
-        journal_linked: false,
+        // Derived from the actually loaded pair, never a literal or a
+        // copied flag: only a session whose loaded object carries both
+        // journal roots seals linked.
+        journal_linked: journal_pair_present(&ebpf.programs().map(|(name, _)| name).collect()),
     };
     attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
     // Only a successful sealing mints, from native: the generation
@@ -3423,7 +3420,7 @@ fn group_static_slots_with_roots(
     attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
     roots: StaticRoots,
     expected_counter_mode: Option<CounterMode>,
-    _journal: bool,
+    journal: bool,
 ) -> Result<Vec<StaticGroup>> {
     if roots == StaticRoots::CounterBanks {
         if policy.counter_mode() != expected_counter_mode || object_has_unsafe {
@@ -3446,7 +3443,13 @@ fn group_static_slots_with_roots(
             }
         }
     }
-    let return_program = if roots == StaticRoots::CounterBanks {
+    // Journal sessions reuse Detailed roots with the pair swapped: the
+    // journal build carries no unsafe/ia32 entry variants, so every slot
+    // resolves the single journal entry program. A counter/journal
+    // combination is refused at preparation; journal takes precedence here.
+    let return_program = if journal {
+        "p11_return_journal"
+    } else if roots == StaticRoots::CounterBanks {
         "p11_counter_bank_return"
     } else {
         "p11_return"
@@ -3463,7 +3466,9 @@ fn group_static_slots_with_roots(
         else {
             unreachable!("static attach points are absolute with cookies");
         };
-        let program = if roots == StaticRoots::CounterBanks {
+        let program = if journal {
+            "p11_entry_journal"
+        } else if roots == StaticRoots::CounterBanks {
             "p11_counter_bank_entry"
         } else {
             entry_program(&slot.semantics, policy, object_has_unsafe, *abi)
@@ -4278,7 +4283,7 @@ fn attach_targets_observed_with_roots_journal(
     object_has_unsafe: bool,
     roots: StaticRoots,
     expected_counter_mode: Option<CounterMode>,
-    _journal: bool,
+    journal: bool,
     mut abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
     mut attach: impl FnMut(
         &'static str,
@@ -4300,7 +4305,11 @@ fn attach_targets_observed_with_roots_journal(
     {
         bail!("private counter bank attachment requires the LP64 aggregate-only fixed pair");
     }
-    let return_program = if roots == StaticRoots::CounterBanks {
+    // Journal sessions reuse Detailed roots with the pair swapped (see the
+    // grouping selection above); journal takes precedence over bank roots.
+    let return_program = if journal {
+        "p11_return_journal"
+    } else if roots == StaticRoots::CounterBanks {
         "p11_counter_bank_return"
     } else {
         "p11_return"
@@ -4368,7 +4377,9 @@ fn attach_targets_observed_with_roots_journal(
         }
     }
 
-    let entry_programs: &[&str] = if roots == StaticRoots::CounterBanks {
+    let entry_programs: &[&str] = if journal {
+        &["p11_entry_journal"]
+    } else if roots == StaticRoots::CounterBanks {
         &["p11_counter_bank_entry"]
     } else if object_has_unsafe {
         &[
@@ -4384,7 +4395,8 @@ fn attach_targets_observed_with_roots_journal(
     for program in entry_programs {
         for (slot, abi) in &targets {
             if !return_attached.contains(&slot.index)
-                || (roots == StaticRoots::Detailed
+                || (!journal
+                    && roots == StaticRoots::Detailed
                     && entry_program(&slot.semantics, policy, object_has_unsafe, *abi) != *program)
             {
                 continue;
@@ -6404,6 +6416,9 @@ impl Session {
             },
         )
         .map_err(|reason| anyhow!("attested semantic attachment refused: {reason}"))?;
+        // Only a successful seal retains: the producers drain derives its
+        // linkage from this sealed fact. A refused seal keeps no linkage.
+        session.sealed_journal_linked = Some(attached.journal_linked());
         Ok((session, attached))
     }
 
@@ -7887,7 +7902,9 @@ impl Session {
                                 .filter(|diag| diag.active())
                                 .map(|diag| {
                                     diag.begin(
-                                        if program == "p11_return" {
+                                        if program == "p11_return"
+                                            || program == "p11_return_journal"
+                                        {
                                             DiagnosticPhase::NativeReturn
                                         } else {
                                             DiagnosticPhase::NativeEntry
@@ -8022,7 +8039,7 @@ impl Session {
         targets: &[Slot],
         attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
         roots: StaticRoots,
-        _journal: bool,
+        journal: bool,
     ) -> Result<AttachOutcome> {
         let counter_mode = self
             .counter_banks
@@ -8035,7 +8052,7 @@ impl Session {
             attach_targets,
             roots,
             counter_mode,
-            _journal,
+            journal,
         )?;
         let mut programs: BTreeSet<&'static str> =
             groups.iter().map(|group| group.entry_program).collect();
@@ -8621,7 +8638,11 @@ impl Session {
         let rebuilt_groups = affected_group_count(&self.links, affected);
         let mut programs: BTreeSet<&'static str> =
             groups.iter().map(|group| group.entry_program).collect();
-        programs.insert("p11_return");
+        programs.insert(if self.journal {
+            "p11_return_journal"
+        } else {
+            "p11_return"
+        });
         let mut prog_fds = BTreeMap::new();
         for program in programs {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
@@ -9106,7 +9127,7 @@ impl Session {
             .map(|diag| {
                 let phase = match &link {
                     RegisteredLink::UProbe {
-                        program: "p11_return",
+                        program: "p11_return" | "p11_return_journal",
                         ..
                     } => DiagnosticPhase::NativeReturn,
                     RegisteredLink::UProbe { .. } => DiagnosticPhase::NativeEntry,
@@ -9175,9 +9196,10 @@ impl Session {
         Some(SessionDrainProducers {
             native: self.native_domain()?,
             events: self.events_domain(),
-            // OD33/R-50: v0.5.0 links the object-journal producer into
-            // no BPF flavor, so production producers are never linked.
-            journal_linked: false,
+            // Derived from the retained sealed fact, never a literal: a
+            // sealed attachment carries its derived linkage to the drain,
+            // while a never-sealed session drains unlinked.
+            journal_linked: self.sealed_journal_linked.unwrap_or(false),
         })
     }
 
@@ -16227,7 +16249,12 @@ mod tests {
             assert_eq!(groups[0].path, PathBuf::from("/a.so"));
             assert_eq!(groups[1].path, PathBuf::from("/b.so"));
             for member in groups.iter().flat_map(|group| &group.members) {
-                assert_ne!(member.cookie, 0, "slot {}", member.slot.index);
+                assert_eq!(
+                    member.cookie,
+                    attach_cookie(member.slot.index, member.slot.descriptor_index),
+                    "slot {}",
+                    member.slot.index
+                );
             }
             assert_ne!(grouped_offset(&groups, 0), grouped_offset(&groups, 1));
         }

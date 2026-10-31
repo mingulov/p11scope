@@ -3048,7 +3048,7 @@ fn linked_joint_services_dd_without_repolling_original() {
     // Sticky error: a DD read fault at the owner seam latches the
     // transport status; a later healthy DD service still refuses
     // instead of silently clearing it.
-    let mut faulty = MachineScene::new(1);
+    let faulty = MachineScene::new(1);
     let mut bad_dd = LiveMachineDiscovery::records(1);
     bad_dd.fail_read = true;
     let fault = faulty

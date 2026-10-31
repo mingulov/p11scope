@@ -1514,12 +1514,13 @@ impl ModelState {
             return;
         }
         if state.initialized {
-            // P4-M5: a qualified OK while the era is live contradicts
-            // — a conforming provider answers ALREADY there, so OK
-            // evidences an unseen Finalize or a nonconforming
-            // provider, and joins published since the unseen boundary
-            // cannot be located (a clean end_domain would leave them
-            // Valid).
+            // P4-M5: a non-malformed OK while the era is live
+            // contradicts, qualified or not — a conforming provider
+            // answers ALREADY there, so OK evidences an unseen
+            // Finalize or a nonconforming provider (a pre-bootstrap
+            // straddler OK voids on unproven evidence, fail-closed),
+            // and joins published since the unseen boundary cannot be
+            // located (a clean end_domain would leave them Valid).
             self.contradict(domain, ObjectGap::UnseenFinalize, None, effects, ledger);
             return;
         }

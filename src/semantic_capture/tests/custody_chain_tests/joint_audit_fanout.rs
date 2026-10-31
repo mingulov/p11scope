@@ -210,6 +210,8 @@ struct MachineNativeRows {
     )>,
     pending_q_resolutions: usize,
     pending_q_calls: usize,
+    collect_calls: usize,
+    continue_calls: usize,
 }
 
 struct HeldMachineIo<'a> {
@@ -346,6 +348,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
     ) -> Result<(RawJointQuantum, Option<crate::events::DispatchPoll>), RawQuantumRefusal> {
         self.validate_finish_q(q)
             .map_err(|_| RawQuantumRefusal::Stopped)?;
+        self.native.collect_calls += 1;
         RawJointQuantum::begin_bounded_with_adapter(
             self.drain,
             &publish_object_descriptors(),
@@ -369,6 +372,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
     ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
         self.validate_finish_q(q)
             .map_err(|_| RawQuantumRefusal::Stopped)?;
+        self.native.continue_calls += 1;
         raw.continue_bounded_with_adapter(
             self.drain,
             &publish_object_descriptors(),
@@ -474,6 +478,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         capacity: usize,
         work: usize,
     ) -> Result<(RawJointQuantum, Option<crate::events::DispatchPoll>), RawQuantumRefusal> {
+        self.native.collect_calls += 1;
         RawJointQuantum::begin_bounded_with_adapter(
             self.drain,
             &publish_object_descriptors(),
@@ -494,6 +499,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         adapter: &mut JournalAdapter,
         work: usize,
     ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
+        self.native.continue_calls += 1;
         raw.continue_bounded_with_adapter(
             self.drain,
             &publish_object_descriptors(),
@@ -1237,6 +1243,8 @@ impl MachineScene {
                 birth_outcomes: Vec::new(),
                 pending_q_resolutions: 0,
                 pending_q_calls: 0,
+                collect_calls: 0,
+                continue_calls: 0,
             },
         }
     }
@@ -2947,6 +2955,327 @@ fn joint_machine_live_discovery_preserves_linked_and_terminal_owners() {
         assert_eq!(discovery.calls, 0, "{state}");
         assert_eq!(discovery.consumer(), 0, "{state}");
     }
+}
+
+/// Service DD once through its existing owner seam (the Capture's
+/// bounded live-discovery service over the scripted drain), exactly
+/// the leaf the production Session IO forwards to. Returns the
+/// record count the owner consumed.
+fn service_dd_as_owner(fixture: &MachineScene, dd: &mut LiveMachineDiscovery) -> usize {
+    fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .capture
+        .service_live_discovery_until_with(
+            crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM,
+            Instant::now() + Duration::from_secs(10),
+            || {
+                anyhow::ensure!(!dd.fail_read, "owned fixture DISCOVERY read failed");
+                Ok(dd.drain.dequeue())
+            },
+        )
+        .expect("healthy DD service through the owner seam")
+}
+
+/// Linked dispatch services DD and EVENTS without repolling the
+/// original: the machine owns the EVENTS original (one begin per
+/// original, one reserved phase credit under tiny budgets), DD
+/// progresses through its existing owner seam between machine
+/// services, and neither service moves the other's cursor, mints a
+/// third cursor, or clears a sticky transport error.
+#[test]
+fn linked_joint_services_dd_without_repolling_original() {
+    let mut fixture = MachineScene::new(1);
+    assert!(
+        fixture.scene.producers.journal_linked(),
+        "the linked fixture pairs linked producers"
+    );
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 1);
+    let producers_before = fixture.scene.producers.clone();
+    let boundary = fixture.scene.drain.consumption_cut().unwrap();
+    // Fixed action/deadline budget: no actions or an expired
+    // deadline services nothing and collects nothing.
+    assert_eq!(
+        fixture.service(0).unwrap(),
+        crate::inventory_semantics::JointServiceProgress::Pending
+    );
+    assert_eq!(
+        fixture
+            .service_until(1024, Instant::now() - Duration::from_secs(1))
+            .unwrap(),
+        crate::inventory_semantics::JointServiceProgress::Pending
+    );
+    assert_eq!(fixture.native.collect_calls, 0);
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
+    assert!(boundary.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+    // One original-phase credit begins exactly one original.
+    fixture.service(1).unwrap();
+    assert_eq!(fixture.native.collect_calls, 1, "one begin per original");
+    let original = fixture.machine.retained_original_for_test().unwrap();
+    let after_begin = fixture.scene.drain.consumption_cut().unwrap();
+    // DD progresses through its owner seam without touching the
+    // EVENTS cursor, the retained original, or the collect count.
+    let mut dd = LiveMachineDiscovery::records(3);
+    assert_eq!(service_dd_as_owner(&fixture, &mut dd), 3);
+    assert_eq!(dd.remaining(), 0);
+    assert!(dd.consumer() > 0, "the DD cursor advanced");
+    assert_eq!(fixture.native.collect_calls, 1, "DD service never repolls");
+    assert!(fixture.machine.retained_original_for_test().unwrap() == original);
+    assert!(after_begin.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+    // The same original publishes under one-action services: still
+    // one begin, continuations only, and the producers (the only two
+    // cursors) are the same allocations throughout.
+    fixture.published();
+    assert_eq!(
+        fixture.native.collect_calls, 1,
+        "the whole original needed exactly one begin"
+    );
+    assert!(producers_before.same_producers(&fixture.scene.producers));
+    assert_eq!(
+        producers_before.events_id(),
+        fixture.scene.producers.events_id(),
+        "no third EVENTS cursor was minted"
+    );
+    assert!(
+        boundary
+            .events()
+            .same_allocation(fixture.scene.drain.consumption_cut().unwrap().events()),
+        "the EVENTS allocation never changed"
+    );
+    // Sticky error: a DD read fault at the owner seam latches the
+    // transport status; a later healthy DD service still refuses
+    // instead of silently clearing it.
+    let mut faulty = MachineScene::new(1);
+    let mut bad_dd = LiveMachineDiscovery::records(1);
+    bad_dd.fail_read = true;
+    let fault = faulty
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .capture
+        .service_live_discovery_until_with(
+            crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM,
+            Instant::now() + Duration::from_secs(10),
+            || {
+                anyhow::ensure!(!bad_dd.fail_read, "owned fixture DISCOVERY read failed");
+                Ok(bad_dd.drain.dequeue())
+            },
+        );
+    assert!(fault.is_err(), "the DD read fault refuses: {fault:?}");
+    bad_dd.fail_read = false;
+    let retry = faulty
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .capture
+        .service_live_discovery_until_with(
+            crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM,
+            Instant::now() + Duration::from_secs(10),
+            || Ok(bad_dd.drain.dequeue()),
+        );
+    assert!(
+        retry.is_err(),
+        "the latched transport error stays sticky: {retry:?}"
+    );
+}
+
+/// Unlinked twin of the linked DD dispatch proof: the fallback path
+/// is unchanged — the machine itself services DD inline (the
+/// unlinked-only repair), one begin serves the original, and the
+/// same budget and cursor rules hold.
+#[test]
+fn unlinked_joint_services_dd_without_repolling_original() {
+    let mut fixture = MachineScene::unlinked(1);
+    assert!(
+        !fixture.scene.producers.journal_linked(),
+        "the unlinked fixture pairs unlinked producers"
+    );
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 1);
+    let producers_before = fixture.scene.producers.clone();
+    fixture.live_discovery = Some(LiveMachineDiscovery::records(3));
+    let boundary = fixture.scene.drain.consumption_cut().unwrap();
+    assert_eq!(
+        fixture.service(0).unwrap(),
+        crate::inventory_semantics::JointServiceProgress::Pending
+    );
+    assert_eq!(
+        fixture
+            .service_until(1024, Instant::now() - Duration::from_secs(1))
+            .unwrap(),
+        crate::inventory_semantics::JointServiceProgress::Pending
+    );
+    assert_eq!(fixture.native.collect_calls, 0);
+    assert_eq!(fixture.live_discovery.as_ref().unwrap().calls, 0);
+    assert!(boundary.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
+    // One credit begins the original; DD waits for a second credit
+    // (the reserved original-phase action), then drains inline.
+    fixture.service(1).unwrap();
+    assert_eq!(fixture.native.collect_calls, 1, "one begin per original");
+    assert_eq!(fixture.live_discovery.as_ref().unwrap().calls, 0);
+    let original = fixture.machine.retained_original_for_test().unwrap();
+    let progress = fixture.service(1024).unwrap();
+    let dd = fixture.live_discovery.as_ref().unwrap();
+    assert!(dd.calls >= 1, "unlinked DD services inline");
+    assert_eq!(dd.remaining(), 0);
+    assert!(fixture.machine.retained_original_for_test().is_none_or(|held| held == original));
+    if progress != crate::inventory_semantics::JointServiceProgress::Published {
+        fixture.published();
+    }
+    assert_eq!(fixture.native.collect_calls, 1);
+    assert!(producers_before.same_producers(&fixture.scene.producers));
+    assert_eq!(
+        producers_before.events_id(),
+        fixture.scene.producers.events_id()
+    );
+}
+
+/// Drive a begun Finish one action at a time to its terminal
+/// outcome, attempting a running-mode service after the first poll:
+/// the attempt must refuse without collecting, and terminal cleanup
+/// must stay blocked while the Finish pends (pending detach).
+/// Returns (polls, published?) — the refusal case surfaces as Err.
+fn finish_beyond_one_poll(
+    fixture: &mut MachineScene,
+) -> Result<(usize, crate::discovery::engine::inventory_coordinator::BatchReceipt), SemanticRefusal>
+{
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    let mut polls = 0;
+    for _ in 0..512 {
+        polls += 1;
+        match fixture.poll_finish(1)? {
+            JointCommitProgress::Published(receipt) => return Ok((polls, receipt)),
+            JointCommitProgress::Pending => {
+                assert!(
+                    fixture.scene.real.lane.begin_owned_terminal_cleanup().is_err(),
+                    "detach stays pending while Finish owns the lane"
+                );
+                if polls == 1 {
+                    let collects = fixture.native.collect_calls;
+                    assert_eq!(
+                        fixture.service(1024),
+                        Err(SemanticRefusal::Unavailable),
+                        "running service never re-enters a begun Finish"
+                    );
+                    assert_eq!(
+                        fixture.native.collect_calls, collects,
+                        "the refused service collected nothing"
+                    );
+                }
+            }
+        }
+    }
+    panic!("Finish must terminate within its finite poll bound");
+}
+
+/// Finish, once begun, owns the lane: driven beyond one poll through
+/// quiet (no-new-H0) and read-loss windows it still terminates,
+/// running service never resumes during or after it, and a latched
+/// first refusal survives later polls, services, and a healthy
+/// classic status cycle.
+#[test]
+fn linked_finish_never_reenters_running_service() {
+    // Healthy multi-poll finish with no new H0 work after prime.
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    let (polls, _receipt) =
+        finish_beyond_one_poll(&mut fixture).expect("the healthy linked Finish publishes");
+    assert!(polls > 1, "Finish was driven beyond one poll ({polls})");
+    assert!(fixture.scene.real.lane.is_finished());
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "no running service resumes after Finish"
+    );
+    assert_eq!(
+        fixture.begin_finish(),
+        Err(SemanticRefusal::Unavailable),
+        "a finished lane never begins a second Finish"
+    );
+
+    // Read-loss window: a discarded record inside the finish still
+    // terminates the Finish (with an uncertified drain), and running
+    // service still cannot re-enter it.
+    let mut lossy = MachineScene::new(1);
+    lossy.enable_finish_fixture(Vec::new());
+    lossy.scene.drain.source_mut().push_discard();
+    lossy.begin_finish().unwrap();
+    let (lossy_polls, _receipt) =
+        finish_beyond_one_poll(&mut lossy).expect("the read-loss Finish still terminates");
+    assert!(lossy_polls > 1);
+    assert_eq!(
+        lossy.scene.real.lane.semantic_summary().final_drain,
+        Some(false),
+        "read loss forbids a lossless-drain claim"
+    );
+
+    // Latched first error: one injected refusal at a real Finish
+    // site latches the disposition; every later poll and service
+    // returns that same first reason, and a healthy classic DD
+    // status cycle in between clears nothing.
+    let mut latched = MachineScene::new(1);
+    latched.prime(1);
+    latched.enable_finish_fixture(Vec::new());
+    latched.begin_finish().unwrap();
+    latched
+        .machine
+        .inject_finish_site_for_test(crate::inventory_semantics::FinishSite::ValidateOwner);
+    let first = latched.poll_finish(1).unwrap_err();
+    assert_eq!(latched.machine.disposition_reason(), Some(first));
+    assert!(latched.machine.finish_disposition_required());
+    let mut dd = LiveMachineDiscovery::records(1);
+    assert_eq!(service_dd_as_owner(&latched, &mut dd), 1);
+    assert_eq!(
+        latched.machine.disposition_reason(),
+        Some(first),
+        "a healthy classic status cycle never clears the latched error"
+    );
+    assert_eq!(latched.poll_finish(1024), Err(first));
+    assert_eq!(latched.service(1024), Err(first));
+    assert_eq!(
+        latched.machine.disposition_reason(),
+        Some(first),
+        "the first refusal is kept, never replaced or cleared"
+    );
+}
+
+/// Unlinked twin: the fallback Finish path keeps the same
+/// no-re-entry and sticky-error rules with unlinked producers.
+#[test]
+fn unlinked_finish_never_reenters_running_service() {
+    let mut fixture = MachineScene::unlinked(1);
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    let (polls, _receipt) =
+        finish_beyond_one_poll(&mut fixture).expect("the healthy unlinked Finish publishes");
+    assert!(polls > 1, "Finish was driven beyond one poll ({polls})");
+    assert!(fixture.scene.real.lane.is_finished());
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "no running service resumes after Finish"
+    );
+
+    let mut latched = MachineScene::unlinked(1);
+    latched.scene.push(std::process::id(), 0, "C_SignInit", 1);
+    latched.published();
+    latched.enable_finish_fixture(Vec::new());
+    latched.begin_finish().unwrap();
+    latched
+        .machine
+        .inject_finish_site_for_test(crate::inventory_semantics::FinishSite::ValidateOwner);
+    let first = latched.poll_finish(1).unwrap_err();
+    assert_eq!(latched.machine.disposition_reason(), Some(first));
+    assert_eq!(latched.poll_finish(1024), Err(first));
+    assert_eq!(latched.service(1024), Err(first));
 }
 
 #[test]

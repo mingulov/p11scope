@@ -11685,12 +11685,47 @@ pub(crate) mod tests {
         let mut io = GrowthIo::new(pool);
         io.target_store = Some(objects);
         io.provider_owner = Some(&banks.keepalive.custody);
-        let publication = banks.directory.lock().unwrap().stage_with(
-            &mut io,
-            history,
-            toggle_reservation(),
-            &pool.reserver(),
-        );
+        // Size the staging envelope from the plan through the same
+        // production estimator growth staging uses, floored by the
+        // fixed reservation: small scenes keep their exact historical
+        // charges, while WIDE-scale scenes (past the old 4096-FD
+        // ceiling) stage instead of refusing `Budget`.
+        let publication = {
+            let mut directory = banks.directory.lock().unwrap();
+            let end = history.slots.len() as u32;
+            let new_banks = if end == 0 {
+                0
+            } else {
+                (0..geometry.banks as usize)
+                    .filter(|&bank| {
+                        directory.bank_ids.get(bank).copied().flatten().is_none()
+                            && bank <= ((end - 1) / geometry.cells) as usize
+                    })
+                    .count()
+            };
+            let estimated = super::estimate_counter_stage_reservation(
+                p11scope_ebpf_common::CounterMode::Counts,
+                geometry.banks,
+                geometry.cells,
+                &history.slots,
+                0,
+                end,
+                directory.positions.capacity(),
+                2,
+                new_banks,
+                0,
+                None,
+            )
+            .expect("toggle extent sizes");
+            let floor = toggle_reservation();
+            let reservation = BankReservation {
+                retained_bytes: floor.retained_bytes.max(estimated.retained_bytes),
+                transient_bytes: floor.transient_bytes.max(estimated.transient_bytes),
+                metadata_bytes: floor.metadata_bytes.max(estimated.metadata_bytes),
+                file_descriptors: floor.file_descriptors.max(estimated.file_descriptors),
+            };
+            directory.stage_with(&mut io, history, reservation, &pool.reserver())
+        };
         assert!(
             matches!(publication, BankPublication::Published { .. }),
             "toggle prefix stages: {publication:?}"

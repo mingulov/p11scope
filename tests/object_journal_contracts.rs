@@ -17,6 +17,13 @@ use p11scope_ebpf_common::object_wire::{
     OBJECT_LAYOUT_LP64, canonical_object_wire,
 };
 
+/// Shared by path with the BPF roots and other harnesses, which use the
+/// entry/routing helpers this file does not call; the allowance covers
+/// only that module.
+#[allow(dead_code)]
+#[path = "../crates/ebpf/src/journal_roots.rs"]
+mod root_writers;
+
 const THREAD: u64 = 0x1111_2222_3333_4444;
 const SEQUENCE: u64 = 0x5555_6666_7777_8888;
 
@@ -3411,5 +3418,320 @@ fn object_journal_producer_mutants_are_causal() {
             "{label}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+/// Header parity over the length x kind x u8-flags x identity union:
+/// the native `journal_header_valid` (executed by the dedicated
+/// fixture, which prints one verdict line per combination) accepts
+/// exactly the headers the Rust validators accept. Rust verdicts come
+/// from the real `decode_journal_record` dispatcher on mutated
+/// otherwise-valid records. The witness body is chosen per length, and
+/// for END per the tail-absent bit, so every header tuple gets a valid
+/// body and the verdict depends only on the header. The fixture
+/// additionally self-pins refusal of every wide (>u8) flag value; its
+/// exit status carries that pin because the wire flags byte is u8 and
+/// the Rust side has no counterpart. The native validator takes no
+/// version word (its writer always emits 1); version stays 1 and
+/// reserved stays 0 throughout.
+#[test]
+fn object_journal_header_parity_native_matches_rust_validators() {
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_END_TAIL_ABSENT, decode_journal_record, end_compact_eligible, pack_compact_end,
+    };
+    use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+    use std::process::Command;
+
+    let temporary = tempfile::tempdir().expect("parity fixture directory");
+    let binary = temporary.path().join("journal-header-parity");
+    let output = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/object-journal/journal_header_parity.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile parity fixture");
+    assert!(
+        output.status.success(),
+        "parity fixture compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new(&binary).output().expect("run parity fixture");
+    assert!(
+        output.status.success(),
+        "native wide-flags self-check: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let rows = publish_object_descriptors();
+    let begin_template = valid_begin();
+    let end_full_template = valid_end_full();
+    let mut end_absent_template = valid_end_full();
+    end_absent_template[5] = JOURNAL_END_TAIL_ABSENT;
+    end_absent_template[JOURNAL_COMMON_BYTES + 368..].fill(0);
+    let tracked_payload = valid_full_payload();
+    let mut absent_payload = tracked_payload;
+    absent_payload[368..].fill(0);
+    assert!(end_compact_eligible(&tracked_payload));
+    assert!(end_compact_eligible(&absent_payload));
+    let compact_tracked =
+        pack_compact_end(THREAD, SEQUENCE, 0, &tracked_payload).expect("pack tracked compact");
+    let compact_absent =
+        pack_compact_end(THREAD, SEQUENCE, JOURNAL_END_TAIL_ABSENT, &absent_payload)
+            .expect("pack absent compact");
+    let mut abandon_template = [0u8; JOURNAL_ABANDON_BYTES];
+    header(
+        &mut abandon_template,
+        JOURNAL_KIND_ABANDON,
+        JOURNAL_ABANDON_BYTES,
+        0,
+    );
+    put_u64(&mut abandon_template, 24, 0xAAAA_BBBB_CCCC_DDDD);
+    put_u64(&mut abandon_template, 32, 0x1010_1010_1010_1010);
+    put_u64(&mut abandon_template, 40, 0x2020_2020_2020_2020);
+    put_u32(&mut abandon_template, 48, 11);
+    put_u32(&mut abandon_template, 52, JOURNAL_REASON_EXEC_EXIT);
+    put_u64(&mut abandon_template, 56, 0x3030_3030_3030_3030);
+
+    // Every witness template validates before mutation; otherwise a
+    // broken template would read as a unanimous refusal below.
+    assert!(decode_journal_record(&begin_template, &rows).is_some());
+    assert!(decode_journal_record(&end_full_template, &rows).is_some());
+    assert!(decode_journal_record(&end_absent_template, &rows).is_some());
+    assert!(decode_journal_record(&compact_tracked, &rows).is_some());
+    assert!(decode_journal_record(&compact_absent, &rows).is_some());
+    assert!(decode_journal_record(&abandon_template, &rows).is_some());
+
+    let stdout = String::from_utf8(output.stdout).expect("fixture prints text");
+    let mut parsed = 0u64;
+    let mut accepts = 0u64;
+    let mut unjournaled_pins = 0u32;
+    let mut mismatches: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let fields: Vec<u64> = line
+            .split_whitespace()
+            .map(|field| field.parse().expect("fixture prints numbers"))
+            .collect();
+        assert_eq!(fields.len(), 6, "six verdict fields: {line}");
+        let length = fields[0] as usize;
+        let kind = fields[1] as u8;
+        let flags = fields[2] as u8;
+        let (thread, sequence, native) = (fields[3], fields[4], fields[5] != 0);
+        let mut bytes: Vec<u8> = match length {
+            JOURNAL_BEGIN_BYTES => begin_template.to_vec(),
+            JOURNAL_END_FULL_BYTES => {
+                if flags & JOURNAL_END_TAIL_ABSENT != 0 {
+                    end_absent_template.to_vec()
+                } else {
+                    end_full_template.to_vec()
+                }
+            }
+            JOURNAL_END_COMPACT_BYTES => {
+                if flags & JOURNAL_END_TAIL_ABSENT != 0 {
+                    compact_absent.to_vec()
+                } else {
+                    compact_tracked.to_vec()
+                }
+            }
+            JOURNAL_ABANDON_BYTES => abandon_template.to_vec(),
+            _ => vec![0u8; length],
+        };
+        if bytes.len() >= JOURNAL_COMMON_BYTES {
+            put_u16(&mut bytes, 0, JOURNAL_VERSION);
+            put_u16(&mut bytes, 2, length as u16);
+            bytes[4] = kind;
+            bytes[5] = flags;
+            put_u16(&mut bytes, 6, 0);
+            put_u64(&mut bytes, 8, thread);
+            put_u64(&mut bytes, 16, sequence);
+        }
+        let rust = decode_journal_record(&bytes, &rows).is_some();
+        parsed += 1;
+        accepts += u64::from(native && rust);
+        if (length == JOURNAL_END_FULL_BYTES || length == JOURNAL_END_COMPACT_BYTES)
+            && kind == JOURNAL_KIND_END
+            && (flags == 0x04 || flags == 0x06)
+            && thread == 0
+            && sequence == 0
+        {
+            assert!(
+                native && rust,
+                "END+UNJOURNALED+zero must validate on both sides (len={length} flags={flags:#04x})"
+            );
+            unjournaled_pins += 1;
+        }
+        if native != rust && mismatches.len() < 12 {
+            mismatches.push(format!(
+                "len={length} kind={kind} flags={flags:#04x} thread={thread} seq={sequence}: native={native} rust={rust}"
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "parity mismatches:\n{}",
+        mismatches.join("\n")
+    );
+    assert_eq!(parsed, 15 * 6 * 256 * 4, "every union combination ran");
+    // Accept-set census: BEGIN 2 (flags 0/1 x nonzero key) + END 8 (2
+    // lengths x (flags 0/2 x nonzero + flags 4/6 x zero)) + ABANDON 1.
+    assert_eq!(accepts, 11, "exact parity accept census");
+    assert_eq!(unjournaled_pins, 4, "both END lengths x flags 4/6 pinned");
+}
+
+/// Writer twin: the BPF END writer's flag conversion must refuse every
+/// unknown bit — including any bit at or above 0x100, which the old
+/// `as u8` cast truncated silently — before any header byte is
+/// written, and must emit byte-identical headers for the finite valid
+/// set. Refusal inputs leave the whole reservation untouched; every
+/// produced header is checked through the real END validator below.
+#[test]
+fn object_journal_end_writer_refuses_unknown_flags_without_writing() {
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_END_FULL_BYTES, JOURNAL_END_TAIL_ABSENT, JOURNAL_END_UNJOURNALED, JOURNAL_KIND_END,
+        JOURNAL_VERSION, JournalEndFull, validate_end,
+    };
+
+    let refused: &[u32] = &[
+        0x01,
+        0x03,
+        0x05,
+        0x07,
+        0x08,
+        0x09,
+        0x0e,
+        0x0f,
+        0x10,
+        0x20,
+        0x40,
+        0x80,
+        0xf0,
+        0xf2,
+        0xf4,
+        0xf6,
+        0xfe,
+        0xff,
+        0x100,
+        0x101,
+        0x102,
+        0x104,
+        0x106,
+        0x107,
+        0x1ff,
+        0x200,
+        0x8000,
+        0x1_0000,
+        0x8000_0000,
+        0xffff_ffff,
+    ];
+    for &flags in refused {
+        for absent in [false, true] {
+            for (thread, sequence) in [(0u64, 0u64), (THREAD, SEQUENCE)] {
+                let mut storage = std::mem::MaybeUninit::<JournalEndFull>::uninit();
+                unsafe {
+                    storage
+                        .as_mut_ptr()
+                        .cast::<u8>()
+                        .write_bytes(0xa5, JOURNAL_END_FULL_BYTES);
+                }
+                let words = root_writers::ReturnWords {
+                    thread,
+                    sequence,
+                    flags,
+                    pad: 0,
+                };
+                unsafe { root_writers::initialize_end(storage.as_mut_ptr(), &words, absent) };
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        storage.as_ptr().cast::<u8>(),
+                        JOURNAL_END_FULL_BYTES,
+                    )
+                };
+                assert!(
+                    bytes.iter().all(|byte| *byte == 0xa5),
+                    "flags {flags:#x} absent={absent} thread={thread} seq={sequence} must not write any byte"
+                );
+            }
+        }
+    }
+
+    // Positive twins: the finite valid set writes exact headers, and
+    // each produced header validates through the real END validator
+    // against its matching body. These exact bytes are the no-wire-change
+    // pin for currently-valid tracked records.
+    let descriptor = create_descriptor();
+    for (flags, thread, sequence) in [
+        (0u32, THREAD, SEQUENCE),
+        (u32::from(JOURNAL_END_TAIL_ABSENT), THREAD, SEQUENCE),
+        (u32::from(JOURNAL_END_UNJOURNALED), 0, 0),
+        (
+            u32::from(JOURNAL_END_TAIL_ABSENT | JOURNAL_END_UNJOURNALED),
+            0,
+            0,
+        ),
+    ] {
+        for absent in [false, true] {
+            let mut storage = std::mem::MaybeUninit::<JournalEndFull>::uninit();
+            unsafe {
+                storage
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .write_bytes(0xa5, JOURNAL_END_FULL_BYTES);
+            }
+            let words = root_writers::ReturnWords {
+                thread,
+                sequence,
+                flags,
+                pad: 0,
+            };
+            unsafe { root_writers::initialize_end(storage.as_mut_ptr(), &words, absent) };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), JOURNAL_END_FULL_BYTES)
+            };
+            let mut expected = [0u8; 24];
+            expected[..2].copy_from_slice(&JOURNAL_VERSION.to_ne_bytes());
+            expected[2..4].copy_from_slice(&(JOURNAL_END_FULL_BYTES as u16).to_ne_bytes());
+            expected[4] = JOURNAL_KIND_END;
+            expected[5] = flags as u8 | if absent { JOURNAL_END_TAIL_ABSENT } else { 0 };
+            expected[8..16].copy_from_slice(&thread.to_ne_bytes());
+            expected[16..24].copy_from_slice(&sequence.to_ne_bytes());
+            assert_eq!(
+                &bytes[..24],
+                &expected,
+                "exact header for flags {flags:#x} absent={absent}"
+            );
+            assert!(
+                bytes[24..392].iter().all(|byte| *byte == 0xa5),
+                "payload base untouched for flags {flags:#x} absent={absent}"
+            );
+            assert!(
+                bytes[392..]
+                    .iter()
+                    .all(|byte| *byte == if absent { 0 } else { 0xa5 }),
+                "tail zeroed iff absent for flags {flags:#x} absent={absent}"
+            );
+            let produced = expected[5];
+            let mut record = valid_end_full();
+            if produced & JOURNAL_END_TAIL_ABSENT != 0 {
+                record[JOURNAL_COMMON_BYTES + 368..].fill(0);
+            }
+            record[..24].copy_from_slice(&bytes[..24]);
+            let row = if produced & JOURNAL_END_TAIL_ABSENT != 0 {
+                None
+            } else {
+                Some(&descriptor)
+            };
+            assert!(
+                validate_end(&record, row).is_some(),
+                "writer header flags={flags:#x} absent={absent} validates"
+            );
+        }
     }
 }

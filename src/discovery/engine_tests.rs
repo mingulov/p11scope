@@ -8078,8 +8078,7 @@ impl DiscoveryLifecycleFixture {
             manifest_helper_cpu_ticks(helper_pid),
             std::fs::read_to_string("/proc/loadavg")
                 .unwrap_or_default()
-                .trim()
-                .to_string(),
+                .trim(),
             std::fs::read_to_string(log).unwrap_or_default()
         );
         let status = helper.child.wait().expect("reap the exact manifest helper");

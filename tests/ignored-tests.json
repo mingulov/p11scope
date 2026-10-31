@@ -649,12 +649,6 @@
       "cell": "privileged"
     },
     {
-      "file": "src/discovery/cgroup_native_owner_tests.rs",
-      "path": "discovery::engine::inventory_coordinator::cgroup_native_owner_tests::cgroup_native_owner_stable_retained_member_activates_after_final_permit",
-      "reason": "6.11 activation deferred per docs/superpowers/decisions/2026-10-29-611-bridge-decision.md; tracked RED cell, migration twin cgroup_native_owner_migration_during_provider_retention_refuses_activation stays running",
-      "cell": "performance"
-    },
-    {
       "file": "src/discovery/confirm_shards_tests.rs",
       "path": "discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_serial_production_probe",
       "reason": "root (map_files): proves real children's ranges",
@@ -1234,6 +1228,18 @@
       "file": "src/metrics/counter_reader.rs",
       "path": "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64",
       "reason": "requires authorized native Multi staging as root: run --counter-mode counts with an owned child to -o JSON",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: 6.15 profile --select-endpoint counts to -o JSON with live-plan resolution plus exact workload-ledger aggregate",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/metrics/counter_reader.rs",
+      "path": "metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64",
+      "reason": "requires prebuilt LP64 growth fixtures as root: 6.15 selection stage against the live plan refuses system scope by name",
       "cell": "privileged"
     },
     {

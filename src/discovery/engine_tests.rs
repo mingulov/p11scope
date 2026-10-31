@@ -12068,10 +12068,17 @@ fn loaded_tabled_provider() -> (TabledSeedProvider, ProcessView, PathBuf) {
 
 /// The setup tick for the exec-rearm routes: one ordinary batch that must
 /// leave every requested view scanned and armed before the test body runs.
+/// Setup is not a pacing test: the production tick quantum may
+/// legitimately defer a later view's scan to the next tick (disclosed,
+/// refresh retained), which would make the routes' armed-loader
+/// precondition wall-clock dependent on a loaded host. Pin the
+/// unreachable extreme, matching the dedicated quantum tests' use of
+/// extremes; pacing itself stays covered there.
 fn apply_unpaced_setup_tick(
     engine: &mut Engine,
     session: &mut ScriptedSession,
 ) -> Result<DiscoveryBatchOutcome> {
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     apply_ordinary_batch(engine, session, Vec::new())
 }
 

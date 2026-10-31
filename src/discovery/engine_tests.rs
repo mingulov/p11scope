@@ -12066,6 +12066,15 @@ fn loaded_tabled_provider() -> (TabledSeedProvider, ProcessView, PathBuf) {
     (fixture, view, library)
 }
 
+/// The setup tick for the exec-rearm routes: one ordinary batch that must
+/// leave every requested view scanned and armed before the test body runs.
+fn apply_unpaced_setup_tick(
+    engine: &mut Engine,
+    session: &mut ScriptedSession,
+) -> Result<DiscoveryBatchOutcome> {
+    apply_ordinary_batch(engine, session, Vec::new())
+}
+
 /// H6 slice 1 route: a PID capture whose static plan, loader and exports all
 /// come from the real inventory tick over a live tabled-provider child — no
 /// hand-built modules, so the post-exec rescan re-accepts the same facts.
@@ -12080,7 +12089,7 @@ fn exec_rearm_pid_route() -> (TabledSeedProvider, Engine, ScriptedSession) {
     let mut session = ScriptedSession::default();
     session.dynamic_attach_reports_added = true;
     assert!(engine.request_refresh(pid, crate::attach::monotonic_ns()));
-    let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+    let outcome = apply_unpaced_setup_tick(&mut engine, &mut session)
         .expect("the initial inventory tick applies");
     assert!(
         outcome.required_complete,
@@ -12146,7 +12155,7 @@ fn exec_rearm_global_twin_route(
     session.dynamic_attach_reports_added = true;
     assert!(engine.request_refresh(pid0, crate::attach::monotonic_ns()));
     assert!(engine.request_refresh(pid1, crate::attach::monotonic_ns()));
-    let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+    let outcome = apply_unpaced_setup_tick(&mut engine, &mut session)
         .expect("the initial cgroup tick applies");
     assert!(
         outcome.required_complete,
@@ -12168,6 +12177,57 @@ fn exec_rearm_global_twin_route(
         "the initial tick arms the sibling provider loader"
     );
     (fixture, engine, session, scope_dir)
+}
+
+/// The setup tick must arm both twin loaders even when the scheduler's
+/// preset quantum is already expired: route setup is not a pacing test,
+/// and its armed-loader precondition must not depend on how much wall
+/// time the first scan happens to take on a loaded host. Extremes only —
+/// the preset is either already expired or, once the setup tick runs,
+/// unreachable — so this never reads a wall clock for its verdict.
+#[test]
+fn twin_route_setup_tick_arms_both_loaders_past_an_expired_quantum() {
+    let (mut fixture, view, library0) = loaded_tabled_provider();
+    let pid0 = view.pid();
+    let (pid1, library1) = fixture.spawn_peer("tabled-sibling");
+    let peer_view = ProcessView::open(ProcessViewId(1), pid1).unwrap();
+    let (cgroup_engine, _scope_dir) = engine_over_cgroup_naming(&[pid0, pid1]);
+    let mut engine = Engine::empty();
+    engine.scope = cgroup_engine.scope;
+    engine.next_view_id = 2;
+    engine.module_hints = vec![library0, library1];
+    engine.views.push(view);
+    engine.views.push(peer_view);
+    engine.seed_initial_cgroup_views();
+    let mut session = ScriptedSession::default();
+    session.dynamic_attach_reports_added = true;
+    engine.scheduler.set_tick_quantum_ns_for_test(0);
+    assert!(engine.request_refresh(pid0, crate::attach::monotonic_ns()));
+    assert!(engine.request_refresh(pid1, crate::attach::monotonic_ns()));
+    let outcome =
+        apply_unpaced_setup_tick(&mut engine, &mut session).expect("the setup tick applies");
+    assert_eq!(
+        engine.loader_registry.ids_for_view(ProcessViewId(0)).len(),
+        1,
+        "the setup tick arms the first provider loader past the expired preset: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(ProcessViewId(1)).len(),
+        1,
+        "the setup tick arms the sibling provider loader past the expired preset: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        outcome.required_complete,
+        "the setup tick must complete: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "both setup refreshes are served: {:?}",
+        engine.refresh_requested
+    );
 }
 
 #[test]

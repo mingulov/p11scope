@@ -396,6 +396,36 @@ impl PromotionDriver {
         }
     }
 
+    /// Settle this flight's own parked custody on a terminal status,
+    /// distinguishing never-bound abandonment from bound-window
+    /// completion: a never-bound reservation abandons (its charge and
+    /// bracket storage release, exactly as before); a parked bound
+    /// window transfers to the pending-close context WITH its
+    /// original request and bracket collector, so the host's close
+    /// records the terminal result. Anything else belongs to another
+    /// flight and is left alone. Reports whether a never-bound
+    /// reservation was abandoned (the cancelled-before-delivery row
+    /// still owes only to that case — a transferred window records
+    /// its own close).
+    fn settle_terminal(&mut self, id: RequestId) -> bool {
+        if self.reserved_for != Some(id) {
+            return false;
+        }
+        self.reserved_for = None;
+        if let Some(reserved) = self.custody.take_reserved() {
+            let _ = reserved.abandon();
+            self.brackets = None;
+            return true;
+        }
+        if let Some(bound) = self.custody.take_bound() {
+            let window = match bound {
+                BoundWindow::Active(window) | BoundWindow::Unactivated(window) => window,
+            };
+            self.open_window = Some(window);
+        }
+        false
+    }
+
     /// Poll once (driver tick): reap service events, abandon orphan
     /// reservations with their ledger rows, take custody on install
     /// (Active installs; anything else reclaims for genuine
@@ -403,13 +433,17 @@ impl PromotionDriver {
     pub(crate) fn poll(&mut self, out: &mut dyn std::io::Write) -> Option<DriverEvent> {
         match self.lifecycle.poll(out)? {
             LifecycleEvent::Status(update) => {
-                // The flight ended without delivery: abandon the
-                // orphan reservation when it is this flight's own
-                // (its charge and bracket storage release, custody
-                // drains). A cancel/stop end records the adapter's
-                // cancelled_unactivated row; failures record only the
-                // outcome (nothing was cancelled).
-                let orphaned = self.abandon_mine(update.request);
+                // The flight ended: settle this flight's own parked
+                // custody. A never-bound reservation abandons (its
+                // charge and bracket storage release, custody drains);
+                // a parked bound window transfers to the pending-close
+                // context with its original request and brackets. A
+                // cancel/stop end records the adapter's
+                // cancelled_unactivated row only for the never-bound
+                // case; failures record only the outcome (nothing was
+                // cancelled); a transferred window records its own
+                // close.
+                let orphaned = self.settle_terminal(update.request);
                 if orphaned
                     && matches!(update.outcome, PromotionOutcome::Ended { .. })
                     && let Some(current) = self.current.as_ref()
@@ -424,6 +458,12 @@ impl PromotionDriver {
                             Some("cancelled before delivery"),
                         ));
                 }
+                // A pending close keeps its context: the host closes
+                // the open window next, and close needs the original
+                // request plus the bracket collector. Single-flight:
+                // an open window can only be this flight's own (a new
+                // flight cannot reserve while admission is held).
+                let pending_close = self.open_window.is_some();
                 match update.outcome {
                     PromotionOutcome::Refused { reason } => {
                         self.ledger.record_event(promotion_outcome_row(
@@ -432,7 +472,9 @@ impl PromotionDriver {
                             Some(reason.label()),
                             None,
                         ));
-                        self.current = None;
+                        if !pending_close {
+                            self.current = None;
+                        }
                     }
                     PromotionOutcome::Ended { reason } => {
                         self.ledger.record_event(promotion_outcome_row(
@@ -441,7 +483,9 @@ impl PromotionDriver {
                             Some(reason.label()),
                             None,
                         ));
-                        self.current = None;
+                        if !pending_close {
+                            self.current = None;
+                        }
                     }
                     // The service emits terminal statuses only; anything
                     // else passes to the host without a row or state
@@ -2725,6 +2769,9 @@ mod tests {
             .close(&broad, &scene.plan, CounterMode::Counts, Ok(after_b1))
             .expect("transferred window closes");
         assert_eq!((report.seq_before, report.seq_after), (1, 2));
+        // The close report is caller-owned: its after-receipt lease
+        // releases with it, before the charge accounting below.
+        drop(report);
         assert!(
             !driver.pending_close(),
             "the close consumes the pending context"
@@ -2890,6 +2937,9 @@ mod tests {
             .close(&broad, &scene.plan, CounterMode::Counts, Ok(after_b2))
             .expect("open window closes after its terminal status");
         assert_eq!((report.seq_before, report.seq_after), (1, 2));
+        // The close report is caller-owned: its after-receipt lease
+        // releases with it, before the charge accounting below.
+        drop(report);
         assert!(
             !driver.pending_close(),
             "the close consumes the pending context"

@@ -3063,4 +3063,67 @@ mod tests {
         assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
         assert_eq!(state.analyses_run_for_test(), 2, "unknown is never cached");
     }
+
+    fn exec_record(pid: u32, kind: u8, binding_id: u64) -> DiscoveryRecord {
+        let mut pointers = [0u64; p11scope_ebpf_common::DISCOVERY_POINTERS];
+        pointers[0] = 0xD0;
+        pointers[1] = 0xE1;
+        DiscoveryRecord {
+            hook_ts_ns: 900,
+            pid_tgid: (u64::from(pid) << 32) | u64::from(pid),
+            table_ptr: 0,
+            interface_flags: 0,
+            pointers,
+            kind,
+            case_id: 0,
+            interface_index: 0,
+            name_class: 0,
+            status_flags: 0,
+            usable_n: 0,
+            pointers_attempted: 0,
+            completed_prefix: 0,
+            version_major: 0,
+            version_minor: 0,
+            selection_version_class: 0,
+            reserved_zero: [0],
+            symbol_id: 0,
+            announced_count: 0,
+            reserved_tail_zero: [0; 4],
+            send_signal_rc: 0,
+            return_rv: 0,
+            request_flags: 0,
+            binding_id,
+        }
+    }
+
+    #[test]
+    fn exec_stash_seeds_only_on_bounded_ticket() {
+        use p11scope_ebpf_common::{DISCOVERY_KIND_EXEC, IMAGE_IDENTITY_TICKET_LIMIT};
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        // An over-limit ticket must not seed the stash.
+        state.note_exec_record(&exec_record(
+            4242,
+            DISCOVERY_KIND_EXEC,
+            IMAGE_IDENTITY_TICKET_LIMIT + 1,
+        ));
+        assert!(state.stash.is_empty(), "over-limit ticket must not seed");
+        // Zero still seeds nothing (existing rule preserved).
+        state.note_exec_record(&exec_record(4243, DISCOVERY_KIND_EXEC, 0));
+        assert!(state.stash.is_empty(), "zero ticket must not seed");
+        // A non-EXEC kind never seeds, even with a nonzero word.
+        state.note_exec_record(&exec_record(4244, DISCOVERY_KIND_EXEC + 1, 7));
+        assert!(state.stash.is_empty(), "non-EXEC record must not seed");
+        // The boundary ticket seeds with the record's exe words.
+        state.note_exec_record(&exec_record(
+            4245,
+            DISCOVERY_KIND_EXEC,
+            IMAGE_IDENTITY_TICKET_LIMIT,
+        ));
+        let stashed = state.stash.get(&4245).expect("boundary ticket seeds");
+        assert_eq!(
+            (stashed.dev, stashed.ino, stashed.exec_ts_ns),
+            (0xD0, 0xE1, 900)
+        );
+    }
 }

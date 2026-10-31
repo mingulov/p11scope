@@ -36,6 +36,48 @@ pub fn compile_owner_fixture(directory: &Path, name: &str, small: bool) -> PathB
     binary
 }
 
+/// Compile the native owner fixture as a bridge shared library.
+///
+/// Same sources and warning discipline as the fixture binaries, plus
+/// position-independent shared linkage and the `P11SCOPE_BRIDGE_LIB`
+/// inspection exports. Lets one host test drive the real native
+/// START allocation, side query and removal in-process with the real
+/// shared Rust adapters on the same owned row. Used by the owner
+/// suite's connected KEM test; allowed dead for suites that share
+/// this file without the bridge.
+#[allow(dead_code)]
+pub fn compile_owner_bridge(directory: &Path, name: &str, small: bool) -> PathBuf {
+    let library = directory.join(name);
+    let mut compiler = Command::new("clang-18");
+    compiler
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-fPIC",
+            "-shared",
+            "-DP11SCOPE_BRIDGE_LIB",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/task-owner/helper_tests.c",
+            "-o",
+        ])
+        .arg(&library);
+    if small {
+        compiler.arg("-DP11SCOPE_SMALL_STATE_MAPS");
+    }
+    let output = compiler.output().expect("execute clang-18");
+    assert!(
+        output.status.success(),
+        "native owner bridge compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    library
+}
+
 pub fn run_fixture_subcommand(binary: &Path, subcommand: &str, marker: &str) {
     let output = Command::new(binary)
         .arg(subcommand)

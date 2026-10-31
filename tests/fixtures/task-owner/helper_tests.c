@@ -3470,6 +3470,46 @@ static void journal_custody_never_reused(void)
     assert(owners[0].journal_thread == 7 && owners[0].journal_sequence == 3);
     assert(!ctl.poison && !ctl.outstanding);
 }
+#if !defined(P11SCOPE_INVENTORY_ONLY) && defined(P11SCOPE_BRIDGE_LIB)
+/* Connected KEM ENTRY-to-emission bridge (host integration test only):
+ * export the fixture's own reset/setup plus read-only state
+ * inspection, so one host test drives the REAL native START
+ * allocation, side query and removal in-process with the REAL shared
+ * Rust KEM adapters on the same owned row. Only compiled for the
+ * bridge shared library; ordinary fixture binaries and the
+ * root-affiliation TU never see these symbols. The bridge exposes no
+ * phase (or any row) write: phase is asserted, never repaired,
+ * between the production adapters. */
+void p11scope_kem_bridge_reset(void)
+{
+    reset();
+    object_setup();
+    kem_install_descriptor_rows();
+}
+u64 p11scope_kem_bridge_pid(void) { return pid_tgid(); }
+u32 p11scope_kem_bridge_phase(const void *side)
+{
+    return side ? ((const struct object_start *)side)->phase : 0;
+}
+u64 p11scope_kem_bridge_outstanding(void) { return ctl.outstanding; }
+u64 p11scope_kem_bridge_poison(void) { return ctl.poison; }
+int p11scope_kem_bridge_start_present(const struct owner_start_key *key)
+{
+    return row(&START, key) != NULL;
+}
+int p11scope_kem_bridge_side_present(const struct owner_start_key *key)
+{
+    return row(&OBJECT_START, key) != NULL;
+}
+int p11scope_kem_bridge_idle(void) { return idle(0); }
+u64 p11scope_kem_bridge_object_start_size(void) { return sizeof(struct object_start); }
+u64 p11scope_kem_bridge_phase_offset(void)
+{
+    return __builtin_offsetof(struct object_start, phase);
+}
+u64 p11scope_kem_bridge_key_size(void) { return sizeof(struct owner_start_key); }
+u64 p11scope_kem_bridge_seed_size(void) { return sizeof(struct call_start_seed); }
+#endif
 int main(int argc, char **argv)
 {
     if (argc == 2) {

@@ -1062,6 +1062,494 @@ fn object_kem_owned_pointer_and_guard_clearing_matrix() {
     );
 }
 
+// ENTRY-to-emission through the real native transaction: actual native
+// START/side allocation, the actual shared KEM entry adapter on that
+// owned row, the real required=1 side query, the shared return fill,
+// the real tail emission boundary, and the real native retire. No
+// hand-built row, no substitute predicate, no quiet drain: the bridge
+// exposes native setup plus read-only inspection only, so phase is
+// asserted, never repaired, between the production adapters. Covers
+// healthy calls, finite no-read refusals, and loud-failure cleanup.
+#[test]
+fn object_kem_native_entry_to_emission_connected() {
+    use p11scope_ebpf_common::LinuxLayout;
+    use p11scope_ebpf_common::object_capture::handle_status as hst;
+    use p11scope_ebpf_common::object_flow::{
+        adapter_fill_return, adapter_kem_entry, adapter_tail_fill,
+    };
+    use p11scope_ebpf_common::object_wire::{ObjectCallWire, ObjectStart, canonical_object_wire};
+    use std::ffi::{CString, c_int, c_long, c_void};
+    use std::mem::{offset_of, size_of};
+
+    // Native key/seed layouts (task_owner.h static asserts pin the C
+    // side; the bridge-reported sizes pin the match at runtime).
+    #[repr(C)]
+    struct OwnerStartKey {
+        pid_tgid: u64,
+        slot: u32,
+        pad: u32,
+    }
+    #[repr(C)]
+    struct CallStartSeed {
+        ts_ns: u64,
+        task_cookie: u64,
+        exec_id: u64,
+        object_required: u64,
+    }
+    assert_eq!(size_of::<OwnerStartKey>(), 16);
+    assert_eq!(size_of::<CallStartSeed>(), 32);
+    assert_eq!(size_of::<ObjectStart>(), 432);
+    assert_eq!(offset_of!(ObjectStart, phase), 31);
+
+    unsafe fn lookup(handle: *mut c_void, name: &str) -> *mut c_void {
+        let symbol = CString::new(name).unwrap();
+        let found = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
+        assert!(!found.is_null(), "bridge dlsym {name}");
+        found
+    }
+
+    #[derive(Clone, Copy)]
+    struct Leg {
+        encapsulate: bool,
+        layout: LinuxLayout,
+        template: Option<u64>,
+        count: Option<u64>,
+        arg6: Option<u64>,
+        stack_cell: Result<u64, ()>,
+        stack_pointer: u64,
+        kem_wired: bool,
+        output_non_null: bool,
+        loud: bool,
+        row_function: u32,
+        retained: u64,
+        return_reads: u32,
+        return_status: u8,
+    }
+    // Healthy FULL calls, finite no-read refusals (P0, query shape,
+    // template/length overlap, unreadable cell, invalid span), and
+    // loud failures (wrapping arg-7 address, row/descriptor
+    // mismatch) that keep ENTRY for the caller's loud cleanup.
+    const LEGS: [Leg; 12] = [
+        Leg {
+            encapsulate: true,
+            layout: LinuxLayout::Lp64,
+            template: Some(0x5000),
+            count: Some(2),
+            arg6: Some(0x6000),
+            stack_cell: Ok(0x7000),
+            stack_pointer: 0x1000,
+            kem_wired: true,
+            output_non_null: true,
+            loud: false,
+            row_function: 92,
+            retained: 0x7000,
+            return_reads: 1,
+            return_status: hst::VALUE,
+        },
+        Leg {
+            encapsulate: true,
+            layout: LinuxLayout::Ilp32,
+            template: Some(0x5000),
+            count: Some(2),
+            arg6: Some(0x6000),
+            stack_cell: Ok(0x7000),
+            stack_pointer: 0x1000,
+            kem_wired: true,
+            output_non_null: true,
+            loud: false,
+            row_function: 92,
+            retained: 0x7000,
+            return_reads: 1,
+            return_status: hst::VALUE,
+        },
+        Leg {
+            encapsulate: false,
+            layout: LinuxLayout::Lp64,
+            template: Some(0x5000),
+            count: Some(2),
+            arg6: Some(9),
+            stack_cell: Ok(0x7000),
+            stack_pointer: 0x1000,
+            kem_wired: true,
+            output_non_null: true,
+            loud: false,
+            row_function: 93,
+            retained: 0x7000,
+            return_reads: 1,
+            return_status: hst::VALUE,
+        },
+        Leg {
+            encapsulate: false,
+            layout: LinuxLayout::Ilp32,
+            template: Some(0x5000),
+            count: Some(2),
+            arg6: Some(9),
+            stack_cell: Ok(0x7000),
+            stack_pointer: 0x1000,
+            kem_wired: true,
+            output_non_null: true,
+            loud: false,
+            row_function: 93,
+            retained: 0x7000,
+            return_reads: 1,
+            return_status: hst::VALUE,
+        },
+        Leg {
+            encapsulate: true,
+            layout: LinuxLayout::Lp64,
+            template: Some(0x5000),
+            count: Some(2),
+            arg6: Some(0x6000),
+            stack_cell: Ok(0x7000),
+            stack_pointer: 0x1000,
+            kem_wired: false,
+            output_non_null: true,
+            loud: false,
+            row_function: 92,
+            retained: 0,
+            return_reads: 0,
+            return_status: hst::UNREADABLE,
+        },
+        Leg {
+            encapsulate: true,
+            layout: LinuxLayout::Lp64,
+            template: Some(0x5000),
+            count: Some(2),
+            arg6: Some(0x6000),
+            stack_cell: Ok(0x7000),
+            stack_pointer: 0x1000,
+            kem_wired: true,
+            output_non_null: false,
+            loud: false,
+            row_function: 92,
+            retained: 0,
+            return_reads: 0,
+            return_status: hst::UNREADABLE,
+        },
+        Leg {
+            encapsulate: true,
+            layout: LinuxLayout::Lp64,
+            template: Some(0x6FF0),
+            count: Some(2),
+            arg6: Some(0x6000),
+            stack_cell: Ok(0x7000),
+            stack_pointer: 0x1000,
+            kem_wired: true,
+            output_non_null: true,
+            loud: false,
+            row_function: 92,
+            retained: 0,
+            return_reads: 0,
+            return_status: hst::UNREADABLE,
+        },
+        Leg {
+            encapsulate: true,
+            layout: LinuxLayout::Lp64,
+            template: Some(0x5000),
+            count: Some(2),
+            arg6: Some(0x7004),
+            stack_cell: Ok(0x7000),
+            stack_pointer: 0x1000,
+            kem_wired: true,
+            output_non_null: true,
+            loud: false,
+            row_function: 92,
+            retained: 0,
+            return_reads: 0,
+            return_status: hst::UNREADABLE,
+        },
+        Leg {
+            encapsulate: false,
+            layout: LinuxLayout::Lp64,
+            template: Some(0x5000),
+            count: Some(2),
+            arg6: Some(9),
+            stack_cell: Err(()),
+            stack_pointer: 0x1000,
+            kem_wired: true,
+            output_non_null: true,
+            loud: false,
+            row_function: 93,
+            retained: 0,
+            return_reads: 0,
+            return_status: hst::UNREADABLE,
+        },
+        Leg {
+            encapsulate: true,
+            layout: LinuxLayout::Lp64,
+            template: Some(0x5000),
+            count: Some(2),
+            arg6: Some(0x6000),
+            stack_cell: Ok(u64::MAX),
+            stack_pointer: 0x1000,
+            kem_wired: true,
+            output_non_null: true,
+            loud: false,
+            row_function: 92,
+            retained: u64::MAX,
+            return_reads: 0,
+            return_status: hst::INVALID_SPAN,
+        },
+        Leg {
+            encapsulate: true,
+            layout: LinuxLayout::Lp64,
+            template: Some(0x5000),
+            count: Some(2),
+            arg6: Some(0x6000),
+            stack_cell: Ok(0x7000),
+            stack_pointer: u64::MAX - 15,
+            kem_wired: true,
+            output_non_null: true,
+            loud: true,
+            row_function: 92,
+            retained: 0,
+            return_reads: 0,
+            return_status: hst::UNREADABLE,
+        },
+        Leg {
+            encapsulate: true,
+            layout: LinuxLayout::Lp64,
+            template: Some(0x5000),
+            count: Some(2),
+            arg6: Some(0x6000),
+            stack_cell: Ok(0x7000),
+            stack_pointer: 0x1000,
+            kem_wired: true,
+            output_non_null: true,
+            loud: true,
+            row_function: 93,
+            retained: 0,
+            return_reads: 0,
+            return_status: hst::UNREADABLE,
+        },
+    ];
+
+    for small in [false, true] {
+        let directory = tempfile::tempdir().expect("native KEM bridge directory");
+        let library = owner_fixture::compile_owner_bridge(directory.path(), "kem-bridge.so", small);
+        let path = CString::new(library.to_str().unwrap()).unwrap();
+        let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        assert!(!handle.is_null(), "dlopen {}", library.display());
+        // SAFETY: signatures match task_owner.h and the bridge exports.
+        let bridge_reset: unsafe extern "C" fn() =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_reset")) };
+        let bridge_pid: unsafe extern "C" fn() -> u64 =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_pid")) };
+        let bridge_phase: unsafe extern "C" fn(*const c_void) -> u32 =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_phase")) };
+        let bridge_outstanding: unsafe extern "C" fn() -> u64 =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_outstanding")) };
+        let bridge_poison: unsafe extern "C" fn() -> u64 =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_poison")) };
+        let bridge_start_present: unsafe extern "C" fn(*const OwnerStartKey) -> c_int =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_start_present")) };
+        let bridge_side_present: unsafe extern "C" fn(*const OwnerStartKey) -> c_int =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_side_present")) };
+        let bridge_idle: unsafe extern "C" fn() -> c_int =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_idle")) };
+        let bridge_object_start_size: unsafe extern "C" fn() -> u64 =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_object_start_size")) };
+        let bridge_phase_offset: unsafe extern "C" fn() -> u64 =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_phase_offset")) };
+        let bridge_key_size: unsafe extern "C" fn() -> u64 =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_key_size")) };
+        let bridge_seed_size: unsafe extern "C" fn() -> u64 =
+            unsafe { std::mem::transmute(lookup(handle, "p11scope_kem_bridge_seed_size")) };
+        let owner_start_begin: unsafe extern "C" fn(
+            *const OwnerStartKey,
+            *const CallStartSeed,
+        ) -> *mut c_void = unsafe { std::mem::transmute(lookup(handle, "p11_owner_start_begin")) };
+        let object_side_get: unsafe extern "C" fn(*const OwnerStartKey, u32, u32) -> *mut c_void =
+            unsafe { std::mem::transmute(lookup(handle, "p11_object_side_get")) };
+        let owner_start_remove: unsafe extern "C" fn(*const OwnerStartKey, u32) -> c_long =
+            unsafe { std::mem::transmute(lookup(handle, "p11_owner_start_remove")) };
+        // The shared row/key/seed layouts match on both sides of the
+        // bridge before any owned row is touched.
+        assert_eq!(unsafe { bridge_object_start_size() }, 432);
+        assert_eq!(unsafe { bridge_phase_offset() }, 31);
+        assert_eq!(unsafe { bridge_key_size() }, 16);
+        assert_eq!(unsafe { bridge_seed_size() }, 32);
+
+        for (variant, leg) in LEGS.iter().enumerate() {
+            let tag = format!("small={small} variant={variant}");
+            let descriptor = if leg.encapsulate { 93u32 } else { 94u32 };
+            let action = if leg.encapsulate { 13u8 } else { 14u8 };
+            let row = canonical_object_wire(leg.row_function);
+            unsafe { bridge_reset() };
+            let key = OwnerStartKey {
+                pid_tgid: unsafe { bridge_pid() },
+                slot: 7,
+                pad: 0,
+            };
+            let seed = CallStartSeed {
+                ts_ns: 0x1357_9BDF_0246_8ACE,
+                task_cookie: 0x1234_5678_9ABC_DEF0,
+                exec_id: 0x2468_ACE0_1357_9BDF,
+                object_required: u64::from(descriptor + 1),
+            };
+            // Real native START plus subordinate side allocation.
+            let start = unsafe { owner_start_begin(&key, &seed) };
+            assert!(!start.is_null(), "{tag}: native START alloc");
+            let side = unsafe { object_side_get(&key, descriptor, 0) };
+            assert!(!side.is_null(), "{tag}: native side row");
+            assert_eq!(side as usize % 8, 0, "{tag}: row alignment");
+            assert_eq!(unsafe { bridge_phase(side) }, 1, "{tag}: ENTRY phase");
+            // The real required gate refuses ENTRY before the adapter runs.
+            assert!(
+                unsafe { object_side_get(&key, descriptor, 1) }.is_null(),
+                "{tag}: required refuses ENTRY"
+            );
+            // Native binding intact before the adapter touches the row.
+            let probe = unsafe { &*(side as *const ObjectStart) };
+            assert_eq!(probe.descriptor_index, descriptor, "{tag}: binding index");
+            assert_eq!(probe.action, action, "{tag}: binding action");
+            assert_eq!(
+                probe.image.task_cookie, seed.task_cookie,
+                "{tag}: image cookie"
+            );
+            assert_eq!(probe.image.exec_id, seed.exec_id, "{tag}: image exec");
+            assert_eq!(probe.entry_ns, seed.ts_ns, "{tag}: entry time");
+            assert_eq!(probe.result_ptrs, [0, 0], "{tag}: no result yet");
+
+            let table: [(u8, Option<u64>); 7] = [
+                (2, Some(0x1111)),
+                (3, leg.template),
+                (4, leg.count),
+                (5, Some(0x8000)),
+                (6, leg.arg6),
+                (7, None),
+                (0, None),
+            ];
+            let mut entry_reads = Vec::new();
+            let entry_ok = adapter_kem_entry(
+                unsafe { Some(&mut *(side as *mut ObjectStart)) },
+                descriptor,
+                Some(&row),
+                leg.layout,
+                leg.stack_pointer,
+                leg.kem_wired,
+                leg.output_non_null,
+                false,
+                &mut |index| {
+                    table
+                        .iter()
+                        .find_map(|slot| (slot.0 == index).then_some(slot.1).flatten())
+                },
+                |address| {
+                    entry_reads.push(address);
+                    leg.stack_cell
+                },
+            );
+            if leg.loud {
+                assert!(!entry_ok, "{tag}: loud entry refuses");
+                assert!(entry_reads.is_empty(), "{tag}: loud entry reads nothing");
+                // ENTRY kept for the caller's loud cleanup; the
+                // required gate still refuses.
+                assert_eq!(unsafe { bridge_phase(side) }, 1, "{tag}: ENTRY kept");
+                assert!(
+                    unsafe { object_side_get(&key, descriptor, 1) }.is_null(),
+                    "{tag}: required still refuses"
+                );
+            } else {
+                assert!(entry_ok, "{tag}: entry acquires");
+                // Query shapes keep the input only and return before
+                // the arg-7 read; P0 refuses before any acquisition.
+                let query_only = leg.encapsulate && !leg.output_non_null;
+                if leg.kem_wired && !query_only {
+                    let arg7 = if leg.layout == LinuxLayout::Lp64 {
+                        0x1010
+                    } else {
+                        0x1020
+                    };
+                    assert_eq!(entry_reads, vec![arg7], "{tag}: exactly the cell read");
+                } else {
+                    assert!(entry_reads.is_empty(), "{tag}: entry reads nothing");
+                }
+                // The real shared adapter advanced ENTRY to READY; the
+                // harness only asserts phase, never writes it.
+                assert_eq!(unsafe { bridge_phase(side) }, 2, "{tag}: READY phase");
+                let required = unsafe { object_side_get(&key, descriptor, 1) };
+                assert!(
+                    !required.is_null() && required == side,
+                    "{tag}: required admits READY"
+                );
+                let probe = unsafe { &*(side as *const ObjectStart) };
+                assert_eq!(
+                    probe.result_ptrs,
+                    [leg.retained, 0],
+                    "{tag}: retained result"
+                );
+                let mut fill_reads = 0u32;
+                let fill_ok = adapter_fill_return(
+                    unsafe { Some(&mut *(side as *mut ObjectStart)) },
+                    descriptor,
+                    Some(&row),
+                    0,
+                    leg.layout,
+                    0,
+                    0,
+                    true,
+                    |address| {
+                        fill_reads += 1;
+                        assert_eq!(address, 0x7000, "{tag}: fill reads the cell");
+                        Ok(0x777)
+                    },
+                );
+                assert!(fill_ok, "{tag}: return fill");
+                assert_eq!(fill_reads, leg.return_reads, "{tag}: return reads");
+                assert_eq!(unsafe { bridge_phase(side) }, 3, "{tag}: RETURNING phase");
+                let probe = unsafe { &*(side as *const ObjectStart) };
+                assert_eq!(
+                    probe.result_statuses,
+                    [leg.return_status, hst::ABSENT],
+                    "{tag}: result status"
+                );
+                // Real tail emission boundary on the RETURNING row.
+                let mut tail = ObjectCallWire::default();
+                let tail_ok = unsafe {
+                    adapter_tail_fill(
+                        &mut tail,
+                        Some(&*(side as *const ObjectStart)),
+                        descriptor,
+                        Some(&row),
+                    )
+                };
+                assert!(tail_ok, "{tag}: tail emission");
+                assert_eq!(tail.version, 1, "{tag}: tail version");
+                assert_eq!(tail.bytes, 240, "{tag}: tail bytes");
+                assert_eq!(tail.descriptor_index, descriptor, "{tag}: tail index");
+                assert_eq!(tail.action, row.action, "{tag}: tail action");
+                assert_eq!(tail.input_handles, probe.inputs, "{tag}: tail inputs");
+                assert_eq!(
+                    tail.input_status, probe.input_statuses,
+                    "{tag}: tail input status"
+                );
+                assert_eq!(
+                    tail.result_handles, probe.result_ptrs,
+                    "{tag}: tail results"
+                );
+                assert_eq!(
+                    tail.result_status, probe.result_statuses,
+                    "{tag}: tail result status"
+                );
+            }
+            // Real native retire: re-validates, scrubs, deletes.
+            let removed = unsafe { owner_start_remove(&key, 1) };
+            assert_eq!(removed, 0, "{tag}: native retire");
+            assert_eq!(
+                unsafe { bridge_start_present(&key) },
+                0,
+                "{tag}: START gone"
+            );
+            assert_eq!(unsafe { bridge_side_present(&key) }, 0, "{tag}: side gone");
+            assert_eq!(unsafe { bridge_outstanding() }, 0, "{tag}: lease refunded");
+            assert_eq!(unsafe { bridge_poison() }, 0, "{tag}: no poison");
+            assert_eq!(unsafe { bridge_idle() }, 1, "{tag}: owner idle");
+        }
+        println!("native KEM ENTRY-to-emission connected: 12 legs on small={small}");
+    }
+}
+
 #[test]
 fn object_producer_scrub_preserves_whole_side_and_neighbors() {
     owner_fixture::run_object_subcommand(

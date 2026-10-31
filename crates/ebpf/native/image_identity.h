@@ -63,6 +63,40 @@ u64 p11_link_current_cookie(void);
  * line info shifts where the guarded source lines sit. */
 u32 p11_link_task_ticket(struct task_struct *task, u64 *ticket_out);
 u32 p11_image_identity_issued(u64 *watermark_out);
+/* Production bank promotion: one cut from bank A to bank B. Second-bank
+ * maps live in image_identity.c; the SELECT flip word below carries the
+ * current bank, per-slot prepared bits and the L4b image cells. The
+ * loader publishes bank=0, prepared={1,0}, cuts=0, refusals=0 before
+ * links. The Session prepares B (prepared[1]=1) before A fills; the
+ * first A-quota then cuts to B exactly once and the issue lands there,
+ * so a prepared cut refuses nothing. An unprepared quota refuses
+ * honestly, and B quota (no third bank) refuses honestly too.
+ * tickets_issued is derived (both watermarks summed), never a cell.
+ * Continuity/index maps stay single-bank (A): B tickets are never
+ * seeded there, so no key can alias across banks. Bank reuse (fold and
+ * re-prepare with incarnation-safe replacement) is future work: it
+ * needs a drain proof the production START rows cannot carry yet. */
+#define IMAGE_BANK_SLOTS 2U
+#define IMAGE_BANK_NO_SLOT 2U
+struct image_bank_select {
+    u64 bank;
+    u64 prepared[2];
+    u64 cuts;
+    u64 refusals;
+};
+_Static_assert(sizeof(struct image_bank_select) == 40, "bank select ABI");
+_Static_assert(__builtin_offsetof(struct image_bank_select, bank) == 0, "bank current");
+_Static_assert(__builtin_offsetof(struct image_bank_select, prepared) == 8, "bank prepared");
+_Static_assert(__builtin_offsetof(struct image_bank_select, cuts) == 24, "bank cuts");
+_Static_assert(__builtin_offsetof(struct image_bank_select, refusals) == 32, "bank refusals");
+/* Current prepared bank, or IMAGE_BANK_NO_SLOT when SELECT is missing,
+ * malformed or names an unprepared bank. */
+u32 p11_image_bank_select(void);
+/* Flip to a prepared bank exactly once. Returns the bank: the target on
+ * the flip (cuts counts the winner only) and idempotently when already
+ * there; IMAGE_BANK_NO_SLOT for a bad target, a missing SELECT or an
+ * unprepared bank. */
+u32 p11_image_bank_cut(u64 target);
 #endif
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;

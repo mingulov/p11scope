@@ -6,6 +6,13 @@
 extern u32 p11_link_task_ticket(struct task_struct *task, u64 *ticket_out)
     __attribute__((weak));
 extern u32 p11_image_identity_issued(u64 *watermark_out) __attribute__((weak));
+extern u32 p11_image_bank_select(void) __attribute__((weak));
+extern u32 p11_image_bank_cut(u64 target) __attribute__((weak));
+/* Weak map externs: NULL until the bank promotion lands. Addresses are
+ * compared for stub routing only, never dereferenced here. */
+extern unsigned char TASK_COOKIE_B __attribute__((weak));
+extern unsigned char COOKIE_CTL_B __attribute__((weak));
+extern unsigned char IMAGE_BANK_SELECT __attribute__((weak));
 #include "image_identity.c"
 #include <assert.h>
 #include <stddef.h>
@@ -19,6 +26,11 @@ extern u32 p11_image_identity_issued(u64 *watermark_out) __attribute__((weak));
 static struct control ctl;
 static u64 stored[TASK_COUNT];
 static int present[TASK_COUNT];
+static struct control ctl_b;
+static u64 stored_b[TASK_COUNT];
+static int present_b[TASK_COUNT];
+static struct image_bank_select select_stub;
+static int select_present = 1;
 static int fail_create, control_present = 1;
 static unsigned int storage_calls, create_calls;
 static struct task_struct leaders[TASK_COUNT];
@@ -41,36 +53,59 @@ static int task_index(const struct task_struct *task)
 
 static void *lookup(void *map, const void *key)
 {
-    (void)map;
     (void)key;
-    return control_present ? &ctl : 0;
+    if (map == &IMAGE_BANK_SELECT)
+        return select_present ? &select_stub : 0;
+    if (map == &COOKIE_CTL_B)
+        return &ctl_b;
+    if (map == &COOKIE_CTL)
+        return control_present ? &ctl : 0;
+    return 0;
 }
 
 static u64 *storage(void *map, struct task_struct *task, u64 *value, u64 flags)
 {
     int index;
-    (void)map;
+    u64 *cells;
+    int *marks;
     index = task_index(task);
     assert(index >= 0);
     storage_calls++;
     if (flags & BPF_LOCAL_STORAGE_GET_F_CREATE)
         create_calls++;
-    if (present[index])
-        return &stored[index];
+    if (map == &TASK_COOKIE_B) {
+        cells = stored_b;
+        marks = present_b;
+    } else {
+        cells = stored;
+        marks = present;
+    }
+    if (marks[index])
+        return &cells[index];
     if (!value || fail_create)
         return 0;
-    stored[index] = *value;
-    present[index] = 1;
-    return &stored[index];
+    cells[index] = *value;
+    marks[index] = 1;
+    return &cells[index];
 }
 
 static void reset(void)
 {
     int i;
     ctl = (struct control){ .limit = IMAGE_IDENTITY_TICKET_LIMIT };
+    ctl_b = (struct control){ .limit = IMAGE_IDENTITY_TICKET_LIMIT };
+    select_stub = (struct image_bank_select){
+        .bank = 0,
+        .prepared = { 1, 0 },
+        .cuts = 0,
+        .refusals = 0,
+    };
+    select_present = 1;
     for (i = 0; i < TASK_COUNT; i++) {
         stored[i] = 0;
         present[i] = 0;
+        stored_b[i] = 0;
+        present_b[i] = 0;
         leaders[i].tgid = 100 + i;
         leaders[i].group_leader = &leaders[i];
         leaders[i].self_exec_id = 0;
@@ -234,6 +269,165 @@ static void ticket_ignores_exec_id(void)
     puts("ASSERT ticket_query_ignores_exec_id");
 }
 
+/* G17-shaped cut: with B prepared, the 16,385th birth cuts to B
+ * exactly once and lands there; B quota refuses honestly after both
+ * banks fill, with saturating counted refusals. */
+static void bank_cut_once(void)
+{
+    u64 ticket = 0, watermark = 0;
+    u64 n;
+    assert(&p11_image_bank_select && "bank promotion needs select");
+    assert(&p11_image_bank_cut && "bank promotion needs cut");
+    assert(&TASK_COOKIE_B && "bank promotion needs bank-B maps");
+    assert(&COOKIE_CTL_B && "bank promotion needs bank-B control");
+    assert(&IMAGE_BANK_SELECT && "bank promotion needs the SELECT word");
+    reset();
+    /* The Session prepares B before A fills, as the contract requires. */
+    select_stub.prepared[1] = 1;
+    for (n = 0; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present[0] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+        assert(ticket == n + 1);
+    }
+    assert(p11_image_identity_issued(&watermark) == COOKIE_STATUS_OK);
+    assert(watermark == IMAGE_IDENTITY_TICKET_LIMIT);
+    present[0] = 0;
+    present_b[0] = 0;
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    assert(select_stub.cuts == 1);
+    assert(select_stub.bank == 1);
+    puts("ASSERT cut_flips_to_b_once");
+    assert(ctl.next_ticket == IMAGE_IDENTITY_TICKET_LIMIT);
+    puts("ASSERT a_watermark_frozen");
+    assert(ctl_b.next_ticket == 1);
+    puts("ASSERT b_issues_from_one");
+    assert(p11_image_identity_issued(&watermark) == COOKIE_STATUS_OK);
+    assert(watermark == IMAGE_IDENTITY_TICKET_LIMIT + 1);
+    puts("ASSERT total_crosses_16384");
+    /* A second cut is idempotent: no double count, admissions flow. */
+    assert(p11_image_bank_cut(1) == 1);
+    assert(select_stub.cuts == 1);
+    puts("ASSERT second_cut_no_double_count");
+    for (n = 1; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present_b[0] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+        assert(ticket == n + 1);
+    }
+    assert(p11_image_identity_issued(&watermark) == COOKIE_STATUS_OK);
+    assert(watermark == 2 * IMAGE_IDENTITY_TICKET_LIMIT);
+    puts("ASSERT total_reaches_32768");
+    present_b[0] = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_QUOTA);
+    assert(ticket == 0);
+    assert(select_stub.cuts == 1);
+    puts("ASSERT b_quota_honest");
+    assert(select_stub.refusals == 1);
+    puts("ASSERT bank_refusals_counted");
+    select_stub.refusals = ~0ULL - 1;
+    present_b[0] = 0;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_QUOTA);
+    assert(select_stub.refusals == ~0ULL);
+    present_b[0] = 0;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_QUOTA);
+    assert(select_stub.refusals == ~0ULL);
+    puts("ASSERT bank_refusals_saturate");
+}
+
+/* Retained routes: a pre-cut ticket still resolves from its bank after
+ * the cut, new births land in B, and A storage is undisturbed. */
+static void bank_query_routes(void)
+{
+    u64 ticket = 0;
+    u64 n;
+    assert(&p11_image_bank_select && "bank promotion needs select");
+    assert(&p11_image_bank_cut && "bank promotion needs cut");
+    reset();
+    select_stub.prepared[1] = 1;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    for (n = 1; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present[1] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
+        assert(ticket == n + 1);
+    }
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[2], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    assert(select_stub.bank == 1 && select_stub.cuts == 1);
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    assert(stored[0] == 1 && present[0]);
+    puts("ASSERT pre_cut_ticket_retained");
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[3], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 2);
+    assert(stored_b[3] == 2 && present_b[3]);
+    puts("ASSERT post_cut_new_bank_b");
+    assert(stored[0] == 1 && present[0]);
+    assert(ctl.next_ticket == IMAGE_IDENTITY_TICKET_LIMIT);
+    puts("ASSERT a_storage_undisturbed");
+}
+
+/* Selection validation: unpublished, corrupt or missing SELECT refuses
+ * new issues; cut validates its target and the prepared bit. */
+static void bank_select_validation(void)
+{
+    u64 ticket = 99;
+    u64 calls;
+    assert(&p11_image_bank_select && "bank promotion needs select");
+    assert(&p11_image_bank_cut && "bank promotion needs cut");
+    reset();
+    select_stub.bank = 0;
+    select_stub.prepared[0] = 0;
+    select_stub.prepared[1] = 0;
+    assert(p11_image_bank_select() == IMAGE_BANK_NO_SLOT);
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ticket == 0);
+    puts("ASSERT unpublished_select_refuses");
+    select_stub.prepared[0] = 1;
+    select_stub.bank = 7;
+    assert(p11_image_bank_select() == IMAGE_BANK_NO_SLOT);
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ticket == 0);
+    puts("ASSERT bad_bank_refuses");
+    select_stub.bank = 0;
+    select_present = 0;
+    assert(p11_image_bank_select() == IMAGE_BANK_NO_SLOT);
+    ticket = 99;
+    calls = storage_calls;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ticket == 0);
+    assert(storage_calls == calls);
+    puts("ASSERT missing_select_refuses");
+    assert(select_stub.refusals == 3);
+    puts("ASSERT bad_select_counted");
+    select_present = 1;
+    assert(p11_image_bank_cut(7) == IMAGE_BANK_NO_SLOT);
+    select_present = 0;
+    assert(p11_image_bank_cut(1) == IMAGE_BANK_NO_SLOT);
+    select_present = 1;
+    select_stub.bank = 0;
+    select_stub.prepared[0] = 1;
+    select_stub.prepared[1] = 0;
+    assert(p11_image_bank_cut(1) == IMAGE_BANK_NO_SLOT);
+    assert(select_stub.cuts == 0);
+    puts("ASSERT cut_validates_target");
+    select_stub.prepared[1] = 1;
+    assert(p11_image_bank_cut(1) == 1);
+    assert(select_stub.bank == 1 && select_stub.cuts == 1);
+    assert(p11_image_bank_cut(1) == 1);
+    assert(select_stub.cuts == 1);
+    puts("ASSERT cut_flips_once_ready");
+}
+
 int main(int argc, char **argv)
 {
     bpf_map_lookup_elem = lookup;
@@ -248,6 +442,12 @@ int main(int argc, char **argv)
         ticket_crosses_16384();
     } else if (!strcmp(argv[1], "ticket-ignores-exec-id")) {
         ticket_ignores_exec_id();
+    } else if (!strcmp(argv[1], "bank-cut-once")) {
+        bank_cut_once();
+    } else if (!strcmp(argv[1], "bank-query-routes")) {
+        bank_query_routes();
+    } else if (!strcmp(argv[1], "bank-select-validation")) {
+        bank_select_validation();
     } else {
         return 2;
     }

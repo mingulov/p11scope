@@ -7,6 +7,14 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Weak so the pre-implementation scenarios fail at the actual missing
+ * acknowledgement assertion, without a link error masquerading as
+ * runtime RED (same trick as the ticket fixture). */
+extern long p11_loader_gate_ack(u64 cookie) __attribute__((weak));
+extern long p11_loader_gate_row_generation(u32 slot, u64 *generation_out)
+    __attribute__((weak));
+extern long p11_loader_gate_cutover_latched(void) __attribute__((weak));
+
 unsigned char LOADER_GATE, LOADER_GATE_CTL;
 static struct loader_gate_row gate_rows[LOADER_GATE_SLOTS];
 static struct loader_gate_control gate_ctl;
@@ -234,6 +242,132 @@ static int cutover_latch(const char *scenario)
     return 0;
 }
 
+/* L4b loader cells: arms count admits, retained tracks live rows,
+ * the peak is monotonic across retire/reclaim cycles. */
+static int l4b_counters(const char *scenario)
+{
+    gate_reset();
+    CHECK(&p11_loader_gate_ack, "ack_present");
+    CHECK(p11_loader_gate_admit(0, 1) == 0, "admit_slot0");
+    CHECK(p11_loader_gate_admit(1, 1) == 0, "admit_slot1");
+    CHECK(p11_loader_gate_admit(2, 1) == 0, "admit_slot2");
+    CHECK(gate_ctl.admitted == 3, "arms_counted");
+    CHECK(gate_ctl.retained == 3, "retained_tracks_live");
+    CHECK(gate_ctl.retained_peak == 3, "peak_tracks_max");
+    CHECK(p11_loader_gate_note_producer_end(TOKEN(1, 0), 0) == 0, "retire_slot0");
+    CHECK(gate_ctl.retired == 1, "retired_counted");
+    CHECK(gate_ctl.retained == 2, "retained_tracks_retire");
+    CHECK(gate_ctl.retained_peak == 3, "peak_survives_retire");
+    gate_rows[0].acked = 1;
+    CHECK(p11_loader_gate_ack(TOKEN(1, 0)) == 0, "ack_slot0");
+    CHECK(gate_ctl.reclaims == 1, "reclaims_counted");
+    CHECK(gate_rows[0].state == LOADER_GATE_EMPTY, "row_emptied");
+    CHECK(p11_loader_gate_admit(0, 2) == 0, "successor_admits");
+    CHECK(gate_ctl.retained == 3, "retained_tracks_readmit");
+    CHECK(gate_ctl.retained_peak == 3, "peak_survives_cycles");
+    CHECK(p11_loader_gate_note_producer_end(TOKEN(1, 1), 1) == 0, "retire_slot1");
+    CHECK(p11_loader_gate_note_producer_end(TOKEN(1, 2), 6) == 0, "retire_slot2");
+    CHECK(p11_loader_gate_note_producer_end(TOKEN(2, 0), 0) == 0, "retire_slot0_gen2");
+    CHECK(gate_ctl.retained == 0, "retained_drains");
+    CHECK(gate_ctl.retained_peak == 3, "peak_never_falls");
+    return 0;
+}
+
+/* Every counting cell saturates at U64_MAX and never wraps; the
+ * retained gauge floors at zero on a caller-fault retire. */
+static int counter_saturation(const char *scenario)
+{
+    gate_reset();
+    CHECK(&p11_loader_gate_ack, "ack_present");
+    gate_ctl.admitted = ~0ULL - 1;
+    CHECK(p11_loader_gate_admit(0, 1) == 0, "admit_at_ceiling");
+    CHECK(gate_ctl.admitted == ~0ULL, "admitted_saturates");
+    CHECK(p11_loader_gate_admit(1, 1) == 0, "admit_past_ceiling");
+    CHECK(gate_ctl.admitted == ~0ULL, "admitted_never_wraps");
+    gate_ctl.refusals = ~0ULL - 1;
+    CHECK(p11_loader_gate_cutover() == 0, "cutover_zero");
+    CHECK(p11_loader_gate_lookup(TOKEN(9, 9)) == -1, "refuse_at_ceiling");
+    CHECK(gate_ctl.refusals == ~0ULL, "refusals_saturate");
+    CHECK(p11_loader_gate_lookup(TOKEN(9, 9)) == -1, "refuse_past_ceiling");
+    CHECK(gate_ctl.refusals == ~0ULL, "refusals_never_wrap");
+    gate_ctl.retired = ~0ULL - 1;
+    CHECK(p11_loader_gate_note_producer_end(TOKEN(1, 0), 0) == 0, "retire_at_ceiling");
+    CHECK(gate_ctl.retired == ~0ULL, "retired_saturates");
+    CHECK(p11_loader_gate_note_producer_end(TOKEN(1, 1), 0) == 0, "retire_past_ceiling");
+    CHECK(gate_ctl.retired == ~0ULL, "retired_never_wraps");
+    gate_ctl.reclaims = ~0ULL - 1;
+    gate_rows[0].acked = 1;
+    CHECK(p11_loader_gate_ack(TOKEN(1, 0)) == 0, "ack_at_ceiling");
+    CHECK(gate_ctl.reclaims == ~0ULL, "reclaims_saturate");
+    gate_rows[1].acked = 1;
+    CHECK(p11_loader_gate_ack(TOKEN(1, 1)) == 0, "ack_past_ceiling");
+    CHECK(gate_ctl.reclaims == ~0ULL, "reclaims_never_wrap");
+    gate_reset();
+    CHECK(p11_loader_gate_cutover() == 0, "cutover_zero_again");
+    gate_rows[5].state = LOADER_GATE_ARMED;
+    gate_rows[5].generation = 1;
+    gate_rows[5].disposition = LOADER_GATE_DISP_NONE;
+    CHECK(gate_ctl.retained == 0, "retained_zero_before_fault");
+    CHECK(p11_loader_gate_note_producer_end(TOKEN(1, 5), 0) == 0, "fault_retire_zero");
+    CHECK(gate_rows[5].state == LOADER_GATE_RETIRED, "fault_row_retired");
+    CHECK(gate_ctl.retained == 0, "retained_floor_holds");
+    return 0;
+}
+
+/* A retired row refuses until the native acknowledgement consumes the
+ * T-L3 flag; exactly one successor generation admits after. Ack-pending
+ * answers the third -2 (never counted) at any cutover state, while
+ * wrong-state, wrong-generation and corrupted rows refuse counted. */
+static int native_ack(const char *scenario)
+{
+    u64 row_gen = 0;
+    gate_reset();
+    CHECK(&p11_loader_gate_ack, "ack_present");
+    CHECK(&p11_loader_gate_row_generation, "row_gen_present");
+    CHECK(&p11_loader_gate_cutover_latched, "latch_present");
+    CHECK(p11_loader_gate_cutover_latched() == 0, "latch_reads_unlatched");
+    CHECK(p11_loader_gate_admit(4, 1) == 0, "admit_slot4");
+    CHECK(p11_loader_gate_note_producer_end(TOKEN(1, 4), 0) == 0, "retire_slot4");
+    CHECK(p11_loader_gate_lookup(TOKEN(1, 4)) == -2, "retired_lookup_refuses_pre_cutover");
+    CHECK(p11_loader_gate_admit(4, 2) == -2, "readmit_refuses_pre_ack");
+    CHECK(gate_ctl.refusals == 0, "retired_refuses_until_ack");
+    CHECK(p11_loader_gate_ack(TOKEN(1, 4)) == -2, "ack_pending_pre_cutover");
+    CHECK(gate_ctl.refusals == 0, "ack_pending_untracked");
+    CHECK(p11_loader_gate_cutover() == 0, "cutover_zero");
+    CHECK(p11_loader_gate_ack(TOKEN(1, 4)) == -2, "ack_pending_post_cutover");
+    CHECK(gate_ctl.refusals == 0, "ack_pending_uncounted_post_cutover");
+    gate_rows[4].acked = 1;
+    CHECK(p11_loader_gate_ack(TOKEN(1, 4)) == 0, "ack_empties_exact_row");
+    CHECK(gate_rows[4].state == LOADER_GATE_EMPTY, "row_empty");
+    CHECK(gate_rows[4].generation == 0, "generation_cleared");
+    CHECK(gate_rows[4].disposition == LOADER_GATE_DISP_NONE, "disposition_cleared");
+    CHECK(gate_rows[4].acked == 0, "flag_consumed");
+    CHECK(gate_ctl.reclaims == 1, "reclaim_counted");
+    CHECK(p11_loader_gate_admit(4, 2) == 0, "successor_admits_once");
+    CHECK(p11_loader_gate_row_generation(4, &row_gen) == 0, "row_gen_successor");
+    CHECK(row_gen == 2, "row_gen_value");
+    CHECK(p11_loader_gate_row_generation(6, &row_gen) == -1, "row_gen_empty_refuses");
+    CHECK(p11_loader_gate_cutover_latched() == 1, "latch_reads_latched");
+    CHECK(p11_loader_gate_admit(4, 3) == -1, "double_admit_refuses");
+    CHECK(gate_ctl.refusals == 1, "double_admit_counted");
+    CHECK(p11_loader_gate_admit(5, 1) == 0, "admit_slot5");
+    gate_rows[5].acked = 1;
+    CHECK(p11_loader_gate_ack(TOKEN(1, 5)) == -1, "armed_ack_refuses_counted");
+    CHECK(gate_rows[5].state == LOADER_GATE_ARMED, "armed_row_untouched");
+    CHECK(p11_loader_gate_note_producer_end(TOKEN(1, 5), 0) == 0, "retire_slot5");
+    CHECK(p11_loader_gate_ack(TOKEN(2, 5)) == -1, "gen_mismatch_refuses");
+    CHECK(gate_rows[5].state == LOADER_GATE_RETIRED, "retired_row_untouched");
+    gate_rows[5].disposition = LOADER_GATE_DISP_NONE;
+    CHECK(p11_loader_gate_ack(TOKEN(1, 5)) == -1, "corrupt_disp_refuses");
+    CHECK(gate_ctl.refusals == 4, "ack_refusals_counted");
+    gate_ctl.limit = 0;
+    CHECK(p11_loader_gate_ack(TOKEN(1, 5)) == -1, "bad_control_ack_refuses");
+    CHECK(gate_rows[5].state == LOADER_GATE_RETIRED, "corrupt_row_untouched");
+    CHECK(p11_loader_gate_row_generation(5, &row_gen) == -1, "row_gen_bad_control");
+    CHECK(p11_loader_gate_cutover_latched() == -1, "latch_bad_control");
+    return 0;
+}
+
 /* Malformed control fails closed without touching rows. */
 static int bad_control(const char *scenario)
 {
@@ -267,6 +401,9 @@ int main(int argc, char **argv)
         { "admit-without-producer-keeps-debt", admit_without_producer_keeps_debt },
         { "cutover-latch", cutover_latch },
         { "bad-control", bad_control },
+        { "l4b-counters", l4b_counters },
+        { "counter-saturation", counter_saturation },
+        { "native-ack", native_ack },
     };
     unsigned i;
 

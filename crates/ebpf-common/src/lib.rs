@@ -3194,6 +3194,52 @@ mod tests {
         assert!(!valid_discovery_record(&loader));
     }
 
+    /// The loader token word: zero (pre-existing records), 40-bit tokens
+    /// and old-format cookies all cross; garbage never does.
+    #[test]
+    fn loader_binding_accepts_zero_token_and_old_cookie_shapes() {
+        let mut base = discovery_record(DISCOVERY_KIND_LOADER);
+        base.table_ptr = 0x3000;
+        for binding in [
+            0,
+            0x100,                 // twin: delta-0 old cookie and gen-1 token coincide
+            0x201,                 // old absent cookie, context 2
+            0x0000_0200_0000_0001, // wide token: nonzero generation, slot 1
+            0xffffffffff,          // widest token: generation 2^32 - 1, slot 255
+            0xb00,                 // old present cookie, delta 5
+        ] {
+            base.binding_id = binding;
+            assert!(valid_discovery_record(&base), "binding={binding:#x}");
+        }
+    }
+
+    #[test]
+    fn loader_binding_rejects_garbage_and_invalid_arm_pins_zero() {
+        let mut base = discovery_record(DISCOVERY_KIND_LOADER);
+        base.table_ptr = 0x3000;
+        for binding in [0x1, 0xff, 0x1_0000_0000_0000] {
+            base.binding_id = binding;
+            assert!(!valid_discovery_record(&base), "binding={binding:#x}");
+        }
+        let mut invalid = discovery_record(DISCOVERY_KIND_LOADER);
+        invalid.status_flags = DISCOVERY_STATUS_LOADER_CONTEXT_INVALID;
+        assert!(valid_discovery_record(&invalid));
+        invalid.binding_id = 0x100;
+        assert!(!valid_discovery_record(&invalid));
+    }
+
+    #[test]
+    fn loader_pending_status_carries_a_token_shaped_word() {
+        let mut pending = discovery_record(DISCOVERY_KIND_LOADER);
+        pending.table_ptr = 0x3000;
+        // 0x80 is DISCOVERY_STATUS_LOADER_ACK_PENDING, defined with the impl.
+        pending.status_flags = 0x80;
+        pending.binding_id = 0x100;
+        assert!(valid_discovery_record(&pending));
+        pending.binding_id = 0x1;
+        assert!(!valid_discovery_record(&pending));
+    }
+
     /// Mutation caught: an arbitrary 64-bit private value is accepted as a
     /// helper return even though bpf_send_signal returns a signed 32-bit int.
     #[test]

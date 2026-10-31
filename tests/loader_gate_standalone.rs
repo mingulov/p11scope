@@ -317,6 +317,99 @@ fn loader_ticket_harness_ignores_exec_id() {
     );
 }
 
+/// L4b loader cells: arms count admits, retained tracks live rows, the
+/// peak is monotonic across retire/reclaim cycles.
+#[test]
+fn loader_gate_harness_l4b_counters() {
+    drive_gate(
+        "l4b-counters",
+        &[
+            "ASSERT arms_counted",
+            "ASSERT retained_tracks_live",
+            "ASSERT peak_tracks_max",
+            "ASSERT reclaims_counted",
+            "ASSERT peak_never_falls",
+        ],
+    );
+}
+
+/// Every counting cell saturates at U64_MAX and never wraps; the
+/// retained gauge floors at zero on a caller-fault retire.
+#[test]
+fn loader_gate_harness_counter_saturation() {
+    drive_gate(
+        "counter-saturation",
+        &[
+            "ASSERT admitted_never_wraps",
+            "ASSERT refusals_never_wrap",
+            "ASSERT reclaims_never_wrap",
+            "ASSERT retained_floor_holds",
+        ],
+    );
+}
+
+/// A retired row refuses until the native acknowledgement consumes the
+/// T-L3 flag; exactly one successor generation admits after.
+#[test]
+fn loader_gate_harness_native_ack() {
+    drive_gate(
+        "native-ack",
+        &[
+            "ASSERT retired_refuses_until_ack",
+            "ASSERT ack_pending_uncounted_post_cutover",
+            "ASSERT ack_empties_exact_row",
+            "ASSERT successor_admits_once",
+            "ASSERT row_gen_value",
+            "ASSERT latch_reads_latched",
+            "ASSERT ack_refusals_counted",
+        ],
+    );
+}
+
+/// G17-shaped cut: with B prepared, the 16,385th birth cuts to B
+/// exactly once; B quota refuses honestly with counted refusals.
+#[test]
+fn loader_ticket_harness_bank_cut_once() {
+    drive_tickets(
+        "bank-cut-once",
+        &[
+            "ASSERT cut_flips_to_b_once",
+            "ASSERT total_crosses_16384",
+            "ASSERT b_quota_honest",
+            "ASSERT bank_refusals_saturate",
+        ],
+    );
+}
+
+/// Retained routes: a pre-cut ticket still resolves from its bank
+/// after the cut, and A storage is undisturbed by B traffic.
+#[test]
+fn loader_ticket_harness_bank_query_routes() {
+    drive_tickets(
+        "bank-query-routes",
+        &[
+            "ASSERT pre_cut_ticket_retained",
+            "ASSERT post_cut_new_bank_b",
+            "ASSERT a_storage_undisturbed",
+        ],
+    );
+}
+
+/// Selection validation: unpublished, corrupt or missing SELECT
+/// refuses new issues; cut validates its target and prepared bit.
+#[test]
+fn loader_ticket_harness_bank_select_validation() {
+    drive_tickets(
+        "bank-select-validation",
+        &[
+            "ASSERT unpublished_select_refuses",
+            "ASSERT missing_select_refuses",
+            "ASSERT cut_flips_once_ready",
+            "ASSERT bad_select_counted",
+        ],
+    );
+}
+
 /// The gate unit lowers to BPF bitcode warning-free under the exact BPF
 /// object flags, so the host-only unit can never rot. Host-only; emits
 /// LLVM bitcode to a temp dir, no BPF load, no attach.
@@ -365,4 +458,160 @@ fn loader_gate_unit_compiles_to_bpf_bitcode() {
         );
         assert!(output_path.exists(), "native {unit} gate bitcode emitted");
     }
+    // The same units compile without the gate define: the gate-off
+    // production flavors must never rot behind the new guarded code.
+    for unit in ["loader_gate", "task_owner", "image_identity"] {
+        let output_name = format!("{unit}-loader-gate-off.bc");
+        let output_path = temporary.path().join(&output_name);
+        let source = format!("{manifest}/crates/ebpf/native/{unit}.c");
+        let output = std::process::Command::new("clang-18")
+            .current_dir(temporary.path())
+            .args([
+                "-target",
+                target,
+                "-O2",
+                "-g",
+                "-gno-record-gcc-switches",
+                "-fdebug-compilation-dir=/p11scope/native",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-emit-llvm",
+                "-c",
+            ])
+            .arg(&prefix)
+            .arg(&source)
+            .arg("-I")
+            .arg(format!("{manifest}/crates/ebpf/native"))
+            .arg("-o")
+            .arg(&output_name)
+            .output()
+            .expect("compile loader gate unit without the define");
+        assert!(
+            output.status.success(),
+            "native {unit} gate-off compile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output_path.exists(),
+            "native {unit} gate-off bitcode emitted"
+        );
+    }
+    assert_loader_producer_verifier_probe(temporary.path());
+}
+
+/// Count LLVM instructions in one named function of disassembled
+/// bitcode: indented non-comment lines in its define body, excluding
+/// debug intrinsics (they lower to nothing). Returns None when the
+/// function is absent.
+fn llvm_function_insns(disassembly: &str, name: &str) -> Option<usize> {
+    let mut in_body = false;
+    let mut count = 0usize;
+    let mut found = false;
+    let define_needle = format!("@{name}(");
+    for line in disassembly.lines() {
+        if !in_body {
+            if line.starts_with("define ") && line.contains(&define_needle) {
+                in_body = true;
+                found = true;
+            }
+            continue;
+        }
+        if line == "}" {
+            break;
+        }
+        let trimmed = line.trim_start();
+        if line.len() == trimmed.len() {
+            continue; // label or unindented directive
+        }
+        let trimmed = trimmed.trim_end();
+        if trimmed.is_empty() || trimmed.starts_with(';') {
+            continue;
+        }
+        if trimmed.contains("@llvm.dbg.") {
+            continue;
+        }
+        count += 1;
+    }
+    found.then_some(count)
+}
+
+/// Verifier-cost probe for the loader/image producer: disassemble the
+/// gate-enabled unit bitcode, count LLVM instructions in the touched
+/// BPF functions, and score the total against the existing loader-root
+/// pin (minimum across kernels) further limited by the configured
+/// headroom against the verifier limit. Both the numeric pin and the
+/// headroom apply; no new numbers are pinned here. LLVM counts are a
+/// documented proxy (gross-blowup tripwire), never a verifier proof:
+/// genuinely new gate costs are measured and pinned from kernel data
+/// in the later qualification stage.
+fn assert_loader_producer_verifier_probe(bitcode_dir: &Path) {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let budgets_text =
+        std::fs::read_to_string(format!("{manifest}/tests/bpf-verifier-budgets.json"))
+            .expect("verifier budgets file must exist");
+    let budgets: serde_json::Value =
+        serde_json::from_str(&budgets_text).expect("verifier budgets must parse");
+    let limit = budgets["limit"].as_u64().expect("verifier limit pin");
+    let min_headroom = budgets["min_headroom_percent"]
+        .as_f64()
+        .expect("headroom pin");
+    let root = &budgets["programs"]["detailed/dl_debug_state"];
+    let pin = root
+        .as_object()
+        .expect("loader root pin")
+        .values()
+        .map(|value| value.as_u64().expect("per-kernel pin"))
+        .min()
+        .expect("at least one kernel pin");
+    let bound = pin.min((limit as f64 * (1.0 - min_headroom / 100.0)) as u64);
+    assert!(bound > 0, "pin bound must be positive");
+    let touched: &[(&str, &[&str])] = &[
+        (
+            "loader_gate",
+            &[
+                "p11_loader_gate_ack",
+                "p11_loader_gate_row_generation",
+                "p11_loader_gate_cutover_latched",
+                "p11_loader_gate_admit",
+                "p11_loader_gate_note_producer_end",
+            ],
+        ),
+        (
+            "image_identity",
+            &[
+                "p11_image_bank_select",
+                "p11_image_bank_cut",
+                "p11_link_task_ticket",
+                "p11_image_identity_issued",
+            ],
+        ),
+    ];
+    let mut total = 0usize;
+    for (unit, functions) in touched {
+        let bitcode = bitcode_dir.join(format!("{unit}-loader-gate.bc"));
+        let disassembly = std::process::Command::new("llvm-dis-18")
+            .arg(&bitcode)
+            .arg("-o")
+            .arg("-")
+            .output()
+            .expect("disassemble loader gate bitcode");
+        assert!(
+            disassembly.status.success(),
+            "native {unit} disassembly: {}",
+            String::from_utf8_lossy(&disassembly.stderr)
+        );
+        let text = String::from_utf8(disassembly.stdout).expect("llvm disassembly is utf-8");
+        for name in *functions {
+            let count = llvm_function_insns(&text, name)
+                .unwrap_or_else(|| panic!("touched BPF function {name} must be present"));
+            println!("verifier probe: {unit}::{name} = {count} llvm insns");
+            total += count;
+        }
+    }
+    println!("verifier probe: touched total = {total} llvm insns, bound = {bound}");
+    assert!(
+        total as u64 <= bound,
+        "touched loader producer {total} llvm insns exceed the loader-root pin {bound}"
+    );
 }

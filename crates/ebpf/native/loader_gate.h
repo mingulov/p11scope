@@ -4,12 +4,15 @@
 /* T-L2c token-keyed loader gate: the BPF/native side of the cookie contract
  * pinned in src/discovery/loader_lifetime.rs (`loader_attach_cookie` is
  * exactly the 40-bit token bits). The gate admits one generation per slot,
- * resolves token cookies to slots, and retires rows with the owned
+ * resolves token cookies to slots, retires rows with the owned
  * producer disposition (END / NO_END / ABANDON) derived from the
- * START-removal reason. Retired rows never re-admit: no token or map
- * identity recycles before acknowledgement (the ack entry point is a T-L3
- * seam, not this packet). Unknown cookies fail closed: untracked (-2)
- * before the cutover, counted refusals (-1) after it.
+ * START-removal reason, and empties retired rows through the native
+ * acknowledgement once userspace arms per-row reuse. Retired rows never
+ * re-admit: no token or map identity recycles before acknowledgement.
+ * Unknown cookies fail closed: untracked (-2) before the cutover,
+ * counted refusals (-1) after it. An unacknowledged retired row answers
+ * -2 (never counted) at any cutover state: the third -2, alongside the
+ * absent no-op and the pre-cutover refusal.
  *
  * The cutover is a one-way latch, not a format detector: several
  * old-format cookies are numerically identical to live tokens, and no code
@@ -40,7 +43,8 @@ typedef unsigned long long u64;
 #define LOADER_GATE_TOKEN_MAX 0xffffffffffULL
 
 /* Row states: EMPTY admits, ARMED resolves, RETIRED refuses everything
- * until the T-L3 acknowledgement empties the row. */
+ * until the native acknowledgement consumes the T-L3 flag and empties
+ * exactly that row for one successor generation. */
 #define LOADER_GATE_EMPTY 0U
 #define LOADER_GATE_ARMED 1U
 #define LOADER_GATE_RETIRED 2U
@@ -66,30 +70,49 @@ _Static_assert(P11_OWNER_START_REASON_EXEC_EXIT == P11_LOADER_START_REASON_EXEC_
                "gate EXEC_EXIT reason must match task_owner.h");
 #endif
 
+/* Rows are BPF-owned except acked: userspace sets it once per retired
+ * generation after its T-L3 acknowledgement completes, and the native
+ * acknowledgement consumes (validates plus clears) it. Single-word and
+ * write-once: a BPF read racing the set sees 0 (retry later) or 1
+ * (proceed), both safe. The retired generation in the ack cookie is the
+ * capability; the T-L3 completion ordering is the caller's proof. */
 struct loader_gate_row {
     u64 generation;
     u32 state;
     u32 disposition;
+    u32 acked;
+    u32 reserved;
 };
 /* Loader publishes limit=256, all other fields zero, before links, then
- * freezes userspace mutation. BPF alone mutates while linked; no reset. */
+ * freezes userspace mutation. BPF alone mutates while linked; no reset.
+ * The L4b loader cells are admitted (arms), reclaims, retained_peak and
+ * refusals; retired stays an end-report diagnostic. All counting cells
+ * saturate, never wrap. */
 struct loader_gate_control {
     u64 limit;
     u64 cutover;
     u64 admitted;
     u64 refusals;
     u64 retired;
+    u64 reclaims;
+    u64 retained;
+    u64 retained_peak;
 };
-_Static_assert(sizeof(struct loader_gate_row) == 16, "gate row ABI");
+_Static_assert(sizeof(struct loader_gate_row) == 24, "gate row ABI");
 _Static_assert(__builtin_offsetof(struct loader_gate_row, generation) == 0, "gate generation");
 _Static_assert(__builtin_offsetof(struct loader_gate_row, state) == 8, "gate state");
 _Static_assert(__builtin_offsetof(struct loader_gate_row, disposition) == 12, "gate disposition");
-_Static_assert(sizeof(struct loader_gate_control) == 40, "gate control ABI");
+_Static_assert(__builtin_offsetof(struct loader_gate_row, acked) == 16, "gate acked");
+_Static_assert(__builtin_offsetof(struct loader_gate_row, reserved) == 20, "gate row reserved");
+_Static_assert(sizeof(struct loader_gate_control) == 64, "gate control ABI");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, limit) == 0, "gate limit");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, cutover) == 8, "gate cutover");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, admitted) == 16, "gate admitted");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, refusals) == 24, "gate refusals");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, retired) == 32, "gate retired");
+_Static_assert(__builtin_offsetof(struct loader_gate_control, reclaims) == 40, "gate reclaims");
+_Static_assert(__builtin_offsetof(struct loader_gate_control, retained) == 48, "gate retained");
+_Static_assert(__builtin_offsetof(struct loader_gate_control, retained_peak) == 56, "gate peak");
 
 /* Future real Rust map symbols; only their addresses enter map helpers.
  * The Rust maps land with activation; until then the host harnesses
@@ -124,4 +147,23 @@ long p11_loader_gate_lookup(u64 cookie);
 long p11_loader_gate_note_producer_end(u64 cookie, u32 reason);
 /* Latch the atomic cutover. 0 on the flip, -1 once already cut. */
 long p11_loader_gate_cutover(void);
+/* Empty exactly the acknowledged RETIRED row for one successor
+ * generation. 0 emptied (reclaims counts it); -2 when the row is
+ * retired but userspace has not armed reuse yet (never counted, at any
+ * cutover state); the strict refusal rule for malformed, foreign,
+ * wrong-generation, wrong-state and corrupted-disposition cookies;
+ * -1 on a missing or malformed control. The row is untouched unless
+ * 0 returns. */
+long p11_loader_gate_ack(u64 cookie);
+/* Read one row's generation for the acknowledgement capability: 0 with
+ * *generation_out set for an ARMED or RETIRED row, -1 for EMPTY, an
+ * out-of-range slot, or a missing or malformed control. The BPF hit
+ * path names the row's own generation back to the acknowledgement, so
+ * the generation match stays a TOCTOU guard, never a guess. */
+long p11_loader_gate_row_generation(u32 slot, u64 *generation_out);
+/* Read the cutover latch for the producer's decode selection: 1 once
+ * latched, 0 before, -1 on a missing or malformed control. The hit
+ * path decodes old-format cookies before the latch and tokens after;
+ * nothing admits before the latch. */
+long p11_loader_gate_cutover_latched(void);
 #endif

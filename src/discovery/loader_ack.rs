@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! STAGED: no production caller; activation obligations in planning docs/superpowers/2026-10-31-v060-staged-registry.md.
 //! Staged T-L3 Engine acknowledgement for loader lifetimes (packet 6.09b).
 //!
 //! Engine-facing endpoints over the L1 [`LifetimeRegistry`]: every Engine

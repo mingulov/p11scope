@@ -97,15 +97,15 @@ def hook_contract(main, identity):
             or "p11_root_current_exit" in function(main, "sched_process_exec_impl")):
         raise AssertionError("exec must retain affiliation")
     for site in ("p11_return", "p11_return_impl", "ordinary_return",
-                 "object_return", "capture_return_facts"):
+                 "object_return_ordinary", "object_return", "capture_return_facts"):
         if "p11_root_current_exit" in function(main, site):
             raise AssertionError("return must retain affiliation")
     impl = function(main, "p11_return_impl")
     ordinary = "ordinary_return(ctx, &key, start, flags, layout)"
     if impl.count(ordinary) != 2 or impl.count("journal_roots::program::" + ordinary) != 1:
         raise AssertionError("return must dispatch once per arm to ordinary_return")
-    if impl.count("object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)") != 1:
-        raise AssertionError("return must dispatch once to object_return")
+    if impl.count("object_return_ordinary(ctx, &key, start, flags, layout)") != 1:
+        raise AssertionError("return must dispatch once to object_return_ordinary")
     if impl.count("object_return::<true, p11scope_ebpf_common::object_journal::JournalEndFull>(") != 1:
         raise AssertionError("return must dispatch once to the journal object_return")
     if ("image_pair_matches" in impl or "p11_root_current_tag" in impl
@@ -115,8 +115,9 @@ def hook_contract(main, identity):
     if facts.count("p11_root_current_tag") != 1:
         raise AssertionError("CALL tag must live exactly once in capture_return_facts")
     facts_calls = {"ordinary_return": "capture_return_facts::<false>(ctx, &start, flags, layout, accounting)",
+                   "object_return_ordinary": "capture_return_facts::<false>(ctx, &*start, flags, layout, accounting)",
                    "object_return": "capture_return_facts::<JOURNAL>(ctx, &*start, flags, layout, accounting)"}
-    for branch in ("ordinary_return", "object_return"):
+    for branch in ("ordinary_return", "object_return_ordinary", "object_return"):
         body = function(main, branch)
         if body.count("image_pair_matches") != 1:
             raise AssertionError(f"{branch} must carry exactly one image guard")
@@ -228,15 +229,35 @@ class RootAffiliationTests(unittest.TestCase):
         facts_line = ("    let facts = capture_return_facts::<false>(ctx, &start, flags, layout, accounting);\n")
         swapped = ordinary.replace(guard + facts_line, facts_line + guard, 1)
         self.assertNotEqual(swapped, ordinary, "guard/facts swap must apply")
+        object_ordinary = function(main, "object_return_ordinary")
+        object_guard = ("    let mut image = ImageIdentity::default();\n"
+                        "    if unsafe { p11_link_current_identity(&mut image) } != 1\n"
+                        "        || !image_pair_matches(unsafe { (*start).image }, image)\n"
+                        "    {\n"
+                        "        let _ = owned_start_remove(&key, true);\n"
+                        "        unsafe { p11_object_fault() };\n"
+                        "        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);\n"
+                        "        return 0;\n"
+                        "    }\n")
+        object_gap = ("    // This short immutable borrow ends before reservation/native continuity\n"
+                      "    // or side-row helpers. All retained START reads finish before removal.\n")
+        object_facts = ("    let facts = unsafe { capture_return_facts::<false>(ctx, &*start, flags, layout, accounting) };\n")
+        object_swapped = object_ordinary.replace(object_guard + object_gap + object_facts,
+                                                  object_facts + object_gap + object_guard, 1)
+        self.assertNotEqual(object_swapped, object_ordinary, "guard/facts swap must apply")
         mutants += [
             main.replace("        ordinary_return(ctx, &key, start, flags, layout)\n",
-                         "        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)\n", 1),
-            main.replace("        object_return::<false, ObjectEventRecord>(ctx, &key, start, flags, layout)\n",
+                         "        object_return_ordinary(ctx, &key, start, flags, layout)\n", 1),
+            main.replace("        object_return_ordinary(ctx, &key, start, flags, layout)\n",
                          "        ordinary_return(ctx, &key, start, flags, layout)\n", 1),
             main.replace(ordinary, swapped, 1),
+            main.replace(object_ordinary, object_swapped, 1),
             main.replace("        || !image_pair_matches(start.image, image)\n", "", 1),
+            main.replace("        || !image_pair_matches(unsafe { (*start).image }, image)\n", "", 1),
             main.replace("            || !image_pair_matches(unsafe { (*start).image }, image)\n", "", 1),
             main.replace("        root_affiliation: unsafe { p11_root_current_tag() },\n", "", 1),
+            main.replace(object_facts,
+                         object_facts + "    let _ = unsafe { p11_root_current_exit() };\n", 1),
         ]
         for mutant in mutants:
             self.assertNotEqual(mutant, main, "mutation must change the tested source")

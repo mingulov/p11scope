@@ -33,9 +33,16 @@ mod clang_resolve;
 #[path = "build_support/semantic_rustc.rs"]
 mod semantic_rustc;
 
-// R52: the unused birth-marker paths move to 0.5.1. One trusted source
-// decision controls host expectations and every native/Rust BPF build site.
-const BIRTH_MARKER_ENABLED: bool = false;
+// R52: the birth-marker paths stay default-off behind P11SCOPE_BIRTH_MARKER
+// (unset/0 = off, 1 = on). One derived decision controls host expectations
+// and every native/Rust BPF build site.
+fn birth_marker_requested() -> bool {
+    match env::var("P11SCOPE_BIRTH_MARKER").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => panic!("P11SCOPE_BIRTH_MARKER must be unset, 0 or 1"),
+    }
+}
 
 #[derive(Clone, Copy)]
 enum BpfFlavor {
@@ -168,6 +175,7 @@ fn main() {
     let image_bank_proof = image_bank_proof_requested();
     let journal_proof = journal_proof_requested();
     let production_journal = journal_requested();
+    let birth_marker = birth_marker_requested();
     println!("cargo:rustc-check-cfg=cfg(p11scope_journal_roots)");
     if journal_proof {
         println!("cargo:rustc-cfg=p11scope_journal_roots");
@@ -177,12 +185,12 @@ fn main() {
         println!("cargo:rustc-cfg=p11scope_journal");
     }
     println!("cargo:rustc-check-cfg=cfg(p11scope_birth_marker)");
-    if BIRTH_MARKER_ENABLED {
+    if birth_marker {
         println!("cargo:rustc-cfg=p11scope_birth_marker");
     }
     println!(
         "cargo:rustc-env=P11SCOPE_BIRTH_MARKER_ENABLED={}",
-        u8::from(BIRTH_MARKER_ENABLED)
+        u8::from(birth_marker)
     );
     println!("cargo:rerun-if-changed=crates/ebpf/src");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
@@ -228,6 +236,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=P11SCOPE_IMAGE_BANK_PROOF");
     println!("cargo:rerun-if-env-changed=P11SCOPE_JOURNAL_PROOF");
     println!("cargo:rerun-if-env-changed=P11SCOPE_JOURNAL");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_BIRTH_MARKER");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WIDE_DETAILED_2112");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES");
@@ -344,6 +353,7 @@ fn main() {
             small_discovery_ring,
             wide_detailed,
             stub_object_attributes,
+            birth_marker,
         );
     }
     // The identity flavor is a standalone clang invocation, not a fourth
@@ -357,7 +367,7 @@ fn main() {
             BpfFlavor::CounterTimestamps,
             BpfFlavor::CounterLatency,
         ] {
-            build_variant(flavor, false, false, false, false, false);
+            build_variant(flavor, false, false, false, false, false, birth_marker);
         }
     }
     println!("cargo:rustc-check-cfg=cfg(p11scope_counter_objects)");
@@ -379,6 +389,7 @@ fn main() {
                 false,
                 BankProof::Counter,
                 false,
+                birth_marker,
             );
         }
     }
@@ -393,6 +404,7 @@ fn main() {
             false,
             BankProof::Image,
             false,
+            birth_marker,
         );
     }
     if journal_proof {
@@ -405,6 +417,7 @@ fn main() {
             false,
             BankProof::Journal,
             false,
+            birth_marker,
         );
     }
     if production_journal {
@@ -417,6 +430,7 @@ fn main() {
             false,
             BankProof::Journal,
             true,
+            birth_marker,
         );
     }
     println!(
@@ -503,6 +517,7 @@ fn build_variant(
     small_discovery_ring: bool,
     wide_detailed: bool,
     stub_object_attributes: bool,
+    birth_marker: bool,
 ) {
     build_variant_with_proof(
         flavor,
@@ -513,6 +528,7 @@ fn build_variant(
         stub_object_attributes,
         BankProof::None,
         false,
+        birth_marker,
     );
 }
 
@@ -528,6 +544,7 @@ fn build_variant_with_proof(
     stub_object_attributes: bool,
     bank_proof: BankProof,
     production_journal: bool,
+    birth_marker: bool,
 ) {
     let counter_bank_proof = matches!(bank_proof, BankProof::Counter);
     let image_bank_proof = matches!(bank_proof, BankProof::Image);
@@ -609,7 +626,7 @@ fn build_variant_with_proof(
     // control row; counter and inventory flavors keep no marker state.
     // One gate for the unit, define and exports below: Image is Detailed
     // and retains the canonical marker dependencies; Counter excludes them.
-    let journal_marker = BIRTH_MARKER_ENABLED
+    let journal_marker = birth_marker
         && matches!(flavor, BpfFlavor::Detailed)
         && !counter_bank_proof
         && !journal_roots;

@@ -40,7 +40,12 @@ fn journal_proof_output_matches_this_build_selection() {
         option_env!("P11SCOPE_JOURNAL_PROOF_OUTPUTS"),
         Some(if requested { "journal-proof-v1" } else { "" })
     );
-    assert_eq!(env!("P11SCOPE_BIRTH_MARKER_ENABLED"), "0");
+    let marker_requested = option_env!("P11SCOPE_BIRTH_MARKER") == Some("1");
+    assert_eq!(
+        env!("P11SCOPE_BIRTH_MARKER_ENABLED"),
+        if marker_requested { "1" } else { "0" },
+        "birth-marker build selection must track P11SCOPE_BIRTH_MARKER"
+    );
     if requested {
         assert!(
             fs::read(path).unwrap().as_slice() != p11scope::EBPF_OBJECT,
@@ -500,6 +505,40 @@ fn journal_switch_refuses_before_tools_or_outputs() {
         );
         assert!(!reached, "{setting:?} reached a compiler");
         assert_eq!(entries, ["preserved"]);
+    }
+}
+
+#[test]
+fn birth_marker_switch_refuses_before_tools_or_outputs() {
+    use std::os::unix::ffi::OsStringExt;
+    let mut values: Vec<_> = ["", "2", "true", "false", "01", "-1", "1 ", " 1", "\n1"]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+    values.push(std::ffi::OsString::from_vec(vec![0xff]));
+    for value in values {
+        let (output, reached, entries) =
+            preflight_switch("P11SCOPE_BIRTH_MARKER", Some(&value), &[]);
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("P11SCOPE_BIRTH_MARKER must be unset, 0 or 1"),
+            "{value:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!reached, "invalid request reached a compiler");
+        assert_eq!(entries, ["preserved"]);
+    }
+    for value in [None, Some(OsStr::new("0")), Some(OsStr::new("1"))] {
+        let (output, reached, _) = preflight_switch("P11SCOPE_BIRTH_MARKER", value, &[]);
+        assert!(
+            reached,
+            "{value:?} must reach the compiler tripwire without a marker refusal"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("P11SCOPE_BIRTH_MARKER"),
+            "{value:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 

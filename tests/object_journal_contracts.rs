@@ -1372,10 +1372,11 @@ fn object_journal_cleanup_abandoned_code_matches_native() {
     assert_eq!(bound, 2, "the abandoned-start code is 2 (only 1 fails)");
 }
 
-/// H8-D marker build gate: the native unit, the instance-epoch define and
-/// the two global exports share one predicate, so a future Detailed bank
-/// object cannot half-link the marker (unit without exports, or the
-/// reverse).
+/// H8-D marker build gate: `P11SCOPE_BIRTH_MARKER` (unset/0 = off, 1 =
+/// on) derives one decision; the native unit, the instance-epoch define,
+/// the Rust cfg and the two global exports share one predicate, so a
+/// future Detailed bank object cannot half-link the marker (unit without
+/// exports, or the reverse).
 #[test]
 fn object_journal_marker_build_uses_one_gate() {
     let build = std::fs::read_to_string("build.rs").expect("read build script");
@@ -1390,7 +1391,30 @@ fn object_journal_marker_build_uses_one_gate() {
         1,
         "the marker build must share one predicate"
     );
-    assert!(build.contains("const BIRTH_MARKER_ENABLED: bool = false;"));
+    assert!(
+        !build.contains("const BIRTH_MARKER_ENABLED"),
+        "the marker const is replaced by the P11SCOPE_BIRTH_MARKER derivation"
+    );
+    let at = lines
+        .iter()
+        .position(|line| line.contains("fn birth_marker_requested() -> bool"))
+        .expect("marker derivation");
+    let derivation = lines[at..at + 8].join("\n");
+    for arm in [
+        "P11SCOPE_BIRTH_MARKER",
+        "| Ok(\"0\") => false",
+        "Ok(\"1\") => true",
+        "P11SCOPE_BIRTH_MARKER must be unset, 0 or 1",
+    ] {
+        assert!(
+            derivation.contains(arm),
+            "the marker derivation must map unset/0 to off and 1 to on: {arm}"
+        );
+    }
+    assert!(
+        build.contains("cargo:rerun-if-env-changed=P11SCOPE_BIRTH_MARKER"),
+        "the marker derivation must declare its environment input"
+    );
     let predicate = build
         .split_once(binding)
         .expect("single marker predicate")
@@ -1399,9 +1423,10 @@ fn object_journal_marker_build_uses_one_gate() {
         .next()
         .expect("terminated marker predicate");
     assert!(
-        predicate.contains("BIRTH_MARKER_ENABLED")
+        predicate.contains("birth_marker")
             && predicate.contains("BpfFlavor::Detailed")
-            && predicate.contains("!counter_bank_proof"),
+            && predicate.contains("!counter_bank_proof")
+            && !predicate.contains("BIRTH_MARKER"),
         "the shared gate must select Detailed non-bank builds: {}",
         predicate
     );
@@ -1434,8 +1459,128 @@ fn object_journal_marker_build_uses_one_gate() {
         host.lines()
             .rev()
             .take(2)
-            .any(|line| line.contains("if BIRTH_MARKER_ENABLED"))
+            .any(|line| line.contains("if birth_marker"))
     );
+}
+
+/// H8-D marker host selection: this compilation's cfg and build receipt
+/// track the `P11SCOPE_BIRTH_MARKER` request exactly, so the default
+/// (unset) build stays marker-off and the opt-in build flips on.
+#[test]
+fn object_journal_birth_marker_host_selection_tracks_request() {
+    let requested = option_env!("P11SCOPE_BIRTH_MARKER") == Some("1");
+    assert_eq!(
+        cfg!(p11scope_birth_marker),
+        requested,
+        "host cfg must track P11SCOPE_BIRTH_MARKER"
+    );
+    assert_eq!(
+        env!("P11SCOPE_BIRTH_MARKER_ENABLED"),
+        if requested { "1" } else { "0" },
+        "host receipt must track P11SCOPE_BIRTH_MARKER"
+    );
+}
+
+/// H8-D marker BPF selection: the Detailed rustflags carry the marker cfg
+/// exactly when requested; inventory and counter flavors never carry it,
+/// so no Inventory/counter build mints births in either mode.
+#[test]
+fn object_journal_birth_marker_detailed_flags_tracks_request() {
+    const FLAG: &str = "--cfg=p11scope_birth_marker";
+    let requested = option_env!("P11SCOPE_BIRTH_MARKER") == Some("1");
+    assert_eq!(
+        env!("P11SCOPE_BPF_RUSTFLAGS_DETAILED").contains(FLAG),
+        requested,
+        "Detailed BPF flags must track P11SCOPE_BIRTH_MARKER"
+    );
+    let mut plain = vec![
+        ("inventory", env!("P11SCOPE_BPF_RUSTFLAGS_INVENTORY")),
+        (
+            "inventory-callers",
+            env!("P11SCOPE_BPF_RUSTFLAGS_INVENTORY_CALLERS"),
+        ),
+    ];
+    for (name, flags) in [
+        (
+            "counter-counts",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_COUNTS"),
+        ),
+        (
+            "counter-timestamps",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_TIMESTAMPS"),
+        ),
+        (
+            "counter-latency",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_LATENCY"),
+        ),
+        (
+            "counter-counts-proof",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_COUNTS_PROOF"),
+        ),
+        (
+            "counter-timestamps-proof",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_TIMESTAMPS_PROOF"),
+        ),
+        (
+            "counter-latency-proof",
+            option_env!("P11SCOPE_BPF_RUSTFLAGS_COUNTER_LATENCY_PROOF"),
+        ),
+    ] {
+        if let Some(flags) = flags {
+            plain.push((name, flags));
+        }
+    }
+    for (name, flags) in plain {
+        assert!(
+            !flags.contains(FLAG),
+            "{name} BPF flags must never carry the marker cfg"
+        );
+    }
+}
+
+/// H8-D marker object bytes: the built Detailed object carries the
+/// control map and both marker globals exactly when requested;
+/// inventory objects carry neither in either mode.
+#[test]
+fn object_journal_birth_marker_detailed_object_tracks_request() {
+    const MAP: &str = "JOURNAL_MARKER_CTL";
+    const GLOBALS: [&str; 2] = ["p11_instance_exec_birth", "p11_instance_scope_gap"];
+    let requested = option_env!("P11SCOPE_BIRTH_MARKER") == Some("1");
+    let object = aya_obj::Object::parse(p11scope::EBPF_OBJECT).expect("parse Detailed object");
+    assert_eq!(
+        object.maps.contains_key(MAP),
+        requested,
+        "Detailed marker map must track P11SCOPE_BIRTH_MARKER"
+    );
+    for global in GLOBALS {
+        assert_eq!(
+            object
+                .functions
+                .values()
+                .any(|function| function.name == global),
+            requested,
+            "Detailed {global} must track P11SCOPE_BIRTH_MARKER"
+        );
+    }
+    for (name, bytes) in [
+        ("inventory", p11scope::EBPF_INVENTORY_OBJECT),
+        ("inventory-callers", p11scope::EBPF_INVENTORY_CALLERS_OBJECT),
+    ] {
+        let object = aya_obj::Object::parse(bytes).expect("parse inventory object");
+        assert!(
+            !object.maps.contains_key(MAP),
+            "{name} must not allocate the marker control map"
+        );
+        for global in GLOBALS {
+            assert!(
+                !object
+                    .functions
+                    .values()
+                    .any(|function| function.name == global),
+                "{name} must not retain {global}"
+            );
+        }
+    }
 }
 
 #[test]

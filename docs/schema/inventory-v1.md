@@ -108,8 +108,12 @@ Quiet cgroup edges use `unknown` with reason `scope_membership_unproven` when
 otherwise covered: endpoint samples do not prove continuous residency and cannot
 authorize `watched_no_use`. Existing valid counted history remains usable.
 Same-image reentry retains its caller ID; a deferred successor need not have an
-ID merely to retire an old image. Scoped native owner activation/refresh is
-currently deferred and carries a gap; scan-pinned caller facts remain available.
+ID merely to retire an old image. Scoped native owners activate and refresh
+inside the final cgroup membership bracket while an image-acquisition handle
+is active, and suspend back to scan-pinned facts with a named gap when their
+caller leaves a complete transaction, retires, or is proven to have exec'd at
+a refresh check; without an active handle, activation stays unavailable with
+a standing named gap and scan-pinned caller facts remain available.
 The main thread services lifecycle evidence before scoped admission, then
 publishes newly admitted targets before extending them and publishes native
 receipts before output. Cancellation is cooperative at returning-operation

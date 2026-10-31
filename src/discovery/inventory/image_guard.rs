@@ -1,5 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! STAGED: no production caller; activation obligations in planning docs/superpowers/2026-10-31-v060-staged-registry.md.
+//! Production caller: scoped owner preparation and refresh in the
+//! inventory coordinator, fed per commit by the capture lane's
+//! threaded acquisition handle.
 //! Fresh current-image guard for inventory owners: every check acquires a
 //! new observation through the retained pin and compares it against the
 //! independently supplied expected image. The binder vetoes revoked
@@ -17,7 +19,6 @@ use std::sync::Arc;
 /// One genuine current-image acquisition from the guard's own capture
 /// domain: the facade operation with its fresh generation and stopping
 /// refusal, never a cached observation.
-#[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
 pub(crate) trait ImageAcquisition {
     fn acquisition_domain(&self) -> NativeDomainId;
     fn acquire_caller_image(
@@ -27,7 +28,7 @@ pub(crate) trait ImageAcquisition {
     ) -> Result<CallerImageObservation>;
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
+#[cfg_attr(not(test), allow(dead_code))] // Guard tests use this; production acquires through FacadeLane.
 impl ImageAcquisition for InventoryCapture {
     fn acquisition_domain(&self) -> NativeDomainId {
         self.domain()
@@ -46,16 +47,15 @@ impl ImageAcquisition for InventoryCapture {
 /// classifies provenance before mismatch. A foreign domain, foreign
 /// allocation, or invalid generation is `Unavailable`, never terminal
 /// `Changed`. Neither the observation nor an `Exact` result is stored for
-/// the next check. Packet 2 preparation constructs this around its active
-/// capture; packet 1 exercises it through scripted acquisition.
-#[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
+/// the next check. Scoped owner preparation constructs this around
+/// the threaded acquisition handle; guard tests exercise it through
+/// scripted acquisition.
 pub(crate) struct FreshImageGuard<'a, S: ImageAcquisition + ?Sized> {
     source: &'a mut S,
     binder: &'a NativeBinder,
     window: ReadWindow,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
 impl<'a, S: ImageAcquisition + ?Sized> FreshImageGuard<'a, S> {
     /// Borrow the guard's own capture, the binder (a revocation veto
     /// only), and the one-row window built from the operation allowance.

@@ -120,6 +120,10 @@ fn native_read(
 
 struct ScopedNativeScene {
     coordinator: Box<InventoryCoordinator<OsProcessSource>>,
+    /// The scripted acquisition handle the scene threads through
+    /// the production-shaped commit entry; `None` is the
+    /// handle-less path.
+    acquisition: Option<SharedAcquisition>,
     identity: OriginalNativeIdentity,
     caller: CallerId,
     module: ModuleId,
@@ -257,6 +261,7 @@ impl ScopedNativeScene {
         coordinator.commit_batch(false).unwrap();
         let scene = Self {
             coordinator,
+            acquisition: None,
             identity,
             caller,
             module,
@@ -288,8 +293,7 @@ impl ScopedNativeScene {
             source.script_observe(*generation, *ticket, *exec);
         }
         let shared = Rc::new(RefCell::new(source));
-        self.coordinator
-            .set_native_image_acquisition(Box::new(SharedAcquisition(Rc::clone(&shared))));
+        self.acquisition = Some(SharedAcquisition(Rc::clone(&shared)));
         shared
     }
 
@@ -609,7 +613,7 @@ impl ScopedNativeScene {
                     }
                 }
             },
-            || self.coordinator.commit_batch(false).unwrap(),
+            || self.commit_scene_batch(),
         );
         assert!(
             reads.get() > 0,
@@ -1069,9 +1073,7 @@ fn cgroup_native_owner_finished_domain_refuses_activation() {
     let mut source = ScriptedAcquisition::new(failed.domain);
     source.script_fail("lens cap on");
     let shared = Rc::new(RefCell::new(source));
-    failed
-        .coordinator
-        .set_native_image_acquisition(Box::new(SharedAcquisition(Rc::clone(&shared))));
+    failed.acquisition = Some(SharedAcquisition(Rc::clone(&shared)));
     let completion = failed.commit_membership_pass(false);
     assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
     assert_eq!(failed.coordinator.owner_of(failed.caller), None);
@@ -1096,22 +1098,18 @@ fn cgroup_native_owner_finished_domain_refuses_activation() {
     );
 
     // Leg 3 (no acquisition): without any handle the scan fallback
-    // stands with the standing deferral disclosure the installed H6
-    // consumer recognizes, never a silent skip.
+    // stands with the standing unavailable disclosure the installed
+    // H6 consumer recognizes, never a silent skip.
     let mut bare = ScopedNativeScene::new();
     let completion = bare.commit_membership_pass(false);
     assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
     assert_eq!(bare.coordinator.owner_of(bare.caller), None);
     assert!(
-        bare.coordinator
-            .registry()
-            .gaps()
-            .iter()
-            .any(|gap| {
-                gap.subject == "scoped native owner admission deferred"
-                    && gap.reason
-                        == "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; sampled scan-pinned callers and retained native totals remain available"
-            }),
+        bare.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == "native owner activation unavailable"
+                && gap.reason
+                    == "no image acquisition handle is installed; scan-pinned fallback retained"
+        }),
         "a missing handle discloses itself: {:?}",
         bare.coordinator
             .registry()
@@ -1399,7 +1397,7 @@ impl ScopedNativeScene {
                             }
                         }
                     },
-                    || self.coordinator.commit_batch(false).unwrap(),
+                    || self.commit_scene_batch(),
                 )
             },
         );
@@ -1436,8 +1434,14 @@ impl ScopedNativeScene {
     /// Commit the staged batch through the scene's one commit entry:
     /// the membership helpers and the refresh/suspend twins all commit
     /// here, so the acquisition handle delivery has a single seam.
-    fn commit_scene_batch(&mut self) {
-        self.coordinator.commit_batch(false).unwrap();
+    fn commit_scene_batch(&mut self) -> BatchReceipt {
+        let mut acquisition = self.acquisition.clone();
+        let handle = acquisition
+            .as_mut()
+            .map(|shared| shared as &mut dyn ImageAcquisition);
+        self.coordinator
+            .commit_batch_with_acquisition(false, None, handle)
+            .unwrap()
     }
 
     /// One pass over the membership file exactly as the twin last

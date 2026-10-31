@@ -7,6 +7,7 @@ use super::{JointCommitIo, RetainedJointBirths};
 use crate::attach::{BirthObservationRefusal, CollectedFinishQ, SessionDrainProducers};
 use crate::discovery::caller_registry::OsProcessSource;
 use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
+use crate::discovery::engine::inventory::image_guard::ImageAcquisition;
 use crate::discovery::engine::inventory_coordinator::semantics::CompletedJointFinish;
 use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
 use crate::discovery::engine::inventory_coordinator::{
@@ -41,6 +42,16 @@ use crate::semantics_objects::journal::{
 };
 use p11scope_ebpf_common::event_type;
 use std::time::{Duration, Instant};
+
+/// Reborrow an acquisition handle for one more call.
+fn reborrow_acquisition<'a, 'b: 'a>(
+    acquisition: &'a mut Option<&'b mut (dyn ImageAcquisition + 'b)>,
+) -> Option<&'a mut (dyn ImageAcquisition + 'a)> {
+    match acquisition {
+        Some(handle) => Some(&mut **handle),
+        None => None,
+    }
+}
 
 const RAW_CAPACITY: usize = 4_096;
 // The actual shared binder selects at most four caller/provider pairs. Its
@@ -238,6 +249,35 @@ pub(crate) trait JointMachineIo {
         _q: &CollectedFinishQ,
     ) -> anyhow::Result<()> {
         self.prepare_publication(lane, coordinator, raw, changed)
+    }
+
+    /// `prepare_publication` with the pass's image-acquisition
+    /// handle for the physical preparation inside it. The default
+    /// ignores the handle (test I/O prepares handle-less exactly as
+    /// before); the Session implementation forwards it.
+    fn prepare_publication_with_acquisition(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        raw: &mut RawJointQuantum,
+        engine_changed: bool,
+        _acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> anyhow::Result<()> {
+        self.prepare_publication(lane, coordinator, raw, engine_changed)
+    }
+
+    /// `prepare_publication_at_q` with the acquisition handle; same
+    /// defaulting rule as `prepare_publication_with_acquisition`.
+    fn prepare_publication_at_q_with_acquisition(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        raw: &mut RawJointQuantum,
+        changed: bool,
+        q: &CollectedFinishQ,
+        _acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> anyhow::Result<()> {
+        self.prepare_publication_at_q(lane, coordinator, raw, changed, q)
     }
 
     #[allow(clippy::too_many_arguments)] // Original candidate and actual Q remain separate borrowed authority.
@@ -1456,7 +1496,10 @@ impl LiveJointMachine {
                 return Ok(JointCommitProgress::Pending);
             }
             let phase = self.phase.take().expect("retained original Finish phase");
-            let (phase, progress) = self.advance(phase, lane, coordinator, io, budget, Some(q));
+            // Finish prepares handle-less by construction: the run
+            // is ending and no loop handle reaches this driver.
+            let (phase, progress) =
+                self.advance(phase, lane, coordinator, io, budget, Some(q), None);
             self.phase = Some(phase);
             match progress {
                 Ok(Step::Published) => {
@@ -1772,6 +1815,17 @@ impl LiveJointMachine {
         io: &mut I,
         budget: &mut JointWorkBudget,
     ) -> Result<JointCommitProgress, SemanticRefusal> {
+        self.poll_commit_with_io_and_acquisition(lane, coordinator, io, budget, None)
+    }
+
+    pub(crate) fn poll_commit_with_io_and_acquisition<I: JointMachineIo>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        io: &mut I,
+        budget: &mut JointWorkBudget,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<JointCommitProgress, SemanticRefusal> {
         self.validate_owner(lane, coordinator, io)?;
         if matches!(self.demand, Some(Demand::Published(_))) {
             return Ok(self.take_published());
@@ -1779,7 +1833,14 @@ impl LiveJointMachine {
         if self.demand.is_none() {
             return Ok(JointCommitProgress::Pending);
         }
-        self.service_with_io(lane, coordinator, io, JointServiceMode::Running, budget)?;
+        self.service_with_io_and_acquisition(
+            lane,
+            coordinator,
+            io,
+            JointServiceMode::Running,
+            budget,
+            acquisition,
+        )?;
         Ok(self.take_published())
     }
 
@@ -1798,8 +1859,20 @@ impl LiveJointMachine {
         lane: &mut AttestedSemanticLane,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         io: &mut I,
+        mode: JointServiceMode,
+        budget: &mut JointWorkBudget,
+    ) -> Result<JointServiceProgress, SemanticRefusal> {
+        self.service_with_io_and_acquisition(lane, coordinator, io, mode, budget, None)
+    }
+
+    pub(crate) fn service_with_io_and_acquisition<I: JointMachineIo>(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        io: &mut I,
         _mode: JointServiceMode,
         budget: &mut JointWorkBudget,
+        mut acquisition: Option<&mut dyn ImageAcquisition>,
     ) -> Result<JointServiceProgress, SemanticRefusal> {
         self.validate_owner(lane, coordinator, io)?;
         if self.finish.is_some()
@@ -1832,7 +1905,15 @@ impl LiveJointMachine {
         }
         while budget.available() {
             let phase = self.phase.take().expect("one original machine phase");
-            let (phase, result) = self.advance(phase, lane, coordinator, io, budget, None);
+            let (phase, result) = self.advance(
+                phase,
+                lane,
+                coordinator,
+                io,
+                budget,
+                None,
+                reborrow_acquisition(&mut acquisition),
+            );
             self.phase = Some(phase);
             match result {
                 Ok(Step::Continue) => {}
@@ -2319,6 +2400,7 @@ impl LiveJointMachine {
 
     #[allow(clippy::too_many_arguments)] // Disjoint canonical owners plus one finite shared budget.
     #[allow(clippy::result_large_err)] // Native callbacks return the original proof/frame without allocating.
+    #[allow(clippy::too_many_arguments)] // The acquisition handle joins the existing borrowed authority set.
     fn advance<I: JointMachineIo>(
         &mut self,
         phase: Phase,
@@ -2327,6 +2409,7 @@ impl LiveJointMachine {
         io: &mut I,
         budget: &mut JointWorkBudget,
         q: Option<&CollectedFinishQ>,
+        acquisition: Option<&mut dyn ImageAcquisition>,
     ) -> (Phase, Result<Step, SemanticRefusal>) {
         match phase {
             phase @ (Phase::FinishStopReady(_) | Phase::FinishStopReport { .. }) => {
@@ -2692,14 +2775,21 @@ impl LiveJointMachine {
                 };
                 budget.spend(1);
                 let prepared = match q {
-                    Some(q) => io.prepare_publication_at_q(
+                    Some(q) => io.prepare_publication_at_q_with_acquisition(
                         lane,
                         coordinator,
                         &mut original.raw,
                         changed,
                         q,
+                        acquisition,
                     ),
-                    None => io.prepare_publication(lane, coordinator, &mut original.raw, changed),
+                    None => io.prepare_publication_with_acquisition(
+                        lane,
+                        coordinator,
+                        &mut original.raw,
+                        changed,
+                        acquisition,
+                    ),
                 };
                 retain_on_refusal!(Phase::PreparationAttempted(original), prepared);
                 if q.is_some() && original.attempted == 0 && coordinator.collected_stop_candidate()
@@ -3683,6 +3773,24 @@ impl JointMachineIo for SessionMachineIo {
         coordinator.prepare_joint_publication(engine_changed, lane, raw, &self.producers)
     }
 
+    fn prepare_publication_with_acquisition(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        raw: &mut RawJointQuantum,
+        engine_changed: bool,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> anyhow::Result<()> {
+        self.live(lane).map_err(anyhow::Error::msg)?;
+        coordinator.prepare_joint_publication_with_acquisition(
+            engine_changed,
+            lane,
+            raw,
+            &self.producers,
+            acquisition,
+        )
+    }
+
     fn tick_collected_at_q(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -3704,6 +3812,25 @@ impl JointMachineIo for SessionMachineIo {
     ) -> anyhow::Result<()> {
         self.live_at_q(lane, q).map_err(anyhow::Error::msg)?;
         coordinator.prepare_joint_publication(changed, lane, raw, &self.producers)
+    }
+
+    fn prepare_publication_at_q_with_acquisition(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        raw: &mut RawJointQuantum,
+        changed: bool,
+        q: &CollectedFinishQ,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> anyhow::Result<()> {
+        self.live_at_q(lane, q).map_err(anyhow::Error::msg)?;
+        coordinator.prepare_joint_publication_with_acquisition(
+            changed,
+            lane,
+            raw,
+            &self.producers,
+            acquisition,
+        )
     }
 
     #[allow(clippy::too_many_arguments)] // Delegate the same original candidate/negative/native subject to Capture.
@@ -4125,12 +4252,29 @@ impl AttestedSemanticLane {
         mode: JointServiceMode,
         budget: &mut JointWorkBudget,
     ) -> Result<JointServiceProgress, SemanticRefusal> {
+        self.service_joint_with_acquisition(coordinator, mode, budget, None)
+    }
+
+    pub(crate) fn service_joint_with_acquisition(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        mode: JointServiceMode,
+        budget: &mut JointWorkBudget,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<JointServiceProgress, SemanticRefusal> {
         #[cfg(test)]
         {
             self.joint_service_calls += 1;
         }
-        self.with_machine(coordinator, |machine, lane, coordinator, io| {
-            machine.service_with_io(lane, coordinator, io, mode, budget)
+        self.with_machine(coordinator, move |machine, lane, coordinator, io| {
+            machine.service_with_io_and_acquisition(
+                lane,
+                coordinator,
+                io,
+                mode,
+                budget,
+                acquisition,
+            )
         })
     }
 
@@ -4159,6 +4303,15 @@ impl AttestedSemanticLane {
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         budget: &mut JointWorkBudget,
     ) -> Result<JointCommitProgress, SemanticRefusal> {
+        self.poll_joint_commit_with_acquisition(coordinator, budget, None)
+    }
+
+    pub(crate) fn poll_joint_commit_with_acquisition(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        budget: &mut JointWorkBudget,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<JointCommitProgress, SemanticRefusal> {
         #[cfg(test)]
         if let Some(scripted) = self
             .scripted_commit_poll_queue
@@ -4169,8 +4322,8 @@ impl AttestedSemanticLane {
             // conversion owns the verdict for commit refusals.
             return scripted;
         }
-        self.with_machine(coordinator, |machine, lane, coordinator, io| {
-            machine.poll_commit_with_io(lane, coordinator, io, budget)
+        self.with_machine(coordinator, move |machine, lane, coordinator, io| {
+            machine.poll_commit_with_io_and_acquisition(lane, coordinator, io, budget, acquisition)
         })
     }
 }

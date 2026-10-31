@@ -145,6 +145,13 @@ struct Owner {
     /// authority and publish nothing; anything still staged at a
     /// failure releases instead of activating.
     staged: bool,
+    /// An active owner whose scoped refresh candidate is being
+    /// prepared for the permit-backed commit: the scope check defers
+    /// to that proof exactly like a staged provisional, generic
+    /// commit entries refuse the record while the flag stands, and
+    /// every abandon path clears it. Never set together with
+    /// `staged`.
+    scoped_refresh: bool,
     revision: u64,
     requested_epoch: u64,
     serviced_epoch: u64,
@@ -362,6 +369,7 @@ impl Engine {
             Owner {
                 image,
                 staged: false,
+                scoped_refresh: false,
                 revision: 0,
                 requested_epoch: 0,
                 serviced_epoch: 0,
@@ -408,6 +416,7 @@ impl Engine {
             Owner {
                 image,
                 staged: true,
+                scoped_refresh: false,
                 revision: 0,
                 requested_epoch: 0,
                 serviced_epoch: 0,
@@ -464,7 +473,7 @@ impl Engine {
         }
         // The record stays staged through the commit: the staged scope
         // exception carries it, and a failed commit releases below.
-        let commit = match self.commit_preflighted_reconciliation(preflighted, guard) {
+        let commit = match self.commit_preflighted_reconciliation_scoped(preflighted, guard) {
             Ok(commit) => commit,
             Err(error) => {
                 return match self.abandon_staged_owner(owner, lease) {
@@ -513,6 +522,227 @@ impl Engine {
             (Ok(()), Err(error)) => Err(error),
             (Err(first), Err(second)) => Err(anyhow!("{first:#}; and {second:#}")),
         }
+    }
+
+    /// Begin one scoped refresh of an active owner: mark the record
+    /// as a scoped-refresh candidate (its scope proof now defers to
+    /// the permit-backed refresh commit) and return its proven image
+    /// with the retained view pin for the fresh observation. Refuses
+    /// staged provisionals, leased owners, owners whose image
+    /// already changed, and a second concurrent begin; a refused
+    /// begin sets nothing.
+    pub(crate) fn begin_scoped_owner_refresh(
+        &mut self,
+        owner: ProcessViewId,
+    ) -> Result<(BoundImage, Arc<PidPin>)> {
+        self.note_graph_inputs_mutated();
+        let state = self.inventory_state()?;
+        let record = state
+            .owners
+            .get(&owner)
+            .ok_or_else(|| anyhow!("scoped refresh owner is not retained"))?;
+        if record.staged {
+            bail!("scoped refresh names a staged provisional; only active owners refresh");
+        }
+        if record.scoped_refresh {
+            bail!("scoped refresh is already in progress for this owner");
+        }
+        if record.image_state == ImageCheck::Changed {
+            bail!("scoped refresh owner image already changed; existing claims retained");
+        }
+        if state.leases.contains_key(&owner) {
+            bail!("scoped refresh owner already holds a scan lease");
+        }
+        let image = record.image;
+        let pin = Arc::clone(
+            self.views
+                .iter()
+                .find(|view| view.id() == owner)
+                .ok_or_else(|| anyhow!("scoped refresh owner has no retained view"))?
+                .retained_pin_arc(),
+        );
+        self.inventory
+            .as_mut()
+            .expect("checked Inventory state")
+            .owners
+            .get_mut(&owner)
+            .expect("checked refresh owner")
+            .scoped_refresh = true;
+        Ok((image, pin))
+    }
+
+    /// Abandon one prepared scoped refresh that cannot commit: clear
+    /// the candidate flag and release the scan lease when one was
+    /// acquired. The owner and its prior facts stand; only the
+    /// prepared candidate dies. A record that is already gone (a
+    /// racing release) abandons quietly, like lease release would.
+    pub(crate) fn abandon_scoped_owner_refresh(
+        &mut self,
+        owner: ProcessViewId,
+        lease: Option<&ScanLease>,
+    ) -> Result<()> {
+        if let Some(state) = self.inventory.as_mut()
+            && let Some(record) = state.owners.get_mut(&owner)
+        {
+            record.scoped_refresh = false;
+        }
+        match lease {
+            Some(lease) => self.release_inventory_scan(lease),
+            None => Ok(()),
+        }
+    }
+
+    /// Commit one prepared scoped refresh under the permit-backed
+    /// proof: bounded pure work only, mirroring
+    /// `activate_staged_owner` without the staged flip or any
+    /// authority installation. Validates the retained view's pid and
+    /// liveness against the proof and commits the preflighted
+    /// reconciliation through the passed replay guard over the
+    /// stored observation (no provider I/O). The candidate flag
+    /// clears and the scan lease releases on every path; a refused
+    /// commit retains the owner and its prior facts.
+    pub(crate) fn commit_scoped_owner_refresh(
+        &mut self,
+        owner: ProcessViewId,
+        preflighted: PreflightedReconciliation,
+        lease: &ScanLease,
+        proof: &crate::discovery::caller_registry::ScopedOwnerProof<'_>,
+        guard: &mut dyn ImageGuard,
+    ) -> Result<InventoryCommit> {
+        self.note_graph_inputs_mutated();
+        let result = (|| {
+            if !self
+                .inventory_state()?
+                .owners
+                .get(&owner)
+                .is_some_and(|record| !record.staged && record.scoped_refresh)
+            {
+                bail!("inventory owner is not an active scoped refresh candidate");
+            }
+            let view = self
+                .views
+                .iter()
+                .find(|view| view.id() == owner)
+                .ok_or_else(|| anyhow!("scoped refresh owner has no retained view"))?;
+            if view.pid() != proof.pid() || !view.still_the_same() {
+                bail!("scoped refresh owner liveness or pid changed at refresh commit");
+            }
+            self.commit_preflighted_reconciliation_scoped(preflighted, guard)
+        })();
+        let release = self.abandon_scoped_owner_refresh(owner, Some(lease));
+        match (result, release) {
+            (Ok(commit), Ok(())) => Ok(commit),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    /// Release one active scoped owner (suspend teardown): rebuild
+    /// the remaining owners' facts as the new current state, then
+    /// drop the owner record, its view, and its ID occupancy, so
+    /// owners-map, view-ID, and claim-reference capacity all return.
+    /// Refuses staged provisionals (they release through the staged
+    /// path) and leased owners; a refused release changes nothing
+    /// (the candidate rebuild is fallible before any mutation).
+    pub(crate) fn release_scoped_owner(&mut self, owner: ProcessViewId) -> Result<()> {
+        self.note_graph_inputs_mutated();
+        self.inventory_state()?;
+        {
+            let state = self.inventory.as_ref().expect("checked Inventory state");
+            let record = state
+                .owners
+                .get(&owner)
+                .ok_or_else(|| anyhow!("scoped release owner is not retained"))?;
+            if record.staged {
+                bail!(
+                    "scoped release names a staged provisional; staged owners release through the staged path"
+                );
+            }
+            if state.leases.contains_key(&owner) {
+                bail!("scoped release owner holds a scan lease; release refused");
+            }
+        }
+        let mut pinned = self.pinned.clone();
+        pinned.remove_view(owner);
+        let modules: Vec<_> = self
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view != owner)
+            .map(|module| module.scanned.clone())
+            .collect();
+        let mut candidate = self.live_candidate(pinned, modules, Vec::new())?;
+        self.preflight_candidate_publication(&candidate)?;
+        record_object_skips(&mut candidate.plan, &self.counters.object_skips);
+        self.pinned = candidate.pinned;
+        self.modules = candidate.modules;
+        self.plan = candidate.plan;
+        self.note_facts_mutated();
+        for binding in self.selection_bindings.values_mut() {
+            if let Some(module) = self
+                .plan
+                .modules
+                .iter()
+                .find(|module| module.object == binding.object)
+            {
+                binding.provider = module.id;
+            }
+        }
+        self.counters.corroboration = candidate.corroboration;
+        self.counters.manifest_fallbacks = candidate.manifest_fallbacks;
+        self.selection_claims = candidate.selection_claims;
+        self.selection_tables = candidate.selection_tables;
+        let state = self.inventory.as_mut().expect("checked Inventory state");
+        state.owners.remove(&owner);
+        state.leases.remove(&owner);
+        self.views.retain(|view| view.id() != owner);
+        self.release_view_id(owner);
+        Ok(())
+    }
+
+    /// The proven image an active owner was retained under (suspend
+    /// cancels exactly this installed authority).
+    pub(crate) fn inventory_owner_image(&self, owner: ProcessViewId) -> Result<BoundImage> {
+        Ok(self
+            .inventory_state()?
+            .owners
+            .get(&owner)
+            .ok_or_else(|| anyhow!("inventory owner is no longer retained"))?
+            .image)
+    }
+
+    /// Whether the owner's checked image already ended (`Changed`):
+    /// the coordinator routes such owners to suspend instead of any
+    /// further scan.
+    pub(crate) fn inventory_owner_image_changed(&self, owner: ProcessViewId) -> Result<bool> {
+        Ok(self
+            .inventory_state()?
+            .owners
+            .get(&owner)
+            .ok_or_else(|| anyhow!("inventory owner is no longer retained"))?
+            .image_state
+            == ImageCheck::Changed)
+    }
+
+    /// Refresh epochs for candidate ordering: (requested, serviced).
+    /// A serviced epoch behind the requested one is a pending
+    /// refresh.
+    pub(crate) fn inventory_refresh_epochs(&self, owner: ProcessViewId) -> Result<(u64, u64)> {
+        let record = self
+            .inventory_state()?
+            .owners
+            .get(&owner)
+            .ok_or_else(|| anyhow!("inventory owner is no longer retained"))?;
+        Ok((record.requested_epoch, record.serviced_epoch))
+    }
+
+    /// Whether any owner still carries the scoped-refresh candidate
+    /// flag: the coordinator asserts this is false at each scoped
+    /// publication's end, so a missed abandon path cannot strand an
+    /// owner behind the generic-commit refusal.
+    pub(crate) fn scoped_refresh_in_progress(&self) -> bool {
+        self.inventory
+            .as_ref()
+            .is_some_and(|state| state.owners.values().any(|record| record.scoped_refresh))
     }
 
     pub(crate) fn acquire_inventory_scan(&mut self, owner: ProcessViewId) -> Result<ScanLease> {
@@ -657,8 +887,10 @@ impl Engine {
         }
         // A staged provisional defers its scope proof to the
         // permit-backed activation commit; it publishes nothing
-        // before. `inventory_scope_contains` itself is not weakened.
-        let staged_provisional = owner.staged;
+        // before. An active scoped-refresh candidate defers the same
+        // way to its permit-backed refresh commit.
+        // `inventory_scope_contains` itself is not weakened.
+        let staged_provisional = owner.staged || owner.scoped_refresh;
         let view = self
             .views
             .iter()
@@ -985,8 +1217,27 @@ impl Engine {
         guard: &mut dyn ImageGuard,
     ) -> Result<InventoryCommit> {
         self.note_graph_inputs_mutated();
+        self.refuse_scoped_refresh_owner(prepared.identity.owner)?;
         self.revalidate_inventory_reconciliation(&prepared, guard)?;
         self.commit_validated_reconciliation(prepared)
+    }
+
+    /// A scoped-refresh candidate publishes only through its
+    /// permit-backed proof entry: generic commit entries refuse it
+    /// while the flag stands, before any boundary check can mutate
+    /// its image state.
+    fn refuse_scoped_refresh_owner(&self, owner: ProcessViewId) -> Result<()> {
+        if self
+            .inventory_state()?
+            .owners
+            .get(&owner)
+            .is_some_and(|record| record.scoped_refresh)
+        {
+            bail!(
+                "inventory owner is a scoped refresh candidate; only the permit-backed refresh commit may publish it"
+            );
+        }
+        Ok(())
     }
 
     /// Seal a prepared reconciliation for the scoped permit-backed
@@ -1017,7 +1268,24 @@ impl Engine {
     /// then applies the candidate. The provider pins stand on their
     /// pre-sample preflight seal — no `check_unchanged` runs here —
     /// while the generic entry above keeps its own boundary check.
+    // No generic caller remains: activation and refresh commit
+    // through their proof entries below. The entry stays as the
+    // refusal boundary any future generic caller must cross.
+    #[allow(dead_code)]
     pub(crate) fn commit_preflighted_reconciliation(
+        &mut self,
+        preflighted: PreflightedReconciliation,
+        guard: &mut dyn ImageGuard,
+    ) -> Result<InventoryCommit> {
+        self.note_graph_inputs_mutated();
+        self.refuse_scoped_refresh_owner(preflighted.prepared.identity.owner)?;
+        self.commit_preflighted_reconciliation_scoped(preflighted, guard)
+    }
+
+    /// The scoped apply itself, reached only through the
+    /// permit-backed activation and refresh proof entries (the
+    /// generic entry above refuses scoped-refresh candidates).
+    fn commit_preflighted_reconciliation_scoped(
         &mut self,
         preflighted: PreflightedReconciliation,
         guard: &mut dyn ImageGuard,

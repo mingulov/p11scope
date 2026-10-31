@@ -107,6 +107,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         raw: &mut RawJointQuantum,
         producers: &SessionDrainProducers,
     ) -> Result<()> {
+        self.prepare_joint_publication_with_acquisition(engine_changed, lane, raw, producers, None)
+    }
+
+    /// `prepare_joint_publication` with the pass's image-acquisition
+    /// handle threaded to the physical preparation inside it: the
+    /// running Joint machine prepares scoped owners through the
+    /// same handle as the plain path. Finish preparation passes
+    /// `None` (the run is ending; the standing disclosure names it).
+    pub(crate) fn prepare_joint_publication_with_acquisition(
+        &mut self,
+        engine_changed: bool,
+        lane: &mut AttestedSemanticLane,
+        raw: &mut RawJointQuantum,
+        producers: &SessionDrainProducers,
+        acquisition: Option<
+            &mut dyn crate::discovery::engine::inventory::image_guard::ImageAcquisition,
+        >,
+    ) -> Result<()> {
         raw.validate_preparation(self.joint_capture.adapter(), producers)
             .map_err(|reason| anyhow::anyhow!("Joint preparation original refused: {reason:?}"))?;
         if lane.domain() != producers.native_domain() || !lane.is_live() || lane.is_finished() {
@@ -136,13 +154,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .map_err(|reason| anyhow::anyhow!("Joint completion storage refused: {reason:?}"))?;
         self.registry
             .begin_joint_publication(raw, &self.joint_capture, producers)?;
-        let completion = match self.prepare_physical_publication(engine_changed, Some(lane)) {
-            Ok(completion) => completion,
-            Err(reason) => {
-                self.registry.cancel_unapplied_joint_publication();
-                return Err(reason);
-            }
-        };
+        let completion =
+            match self.prepare_physical_publication(engine_changed, Some(lane), acquisition) {
+                Ok(completion) => completion,
+                Err(reason) => {
+                    self.registry.cancel_unapplied_joint_publication();
+                    return Err(reason);
+                }
+            };
         self.observe_pending_h0_images();
         let cut_barrier = self.finalize_physical_tail(lane, Some(raw));
         self.joint_publication = Some(PendingJointPublication {
@@ -178,6 +197,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 remaining,
                 finish: None,
             }),
+            None,
         )
     }
 
@@ -203,6 +223,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 remaining,
                 finish: None,
             }),
+            None,
         )
     }
 
@@ -231,6 +252,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     completed,
                 }),
             }),
+            None,
         )
     }
 

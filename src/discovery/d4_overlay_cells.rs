@@ -2649,3 +2649,144 @@ fn anchor_range(child: &SwapChild) -> (u64, u64) {
 fn target_range(child: &SwapChild) -> (u64, u64) {
     (child.address, child.address + 4096)
 }
+
+/// P-EXP capture-K1 gate experiment: can the shared kernel original-file
+/// query, invoked from the deep-scan guard shape with a same-scan
+/// observer-held anchor, refuse a stale-lower target in the B16 direction
+/// while joining a fresh-upper target — on lane B? Experiment code only;
+/// production K1 is Stage P work. Reuse-first at n=1 through the existing
+/// sweep custody machinery (pattern: `d4_overlay_kernel_attribution_for_pid`).
+///
+/// The current deep-scan join rule, mirrored test-locally (production
+/// `mapped_file_guard` compares the same `(dev, ino)` pair per range and
+/// joins on equality). The wrapper twins below pin what it does in the
+/// B16 direction; the K1 driver (next commit) dispatches past it.
+fn k1_legacy_guard(expected: FileIdentity, mapped: FileIdentity) -> bool {
+    expected == mapped
+}
+
+/// The witness-requiring predicate (named testable rule): on lane B, when
+/// the observer-held file lives on overlayfs — or its filesystem cannot be
+/// proven otherwise (unreadable statfs fails closed) — and a target range's
+/// `(dev, ino)` equals the held file's, the join requires a kernel
+/// original-file verdict. Everywhere else today's guard stands unchanged:
+/// lane A separates by key already, other filesystems have no copy-up
+/// staleness, and an already-unequal `(dev, ino)` keeps refusing without
+/// spending witness budget. This is not `overlay_identity_equal` (the
+/// collapse heuristic); it names where the R-41 hole joins.
+fn k1_witness_required(
+    lane: OverlayLane,
+    held: MappedFile,
+    target: FileIdentity,
+) -> bool {
+    lane == OverlayLane::B
+        && target == held.identity
+        && held.fs_magic.is_none_or(|magic| {
+            magic == p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC
+        })
+}
+
+/// B16-direction synthetic vectors on lane B: the observer holds the
+/// post-copy-up (upper) file while the stable overlay inode renders the
+/// stale pre-copy-up (lower) mapping and the fresh post-copy-up (upper)
+/// mapping identically. `(dev, ino)` cannot separate them by construction.
+fn k1_b16_vectors() -> (MappedFile, FileIdentity, FileIdentity) {
+    let held = MappedFile {
+        identity: FileIdentity { dev: 42, ino: 7 },
+        fs_magic: Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+    };
+    let stale_lower = FileIdentity { dev: 42, ino: 7 };
+    let fresh_upper = FileIdentity { dev: 42, ino: 7 };
+    (held, stale_lower, fresh_upper)
+}
+
+/// The predicate requires the witness exactly on the lane-B overlay
+/// would-join shape, and nowhere else.
+#[test]
+fn k1_predicate_requires_witness_only_on_the_overlay_join_shape() {
+    let (held, stale, fresh) = k1_b16_vectors();
+    assert!(
+        k1_witness_required(OverlayLane::B, held, stale),
+        "stale lower under the stable inode requires the witness"
+    );
+    assert!(
+        k1_witness_required(OverlayLane::B, held, fresh),
+        "fresh upper under the stable inode requires the witness too"
+    );
+    let other = FileIdentity { dev: 42, ino: 9 };
+    assert!(
+        !k1_witness_required(OverlayLane::B, held, other),
+        "an already-unequal (dev, ino) keeps refusing without the witness"
+    );
+    let ext4 = MappedFile {
+        identity: held.identity,
+        fs_magic: Some(0xef53),
+    };
+    assert!(
+        !k1_witness_required(OverlayLane::B, ext4, stale),
+        "non-overlay keys keep today's guard untouched"
+    );
+    assert!(
+        !k1_witness_required(OverlayLane::A, held, stale),
+        "lane A separates by key already"
+    );
+    let unknown_fs = MappedFile {
+        identity: held.identity,
+        fs_magic: None,
+    };
+    assert!(
+        k1_witness_required(OverlayLane::B, unknown_fs, stale),
+        "unreadable statfs fails closed: overlay cannot be excluded"
+    );
+}
+
+/// Characterization (stays green): the current guard joins the stale
+/// lower mapping — the R-41 hole through the guard shape.
+#[test]
+fn k1_legacy_guard_joins_stale_lower_characterization() {
+    let (held, stale, _) = k1_b16_vectors();
+    assert!(
+        k1_legacy_guard(held.identity, stale),
+        "current (dev, ino) guard joins the stale lower mapping"
+    );
+}
+
+/// Characterization (stays green): the current guard joins the fresh
+/// upper mapping — the exactness the witness must preserve.
+#[test]
+fn k1_legacy_guard_joins_fresh_upper_characterization() {
+    let (held, _, fresh) = k1_b16_vectors();
+    assert!(
+        k1_legacy_guard(held.identity, fresh),
+        "current (dev, ino) guard joins the fresh upper mapping"
+    );
+}
+
+/// Stale-negative twin (RED against the wrapper): the B16-direction stale
+/// lower target must refuse. Fails while the guard is `(dev, ino)`-only.
+#[test]
+fn k1_deep_scan_stale_lower_refuses() {
+    let (held, stale, _) = k1_b16_vectors();
+    assert!(
+        k1_witness_required(OverlayLane::B, held, stale),
+        "the stale shape requires the witness"
+    );
+    assert!(
+        !k1_legacy_guard(held.identity, stale),
+        "stale lower must refuse, never join the held upper file"
+    );
+}
+
+/// Fresh-positive twin (green baseline): the fresh upper target joins.
+#[test]
+fn k1_deep_scan_fresh_upper_joins() {
+    let (held, _, fresh) = k1_b16_vectors();
+    assert!(
+        k1_witness_required(OverlayLane::B, held, fresh),
+        "the fresh shape requires the witness"
+    );
+    assert!(
+        k1_legacy_guard(held.identity, fresh),
+        "fresh upper joins the held upper file"
+    );
+}

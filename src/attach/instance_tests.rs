@@ -2149,10 +2149,7 @@ fn privileged_instance_b17_drain_yields_identity_once_live() -> Result<()> {
         .refresh(&mut harness.session, target.pin.clone(), 0)?;
     let elapsed = started.elapsed().as_nanos();
     ensure!(
-        report
-            .observations
-            .iter()
-            .any(|outcome| *outcome == ObserveOutcome::Continued),
+        report.observations.contains(&ObserveOutcome::Continued),
         "post-churn scan observed no continuation: {report:?}"
     );
     ensure!(
@@ -2185,10 +2182,7 @@ fn privileged_instance_b17_drain_yields_identity_once_live() -> Result<()> {
         .refresh(&mut harness.session, target.pin.clone(), 0)?;
     let elapsed = started.elapsed().as_nanos();
     ensure!(
-        refresh
-            .observations
-            .iter()
-            .any(|outcome| *outcome == ObserveOutcome::Continued),
+        refresh.observations.contains(&ObserveOutcome::Continued),
         "refresh observed no continuation: {refresh:?}"
     );
     ensure!(

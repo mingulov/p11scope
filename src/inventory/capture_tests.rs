@@ -11,6 +11,7 @@ use crate::attach::capture::{
 use crate::discovery::caller_registry::tests::ScriptedSource;
 use crate::discovery::caller_registry::{CallerId, ExeIdentity, RegistryLimits, UseCoverage};
 use crate::discovery::engine::inventory::UnavailableImageGuard;
+use crate::discovery::engine::inventory::image_guard::{ImageAcquisition, ScriptedAcquisition};
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::inventory_attach_set::AttachEndpoint;
 use crate::discovery::inventory_attach_set::tests as fx;
@@ -488,6 +489,10 @@ struct ScriptedLane {
     services: usize,
     /// The actual deadlines passed through the native I/O boundary.
     io_deadlines: Rc<RefCell<Vec<(&'static str, Instant)>>>,
+    /// Scripted image acquisition handed to the driver while
+    /// `acquisition_active` (the production facade's Active state).
+    acquisition: Option<ScriptedAcquisition>,
+    acquisition_active: bool,
 }
 
 impl Drop for ScriptedLane {
@@ -534,6 +539,8 @@ impl ScriptedLane {
             drain_high_water_bytes: Vec::new(),
             services: 0,
             io_deadlines: Rc::default(),
+            acquisition: None,
+            acquisition_active: false,
         }
     }
 
@@ -569,6 +576,16 @@ impl NativeIdentity<Pin> for ScriptedLane {
 impl CaptureLane<Pin> for ScriptedLane {
     fn domain(&self) -> NativeDomainId {
         self.domain
+    }
+
+    fn image_acquisition(&mut self) -> Option<&mut dyn ImageAcquisition> {
+        if self.acquisition_active {
+            self.acquisition
+                .as_mut()
+                .map(|acquisition| acquisition as &mut dyn ImageAcquisition)
+        } else {
+            None
+        }
     }
 
     fn scope_coverage(&self) -> CaptureScopeCoverage {
@@ -815,6 +832,10 @@ struct Scene {
     staged_lifecycle: Vec<u64>,
     /// Every staged witness batch's refreshed-count size, in staging order.
     staged_counts: Vec<usize>,
+    /// Acquisition domains the loop forwarded to commit polls, in order.
+    poll_acquisitions: Vec<Option<NativeDomainId>>,
+    /// Acquisition domains the loop forwarded to ticks, in order.
+    tick_acquisitions: Vec<Option<NativeDomainId>>,
 }
 
 impl Scene {
@@ -844,6 +865,8 @@ impl Scene {
             collect_gate: None,
             staged_lifecycle: Vec::new(),
             staged_counts: Vec::new(),
+            poll_acquisitions: Vec::new(),
+            tick_acquisitions: Vec::new(),
         }
     }
 
@@ -1098,6 +1121,23 @@ impl PassDriver<Pin> for Scene {
     fn commit(&mut self, engine_changed: bool) -> Result<()> {
         self.note("commit");
         self.coordinator.commit_batch(engine_changed).map(|_| ())
+    }
+
+    fn poll_commit_with_acquisition(
+        &mut self,
+        engine_changed: bool,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<PassCommitProgress> {
+        self.poll_acquisitions
+            .push(acquisition.map(|handle| handle.acquisition_domain()));
+        self.commit(engine_changed)?;
+        Ok(PassCommitProgress::Published)
+    }
+
+    fn on_tick_with_acquisition(&mut self, acquisition: Option<&mut dyn ImageAcquisition>) {
+        self.tick_acquisitions
+            .push(acquisition.map(|handle| handle.acquisition_domain()));
+        self.on_tick();
     }
 
     fn on_tick(&mut self) {
@@ -2961,6 +3001,66 @@ fn the_ring_is_serviced_before_the_display_while_a_pass_collects() {
     for tick in during.chunks(2) {
         assert_eq!(tick, ["service", "display"], "{log:?}");
     }
+}
+
+#[test]
+fn active_lane_handle_reaches_every_poll_and_collection_tick() {
+    // The pass loop threads the active lane's acquisition handle
+    // into every commit poll and collection tick; an inactive lane
+    // forwards no handle anywhere.
+    for active in [true, false] {
+        let log = Log::default();
+        let mut scene = Scene::new(&log);
+        let mut lane = ScriptedLane::new(&log);
+        let domain = lane.domain();
+        lane.acquisition = Some(ScriptedAcquisition::new(domain));
+        lane.acquisition_active = active;
+        let (serviced, gate) = mpsc::channel();
+        lane.serviced = Some(serviced);
+        scene.collect_gate = Some((gate, 3));
+        run_ticking(&mut scene, lane, 1, Duration::from_millis(1));
+        let expected = active.then_some(domain);
+        assert!(
+            !scene.poll_acquisitions.is_empty(),
+            "the commit poll recorded its handle (active={active})"
+        );
+        assert!(
+            scene.poll_acquisitions.iter().all(|seen| *seen == expected),
+            "every poll forwards the lane state (active={active}): {:?}",
+            scene.poll_acquisitions
+        );
+        assert!(
+            scene.tick_acquisitions.len() >= 3,
+            "the gated collection ticked (active={active}): {:?}",
+            scene.tick_acquisitions
+        );
+        assert!(
+            scene.tick_acquisitions.iter().all(|seen| *seen == expected),
+            "every tick forwards the lane state (active={active}): {:?}",
+            scene.tick_acquisitions
+        );
+    }
+}
+
+#[test]
+fn scan_lane_polls_forward_no_acquisition() {
+    // With no native lane at all, commit polls still run and carry
+    // no handle: handle-less is an explicit `None`, never a stale
+    // or invented acquisition.
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let clock = LoopClock {
+        deadline: None,
+        stop: &|| false,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let none: Option<NativeLane<ScriptedLane>> = None;
+    let stopped = run_classic(&mut scene, none, &clock, &mut |_, _| Ok(())).unwrap();
+    assert!(stopped.is_none());
+    assert_eq!(scene.poll_acquisitions, [None]);
 }
 
 #[test]

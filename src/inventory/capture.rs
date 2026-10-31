@@ -53,6 +53,7 @@ use crate::attach::capture::{
 };
 use crate::attach::{AttachBackend, BackendSelection};
 use crate::discovery::caller_registry::{CallerEvent, ProcessSource, UnknownReason, now_ns};
+use crate::discovery::engine::inventory::image_guard::ImageAcquisition;
 use crate::discovery::engine::inventory_coordinator::{
     InventoryCoordinator, NativeBatch, NativeReceipt, PassReport,
 };
@@ -384,6 +385,15 @@ pub(crate) use crate::attach::multi_functional_probe;
 /// own; `begin_stop` and `poll_retirement` hide the typestate moves.
 pub(crate) trait CaptureLane<Pin>: NativeIdentity<Pin> {
     fn domain(&self) -> NativeDomainId;
+
+    /// The lane's native image-acquisition handle while its capture
+    /// is active: the pass loop threads it into commit polls and
+    /// ticks for the duration of each call only (the capture is
+    /// serviced between calls; nothing is retained). Lanes without
+    /// an active capture answer `None` (handle-less commits).
+    fn image_acquisition(&mut self) -> Option<&mut dyn ImageAcquisition> {
+        None
+    }
     /// One serialized identity-only observation through the retained capture
     /// owner. This grants no Detailed or semantic admission authority; its
     /// one admission-adjacent consumer is the specifically approved
@@ -1863,6 +1873,26 @@ pub(crate) trait PassDriver<Pin> {
         self.commit(engine_changed)?;
         Ok(PassCommitProgress::Published)
     }
+
+    /// `poll_commit` with the active lane's image-acquisition
+    /// handle for this call: production drivers forward it to the
+    /// coordinator commit entry. The default ignores the handle and
+    /// polls as before.
+    fn poll_commit_with_acquisition(
+        &mut self,
+        engine_changed: bool,
+        _acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<PassCommitProgress> {
+        self.poll_commit(engine_changed)
+    }
+
+    /// `on_tick` with the active lane's image-acquisition handle
+    /// for this tick: services that can reach a physical
+    /// publication prepare (the Joint machine) forward it the same
+    /// way. The default ignores the handle and ticks as before.
+    fn on_tick_with_acquisition(&mut self, _acquisition: Option<&mut dyn ImageAcquisition>) {
+        self.on_tick()
+    }
     /// An earlier owned publication fences the next collected pass's apply.
     fn publication_pending(&self) -> bool {
         false
@@ -2642,7 +2672,7 @@ where
             }
             RetainedServiceCursor::Tick => {
                 run.service = RetainedServiceCursor::Poll;
-                driver.on_tick();
+                driver.on_tick_with_acquisition(retained_acquisition(&mut run.native));
                 continue;
             }
             RetainedServiceCursor::Poll => {}
@@ -2650,7 +2680,9 @@ where
 
         let mut failure: Option<(RetainedBlock, anyhow::Error, bool)> = None;
         match &mut run.pass {
-            RetainedPass::BeforeCollection => match driver.poll_commit(false) {
+            RetainedPass::BeforeCollection => match driver
+                .poll_commit_with_acquisition(false, retained_acquisition(&mut run.native))
+            {
                 Ok(PassCommitProgress::Pending) => run.service = RetainedServiceCursor::HoldNative,
                 Ok(PassCommitProgress::Published) => {
                     run.pass = RetainedPass::Terminal {
@@ -2677,7 +2709,9 @@ where
             RetainedPass::Applied { report, phase } => match *phase {
                 AppliedPassPhase::FirstCommit => {
                     *phase = AppliedPassPhase::FirstCommitAttempted;
-                    match driver.poll_commit(false) {
+                    match driver
+                        .poll_commit_with_acquisition(false, retained_acquisition(&mut run.native))
+                    {
                         Ok(PassCommitProgress::Pending) => {
                             *phase = AppliedPassPhase::FirstCommit;
                             run.service = RetainedServiceCursor::HoldNative;
@@ -2710,7 +2744,9 @@ where
                 }
                 AppliedPassPhase::ScopedReceipts => {
                     *phase = AppliedPassPhase::ScopedReceiptsAttempted;
-                    match driver.poll_commit(false) {
+                    match driver
+                        .poll_commit_with_acquisition(false, retained_acquisition(&mut run.native))
+                    {
                         Ok(PassCommitProgress::Pending) => {
                             *phase = AppliedPassPhase::ScopedReceipts;
                             run.service = RetainedServiceCursor::HoldNative;
@@ -2776,7 +2812,9 @@ where
                 }
                 RetainedTerminalPhase::ScopedStartupCommit => {
                     *phase = RetainedTerminalPhase::ScopedStartupCommitAttempted;
-                    match driver.poll_commit(false) {
+                    match driver
+                        .poll_commit_with_acquisition(false, retained_acquisition(&mut run.native))
+                    {
                         Ok(PassCommitProgress::Pending) => {
                             *phase = RetainedTerminalPhase::ScopedStartupCommit;
                             run.service = RetainedServiceCursor::HoldNative;
@@ -2876,7 +2914,9 @@ where
                 RetainedTerminalPhase::FinalCommit => {
                     *phase = RetainedTerminalPhase::FinalCommitAttempted;
                     let best_effort = run.native.is_none() && run.terminal_zero_pass.is_some();
-                    match driver.poll_commit(false) {
+                    match driver
+                        .poll_commit_with_acquisition(false, retained_acquisition(&mut run.native))
+                    {
                         Ok(PassCommitProgress::Pending) => {
                             *phase = RetainedTerminalPhase::FinalCommit;
                             run.service = RetainedServiceCursor::HoldNative;
@@ -3018,6 +3058,28 @@ fn publication_stop_cause(
     })
 }
 
+/// The running lane's acquisition handle for one driver call:
+/// `Some` exactly while the lane's capture is active.
+fn lane_acquisition<Pin, L: CaptureLane<Pin>>(
+    lane: &mut Option<NativeLane<L>>,
+) -> Option<&mut dyn ImageAcquisition> {
+    lane.as_mut()
+        .and_then(|lane| lane.capture.image_acquisition())
+}
+
+/// The retained run's acquisition handle for one disposal call,
+/// across its live/stopping/stopped lane states.
+fn retained_acquisition<Pin, L: CaptureLane<Pin>>(
+    native: &mut Option<RetainedNative<L>>,
+) -> Option<&mut dyn ImageAcquisition> {
+    match native.as_mut() {
+        Some(RetainedNative::Live(lane)) => lane.capture.image_acquisition(),
+        Some(RetainedNative::Stopping(stop)) => stop.lane.capture.image_acquisition(),
+        Some(RetainedNative::Stopped(stopped)) => stopped.capture.image_acquisition(),
+        None => None,
+    }
+}
+
 /// Pending work services the same owner but holds new native quanta under
 /// the collection bounds. It cannot stage fresh inputs into an unfinished
 /// revision. The next ordinary hook or terminal owner stages them once.
@@ -3038,7 +3100,7 @@ where
     }
     let mut schedule = TickSchedule::starting(Instant::now(), clock.tick);
     loop {
-        match driver.poll_commit(engine_changed)? {
+        match driver.poll_commit_with_acquisition(engine_changed, lane_acquisition(lane))? {
             PassCommitProgress::Published => return Ok(PublicationWait::Published),
             PassCommitProgress::Pending => engine_changed = false,
         }
@@ -3062,7 +3124,7 @@ where
         if let Some(cause) = publication_stop_cause(control, clock) {
             return Ok(PublicationWait::Stopped(cause));
         }
-        driver.on_tick();
+        driver.on_tick_with_acquisition(lane_acquisition(lane));
         if let Some(cause) = publication_stop_cause(control, clock) {
             return Ok(PublicationWait::Stopped(cause));
         }
@@ -3190,7 +3252,7 @@ where
                             lane.as_mut()
                                 .map(|lane| &mut lane.capture as &mut dyn CaptureLane<Pin>),
                         );
-                        driver.on_tick();
+                        driver.on_tick_with_acquisition(lane_acquisition(&mut lane));
                         if let Some(control) = &control {
                             latch_collection_stop(control, clock);
                         }
@@ -3449,7 +3511,7 @@ where
                         lane.as_mut()
                             .map(|lane| &mut lane.capture as &mut dyn CaptureLane<Pin>),
                     );
-                    driver.on_tick();
+                    driver.on_tick_with_acquisition(lane_acquisition(&mut lane));
                     // This is the actual between-pass producer of Pending.
                     // Do not run another native staging tick or leave through
                     // a clock/control stop before returning its same owner.
@@ -3747,9 +3809,35 @@ impl NativeIdentity<PidPin> for FacadeLane {
     }
 }
 
+/// The production acquisition handle: fresh caller-image
+/// observations come only from the active capture (retiring or
+/// retired lanes refuse), decoded through the one baseline decoder
+/// inside `observe_caller_image`.
+impl ImageAcquisition for FacadeLane {
+    fn acquisition_domain(&self) -> NativeDomainId {
+        self.domain
+    }
+
+    fn acquire_caller_image(
+        &mut self,
+        original: &std::sync::Arc<PidPin>,
+        window: ReadWindow,
+    ) -> Result<crate::attach::capture::CallerImageObservation> {
+        self.observe_caller_image(original, window)
+    }
+}
+
 impl CaptureLane<PidPin> for FacadeLane {
     fn domain(&self) -> NativeDomainId {
         self.domain
+    }
+
+    fn image_acquisition(&mut self) -> Option<&mut dyn ImageAcquisition> {
+        if matches!(self.state, FacadeState::Active(_)) {
+            Some(self)
+        } else {
+            None
+        }
     }
 
     fn observe_caller_image(

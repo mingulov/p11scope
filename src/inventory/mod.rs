@@ -21,6 +21,7 @@ use crate::discovery::caller_registry::{
 #[cfg(test)]
 use crate::discovery::caller_registry::{CallerId, MappingState, ModuleKey};
 use crate::discovery::engine::inventory::UnavailableImageGuard;
+use crate::discovery::engine::inventory::image_guard::ImageAcquisition;
 use crate::discovery::engine::inventory_coordinator::{
     InventoryCoordinator, InventoryScope, JointCommitProgress, PassReport,
 };
@@ -2357,6 +2358,45 @@ fn record_warned_for_test(line: &str) {
 
 #[cfg(test)]
 thread_local! {
+    /// The acquisition domain (or recorded `None`) the last classic
+    /// commit forwarded to the coordinator. Tests drain it through
+    /// `take_last_commit_acquisition_for_test` (thread-local, like
+    /// the commit fault above: no driver field, so no literal churn).
+    static LAST_COMMIT_ACQUISITION: std::cell::Cell<Option<Option<crate::attach::capture::NativeDomainId>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Drain the last forwarded-commit-acquisition record (tests).
+#[cfg(test)]
+fn take_last_commit_acquisition_for_test() -> Option<Option<crate::attach::capture::NativeDomainId>>
+{
+    LAST_COMMIT_ACQUISITION.with(|record| record.take())
+}
+
+/// Record the acquisition handle one classic commit forwards (tests).
+#[cfg(test)]
+fn record_commit_acquisition_for_test(acquisition: &Option<&mut dyn ImageAcquisition>) {
+    LAST_COMMIT_ACQUISITION.with(|record| {
+        record.set(Some(
+            acquisition
+                .as_ref()
+                .map(|handle| handle.acquisition_domain()),
+        ));
+    });
+}
+
+/// Reborrow an acquisition handle for one more call.
+fn reborrow_acquisition<'a, 'b: 'a>(
+    acquisition: &'a mut Option<&'b mut (dyn ImageAcquisition + 'b)>,
+) -> Option<&'a mut (dyn ImageAcquisition + 'a)> {
+    match acquisition {
+        Some(handle) => Some(&mut **handle),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
     /// Every seal-readiness line the startup noted, in order. Tests
     /// drain it through `take_sealed_for_test` (thread-local, like
     /// the warned record above: no shared sink, so no churn in the
@@ -3829,7 +3869,40 @@ impl ClassicDriver<'_> {
     /// semantic-lane stop, never a whole-capture failure: the lane is
     /// held for exit, disclosed once, and the pass commits past it
     /// and publishes, so later passes continue on the legacy path.
-    fn poll_joint_commit_path(&mut self, engine_changed: bool) -> Result<PassCommitProgress> {
+    /// The classic sync commit, forwarding the loop's acquisition
+    /// handle to the coordinator entry for this call only.
+    fn commit_with_acquisition(
+        &mut self,
+        engine_changed: bool,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        {
+            self.commit_calls += 1;
+            record_commit_acquisition_for_test(&acquisition);
+            if let Some(text) = take_classic_commit_fault_for_test() {
+                return Err(anyhow::anyhow!(text));
+            }
+        }
+        let receipt = self.coordinator.commit_batch_with_acquisition(
+            engine_changed,
+            self.semantic.as_mut(),
+            acquisition,
+        );
+        receipt.map(|_| {
+            // The staged quantum published: the next tick may stage again.
+            self.semantic_staged = false;
+            if let Some(lane) = self.semantic.as_mut() {
+                lane.note_semantic_published();
+            }
+        })
+    }
+
+    fn poll_joint_commit_path(
+        &mut self,
+        engine_changed: bool,
+        mut acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<PassCommitProgress> {
         use crate::inventory_semantics::JointCommitRefusal;
         if !self.joint_commit_pending {
             let begin = {
@@ -3840,7 +3913,10 @@ impl ClassicDriver<'_> {
                 Ok(()) => self.joint_commit_pending = true,
                 Err(JointCommitRefusal::NotInitialized) => {
                     return self
-                        .commit(engine_changed)
+                        .commit_with_acquisition(
+                            engine_changed,
+                            reborrow_acquisition(&mut acquisition),
+                        )
                         .map(|()| PassCommitProgress::Published);
                 }
                 Err(JointCommitRefusal::OutstandingRequest) => {
@@ -3854,7 +3930,11 @@ impl ClassicDriver<'_> {
                         .or(self.joint_tick_refusal)
                         .map(|refusal| refusal.code())
                         .unwrap_or("DispositionRequired");
-                    return self.hold_joint_commit_lane_and_publish(engine_changed, reason);
+                    return self.hold_joint_commit_lane_and_publish(
+                        engine_changed,
+                        reason,
+                        reborrow_acquisition(&mut acquisition),
+                    );
                 }
             }
         }
@@ -3868,14 +3948,22 @@ impl ClassicDriver<'_> {
         };
         let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
         let lane = semantic.as_mut().expect("a joint lane is seated");
-        let progress = lane.poll_joint_commit(coordinator, &mut budget);
+        let progress = lane.poll_joint_commit_with_acquisition(
+            coordinator,
+            &mut budget,
+            reborrow_acquisition(&mut acquisition),
+        );
         match progress {
             Ok(JointCommitProgress::Published(_)) => {
                 self.joint_commit_pending = false;
                 Ok(PassCommitProgress::Published)
             }
             Ok(JointCommitProgress::Pending) => Ok(PassCommitProgress::Pending),
-            Err(reason) => self.hold_joint_commit_lane_and_publish(engine_changed, reason.code()),
+            Err(reason) => self.hold_joint_commit_lane_and_publish(
+                engine_changed,
+                reason.code(),
+                reborrow_acquisition(&mut acquisition),
+            ),
         }
     }
 
@@ -3897,6 +3985,7 @@ impl ClassicDriver<'_> {
         &mut self,
         engine_changed: bool,
         reason: &str,
+        acquisition: Option<&mut dyn ImageAcquisition>,
     ) -> Result<PassCommitProgress> {
         self.snapshot_seated_summary();
         if let Some(summary) = self.seated_summary.as_mut() {
@@ -3921,7 +4010,7 @@ impl ClassicDriver<'_> {
                 "{reason}; broad inventory continues; semantic probes stay attached until exit"
             ),
         );
-        match self.commit(engine_changed) {
+        match self.commit_with_acquisition(engine_changed, acquisition) {
             Ok(()) => Ok(PassCommitProgress::Published),
             Err(error)
                 if Self::commit_hit_unfinished_joint_publication(&error, &*self.coordinator) =>
@@ -5304,32 +5393,23 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn commit(&mut self, engine_changed: bool) -> Result<()> {
-        #[cfg(test)]
-        {
-            self.commit_calls += 1;
-            if let Some(text) = take_classic_commit_fault_for_test() {
-                return Err(anyhow::anyhow!(text));
-            }
-        }
-        let receipt = match self.semantic.as_mut() {
-            Some(lane) => self
-                .coordinator
-                .commit_batch_with_semantics(engine_changed, Some(lane)),
-            None => self.coordinator.commit_batch(engine_changed),
-        };
-        receipt.map(|_| {
-            // The staged quantum published: the next tick may stage again.
-            self.semantic_staged = false;
-            if let Some(lane) = self.semantic.as_mut() {
-                lane.note_semantic_published();
-            }
-        })
+        self.commit_with_acquisition(engine_changed, None)
     }
 
     /// T18 (§9 item 3): a Joint lane publishes through its machine
     /// (begin once per publication, then poll); a legacy lane keeps
-    /// today's sync commit plus Published.
+    /// today's sync commit plus Published. The loop's acquisition
+    /// handle forwards to whichever step prepares the physical
+    /// publication (the Joint machine's prepare, or the sync commit).
     fn poll_commit(&mut self, engine_changed: bool) -> Result<PassCommitProgress> {
+        self.poll_commit_with_acquisition(engine_changed, None)
+    }
+
+    fn poll_commit_with_acquisition(
+        &mut self,
+        engine_changed: bool,
+        mut acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<PassCommitProgress> {
         // Stop already gated this lane and transferred its publication to
         // Finish. Keep that original terminal owner: a running poll rejects
         // the gated Session before Finish can publish or detach can join.
@@ -5358,9 +5438,11 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             .as_ref()
             .is_some_and(|lane| lane.has_joint_machine())
         {
-            return self.poll_joint_commit_path(engine_changed);
+            return self.poll_joint_commit_path(engine_changed, acquisition);
         }
-        if let Err(error) = self.commit(engine_changed) {
+        if let Err(error) =
+            self.commit_with_acquisition(engine_changed, reborrow_acquisition(&mut acquisition))
+        {
             // Terminal-commit wedge (soak shape): the lane is already
             // held but the coordinator still holds its unfinished
             // Joint publication, so the plain commit refuses. Name the
@@ -5402,6 +5484,10 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn on_tick(&mut self) {
+        self.on_tick_with_acquisition(None);
+    }
+
+    fn on_tick_with_acquisition(&mut self, mut acquisition: Option<&mut dyn ImageAcquisition>) {
         if let Some(display) = self.display.as_mut() {
             display.tick();
         }
@@ -5467,10 +5553,11 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 // first refusal is kept instead of dropped: it names
                 // the lane's stop if the lane later holds with no
                 // latched reason of its own.
-                if let Err(reason) = lane.service_joint(
+                if let Err(reason) = lane.service_joint_with_acquisition(
                     coordinator,
                     crate::inventory_semantics::JointServiceMode::Running,
                     &mut budget,
+                    reborrow_acquisition(&mut acquisition),
                 ) {
                     self.joint_tick_refusal.get_or_insert(reason);
                 }
@@ -5492,7 +5579,10 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 .as_ref()
                 .and_then(|lane| lane.staged_semantic_age())
                 .is_some_and(|age| age >= STAGED_SEMANTIC_MAX_AGE);
-        if stale && let Err(error) = self.commit(false) {
+        if stale
+            && let Err(error) =
+                self.commit_with_acquisition(false, reborrow_acquisition(&mut acquisition))
+        {
             self.coordinator
                 .note_scope_gap("semantic staged commit failed".into(), format!("{error:#}"));
             if let Some(lane) = self.semantic.as_mut() {
@@ -5522,7 +5612,9 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 self.coordinator.stage_semantic_batch(batch);
                 lane.note_semantic_staged();
                 if publish_now {
-                    match self.commit(false) {
+                    match self
+                        .commit_with_acquisition(false, reborrow_acquisition(&mut acquisition))
+                    {
                         Ok(()) => false,
                         Err(error) => {
                             self.coordinator.note_scope_gap(
@@ -15022,6 +15114,46 @@ mod tests {
             "a legacy commit never begins"
         );
         assert_eq!(driver.joint_commit_polls, 0, "a legacy commit never polls");
+    }
+
+    #[test]
+    fn classic_driver_forwards_acquisition_handle_to_coordinator_commit() {
+        // The production driver hands the loop's acquisition handle
+        // to the coordinator commit entry unchanged: `Some` forwards
+        // its domain, `None` stays explicitly handle-less.
+        use crate::discovery::engine::inventory::image_guard::ScriptedAcquisition;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let domain = crate::attach::capture::NativeDomainId::mint();
+        let mut acquisition = ScriptedAcquisition::new(domain);
+        let _ = take_last_commit_acquisition_for_test();
+        let outcome = driver.poll_commit_with_acquisition(true, Some(&mut acquisition));
+        assert!(
+            matches!(
+                outcome,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "the handled poll publishes"
+        );
+        assert_eq!(
+            take_last_commit_acquisition_for_test(),
+            Some(Some(domain)),
+            "the coordinator commit saw the forwarded handle"
+        );
+        let outcome = driver.poll_commit_with_acquisition(false, None);
+        assert!(
+            matches!(
+                outcome,
+                Ok(crate::inventory_capture::PassCommitProgress::Published)
+            ),
+            "the handle-less poll publishes"
+        );
+        assert_eq!(
+            take_last_commit_acquisition_for_test(),
+            Some(None),
+            "the coordinator commit saw no handle"
+        );
     }
 
     #[test]

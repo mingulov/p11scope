@@ -5028,6 +5028,123 @@ class InventoryFixtureTest(unittest.TestCase):
                 self.assertFalse(result["pass"], result)
                 self.assertTrue(any("unexpected inventory gap" in error for error in result["errors"]), result)
 
+    def cgroup_unavailable_disclosure_inputs(self):
+        # Provenance: the gap values below are asserted from the real
+        # coordinator in
+        # cgroup_native_owner_handle_transition_replaces_standing_disclosure
+        # (src/discovery/cgroup_native_owner_tests.rs, commit 33574ed7):
+        # this exact subject and reason, with caller, module, pid and
+        # budget all None, emitted on handle-less cgroup passes.
+        doc, ledgers, receipt = self.cgroup_disclosure_inputs()
+        gap = doc["gaps"][0]
+        gap["subject"] = "native owner activation unavailable"
+        gap["reason"] = "no image acquisition handle is installed; scan-pinned fallback retained"
+        for row in receipt["inventory_control"]["final_records"]:
+            if row["kind"] == "gap_recorded" and row["event"]["index"] == 0:
+                row["event"]["subject"] = gap["subject"]
+                row["event"]["reason"] = gap["reason"]
+        return doc, ledgers, receipt
+
+    def test_cgroup_unavailable_disclosure_is_recognized_with_exact_counts(self):
+        doc, ledgers, receipt = self.cgroup_unavailable_disclosure_inputs()
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["completed_operations"], 20)
+        self.assertEqual(result["physical_counted"], result["physical_entered"])
+        self.assertEqual(result["gaps"], [(row["subject"], None) for row in doc["gaps"]])
+        self.assertEqual(result["expected_disclosures"], doc["gaps"])
+
+    def test_cgroup_unavailable_disclosure_rejects_mutations(self):
+        original = self.cgroup_unavailable_disclosure_inputs()
+
+        def gap_change(data, index, field, value):
+            data[0]["gaps"][index][field] = value
+            for row in data[2]["inventory_control"]["final_records"]:
+                if row["kind"] == "gap_recorded" and row["event"]["index"] == index:
+                    row["event"][field] = value
+
+        def reseq(data):
+            for seq, row in enumerate(data[2]["inventory_control"]["final_records"]):
+                row["seq"] = seq
+
+        def missing_publication(data):
+            records = data[2]["inventory_control"]["final_records"]
+            records[:] = [row for row in records
+                          if not (row["kind"] == "gap_recorded" and row["event"]["index"] == 0)]
+            reseq(data)
+
+        def duplicate_publication(data):
+            records = data[2]["inventory_control"]["final_records"]
+            position = next(i for i, row in enumerate(records)
+                            if row["kind"] == "gap_recorded" and row["event"]["index"] == 0)
+            records.insert(position, copy.deepcopy(records[position]))
+            reseq(data)
+
+        def allowlist_bypass(data):
+            gap_change(data, 0, "reason", "different limitation")
+            data[2]["allowed_gap_subjects"].append("native owner activation unavailable")
+
+        cases = {
+            "wrong-reason": lambda d: gap_change(d, 0, "reason", "different limitation"),
+            "caller": lambda d: gap_change(d, 0, "caller", d[0]["callers"][0]["id"]),
+            "module": lambda d: gap_change(d, 0, "module", "m0"),
+            "pid": lambda d: gap_change(d, 0, "pid", d[1]["RS0"]["idents"][0]["pid"]),
+            "budget": lambda d: gap_change(d, 0, "budget", "callers"),
+            "repeats-zero": lambda d: d[0]["gaps"][0].update(repeats=0),
+            "repeats-over-passes": lambda d: d[0]["gaps"][0].update(repeats=101),
+            "extra-key": lambda d: d[0]["gaps"][0].update(extra_field=1),
+            "missing-publication": missing_publication,
+            "duplicate-publication": duplicate_publication,
+            "mismatched-publication": lambda d: next(
+                row for row in d[2]["inventory_control"]["final_records"]
+                if row["kind"] == "gap_recorded" and row["event"]["index"] == 0
+            )["event"].update(reason="other"),
+            "scope": lambda d: d[2].update(scope_kind="system"),
+            "lane": lambda d: d[0]["observation"].update(lane="scan"),
+            "filter": lambda d: d[0]["observation"]["attach"].update(scope_filter="bpf-pid"),
+            "suppressed": lambda d: d[0].update(gaps_suppressed=1),
+            "allowlist-bypass": allowlist_bypass,
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                data = copy.deepcopy(original)
+                mutate(data)
+                result = H6["evaluate_inventory_h6"](*data)
+                self.assertFalse(result["pass"], result)
+                self.assertTrue(
+                    any("unexpected inventory gap" in error for error in result["errors"]), result)
+
+    def test_cgroup_refusal_suspend_and_tail_subjects_stay_unexpected(self):
+        original = self.cgroup_unavailable_disclosure_inputs()
+
+        def set_subject(data, subject, named):
+            data[0]["gaps"][0]["subject"] = subject
+            for row in data[2]["inventory_control"]["final_records"]:
+                if row["kind"] == "gap_recorded" and row["event"]["index"] == 0:
+                    row["event"]["subject"] = subject
+            if named:
+                caller = data[0]["callers"][0]["id"]
+                pid = data[1]["RS0"]["idents"][0]["pid"]
+                data[0]["gaps"][0].update(caller=caller, pid=pid)
+                for row in data[2]["inventory_control"]["final_records"]:
+                    if row["kind"] == "gap_recorded" and row["event"]["index"] == 0:
+                        row["event"].update(caller=caller, pid=pid)
+
+        for subject, named in [
+            ("native owner activation refused", True),
+            ("native owner refresh refused", True),
+            ("native owner suspended", True),
+            ("engine tail revision failed", False),
+        ]:
+            with self.subTest(subject=subject):
+                data = copy.deepcopy(original)
+                set_subject(data, subject, named)
+                result = H6["evaluate_inventory_h6"](*data)
+                self.assertFalse(result["pass"], result)
+                self.assertTrue(any(
+                    error == f"unexpected inventory gap: {subject}"
+                    for error in result["errors"]), result)
+
     def test_recovered_successor_keeps_inherited_loss_and_exact_fixed_outcomes(self):
         doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry", fault="recovered-history")
         phase = receipt["inventory_control"]["measurements"][1]

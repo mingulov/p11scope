@@ -5773,6 +5773,17 @@ mod tests {
     /// is not pinned here (injected discovery carries no discovery
     /// evidence); discovery cells own it.
     fn counter_cli_capture_cell(mode: CounterMode) {
+        counter_cli_capture_cell_with_selection(mode, None);
+    }
+
+    /// The CLI cell plus an optional 6.15 `--select-endpoint`: the same
+    /// real path with the selection riding argv into the loop. When a
+    /// name is given, the terminal document must also carry the additive
+    /// `selected_detail` envelope with the genuine live-plan resolution
+    /// (slot, names, original pid) plus the honest host-composition seam
+    /// refusal — while the aggregate still equals the workload ledger
+    /// exactly, so selection adds no duplicate counts.
+    fn counter_cli_capture_cell_with_selection(mode: CounterMode, select: Option<&str>) {
         const STAGED: usize = 512;
         let mut parts = engine_counter_fixture();
         let first = parts.slots[..STAGED].to_vec();
@@ -5782,14 +5793,15 @@ mod tests {
         // Real argv, exactly as a user runs it (the workload PID and the
         // `-o` path are the only runtime values).
         let out_path = std::env::temp_dir().join(format!(
-            "p11scope-counter-cli-{}-{}.json",
+            "p11scope-counter-cli-{}{}-{}.json",
             mode.name(),
+            if select.is_some() { "-sel" } else { "" },
             std::process::id()
         ));
         let _cleanup = RemoveReportOnDrop(out_path.clone());
         let pid_text = pid.to_string();
         let out_text = out_path.to_string_lossy().into_owned();
-        let argv = [
+        let mut argv = vec![
             "profile",
             "--pid",
             pid_text.as_str(),
@@ -5804,9 +5816,13 @@ mod tests {
             "-o",
             out_text.as_str(),
         ];
+        if let Some(name) = select {
+            argv.extend(["--select-endpoint", name]);
+        }
         let Ok(crate::cli::Command::Profile(capture_args)) = crate::cli::parse(argv) else {
             panic!("counter argv must parse as a profile capture");
         };
+        assert_eq!(capture_args.select_endpoint.as_deref(), select);
         assert_eq!(capture_args.counter_mode, Some(mode));
         assert!(capture_args.metrics);
         assert_eq!(
@@ -5859,7 +5875,7 @@ mod tests {
                 policy,
                 duration,
                 &out_path,
-                None,
+                select,
             )
             .expect("profile loop completes"),
         );
@@ -5975,6 +5991,24 @@ mod tests {
                 }
             }
         }
+        if let Some(name) = select {
+            // 6.15: the selection resolved against the live plan (slot 7
+            // of the staged 512) and composed additively; the honest
+            // host-composition seam refusal rides the record while the
+            // aggregate above already proved exact.
+            let selected = &document["evidence"]["selected_detail"];
+            let record = &selected["selection"];
+            assert_eq!(record["endpoint"], serde_json::json!(name));
+            assert_eq!(record["slot"], serde_json::json!(7));
+            assert_eq!(record["file_offset"], serde_json::json!(offsets[7]));
+            assert_eq!(record["names"], serde_json::json!([name]));
+            assert_eq!(record["original_pid"], serde_json::json!(pid));
+            assert_eq!(record["refusal"], serde_json::json!("bundle_unavailable"));
+            assert_eq!(selected["events"], serde_json::json!([]));
+            assert!(selected.get("lineage").is_none());
+            assert!(selected.get("aggregate").is_none());
+            assert!(selected.get("detail").is_none());
+        }
         parts.fixture.command("QUIT");
         parts.fixture.expect("DONE 512");
         parts.fixture.wait_after_done();
@@ -6003,6 +6037,68 @@ mod tests {
     #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode latency to -o JSON with exact workload-ledger numbers"]
     fn counter_cli_profile_latency_matches_workload_ledger_lp64() {
         counter_cli_capture_cell(CounterMode::Latency);
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: 6.15 profile --select-endpoint counts to -o JSON with live-plan resolution plus exact workload-ledger aggregate"]
+    fn selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64() {
+        counter_cli_capture_cell_with_selection(
+            CounterMode::Counts,
+            Some("counter_bank_growth_e0007"),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires prebuilt LP64 growth fixtures as root: 6.15 selection stage against the live plan refuses system scope by name"]
+    fn selected_detail_system_scope_refuses_live_plan_lp64() {
+        // The system neighbor: the same live plan the positive
+        // resolves against refuses a system scope by name — no slot,
+        // no original, aggregate untouched (there is no capture here
+        // to disturb). The engine arms pid-scoped as in the CLI cell;
+        // only the plan's live names matter to the stage. The session
+        // starts first as in production: session start re-admits the
+        // injected plan under the Counters policy, and the stage reads
+        // the plan post-start like the capture loop does.
+        let mut parts = engine_counter_fixture();
+        let first = parts.slots[..512].to_vec();
+        let mut engine = engine_over_counter_fixture(&mut parts, first);
+        let session = engine
+            .start_session(
+                crate::attach::CapturePolicy::Counter(CounterMode::Counts),
+                None,
+                crate::attach::BackendSelection::Multi,
+            )
+            .expect("counter session starts");
+        let mut ledger = crate::metrics::selected_detail_driver::SelectionLedger::new();
+        let resolved = crate::metrics::selected_detail_driver::run_metrics_selection_stage(
+            "counter_bank_growth_e0007",
+            engine.plan(),
+            &crate::attach::Scope::System,
+            &mut ledger,
+        );
+        assert!(
+            resolved.is_none(),
+            "system scope never resolves one original"
+        );
+        let composed = crate::metrics::selected_detail_driver::with_selected_detail(
+            serde_json::json!({"evidence": {}}),
+            &ledger,
+        );
+        let record = &composed["evidence"]["selected_detail"]["selection"];
+        assert_eq!(
+            record["endpoint"],
+            serde_json::json!("counter_bank_growth_e0007")
+        );
+        assert_eq!(
+            record["refusal"],
+            serde_json::json!("promotion_scope_unsupported")
+        );
+        assert!(record.get("slot").is_none());
+        assert!(record.get("original_pid").is_none());
+        // No transcript ran: the session and engine drop, and the owned
+        // fixture drops (kill/reap) with the parts.
+        drop(session);
+        drop(engine);
     }
 
     /// Marker the owned child writes: must live where the

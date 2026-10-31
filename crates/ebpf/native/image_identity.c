@@ -74,13 +74,17 @@ static __always_inline struct control *get_control(void)
     return bpf_map_lookup_elem(&COOKIE_CTL, &key);
 }
 
+#ifndef P11SCOPE_LOADER_GATE
 /* Exact under contention: a non-fetch atomic add (result never consumed)
- * never drops an increment the way a single lost compare-exchange did. */
+ * never drops an increment the way a single lost compare-exchange did.
+ * Single-bank legacy builds only; bank builds count through the
+ * bounded saturating protocol above. */
 static __always_inline void finite_increment(u64 *counter)
 {
     if (*(volatile u64 *)counter != U64_MAX_VALUE)
         __sync_fetch_and_add(counter, 1);
 }
+#endif
 
 #ifdef P11SCOPE_LOADER_GATE
 static __always_inline struct image_bank_select *bank_select_word(void)

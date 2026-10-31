@@ -477,7 +477,7 @@ class CopyUpTest(unittest.TestCase):
         for record in userspace["edges"]:
             if record["caller"] == caller_of[PID_B_SPAN] \
                     and record["module"] == "m8":
-                record["entries"]["coverage"]["Detail"] = "x"
+                record["entries"]["coverage"]["detail"] = "x"
         with self.assertRaisesRegex(
                 AssertionError, "backends disagree on provider edges.*104"):
             check_copy_up(span_kernel=kernel, span_userspace=userspace)

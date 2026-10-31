@@ -8336,6 +8336,10 @@ fn evidence_for(
         // 6.14 Option B: `None` unless extensive mode armed; the JSON
         // key is then omitted, never null.
         gap_exe_hints: engine.gap_exe_hints().copied(),
+        // B17 W2: the capture path stages no semantic lane, so no
+        // producer feeds this yet; the key stays absent. A future
+        // lane-backed producer sets it post-hoc before the render.
+        instance_reload_not_excluded: None,
         // Design §5.7: a live-learned attach key is protected only inside a
         // confirmed pause owner's window. A nonzero debug-state hit counter is
         // what says a live window happened at all; the design forbids

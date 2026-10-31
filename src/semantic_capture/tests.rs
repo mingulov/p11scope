@@ -6649,3 +6649,308 @@ mod b17_capture_disclosure {
         );
     }
 }
+
+/// B17 W2 wire twins: the disclosure quadrant must travel from the
+/// capture report through the batch and the coordinator ledger into the
+/// v3 profile-lane evidence render. One artifact carries the churned
+/// identity's IDs plus the capture counts, with the clean control
+/// identity of the same capture absent from the key; a clean-only
+/// capture omits the key entirely (absent, never zero).
+mod b17_wire_projection {
+    use super::*;
+    use crate::attach::{BackendSelection, Scope};
+    use crate::discovery::caller_registry::{OsProcessSource, RegistryLimits};
+    use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
+    use crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset;
+    use crate::discovery::hooks::HookRegistry;
+    use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
+    use crate::inventory_semantics::{AttestedSemanticLane, SemanticBatch};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const BASE: u64 = 0x7f00_0000_0000;
+    const TEXT_OFF: u64 = 0x2000;
+    const CHURNED: ImageIdentity = ImageIdentity {
+        task_cookie: 0x51,
+        exec_id: 7,
+    };
+    const CLEAN: ImageIdentity = ImageIdentity {
+        task_cookie: 0x52,
+        exec_id: 9,
+    };
+
+    fn ranges() -> Vec<MapRange> {
+        vec![
+            MapRange::new(BASE, BASE + 0x1000, 0, false),
+            MapRange::new(BASE + 0x1000, BASE + 0x3000, 0x1000, true),
+            MapRange::new(BASE + 0x3000, BASE + 0x4000, 0x3000, false),
+        ]
+    }
+
+    fn fixture() -> (SemanticCapture, ScriptIo, Endpoint) {
+        let domain = NativeDomainId::mint();
+        let io = ScriptIo::small(domain);
+        let capture = capture(&io);
+        let endpoint = io.endpoint(0).expect("slot 0 scripted");
+        (capture, io, endpoint)
+    }
+
+    fn scan(
+        capture: &mut SemanticCapture,
+        io: &mut ScriptIo,
+        endpoint: Endpoint,
+        image: ImageIdentity,
+        local: u64,
+        global: u64,
+    ) -> TickReport {
+        let fence = capture.router.fence();
+        let proof = acquire_test_scan(
+            io.domain,
+            image,
+            endpoint.file_slot,
+            CompleteEpochs {
+                local,
+                global,
+                fault: 0,
+                sticky: 0,
+                record_flags: 0,
+            },
+            ranges(),
+            fence,
+        )
+        .expect("stable acquisition");
+        let job = ScanJob {
+            image,
+            endpoint,
+            slot: 0,
+            pin: io.pin.clone(),
+            deadline: io.now + Duration::from_secs(60),
+            birth_cut: None,
+        };
+        let mut report = TickReport::default();
+        capture.accept_scan(io, proof, &job, fence, &mut report);
+        report
+    }
+
+    fn stamp(local: u32, global: u32) -> InstanceStamp {
+        InstanceStamp {
+            epoch: local,
+            global,
+            fault: 0,
+            file_slot_plus1: 1,
+            flags: instance::STAMP_VALID,
+        }
+    }
+
+    fn route(
+        capture: &mut SemanticCapture,
+        image: ImageIdentity,
+        token: u64,
+        local: u32,
+        global: u32,
+    ) -> Route {
+        capture.router.route(CallFacts {
+            token,
+            domain: capture.router.domain(),
+            image,
+            entry: stamp(local, global),
+            ret: stamp(local, global),
+            ip: EntryIp::new(BASE + TEXT_OFF),
+            attached_offset: Some(TEXT_OFF),
+        })
+    }
+
+    fn joined(route: Route) -> InstanceId {
+        match route {
+            Route::Joined(id) => id,
+            other => panic!("expected a join, got {other:?}"),
+        }
+    }
+
+    fn coordinator() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap()
+    }
+
+    fn shell_lane() -> AttestedSemanticLane {
+        let slot = crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+            object: PinnedObjectId(0),
+            object_path: "/stub-provider.so".into(),
+            file_offset: 0x1200,
+            names: vec!["C_SignInit".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        };
+        let subset = AttestedSubset::scripted(
+            crate::plan::AttachPlan::from_slots(vec![slot]),
+            PinnedObjects::empty(),
+            BTreeMap::from([(PinnedObjectId(0), BTreeSet::from([0]))]),
+        );
+        AttestedSemanticLane::start(
+            subset,
+            &Scope::Pid(std::process::id()),
+            BackendSelection::Auto,
+        )
+        .expect("shell lane starts")
+    }
+
+    fn commit(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        lane: &mut AttestedSemanticLane,
+        report: TickReport,
+    ) {
+        let batch =
+            SemanticBatch::from_tick_report(lane.domain(), report, Vec::new(), 130).unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator.finalize_semantic_batches(Some(lane));
+    }
+
+    #[test]
+    fn b17_wire_projects_churned_identity_beside_clean_control() {
+        let (mut capture, mut io, endpoint) = fixture();
+        // Churned identity: New, join, a global-only continuation that
+        // discloses, a tainted join, then a silent refresh.
+        let churned_new = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 0);
+        assert_eq!(churned_new.observations, vec![ObserveOutcome::New]);
+        let id_churned = joined(route(&mut capture, CHURNED, 1, 2, 0));
+        let churned_tainted = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 1);
+        assert_eq!(
+            churned_tainted.observations,
+            vec![ObserveOutcome::Continued]
+        );
+        assert_eq!(
+            churned_tainted.reload_not_excluded.len(),
+            1,
+            "the churn must disclose"
+        );
+        assert_eq!(joined(route(&mut capture, CHURNED, 2, 2, 1)), id_churned);
+        let churned_refresh = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 1);
+        assert_eq!(
+            churned_refresh.observations,
+            vec![ObserveOutcome::Continued]
+        );
+        assert!(
+            churned_refresh.reload_not_excluded.is_empty(),
+            "no re-yield"
+        );
+        // Clean control, same capture: New, join, same-triple
+        // continuation, never disclosed.
+        let clean_new = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(clean_new.observations, vec![ObserveOutcome::New]);
+        let id_clean = joined(route(&mut capture, CLEAN, 3, 2, 0));
+        assert_ne!(id_clean, id_churned);
+        let clean_quiet = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(clean_quiet.observations, vec![ObserveOutcome::Continued]);
+        assert!(
+            clean_quiet.reload_not_excluded.is_empty(),
+            "the clean control must stay silent"
+        );
+
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        for report in [
+            churned_new,
+            churned_tainted,
+            churned_refresh,
+            clean_new,
+            clean_quiet,
+        ] {
+            commit(&mut coordinator, &mut lane, report);
+        }
+        let projected = coordinator
+            .reload_not_excluded_evidence()
+            .expect("the churned capture projects");
+        assert_eq!(projected.continued_across_global, 1);
+        assert_eq!(projected.joined_across_global, 1);
+        assert_eq!(projected.identities.len(), 1);
+        assert_eq!(projected.identities[0].file_slot, endpoint.file_slot);
+        assert_eq!(projected.identities[0].ids, vec![id_churned.get()]);
+        assert!(
+            !projected
+                .identities
+                .iter()
+                .flat_map(|entry| entry.ids.iter())
+                .any(|id| *id == id_clean.get()),
+            "the clean control must have no entry"
+        );
+
+        // One artifact, both directions: the churned IDs render under the
+        // ruled key with the capture counts, and the projection carries
+        // no private image key (exact closed key sets).
+        let mut evidence = crate::render::tests::evidence();
+        evidence.instance_reload_not_excluded = Some(projected);
+        let value = crate::render::versioned_evidence(&evidence);
+        assert_eq!(
+            value["instance_reload_not_excluded"],
+            serde_json::json!({
+                "continued_across_global": 1,
+                "joined_across_global": 1,
+                "identities": [{"file_slot": endpoint.file_slot, "ids": [id_churned.get()]}],
+            }),
+        );
+        let disclosed = value["instance_reload_not_excluded"].as_object().unwrap();
+        assert_eq!(
+            disclosed
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            [
+                "continued_across_global",
+                "joined_across_global",
+                "identities"
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        );
+        let entry = disclosed["identities"].as_array().unwrap();
+        assert_eq!(entry.len(), 1);
+        assert_eq!(
+            entry[0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            ["file_slot", "ids"].into_iter().collect::<BTreeSet<_>>(),
+        );
+    }
+
+    #[test]
+    fn b17_wire_clean_capture_omits_the_key() {
+        let (mut capture, mut io, endpoint) = fixture();
+        let first = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(first.observations, vec![ObserveOutcome::New]);
+        let _ = joined(route(&mut capture, CLEAN, 1, 2, 0));
+        let second = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(second.observations, vec![ObserveOutcome::Continued]);
+        assert!(second.reload_not_excluded.is_empty());
+
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        for report in [first, second] {
+            commit(&mut coordinator, &mut lane, report);
+        }
+        assert!(
+            coordinator.reload_not_excluded_evidence().is_none(),
+            "a clean capture projects nothing"
+        );
+        let mut evidence = crate::render::tests::evidence();
+        evidence.instance_reload_not_excluded = None;
+        let value = crate::render::versioned_evidence(&evidence);
+        assert!(
+            value.get("instance_reload_not_excluded").is_none(),
+            "absent, never zero: {value}"
+        );
+    }
+}

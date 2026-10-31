@@ -10,6 +10,7 @@ use crate::discovery::scan::Skipped;
 use crate::kinds;
 use crate::metrics::{SlotReport, percentile_ns};
 use crate::plan::{ModuleId, TableSummary};
+use crate::semantic_capture::InstanceReloadNotExcluded;
 use p11scope_ebpf_common::CounterMode;
 use p11scope_manifest::manifest::{SelectionAuthority, SelectionRequest};
 use serde::Serialize;
@@ -998,6 +999,11 @@ pub struct Evidence {
     /// the gap counts; never part of shares or verdicts.
     #[serde(skip)]
     pub gap_exe_hints: Option<GapExeHints>,
+    /// B17 W2 per-identity reload disclosure, `None` without a
+    /// producer. Manually serialized beside the gap counts into the
+    /// profile lane only; never part of shares or verdicts.
+    #[serde(skip)]
+    pub instance_reload_not_excluded: Option<InstanceReloadNotExcluded>,
     /// Whether a live window (design §5.7: a first required attach key learned
     /// from a live loader or export event) went unprotected by a confirmed
     /// pause owner: 0 or 1, inferred as `loader_discovery.hits > 0` and
@@ -2541,6 +2547,25 @@ pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
             }),
         );
     }
+    // B17 W2: present if and only if the capture disclosed a tainted
+    // identity. Per-identity entries plus the capture counts; the
+    // private image key never renders, and the key never feeds
+    // shares, verdicts, or completeness.
+    if let Some(reload) = ev.instance_reload_not_excluded.as_ref() {
+        let identities: Vec<serde_json::Value> = reload
+            .identities
+            .iter()
+            .map(|entry| serde_json::json!({"file_slot": entry.file_slot, "ids": entry.ids}))
+            .collect();
+        object.insert(
+            "instance_reload_not_excluded".into(),
+            serde_json::json!({
+                "continued_across_global": reload.continued_across_global,
+                "joined_across_global": reload.joined_across_global,
+                "identities": identities,
+            }),
+        );
+    }
     evidence
 }
 
@@ -3343,6 +3368,7 @@ pub(crate) mod tests {
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
             gap_exe_hints: None,
+            instance_reload_not_excluded: None,
             unprotected_live_windows: 0,
             module_unresolved_slots: 0,
             provider_changed: false,
@@ -3564,6 +3590,70 @@ pub(crate) mod tests {
             .unwrap()
             .remove("gap_exe_hints");
         assert_eq!(armed, plain);
+    }
+
+    // B17 W2 RED: the v3 profile lane renders the ruled per-identity
+    // disclosure key with the exact closed shape, without moving the
+    // verdict: the disclosure is informational, never a PARTIAL cause.
+    // The metrics lane stays blind to it (profile-only, like the hint
+    // split above).
+    #[test]
+    fn profile_v3_reload_disclosure_renders_exact_shape_and_holds_complete() {
+        use crate::semantic_capture::ReloadNotExcludedIdentity;
+
+        let mut ev = evidence();
+        ev.drain_proven = true;
+        ev.instance_reload_not_excluded = Some(InstanceReloadNotExcluded {
+            continued_across_global: 1,
+            joined_across_global: 1,
+            identities: vec![ReloadNotExcludedIdentity {
+                file_slot: 0,
+                ids: vec![1],
+            }],
+        });
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        assert_eq!(ev.verdict_detail, VERDICT_CLEAN_PROVEN);
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["evidence"]["instance_reload_not_excluded"],
+            serde_json::json!({
+                "continued_across_global": 1,
+                "joined_across_global": 1,
+                "identities": [{"file_slot": 0, "ids": [1]}],
+            })
+        );
+        assert_eq!(profile["evidence"]["completeness"], "COMPLETE");
+        assert_eq!(profile["evidence"]["verdict_detail"], "clean_proven");
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        assert!(
+            metrics["evidence"]
+                .get("instance_reload_not_excluded")
+                .is_none()
+        );
+    }
+
+    // B17 W2 control twin: without a producer the key is absent, never
+    // zero or null.
+    #[test]
+    fn profile_v3_reload_disclosure_absent_without_producer() {
+        let ev = evidence();
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert!(
+            profile["evidence"]
+                .get("instance_reload_not_excluded")
+                .is_none()
+        );
     }
 
     #[test]

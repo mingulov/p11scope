@@ -863,6 +863,29 @@ pub(crate) struct ReloadNotExcludedReport {
     pub(crate) file_slot: u32,
     pub(crate) ids: Vec<InstanceId>,
 }
+
+/// B17 W2 terminal projection of the per-capture reload disclosure
+/// ledger: the capture-monotonic router count snapshots plus one entry
+/// per tainted identity, in `(file_slot, ids)` order. `pub` for the
+/// `render::Evidence` field; the module stays `pub(crate)`, so no new
+/// nameable public API escapes. The private image key (task cookie and
+/// exec id) groups the ledger but never renders: entries name only the
+/// watched file slot and the public-safe capture-local instance IDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceReloadNotExcluded {
+    pub continued_across_global: u64,
+    pub joined_across_global: u64,
+    pub identities: Vec<ReloadNotExcludedIdentity>,
+}
+
+/// One tainted identity in [`InstanceReloadNotExcluded`]: the watched
+/// file slot plus the continued instance IDs. No cookie, exec id,
+/// epoch, range or address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadNotExcludedIdentity {
+    pub file_slot: u32,
+    pub ids: Vec<u64>,
+}
 #[derive(Default, Debug)]
 pub(crate) struct TickReport {
     outcomes: Vec<TickOutcome>,

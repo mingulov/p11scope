@@ -8457,3 +8457,57 @@ fn unavailable_admission_errors_carry_finite_site_labels() {
         assert_eq!(error.site(), None);
     }
 }
+
+// B17 W2 RED: the batch must carry the disclosure quadrant of the tick
+// report — the drained `instance_reload_not_excluded` identities plus the
+// capture-monotonic count snapshots — instead of swallowing them at
+// `into_parts`. A disclosure-only batch is evidence, never quiet.
+#[test]
+fn batch_carries_reload_disclosure_and_count_snapshots() {
+    use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+    use crate::semantic_capture::{ReloadNotExcludedReport, TickReport};
+    use p11scope_ebpf_common::ImageIdentity;
+
+    let conv = ConversionScene::new();
+    let domain = conv.detailed();
+    let image = ImageIdentity {
+        task_cookie: 0x51,
+        exec_id: 7,
+    };
+    let mut report = TickReport::default();
+    report.reload_not_excluded.push(ReloadNotExcludedReport {
+        label: RELOAD_NOT_EXCLUDED_LABEL,
+        image,
+        file_slot: 3,
+        ids: vec![InstanceId::from_raw(1)],
+    });
+    report.continued_across_global = 4;
+    report.joined_across_global = 2;
+    let batch = SemanticBatch::from_tick_report(domain, report, Vec::new(), 100)
+        .expect("a disclosed batch respects lane bounds");
+    assert_eq!(batch.reload_not_excluded().len(), 1);
+    let carried = &batch.reload_not_excluded()[0];
+    assert_eq!(carried.label, "instance_reload_not_excluded");
+    assert_eq!(carried.image, image);
+    assert_eq!(carried.file_slot, 3);
+    assert_eq!(carried.ids, vec![InstanceId::from_raw(1)]);
+    assert_eq!(batch.continued_across_global(), 4);
+    assert_eq!(batch.joined_across_global(), 2);
+    assert!(!batch.is_empty(), "a disclosure is evidence, never quiet");
+}
+
+// B17 W2 control twin: no disclosure in means no disclosure out, and a
+// quiet report still stages a quiet batch.
+#[test]
+fn batch_without_disclosure_stays_quiet() {
+    use crate::semantic_capture::TickReport;
+
+    let conv = ConversionScene::new();
+    let domain = conv.detailed();
+    let batch = SemanticBatch::from_tick_report(domain, TickReport::default(), Vec::new(), 100)
+        .expect("a quiet batch respects lane bounds");
+    assert!(batch.reload_not_excluded().is_empty());
+    assert_eq!(batch.continued_across_global(), 0);
+    assert_eq!(batch.joined_across_global(), 0);
+    assert!(batch.is_empty());
+}

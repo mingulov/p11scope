@@ -2243,7 +2243,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// loss through the existing audited path, never silently.
     pub(crate) fn stage_semantic_batch(
         &mut self,
-        batch: crate::inventory_semantics::SemanticBatch,
+        mut batch: crate::inventory_semantics::SemanticBatch,
     ) {
         if self.refused_semantic_domains.contains(&batch.domain()) {
             self.registry.record_gap(RegistryGap {
@@ -2260,10 +2260,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.publish_refused_batch_negatives(batch);
             return;
         }
-        let state = self
+        let domain = batch.domain();
+        let namespace = self
             .semantic_finalizer
-            .get_or_insert_with(|| SessionFinalizerState::new(batch.domain()));
-        if state.domain != batch.domain() {
+            .get_or_insert_with(|| SessionFinalizerState::new(domain));
+        if namespace.domain != domain {
             self.registry.record_gap(RegistryGap {
                 caller: None,
                 module: None,
@@ -2274,7 +2275,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             });
             return;
         }
-        if state.pending_semantic.is_some() {
+        let backpressure = namespace.pending_semantic.is_some();
+        // B17 W2: drain the disclosure quadrant into the live namespace
+        // ledger before any staging decision below. Same-domain
+        // backpressure drops keep their disclosures (the router drained
+        // each identity once); the refused and foreign returns above
+        // drop theirs with the batch at the namespace boundary.
+        let (disclosures, continued, joined) = batch.take_reload_disclosures();
+        self.semantic_finalizer
+            .as_mut()
+            .expect("the matching Session state is retained")
+            .accumulate_reload_disclosures(disclosures, continued, joined);
+        if backpressure {
             self.registry.record_gap(RegistryGap {
                 caller: None,
                 module: None,
@@ -2293,6 +2305,37 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .as_mut()
             .expect("the matching Session state is retained")
             .pending_semantic = Some(PendingSemanticBatch::Collected(batch));
+    }
+
+    /// B17 W2 terminal projection of the namespace reload disclosure
+    /// ledger: `None` without a disclosed identity (absent, never
+    /// zero), else the per-identity entries in `(file_slot, ids)`
+    /// order plus the latest count snapshots. The private image key
+    /// never leaves the ledger. Tests only until a lane-backed
+    /// producer feeds the capture render.
+    #[cfg(test)]
+    pub(crate) fn reload_not_excluded_evidence(
+        &self,
+    ) -> Option<crate::semantic_capture::InstanceReloadNotExcluded> {
+        use crate::semantic_capture::{InstanceReloadNotExcluded, ReloadNotExcludedIdentity};
+        let state = self.semantic_finalizer.as_ref()?;
+        if state.reload_not_excluded.is_empty() {
+            return None;
+        }
+        let mut identities: Vec<ReloadNotExcludedIdentity> = state
+            .reload_not_excluded
+            .values()
+            .map(|(file_slot, ids)| ReloadNotExcludedIdentity {
+                file_slot: *file_slot,
+                ids: ids.clone(),
+            })
+            .collect();
+        identities.sort_by(|a, b| (a.file_slot, &a.ids).cmp(&(b.file_slot, &b.ids)));
+        Some(InstanceReloadNotExcluded {
+            continued_across_global: state.continued_across_global,
+            joined_across_global: state.joined_across_global,
+            identities,
+        })
     }
 
     /// Take the latest H3 disposition evidence for one seal audit

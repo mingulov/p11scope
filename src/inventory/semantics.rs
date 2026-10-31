@@ -39,8 +39,8 @@ use crate::process::PidPin;
 use crate::run::{STOP_QUIESCE_BUDGET, StopState, TerminalQuiescence};
 use crate::semantic_capture::{
     CurrentPartitionReceipt, CurrentReceiptRefusal, Endpoint, InvalidationScope,
-    PhysicalSemanticGap, SemanticCapture, TickLimits, TickOutcome, TickReport,
-    unjoined_shed_counts,
+    PhysicalSemanticGap, ReloadNotExcludedReport, SemanticCapture, TickLimits, TickOutcome,
+    TickReport, unjoined_shed_counts,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal,
@@ -314,6 +314,12 @@ pub(crate) struct SemanticBatch {
     has_pending_scans: bool,
     awaited_jobs_pending: bool,
     awaited_hold_pending: bool,
+    /// B17 W2 disclosure quadrant carried from the tick report: the
+    /// drained per-identity reload qualifications plus the
+    /// capture-monotonic router count snapshots at drain time.
+    reload_not_excluded: Vec<ReloadNotExcludedReport>,
+    continued_across_global: u64,
+    joined_across_global: u64,
 }
 
 /// Lane negatives per batch: one cut barrier plus bounded collection
@@ -327,6 +333,7 @@ impl std::fmt::Debug for SemanticBatch {
             .field("outcomes", &self.outcomes.len())
             .field("current", &self.current.len())
             .field("negatives", &self.negatives.len())
+            .field("reload_not_excluded", &self.reload_not_excluded.len())
             .finish_non_exhaustive()
     }
 }
@@ -374,16 +381,26 @@ impl SemanticBatch {
             (a, b) => a.or(b),
         };
         self.exhausted |= report.exhausted();
-        let (mut outcomes, current) = std::mem::take(report).into_parts();
+        let mut report = std::mem::take(report);
+        self.reload_not_excluded
+            .append(&mut report.reload_not_excluded);
+        self.continued_across_global = self
+            .continued_across_global
+            .max(report.continued_across_global);
+        self.joined_across_global = self.joined_across_global.max(report.joined_across_global);
+        let (mut outcomes, current) = report.into_parts();
         self.outcomes.append(&mut outcomes);
         drop(outcomes);
         drop(current);
         Ok(())
     }
     /// The lane's batch constructor: bounds-checked before ownership.
+    /// The disclosure quadrant travels with the batch: each drained
+    /// identity names at least one minted ID, once per identity, so the
+    /// disclosure count shares the outcomes/current mint bound.
     pub(crate) fn from_tick_report(
         domain: NativeDomainId,
-        report: TickReport,
+        mut report: TickReport,
         negatives: Vec<LaneNegative>,
         observed_ns: u64,
     ) -> Result<Self, SemanticRefusal> {
@@ -393,10 +410,14 @@ impl SemanticBatch {
         let has_pending_scans = report.pending_scans > 0;
         let awaited_jobs_pending = report.awaited_jobs_pending;
         let awaited_hold_pending = report.awaited_hold_pending;
+        let reload_not_excluded = std::mem::take(&mut report.reload_not_excluded);
+        let continued_across_global = report.continued_across_global;
+        let joined_across_global = report.joined_across_global;
         let (outcomes, current) = report.into_parts();
         if outcomes.len() > crate::discovery::instances::MAX_INSTANCES
             || current.len() > crate::discovery::instances::MAX_INSTANCES
             || negatives.len() > MAX_LANE_NEGATIVES
+            || reload_not_excluded.len() > crate::discovery::instances::MAX_INSTANCES
         {
             return Err(SemanticRefusal::Unavailable);
         }
@@ -412,6 +433,9 @@ impl SemanticBatch {
             has_pending_scans,
             awaited_jobs_pending,
             awaited_hold_pending,
+            reload_not_excluded,
+            continued_across_global,
+            joined_across_global,
         })
     }
 
@@ -490,11 +514,48 @@ impl SemanticBatch {
         &self.outcomes
     }
 
-    /// Whether the batch carries no outcomes, receipts or negatives:
-    /// tests assert quiet ticks stage or commit nothing.
+    /// Borrow the carried reload disclosures for the coordinator
+    /// ledger: one entry per newly tainted identity, drained once.
+    /// Tests only until a production reader joins the take path.
+    #[cfg(test)]
+    pub(crate) fn reload_not_excluded(&self) -> &[ReloadNotExcludedReport] {
+        &self.reload_not_excluded
+    }
+
+    /// The carried router count snapshots at drain time:
+    /// capture-monotonic and saturating. Tests only until a
+    /// production reader joins the take path.
+    #[cfg(test)]
+    pub(crate) fn continued_across_global(&self) -> u64 {
+        self.continued_across_global
+    }
+    #[cfg(test)]
+    pub(crate) fn joined_across_global(&self) -> u64 {
+        self.joined_across_global
+    }
+
+    /// Move the disclosure quadrant into the coordinator ledger. The
+    /// router drains each identity once, so the batch takes its copy
+    /// out exactly once at staging; later drop paths see nothing left
+    /// to lose.
+    pub(crate) fn take_reload_disclosures(&mut self) -> (Vec<ReloadNotExcludedReport>, u64, u64) {
+        (
+            std::mem::take(&mut self.reload_not_excluded),
+            std::mem::take(&mut self.continued_across_global),
+            std::mem::take(&mut self.joined_across_global),
+        )
+    }
+
+    /// Whether the batch carries no outcomes, receipts, negatives or
+    /// disclosures: tests assert quiet ticks stage or commit nothing.
+    /// A disclosure is evidence, so a disclosure-only batch is not
+    /// empty.
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.outcomes.is_empty() && self.current.is_empty() && self.negatives.is_empty()
+        self.outcomes.is_empty()
+            && self.current.is_empty()
+            && self.negatives.is_empty()
+            && self.reload_not_excluded.is_empty()
     }
 
     /// The batch's own cut fence, if any: the maximum cut-barrier
@@ -3375,7 +3436,10 @@ impl SemanticStopIo for LiveStopIo<'_> {
             let shed = merge_stash_into_report(drain.stash, &mut report);
             *drain.shed = drain.shed.saturating_add(shed);
         }
-        if report.outcomes().is_empty() && report.current().is_empty() {
+        if report.outcomes().is_empty()
+            && report.current().is_empty()
+            && report.reload_not_excluded.is_empty()
+        {
             return Ok(None);
         }
         SemanticBatch::from_tick_report(self.domain, report, Vec::new(), now_ns()).map(Some)

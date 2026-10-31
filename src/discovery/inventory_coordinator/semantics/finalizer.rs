@@ -32,6 +32,22 @@ pub(in crate::discovery::engine::inventory_coordinator) struct SessionFinalizerS
     /// Dropped with the namespace at retire: no cross-domain reuse.
     pub(super) seal_admission:
         Option<crate::discovery::caller_registry::instance_input::AdmittedInstanceCall>,
+    /// B17 W2 per-namespace reload disclosure ledger: one entry per
+    /// tainted identity keyed by the private (task cookie, exec id,
+    /// file slot), holding the watched slot plus the continued
+    /// instance IDs. First disclosure wins; the router queues each
+    /// identity once. Dropped with the namespace at retire.
+    #[cfg_attr(not(test), allow(dead_code))]
+    // Staged: tested only; no production render path reads it yet.
+    pub(super) reload_not_excluded: BTreeMap<(u64, u64, u32), (u32, Vec<u64>)>,
+    /// Latest carried router count snapshots: capture-monotonic, so
+    /// the maximum wins.
+    #[cfg_attr(not(test), allow(dead_code))]
+    // Staged: tested only; no production render path reads it yet.
+    pub(super) continued_across_global: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    // Staged: tested only; no production render path reads it yet.
+    pub(super) joined_across_global: u64,
 }
 
 impl SessionFinalizerState {
@@ -61,7 +77,40 @@ impl SessionFinalizerState {
             pending_drop: None,
             pending_drop_shed: BTreeMap::new(),
             seal_admission: None,
+            reload_not_excluded: BTreeMap::new(),
+            continued_across_global: 0,
+            joined_across_global: 0,
         }
+    }
+
+    /// Stage one batch's disclosure quadrant into the namespace
+    /// ledger: the first disclosure per identity wins, and the count
+    /// snapshots take the maximum. Called for every same-domain
+    /// staged batch, including backpressure drops, so a drained-once
+    /// disclosure is never silently lost; refused and foreign batches
+    /// drop theirs with the batch at the namespace boundary.
+    pub(super) fn accumulate_reload_disclosures(
+        &mut self,
+        disclosures: Vec<crate::semantic_capture::ReloadNotExcludedReport>,
+        continued_across_global: u64,
+        joined_across_global: u64,
+    ) {
+        for disclosure in disclosures {
+            self.reload_not_excluded
+                .entry((
+                    disclosure.image.task_cookie,
+                    disclosure.image.exec_id,
+                    disclosure.file_slot,
+                ))
+                .or_insert_with(|| {
+                    (
+                        disclosure.file_slot,
+                        disclosure.ids.iter().map(|id| id.get()).collect(),
+                    )
+                });
+        }
+        self.continued_across_global = self.continued_across_global.max(continued_across_global);
+        self.joined_across_global = self.joined_across_global.max(joined_across_global);
     }
 
     pub(super) fn take_disposition(&mut self) -> H3DispositionEvidence {

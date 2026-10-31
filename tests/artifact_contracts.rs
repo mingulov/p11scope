@@ -11974,6 +11974,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
         gap_exe_hints: None,
+        instance_reload_not_excluded: None,
         unprotected_live_windows: 1,
         module_unresolved_slots: 0,
         discovery: DiscoveryEvidence {

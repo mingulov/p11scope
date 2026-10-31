@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! STAGED: unreachable in production (all Session factories pass None; only tests pass Some); activation obligations in planning docs/superpowers/2026-10-31-v060-staged-registry.md.
 //! Production journal-object selection, load contract and class fill.
 //!
 //! The production journal object is a Detailed object whose entry/return

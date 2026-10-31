@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! STAGED: no production caller; activation obligations in planning docs/superpowers/2026-10-31-v060-staged-registry.md.
 //! Fresh current-image guard for inventory owners: every check acquires a
 //! new observation through the retained pin and compares it against the
 //! independently supplied expected image. The binder vetoes revoked

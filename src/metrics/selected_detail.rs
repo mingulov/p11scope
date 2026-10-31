@@ -1,4 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+//! STAGED: no production caller; activation obligations in planning docs/superpowers/2026-10-31-v060-staged-registry.md.
 //! Selected-detail handoff→gate adapter (6.15 phase 2).
 //!
 //! Maps a proved caller/provider request plus its selected-endpoint receipt

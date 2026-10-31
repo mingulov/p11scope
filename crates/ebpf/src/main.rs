@@ -1971,12 +1971,11 @@ fn loader_gate_latched_for_producer() -> bool {
     unsafe { p11_loader_gate_cutover_latched() == 1 }
 }
 
-/// Staged token hit path (activation builds only): resolve the token
-/// through the gate, admitting on first hit and reusing a retired slot
-/// only after userspace arms the acknowledgement. Same-generation
-/// misses are stale hits on a retired incarnation and never re-admit;
-/// unarmed reuse waits as acknowledgement-pending instead of resolving.
-/// Straight-line with bounded re-reads: no loops for the verifier.
+/// Staged token hit path (activation builds only): one native
+/// transaction resolves the token with exactly-once accounting, so the
+/// probe never touches a counting lookup. Nonnegative resolves to a
+/// healthy record, -2 waits as acknowledgement-pending, anything else
+/// negative stays an invalid record.
 #[allow(unexpected_cfgs)]
 #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
 fn emit_loader_token_record(
@@ -1985,42 +1984,23 @@ fn emit_loader_token_record(
     layout: LinuxLayout,
     cookie: u64,
 ) -> u32 {
-    // SAFETY: every gate entry point validates its arguments and fails
-    // closed; nonzero returns below never wrote a row.
+    // SAFETY: the transaction validates its arguments and fails
+    // closed; only a nonnegative return admitted or resolved a row.
     let slot = (cookie & 0xff) as u32;
     let generation = cookie >> 8;
     let mut status = DISCOVERY_STATUS_LOADER_CONTEXT_INVALID;
     let mut publish = false;
     if valid_loader_token(cookie) {
-        if unsafe { p11_loader_gate_lookup(cookie) } >= 0 {
-            status = 0;
-            publish = true;
-        } else if unsafe { p11_loader_gate_admit(slot, generation) } == 0 {
-            status = 0;
-            publish = true;
-        } else if unsafe { p11_loader_gate_lookup(cookie) } >= 0 {
-            // Lost race: a same-incarnation hit admitted first.
-            status = 0;
-            publish = true;
-        } else {
-            let mut row_generation = 0u64;
-            let read = unsafe { p11_loader_gate_row_generation(slot, &mut row_generation) };
-            if read == 0 && row_generation != generation {
-                let retired = (row_generation << 8) | slot as u64;
-                let acked = unsafe { p11_loader_gate_ack(retired) };
-                if acked == 0 {
-                    if unsafe { p11_loader_gate_admit(slot, generation) } == 0 {
-                        status = 0;
-                        publish = true;
-                    } else if unsafe { p11_loader_gate_lookup(cookie) } >= 0 {
-                        status = 0;
-                        publish = true;
-                    }
-                } else if acked == -2 {
-                    status = DISCOVERY_STATUS_LOADER_ACK_PENDING;
-                    publish = true;
-                }
+        match unsafe { p11_loader_gate_hit(slot, generation) } {
+            resolved if resolved >= 0 => {
+                status = 0;
+                publish = true;
             }
+            -2 => {
+                status = DISCOVERY_STATUS_LOADER_ACK_PENDING;
+                publish = true;
+            }
+            _ => {}
         }
     }
     if !publish {
@@ -3136,22 +3116,11 @@ unsafe extern "C" {
     ) -> i64;
     fn p11_owner_discovery_remove(key: *const StateKey, required: u32) -> i64;
     /// Staged loader gate (native loader_gate.c, activation builds only):
-    /// token lookup/admit/ack plus the row-generation read that feeds
-    /// the acknowledgement capability and the latch read that selects
-    /// the producer decode. Every entry point validates and fails
-    /// closed; nonzero returns never wrote a row.
+    /// the probe-hit transaction plus the latch read that selects the
+    /// producer decode. Both entry points validate and fail closed.
     #[allow(unexpected_cfgs)]
     #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
-    fn p11_loader_gate_lookup(cookie: u64) -> i64;
-    #[allow(unexpected_cfgs)]
-    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
-    fn p11_loader_gate_admit(slot: u32, generation: u64) -> i64;
-    #[allow(unexpected_cfgs)]
-    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
-    fn p11_loader_gate_ack(cookie: u64) -> i64;
-    #[allow(unexpected_cfgs)]
-    #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
-    fn p11_loader_gate_row_generation(slot: u32, generation_out: *mut u64) -> i64;
+    fn p11_loader_gate_hit(slot: u32, generation: u64) -> i64;
     #[allow(unexpected_cfgs)]
     #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
     fn p11_loader_gate_cutover_latched() -> i64;

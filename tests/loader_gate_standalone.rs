@@ -831,6 +831,7 @@ fn assert_loader_producer_verifier_probe(bitcode_dir: &Path) {
                 "p11_loader_gate_cutover_latched",
                 "p11_loader_gate_admit",
                 "p11_loader_gate_note_producer_end",
+                "p11_loader_gate_hit",
             ],
         ),
         (

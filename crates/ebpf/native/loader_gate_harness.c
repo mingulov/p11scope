@@ -17,7 +17,7 @@ extern long p11_loader_gate_cutover_latched(void) __attribute__((weak));
 #include <string.h>
 
 #ifdef GATE_HOST_CAS_HOOK
-extern int gate_cas_fail_budget;
+extern int gate_cas_fail_all;
 #endif
 
 unsigned char LOADER_GATE, LOADER_GATE_CTL;
@@ -915,16 +915,14 @@ static int cas_exhaustion_counts(const char *scenario)
     gate_reset();
     CHECK(p11_loader_gate_cutover() == 0, "cutover_zero");
     CHECK(p11_loader_gate_admit(40, 1) == 0, "exhaust_setup_admits");
-    gate_cas_fail_budget = 8;
+    gate_cas_fail_all = 1;
     CHECK(p11_loader_gate_hit(40, 9) == -1, "exhaust_foreign_refuses");
     CHECK(gate_ctl.refusals == 1, "fallback_settles_count");
     CHECK(gate_ctl.update_losses == 0, "fallback_no_loss");
     gate_ctl.refusals = ~0ULL - 1;
-    gate_cas_fail_budget = 8;
     CHECK(p11_loader_gate_hit(40, 9) == -1, "exhaust_refuses_again");
     CHECK(gate_ctl.refusals == ~0ULL - 1, "skip_holds_ceiling");
     CHECK(gate_ctl.update_losses == 1, "skip_reports_loss");
-    gate_cas_fail_budget = 8;
     CHECK(p11_loader_gate_hit(41, 1) == 41, "exhaust_admit_succeeds");
     CHECK(gate_ctl.retained == 2, "exhaust_gauge_counts");
     CHECK(gate_ctl.retained_peak == 1, "exhaust_peak_holds");
@@ -932,7 +930,6 @@ static int cas_exhaustion_counts(const char *scenario)
     CHECK(p11_loader_gate_note_producer_end(TOKEN(1, 40), 0) == 0,
           "exhaust_retire");
     gate_rows[40].acked = 1;
-    gate_cas_fail_budget = 8;
     CHECK(p11_loader_gate_ack(TOKEN(1, 40)) == 0, "exhaust_ack_empties");
     CHECK(gate_rows[40].state == LOADER_GATE_EMPTY, "exhaust_row_empty");
     CHECK(gate_ctl.retained == 2, "exhaust_drop_overcounts");

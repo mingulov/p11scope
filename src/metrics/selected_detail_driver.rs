@@ -3140,8 +3140,15 @@ mod tests {
         // stays vacant, and a small envelope reserves right after on
         // the same banks.
         use crate::attach::counter_banks::{BroadToggleFacts, DetailToggleRefusal};
-        let pool = test_pool();
-        let scene = stage_single_provider(pool, 513);
+        // Sized from the configured Detailed ceiling, so the negative
+        // overhangs by exactly one slot under both the default (512)
+        // and wide-detailed-2112 builds. The WIDE-scale staging
+        // envelope needs headroom past the small-scene pool (an
+        // accounting limit only; staged bytes stay far below it).
+        let overhang = p11scope_ebpf_common::MAX_SLOTS;
+        let overhang_offset = 0x80 + u64::from(overhang) * 0x10;
+        let pool = SemanticResourcePool::reference_limit(128 * 1024 * 1024);
+        let scene = stage_single_provider(pool, overhang + 1);
         let mut driver = PromotionDriver::new();
         let broad = BanksBroad {
             banks: Some(&scene.banks),
@@ -3158,7 +3165,7 @@ mod tests {
             convert_for(&scene.plan, scene.object),
             scene.objects.clone(),
             BTreeMap::from([(scene.object, full_map)]),
-            Some(0x80 + 512 * 0x10),
+            Some(overhang_offset),
             0xC00,
             0xE9E,
         );
@@ -3203,7 +3210,7 @@ mod tests {
             .plan
             .slots
             .iter()
-            .filter(|slot| slot.index == 512)
+            .filter(|slot| slot.index == overhang)
             .cloned()
             .collect();
         small_slots[0].index = 0;
@@ -3212,7 +3219,7 @@ mod tests {
             small_convert,
             scene.objects.clone(),
             BTreeMap::from([(scene.object, BTreeSet::from([0]))]),
-            Some(0x80 + 512 * 0x10),
+            Some(overhang_offset),
             0xC01,
             0xE9F,
         );

@@ -644,6 +644,39 @@ fn loader_ticket_harness_identity_cas_exhaustion() {
     );
 }
 
+/// Incarnation guard: the top incarnation still issues a qualified
+/// identity; one past the 48-bit range refuses without wrapping.
+#[test]
+fn loader_ticket_harness_bank_incarnation_guard() {
+    drive_tickets(
+        "incarnation-guard",
+        &[
+            "ASSERT incarnation_top_issues",
+            "ASSERT incarnation_overflow_refuses",
+        ],
+    );
+}
+
+/// Empty slots never fold: admissions leave fold marks alone when the
+/// unprepared bank has no issuance to retire.
+#[test]
+fn loader_ticket_harness_bank_fold_skips_empty() {
+    drive_tickets("fold-skips-empty", &["ASSERT fold_skips_empty"]);
+}
+
+/// EXEC binding stays local: the current-task cookie returns the
+/// per-bank ticket on both banks, never the qualified identity.
+#[test]
+fn loader_ticket_harness_bank_binding_stays_local() {
+    drive_tickets(
+        "binding-stays-local",
+        &[
+            "ASSERT binding_b_stays_local",
+            "ASSERT binding_a_stays_local",
+        ],
+    );
+}
+
 /// Selection validation: unpublished, corrupt or missing SELECT
 /// refuses new issues; cut validates its target and prepared bit.
 #[test]

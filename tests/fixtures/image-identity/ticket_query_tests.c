@@ -753,6 +753,87 @@ static void exec_return_isolation(void)
     puts("ASSERT return_mismatches_across_banks");
 }
 
+/* Incarnation guard: the top of the 48-bit incarnation range still
+ * issues; one past it refuses instead of wrapping the qualifier into
+ * an aliasing cookie. */
+static void incarnation_guard(void)
+{
+    struct image_identity got;
+    u64 ticket = 0;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    select_stub.incarnation[0] = (1ULL << 48) - 1;
+    present[0] = 0;
+    assert(p11_link_task_identity(&leaders[0], &got) == COOKIE_STATUS_OK);
+    assert(got.task_cookie == image_identity_qualify(1, 0, (1ULL << 48) - 1));
+    puts("ASSERT incarnation_top_issues");
+    reset();
+    select_stub.prepared[1] = 1;
+    select_stub.incarnation[0] = 1ULL << 48;
+    present[1] = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ticket == 0);
+    assert(ctl.unavailable == 1);
+    puts("ASSERT incarnation_overflow_refuses");
+}
+
+/* Empty slots never fold: an unprepared bank with no issuance is
+ * fresh, not a fold claim, so admissions leave the fold marks alone.
+ * (Regression guard: passes pre-implementation; the mutation run
+ * proves it detects unconditional folding.) */
+static void fold_skips_empty(void)
+{
+    u64 ticket = 0;
+
+    reset();
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    assert(select_stub.folds == 0);
+    assert(select_stub.folded[0] == 0 && select_stub.folded[1] == 0);
+    assert(select_stub.folded_issued == 0);
+    puts("ASSERT fold_skips_empty");
+}
+
+static int stub_leader = 0;
+
+static struct task_struct *stub_current_task(void)
+{
+    return &leaders[stub_leader];
+}
+
+/* EXEC binding stays local: the current-task cookie returns the
+ * per-bank ticket on both banks, never the qualified identity.
+ * (Regression guard: passes pre-implementation; the mutation run
+ * proves it detects a qualifier leak into the binding.) */
+static void binding_stays_local(void)
+{
+    u64 ticket = 0;
+    u64 n;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    for (n = 1; n < IMAGE_IDENTITY_TICKET_LIMIT; n++) {
+        present[0] = 0;
+        ticket = 0;
+        assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    }
+    present_b[2] = 0;
+    ticket = 0;
+    assert(p11_link_task_ticket(&leaders[2], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    bpf_get_current_task_btf = stub_current_task;
+    stub_leader = 2;
+    assert(p11_link_current_cookie() == 1);
+    puts("ASSERT binding_b_stays_local");
+    stub_leader = 1;
+    assert(p11_link_current_cookie() == 1);
+    puts("ASSERT binding_a_stays_local");
+}
+
 #ifdef IMAGE_HOST_CAS_HOOK
 /* Exhaustion twin: with every identity saturating-counter CAS forced
  * to fail, settled updates still land through the fallback and every
@@ -836,6 +917,12 @@ int main(int argc, char **argv)
         bank_reprepare_race();
     } else if (!strcmp(argv[1], "exec-return-isolation")) {
         exec_return_isolation();
+    } else if (!strcmp(argv[1], "incarnation-guard")) {
+        incarnation_guard();
+    } else if (!strcmp(argv[1], "fold-skips-empty")) {
+        fold_skips_empty();
+    } else if (!strcmp(argv[1], "binding-stays-local")) {
+        binding_stays_local();
 #ifdef IMAGE_HOST_CAS_HOOK
     } else if (!strcmp(argv[1], "identity-cas-exhaustion")) {
         identity_cas_exhaustion();

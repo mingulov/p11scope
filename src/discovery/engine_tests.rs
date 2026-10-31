@@ -7996,6 +7996,7 @@ fn manifest_helper_wait_accepts_a_progressing_child_past_the_stall_limit() {
     );
     let pidfd = DiscoveryLifecycleFixture::child_pidfd(&guard);
     let started = std::time::Instant::now();
+    // Scheduling assumption: the busy child must accrue a CPU tick within 300 ms; a longer deschedule would fail this twin spuriously.
     assert!(
         wait_manifest_helper_exit(
             &pidfd,
@@ -37446,6 +37447,12 @@ fn peer_maps_census_normalizes_addresses_but_counts_every_line() {
         maps_census_of_text(one),
         maps_census_of_text(&longer_path),
         "dependency validation charges per path byte"
+    );
+    let reversed = one.lines().rev().collect::<Vec<_>>().join("\n") + "\n";
+    assert_eq!(
+        maps_census_of_text(one),
+        maps_census_of_text(&reversed),
+        "line order must not change the census"
     );
 }
 

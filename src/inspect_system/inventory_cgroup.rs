@@ -359,6 +359,8 @@ impl CgroupCollection {
     /// Final identity reads and source-pin preparation precede this fresh
     /// zero-origin grouped end sample. It runs in commit_batch, not apply.
     pub(crate) fn sample_end(&mut self, prepared: &BTreeSet<u32>) {
+        #[cfg(test)]
+        crate::discovery::identity::provider_metadata_read_test::mark_sampled();
         if !self
             .work
             .charge(self.locators.len().saturating_mul(2).saturating_add(1))

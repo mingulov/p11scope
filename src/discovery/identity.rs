@@ -46,10 +46,62 @@ pub(crate) struct Pin {
 }
 
 pub(crate) fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
+    #[cfg(test)]
+    provider_metadata_read_test::metadata_read();
     let md = file
         .metadata()
         .map_err(|error| format!("fstat failed: {error}"))?;
     Ok(pin_from_metadata(&md))
+}
+
+#[cfg(test)]
+pub(crate) mod provider_metadata_read_test {
+    //! Observer for actual provider metadata reads (held-fd `fstat`
+    //! through `pin_of`/`same_kernel_file`, the primitives behind
+    //! `check_unchanged`, target retention and identity comparison).
+    //! The scoped inventory transaction marks its final membership
+    //! sample; the observer tags each read pre/post-sample so twins
+    //! prove the permit-backed commit performs no provider I/O.
+    use std::cell::{Cell, RefCell};
+
+    type Observer = Box<dyn FnMut(bool)>;
+    thread_local! {
+        static OBSERVER: RefCell<Option<Observer>> = RefCell::new(None);
+        static POST_SAMPLE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    struct Restore(Option<Observer>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVER.with(|observer| *observer.borrow_mut() = self.0.take());
+        }
+    }
+
+    /// Run `action` with `observer(post_sample)` notified on every
+    /// provider metadata read. The sample marker starts clear.
+    pub(crate) fn observe<T>(
+        observer: impl FnMut(bool) + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        POST_SAMPLE.with(|flag| flag.set(false));
+        let _restore = Restore(OBSERVER.with(|slot| slot.replace(Some(Box::new(observer)))));
+        action()
+    }
+
+    pub(super) fn metadata_read() {
+        let post_sample = POST_SAMPLE.with(|flag| flag.get());
+        OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().as_mut() {
+                observer(post_sample);
+            }
+        });
+    }
+
+    /// Mark the final membership sample: later reads in this
+    /// observation are post-sample. Called from `sample_end` only.
+    pub(crate) fn mark_sampled() {
+        POST_SAMPLE.with(|flag| flag.set(true));
+    }
 }
 
 fn pin_from_metadata(md: &std::fs::Metadata) -> Pin {
@@ -6046,6 +6098,8 @@ fn same_open_file(left: &Entry, right: &Entry) -> bool {
 }
 
 fn same_kernel_file(left: &std::fs::File, right: &std::fs::File) -> bool {
+    #[cfg(test)]
+    provider_metadata_read_test::metadata_read();
     match (left.metadata(), right.metadata()) {
         (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
         _ => false,

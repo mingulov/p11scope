@@ -2986,6 +2986,19 @@ fn service_dd_as_owner(fixture: &MachineScene, dd: &mut LiveMachineDiscovery) ->
 /// progresses through its existing owner seam between machine
 /// services, and neither service moves the other's cursor, mints a
 /// third cursor, or clears a sticky transport error.
+///
+/// Honest scope: this test drives the DD owner seam directly
+/// (`service_dd_as_owner`); it proves seam capability and
+/// non-interference with machine EVENTS service, not production
+/// dispatch wiring. No production path pumps that seam for a
+/// linked lane with an installed machine yet: the inventory
+/// driver returns after machine service before reaching the
+/// lane's live-discovery service, that lane service itself
+/// returns early when a joint machine is installed, and the
+/// machine services DD inline only for unlinked lanes (pinned
+/// above: machine-side DD calls stay zero for linked lanes).
+/// The production DD pump for linked+machine lanes is planned
+/// work for a follow-up packet; the controller owns the driver.
 #[test]
 fn linked_joint_services_dd_without_repolling_original() {
     let mut fixture = MachineScene::new(1);
@@ -3032,6 +3045,11 @@ fn linked_joint_services_dd_without_repolling_original() {
     assert_eq!(
         fixture.native.collect_calls, 1,
         "the whole original needed exactly one begin"
+    );
+    assert!(
+        fixture.native.continue_calls >= 1,
+        "the rest of the original ran continuations only (continue_calls={})",
+        fixture.native.continue_calls
     );
     assert!(producers_before.same_producers(&fixture.scene.producers));
     assert_eq!(
@@ -3134,6 +3152,11 @@ fn unlinked_joint_services_dd_without_repolling_original() {
         fixture.published();
     }
     assert_eq!(fixture.native.collect_calls, 1);
+    assert!(
+        fixture.native.continue_calls >= 1,
+        "the rest of the original ran continuations only (continue_calls={})",
+        fixture.native.continue_calls
+    );
     assert!(producers_before.same_producers(&fixture.scene.producers));
     assert_eq!(
         producers_before.events_id(),
@@ -3233,9 +3256,12 @@ fn linked_finish_never_reenters_running_service() {
     );
 
     // Latched first error: one injected refusal at a real Finish
-    // site latches the disposition; every later poll and service
-    // returns that same first reason, and a healthy classic DD
-    // status cycle in between clears nothing.
+    // site latches the disposition; later polls return that same
+    // first reason, and a healthy classic DD status cycle in
+    // between clears nothing. Service refuses (Unavailable) while
+    // Finish owns the lane — that branch precedes the latched
+    // disposition branch, so service == Err(first) below holds
+    // only because this injection site's refusal is Unavailable.
     let mut latched = MachineScene::new(1);
     latched.prime(1);
     latched.enable_finish_fixture(Vec::new());
@@ -3279,6 +3305,23 @@ fn unlinked_finish_never_reenters_running_service() {
         "no running service resumes after Finish"
     );
 
+    // Read-loss window, mirroring the linked twin: a discarded
+    // record inside the finish still terminates the Finish (with
+    // an uncertified drain), and running service still cannot
+    // re-enter it.
+    let mut lossy = MachineScene::unlinked(1);
+    lossy.enable_finish_fixture(Vec::new());
+    lossy.scene.drain.source_mut().push_discard();
+    lossy.begin_finish().unwrap();
+    let (lossy_polls, _receipt) =
+        finish_beyond_one_poll(&mut lossy).expect("the read-loss Finish still terminates");
+    assert!(lossy_polls > 1);
+    assert_eq!(
+        lossy.scene.real.lane.semantic_summary().final_drain,
+        Some(false),
+        "read loss forbids a lossless-drain claim"
+    );
+
     let mut latched = MachineScene::unlinked(1);
     latched.scene.push(std::process::id(), 0, "C_SignInit", 1);
     latched.published();
@@ -3290,6 +3333,9 @@ fn unlinked_finish_never_reenters_running_service() {
     let first = latched.poll_finish(1).unwrap_err();
     assert_eq!(latched.machine.disposition_reason(), Some(first));
     assert_eq!(latched.poll_finish(1024), Err(first));
+    // Service refuses (Unavailable) while Finish owns the lane;
+    // equality with `first` holds because this injection site's
+    // refusal is Unavailable (see the linked twin).
     assert_eq!(latched.service(1024), Err(first));
 }
 

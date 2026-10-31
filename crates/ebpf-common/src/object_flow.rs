@@ -505,6 +505,20 @@ pub(crate) fn capture_request_pairs(
     side.flags |= accumulated as u16;
 }
 
+// Per-slot return gates for the unrolled fill below. Always inlined
+// with value semantics: taking `&mut` of the slot scalars would pin
+// them to stack addresses and spill past the 64-byte helper frame.
+#[inline(always)]
+fn slot_gate(arg: u8, action: u8, derive_ok: bool) -> (bool, u8) {
+    if arg == ARG_NONE {
+        (false, handle_status::ABSENT)
+    } else if action == OBJECT_ACTION_DERIVE && !derive_ok {
+        (false, handle_status::PROTOCOL_UNAVAILABLE)
+    } else {
+        (true, handle_status::ABSENT)
+    }
+}
+
 /// Build flavor for T0 KEM capture: false only in the
 /// `stub-object-attributes` (P0) BPF build. The KEM entry wrapper
 /// passes this constant; the shared adapter takes it as a runtime
@@ -705,20 +719,6 @@ pub fn adapter_kem_entry(
     side.result_ptrs = [cell, 0];
     side.phase = 2;
     true
-}
-
-// Per-slot return gates for the unrolled fill below. Always inlined
-// with value semantics: taking `&mut` of the slot scalars would pin
-// them to stack addresses and spill past the 64-byte helper frame.
-#[inline(always)]
-fn slot_gate(arg: u8, action: u8, derive_ok: bool) -> (bool, u8) {
-    if arg == ARG_NONE {
-        (false, handle_status::ABSENT)
-    } else if action == OBJECT_ACTION_DERIVE && !derive_ok {
-        (false, handle_status::PROTOCOL_UNAVAILABLE)
-    } else {
-        (true, handle_status::ABSENT)
-    }
 }
 
 #[inline(always)]

@@ -1028,6 +1028,45 @@ static void fold_despite_corrupt_current(void)
     puts("ASSERT fold_despite_corrupt_current");
 }
 
+/* The incarnation guard covers re-queries too: a stored cell from
+ * an overflowed epoch refuses instead of serving an aliasing cookie. */
+static void hit_overflow_refuses(void)
+{
+    struct image_identity got;
+    u64 ticket = 0;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    select_stub.incarnation[0] = 1ULL << 48;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ticket == 0);
+    assert(ctl.unavailable == 1);
+    assert(p11_link_task_identity(&leaders[1], &got) == COOKIE_STATUS_BAD_CONFIG);
+    assert(got.task_cookie == 0);
+    puts("ASSERT hit_overflow_refuses");
+}
+
+/* Domain before row: a zero cell in an overflowed epoch reports the
+ * corrupt epoch, not the corrupt cell. */
+static void guard_before_zero_cell(void)
+{
+    u64 ticket = 99;
+
+    reset();
+    select_stub.prepared[1] = 1;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    select_stub.incarnation[0] = 1ULL << 48;
+    stored[1] = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ticket == 0);
+    puts("ASSERT guard_before_zero_cell");
+}
+
 #ifdef IMAGE_HOST_CAS_HOOK
 /* Exhaustion twin: with every identity saturating-counter CAS forced
  * to fail, settled updates still land through the fallback and every
@@ -1129,6 +1168,10 @@ int main(int argc, char **argv)
         cut_refuses_corrupt_target();
     } else if (!strcmp(argv[1], "fold-despite-corrupt-current")) {
         fold_despite_corrupt_current();
+    } else if (!strcmp(argv[1], "hit-overflow-refuses")) {
+        hit_overflow_refuses();
+    } else if (!strcmp(argv[1], "guard-before-zero-cell")) {
+        guard_before_zero_cell();
 #ifdef IMAGE_HOST_CAS_HOOK
     } else if (!strcmp(argv[1], "identity-cas-exhaustion")) {
         identity_cas_exhaustion();

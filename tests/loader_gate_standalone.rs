@@ -735,6 +735,21 @@ fn loader_ticket_harness_bank_fold_despite_corrupt_current() {
     );
 }
 
+/// Re-queries from an overflowed epoch refuse on both entries.
+#[test]
+fn loader_ticket_harness_bank_hit_overflow_refuses() {
+    drive_tickets("hit-overflow-refuses", &["ASSERT hit_overflow_refuses"]);
+}
+
+/// Domain before row: the epoch guard fires before the zero-cell check.
+#[test]
+fn loader_ticket_harness_bank_guard_before_zero_cell() {
+    drive_tickets(
+        "guard-before-zero-cell",
+        &["ASSERT guard_before_zero_cell"],
+    );
+}
+
 /// Selection validation: unpublished, corrupt or missing SELECT
 /// refuses new issues; cut validates its target and prepared bit.
 #[test]

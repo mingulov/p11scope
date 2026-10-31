@@ -20392,6 +20392,10 @@ mod tests {
             body.contains("mint_attach_generation()"),
             "the native sealer mints from the attach cell"
         );
+        assert!(
+            body.contains("&programs,"),
+            "the native sealer must seal the live loaded inventory"
+        );
     }
 
     /// The attested start retains its successful seal through the retention
@@ -20447,6 +20451,10 @@ mod tests {
         assert!(
             body.contains("drain_linkage_from_sealed("),
             "the production drain must derive through the linkage seam"
+        );
+        assert!(
+            body.contains("journal_linked: drain_linkage_from_sealed(self.sealed_journal_linked)"),
+            "the production drain must wire the seam result into the returned linkage"
         );
     }
 

@@ -708,9 +708,10 @@ pub(crate) struct SelectionRecord {
     pub(crate) slot: Option<u32>,
     pub(crate) file_offset: Option<u64>,
     pub(crate) names: Vec<String>,
-    /// The pinned live original's pid (`None` when unresolved): the
-    /// report names which process the selection bound.
-    pub(crate) original_pid: Option<u32>,
+    /// The pin/PID stays private with the [`ResolvedSelection`] the
+    /// stage returns to its caller: the public record never publishes
+    /// process identity (allowlist-v1: profile and metrics do not
+    /// publish raw PID/TID).
     pub(crate) refusal: Option<&'static str>,
 }
 
@@ -745,7 +746,6 @@ impl SelectionLedger {
             slot: Some(resolved.slot),
             file_offset: Some(resolved.physical.file_offset),
             names: resolved.names.clone(),
-            original_pid: Some(resolved.original.pid()),
             refusal: None,
         });
     }
@@ -756,7 +756,6 @@ impl SelectionLedger {
             slot: None,
             file_offset: None,
             names: Vec::new(),
-            original_pid: None,
             refusal: Some(refusal),
         });
     }
@@ -897,9 +896,6 @@ pub(crate) fn with_selected_detail(
         }
         if !selection.names.is_empty() {
             record.insert("names".into(), serde_json::json!(selection.names));
-        }
-        if let Some(pid) = selection.original_pid {
-            record.insert("original_pid".into(), serde_json::json!(pid));
         }
         if let Some(refusal) = selection.refusal {
             record.insert("refusal".into(), serde_json::json!(refusal));
@@ -1536,11 +1532,34 @@ mod tests {
             run_metrics_selection_stage("C_Toggle0002", &scene.plan, &scope, &mut ledger)
                 .expect("live name resolves for the composition packet");
         assert_eq!(resolved.slot, 2);
+        assert_eq!(
+            resolved.original.pid(),
+            std::process::id(),
+            "the pin stays private with the resolution"
+        );
         let record = ledger.selection.as_ref().expect("selection records");
         assert_eq!(record.endpoint, "C_Toggle0002");
         assert_eq!(record.slot, Some(2));
-        assert_eq!(record.original_pid, Some(std::process::id()));
         assert_eq!(record.refusal, Some("bundle_unavailable"));
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let resolved_record = composed["evidence"]["selected_detail"]["selection"]
+            .as_object()
+            .expect("resolved selection composes");
+        assert!(
+            resolved_record.get("original_pid").is_none(),
+            "no raw PID publishes: {resolved_record:?}"
+        );
+        assert_eq!(
+            resolved_record.len(),
+            5,
+            "resolved selection carries exactly its closed keys: {resolved_record:?}"
+        );
+        for key in ["endpoint", "slot", "file_offset", "names", "refusal"] {
+            assert!(
+                resolved_record.contains_key(key),
+                "resolved selection names {key}: {resolved_record:?}"
+            );
+        }
 
         let mut refused = SelectionLedger::new();
         let none = run_metrics_selection_stage("C_Missing", &scene.plan, &scope, &mut refused);
@@ -1572,6 +1591,14 @@ mod tests {
             serde_json::json!("endpoint_unknown")
         );
         assert!(section["selection"].get("original_pid").is_none());
+        let unresolved = section["selection"]
+            .as_object()
+            .expect("unresolved selection composes");
+        assert_eq!(
+            unresolved.len(),
+            2,
+            "unresolved selection carries exactly its closed keys: {unresolved:?}"
+        );
         assert!(section.get("lineage").is_none());
         assert!(section.get("aggregate").is_none());
         assert!(section.get("detail").is_none());

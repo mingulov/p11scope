@@ -5780,9 +5780,10 @@ mod tests {
     /// real path with the selection riding argv into the loop. When a
     /// name is given, the terminal document must also carry the additive
     /// `selected_detail` envelope with the genuine live-plan resolution
-    /// (slot, names, original pid) plus the honest host-composition seam
-    /// refusal — while the aggregate still equals the workload ledger
-    /// exactly, so selection adds no duplicate counts.
+    /// (slot, names, file offset — never process identity) plus the
+    /// honest host-composition seam refusal — while the aggregate still
+    /// equals the workload ledger exactly, so selection adds no
+    /// duplicate counts.
     fn counter_cli_capture_cell_with_selection(mode: CounterMode, select: Option<&str>) {
         const STAGED: usize = 512;
         let mut parts = engine_counter_fixture();
@@ -6002,8 +6003,17 @@ mod tests {
             assert_eq!(record["slot"], serde_json::json!(7));
             assert_eq!(record["file_offset"], serde_json::json!(offsets[7]));
             assert_eq!(record["names"], serde_json::json!([name]));
-            assert_eq!(record["original_pid"], serde_json::json!(pid));
             assert_eq!(record["refusal"], serde_json::json!("bundle_unavailable"));
+            let record_map = record.as_object().expect("selection is an object");
+            assert!(
+                record_map.get("original_pid").is_none(),
+                "no raw PID publishes: {record_map:?}"
+            );
+            assert_eq!(
+                record_map.len(),
+                5,
+                "resolved selection carries exactly its closed keys: {record_map:?}"
+            );
             assert_eq!(selected["events"], serde_json::json!([]));
             assert!(selected.get("lineage").is_none());
             assert!(selected.get("aggregate").is_none());
@@ -6095,6 +6105,11 @@ mod tests {
         );
         assert!(record.get("slot").is_none());
         assert!(record.get("original_pid").is_none());
+        assert_eq!(
+            record.as_object().expect("selection is an object").len(),
+            2,
+            "unresolved selection carries exactly its closed keys: {record:?}"
+        );
         // No transcript ran: the session and engine drop, and the owned
         // fixture drops (kill/reap) with the parts.
         drop(session);

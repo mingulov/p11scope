@@ -22,38 +22,41 @@
 //! inventory facts publish through the same batch boundary the Phase 2
 //! ordering test pins.
 
+use super::inventory::image_guard::{FreshImageGuard, ImageAcquisition};
 use super::inventory::{
-    ExecProof, ImageGuard, InventoryCommit, InventoryDiscoveryConfig, InventoryOwnerLimits,
-    RefreshCause, ScanReceipt,
+    ExecProof, ImageCheck, ImageGuard, InventoryCommit, InventoryDiscoveryConfig,
+    InventoryOwnerLimits, PreflightedReconciliation, RefreshCause, ScanLease, ScanReceipt,
 };
 use super::*;
 #[cfg(test)]
 use crate::attach::capture::ScopeIncarnation;
 use crate::attach::capture::{
-    CallerCountUpdate, CaptureScopeCoverage, CookieQuery, DiscoveryBatch, DomainCookie,
-    ExtendReceipt, LifecycleLoss, NativeDomainId, ScopeCustody, WitnessBatch, WitnessRow,
+    BindingObservation, CallerCountUpdate, CallerImageObservation, CaptureScopeCoverage,
+    CookieQuery, DiscoveryBatch, DomainCookie, ExtendReceipt, LifecycleLoss, NativeDomainId,
+    ReadWindow, ScopeCustody, WitnessBatch, WitnessRow,
 };
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
     AdmissionState, AdmitFailure, BudgetRefusal, CallerAdapter, CallerEvent, CallerId,
     CallerRegistry, CountPublication, CoverageNote, EdgeRecord, ExeIdentity, ImageAuthority,
     MappingState, ModuleId, ModuleInfo, ModuleKey, PendingCountOutcome, PendingRejection,
-    ProcessSource, RegistryGap, RegistryLimits, UnknownReason, UseCoverage,
+    ProcessSource, RegistryGap, RegistryLimits, ScopedOwnerProof, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
     AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
     InventoryAttachSet, MEMBERSHIP_RESOURCE, ModuleMembers, TargetDelta,
 };
 use crate::discovery::native_binding::{
-    BinderLimits, Binding, CurrentBindingCheck, CurrentBindingRequest, CurrentBindingSighting,
-    Decision, ExecTransition, NativeBinder, NativeIdentity, UnboundReason,
+    BinderLimits, Binding, BoundImage, CurrentBindingCheck, CurrentBindingRequest,
+    CurrentBindingSighting, Decision, ExecTransition, NativeBinder, NativeIdentity, UnboundReason,
 };
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
 };
 use crate::discovery::sweep_attribution::AttributionLoss;
 use crate::inspect_system::inventory_cgroup::{
-    CgroupCollectRequest, CgroupCollection, CgroupFence, ScopedCollectionOutcome,
+    CgroupAdmissionPermit, CgroupCollectRequest, CgroupCollection, CgroupFence,
+    ScopedCollectionOutcome, SharedCollectionWork,
 };
 use crate::inventory_diagnostics::{
     Decision as DiagnosticDecision, DiagnosticConfig, DiagnosticKind, DiagnosticOutcome,
@@ -61,12 +64,14 @@ use crate::inventory_diagnostics::{
     ReadOrigin, Recorder,
 };
 use crate::inventory_semantics::{AttestedSemanticLane, SemanticBatch};
+use crate::process::PidPin;
 use crate::scope::inventory_cgroup::{CgroupWalkLimits, CgroupWalkState, CollectionControl};
 use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
 use p11scope_ebpf_common::inventory_callers::CallerEvidence;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[path = "inventory_count_eligibility.rs"]
 mod count_eligibility;
@@ -275,6 +280,15 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// The native witness binder (Task 6 C4): every native row enters
     /// through `stage_native`.
     binder: NativeBinder,
+    /// The retained native image-acquisition handle the scoped owner
+    /// preparation (packet 6.11p2) acquires fresh caller-image
+    /// observations through, before the final membership sample.
+    /// `None` (production until the capture handoff is wired, and the
+    /// scan lane) keeps scan-pinned fallback with a named gap; tests
+    /// install a scripted acquisition whose observations decode
+    /// through the real baseline decoder.
+    #[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation reads this.
+    native_image_acquisition: Option<Box<dyn ImageAcquisition>>,
     /// Accepted semantic caller bindings (H3 Task 3): one stable custody
     /// Arc per accepted caller, owned by the coordinator semantic child.
     semantic_bindings: semantics::SemanticBindingSet,
@@ -431,6 +445,60 @@ fn exit_clocks_comparable_with(
     crate::attach::clock_origins_comparable_with(active, children, offsets)
 }
 
+/// One staged native owner: all preparation I/O (fresh observation,
+/// warm view, guarded scan, prepared reconciliation, pin preflight)
+/// complete before the final membership sample, awaiting the
+/// permit-backed commit. Owns its evidence; the commit judges it
+/// through the real invoked paths and either activates or releases
+/// everything.
+struct StagedNativeOwner {
+    caller: CallerId,
+    pid: u32,
+    generation: crate::inspect_system::MemberGeneration,
+    expected: BoundImage,
+    observation: CallerImageObservation,
+    original: Arc<PidPin>,
+    owner: ProcessViewId,
+    lease: ScanLease,
+    preflighted: PreflightedReconciliation,
+}
+
+/// Pure commit-time image guard: replays the preparation's stored
+/// observation through the real binding comparison. No new I/O — the
+/// commit stays bounded pure work — and no copied bools: authority is
+/// computed here from evidence on every invocation.
+struct ReplayImageGuard {
+    original: Arc<PidPin>,
+    observation: CallerImageObservation,
+}
+
+impl ImageGuard for ReplayImageGuard {
+    fn check(&mut self, view: &ProcessView, expected: BoundImage) -> ImageCheck {
+        if !view.still_the_same() {
+            return ImageCheck::Unavailable;
+        }
+        if !Arc::ptr_eq(view.retained_pin_arc(), &self.original) {
+            return ImageCheck::Unavailable;
+        }
+        match expected.compare_observation(&self.original, &self.observation) {
+            BindingObservation::Match => ImageCheck::Exact,
+            BindingObservation::DifferentImage => ImageCheck::Changed,
+            BindingObservation::Unavailable => ImageCheck::Unavailable,
+        }
+    }
+}
+
+/// At most four staged owner preparations per publication (mirrors the
+/// semantic-preparation bound): activation stays bounded work.
+const SCOPED_OWNER_PREPARATION_ATTEMPTS: usize = 4;
+
+/// Interim one-owner-per-transaction gate: preparations share one
+/// committed snapshot and each commit replaces the whole engine
+/// state, so at most one staged owner may commit per transaction;
+/// further permitted members defer deterministically to a later
+/// pass with their staged state released.
+const SCOPED_OWNER_COMMITS_PER_TRANSACTION: usize = 1;
+
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
     // Retain the default constructor for existing internal harness callers;
     // the public runtime always supplies its already-resolved budget.
@@ -488,6 +556,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_targets: TargetDelta::default(),
             capture: None,
             binder: NativeBinder::new(BinderLimits::default()),
+            native_image_acquisition: None,
             semantic_bindings: semantics::SemanticBindingSet::new(),
             semantic_finalizer: None,
             joint_capture,
@@ -2327,6 +2396,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.owners.get(&caller).copied()
     }
 
+    /// Install the image-acquisition handle the scoped owner
+    /// preparation acquires fresh observations through. Twins install
+    /// a scripted acquisition; production wiring (handing over the
+    /// active capture) is future work — see the packet 2 seam note.
+    #[cfg_attr(not(test), allow(dead_code))] // Twin seam; production sets nothing yet.
+    pub(crate) fn set_native_image_acquisition(&mut self, acquisition: Box<dyn ImageAcquisition>) {
+        self.native_image_acquisition = Some(acquisition);
+    }
+
     /// Owned-fixture growth path: open one native owner through the real
     /// engine call, admit its caller, and bind the two — the same three
     /// steps `scan_pass` performs per pid, without a scope collection.
@@ -3087,6 +3165,425 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Prepare native owner activation for prepared members with live
+    /// callers, before the final membership sample. All owner I/O
+    /// completes here; each returned staged handle commits only under
+    /// its matching borrowed permit, or releases. Members without a
+    /// settled expected image, without an acquisition answer, or
+    /// already owning skip with a named gap (silently when already
+    /// active — refresh is packet 3).
+    fn prepare_scoped_native_owners(
+        &mut self,
+        candidates: Vec<(u32, CallerId, crate::inspect_system::MemberGeneration)>,
+        work: &SharedCollectionWork,
+    ) -> Vec<StagedNativeOwner> {
+        let mut staged = Vec::new();
+        for (pid, caller, generation) in candidates {
+            if staged.len() >= SCOPED_OWNER_PREPARATION_ATTEMPTS {
+                break;
+            }
+            if !work.charge(8) {
+                break;
+            }
+            if let Some(one) = self.prepare_one_scoped_native_owner(pid, caller, generation) {
+                staged.push(one);
+            }
+        }
+        staged
+    }
+
+    fn prepare_one_scoped_native_owner(
+        &mut self,
+        pid: u32,
+        caller: CallerId,
+        generation: crate::inspect_system::MemberGeneration,
+    ) -> Option<StagedNativeOwner> {
+        if self.owners.contains_key(&caller) {
+            // Already active: refresh and suspend belong to packet 3.
+            return None;
+        }
+        // The caller prepares only with a handle installed; the
+        // handle-less path keeps the standing deferral disclosure.
+        let domain = self
+            .native_image_acquisition
+            .as_ref()
+            .expect("checked acquisition handle")
+            .acquisition_domain();
+        let expected = match self
+            .binder
+            .expected_owner_image(domain, caller, pid, &self.adapter)
+        {
+            Some(expected) => expected,
+            None => {
+                self.refuse_scoped_native_owner(caller, pid,
+                        "no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained");
+                return None;
+            }
+        };
+        let (owner, original) = match self.engine.provision_staged_owner(pid, expected) {
+            Ok(provisioned) => provisioned,
+            Err(error) => {
+                self.refuse_scoped_native_owner(
+                    caller,
+                    pid,
+                    format!("staged owner provision failed: {error:#}"),
+                );
+                return None;
+            }
+        };
+        // One bounded single-row window for the stored observation;
+        // the pass deadline bounds the whole commit around it.
+        let window = ReadWindow::new(1, Instant::now() + Duration::from_secs(5))
+            .expect("one-row observation window");
+        let observation = match self
+            .native_image_acquisition
+            .as_mut()
+            .expect("checked acquisition handle")
+            .acquire_caller_image(&original, window)
+        {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    None,
+                    format!("fresh image observation unavailable: {error:#}"),
+                );
+                return None;
+            }
+        };
+        let mut guard = FreshImageGuard::new(
+            self.native_image_acquisition
+                .as_mut()
+                .expect("checked acquisition handle")
+                .as_mut(),
+            &self.binder,
+            window,
+        );
+        let lease = match self.engine.acquire_inventory_scan(owner) {
+            Ok(lease) => lease,
+            Err(error) => {
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    None,
+                    format!("staged scan lease unavailable: {error:#}"),
+                );
+                return None;
+            }
+        };
+        // I4a window around the staged scan, mirroring the scan
+        // lane: the window limits cap the scan's work. No separate
+        // deadline rides here (u64::MAX): the pass deadline bounds the
+        // whole commit from outside, and the collection control's
+        // deadline has no reader on this path yet (packet 2 seam note).
+        let window_id = self.next_window;
+        self.next_window = self.next_window.saturating_add(1);
+        let window_token = match self
+            .engine
+            .budget
+            .begin_window(WindowId::new(window_id), u64::MAX)
+        {
+            Ok(token) => token,
+            Err(error) => {
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("staged scan window unavailable: {error}"),
+                );
+                return None;
+            }
+        };
+        let checkpoint = match self.engine.budget.checkpoint(window_token.clone()) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                let _ = self.engine.budget.finish_window(window_token);
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("staged scan checkpoint unavailable: {error}"),
+                );
+                return None;
+            }
+        };
+        let receipt = match self.engine.scan_inventory_owner(&lease, &mut guard) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let _ = self.engine.budget.finish_scan(checkpoint);
+                let _ = self.engine.budget.finish_window(window_token);
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("staged owner scan failed: {error:#}"),
+                );
+                return None;
+            }
+        };
+        if let Err(error) = self.engine.budget.finish_scan(checkpoint) {
+            let _ = self.engine.budget.finish_window(window_token);
+            guard.release();
+            self.abandon_staged_native_owner(
+                caller,
+                pid,
+                owner,
+                Some(&lease),
+                format!("staged scan finish failed: {error}"),
+            );
+            return None;
+        }
+        if let Err(error) = self.engine.budget.finish_window(window_token) {
+            guard.release();
+            self.abandon_staged_native_owner(
+                caller,
+                pid,
+                owner,
+                Some(&lease),
+                format!("staged scan window finish failed: {error}"),
+            );
+            return None;
+        }
+        let prepared = match self
+            .engine
+            .prepare_inventory_reconciliation(receipt, &mut guard)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("staged reconciliation preparation failed: {error:#}"),
+                );
+                return None;
+            }
+        };
+        // Pin preflight seals the prepared reconciliation before the
+        // final membership sample: the commit-time apply trusts this
+        // evidence and performs no provider I/O.
+        let preflighted = match Engine::preflight_scoped_reconciliation(prepared) {
+            Ok(preflighted) => preflighted,
+            Err(error) => {
+                guard.release();
+                self.abandon_staged_native_owner(
+                    caller,
+                    pid,
+                    owner,
+                    Some(&lease),
+                    format!("staged reconciliation preflight failed: {error:#}"),
+                );
+                return None;
+            }
+        };
+        guard.release();
+        Some(StagedNativeOwner {
+            caller,
+            pid,
+            generation,
+            expected,
+            observation,
+            original,
+            owner,
+            lease,
+            preflighted,
+        })
+    }
+
+    /// Commit one staged native owner under its borrowed final-sample
+    /// permit: bounded pure work only. Validates the staged pid and
+    /// generation against the permit, installs native-exact caller
+    /// authority, activates the staged owner (which replays the stored
+    /// observation through the real binding comparison and applies the
+    /// preflighted reconciliation with no provider I/O), binds owner
+    /// to caller, and projects the commit. Any failure releases the
+    /// staged reservation and lease with a named gap; an installed
+    /// authority rolls back when the engine commit refuses, and a
+    /// rollback that misses its installed image retires the caller
+    /// instead of leaving native-exact authority without an owner.
+    fn commit_staged_native_owner(
+        &mut self,
+        staged: StagedNativeOwner,
+        permit: &CgroupAdmissionPermit<'_>,
+        verdicts: &BTreeMap<AttachModuleKey, AttachVerdict>,
+        now_ns: u64,
+    ) {
+        let StagedNativeOwner {
+            caller,
+            pid,
+            generation,
+            expected,
+            observation,
+            original,
+            owner,
+            lease,
+            preflighted,
+        } = staged;
+        let Some(proof) = ScopedOwnerProof::validate(pid, &generation, permit) else {
+            self.abandon_staged_native_owner(
+                caller,
+                pid,
+                owner,
+                Some(&lease),
+                "the staged member does not match the final-sample permit; scan-pinned fallback retained",
+            );
+            return;
+        };
+        if let Err(failure) = self
+            .adapter
+            .install_scoped_native_authority(caller, expected, &proof)
+        {
+            self.abandon_staged_native_owner(
+                caller,
+                pid,
+                owner,
+                Some(&lease),
+                format!("native authority installation refused: {}", failure.reason),
+            );
+            return;
+        }
+        let mut replay = ReplayImageGuard {
+            original,
+            observation,
+        };
+        match self
+            .engine
+            .activate_staged_owner(owner, preflighted, &lease, &proof, &mut replay)
+        {
+            Ok(commit) => {
+                self.owners.insert(caller, owner);
+                self.project_native_commit(caller, owner, &commit, verdicts, now_ns);
+                if commit.complete {
+                    self.complete_scanned.insert(caller);
+                }
+            }
+            Err(error) => {
+                self.rollback_installed_native_authority(caller, pid, expected, &error, now_ns);
+            }
+        }
+    }
+
+    /// Roll back one installed native authority after its staged
+    /// activation failed: restore scan-pinned authority when the
+    /// installed image still stands. When the rollback misses its
+    /// installed image, the installed authority survives with no
+    /// activated owner, so retire the caller (evidence retained)
+    /// instead of leaving a live `NativeExact` caller without its
+    /// owner. Bounded pure work: no provider I/O. Every outcome
+    /// reports its own named gap; nothing drops silently.
+    fn rollback_installed_native_authority(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        expected: BoundImage,
+        error: &anyhow::Error,
+        now_ns: u64,
+    ) {
+        if let Err(rollback) = self
+            .adapter
+            .cancel_scoped_native_authority(caller, expected)
+        {
+            self.refuse_scoped_native_owner(caller, pid, rollback);
+            if self.adapter.retire_native_caller_without_owner(
+                caller,
+                "native authority rollback missed its installed image after a failed activation; the caller retires with its evidence rather than keep native-exact authority without an activated owner".into(),
+                now_ns,
+            ) {
+                self.retire_caller_in_registry(caller, now_ns);
+                self.refuse_scoped_native_owner(
+                    caller,
+                    pid,
+                    "the installed native authority survived a missed rollback with no activated owner; the caller retired with its evidence; scan-pinned fallback is not claimed",
+                );
+            }
+        }
+        self.refuse_scoped_native_owner(
+            caller,
+            pid,
+            format!("staged owner activation failed: {error:#}"),
+        );
+    }
+
+    /// Revise the engine tail after scoped owner work: the batch
+    /// tail already ran at this publication's start, and owner
+    /// preparation dirtied its inputs whether or not any activation
+    /// committed, so republish before the publication's revisions are
+    /// cut. Infallible by construction — the scoped region allows no
+    /// later fallible tail — so a failed revision keeps the previous
+    /// publication with a named gap and never unwinds committed work.
+    fn revise_engine_tail_after_scoped_owners(&mut self) {
+        if let Err(error) = self.engine.publish_batch_tail(true) {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "engine tail revision failed".into(),
+                reason: format!(
+                    "scoped owner work could not revise the engine tail: {error:#}; the previous publication stands"
+                ),
+                budget: None,
+            });
+        }
+    }
+
+    /// Release one staged owner that cannot commit: the scan lease when
+    /// one was acquired, and the staged record, view, and ID occupancy,
+    /// with a named refusal gap. Every release step reports its own
+    /// loud gap on failure; nothing is dropped silently.
+    fn abandon_staged_native_owner(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        owner: ProcessViewId,
+        lease: Option<&ScanLease>,
+        reason: impl Into<String>,
+    ) {
+        self.refuse_scoped_native_owner(caller, pid, reason.into());
+        if let Some(lease) = lease
+            && let Err(error) = self.engine.release_inventory_scan(lease)
+        {
+            self.refuse_scoped_native_owner(
+                caller,
+                pid,
+                format!("staged scan lease release failed: {error:#}"),
+            );
+        }
+        if let Err(error) = self.engine.release_staged_owner(owner) {
+            self.refuse_scoped_native_owner(
+                caller,
+                pid,
+                format!("staged owner release failed: {error:#}"),
+            );
+        }
+    }
+
+    fn refuse_scoped_native_owner(
+        &mut self,
+        caller: CallerId,
+        pid: u32,
+        reason: impl Into<String>,
+    ) {
+        self.registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: Some(pid),
+            subject: "native owner activation refused".into(),
+            reason: reason.into(),
+            budget: None,
+        });
+    }
     /// One native owner through the core: refresh request, lease, I4a
     /// window, scan, prepare, commit (which revalidates at the
     /// publication boundary). The lease releases on every path.
@@ -6617,6 +7114,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     }
                 }
             }
+            // Native owner preparation (packet 6.11p2): all owner I/O
+            // completes here, before the final membership sample. Only
+            // prepared members with a live caller qualify; the commit
+            // below activates at most one staged owner under its
+            // borrowed final-sample permit and releases the rest.
+            // Without an acquisition handle nothing prepares: the
+            // commit keeps the standing deferral disclosure.
+            let owner_candidates: Vec<(u32, CallerId, crate::inspect_system::MemberGeneration)> =
+                prepared
+                    .iter()
+                    .filter_map(|(pid, pin)| {
+                        pin.existing()
+                            .map(|caller| (*pid, caller, pin.generation().clone()))
+                    })
+                    .collect();
+            let staged_owners = if self.native_image_acquisition.is_none() {
+                Vec::new()
+            } else {
+                self.prepare_scoped_native_owners(owner_candidates, &work)
+            };
             // Prepare every provider read while retaining exclusive attach-set
             // custody. No aliases/endpoints/memberships are published here.
             let provider = if collection.reserve_projection(self.registry.edge_count()) {
@@ -6774,9 +7291,69 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     lane.deliver_admission_receipt(receipt);
                 }
             }
-            self.registry.record_gap(RegistryGap { caller: None, module: None, pid: None,
-                subject: "scoped native owner admission deferred".into(),
-                reason: "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; sampled scan-pinned callers and retained native totals remain available".into(), budget: None });
+            // Without an acquisition handle (production until the
+            // capture handoff is wired): keep the standing deferral
+            // disclosure the installed consumer recognizes; its
+            // replacement is coordinated separately.
+            if self.native_image_acquisition.is_none() {
+                self.registry.record_gap(RegistryGap { caller: None, module: None, pid: None,
+                    subject: "scoped native owner admission deferred".into(),
+                    reason: "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; sampled scan-pinned callers and retained native totals remain available".into(), budget: None });
+            }
+            // Native owner activation (packet 6.11p2): commit staged
+            // owners under their borrowed final-sample permits. A
+            // commit requires both its member permit and a complete
+            // transaction (the outcome gates the fence); a missing
+            // permit reports the member-precise reason, a permitted
+            // member of an incomplete transaction the fence reason.
+            // At most one staged owner commits per transaction: each
+            // commit replaces the whole engine state, so a further
+            // permitted member defers deterministically to a later
+            // pass with its staged state released. Refresh and suspend
+            // stay deferred (packet 3).
+            let transaction_complete = collection.outcome() == ScopedCollectionOutcome::Complete;
+            let mut commits_used = 0;
+            for staged in staged_owners {
+                let permit = collection.permit(staged.pid);
+                match (permit, transaction_complete) {
+                    (Some(permit), true) => {
+                        if commits_used >= SCOPED_OWNER_COMMITS_PER_TRANSACTION {
+                            self.abandon_staged_native_owner(
+                                staged.caller,
+                                staged.pid,
+                                staged.owner,
+                                Some(&staged.lease),
+                                "only one native owner activation per transaction; the staged owner is deferred to a later pass; scan-pinned fallback retained",
+                            );
+                        } else {
+                            commits_used += 1;
+                            self.commit_staged_native_owner(staged, &permit, &verdicts, *now_ns);
+                        }
+                    }
+                    (None, _) => {
+                        self.abandon_staged_native_owner(
+                            staged.caller,
+                            staged.pid,
+                            staged.owner,
+                            Some(&staged.lease),
+                            "the final-sample permit was not granted; scan-pinned fallback retained",
+                        );
+                    }
+                    (Some(_), false) => {
+                        self.abandon_staged_native_owner(
+                            staged.caller,
+                            staged.pid,
+                            staged.owner,
+                            Some(&staged.lease),
+                            "the cgroup transaction did not complete; scan-pinned fallback retained",
+                        );
+                    }
+                }
+            }
+            // Preparation dirtied engine facts after the first tail
+            // whether or not any activation committed: revise through
+            // the non-unwinding handler before revisions are cut.
+            self.revise_engine_tail_after_scoped_owners();
             let outcome = collection.outcome(); // final cancellation/deadline poll
             if outcome != ScopedCollectionOutcome::Complete {
                 allowed_callers.clear();

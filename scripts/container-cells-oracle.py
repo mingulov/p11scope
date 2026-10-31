@@ -893,6 +893,12 @@ def refuses_with(label, text, check):
     raise SystemExit(f"container-cells mutation accepted: {label}")
 
 
+def accepts(label, check):
+    """The check must pass (an accepts-case); a refusal fails the self-test."""
+    check()
+    print(f"container-cells mutation accepted: {label}")
+
+
 def self_test():
     healthy = copy_up(**good_copy_up("B"))
     assert healthy["lane"] == "B"
@@ -970,6 +976,39 @@ def self_test():
         modules=ST_MODULES_SPAN)
     refuses_with("fallback null without backend agreement", "disagree",
                  lambda: copy_up(**none_split))
+    # B2's span entries coverage is a per-capture observation: one leg may
+    # watch B2's edge while the other records B2's setup rows before B2's
+    # admission. That honest split passes; any other reason still refuses.
+    b2_split = good_copy_up("B")
+    for key in ("pre_kernel", "span_kernel", "fresh_kernel"):
+        b2_split[key]["observation"]["identity"]["fallback"] = None
+    b2_split_edges = [item if (item["pid"], item["module"]) != (104, "m8")
+                    else st_edge(104, "m8", evidence="maps_match",
+                                 cov="unknown", since=3000, first_seen=2000)
+                    for item in st_span_edges()]
+    b2_split["span_userspace"] = good_inventory(
+        b2_split_edges, [st_collapse()], backend="userspace", fallback=None,
+        modules=ST_MODULES_SPAN)
+    b2_split_caller = {caller["pid"]: caller["id"]
+                       for caller in b2_split["span_userspace"]["callers"]}[104]
+    for record in b2_split["span_userspace"]["edges"]:
+        if record["caller"] == b2_split_caller and record["module"] == "m8":
+            record["entries"]["coverage"]["reason"] = "use_before_admission"
+    accepts("B2 span coverage split watched vs pre-admission",
+            lambda: copy_up(**b2_split))
+    b2_loss = good_copy_up("B")
+    for key in ("pre_kernel", "span_kernel", "fresh_kernel"):
+        b2_loss[key]["observation"]["identity"]["fallback"] = None
+    b2_loss["span_userspace"] = good_inventory(
+        b2_split_edges, [st_collapse()], backend="userspace", fallback=None,
+        modules=ST_MODULES_SPAN)
+    b2_loss_caller = {caller["pid"]: caller["id"]
+                      for caller in b2_loss["span_userspace"]["callers"]}[104]
+    for record in b2_loss["span_userspace"]["edges"]:
+        if record["caller"] == b2_loss_caller and record["module"] == "m8":
+            record["entries"]["coverage"]["reason"] = "loss"
+    refuses_with("B2 span coverage split with a loss reason", "disagree",
+                 lambda: copy_up(**b2_loss))
     # Ambient host PKCS#11 users keep calling across the sequential legs,
     # so an ambient-only count split (or an ambient-only module) passes.
     ambient_split = good_copy_up("B")

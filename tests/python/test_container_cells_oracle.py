@@ -46,10 +46,11 @@ def key_of_module(module_id):
 
 def edge(pid, module, evidence="deep_scan", state="mapped", count=0,
          cov="unknown", since=None, first_seen=1000, lossy=None,
-         reason="not_attached"):
+         reason="not_attached", cov_reason=None):
     return {"pid": pid, "module": module, "evidence": evidence, "state": state,
             "count": count, "cov": cov, "since": since,
-            "first_seen": first_seen, "lossy": lossy, "reason": reason}
+            "first_seen": first_seen, "lossy": lossy, "reason": reason,
+            "cov_reason": cov_reason}
 
 
 def collapse_gap(mapping_key=KEY_B, target_key=KEY_A, path=PROVIDER):
@@ -93,7 +94,8 @@ def inventory(edges, gaps=(), observer="initial", backend="kernel",
                    "entries": {"count": item["count"],
                                "coverage": {"state": item["cov"],
                                             "since_ns": item["since"],
-                                            "lossy": item["lossy"]}}}
+                                            "lossy": item["lossy"],
+                                            "reason": item["cov_reason"]}}}
                  for item in edges],
         "gaps": [{"subject": subject, "reason": reason, "caller": None,
                   "module": None, "pid": pid} for subject, reason, pid in gaps],
@@ -416,6 +418,112 @@ class CopyUpTest(unittest.TestCase):
         with self.assertRaisesRegex(
                 AssertionError, "backends disagree on provider edges.*102"):
             ORACLE["copy_up"](**inputs)
+
+    def test_span_b2_coverage_split_watched_vs_pre_admission_passes(self):
+        """Honest per-capture B2 split: watched vs pre-admission use."""
+        split = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
+                 else edge(PID_B_SPAN, "m8", cov="unknown",
+                           cov_reason="use_before_admission", first_seen=2000)
+                 for item in span_edges_twin_old()]
+        kernel = inventory(span_edges_twin_old(), [collapse_gap()],
+                           backend="kernel", modules=dict(D1_MODULES_SPAN))
+        userspace = inventory(split, [collapse_gap()], backend="userspace",
+                              fallback=None, modules=dict(D1_MODULES_SPAN))
+        result = check_copy_up(span_kernel=kernel, span_userspace=userspace)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["known_issue"],
+                         {"pid": PID_B_PRE, "old_module": "m7",
+                          "new_module": "m8"})
+
+    def test_span_b2_coverage_split_either_direction_passes(self):
+        """The honest B2 split passes with the legs swapped too."""
+        split = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
+                 else edge(PID_B_SPAN, "m8", cov="unknown",
+                           cov_reason="use_before_admission", first_seen=2000)
+                 for item in span_edges_twin_old()]
+        kernel = inventory(split, [collapse_gap()],
+                           backend="kernel", modules=dict(D1_MODULES_SPAN))
+        userspace = inventory(span_edges_twin_old(), [collapse_gap()],
+                              backend="userspace", fallback=None,
+                              modules=dict(D1_MODULES_SPAN))
+        result = check_copy_up(span_kernel=kernel, span_userspace=userspace)
+        self.assertTrue(result["ok"])
+
+    def test_span_b2_coverage_split_both_unknown_passes(self):
+        """Both legs pre-admission on B2: the other same-side shape passes."""
+        split = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
+                 else edge(PID_B_SPAN, "m8", cov="unknown",
+                           cov_reason="use_before_admission", first_seen=2000)
+                 for item in span_edges_twin_old()]
+        kernel = inventory(split, [collapse_gap()],
+                           backend="kernel", modules=dict(D1_MODULES_SPAN))
+        userspace = inventory(split, [collapse_gap()], backend="userspace",
+                              fallback=None, modules=dict(D1_MODULES_SPAN))
+        result = check_copy_up(span_kernel=kernel, span_userspace=userspace)
+        self.assertTrue(result["ok"])
+
+    def test_span_b2_coverage_split_other_reason_fails(self):
+        """A loss reason on the unknown leg is not the honest split."""
+        split = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
+                 else edge(PID_B_SPAN, "m8", cov="unknown",
+                           cov_reason="loss", first_seen=2000)
+                 for item in span_edges_twin_old()]
+        kernel = inventory(span_edges_twin_old(), [collapse_gap()],
+                           backend="kernel", modules=dict(D1_MODULES_SPAN))
+        userspace = inventory(split, [collapse_gap()], backend="userspace",
+                              fallback=None, modules=dict(D1_MODULES_SPAN))
+        caller_of = {caller["pid"]: caller["id"]
+                     for caller in userspace["callers"]}
+        for record in userspace["edges"]:
+            if record["caller"] == caller_of[PID_B_SPAN] \
+                    and record["module"] == "m8":
+                record["entries"]["coverage"]["Detail"] = "x"
+        with self.assertRaisesRegex(
+                AssertionError, "backends disagree on provider edges.*104"):
+            check_copy_up(span_kernel=kernel, span_userspace=userspace)
+
+    def test_span_b2_coverage_split_nonzero_count_fails(self):
+        """Split coverage with a 1 vs 0 count is still a divergence."""
+        split = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
+                 else edge(PID_B_SPAN, "m8", count=1, cov="unknown",
+                           cov_reason="use_before_admission", first_seen=2000)
+                 for item in span_edges_twin_old()]
+        kernel = inventory(span_edges_twin_old(), [collapse_gap()],
+                           backend="kernel", modules=dict(D1_MODULES_SPAN))
+        userspace = inventory(split, [collapse_gap()], backend="userspace",
+                              fallback=None, modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(
+                AssertionError, "backends disagree on provider edges.*104"):
+            check_copy_up(span_kernel=kernel, span_userspace=userspace)
+
+    def test_span_b2_coverage_split_mapping_differs_fails(self):
+        """Split coverage with maps_match vs deep_scan mapping still fails."""
+        split = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
+                 else edge(PID_B_SPAN, "m8", evidence="maps_match",
+                           cov="unknown", cov_reason="use_before_admission",
+                           first_seen=2000)
+                 for item in span_edges_twin_old()]
+        kernel = inventory(span_edges_twin_old(), [collapse_gap()],
+                           backend="kernel", modules=dict(D1_MODULES_SPAN))
+        userspace = inventory(split, [collapse_gap()], backend="userspace",
+                              fallback=None, modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(
+                AssertionError, "backends disagree on provider edges.*104"):
+            check_copy_up(span_kernel=kernel, span_userspace=userspace)
+
+    def test_span_b_pre_coverage_split_still_fails(self):
+        """The tolerance is B2-scoped: the same split on B-pre still fails."""
+        split = [item if (item["pid"], item["module"]) != (PID_B_PRE, "m8")
+                 else edge(PID_B_PRE, "m8", cov="unknown",
+                           cov_reason="use_before_admission", first_seen=2000)
+                 for item in span_edges_twin_old()]
+        kernel = inventory(span_edges_twin_old(), [collapse_gap()],
+                           backend="kernel", modules=dict(D1_MODULES_SPAN))
+        userspace = inventory(split, [collapse_gap()], backend="userspace",
+                              fallback=None, modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(
+                AssertionError, "backends disagree on provider edges.*102"):
+            check_copy_up(span_kernel=kernel, span_userspace=userspace)
 
     def test_pre_profile_b_wrong_count_fails(self):
         with self.assertRaises(AssertionError):

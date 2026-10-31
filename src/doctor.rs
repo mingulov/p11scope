@@ -2872,6 +2872,154 @@ mod tests {
         );
     }
 
+    /// Journal-pair honesty: every non-loaded shape of the pair fact
+    /// reports "unavailable" with a finite reason, never "available".
+    /// Only an actually present, flavor-clean pair reports available.
+    #[test]
+    fn journal_pair_unavailable_shapes_never_report_available() {
+        use crate::attach::JournalPairPreflight;
+        for (shape, needle) in [
+            (
+                JournalPairPreflight::PairMissing(
+                    "p11_entry_journal, p11_return_journal".into(),
+                ),
+                "pair missing",
+            ),
+            (
+                JournalPairPreflight::LoadError("journal object unparseable".into()),
+                "load error",
+            ),
+            (
+                JournalPairPreflight::WrongDomain("ordinary roots present".into()),
+                "wrong domain",
+            ),
+        ] {
+            let check = journal_pair_check(shape);
+            assert_eq!(check.name, JOURNAL_PAIR_ROW);
+            let detail = status_detail(&check.status);
+            assert!(
+                detail.starts_with("unavailable"),
+                "must report unavailable, got {detail:?}"
+            );
+            assert_ne!(detail, "available");
+            assert!(
+                detail.contains(needle),
+                "finite reason names its shape: {detail:?}"
+            );
+            assert!(
+                matches!(check.status, Status::Warn(_)),
+                "an opt-in lane warns, never fails the verdict: {check:?}"
+            );
+        }
+        let check = journal_pair_check(JournalPairPreflight::Available);
+        assert_eq!(check.status, Status::Ok("available".into()));
+        // A build that omits the production journal object reports the
+        // one build-limit token: identical on every host, so it never
+        // becomes an extra-strict qualification violation.
+        let check = journal_pair_check(JournalPairPreflight::UnavailableInBuild);
+        assert_eq!(check.status, Status::Warn("unavailable-in-build".into()));
+        assert!(
+            extra_strict_violations(std::slice::from_ref(&check)).is_empty(),
+            "the omitted-build row is a build limit, not a host defect"
+        );
+    }
+
+    /// The journal row is preflight only: present in every probe, but
+    /// never a requested/capture lane, so neither its Ok nor its Warn
+    /// can move the verdict or the exit code.
+    #[test]
+    fn journal_pair_row_is_preflight_only_and_never_gates() {
+        let checks = probe(None, None);
+        let row = checks
+            .iter()
+            .find(|c| c.name == JOURNAL_PAIR_ROW)
+            .unwrap_or_else(|| panic!("journal pair row is missing: {checks:?}"));
+        assert!(
+            matches!(row.status, Status::Ok(_) | Status::Warn(_)),
+            "assessed on every host, never Fail or NotApplicable: {row:?}"
+        );
+        assert!(!is_capture_row(JOURNAL_PAIR_ROW));
+        assert!(!is_requested_lane(JOURNAL_PAIR_ROW));
+        // Doctor success alone changes no verdict: an available journal
+        // row beside a failed capture row still exits 1, and an
+        // unavailable journal row beside healthy rows still exits 0.
+        let healthy = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok("available".into()),
+            },
+            Check {
+                name: JOURNAL_PAIR_ROW.into(),
+                status: Status::Warn("unavailable-in-build".into()),
+            },
+        ];
+        assert_eq!(verdict(&healthy), 0);
+        let refused = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Fail("denied".into()),
+            },
+            Check {
+                name: JOURNAL_PAIR_ROW.into(),
+                status: Status::Ok("available".into()),
+            },
+        ];
+        assert_eq!(verdict(&refused), 1);
+    }
+
+    /// The reported fact comes from the actual load inputs, not a
+    /// build flag: ordinary embedded bytes miss the pair by name,
+    /// garbage bytes refuse as a load error, and this build's live
+    /// preflight agrees with its embedded journal selection.
+    #[test]
+    fn journal_pair_preflight_derives_from_actual_object_bytes() {
+        use crate::attach::JournalPairPreflight;
+        for bytes in [b"not an ELF object".as_slice(), b""] {
+            assert!(
+                matches!(
+                    crate::attach::journal_pair_preflight_from_bytes(bytes),
+                    JournalPairPreflight::LoadError(_)
+                ),
+                "unparseable bytes are a load error"
+            );
+        }
+        let ordinary =
+            aya_obj::Object::parse(crate::EBPF_OBJECT).expect("ordinary bytes parse");
+        match crate::attach::journal_pair_preflight_from_parsed(&ordinary) {
+            JournalPairPreflight::PairMissing(names) => {
+                assert!(names.contains("p11_entry_journal"), "{names}");
+                assert!(names.contains("p11_return_journal"), "{names}");
+            }
+            other => panic!("ordinary bytes must miss the pair, got {other:?}"),
+        }
+        if env!("P11SCOPE_JOURNAL_ENABLED") == "1" {
+            assert!(matches!(
+                crate::attach::journal_pair_preflight(),
+                JournalPairPreflight::Available
+            ));
+            // A planted ordinary root is the wrong program domain even
+            // though both journal roots are present.
+            let mut mixed = aya_obj::Object::parse(crate::attach::journal::journal_object())
+                .expect("journal bytes parse");
+            let program = mixed
+                .programs
+                .values()
+                .next()
+                .expect("journal bytes carry programs")
+                .clone();
+            mixed.programs.insert("p11_entry".to_string(), program);
+            assert!(matches!(
+                crate::attach::journal_pair_preflight_from_parsed(&mixed),
+                JournalPairPreflight::WrongDomain(_)
+            ));
+        } else {
+            assert!(matches!(
+                crate::attach::journal_pair_preflight(),
+                JournalPairPreflight::UnavailableInBuild
+            ));
+        }
+    }
+
     #[test]
     fn inventory_preflight_failure_fails_the_requested_lane_verdict() {
         let row = |name: &str, status: Status| Check {

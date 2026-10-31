@@ -20188,6 +20188,43 @@ mod tests {
         );
     }
 
+    /// Preflight-only twin: a present journal pair never widens the
+    /// seal guards. Even with both journal roots in the loaded
+    /// inventory, a non-allowlisted (forced) activation policy refuses
+    /// at production validation before any mint, so doctor-reported
+    /// availability can never become seal authority on its own.
+    #[test]
+    fn journal_pair_presence_never_bypasses_seal_guards() {
+        let programs = BTreeSet::from([
+            "p11_entry",
+            "p11_return",
+            "p11_entry_journal",
+            "p11_return_journal",
+            "task_newtask",
+        ]);
+        for policy in [
+            super::CapturePolicy::AggregateOnly,
+            super::CapturePolicy::UnsafeUnvalidatedMetadata,
+        ] {
+            let scene = SealDrainScene::attest();
+            let minted = std::cell::Cell::new(0u32);
+            let refused = scene.seal_with_inputs(
+                &programs,
+                policy,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                || {
+                    minted.set(minted.get() + 1);
+                    Ok(41)
+                },
+            );
+            assert!(
+                matches!(refused, Err(SemanticRefusal::Attachment)),
+                "forced activation under {policy:?} must refuse: {refused:?}"
+            );
+            assert_eq!(minted.get(), 0, "a refused seal never mints");
+        }
+    }
+
     /// Ordinary seal drains unlinked: the production core seals unlinked over
     /// the real ordinary object inventory (no journal root), and the retained
     /// fact drains unlinked.

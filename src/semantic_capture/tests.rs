@@ -2088,6 +2088,299 @@ fn joint_refused_exec_marker_row_stays_unready_and_stage1_continues() {
     harness.ingest(next, &admitted);
 }
 
+/// 6.05 step 2 failure-injecting birth-row reader: a missing side reads
+/// back unreadable (map error, absent row). Only the ERROR is injected;
+/// a present side carries real published bytes.
+struct UnreadableSideRows {
+    row: Option<p11scope_ebpf_common::InstanceRecord>,
+    control: Option<p11scope_ebpf_common::JournalAdmissionControl>,
+}
+impl crate::attach::BirthRowReader for UnreadableSideRows {
+    fn read_marker_row(
+        &mut self,
+    ) -> Result<p11scope_ebpf_common::InstanceRecord, crate::attach::BirthRowError> {
+        self.row.ok_or(crate::attach::BirthRowError::Unreadable)
+    }
+    fn read_admission_control(
+        &mut self,
+    ) -> Result<p11scope_ebpf_common::JournalAdmissionControl, crate::attach::BirthRowError> {
+        self.control.ok_or(crate::attach::BirthRowError::Unreadable)
+    }
+}
+
+#[test]
+fn joint_retained_exec_birth_wrong_era_refuses_and_correct_era_mints() {
+    // 6.05 step 2 mint gate (wrong era): a READY marker stamped under
+    // another closure refuses the retained ExecMarker birth with
+    // GenerationMismatch; the same READY row stamped under the sealed
+    // closure mints. Every row comes from the real marker leaves; only
+    // the argv parameters (exec, admits, stamp) are injected.
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (_report, admitted) = harness.route(&mut quiet);
+    quiet.classify_ordinary(&admitted).unwrap();
+    let (_, _proof) = harness.ingest(quiet, &admitted);
+    let publisher = NativePublisher::build();
+    let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
+    let sealed = harness.fixture.attachment().generation();
+    let wrong = sealed.wrapping_add(1);
+    assert_ne!(wrong, sealed, "the wrong era differs");
+    let (row, control, _) = publisher.publish_stamped(&["0", "0"], wrong);
+    let mut rows = NativeBirthRows { row, control };
+    assert_eq!(
+        crate::attach::observe_retained_birth(
+            &mut rows,
+            harness.fixture.binding(),
+            harness.fixture.attachment(),
+            &binding,
+            BirthKind::ExecMarker,
+        ),
+        Err(crate::attach::BirthObservationRefusal::GenerationMismatch),
+        "READY under another closure cannot mint this closure's birth"
+    );
+    let (row, control, _) = publisher.publish_stamped(&["0", "0"], sealed);
+    let mut rows = NativeBirthRows { row, control };
+    crate::attach::observe_retained_birth(
+        &mut rows,
+        harness.fixture.binding(),
+        harness.fixture.attachment(),
+        &binding,
+        BirthKind::ExecMarker,
+    )
+    .expect("the same READY row stamped under the sealed closure mints");
+}
+
+#[test]
+fn joint_retained_exec_birth_map_pressure_refuses_and_below_cap_mints() {
+    // 6.05 step 2 mint gate (map pressure): a latched admission row
+    // refuses with LatchTripped and a spent cap refuses with
+    // SpentExhausted; one permit below the cap still mints. The latch
+    // trips natively (admit/exec mismatch admits nothing); the cap
+    // spends 2^24 real admits.
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    use p11scope_ebpf_common::journal_marker::MARKER_ADMIT_CAP;
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (_report, admitted) = harness.route(&mut quiet);
+    quiet.classify_ordinary(&admitted).unwrap();
+    let (_, _proof) = harness.ingest(quiet, &admitted);
+    let publisher = NativePublisher::build();
+    let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
+    let sealed = harness.fixture.attachment().generation();
+    let (row, control, wins) = publisher.publish_stamped(&["0", "1", "0", "1"], sealed);
+    assert_eq!(wins, 0, "mismatch admits nothing");
+    assert_eq!(control.failed, 1, "mismatch trips the latch natively");
+    let mut rows = NativeBirthRows { row, control };
+    assert_eq!(
+        crate::attach::observe_retained_birth(
+            &mut rows,
+            harness.fixture.binding(),
+            harness.fixture.attachment(),
+            &binding,
+            BirthKind::ExecMarker,
+        ),
+        Err(crate::attach::BirthObservationRefusal::LatchTripped)
+    );
+    let (row, control, wins) = publisher.publish_stamped(&["0", "16777216"], sealed);
+    assert_eq!(wins, MARKER_ADMIT_CAP);
+    assert_eq!((control.spent, control.failed), (MARKER_ADMIT_CAP, 0));
+    let mut rows = NativeBirthRows { row, control };
+    assert_eq!(
+        crate::attach::observe_retained_birth(
+            &mut rows,
+            harness.fixture.binding(),
+            harness.fixture.attachment(),
+            &binding,
+            BirthKind::ExecMarker,
+        ),
+        Err(crate::attach::BirthObservationRefusal::SpentExhausted)
+    );
+    let (row, control, wins) = publisher.publish_stamped(&["0", "16777215"], sealed);
+    assert_eq!(wins, MARKER_ADMIT_CAP - 1);
+    let mut rows = NativeBirthRows { row, control };
+    crate::attach::observe_retained_birth(
+        &mut rows,
+        harness.fixture.binding(),
+        harness.fixture.attachment(),
+        &binding,
+        BirthKind::ExecMarker,
+    )
+    .expect("one permit below the cap mints");
+}
+
+#[test]
+fn joint_retained_exec_birth_unread_identity_refuses_and_empty_map_infers_no_flag() {
+    // 6.05 step 2 mint gate (unread identity) and negative twin: an
+    // unreadable marker or control row refuses with RowUnreadable. The
+    // ordinary empty-map case — a process that never mutated watched
+    // state has no PROC_EPOCH row — infers no marker flag: it refuses
+    // instead of minting a birth with a defaulted word.
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (_report, admitted) = harness.route(&mut quiet);
+    quiet.classify_ordinary(&admitted).unwrap();
+    let (_, _proof) = harness.ingest(quiet, &admitted);
+    let publisher = NativePublisher::build();
+    let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
+    let sealed = harness.fixture.attachment().generation();
+    let (good_row, good_control, _) = publisher.publish_stamped(&["0", "0"], sealed);
+    let mut rows = UnreadableSideRows {
+        row: None,
+        control: Some(good_control),
+    };
+    assert_eq!(
+        crate::attach::observe_retained_birth(
+            &mut rows,
+            harness.fixture.binding(),
+            harness.fixture.attachment(),
+            &binding,
+            BirthKind::ExecMarker,
+        ),
+        Err(crate::attach::BirthObservationRefusal::RowUnreadable),
+        "the ordinary empty map infers no marker flag"
+    );
+    let mut rows = UnreadableSideRows {
+        row: Some(good_row),
+        control: None,
+    };
+    assert_eq!(
+        crate::attach::observe_retained_birth(
+            &mut rows,
+            harness.fixture.binding(),
+            harness.fixture.attachment(),
+            &binding,
+            BirthKind::ExecMarker,
+        ),
+        Err(crate::attach::BirthObservationRefusal::RowUnreadable),
+        "an unreadable control row infers no admission"
+    );
+    let mut rows = NativeBirthRows {
+        row: good_row,
+        control: good_control,
+    };
+    crate::attach::observe_retained_birth(
+        &mut rows,
+        harness.fixture.binding(),
+        harness.fixture.attachment(),
+        &binding,
+        BirthKind::ExecMarker,
+    )
+    .expect("readable rows mint");
+}
+
+#[test]
+fn joint_retained_exec_birth_invalid_marker_shapes_refuse() {
+    // 6.05 step 2 mint gate (failed exec): marker words the native
+    // publisher never emits (low bits 11, low bits 00 with high bits
+    // set) refuse with MarkerNotReady. Step 1(c) covers unpublished,
+    // DIRTY and READY-naming-another-exec; these are the corrupt shapes.
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (_report, admitted) = harness.route(&mut quiet);
+    quiet.classify_ordinary(&admitted).unwrap();
+    let (_, _proof) = harness.ingest(quiet, &admitted);
+    let publisher = NativePublisher::build();
+    let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
+    let sealed = harness.fixture.attachment().generation();
+    let (mut row, control, _) = publisher.publish_stamped(&["0", "0"], sealed);
+    for word in [3u64, 4, 7, u64::MAX] {
+        row.journal_bootstrap = word;
+        let mut rows = NativeBirthRows { row, control };
+        assert_eq!(
+            crate::attach::observe_retained_birth(
+                &mut rows,
+                harness.fixture.binding(),
+                harness.fixture.attachment(),
+                &binding,
+                BirthKind::ExecMarker,
+            ),
+            Err(crate::attach::BirthObservationRefusal::MarkerNotReady),
+            "corrupt word {word:#x} cannot mint"
+        );
+    }
+    let (row, control, _) = publisher.publish_stamped(&["0", "0"], sealed);
+    let mut rows = NativeBirthRows { row, control };
+    crate::attach::observe_retained_birth(
+        &mut rows,
+        harness.fixture.binding(),
+        harness.fixture.attachment(),
+        &binding,
+        BirthKind::ExecMarker,
+    )
+    .expect("the uncorrupted row mints");
+}
+
+#[test]
+fn joint_retained_exec_marker_flip_mints_and_retains_across_rereads() {
+    // 6.05 step 2 leader-row retention and flip: a READY row mints on
+    // the first observe (flip) and still mints on a reread (retained,
+    // not consumed); a DIRTY row refuses on every reread (live
+    // stickiness). Retention is the row's own stability, not a cache.
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (_report, admitted) = harness.route(&mut quiet);
+    quiet.classify_ordinary(&admitted).unwrap();
+    let (_, _proof) = harness.ingest(quiet, &admitted);
+    let publisher = NativePublisher::build();
+    let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
+    let sealed = harness.fixture.attachment().generation();
+    let (row, control, _) = publisher.publish_stamped(&["0", "0"], sealed);
+    let mut first = NativeBirthRows { row, control };
+    let evidence = crate::attach::observe_retained_birth(
+        &mut first,
+        harness.fixture.binding(),
+        harness.fixture.attachment(),
+        &binding,
+        BirthKind::ExecMarker,
+    )
+    .expect("the first observe mints the flip");
+    let mut second = NativeBirthRows { row, control };
+    let again = crate::attach::observe_retained_birth(
+        &mut second,
+        harness.fixture.binding(),
+        harness.fixture.attachment(),
+        &binding,
+        BirthKind::ExecMarker,
+    )
+    .expect("a reread still mints: the row is retained, not consumed");
+    assert_eq!(
+        evidence.marker_word(),
+        again.marker_word(),
+        "retention rereads the same flipped word"
+    );
+    let (dirty_row, dirty_control, _) = publisher.publish_stamped(&["0", "0", "1"], sealed);
+    assert_eq!(
+        dirty_row.journal_bootstrap,
+        p11scope_ebpf_common::journal_marker::MARKER_DIRTY
+    );
+    for reread in 0..2 {
+        let mut rows = NativeBirthRows {
+            row: dirty_row,
+            control: dirty_control,
+        };
+        assert_eq!(
+            crate::attach::observe_retained_birth(
+                &mut rows,
+                harness.fixture.binding(),
+                harness.fixture.attachment(),
+                &binding,
+                BirthKind::ExecMarker,
+            ),
+            Err(crate::attach::BirthObservationRefusal::MarkerNotReady),
+            "DIRTY stays refused on reread {reread}"
+        );
+    }
+}
+
 pub(super) fn actual_absence_birth_fixture() {
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
     let mut harness = JointBirthHarness::new();

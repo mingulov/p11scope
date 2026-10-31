@@ -496,6 +496,27 @@ class CopyUpTest(unittest.TestCase):
                 AssertionError, "backends disagree on provider edges.*104"):
             check_copy_up(span_kernel=kernel, span_userspace=userspace)
 
+    def test_span_b2_coverage_split_equal_nonzero_count_fails(self):
+        """Split coverage with a 1 vs 1 count still fails (pins == 0)."""
+        kernel_split = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
+                        else edge(PID_B_SPAN, "m8", count=1,
+                                  cov="watched_no_use", since=3000,
+                                  first_seen=2000)
+                        for item in span_edges_twin_old()]
+        userspace_split = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
+                           else edge(PID_B_SPAN, "m8", count=1, cov="unknown",
+                                     cov_reason="use_before_admission",
+                                     first_seen=2000)
+                           for item in span_edges_twin_old()]
+        kernel = inventory(kernel_split, [collapse_gap()],
+                           backend="kernel", modules=dict(D1_MODULES_SPAN))
+        userspace = inventory(userspace_split, [collapse_gap()],
+                              backend="userspace", fallback=None,
+                              modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(
+                AssertionError, "backends disagree on provider edges.*104"):
+            check_copy_up(span_kernel=kernel, span_userspace=userspace)
+
     def test_span_b2_coverage_split_mapping_differs_fails(self):
         """Split coverage with maps_match vs deep_scan mapping still fails."""
         split = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")

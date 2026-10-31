@@ -2674,16 +2674,12 @@ fn k1_legacy_guard(expected: FileIdentity, mapped: FileIdentity) -> bool {
 /// staleness, and an already-unequal `(dev, ino)` keeps refusing without
 /// spending witness budget. This is not `overlay_identity_equal` (the
 /// collapse heuristic); it names where the R-41 hole joins.
-fn k1_witness_required(
-    lane: OverlayLane,
-    held: MappedFile,
-    target: FileIdentity,
-) -> bool {
+fn k1_witness_required(lane: OverlayLane, held: MappedFile, target: FileIdentity) -> bool {
     lane == OverlayLane::B
         && target == held.identity
-        && held.fs_magic.is_none_or(|magic| {
-            magic == p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC
-        })
+        && held
+            .fs_magic
+            .is_none_or(|magic| magic == p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC)
 }
 
 /// B16-direction synthetic vectors on lane B: the observer holds the
@@ -2762,8 +2758,11 @@ fn k1_legacy_guard_joins_fresh_upper_characterization() {
     );
 }
 
-/// Stale-negative twin (RED against the wrapper): the B16-direction stale
-/// lower target must refuse. Fails while the guard is `(dev, ino)`-only.
+/// Stale-negative twin (GREEN through the driver): the B16-direction stale
+/// lower target refuses with the named loss. Harvest sequencing: RED against
+/// the legacy wrapper first (expectation unchanged), now through the driver
+/// with a scripted stale verdict; the privileged twin below runs the real
+/// kernel query on Fedora.
 #[test]
 fn k1_deep_scan_stale_lower_refuses() {
     let (held, stale, _) = k1_b16_vectors();
@@ -2771,13 +2770,34 @@ fn k1_deep_scan_stale_lower_refuses() {
         k1_witness_required(OverlayLane::B, held, stale),
         "the stale shape requires the witness"
     );
-    assert!(
-        !k1_legacy_guard(held.identity, stale),
+    let range = (0x7f00_0000u64, 0x7f00_1000u64);
+    let mut io = K1ScriptedRangeIo {
+        reads: BTreeMap::from([(range, stale)]),
+    };
+    let mut witness = K1ScriptedWitness::scripted(vec![Ok(K1KernelVerdict::OtherFile)]);
+    let mut budget = K1ScanBudget::fresh();
+    let verdict = k1_deep_scan_guard(
+        OverlayLane::B,
+        held,
+        &[range],
+        &mut io,
+        Some(&mut witness),
+        &mut budget,
+    );
+    assert_eq!(
+        verdict,
+        K1GuardVerdict::WitnessRefuse {
+            loss: K1_ORIGINAL_FILE_UNPROVEN,
+            cause: K1RefusalCause::StaleVerdict,
+        },
         "stale lower must refuse, never join the held upper file"
     );
+    assert_eq!(budget.used, 1, "one budgeted query per scan");
+    assert_eq!(witness.queries, 1, "the refusal came from the witness");
 }
 
-/// Fresh-positive twin (green baseline): the fresh upper target joins.
+/// Fresh-positive twin (GREEN through the driver): the fresh upper target
+/// joins on a same-file verdict. Refusing it would fail acceptance.
 #[test]
 fn k1_deep_scan_fresh_upper_joins() {
     let (held, _, fresh) = k1_b16_vectors();
@@ -2785,8 +2805,818 @@ fn k1_deep_scan_fresh_upper_joins() {
         k1_witness_required(OverlayLane::B, held, fresh),
         "the fresh shape requires the witness"
     );
-    assert!(
-        k1_legacy_guard(held.identity, fresh),
+    let range = (0x7f00_0000u64, 0x7f00_1000u64);
+    let mut io = K1ScriptedRangeIo {
+        reads: BTreeMap::from([(range, fresh)]),
+    };
+    let mut witness = K1ScriptedWitness::scripted(vec![Ok(K1KernelVerdict::SameFile)]);
+    let mut budget = K1ScanBudget::fresh();
+    let verdict = k1_deep_scan_guard(
+        OverlayLane::B,
+        held,
+        &[range],
+        &mut io,
+        Some(&mut witness),
+        &mut budget,
+    );
+    assert_eq!(
+        verdict,
+        K1GuardVerdict::Join,
         "fresh upper joins the held upper file"
     );
+    assert_eq!(budget.used, 1, "one budgeted query per scan");
+    assert_eq!(witness.queries, 1, "the join came from the witness");
+}
+
+/// The ratified refusal name (capture-K1 row): the kernel did not prove the
+/// target range is the held file. Experiment-local: production
+/// `original_file_unproven` / `ImageQueryRefusal::OriginalFileUnproven` is
+/// Stage P work.
+const K1_ORIGINAL_FILE_UNPROVEN: &str = "original_file_unproven";
+
+/// Per-scan witness attempt budget for the experiment (n=1): one deep-scan
+/// guard invocation may spend a single kernel query. Attempts are spent
+/// before the run; exhaustion refuses and never degrades to `(dev, ino)`.
+/// An unbounded experiment would prove nothing ratified.
+const K1_WITNESS_ATTEMPTS_PER_SCAN: u32 = 1;
+
+/// One scan's spent witness attempts. Fresh per scan; never shared.
+struct K1ScanBudget {
+    used: u32,
+}
+
+impl K1ScanBudget {
+    fn fresh() -> Self {
+        Self { used: 0 }
+    }
+}
+
+/// Why the witness path refused. The loss NAME is always
+/// [`K1_ORIGINAL_FILE_UNPROVEN`]; the cause records which experiment leg
+/// produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum K1RefusalCause {
+    StaleVerdict,
+    BudgetExhausted,
+    WitnessUnavailable,
+    AnchorBindingFailed,
+}
+
+/// The deep-scan guard verdict with the witness leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum K1GuardVerdict {
+    /// Today's join stands (non-requiring key) or the kernel proved same-file.
+    Join,
+    /// `(dev, ino)` already differ: today's refusal, witness never consulted.
+    LegacyRefuse,
+    /// The witness path refused with the named loss.
+    WitnessRefuse {
+        loss: &'static str,
+        cause: K1RefusalCause,
+    },
+}
+
+/// One kernel original-file verdict: the target range's `vm_file` is (or is
+/// not) the held anchor's. Slots/verdicts only; no pointers cross.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum K1KernelVerdict {
+    SameFile,
+    OtherFile,
+}
+
+/// A witness malfunction (never a verdict): anchor installation/binding
+/// failed. The driver refuses; unexpected attribution shapes fail loud in
+/// the backend instead of mapping to a verdict. The privileged stale twin
+/// pins the live seam's refusal text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum K1WitnessFailure {
+    InstallFailed,
+}
+
+/// The shared kernel original-file query, one call per witness-required
+/// range. Backends: scripted (unprivileged dispatch proofs) and the sweep
+/// custody backend (privileged twins, real BPF).
+trait K1Witness {
+    fn query(&mut self) -> Result<K1KernelVerdict, K1WitnessFailure>;
+}
+
+/// ScanIo-shaped range reads: mirrors `ScanIo::range_identity`'s contract
+/// (the range's `vm_file` identity, or nothing when the range is gone).
+/// Production `ScanIo` is unreachable from test code, so the experiment
+/// mirrors the shape; Stage P wires the real `ScanIo` verdict.
+trait K1RangeIo {
+    fn range_identity(&mut self, range: (u64, u64)) -> Option<FileIdentity>;
+}
+
+/// Recorded/scripted range identities: the privileged twins feed the
+/// just-recorded `map_files` stats; unprivileged tests feed vectors.
+struct K1ScriptedRangeIo {
+    reads: BTreeMap<(u64, u64), FileIdentity>,
+}
+
+impl K1RangeIo for K1ScriptedRangeIo {
+    fn range_identity(&mut self, range: (u64, u64)) -> Option<FileIdentity> {
+        self.reads.get(&range).copied()
+    }
+}
+
+/// The experiment driver: the deep-scan guard shape with the witness leg.
+/// Per range: gone-mid-scan skips best-effort (mirrors `mapped_file_guard`'s
+/// `Err` arm); unequal `(dev, ino)` keeps today's refusal; non-requiring
+/// keys keep today's join; witness-required ranges spend one budgeted
+/// kernel query and join only on a same-file verdict.
+fn k1_deep_scan_guard<Io: K1RangeIo, W: K1Witness>(
+    lane: OverlayLane,
+    held: MappedFile,
+    group: &[(u64, u64)],
+    io: &mut Io,
+    witness: Option<&mut W>,
+    budget: &mut K1ScanBudget,
+) -> K1GuardVerdict {
+    let mut witness = witness;
+    for range in group {
+        let Some(target) = io.range_identity(*range) else {
+            continue;
+        };
+        if target != held.identity {
+            return K1GuardVerdict::LegacyRefuse;
+        }
+        if !k1_witness_required(lane, held, target) {
+            continue;
+        }
+        let Some(query) = witness.as_mut() else {
+            return K1GuardVerdict::WitnessRefuse {
+                loss: K1_ORIGINAL_FILE_UNPROVEN,
+                cause: K1RefusalCause::WitnessUnavailable,
+            };
+        };
+        if budget.used >= K1_WITNESS_ATTEMPTS_PER_SCAN {
+            return K1GuardVerdict::WitnessRefuse {
+                loss: K1_ORIGINAL_FILE_UNPROVEN,
+                cause: K1RefusalCause::BudgetExhausted,
+            };
+        }
+        budget.used += 1;
+        match query.query() {
+            Ok(K1KernelVerdict::SameFile) => continue,
+            Ok(K1KernelVerdict::OtherFile) => {
+                return K1GuardVerdict::WitnessRefuse {
+                    loss: K1_ORIGINAL_FILE_UNPROVEN,
+                    cause: K1RefusalCause::StaleVerdict,
+                };
+            }
+            Err(K1WitnessFailure::InstallFailed) => {
+                return K1GuardVerdict::WitnessRefuse {
+                    loss: K1_ORIGINAL_FILE_UNPROVEN,
+                    cause: K1RefusalCause::AnchorBindingFailed,
+                };
+            }
+        }
+    }
+    K1GuardVerdict::Join
+}
+
+/// Scripted witness backend: canned verdicts in order, every query counted.
+/// An empty script fails loud — a test that queries past its script is wrong.
+struct K1ScriptedWitness {
+    steps: std::collections::VecDeque<Result<K1KernelVerdict, K1WitnessFailure>>,
+    queries: usize,
+}
+
+impl K1ScriptedWitness {
+    fn scripted(steps: Vec<Result<K1KernelVerdict, K1WitnessFailure>>) -> Self {
+        Self {
+            steps: steps.into(),
+            queries: 0,
+        }
+    }
+}
+
+impl K1Witness for K1ScriptedWitness {
+    fn query(&mut self) -> Result<K1KernelVerdict, K1WitnessFailure> {
+        self.queries += 1;
+        self.steps
+            .pop_front()
+            .expect("scripted witness queried past its script")
+    }
+}
+
+/// The sweep attribution as a kernel verdict: exactly the edge shape joins,
+/// exactly the named-mismatch shape refuses; anything else (exit, loss,
+/// remap) is a fixture failure, never a verdict.
+fn k1_verdict_from_sweep(
+    pid: u32,
+    key: ObjectKey,
+    out: &SweepAttribution,
+) -> Result<K1KernelVerdict, String> {
+    let edged = out.members.len() == 1
+        && out.members[0].pid == pid
+        && out.losses.is_empty()
+        && out.probed == 1
+        && out.members[0]
+            .objects
+            .iter()
+            .map(|o| o.key)
+            .collect::<Vec<_>>()
+            == [key];
+    if edged {
+        return Ok(K1KernelVerdict::SameFile);
+    }
+    if out.members.is_empty()
+        && out.probed == 1
+        && out.losses == BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)])
+    {
+        return Ok(K1KernelVerdict::OtherFile);
+    }
+    Err(format!("unexpected attribution shape: {out:?}"))
+}
+
+/// Non-overlay control: keys the predicate does not require keep today's
+/// join verbatim, and the witness backend is never consulted.
+#[test]
+fn k1_driver_non_overlay_keys_keep_legacy_join() {
+    let (held, stale, _) = k1_b16_vectors();
+    let ext4 = MappedFile {
+        identity: held.identity,
+        fs_magic: Some(0xef53),
+    };
+    let range = (0x7f00_0000u64, 0x7f00_1000u64);
+    let mut io = K1ScriptedRangeIo {
+        reads: BTreeMap::from([(range, stale)]),
+    };
+    // An empty script: any witness consultation fails loud.
+    let mut witness = K1ScriptedWitness::scripted(vec![]);
+    let mut budget = K1ScanBudget::fresh();
+    let verdict = k1_deep_scan_guard(
+        OverlayLane::B,
+        ext4,
+        &[range],
+        &mut io,
+        Some(&mut witness),
+        &mut budget,
+    );
+    assert_eq!(
+        verdict,
+        K1GuardVerdict::Join,
+        "non-overlay keys keep today's guard untouched"
+    );
+    assert_eq!(witness.queries, 0, "the witness is never consulted");
+    assert_eq!(budget.used, 0, "no budget spent off the witness path");
+}
+
+/// Legacy-refusal control: an already-unequal `(dev, ino)` refuses without
+/// consulting the witness, even with a backend attached.
+#[test]
+fn k1_driver_legacy_refusal_never_consults_witness() {
+    let (held, _, _) = k1_b16_vectors();
+    let other = FileIdentity { dev: 42, ino: 9 };
+    let range = (0x7f00_0000u64, 0x7f00_1000u64);
+    let mut io = K1ScriptedRangeIo {
+        reads: BTreeMap::from([(range, other)]),
+    };
+    let mut witness = K1ScriptedWitness::scripted(vec![]);
+    let mut budget = K1ScanBudget::fresh();
+    let verdict = k1_deep_scan_guard(
+        OverlayLane::B,
+        held,
+        &[range],
+        &mut io,
+        Some(&mut witness),
+        &mut budget,
+    );
+    assert_eq!(
+        verdict,
+        K1GuardVerdict::LegacyRefuse,
+        "unequal (dev, ino) keeps today's refusal"
+    );
+    assert_eq!(witness.queries, 0, "the witness is never consulted");
+    assert_eq!(budget.used, 0, "no budget spent off the witness path");
+}
+
+/// Budget-exhausted control: the second witness-required range in one scan
+/// refuses with the named loss instead of degrading to `(dev, ino)`. The
+/// one-step script fails loud on a second query, so a join there would
+/// need both an over-query and a swallow to pass.
+#[test]
+fn k1_driver_budget_exhaustion_refuses_never_degrades() {
+    let (held, stale, _) = k1_b16_vectors();
+    let first = (0x7f00_0000u64, 0x7f00_1000u64);
+    let second = (0x7f00_1000u64, 0x7f00_2000u64);
+    let mut io = K1ScriptedRangeIo {
+        reads: BTreeMap::from([(first, stale), (second, stale)]),
+    };
+    let mut witness = K1ScriptedWitness::scripted(vec![Ok(K1KernelVerdict::SameFile)]);
+    let mut budget = K1ScanBudget::fresh();
+    let verdict = k1_deep_scan_guard(
+        OverlayLane::B,
+        held,
+        &[first, second],
+        &mut io,
+        Some(&mut witness),
+        &mut budget,
+    );
+    assert_eq!(
+        verdict,
+        K1GuardVerdict::WitnessRefuse {
+            loss: K1_ORIGINAL_FILE_UNPROVEN,
+            cause: K1RefusalCause::BudgetExhausted,
+        },
+        "budget exhaustion refuses, never degrades to (dev, ino)"
+    );
+    assert_eq!(witness.queries, 1, "exactly the budgeted query ran");
+    assert_eq!(budget.used, 1, "the budget caps the scan at one query");
+}
+
+/// Witness-unavailable control: a witness-required range with no backend
+/// refuses with the named loss; it never silently joins.
+#[test]
+fn k1_driver_witness_unavailable_refuses() {
+    let (held, stale, _) = k1_b16_vectors();
+    let range = (0x7f00_0000u64, 0x7f00_1000u64);
+    let mut io = K1ScriptedRangeIo {
+        reads: BTreeMap::from([(range, stale)]),
+    };
+    let mut budget = K1ScanBudget::fresh();
+    let verdict = k1_deep_scan_guard::<K1ScriptedRangeIo, K1ScriptedWitness>(
+        OverlayLane::B,
+        held,
+        &[range],
+        &mut io,
+        None,
+        &mut budget,
+    );
+    assert_eq!(
+        verdict,
+        K1GuardVerdict::WitnessRefuse {
+            loss: K1_ORIGINAL_FILE_UNPROVEN,
+            cause: K1RefusalCause::WitnessUnavailable,
+        },
+        "no witness refuses, never silently joins"
+    );
+    assert_eq!(budget.used, 0, "no attempt spent without a backend");
+}
+
+/// Wrong-generation control (mapping half): an anchor installation failure
+/// refuses with the named loss under the binding cause. The privileged
+/// stale twin asserts the live half: the real seam rejects a reused
+/// generation.
+#[test]
+fn k1_driver_anchor_binding_failure_refuses() {
+    let (held, stale, _) = k1_b16_vectors();
+    let range = (0x7f00_0000u64, 0x7f00_1000u64);
+    let mut io = K1ScriptedRangeIo {
+        reads: BTreeMap::from([(range, stale)]),
+    };
+    let mut witness = K1ScriptedWitness::scripted(vec![Err(K1WitnessFailure::InstallFailed)]);
+    let mut budget = K1ScanBudget::fresh();
+    let verdict = k1_deep_scan_guard(
+        OverlayLane::B,
+        held,
+        &[range],
+        &mut io,
+        Some(&mut witness),
+        &mut budget,
+    );
+    assert_eq!(
+        verdict,
+        K1GuardVerdict::WitnessRefuse {
+            loss: K1_ORIGINAL_FILE_UNPROVEN,
+            cause: K1RefusalCause::AnchorBindingFailed,
+        },
+        "anchor binding failure refuses with the named loss"
+    );
+    assert_eq!(budget.used, 1, "the failed attempt still spends the budget");
+}
+
+/// The verdict mapping joins only the exact edge shape, refuses only the
+/// exact named-mismatch shape, and fails loud on anything else.
+#[test]
+fn k1_verdict_mapping_joins_only_the_edge_shape() {
+    let key = ObjectKey {
+        device: Device {
+            major: 0,
+            minor: 42,
+        },
+        inode: 7,
+    };
+    assert_eq!(
+        k1_verdict_from_sweep(4242, key, &synthetic_edged(4242, key)),
+        Ok(K1KernelVerdict::SameFile),
+        "the edge shape joins"
+    );
+    assert_eq!(
+        k1_verdict_from_sweep(4242, key, &synthetic_mismatch()),
+        Ok(K1KernelVerdict::OtherFile),
+        "the named mismatch refuses"
+    );
+    assert!(
+        k1_verdict_from_sweep(4242, key, &synthetic_none()).is_err(),
+        "no candidate is a fixture failure, never a verdict"
+    );
+}
+
+/// The n=1 sweep-custody backend: one installed pass over the same-scan
+/// observer-held anchor (pinned current file), one kernel attribution of
+/// the single target, mapped to a kernel verdict. The helper's asserts
+/// (validated slots, zero fallback, zero userspace reads) plus the twin's
+/// outcome evaluation are the `kernel_proof()` non-vacuity bar; install or
+/// shape malfunctions fail loud (a test bug must not masquerade as Refuse).
+/// One backend instance per scan; the generation is spent by the twin.
+struct K1SweepWitness<'s, 'p> {
+    session: &'s mut crate::discovery::kernel_identity::IdentitySession,
+    pins: &'p crate::discovery::identity::PinnedObjects,
+    object: PinnedObjectId,
+    key: ObjectKey,
+    generation: u64,
+    pid: u32,
+    snapshot: Vec<MapEntry>,
+    last: Option<(SweepAttribution, KernelLegEvidence)>,
+}
+
+impl K1Witness for K1SweepWitness<'_, '_> {
+    fn query(&mut self) -> Result<K1KernelVerdict, K1WitnessFailure> {
+        let (out, evidence) = d4_overlay_kernel_attribution_for_pid(
+            self.pid,
+            self.snapshot.clone(),
+            self.pins,
+            self.object,
+            self.key,
+            &mut *self.session,
+            self.generation,
+        );
+        let verdict = k1_verdict_from_sweep(self.pid, self.key, &out)
+            .unwrap_or_else(|detail| panic!("k1 sweep witness: {detail}"));
+        self.last = Some((out, evidence));
+        Ok(verdict)
+    }
+}
+
+/// Stale-negative twin (privileged, lanes B only): in the B16 direction the
+/// observer holds the post-copy-up (upper) file while the target still runs
+/// the pre-copy-up (lower) mapping; the deep-scan guard shape with the
+/// same-scan anchor must refuse with the named loss. Per mode the twin
+/// proves the anchor is the current upper file, the witness path is
+/// required on the live inputs, the kernel leg mismatches non-vacuously,
+/// and the scan spent exactly one query; it also proves the live seam
+/// rejects a reused generation. BTF/task_vma absence is UNRUN on the tier.
+#[test]
+#[ignore = "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only)"]
+fn privileged_k1_deep_scan_stale_lower_refuses() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    if lane != OverlayLane::B {
+        panic!("K1-STALE lane: lanes B only (lane-A keys differ, refusal would pass vacuously)");
+    }
+    crate::attach::identity_iter::ensure_kernel_identity_btf().expect(
+        "k1 witness: required kernel identity capability is unavailable (BTF/task_vma) \
+         — UNRUN on this kernel tier",
+    );
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session =
+        crate::discovery::kernel_identity::IdentitySession::probe_and_load(&btf, probe_dir.path())
+            .expect("strict-loaded kernel session; no refused/fallback positive");
+    let mut generation = 0u64;
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        generation = k1_stale_row(work.path(), mode, &mut session, generation)
+            .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+    }
+    eprintln!(
+        "K1_DEEP_SCAN direction=stale-lower lane={lane:?} modes=on,off,same-fs verdict=refuse"
+    );
+}
+
+/// Fresh-positive twin (privileged, lanes B only): the target maps the
+/// current upper file after the copy-up; the same guard shape must join.
+/// Refusing here would fail acceptance. Same per-mode proofs as the stale
+/// twin, with the parity expectation instead of the divergence.
+#[test]
+#[ignore = "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only)"]
+fn privileged_k1_deep_scan_fresh_upper_joins() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    if lane != OverlayLane::B {
+        panic!("K1-FRESH lane: lanes B only (lane-A keys differ, the join shape is lane B)");
+    }
+    crate::attach::identity_iter::ensure_kernel_identity_btf().expect(
+        "k1 witness: required kernel identity capability is unavailable (BTF/task_vma) \
+         — UNRUN on this kernel tier",
+    );
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session =
+        crate::discovery::kernel_identity::IdentitySession::probe_and_load(&btf, probe_dir.path())
+            .expect("strict-loaded kernel session; no refused/fallback positive");
+    let mut generation = 0u64;
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        generation = k1_fresh_row(work.path(), mode, &mut session, generation)
+            .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+    }
+    eprintln!("K1_DEEP_SCAN direction=fresh-upper lane={lane:?} modes=on,off,same-fs verdict=join");
+}
+
+/// One stale-lower row: B16 direction over a fresh fixture. Returns the
+/// spent generation.
+fn k1_stale_row(
+    work: &std::path::Path,
+    mode: XinoMode,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: u64,
+) -> Result<u64, String> {
+    eprintln!("K1_DEEP_SCAN start mode={mode:?} row=stale-lower");
+    let fixture = OverlayFixture::mount(work, mode)?;
+    std::fs::write(fixture.lower_path("lib.so"), vec![0xE1u8; 8192])
+        .map_err(|error| format!("k1 stale lower write: {error}"))?;
+    let xino = fixture.xino_verdict("lib.so")?;
+    let merged = fixture.merged_path("lib.so");
+    // B16 direction: the target maps BEFORE the copy-up and keeps running
+    // the lower file.
+    let stale = SwapChild::spawn(&merged);
+    let t_snap = stale.maps();
+    let t_range = target_range(&stale);
+    let t_line = find_line(&t_snap, t_range, *b"r-xp")?;
+    let key = ObjectKey::of(&t_line);
+    trigger_copy_up(
+        &merged,
+        &fixture.upper_path("lib.so"),
+        &fixture.lower_path("lib.so"),
+    )?;
+    // The observer-held anchor is the CURRENT file: pinned after the
+    // copy-up, held open across the query.
+    let (pins, object) = overlay_pin(&merged, key)?;
+    let index = overlay_index(key, object, &pins);
+    let anchor_mapped = pins
+        .object_mapped_identity(object)
+        .map_err(|error| format!("k1 stale anchor identity: {error}"))?;
+    if anchor_mapped.fs_magic != Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC) {
+        return Err(format!(
+            "k1 stale anchor is not on overlayfs: {anchor_mapped:?}"
+        ));
+    }
+    // Anchor stand-in: a fresh upper mapping provides the anchor maps
+    // key and truth (the stable-inode premise across processes).
+    let anchor = SwapChild::spawn(&merged);
+    let a_snap = anchor.maps();
+    let a_line = find_line(&a_snap, anchor_range(&anchor), *b"r-xp")?;
+    if ObjectKey::of(&a_line) != key {
+        return Err("k1 stale lane-B premise broken: anchor key moved across copy-up".into());
+    }
+    let held =
+        std::fs::File::open(&merged).map_err(|error| format!("k1 stale held open: {error}"))?;
+    let pid = stale.pid as u32;
+    let stable = if mode == XinoMode::Off {
+        Some(map_files_stable(pid, t_range)?)
+    } else {
+        None
+    };
+    let a_truth = record_truth(
+        anchor.pid as u32,
+        anchor_range(&anchor),
+        &held,
+        &fixture.upper_path("lib.so"),
+        xino.clone(),
+        None,
+    )?;
+    let t_truth = record_truth(
+        pid,
+        t_range,
+        &held,
+        &fixture.lower_path("lib.so"),
+        xino,
+        stable,
+    )?;
+    if takes_identity_key_branch(&t_truth, &a_truth) {
+        return Err("k1 stale: unexpected backing rendering on lane B".into());
+    }
+    // Anchor currency: the pin names the current upper file, not the lower one.
+    if anchor_mapped.identity != a_truth.map_files_identity() {
+        return Err(format!(
+            "k1 stale anchor pin is not the current upper file: pin {:?} vs upper {:?}",
+            anchor_mapped.identity,
+            a_truth.map_files_identity()
+        ));
+    }
+    // The witness path is required on these live inputs (else the cell
+    // would prove the legacy path, not the gate question).
+    if !k1_witness_required(OverlayLane::B, anchor_mapped, t_truth.map_files_identity()) {
+        return Err(format!(
+            "k1 stale fixture misses the witness-requiring shape: {anchor_mapped:?} vs {:?}",
+            t_truth.map_files_identity()
+        ));
+    }
+    let userspace = d4_overlay_attribute_pid(pid, t_snap.clone(), &index);
+    let started = Instant::now();
+    let generation = generation + 1;
+    let mut io = K1ScriptedRangeIo {
+        reads: BTreeMap::from([(t_range, t_truth.map_files_identity())]),
+    };
+    let mut budget = K1ScanBudget::fresh();
+    let mut witness = K1SweepWitness {
+        session: &mut *session,
+        pins: &pins,
+        object,
+        key,
+        generation,
+        pid,
+        snapshot: t_snap,
+        last: None,
+    };
+    let verdict = k1_deep_scan_guard(
+        OverlayLane::B,
+        anchor_mapped,
+        &[t_range],
+        &mut io,
+        Some(&mut witness),
+        &mut budget,
+    );
+    let (kernel, evidence) = witness.last.take().expect("the witness query ran");
+    assert_overlay_outcome(
+        pid,
+        &t_truth,
+        &a_truth,
+        &userspace,
+        &kernel,
+        &evidence,
+        OverlayExpect::DivergenceC73,
+    )?;
+    if verdict
+        != (K1GuardVerdict::WitnessRefuse {
+            loss: K1_ORIGINAL_FILE_UNPROVEN,
+            cause: K1RefusalCause::StaleVerdict,
+        })
+    {
+        return Err(format!("k1 stale: guard refused to refuse: {verdict:?}"));
+    }
+    if budget.used != 1 {
+        return Err(format!(
+            "k1 stale: scan spent {} queries, not one",
+            budget.used
+        ));
+    }
+    // Wrong-generation control on the live seam: reinstalling the spent
+    // generation must refuse. Fails before any I/O and rolls zero fallback,
+    // so later rows are unaffected.
+    {
+        use crate::discovery::kernel_identity::{AnchorPass, ExaminedCustody};
+        let owner = ReservationOwner::for_examined(
+            SegmentPolicy::try_snapshot(0, 0).expect("actual FD census"),
+            0,
+        );
+        let mut custody = ExaminedCustody::new(owner, BTreeMap::new());
+        custody
+            .reconcile(SegmentPolicy::try_snapshot(1, 1).expect("actual confirmation FD census"))
+            .expect("shared physical reservation owner");
+        let pass = AnchorPass::prepare(&pins, [(key, object)], custody);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match session.install_anchors(pass, generation, deadline) {
+            Ok(_) => {
+                return Err(
+                    "k1 stale: reused generation installed; anchor binding unproven".into(),
+                );
+            }
+            Err("identity generation is unavailable") => {}
+            Err(text) => {
+                return Err(format!(
+                    "k1 stale: reused generation refused with unexpected text: {text}"
+                ));
+            }
+        }
+    }
+    eprintln!(
+        "K1_DEEP_SCAN mode={mode:?} row=stale-lower verdict=refuse wall_ms={} attempts=1 target-{}",
+        started.elapsed().as_millis(),
+        truth_verdict(&t_truth)
+    );
+    Ok(generation)
+}
+
+/// One fresh-upper row: both sides map the current file over a fresh
+/// fixture. Returns the spent generation.
+fn k1_fresh_row(
+    work: &std::path::Path,
+    mode: XinoMode,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: u64,
+) -> Result<u64, String> {
+    eprintln!("K1_DEEP_SCAN start mode={mode:?} row=fresh-upper");
+    let fixture = OverlayFixture::mount(work, mode)?;
+    std::fs::write(fixture.lower_path("lib.so"), vec![0xE2u8; 8192])
+        .map_err(|error| format!("k1 fresh lower write: {error}"))?;
+    let xino = fixture.xino_verdict("lib.so")?;
+    let merged = fixture.merged_path("lib.so");
+    trigger_copy_up(
+        &merged,
+        &fixture.upper_path("lib.so"),
+        &fixture.lower_path("lib.so"),
+    )?;
+    // Fresh-positive: the target maps the current upper file.
+    let anchor = SwapChild::spawn(&merged);
+    let target = SwapChild::spawn(&merged);
+    let a_snap = anchor.maps();
+    let t_snap = target.maps();
+    let a_line = find_line(&a_snap, anchor_range(&anchor), *b"r-xp")?;
+    let t_line = find_line(&t_snap, target_range(&target), *b"r-xp")?;
+    let key = ObjectKey::of(&a_line);
+    if ObjectKey::of(&t_line) != key {
+        return Err("k1 fresh lane-B premise broken: target key differs".into());
+    }
+    let (pins, object) = overlay_pin(&merged, key)?;
+    let index = overlay_index(key, object, &pins);
+    let anchor_mapped = pins
+        .object_mapped_identity(object)
+        .map_err(|error| format!("k1 fresh anchor identity: {error}"))?;
+    if anchor_mapped.fs_magic != Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC) {
+        return Err(format!(
+            "k1 fresh anchor is not on overlayfs: {anchor_mapped:?}"
+        ));
+    }
+    let held =
+        std::fs::File::open(&merged).map_err(|error| format!("k1 fresh held open: {error}"))?;
+    let pid = target.pid as u32;
+    let t_range = target_range(&target);
+    let stable = if mode == XinoMode::Off {
+        Some(map_files_stable(pid, t_range)?)
+    } else {
+        None
+    };
+    let backing = fixture.upper_path("lib.so");
+    let a_truth = record_truth(
+        anchor.pid as u32,
+        anchor_range(&anchor),
+        &held,
+        &backing,
+        xino.clone(),
+        None,
+    )?;
+    let t_truth = record_truth(pid, t_range, &held, &backing, xino, stable)?;
+    if takes_identity_key_branch(&t_truth, &a_truth) {
+        return Err("k1 fresh: unexpected backing rendering on lane B".into());
+    }
+    if anchor_mapped.identity != a_truth.map_files_identity() {
+        return Err(format!(
+            "k1 fresh anchor pin is not the current upper file: pin {:?} vs upper {:?}",
+            anchor_mapped.identity,
+            a_truth.map_files_identity()
+        ));
+    }
+    if !k1_witness_required(OverlayLane::B, anchor_mapped, t_truth.map_files_identity()) {
+        return Err(format!(
+            "k1 fresh fixture misses the witness-requiring shape: {anchor_mapped:?} vs {:?}",
+            t_truth.map_files_identity()
+        ));
+    }
+    let userspace = d4_overlay_attribute_pid(pid, t_snap.clone(), &index);
+    let started = Instant::now();
+    let generation = generation + 1;
+    let mut io = K1ScriptedRangeIo {
+        reads: BTreeMap::from([(t_range, t_truth.map_files_identity())]),
+    };
+    let mut budget = K1ScanBudget::fresh();
+    let mut witness = K1SweepWitness {
+        session: &mut *session,
+        pins: &pins,
+        object,
+        key,
+        generation,
+        pid,
+        snapshot: t_snap,
+        last: None,
+    };
+    let verdict = k1_deep_scan_guard(
+        OverlayLane::B,
+        anchor_mapped,
+        &[t_range],
+        &mut io,
+        Some(&mut witness),
+        &mut budget,
+    );
+    let (kernel, evidence) = witness.last.take().expect("the witness query ran");
+    assert_overlay_outcome(
+        pid,
+        &t_truth,
+        &a_truth,
+        &userspace,
+        &kernel,
+        &evidence,
+        OverlayExpect::Parity(true),
+    )?;
+    if verdict != K1GuardVerdict::Join {
+        return Err(format!(
+            "k1 fresh: guard refused the fresh upper: {verdict:?}"
+        ));
+    }
+    if budget.used != 1 {
+        return Err(format!(
+            "k1 fresh: scan spent {} queries, not one",
+            budget.used
+        ));
+    }
+    eprintln!(
+        "K1_DEEP_SCAN mode={mode:?} row=fresh-upper verdict=join wall_ms={} attempts=1 target-{}",
+        started.elapsed().as_millis(),
+        truth_verdict(&t_truth)
+    );
+    Ok(generation)
 }

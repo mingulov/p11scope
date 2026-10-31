@@ -244,3 +244,30 @@ __attribute__((noinline)) long p11_loader_gate_cutover_latched(void)
         return -1;
     return *(volatile u64 *)&ctl->cutover ? 1 : 0;
 }
+
+#ifdef GATE_HOST_CAS_HOOK
+/* Host-only contention hook: fail the next gate_cas_fail_budget
+ * saturating-counter CAS attempts so the exhaustion twin can prove
+ * every unsettled update is reported, never lost silently. Claim,
+ * reclaim, retire and cutover CAS stay real; only counting-cell CAS
+ * routes through this wrapper. Never defined for BPF. */
+int gate_cas_fail_budget = 0;
+static __always_inline u64 gate_sat_cas(u64 *ptr, u64 old, u64 desired)
+{
+    if (gate_cas_fail_budget > 0) {
+        gate_cas_fail_budget--;
+        return old ^ 1;
+    }
+    return __sync_val_compare_and_swap(ptr, old, desired);
+}
+#endif
+
+/* INERT SCAFFOLD (test commit): always refuses. The probe-hit
+ * transaction lands with the repair; the hit twins below fail against
+ * this stub at their first behavioral needle. */
+__attribute__((noinline)) long p11_loader_gate_hit(u32 slot, u64 generation)
+{
+    (void)slot;
+    (void)generation;
+    return -1;
+}

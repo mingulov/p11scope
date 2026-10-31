@@ -60,6 +60,9 @@ fn compile_harness(source_file: &str, tag: &str, scenario: &str) -> (PathBuf, Pa
     if tag == "owner-gate" || tag == "tickets" {
         command.arg("-DP11SCOPE_LOADER_GATE");
     }
+    if tag == "gate-hook" {
+        command.arg("-DGATE_HOST_CAS_HOOK");
+    }
     let compile = command.output().expect("spawn host cc for the harness");
     assert!(
         compile.status.success(),
@@ -97,6 +100,12 @@ fn run_scenario(binary: &Path, scenario: &str, asserts: &[&str]) {
 
 fn drive_gate(scenario: &str, asserts: &[&str]) {
     let (work, binary) = compile_harness("loader_gate_harness.c", "gate", scenario);
+    run_scenario(&binary, scenario, asserts);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+fn drive_gate_hook(scenario: &str, asserts: &[&str]) {
+    let (work, binary) = compile_harness("loader_gate_harness.c", "gate-hook", scenario);
     run_scenario(&binary, scenario, asserts);
     let _ = std::fs::remove_dir_all(&work);
 }
@@ -317,8 +326,9 @@ fn loader_ticket_harness_ignores_exec_id() {
     );
 }
 
-/// L4b loader cells: arms count admits, retained tracks live rows, the
-/// peak is monotonic across retire/reclaim cycles.
+/// L4b loader cells: arms count admits, retained charges live and
+/// retired-unacknowledged rows until the acknowledged reclaim, the peak
+/// is monotonic across retire/reclaim cycles.
 #[test]
 fn loader_gate_harness_l4b_counters() {
     drive_gate(
@@ -391,6 +401,154 @@ fn loader_ticket_harness_bank_query_routes() {
             "ASSERT pre_cut_ticket_retained",
             "ASSERT post_cut_new_bank_b",
             "ASSERT a_storage_undisturbed",
+        ],
+    );
+}
+
+/// Probe-hit transaction through the exact producer call sequence:
+/// healthy and pending hits keep refusals zero, genuine rejections
+/// count exactly once.
+#[test]
+fn loader_gate_harness_hit_transaction() {
+    drive_gate(
+        "hit-transaction",
+        &[
+            "ASSERT hit_admits_fresh",
+            "ASSERT hit_peer_resolves",
+            "ASSERT hit_pending_uncounted",
+            "ASSERT hit_reuse_admits_successor",
+            "ASSERT hit_refusals_exact",
+            "ASSERT hit_pre_cutover_admits",
+        ],
+    );
+}
+
+/// Stale floor: retired generations never resurrect, successors admit
+/// over the floor, the u32 wrap admits generation 1 over a max floor.
+#[test]
+fn loader_gate_harness_hit_stale_floor() {
+    drive_gate(
+        "hit-stale-floor",
+        &[
+            "ASSERT stale_refused_after_reclaim",
+            "ASSERT successor_admits_over_floor",
+            "ASSERT wrap_gen1_admits",
+            "ASSERT wrap_old_refuses",
+        ],
+    );
+}
+
+/// Eight threads race one token: all resolve, one admission counts.
+#[test]
+fn loader_gate_harness_hit_concurrent_same_token() {
+    drive_gate(
+        "hit-concurrent-same-token",
+        &[
+            "ASSERT same_token_all_resolve",
+            "ASSERT same_token_admitted_once",
+            "ASSERT same_token_no_refusals",
+        ],
+    );
+}
+
+/// Four threads race a successor generation: all resolve, one reclaim
+/// and one admission count.
+#[test]
+fn loader_gate_harness_hit_successor_race() {
+    drive_gate(
+        "hit-successor-race",
+        &[
+            "ASSERT successor_all_resolve",
+            "ASSERT successor_admitted_once",
+            "ASSERT successor_reclaim_once",
+            "ASSERT successor_no_refusals",
+        ],
+    );
+}
+
+/// Ordered admission/reclaim crossings: the peak equals the true
+/// maximum live count in both orders.
+#[test]
+fn loader_gate_harness_admission_reclaim_interleave() {
+    drive_gate(
+        "admission-reclaim-interleave",
+        &[
+            "ASSERT ordered_admit_then_ack_peak_two",
+            "ASSERT ordered_ack_then_admit_peak_one",
+        ],
+    );
+}
+
+/// Sixteen threads drive 64 slots through admit/retire/ack: every
+/// count settles exactly with no update loss.
+#[test]
+fn loader_gate_harness_gauge_contention() {
+    drive_gate(
+        "gauge-contention",
+        &[
+            "ASSERT contended_admit_all_resolve",
+            "ASSERT contended_peak_exact",
+            "ASSERT retired_stays_charged",
+            "ASSERT contended_reclaim_exact",
+        ],
+    );
+}
+
+/// Saturation under contention: operations take their verdicts while
+/// both cells stop exactly at the maximum.
+#[test]
+fn loader_gate_harness_saturation_contention() {
+    drive_gate(
+        "saturation-contention",
+        &[
+            "ASSERT saturated_admit_succeeds",
+            "ASSERT admitted_exact_max",
+            "ASSERT refusals_exact_max",
+        ],
+    );
+}
+
+/// Delayed acknowledgement: nine retired rows stay charged with zero
+/// live rows, then drain exactly through acknowledged reclaims.
+#[test]
+fn loader_gate_harness_delayed_ack_retained() {
+    drive_gate(
+        "delayed-ack-retained",
+        &[
+            "ASSERT retired_nine_charged",
+            "ASSERT peak_nine_despite_zero_armed",
+            "ASSERT reuse_pending_uncounted",
+            "ASSERT delayed_retained_drains",
+        ],
+    );
+}
+
+/// Quarantine: retired-never-armed rows stay charged beside live rows;
+/// fresh traffic resolves while quarantined reuse waits.
+#[test]
+fn loader_gate_harness_quarantine_retained() {
+    drive_gate(
+        "quarantine-retained",
+        &[
+            "ASSERT quarantine_nine_charged",
+            "ASSERT eighteen_retained_nine_armed",
+            "ASSERT quarantine_pending_forever",
+            "ASSERT fresh_unaffected",
+        ],
+    );
+}
+
+/// Forced CAS exhaustion: settled updates land through the fallback
+/// and every unsettled update reports through update_losses.
+#[test]
+fn loader_gate_harness_cas_exhaustion_counts() {
+    drive_gate_hook(
+        "cas-exhaustion-counts",
+        &[
+            "ASSERT fallback_settles_count",
+            "ASSERT skip_reports_loss",
+            "ASSERT peak_loss_reported",
+            "ASSERT drop_loss_reported",
         ],
     );
 }

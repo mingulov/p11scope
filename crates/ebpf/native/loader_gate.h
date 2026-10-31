@@ -75,19 +75,28 @@ _Static_assert(P11_OWNER_START_REASON_EXEC_EXIT == P11_LOADER_START_REASON_EXEC_
  * acknowledgement consumes (validates plus clears) it. Single-word and
  * write-once: a BPF read racing the set sees 0 (retry later) or 1
  * (proceed), both safe. The retired generation in the ack cookie is the
- * capability; the T-L3 completion ordering is the caller's proof. */
+ * capability; the T-L3 completion ordering is the caller's proof.
+ * last_gen is the serial floor: the newest generation admitted here (0
+ * while no generation has ever retired, since generation 0 is never
+ * issued). An empty row admits only a generation strictly ahead of the
+ * floor in u32 serial arithmetic, so a stale hit can never resurrect
+ * a reclaimed incarnation, including across the u32 wrap. */
 struct loader_gate_row {
     u64 generation;
     u32 state;
     u32 disposition;
     u32 acked;
-    u32 reserved;
+    u32 last_gen;
 };
 /* Loader publishes limit=256, all other fields zero, before links, then
  * freezes userspace mutation. BPF alone mutates while linked; no reset.
  * The L4b loader cells are admitted (arms), reclaims, retained_peak and
  * refusals; retired stays an end-report diagnostic. All counting cells
- * saturate, never wrap. */
+ * saturate, never wrap. update_losses counts contention events the
+ * bounded accounting protocol could not settle (a skipped near-ceiling
+ * increment, a lost gauge drop, a lost peak raise): nonzero means the
+ * gauges may over- or understate and must be read as bounds, never as
+ * exact facts. Contention-free operation never increments it. */
 struct loader_gate_control {
     u64 limit;
     u64 cutover;
@@ -97,14 +106,15 @@ struct loader_gate_control {
     u64 reclaims;
     u64 retained;
     u64 retained_peak;
+    u64 update_losses;
 };
 _Static_assert(sizeof(struct loader_gate_row) == 24, "gate row ABI");
 _Static_assert(__builtin_offsetof(struct loader_gate_row, generation) == 0, "gate generation");
 _Static_assert(__builtin_offsetof(struct loader_gate_row, state) == 8, "gate state");
 _Static_assert(__builtin_offsetof(struct loader_gate_row, disposition) == 12, "gate disposition");
 _Static_assert(__builtin_offsetof(struct loader_gate_row, acked) == 16, "gate acked");
-_Static_assert(__builtin_offsetof(struct loader_gate_row, reserved) == 20, "gate row reserved");
-_Static_assert(sizeof(struct loader_gate_control) == 64, "gate control ABI");
+_Static_assert(__builtin_offsetof(struct loader_gate_row, last_gen) == 20, "gate last generation");
+_Static_assert(sizeof(struct loader_gate_control) == 72, "gate control ABI");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, limit) == 0, "gate limit");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, cutover) == 8, "gate cutover");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, admitted) == 16, "gate admitted");
@@ -113,6 +123,7 @@ _Static_assert(__builtin_offsetof(struct loader_gate_control, retired) == 32, "g
 _Static_assert(__builtin_offsetof(struct loader_gate_control, reclaims) == 40, "gate reclaims");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, retained) == 48, "gate retained");
 _Static_assert(__builtin_offsetof(struct loader_gate_control, retained_peak) == 56, "gate peak");
+_Static_assert(__builtin_offsetof(struct loader_gate_control, update_losses) == 64, "gate losses");
 
 /* Future real Rust map symbols; only their addresses enter map helpers.
  * The Rust maps land with activation; until then the host harnesses
@@ -166,4 +177,17 @@ long p11_loader_gate_row_generation(u32 slot, u64 *generation_out);
  * path decodes old-format cookies before the latch and tokens after;
  * nothing admits before the latch. */
 long p11_loader_gate_cutover_latched(void);
+/* Probe-hit transaction: resolve-or-admit-or-reuse with exactly-once
+ * accounting. Returns the slot (>= 0) when this hit resolves: freshly
+ * admitted, admitted by a same-generation peer, or claimed after the
+ * transaction reclaims a retired predecessor. Returns -2 when the slot
+ * holds this generation retired but unarmed (acknowledgement-pending,
+ * never counted, at any cutover state). Otherwise the strict refusal
+ * rule applies (-1 counted after the cutover, -2 untracked before it):
+ * malformed slot/generation, a stale generation under the floor, a
+ * foreign live row and an ABA-recycled row all refuse. Concurrent
+ * same-token and successor-generation hits serialize on the per-slot
+ * claim; only one winner counts each admission and each reclaim, so
+ * healthy and pending hits keep refusals at zero. */
+long p11_loader_gate_hit(u32 slot, u64 generation);
 #endif

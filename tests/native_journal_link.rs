@@ -355,7 +355,11 @@ fn journal_proof_never_enters_ordinary_objects_or_loader_sources() {
             bodies.push(bytes);
         }
     }
-    for bytes in bodies {
+    // bodies[0] is the Detailed object (EBPF_OBJECT); the rest are the
+    // inventory and counter objects. A marker-enabled build links the
+    // JOURNAL_MARKER_CTL admission row into Detailed alone.
+    let marker = env!("P11SCOPE_BIRTH_MARKER_ENABLED") == "1";
+    for (index, bytes) in bodies.iter().enumerate() {
         let object = aya_obj::Object::parse(bytes).unwrap();
         for name in ["p11_entry_journal", "p11_return_journal"] {
             assert!(
@@ -363,20 +367,32 @@ fn journal_proof_never_enters_ordinary_objects_or_loader_sources() {
                 "ordinary object selected {name}"
             );
         }
-        for name in [
-            "JOURNAL_START",
-            "JOURNAL_CTL",
-            "JOURNAL_MARKER_CTL",
-            "JOURNAL_CLASSES",
-        ] {
+        for name in ["JOURNAL_START", "JOURNAL_CTL", "JOURNAL_CLASSES"] {
             assert!(!object.maps.contains_key(name));
         }
-        assert!(
-            !object
-                .functions
-                .values()
-                .any(|function| PRODUCERS.contains(&function.name.as_str()))
-        );
+        if marker && index == 0 {
+            assert!(
+                object.maps.contains_key("JOURNAL_MARKER_CTL"),
+                "marker-enabled Detailed object lost JOURNAL_MARKER_CTL"
+            );
+        } else {
+            assert!(!object.maps.contains_key("JOURNAL_MARKER_CTL"));
+        }
+        let gap = object
+            .functions
+            .values()
+            .any(|function| function.name == "p11_instance_scope_gap");
+        if marker && index == 0 {
+            assert!(
+                gap,
+                "marker-enabled Detailed object lost p11_instance_scope_gap"
+            );
+        } else {
+            assert!(!gap, "ordinary object selected p11_instance_scope_gap");
+        }
+        assert!(!object.functions.values().any(|function| {
+            function.name != "p11_instance_scope_gap" && PRODUCERS.contains(&function.name.as_str())
+        }));
     }
     let mut pending = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
     while let Some(path) = pending.pop() {

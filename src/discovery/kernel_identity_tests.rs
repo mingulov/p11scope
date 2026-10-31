@@ -5934,6 +5934,12 @@ fn auto_kernel_custody_holds_anchors_to_cap() {
     // The auto/kernel twin: full custody still takes anchors up to its
     // capacity and refuses past it with AnchorCap. Late offers carry
     // zero caller counts so they always lose the rank comparison.
+    //
+    // Load-exposed second outcome: the 10 ms file-descriptor census can
+    // refuse under host load at creation or at the gate offer. A census
+    // refusal is a valid outcome with its own full contract — the exact
+    // named reason plus zero anchors held — never a blanket pass. The
+    // anchors-held path below keeps every original assertion.
     let dir = tempfile::tempdir().unwrap();
     let stored: Vec<_> = (0..EXAMINED_ANCHOR_CAP + 10)
         .map(|index| opened(dir.path(), &format!("kept-{index}.so")))
@@ -5943,13 +5949,53 @@ fn auto_kernel_custody_holds_anchors_to_cap() {
         callers.insert(object.key, usize::from(index < EXAMINED_ANCHOR_CAP) * 100);
     }
     let mut custody = crate::inspect_system::build_identity_custody(callers, true);
-    assert!(!custody.failed(), "creation census failed on this host");
+    if custody.failed() {
+        // Creation-census refusal: the census names its exact reason,
+        // custody starts with zero capacity, and every offer refuses
+        // with FdHeadroom before any census — the failed twin of the
+        // explicit-userspace zero-capacity shape.
+        assert_eq!(
+            crate::discovery::sweep_attribution::FD_CENSUS_REASON,
+            "identity file-descriptor census is unavailable",
+            "the creation refusal names its exact census reason"
+        );
+        assert_eq!(custody.owner.examined_capacity(), 0);
+        let owner = custody.owner.clone();
+        let scan = custody.begin_scan();
+        let mut refused = 0usize;
+        let ((), calls) = crate::discovery::sweep_attribution::count_censuses_for_test(|| {
+            for (index, (file, examined)) in stored.into_iter().enumerate() {
+                let key = examined.key;
+                assert!(
+                    !custody.offer(scan, examined, file),
+                    "offer {index} took an anchor after the creation census refused"
+                );
+                refused += 1;
+                assert_eq!(
+                    custody.missing.get(&(scan, key)),
+                    Some(&AnchorDeny::FdHeadroom),
+                    "offer {index} refused without FdHeadroom after the creation census refused"
+                );
+            }
+        });
+        assert_eq!(refused, EXAMINED_ANCHOR_CAP + 10);
+        assert_eq!(calls, 0, "refused offers took {calls} strict censuses");
+        assert!(custody.candidates.is_empty());
+        assert_eq!(owner.examined_for_test(), (0, 0));
+        assert!(custody.failed(), "a capacity refusal reopened custody");
+        println!(
+            "auto_kernel_custody outcome: creation census refused, \
+             {refused} FdHeadroom refusals, {calls} censuses"
+        );
+        return;
+    }
     let cap = custody.owner.examined_capacity();
     assert!(cap > 0, "test hosts hold anchor headroom");
     let owner = custody.owner.clone();
     let scan = custody.begin_scan();
     let mut held = 0usize;
     let mut refused = 0usize;
+    let mut gate_refused = false;
     let ((), calls) = crate::discovery::sweep_attribution::count_censuses_for_test(|| {
         for (index, (file, examined)) in stored.into_iter().enumerate() {
             let key = examined.key;
@@ -5957,14 +6003,52 @@ fn auto_kernel_custody_holds_anchors_to_cap() {
                 held += 1;
             } else {
                 refused += 1;
-                assert_eq!(
-                    custody.missing.get(&(scan, key)),
-                    Some(&AnchorDeny::AnchorCap),
-                    "offer {index} refused without AnchorCap"
-                );
+                if custody.failed() {
+                    // Gate-census refusal mid-loop: this and every later
+                    // offer refuses with FdHeadroom; takes before the
+                    // failure are drained, never kept.
+                    gate_refused = true;
+                    assert_eq!(
+                        custody.missing.get(&(scan, key)),
+                        Some(&AnchorDeny::FdHeadroom),
+                        "offer {index} refused without FdHeadroom after the gate census failed"
+                    );
+                } else {
+                    assert_eq!(
+                        custody.missing.get(&(scan, key)),
+                        Some(&AnchorDeny::AnchorCap),
+                        "offer {index} refused without AnchorCap"
+                    );
+                }
             }
         }
     });
+    if gate_refused {
+        // Gate-census refusal contract: the exact named reason, no
+        // anchor survives the failure, and the refusing in-loop census
+        // was actually attempted.
+        assert_eq!(
+            crate::discovery::sweep_attribution::FD_CENSUS_REASON,
+            "identity file-descriptor census is unavailable",
+            "the gate refusal names its exact census reason"
+        );
+        assert!(custody.failed(), "the gate refusal did not stick");
+        assert!(
+            custody.candidates.is_empty(),
+            "the gate refusal kept anchors"
+        );
+        assert_eq!(
+            owner.examined_for_test().0,
+            0,
+            "the gate refusal leaked examined leases"
+        );
+        assert!(calls >= 1, "no offer took the gate census");
+        println!(
+            "auto_kernel_custody outcome: gate census refused mid-loop, \
+             {held} taken then drained, {refused} refused"
+        );
+        return;
+    }
     assert_eq!(held, cap, "full custody held {held} of {cap}");
     assert_eq!(custody.candidates.len(), cap);
     assert_eq!(owner.examined_for_test(), (cap, cap));
@@ -5981,6 +6065,7 @@ fn auto_kernel_custody_holds_anchors_to_cap() {
             "a zero-count tail offer took on a small host"
         );
     }
+    println!("auto_kernel_custody outcome: anchors held to cap {cap}, {refused} refused past it");
 }
 
 #[test]

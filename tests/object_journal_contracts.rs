@@ -2093,6 +2093,10 @@ fn object_journal_object_ring_loss_gap_requires_settled_guard() {
 /// object count, so the test cannot pass with an empty selection.
 #[test]
 fn object_journal_release_has_no_birth_marker_paths() {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") == "1" {
+        eprintln!("release-config pin; run in the default-mode matrix");
+        return;
+    }
     let object =
         aya_obj::Object::parse(p11scope::EBPF_OBJECT).expect("parse release Detailed object");
     assert!(

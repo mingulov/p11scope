@@ -502,10 +502,35 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin the reviewed v0.6.0 combined tree: journal roots plus the
-      # EXEC generation-witness cookie are the BPF input changes since
-      # the previous baseline. Compare complete objects, including
-      # metadata, from this baseline forward.
+      # Pin the reviewed post-KEM tree ba92b4e2: the BPF input changes
+      # since b172bef6 are exactly these 25 reviewed commits (KEM 6.07c
+      # series, extensive 6.14 A/B, journal/native follow-ups):
+      #   96c690cb test: close 6.04 review gaps on stop custody and emitter map
+      #   0179e201 feat: name journal reason emitters and reservations; retire stale inactive claims
+      #   c9a38c8a refactor: relocate KEM adapter below slot_gate, out of the derive scan region
+      #   cf9501f1 kem: refuse overflowing ciphertext exclusive end at the top edge
+      #   e9410d3f tests: silence own-round clippy lints in KEM helpers
+      #   2845702b tests: add findings 4-6 KEM acceptance twins
+      #   ae6b7464 kem: advance KEM entries to READY and guard ciphertext/result spans
+      #   f2604aed fix: satisfy clippy field-init and clone-on-copy lints
+      #   a48eca45 fix: repair §10 battery APIs, clippy, warning, BPF dump pin
+      #   776e37ea fix: repair KEM entry adapter compile errors
+      #   c28b07ec style: apply cargo fmt to packet 6.07c edits
+      #   81b86ce0 feat: add T0 KEM capture descriptors, wire codes and entry adapter
+      #   393264b8 test: pin KEM capture contract (descriptors, wire, entry adapter)
+      #   6127958a feat: 6.14 B1 exe-identity capture + ABI + CONFIG gate
+      #   d590b54c test: 6.14 B-RED extensive-dependency hints (ABI+native+elf_needed+engine)
+      #   b638ef89 feat: model C_Initialize eras and pin lifecycle link proofs
+      #   aa4160d5 fix: restore ordinary object return shape for the v6.1 verifier
+      #   d512d015 docs: record the gate single-owner obligation and fix identity wording
+      #   ff0096b8 fix: cover loader retirement fault arms and harden the removal contract
+      #   2a9fb054 fix: pin the full old-format cookie collision set with twin scenarios
+      #   ad74a152 feat: wire T-L2 loader retirement and the T-L2c token gate
+      #   6e67848b feat: add the production journal-object load path
+      #   c7cb2772 feat: 6.14 A3 kind-7 ABI validator arm and status bits
+      #   3e7155d1 feat: 6.14 A1 native exit-summary helper
+      #   cf5fe82a test: 6.14 A-RED kind-7 ABI validator case
+      # Compare complete objects, including metadata, from this baseline forward.
       # Object parity does not establish installed/live acceptance.
       # The checker reconstructs and explicitly fetches each immutable snapshot,
       # then builds it offline (including nested nightly Cargo). No target cache.
@@ -513,7 +538,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=b172bef608021943a317532771d051a632668124
+          BASELINE=ba92b4e2c29fc4db97b870ec1f0b28d4acabebef
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

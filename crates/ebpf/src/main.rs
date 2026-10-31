@@ -1874,20 +1874,34 @@ fn dl_debug_state_impl(ctx: ProbeContext) -> u32 {
         return 0;
     };
     bump_discovery_counter(DISCOVERY_COUNTER_LOADER_HITS);
-    let Some(mut entry) = reserve_discovery() else {
-        return 0;
-    };
-    let raw = entry.as_mut_ptr();
-    let pid_tgid = helpers::bpf_get_current_pid_tgid();
     let cookie = loader_cookie_of(&ctx);
-    // Staged token path (activation builds only): once the gate latch
-    // flips, hits decode as tokens. Before the latch the old decode
-    // below runs unchanged, and nothing admits.
+    // Path selection before any reservation (activation builds only):
+    // once the gate latch flips, hits decode as tokens and the token
+    // emitter reserves its own entry. Before the latch the old decode
+    // runs unchanged, and nothing admits. Neither arm holds a
+    // reservation across this branch, so none can leak.
     #[allow(unexpected_cfgs)]
     #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
     if loader_gate_latched_for_producer() {
         return emit_loader_token_record(ctx, scope, layout, cookie);
     }
+    emit_loader_legacy_record(ctx, scope, layout, cookie)
+}
+
+/// Legacy loader hit path: old-cookie decode with its own reservation.
+/// Split from the impl so path selection precedes every reserve.
+#[inline(always)]
+fn emit_loader_legacy_record(
+    ctx: ProbeContext,
+    scope: ScopeAuth,
+    layout: LinuxLayout,
+    cookie: u64,
+) -> u32 {
+    let Some(mut entry) = reserve_discovery() else {
+        return 0;
+    };
+    let raw = entry.as_mut_ptr();
+    let pid_tgid = helpers::bpf_get_current_pid_tgid();
     let state_present = cookie & LOADER_STATE_PRESENT != 0;
     if !valid_loader_cookie(cookie) {
         // SAFETY: invalid-cookie records stay zero outside these finite fields.

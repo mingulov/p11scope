@@ -690,9 +690,14 @@ pub fn adapter_kem_entry(
             side.phase = 2;
             return true;
         }
-    } else if cell.saturating_add(word_len) > ciphertext {
-        // Equality, interior overlap from below, or at-or-above
-        // the base with unknown extent: disjointness unprovable.
+    } else if cell
+        .checked_add(word_len)
+        .is_none_or(|end| end > ciphertext)
+    {
+        // Equality, interior overlap from below, at-or-above the
+        // base with unknown extent, or an overflowing exclusive
+        // end (saturation would hide the top-edge overlap):
+        // disjointness unprovable.
         side.result_ptrs = [0, 0];
         side.phase = 2;
         return true;
@@ -2723,8 +2728,12 @@ mod tests {
             // the buffer begins.
             (true, LinuxLayout::Lp64, Some(0x7008u64), 0x7000u64, true),
             (false, LinuxLayout::Ilp32, Some(0x7004u64), 0x7000u64, true),
+            // Top-edge saturated overlap withholds: the cell's
+            // inclusive last byte is the ciphertext's first byte,
+            // and the overflowing exclusive end refuses.
+            (true, LinuxLayout::Lp64, Some(u64::MAX), u64::MAX - 7, false),
             // Top-edge cell wholly below the base retains.
-            (true, LinuxLayout::Lp64, Some(u64::MAX), u64::MAX - 7, true),
+            (true, LinuxLayout::Lp64, Some(u64::MAX), u64::MAX - 8, true),
             // A null decapsulation input has no span: retains.
             (false, LinuxLayout::Lp64, Some(0u64), 0x7000u64, true),
         ]

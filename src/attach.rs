@@ -3020,6 +3020,71 @@ fn journal_pair_present(programs: &BTreeSet<&str>) -> bool {
     journal::PROGRAMS.iter().all(|root| programs.contains(root))
 }
 
+/// Doctor-facing journal-pair availability, derived from the same
+/// loaded-pair predicate and flavor contract the production seal
+/// consumes — never from a build flag or a second inventory read.
+/// Preflight only: this fact loads nothing, seals nothing and
+/// authorizes nothing; it only names why the pair is or is not
+/// available in this build's production journal object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JournalPairPreflight {
+    /// Both journal roots are present and the object flavor is clean.
+    Available,
+    /// This build omits the production journal object entirely.
+    UnavailableInBuild,
+    /// The object parses but one or both journal roots are missing;
+    /// the payload names the missing roots.
+    PairMissing(String),
+    /// The embedded bytes do not parse as a BPF object.
+    LoadError(String),
+    /// Both roots are present but the object is not a clean journal
+    /// object (ordinary roots present, or a journal map mismatch).
+    WrongDomain(String),
+}
+
+/// Pair availability for this build's production journal object: the
+/// build gate resolves the embedded bytes, then the same parsed-object
+/// derivation as the seal decides. Doctor renders this verbatim.
+pub(crate) fn journal_pair_preflight() -> JournalPairPreflight {
+    match journal::JournalSpec.prepare() {
+        Ok(prepared) => journal_pair_preflight_from_bytes(prepared.object),
+        // Preparation refuses only through the build gate today, so a
+        // refusal here means the build omits the production object.
+        Err(_) => JournalPairPreflight::UnavailableInBuild,
+    }
+}
+
+/// Pair availability over candidate object bytes: unparseable bytes
+/// are a load error, never a missing pair.
+pub(crate) fn journal_pair_preflight_from_bytes(object: &[u8]) -> JournalPairPreflight {
+    match aya_obj::Object::parse(object) {
+        Ok(parsed) => journal_pair_preflight_from_parsed(&parsed),
+        Err(_) => JournalPairPreflight::LoadError("journal object unparseable".into()),
+    }
+}
+
+/// Pair availability over one parsed object: missing roots are named
+/// through the seal's own pair predicate, and a present pair must
+/// still pass the full journal flavor contract (no ordinary roots,
+/// exact journal maps) before it reads as available.
+pub(crate) fn journal_pair_preflight_from_parsed(
+    parsed: &aya_obj::Object,
+) -> JournalPairPreflight {
+    let programs: BTreeSet<&str> = parsed.programs.keys().map(String::as_str).collect();
+    if !journal_pair_present(&programs) {
+        let missing: Vec<&str> = journal::PROGRAMS
+            .iter()
+            .copied()
+            .filter(|root| !programs.contains(root))
+            .collect();
+        return JournalPairPreflight::PairMissing(missing.join(", "));
+    }
+    match journal::journal_flavor_from_parsed(parsed) {
+        Ok(_) => JournalPairPreflight::Available,
+        Err(error) => JournalPairPreflight::WrongDomain(format!("{error:#}")),
+    }
+}
+
 /// Seal one operator-attested subset into Session-owned attachment
 /// authority with a NATIVE mint: validates exactly like the test
 /// sealer, then mints the generation from the mmapable attach cell
@@ -20186,6 +20251,43 @@ mod tests {
             super::drain_linkage_from_sealed(cell),
             "the sealed journal pair drains linked"
         );
+    }
+
+    /// Preflight-only twin: a present journal pair never widens the
+    /// seal guards. Even with both journal roots in the loaded
+    /// inventory, a non-allowlisted (forced) activation policy refuses
+    /// at production validation before any mint, so doctor-reported
+    /// availability can never become seal authority on its own.
+    #[test]
+    fn journal_pair_presence_never_bypasses_seal_guards() {
+        let programs = BTreeSet::from([
+            "p11_entry",
+            "p11_return",
+            "p11_entry_journal",
+            "p11_return_journal",
+            "task_newtask",
+        ]);
+        for policy in [
+            super::CapturePolicy::AggregateOnly,
+            super::CapturePolicy::UnsafeUnvalidatedMetadata,
+        ] {
+            let scene = SealDrainScene::attest();
+            let minted = std::cell::Cell::new(0u32);
+            let refused = scene.seal_with_inputs(
+                &programs,
+                policy,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                || {
+                    minted.set(minted.get() + 1);
+                    Ok(41)
+                },
+            );
+            assert!(
+                matches!(refused, Err(SemanticRefusal::Attachment)),
+                "forced activation under {policy:?} must refuse: {refused:?}"
+            );
+            assert_eq!(minted.get(), 0, "a refused seal never mints");
+        }
     }
 
     /// Ordinary seal drains unlinked: the production core seals unlinked over

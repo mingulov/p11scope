@@ -1912,8 +1912,11 @@ mod tests {
         state.set_enabled(true);
         state.learn_scan_path(cache_key_of(&exe), &exe);
         let (dev, ino) = record_identity_of(&exe);
-        std::fs::remove_file(&exe).unwrap();
-        std::fs::write(&exe, build_elf(&ElfSpec::exe(&[]))).unwrap();
+        // Atomic rename-over replacement: the path resolves to a
+        // provably different inode on every filesystem (remove+create
+        // reuses the freed inode on ext4, voiding the premise below).
+        let fresh = write_elf(dir.path(), "exe.new", &build_elf(&ElfSpec::exe(&[])));
+        std::fs::rename(&fresh, &exe).unwrap();
         let (new_dev, new_ino) = record_identity_of(&exe);
         assert_ne!((dev, ino), (new_dev, new_ino), "replacement kept identity");
         assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
@@ -2960,13 +2963,73 @@ mod tests {
         );
         assert_eq!(state.analyses_run_for_test(), 1);
         // Regular-file replacement of the intermediate refuses promptly.
-        std::fs::remove_file(&helper_real).unwrap();
+        // Atomic rename-over: the path resolves to a provably different
+        // inode on every filesystem (remove+create reuses the freed
+        // inode on ext4, taking the re-analysis branch instead).
+        let helper_fresh = write_elf(
+            dir.path(),
+            "helper.new",
+            &build_elf(&ElfSpec::lib(b"libhelper.so.1", &[b"libprov.so.1"])),
+        );
+        std::fs::rename(&helper_fresh, &helper_real).unwrap();
+        assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
+        assert_eq!(state.analyses_run_for_test(), 2);
+    }
+
+    // Inode-reuse twin of the control above: the same identity with
+    // changed bytes (what remove+create yields on inode-recycling
+    // filesystems such as ext4) re-analyzes the current bytes instead
+    // of serving the stale verdict or voiding. An in-place rewrite
+    // keeps the inode on every filesystem while the snapshot changes.
+    #[test]
+    fn elf_needed_reused_inode_reanalyzes_current_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = write_elf(
+            dir.path(),
+            "libprov.so.1",
+            &build_elf(&ElfSpec::lib(b"libprov.so.1", &[])),
+        );
+        let helper_real = write_elf(
+            dir.path(),
+            "helper.real",
+            &build_elf(&ElfSpec::lib(b"libhelper.so.1", &[b"libprov.so.1"])),
+        );
+        let helper_link = dir.path().join("libhelper.so.1");
+        std::os::unix::fs::symlink(&helper_real, &helper_link).unwrap();
+        let exe_real = write_elf(
+            dir.path(),
+            "exe.real",
+            &build_elf(&ElfSpec::exe(&[b"libhelper.so.1"])),
+        );
+        let exe_link = dir.path().join("exe");
+        std::os::unix::fs::symlink(&exe_real, &exe_link).unwrap();
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        state.set_watched_for_test(vec![watched(&provider, b"libprov.so.1")]);
+        state.learn_scan_path(cache_key_of(&exe_link), &exe_link);
+        state.learn_scan_path(cache_key_of(&helper_link), &helper_link);
+        state.learn_scan_path(cache_key_of(&provider), &provider);
+        let (dev, ino) = record_identity_of(&exe_link);
+        assert_eq!(
+            state.analyze_executable(dev, ino),
+            StaticHint::LinksProvider
+        );
+        assert_eq!(state.analyses_run_for_test(), 1);
+        let helper_identity = record_identity_of(&helper_real);
         std::fs::write(
             &helper_real,
-            build_elf(&ElfSpec::lib(b"libhelper.so.1", &[b"libprov.so.1"])),
+            build_elf(&ElfSpec::lib(b"libhelper.so.1", &[])),
         )
         .unwrap();
-        assert_eq!(state.analyze_executable(dev, ino), StaticHint::Unknown);
+        assert_eq!(
+            record_identity_of(&helper_real),
+            helper_identity,
+            "in-place rewrite must keep the helper identity"
+        );
+        assert_eq!(
+            state.analyze_executable(dev, ino),
+            StaticHint::NoStaticLinkWithinScope
+        );
         assert_eq!(state.analyses_run_for_test(), 2);
     }
 

@@ -157,18 +157,20 @@ fn object_producer_missing_side_state_faults_before_return() {
         1,
         "ordinary keeps its single 368-byte reservation"
     );
-    for (name, body, retire, reserve) in [
+    for (name, body, retire, reserve, arms) in [
         (
             "ordinary object copy",
             object_ordinary,
             "owned_start_remove(&key, true)",
             "reserve::<ObjectEventRecord>",
+            7,
         ),
         (
             "generic object copy",
             object,
             "start_remove_for::<JOURNAL>",
             "reserve::<Record>",
+            8,
         ),
     ] {
         let query = body
@@ -182,11 +184,12 @@ fn object_producer_missing_side_state_faults_before_return() {
             .unwrap_or_else(|| panic!("{name} drain must check retained-ABI agreement"));
         // Ready, agreement, aggregate, image, reserve-failure,
         // continuity-gate and emission arms each retire through the
-        // copy's own removal; the other removal form must not leak in.
+        // copy's own removal (the generic copy adds the journal
+        // flag-conversion arm); the other removal form must not leak in.
         assert_eq!(
             body.matches(retire).count(),
-            7,
-            "{name} must retire at each of its seven arms"
+            arms,
+            "{name} must retire at each of its {arms} arms"
         );
         let other = if retire.starts_with("owned") {
             "start_remove_for::<"
@@ -227,11 +230,11 @@ fn object_producer_missing_side_state_faults_before_return() {
             "{name} reserves exactly its own object record form"
         );
     }
-    // No-new-site guards: 1 ordinary + 7 + 7 retire sites, 3 reserves.
+    // No-new-site guards: 1 ordinary + 7 + 8 retire sites, 3 reserves.
     assert_eq!(
         returned.matches("owned_start_remove(&key, true)").count()
             + returned.matches("start_remove_for::<JOURNAL>").count(),
-        15,
+        16,
         "ordinary plus both object copies retire at every documented arm"
     );
     // Slice D emits the completed tail behind the required-object
@@ -612,7 +615,11 @@ fn object_return_copies_keep_shared_skeleton_and_documented_differences() {
     }
     // Documented difference 1: removal helper. The ordinary copy
     // retires through the owned removal; the generic copy through the
-    // journal-parameterized removal with per-arm reasons.
+    // journal-parameterized removal with per-arm reasons. The generic
+    // copy's eighth site is the journal flag-conversion refusal arm
+    // (difference 5): the Option-returning journal completion can
+    // refuse after emission, and the un-submittable reservation then
+    // retires like a lost result.
     assert_eq!(
         object_ordinary
             .matches("owned_start_remove(&key, true)")
@@ -626,7 +633,7 @@ fn object_return_copies_keep_shared_skeleton_and_documented_differences() {
     );
     assert_eq!(
         object.matches("start_remove_for::<JOURNAL>").count(),
-        7,
+        8,
         "generic copy retires through the journal removal only"
     );
     assert!(

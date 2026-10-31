@@ -132,8 +132,10 @@ class ObjectTailTests(unittest.TestCase):
             bad = bytearray(good)
             bad[offset:offset + size] = value.to_bytes(size, "little")
             cases.append((f"header@{offset}={value}", bytes(bad)))
+        # Actions 13/14 are the valid KEM Encapsulate/Decapsulate wire
+        # codes, so the above-max mutation is 15 (max is 14).
         for offset, value in [
-            (12, 0), (12, 3), (13, 0), (13, 13), (14, 5), (15, 1),
+            (12, 0), (12, 3), (13, 0), (13, 15), (14, 5), (15, 1),
             (127, 1), (236, 1), (237, 1), (238, 1), (239, 1),
         ]:
             bad = bytearray(good)

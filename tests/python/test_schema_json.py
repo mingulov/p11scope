@@ -419,7 +419,6 @@ class SchemaOracleAgreement(unittest.TestCase):
         full = self.selected_document(
             events=self.selected_events_covering_every_row(),
             with_close_products=True)
-        section = full["evidence"]["selected_detail"]
         mutations = [
             ("envelope", []),
             ("selection", ["selection"]),

@@ -146,6 +146,7 @@ impl PromotionView {
 /// viewed frame and the exact caller/provider pair. The runtime treats
 /// these values as expected identities only.
 #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): constructed by take_request for the runtime owner; the take path is staged.
+#[derive(Clone)] // 6.15 driver: the orchestration keeps the current request for ledger rows after the service consumes it.
 pub(crate) struct PromotionRequest {
     id: RequestId,
     viewed: Arc<PromotionView>,

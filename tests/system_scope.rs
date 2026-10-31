@@ -101,6 +101,7 @@ fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs
         scope: ScopeArg::System,
         metrics: false,
         counter_mode: None,
+        select_endpoint: None,
         duration: None,
         out: None,
         max_events: None,

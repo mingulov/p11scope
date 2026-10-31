@@ -22,6 +22,11 @@ mod counter_projection;
 // stay `pub(super)` so only metrics code handles raw reads.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod selected_detail;
+// 6.15 driver packet (this lane): CLI endpoint selection plus live
+// promotion/demotion orchestration over the adapter above. The host
+// composition calls the orchestration entries; the selection stage
+// and composer are production-live.
+pub(crate) mod selected_detail_driver;
 
 pub(crate) use counter_projection::{CaptureCollection, CaptureSnapshot, CounterCaptureInputs};
 

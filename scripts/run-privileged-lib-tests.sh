@@ -479,6 +479,10 @@ metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64
 metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledger_lp64
 metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_ledger_lp64
 metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64
+# 6.15 selected-detail root controls (live-plan resolution positive plus
+# system-scope neighbor): root with prebuilt growth fixtures, run by hand.
+metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64
+metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64
 metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64
 # Unprivileged system-population graph sizing: memory, drain and release
 # are hard gates, the stop time is measured and disclosed (R-40).
@@ -571,6 +575,8 @@ SKIP_REASONS=(
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separately admitted Engine-driven Singles staging; a second stop signal abandons the counter detach with the typed interruption"
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven timestamps growth to 8192 plus an atomic over-ceiling refusal"
 "needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven latency growth to 8192 plus an atomic over-ceiling refusal"
+"needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
+"needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
 "needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
 "needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
 "needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"

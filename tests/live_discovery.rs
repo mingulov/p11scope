@@ -57,6 +57,7 @@ fn engine_initial_discovery_preserves_plan() {
         scope: ScopeArg::Pid(pid),
         metrics: false,
         counter_mode: None,
+        select_endpoint: None,
         duration: None,
         out: None,
         max_events: None,

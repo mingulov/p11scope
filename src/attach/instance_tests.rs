@@ -6,7 +6,8 @@
 use super::*;
 use crate::discovery::identity::pin_scanned_view_objects;
 use crate::discovery::instances::{
-    InstanceId, InstanceRouter, ObserveOutcome, Route, RouterLimits, UnknownReason,
+    InstanceId, InstanceRouter, ObserveOutcome, RELOAD_NOT_EXCLUDED_LABEL, Route, RouterLimits,
+    UnknownReason,
 };
 use crate::discovery::scan::{CaptureWorkBudget, ScannedModule};
 use crate::plan::{AttachPlan, Slot};
@@ -2087,6 +2088,133 @@ fn privileged_instance_b17_counters_observe_sharer_churn() -> Result<()> {
     let kernel = harness.session.instance_maps().counters()?;
     eprintln!(
         "B17_COUNTERS a={a:?} after={after_sharer:?} counters={counters:?} kernel={kernel:?} scans={:?} minted={}",
+        harness.scan,
+        harness.capture.router().instances_minted()
+    );
+    Ok(())
+}
+
+/// Live drain twin: the post-sharer continuation must disclose the tainted
+/// identity exactly once through the capture report, then stay silent on a
+/// same-triple refresh (sticky, no re-yield). The production drain site
+/// consumes the router queue every scan, so the positive assertion reads
+/// the drained TickReport; the test-only forwarder pins queue-level
+/// negative/terminal emptiness.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_b17_drain_yields_identity_once_live() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let provider = compile(directory.path(), true)?;
+    let driver = compile(directory.path(), false)?;
+    let mut target = Target::spawn(&driver, &["cmd".as_ref(), provider.as_os_str()], &[])?;
+    let ready = target.line(Duration::from_secs(10))?;
+    ensure!(ready.starts_with("READY"), "{ready}");
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    // Gen 0, three calls: one instance, no churn yet.
+    for _ in 0..3 {
+        target.command(b'c')?;
+    }
+    let a = single_join(&pump_until(&mut harness, &target, 3)?)?;
+    let gen0_image = harness
+        .take_images()
+        .first()
+        .copied()
+        .context("gen0 call image")?;
+    // Negative control: nothing queued before the sharer step.
+    ensure!(
+        harness
+            .capture
+            .take_reload_not_excluded_for_test()
+            .is_empty(),
+        "disclosure queued before sharer churn"
+    );
+    // A CLONE_VM non-thread child mutating the provider in the shared mm:
+    // marked at fork, its mutations go to the file's global epoch only.
+    let shared_before = harness.session.instance_maps().counters()?;
+    let sharer = target.command(b'v')?;
+    ensure!(sharer == "SHARER", "{sharer}");
+    let shared_after = harness.session.instance_maps().counters()?;
+    ensure!(
+        shared_after.shared >= shared_before.shared + 2
+            && shared_after.global_bumps >= shared_before.global_bumps + 2
+            && shared_after.local_bumps == shared_before.local_bumps,
+        "CLONE_VM sharer was not globalized: {shared_before:?} -> {shared_after:?}"
+    );
+    // First scan past the churn: a tainted continuation discloses the
+    // identity exactly once, under the frozen label.
+    let started = Instant::now();
+    let report = harness
+        .capture
+        .refresh(&mut harness.session, target.pin.clone(), 0)?;
+    let elapsed = started.elapsed().as_nanos();
+    ensure!(
+        report
+            .observations
+            .iter()
+            .any(|outcome| *outcome == ObserveOutcome::Continued),
+        "post-churn scan observed no continuation: {report:?}"
+    );
+    ensure!(
+        report.reload_not_excluded.len() == 1,
+        "post-churn scan must disclose one identity: {report:?}"
+    );
+    let disclosure = &report.reload_not_excluded[0];
+    ensure!(
+        disclosure.label == RELOAD_NOT_EXCLUDED_LABEL
+            && disclosure.label == "instance_reload_not_excluded",
+        "disclosure must carry the frozen label: {disclosure:?}"
+    );
+    ensure!(
+        disclosure.image == gen0_image,
+        "disclosure must name the joined image: {disclosure:?}"
+    );
+    ensure!(
+        disclosure.file_slot == harness.file_slot,
+        "disclosure must name the watched slot: {disclosure:?}"
+    );
+    ensure!(
+        disclosure.ids == vec![a],
+        "disclosure must name the continued instance: {disclosure:?}"
+    );
+    harness.record_report(report, elapsed, false);
+    // Same-triple refresh: still a continuation, but no re-yield (sticky).
+    let started = Instant::now();
+    let refresh = harness
+        .capture
+        .refresh(&mut harness.session, target.pin.clone(), 0)?;
+    let elapsed = started.elapsed().as_nanos();
+    ensure!(
+        refresh
+            .observations
+            .iter()
+            .any(|outcome| *outcome == ObserveOutcome::Continued),
+        "refresh observed no continuation: {refresh:?}"
+    );
+    ensure!(
+        refresh.reload_not_excluded.is_empty(),
+        "refresh re-yielded the disclosure: {refresh:?}"
+    );
+    harness.record_report(refresh, elapsed, false);
+    // One joined call: the same instance survives the churn.
+    target.command(b'c')?;
+    let after_sharer = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        after_sharer == a,
+        "a sharer's mutation did not continue the instance"
+    );
+    // Terminal: production drained everything; nothing undisclosed pending.
+    ensure!(
+        harness
+            .capture
+            .take_reload_not_excluded_for_test()
+            .is_empty(),
+        "undrained disclosure pending after the sequence"
+    );
+    let counters = harness.capture.router().counters();
+    let kernel = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "B17_DRAIN a={a:?} after={after_sharer:?} counters={counters:?} kernel={kernel:?} scans={:?} minted={}",
         harness.scan,
         harness.capture.router().instances_minted()
     );

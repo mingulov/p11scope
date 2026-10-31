@@ -894,10 +894,10 @@ fn llvm_function_insns(disassembly: &str, name: &str) -> Option<usize> {
 /// each arm reserves inside its own emitter. The old shape reserved a
 /// legacy entry and leaked it on every token hit (neither submitted nor
 /// discarded). This pins the source shape in CI; the compiled cfg-on
-/// shape is proven by the repeatable LLVM procedure in the P1 repair
-/// evidence (disassemble the unlinked cfg-on bitcode and show the impl
-/// holds no reserve call), and the cfg-on root enters the later
-/// verifier lane before activation.
+/// shape is proven by the repeatable MIR procedure in the P1 repair
+/// evidence (dump the impl's MIR and show it holds no reserve call;
+/// the LLVM link of that procedure failed in the toolchain), and the
+/// cfg-on root enters the later verifier lane before activation.
 #[test]
 fn cfgon_producer_selects_path_before_reserving() {
     let manifest = env!("CARGO_MANIFEST_DIR");

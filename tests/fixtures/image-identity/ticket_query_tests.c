@@ -1106,6 +1106,7 @@ static void identity_cas_exhaustion(void)
     image_cas_fail_all = 0;
     ctl_b.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
     select_stub.bank = 1;
+    select_stub.prepared[1] = 1;
     select_stub.prepared[0] = 0;
     select_stub.folded_issued = ~0ULL - 1;
     present[4] = 0;

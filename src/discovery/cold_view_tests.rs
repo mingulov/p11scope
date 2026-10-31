@@ -123,6 +123,7 @@ fn cold_group_discovery_keeps_tgid_scope_and_actual_callback_target() {
             scope: crate::cli::ScopeArg::Pid(group.pid()),
             metrics: false,
             counter_mode: None,
+            select_endpoint: None,
             duration: None,
             out: None,
             max_events: None,

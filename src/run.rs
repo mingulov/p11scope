@@ -2338,6 +2338,7 @@ fn capture_with_host(
         a.unsafe_requested,
         a.counter_mode,
         a.track_short_lived,
+        a.select_endpoint.as_deref(),
     )?;
     if let Some(warning) = pid_namespace_preflight(&a.scope, crate::pidns::numbering())? {
         emit_capture_diagnostic(&warning);
@@ -2505,7 +2506,16 @@ pub(crate) fn capture_policy(
     unsafe_requested: bool,
     counter_mode: Option<p11scope_ebpf_common::CounterMode>,
     track_short_lived: bool,
+    select_endpoint: Option<&str>,
 ) -> Result<CapturePolicy> {
+    // 6.15: endpoint selection details a counter broad only. The CLI
+    // refuses this first; the policy re-checks so no programmatic
+    // caller can arm a selection the driver cannot resolve.
+    if select_endpoint.is_some() && counter_mode.is_none() {
+        anyhow::bail!(
+            "--select-endpoint requires --counter-mode counts|timestamps|latency on --mode metrics"
+        );
+    }
     if let Some(mode) = counter_mode {
         if kind != Kind::Profile || !metrics {
             anyhow::bail!(
@@ -3355,6 +3365,7 @@ fn run_owned_inner_with_host(
         args.unsafe_requested,
         args.counter_mode,
         args.track_short_lived,
+        args.select_endpoint.as_deref(),
     )?;
     // DR-K8S-1: `run` is a PID scope over its own child, numbered in this
     // observer's namespace; refuse before anything is forked.
@@ -3408,6 +3419,7 @@ fn run_owned_inner_with_host(
         scope: ScopeArg::Pid(pid),
         metrics: args.metrics,
         counter_mode: args.counter_mode,
+        select_endpoint: args.select_endpoint.clone(),
         duration: args.duration,
         out: args.out.clone(),
         max_events: args.max_events,
@@ -12478,6 +12490,7 @@ mod tests {
                 scope: ScopeArg::Pid(pid),
                 metrics: false,
                 counter_mode: None,
+                select_endpoint: None,
                 track_short_lived: false,
                 duration: None,
                 out: None,
@@ -12548,6 +12561,7 @@ mod tests {
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             metrics: false,
             counter_mode: None,
+            select_endpoint: None,
             duration: None,
             out: None,
             max_events: None,
@@ -12599,6 +12613,7 @@ mod tests {
             scope,
             metrics: false,
             counter_mode: None,
+            select_endpoint: None,
             duration: None,
             out: None,
             max_events: None,
@@ -12845,13 +12860,13 @@ mod tests {
             // Metrics profile/run select the counter policy for every mode.
             if objects {
                 assert_eq!(
-                    capture_policy(Kind::Profile, true, false, Some(mode), false).unwrap(),
+                    capture_policy(Kind::Profile, true, false, Some(mode), false, None).unwrap(),
                     CapturePolicy::Counter(mode),
                     "{mode:?}"
                 );
             } else {
-                let error =
-                    capture_policy(Kind::Profile, true, false, Some(mode), false).unwrap_err();
+                let error = capture_policy(Kind::Profile, true, false, Some(mode), false, None)
+                    .unwrap_err();
                 let text = format!("{error:#}");
                 assert!(
                     text.contains("counter-mode-unavailable-in-build"),
@@ -12877,7 +12892,8 @@ mod tests {
                 ),
             ] {
                 let error =
-                    capture_policy(kind, metrics, unsafe_requested, Some(mode), false).unwrap_err();
+                    capture_policy(kind, metrics, unsafe_requested, Some(mode), false, None)
+                        .unwrap_err();
                 let text = format!("{error:#}");
                 assert_eq!(
                     text, expected,
@@ -12888,15 +12904,15 @@ mod tests {
         }
         // Omission keeps every legacy selection.
         assert_eq!(
-            capture_policy(Kind::Profile, false, false, None, false).unwrap(),
+            capture_policy(Kind::Profile, false, false, None, false, None).unwrap(),
             CapturePolicy::Allowlisted
         );
         assert_eq!(
-            capture_policy(Kind::Profile, true, false, None, false).unwrap(),
+            capture_policy(Kind::Profile, true, false, None, false, None).unwrap(),
             CapturePolicy::AggregateOnly
         );
         assert_eq!(
-            capture_policy(Kind::Trace, false, false, None, false).unwrap(),
+            capture_policy(Kind::Trace, false, false, None, false, None).unwrap(),
             CapturePolicy::Allowlisted
         );
     }
@@ -12912,7 +12928,8 @@ mod tests {
             p11scope_ebpf_common::CounterMode::Timestamps,
             p11scope_ebpf_common::CounterMode::Latency,
         ] {
-            let error = capture_policy(Kind::Profile, true, false, Some(mode), true).unwrap_err();
+            let error =
+                capture_policy(Kind::Profile, true, false, Some(mode), true, None).unwrap_err();
             assert_eq!(
                 format!("{error:#}"),
                 format!(
@@ -12925,17 +12942,56 @@ mod tests {
         }
         // Detailed positives: the flag alone changes no selection.
         assert_eq!(
-            capture_policy(Kind::Profile, false, false, None, true).unwrap(),
+            capture_policy(Kind::Profile, false, false, None, true, None).unwrap(),
             CapturePolicy::Allowlisted
         );
         assert_eq!(
-            capture_policy(Kind::Profile, true, false, None, true).unwrap(),
+            capture_policy(Kind::Profile, true, false, None, true, None).unwrap(),
             CapturePolicy::AggregateOnly
         );
         assert_eq!(
-            capture_policy(Kind::Trace, false, false, None, true).unwrap(),
+            capture_policy(Kind::Trace, false, false, None, true, None).unwrap(),
             CapturePolicy::Allowlisted
         );
+    }
+
+    // 6.15: endpoint selection details a counter broad only. The CLI
+    // refuses this first; the policy re-checks so no programmatic
+    // caller can arm a selection the driver cannot resolve. A
+    // selection beside a counter mode changes no policy by itself.
+    #[test]
+    fn select_endpoint_requires_counter_policy_through_capture_policy() {
+        for (kind, metrics) in [
+            (Kind::Profile, true),
+            (Kind::Profile, false),
+            (Kind::Trace, false),
+        ] {
+            let error =
+                capture_policy(kind, metrics, false, None, false, Some("C_Sign")).unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                "--select-endpoint requires --counter-mode counts|timestamps|latency \
+                 on --mode metrics",
+                "{kind:?}/{metrics}"
+            );
+        }
+        // Beside a counter mode the selection rides along unchanged.
+        // Builds without counter objects refuse by name instead.
+        if env!("P11SCOPE_COUNTER_OBJECTS_ENABLED") == "1" {
+            let mode = p11scope_ebpf_common::CounterMode::Counts;
+            assert_eq!(
+                capture_policy(
+                    Kind::Profile,
+                    true,
+                    false,
+                    Some(mode),
+                    false,
+                    Some("C_Sign")
+                )
+                .unwrap(),
+                CapturePolicy::Counter(mode),
+            );
+        }
     }
 
     // 614b P1 narrow authorization: the exe-identity read arms only
@@ -18115,7 +18171,7 @@ mod tests {
             unsafe_present: cfg!(feature = "unsafe-unvalidated-metadata"),
         };
         let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
-        let error = capture_policy(Kind::Profile, false, false, None, false).unwrap_err();
+        let error = capture_policy(Kind::Profile, false, false, None, false, None).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("stale or mismatched"), "{message}");
     }
@@ -18131,7 +18187,7 @@ mod tests {
             unsafe_present: !cfg!(feature = "unsafe-unvalidated-metadata"),
         };
         let _guard = crate::attach::hold_embedded_flavor_for_test(Ok(planted));
-        let error = capture_policy(Kind::Profile, false, true, None, false).unwrap_err();
+        let error = capture_policy(Kind::Profile, false, true, None, false, None).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("stale or mismatched"), "{message}");
         assert!(message.contains("unsafe-unvalidated-metadata"), "{message}");

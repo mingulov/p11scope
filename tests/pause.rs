@@ -29,6 +29,7 @@ fn paused_run(pause: PausePolicy, marker: &Path) -> RunArgs {
         hooks: HookRegistry::builtin(),
         metrics: false,
         counter_mode: None,
+        select_endpoint: None,
         duration: None,
         out: None,
         max_events: None,

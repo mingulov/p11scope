@@ -5819,6 +5819,7 @@ mod tests {
             capture_args.unsafe_requested,
             capture_args.counter_mode,
             capture_args.track_short_lived,
+            capture_args.select_endpoint.as_deref(),
         )
         .expect("counter argv builds its policy");
         assert_eq!(policy, crate::attach::CapturePolicy::Counter(mode));
@@ -6106,6 +6107,7 @@ mod tests {
             run_args.unsafe_requested,
             run_args.counter_mode,
             run_args.track_short_lived,
+            run_args.select_endpoint.as_deref(),
         )
         .expect("counter run argv builds its policy");
         assert_eq!(policy, crate::attach::CapturePolicy::Counter(mode));

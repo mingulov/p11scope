@@ -1059,6 +1059,7 @@ fn system_sweep_releases_its_pins() {
         scope: crate::cli::ScopeArg::System,
         metrics: false,
         counter_mode: None,
+        select_endpoint: None,
         duration: None,
         out: None,
         max_events: None,

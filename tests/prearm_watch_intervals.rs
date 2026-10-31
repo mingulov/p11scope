@@ -89,6 +89,7 @@ fn capture_args(
         scope: ScopeArg::Pid(pid),
         metrics: false,
         counter_mode: None,
+        select_endpoint: None,
         track_short_lived: false,
         duration: None,
         out: None,

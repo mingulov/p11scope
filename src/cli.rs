@@ -42,6 +42,9 @@ pub struct CaptureArgs {
     pub metrics: bool,
     /// Explicit metrics measurement request; omission keeps legacy behavior.
     pub counter_mode: Option<CounterMode>,
+    /// `--select-endpoint` (6.15): one endpoint function name to detail
+    /// while aggregate counters continue; None ⇒ aggregate-only capture.
+    pub select_endpoint: Option<String>,
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
@@ -89,6 +92,9 @@ pub struct RunArgs {
     pub metrics: bool,
     /// Explicit metrics measurement request; omission keeps legacy behavior.
     pub counter_mode: Option<CounterMode>,
+    /// `--select-endpoint` (6.15): one endpoint function name to detail
+    /// while aggregate counters continue; None ⇒ aggregate-only capture.
+    pub select_endpoint: Option<String>,
     pub duration: Option<Duration>,
     pub out: Option<PathBuf>,
     pub max_events: Option<u64>,
@@ -396,7 +402,7 @@ Use p11scope <command> --help for examples and mode-specific guidance.
 usage:
   p11scope --version
   p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
-                   [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--duration <30|30s|5m|1h>] [-o <out.json>]
+                   [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
@@ -407,7 +413,7 @@ usage:
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
-  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--duration <…>]
+  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--track-short-lived]
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
@@ -455,6 +461,10 @@ Inventory usage entries and trace completed events have separate attribution rul
 --counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
 counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.
 Omit --counter-mode to keep existing metrics behavior. Selections can refuse with a named reason, including on kernels without bpf_loop (helper 181), on builds without counter objects, past the mode's endpoint ceiling, and where the kernel verifier rejects the counter programs.
+--select-endpoint <FUNCTION> names one endpoint for full detail while aggregate counters continue; it requires --mode metrics
+with --counter-mode on profile or run. The name must resolve to exactly one broad slot (use --module to narrow providers);
+an unknown or ambiguous name refuses by name and the capture continues aggregate-only. The selection attempt is recorded
+in the report's additive selected_detail ledger; aggregate and detail counts are never summed.
 Provider identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
@@ -465,7 +475,7 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 /// `p11scope profile --help`: scoped syntax, examples and evidence limits.
 const PROFILE_HELP: &str = "usage:
   p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
-                   [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--duration <30|30s|5m|1h>] [-o <out.json>]
+                   [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
                    [--allow-uretprobe-on-confined-target]
@@ -485,6 +495,8 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
 Aggregate across the selected scope; counts are not per application.
 --mode metrics is the lighter maps-only profile mode; metrics is not a subcommand.
+--select-endpoint <FUNCTION> with --mode metrics and --counter-mode names one endpoint for full
+detail while aggregate counters continue; the name must resolve to exactly one broad slot.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
 --track-short-lived (default off) is extensive mode: the kernel records exec-time
 executable identity and unmatched exits classify into STATIC HINT linkage classes.
@@ -516,7 +528,7 @@ Without --max-events, trace stops at a 10,000,000-event default cap; TRUNCATED n
 
 /// `p11scope run --help`: scoped syntax, examples and evidence limits.
 const RUN_HELP: &str = "usage:
-  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--duration <…>]
+  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--track-short-lived]
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
@@ -532,6 +544,8 @@ scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
 Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
 Profile and metrics counts are aggregate, not per application; --trace selects completed events.
+--select-endpoint <FUNCTION> with --mode metrics and --counter-mode names one endpoint for full
+detail while aggregate counters continue; the name must resolve to exactly one broad slot.
 --pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --track-short-lived (default off) is extensive mode: the kernel records exec-time
@@ -729,6 +743,7 @@ struct Common {
     hooks: HookRegistry,
     metrics: Option<bool>,
     counter_mode: Option<CounterMode>,
+    select_endpoint: Option<String>,
     duration: Option<Duration>,
     out: Option<PathBuf>,
     max_events: Option<u64>,
@@ -748,6 +763,12 @@ impl Common {
     /// One `--mode` rule for every capture surface: raw event streaming has no
     /// mode, whether it was selected as the `trace` subcommand or `run --trace`.
     fn metrics_for(&self, kind: Kind, subject: &str) -> Result<bool, CliError> {
+        if self.select_endpoint.is_some() && self.counter_mode.is_none() {
+            return Err(usage_err(
+                "--select-endpoint requires --counter-mode counts|timestamps|latency \
+                 on --mode metrics",
+            ));
+        }
         if self.counter_mode.is_some() {
             if kind != Kind::Profile || self.metrics != Some(true) {
                 return Err(usage_err(
@@ -814,6 +835,18 @@ fn capture_option(
                     "--counter-mode: invalid value {value:?} (expected counts|timestamps|latency)"
                 ))
             })?);
+        }
+        "--select-endpoint" => {
+            if common.select_endpoint.is_some() {
+                return Err(usage_err("--select-endpoint given twice"));
+            }
+            let value = require_value(args, "--select-endpoint")?;
+            if value.is_empty() {
+                return Err(usage_err(
+                    "--select-endpoint: invalid value \"\" (expected one endpoint function name)",
+                ));
+            }
+            common.select_endpoint = Some(value);
         }
         "--duration" => {
             if common.duration.is_some() {
@@ -1490,6 +1523,7 @@ pub fn parse_capture(
         scope,
         metrics,
         counter_mode: common.counter_mode,
+        select_endpoint: common.select_endpoint,
         duration: common.duration,
         out,
         max_events: common.max_events,
@@ -1576,6 +1610,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         hooks: common.hooks,
         metrics,
         counter_mode: common.counter_mode,
+        select_endpoint: common.select_endpoint,
         duration: common.duration,
         out,
         max_events: common.max_events,
@@ -3539,6 +3574,258 @@ mod tests {
     }
 
     #[test]
+    fn select_endpoint_accepts_one_function_on_profile_and_run_metrics() {
+        // 6.15 CLI selection: one endpoint function name rides a
+        // metrics+counter capture; omission keeps legacy behavior.
+        for options in [
+            vec![
+                "profile",
+                "--pid",
+                "42",
+                "--mode",
+                "metrics",
+                "--counter-mode",
+                "counts",
+                "--select-endpoint",
+                "C_Sign",
+            ],
+            vec![
+                "profile",
+                "--select-endpoint",
+                "C_Sign",
+                "--counter-mode",
+                "latency",
+                "--mode",
+                "metrics",
+                "--pid",
+                "42",
+            ],
+        ] {
+            let Command::Profile(profile) = parse(args(&options)).unwrap_or_else(|error| {
+                panic!("profile metrics must accept --select-endpoint, {options:?}: {error:?}")
+            }) else {
+                panic!("endpoint selection must remain a profile capture");
+            };
+            assert_eq!(profile.kind, Kind::Profile);
+            assert!(profile.metrics);
+            assert!(profile.counter_mode.is_some());
+            assert_eq!(
+                profile.select_endpoint.as_ref().map(|name| name.as_str()),
+                Some("C_Sign")
+            );
+        }
+        // The child owns everything after `--`: its flags and bytes are
+        // never consumed as an endpoint selection.
+        let child = ["--select-endpoint", "C_Verify"];
+        let argv: Vec<String> = ["run", "--mode", "metrics", "--counter-mode", "timestamps"]
+            .into_iter()
+            .map(str::to_string)
+            .chain(["--".to_string(), "/bin/echo".to_string()])
+            .chain(child.iter().map(|word| word.to_string()))
+            .collect();
+        let Command::Run(run) = parse(argv).unwrap_or_else(|error| {
+            panic!("run metrics must accept a child carrying the flag bytes: {error:?}")
+        }) else {
+            panic!("endpoint selection must retain the owned run surface");
+        };
+        assert_eq!(run.select_endpoint, None);
+        assert_eq!(
+            run.command,
+            [
+                OsString::from("/bin/echo"),
+                OsString::from("--select-endpoint"),
+                OsString::from("C_Verify")
+            ]
+        );
+
+        let argv = vec![
+            "run",
+            "--mode",
+            "metrics",
+            "--counter-mode",
+            "latency",
+            "--select-endpoint",
+            "C_Encrypt",
+            "--",
+            "/bin/true",
+        ];
+        let Command::Run(run) = parse(args(&argv)).unwrap_or_else(|error| {
+            panic!("run metrics must accept --select-endpoint, {argv:?}: {error:?}")
+        }) else {
+            panic!("endpoint selection must retain the owned run surface");
+        };
+        assert_eq!(run.kind, Kind::Profile);
+        assert!(run.metrics);
+        assert_eq!(
+            run.select_endpoint.as_ref().map(|name| name.as_str()),
+            Some("C_Encrypt")
+        );
+        // Omission keeps the legacy path: no selection rides along.
+        let Command::Profile(legacy) = parse(args(&[
+            "profile",
+            "--pid",
+            "42",
+            "--mode",
+            "metrics",
+            "--counter-mode",
+            "counts",
+        ]))
+        .unwrap() else {
+            panic!("expected legacy profile surface");
+        };
+        assert_eq!(legacy.select_endpoint, None);
+    }
+
+    #[test]
+    fn select_endpoint_refuses_nonmetrics_repeats_and_bad_values() {
+        let refuses = |argv: &[&str], reasons: &[&str]| {
+            let error = parse(args(argv)).expect_err("endpoint selection must refuse");
+            let CliError::Usage { message, .. } = error else {
+                panic!("{argv:?}: expected usage refusal, got {error:?}");
+            };
+            for reason in reasons {
+                assert!(
+                    message.contains(reason),
+                    "{argv:?}: refusal must explain {reason:?}, got {message:?}"
+                );
+            }
+        };
+        // Without metrics+counter selection the flag has no broad to detail.
+        for argv in [
+            vec!["profile", "--pid", "42", "--select-endpoint", "C_Sign"],
+            vec![
+                "profile",
+                "--pid",
+                "42",
+                "--mode",
+                "profile",
+                "--select-endpoint",
+                "C_Sign",
+            ],
+            vec![
+                "profile",
+                "--pid",
+                "42",
+                "--mode",
+                "metrics",
+                "--select-endpoint",
+                "C_Sign",
+            ],
+            vec!["trace", "--pid", "42", "--select-endpoint", "C_Sign"],
+            vec![
+                "run",
+                "--trace",
+                "--select-endpoint",
+                "C_Sign",
+                "--",
+                "/bin/true",
+            ],
+            vec!["run", "--select-endpoint", "C_Sign", "--", "/bin/true"],
+        ] {
+            refuses(&argv, &["--select-endpoint", "--counter-mode", "metrics"]);
+        }
+        // A counter-mode trace still refuses: selection details a metrics broad.
+        refuses(
+            &[
+                "run",
+                "--trace",
+                "--mode",
+                "metrics",
+                "--counter-mode",
+                "counts",
+                "--select-endpoint",
+                "C_Sign",
+                "--",
+                "/bin/true",
+            ],
+            &["--counter-mode", "metrics"],
+        );
+        // Scalar like the rest: repeats, empties and missing values refuse.
+        refuses(
+            &[
+                "profile",
+                "--pid",
+                "42",
+                "--mode",
+                "metrics",
+                "--counter-mode",
+                "counts",
+                "--select-endpoint",
+                "C_Sign",
+                "--select-endpoint",
+                "C_Verify",
+            ],
+            &["--select-endpoint", "twice"],
+        );
+        refuses(
+            &[
+                "run",
+                "--mode",
+                "metrics",
+                "--counter-mode",
+                "counts",
+                "--select-endpoint",
+                "C_Sign",
+                "--select-endpoint",
+                "C_Sign",
+                "--",
+                "/bin/true",
+            ],
+            &["--select-endpoint", "twice"],
+        );
+        refuses(
+            &[
+                "profile",
+                "--pid",
+                "42",
+                "--mode",
+                "metrics",
+                "--counter-mode",
+                "counts",
+                "--select-endpoint",
+                "",
+            ],
+            &["--select-endpoint", "invalid"],
+        );
+        refuses(
+            &[
+                "profile",
+                "--pid",
+                "42",
+                "--mode",
+                "metrics",
+                "--counter-mode",
+                "counts",
+                "--select-endpoint",
+            ],
+            &["--select-endpoint", "value"],
+        );
+        // Inventory owns no counter broad: the flag is not its option.
+        refuses(
+            &["inventory", "--pid", "42", "--select-endpoint", "C_Sign"],
+            &["--select-endpoint"],
+        );
+    }
+
+    #[test]
+    fn select_endpoint_is_documented_on_profile_and_run_help() {
+        for (topic, help) in [
+            ("global", USAGE),
+            ("profile", PROFILE_HELP),
+            ("run", RUN_HELP),
+        ] {
+            assert!(
+                help.contains("--select-endpoint"),
+                "{topic} help must document the endpoint-selection flag"
+            );
+        }
+        assert!(
+            !TRACE_HELP.contains("--select-endpoint"),
+            "trace streams raw events and must not offer endpoint selection"
+        );
+    }
+
+    #[test]
     fn attach_backend_flag_selects_the_static_backend_on_every_capture_surface() {
         let Command::Profile(a) = parse(args(&[
             "profile",
@@ -3876,14 +4163,14 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        // 8267 / 0x8b8a01b0f89d22de (I-12 614b port re-application over
-        // I-10/I-11): USAGE diff vs the 7804/0x48e2 pin is exactly the
-        // `--track-short-lived` synopsis insertions (2 sites) + the
-        // 5-line extensive-mode flag paragraph; no other drift. Pair
-        // measured by this test (old pair reproduced as `right` by the
-        // same extractor before the update).
-        assert_eq!(USAGE.len(), 8267);
-        assert_eq!(hash, 0x8b8a01b0f89d22de);
+        // 8794 / 0x8aded99b248a97ce (6.15 CLI selection): USAGE diff
+        // vs the 8267/0x8b8a pin is exactly the `--select-endpoint`
+        // synopsis insertions (2 sites) + the 4-line selection flag
+        // paragraph; no other drift. Pair measured by this test (old
+        // pair reproduced as `right` by the same extractor before the
+        // update).
+        assert_eq!(USAGE.len(), 8794);
+        assert_eq!(hash, 0x8aded99b248a97ce);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

@@ -37,7 +37,13 @@ release commitment is made.
 mode-specific load and memory limits. Latency banks grow with the host possible-CPU count
 and refuse with `counter-memory-limit` past the per-capture kernel-map
 memory cap on hosts with many CPUs. Omit `--counter-mode` to keep
-existing metrics behavior.
+existing metrics behavior. `--select-endpoint <FUNCTION>` beside
+`--mode metrics` with `--counter-mode` names one endpoint for full
+detail while aggregate counters continue; the name must resolve to
+exactly one broad slot, otherwise the selection refuses by name and
+the capture continues aggregate-only. The attempt is recorded in the
+report's additive `selected_detail` ledger; aggregate and detail
+counts are never summed.
 
 - [What it does](#what-it-does)
 - [What it does NOT intentionally decode](#what-it-does-not-intentionally-decode)
@@ -777,6 +783,17 @@ Limits that matter in pods:
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one
   aggregate document.
+- `--select-endpoint <FUNCTION>` — `profile` or `run` with `--mode metrics`
+  and `--counter-mode` only: name one endpoint function (for example
+  `C_Sign`) for full detail while aggregate counters continue. The name
+  resolves against the live broad plan: zero matches refuse as unknown,
+  two or more refuse as ambiguous (narrow providers with `--module`),
+  never first-match. Only `--pid` and owned-`run` scopes resolve to one
+  original; `--cgroup` and `--system` refuse by name. The selection
+  attempt — resolved slot or named refusal — is recorded in the
+  report's additive `selected_detail` evidence object; unrelated
+  endpoints stay aggregate-only, and aggregate and detail counts are
+  never summed.
 - `--track-short-lived` — profile and `run` (default off): extensive
   mode. The kernel records the exec-time executable identity (device +
   inode, no path, argv, or environment) in EXEC records, and each novel

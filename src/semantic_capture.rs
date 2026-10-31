@@ -1594,6 +1594,16 @@ impl SemanticCapture {
     pub(crate) fn router(&self) -> &InstanceRouter {
         &self.router
     }
+    /// Test-only drain reach for the live twins: production `accept_scan`
+    /// already consumes this queue into every TickReport, so live twins
+    /// assert the positive disclosure from the report and use this only to
+    /// pin queue-level negative/terminal emptiness.
+    #[cfg(test)]
+    pub(crate) fn take_reload_not_excluded_for_test(
+        &mut self,
+    ) -> Vec<crate::discovery::instances::ReloadNotExcluded> {
+        self.router.take_reload_not_excluded()
+    }
     pub(crate) fn continuity_cuts(&self) -> u64 {
         self.continuity_cuts
     }

@@ -7900,6 +7900,136 @@ fn lifecycle_manifest_helper_entrypoint() {
     std::fs::write(output, serde_json::to_vec(&manifest).unwrap()).unwrap();
 }
 
+/// CPU time (user + system, in clock ticks) one process has consumed, or
+/// `None` when its `/proc` stat cannot be read or parsed.
+fn manifest_helper_cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field is parenthesized and may contain spaces; every field
+    // after the final ')' is positional from overall field 3 (state), so
+    // utime/stime (fields 14/15) sit at indexes 11/12 of the remainder.
+    let after_comm = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    utime.checked_add(stime)
+}
+
+fn manifest_helper_cpu_cap_ticks(cpu_seconds: u64) -> u64 {
+    // SAFETY: sysconf with a valid name returns the tick rate or -1.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let ticks = u64::try_from(ticks).unwrap_or(100).max(1);
+    cpu_seconds.saturating_mul(ticks)
+}
+
+/// Wait for the manifest helper behind `pidfd` to exit. The bound is a
+/// progress witness, not a wall clock: the helper does bounded offline
+/// work, but on a contended host it can be starved of CPU and paging for
+/// long wall-clock stretches while still advancing. The wait fails only
+/// when the helper consumes no CPU for a whole `stall_limit`, or when it
+/// burns more than `cpu_tick_cap` ticks without finishing (a busy hang).
+fn wait_manifest_helper_exit(
+    pidfd: &std::os::fd::OwnedFd,
+    pid: u32,
+    stall_limit: std::time::Duration,
+    cpu_tick_cap: u64,
+) -> bool {
+    use std::os::fd::AsRawFd as _;
+    let slice = std::time::Duration::from_millis(250);
+    let first_cpu = manifest_helper_cpu_ticks(pid);
+    let mut last_cpu = first_cpu;
+    let mut stalled_since = std::time::Instant::now();
+    loop {
+        match system_scope_poll_fd(pidfd.as_raw_fd(), slice) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+        let cpu = manifest_helper_cpu_ticks(pid);
+        if cpu != last_cpu {
+            last_cpu = cpu;
+            stalled_since = std::time::Instant::now();
+        }
+        if let (Some(cpu), Some(first)) = (cpu, first_cpu)
+            && cpu.saturating_sub(first) > cpu_tick_cap
+        {
+            return false;
+        }
+        if stalled_since.elapsed() >= stall_limit {
+            return false;
+        }
+    }
+}
+
+#[test]
+fn manifest_helper_wait_fails_a_stalled_child() {
+    let mut guard = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn the stalled child"),
+    );
+    let pidfd = DiscoveryLifecycleFixture::child_pidfd(&guard);
+    let started = std::time::Instant::now();
+    assert!(
+        !wait_manifest_helper_exit(
+            &pidfd,
+            guard.pid(),
+            std::time::Duration::from_millis(300),
+            u64::MAX,
+        ),
+        "a child making no CPU progress must fail the stall bound"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the stall bound fires long before the child would exit"
+    );
+    guard.reap().unwrap();
+}
+
+#[test]
+fn manifest_helper_wait_accepts_a_progressing_child_past_the_stall_limit() {
+    let mut guard = SystemScopeChildGuard::new(
+        std::process::Command::new("sh")
+            .args(["-c", "i=0; while [ $i -lt 3000000 ]; do i=$((i + 1)); done"])
+            .spawn()
+            .expect("spawn the progressing child"),
+    );
+    let pidfd = DiscoveryLifecycleFixture::child_pidfd(&guard);
+    let started = std::time::Instant::now();
+    assert!(
+        wait_manifest_helper_exit(
+            &pidfd,
+            guard.pid(),
+            std::time::Duration::from_millis(300),
+            u64::MAX,
+        ),
+        "a child burning CPU toward exit must outlive the stall limit"
+    );
+    assert!(
+        started.elapsed() > std::time::Duration::from_millis(300),
+        "the progressing child really outlived the stall limit"
+    );
+    let status = guard.child.wait().expect("reap the progressing child");
+    guard.live = false;
+    assert!(status.success());
+}
+
+#[test]
+fn manifest_helper_wait_caps_total_cpu() {
+    let mut guard = SystemScopeChildGuard::new(
+        std::process::Command::new("sh")
+            .args(["-c", "i=0; while [ $i -lt 3000000 ]; do i=$((i + 1)); done"])
+            .spawn()
+            .expect("spawn the busy child"),
+    );
+    let pidfd = DiscoveryLifecycleFixture::child_pidfd(&guard);
+    assert!(
+        !wait_manifest_helper_exit(&pidfd, guard.pid(), std::time::Duration::from_secs(60), 1,),
+        "a busy hang must stop at the CPU cap, not progress forever"
+    );
+    guard.reap().unwrap();
+}
+
 impl DiscoveryLifecycleFixture {
     fn child_pidfd(child: &SystemScopeChildGuard) -> std::os::fd::OwnedFd {
         use std::os::fd::FromRawFd as _;
@@ -7916,8 +8046,6 @@ impl DiscoveryLifecycleFixture {
     }
 
     fn acquire_manifest(provider: &Path, manifest: &Path, log: &Path) {
-        use std::os::fd::AsRawFd as _;
-
         let output = std::fs::File::create(log).unwrap();
         let mut helper = SystemScopeChildGuard::new(
             std::process::Command::new(std::env::current_exe().unwrap())
@@ -7937,9 +8065,21 @@ impl DiscoveryLifecycleFixture {
                 .expect("exec an isolated offline manifest helper"),
         );
         let pidfd = Self::child_pidfd(&helper);
+        let helper_pid = helper.child.id();
         assert!(
-            system_scope_poll_fd(pidfd.as_raw_fd(), std::time::Duration::from_secs(60)).unwrap(),
-            "manifest helper must finish within its owned-process deadline"
+            wait_manifest_helper_exit(
+                &pidfd,
+                helper_pid,
+                std::time::Duration::from_secs(60),
+                manifest_helper_cpu_cap_ticks(60),
+            ),
+            "manifest helper must finish within its owned-process deadline: \
+             pid={helper_pid} cpu_ticks={:?} loadavg={} log:\n{}",
+            manifest_helper_cpu_ticks(helper_pid),
+            std::fs::read_to_string("/proc/loadavg")
+                .unwrap_or_default()
+                .trim(),
+            std::fs::read_to_string(log).unwrap_or_default()
         );
         let status = helper.child.wait().expect("reap the exact manifest helper");
         helper.live = false;
@@ -9570,6 +9710,18 @@ impl LoadedSeedProvider {
         self.peers.push(child);
         wait_loaded_seed_peer(self.peers.last_mut().unwrap(), &runner, &library, |_| {});
         pid
+    }
+
+    fn respawn_peer(&mut self, pid: u32) -> u32 {
+        let position = self
+            .peers
+            .iter()
+            .position(|child| child.id() == pid)
+            .unwrap_or_else(|| panic!("respawn target {pid} is not a fixture peer"));
+        let mut child = self.peers.remove(position);
+        let _ = child.kill();
+        let _ = child.wait();
+        self.spawn_peer()
     }
 }
 
@@ -37174,6 +37326,169 @@ fn wait_peer_mapped(pid: u32, soname: &str) {
     }
 }
 
+/// Normalized `/proc/<pid>/maps` census of one seed peer: one
+/// `(permissions, path, path length)` entry per maps line, sorted.
+/// Addresses and fixture tempdir names are ignored (file paths reduce to
+/// their final component); every line counts, because a deep scan charges
+/// work per maps line in several places, so two peers whose censuses
+/// differ by one line cannot charge identical scan work.
+type PeerMapsCensus = Vec<(String, String, usize)>;
+
+fn maps_census_of_text(maps: &str) -> PeerMapsCensus {
+    let mut census: PeerMapsCensus = maps
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let _address = fields.next();
+            let permissions = fields.next().unwrap_or_default().to_string();
+            let _offset = fields.next();
+            let _device = fields.next();
+            let _inode = fields.next();
+            let raw_path = fields.collect::<Vec<_>>().join(" ");
+            let normalized = if raw_path.starts_with('/') {
+                raw_path.rsplit('/').next().unwrap_or(&raw_path).to_string()
+            } else {
+                raw_path.clone()
+            };
+            (permissions, normalized, raw_path.len())
+        })
+        .collect();
+    census.sort();
+    census
+}
+
+fn peer_maps_census(pid: u32) -> PeerMapsCensus {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+        .unwrap_or_else(|_| panic!("owned peer {pid} must stay alive"));
+    maps_census_of_text(&maps)
+}
+
+/// Respawn fixture peers until every peer's maps census equals the target
+/// census (`expected`, or the first peer's census when none is given), and
+/// return that census. Peers are only replaced before any view is opened
+/// on them. The settle wait in `spawn_peer` proves a peer's maps hold
+/// still; it does not prove two peers settled on the same census, because
+/// the loader occasionally merges one anonymous mapping in one peer.
+fn align_peer_census(
+    fixture: &mut LoadedSeedProvider,
+    peers: &mut [u32],
+    expected: Option<&PeerMapsCensus>,
+) -> PeerMapsCensus {
+    assert!(!peers.is_empty(), "census alignment needs a peer");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut target: Option<PeerMapsCensus> = expected.cloned();
+    // Censuses produced by peers that missed a freely chosen target,
+    // counted as they are observed. If one alternative keeps recurring,
+    // the anchor peer is the odd one out and the target re-anchors to it
+    // instead of respawning every other peer looking for a rare census.
+    let mut misses: BTreeMap<PeerMapsCensus, usize> = BTreeMap::new();
+    loop {
+        let censuses: Vec<PeerMapsCensus> =
+            peers.iter().map(|pid| peer_maps_census(*pid)).collect();
+        let target = target.get_or_insert_with(|| censuses[0].clone());
+        if censuses.iter().all(|census| census == target) {
+            return target.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "peer maps censuses never aligned to {target:?}: {censuses:?}"
+        );
+        if expected.is_none()
+            && let Some((alternative, count)) = misses
+                .iter()
+                .filter(|(census, _)| *census != target)
+                .max_by_key(|(_, count)| *count)
+            && *count >= 4
+        {
+            let alternative = alternative.clone();
+            target.clone_from(&alternative);
+            continue;
+        }
+        let mismatched = censuses
+            .iter()
+            .position(|census| census != target)
+            .expect("a mismatch was just observed");
+        if expected.is_none() {
+            *misses.entry(censuses[mismatched].clone()).or_default() += 1;
+        }
+        let target = target.clone();
+        peers[mismatched] = fixture.respawn_peer(peers[mismatched]);
+        if expected.is_none() {
+            let fresh = peer_maps_census(peers[mismatched]);
+            if fresh != target {
+                *misses.entry(fresh).or_default() += 1;
+            }
+        }
+    }
+}
+
+#[test]
+fn peer_maps_census_normalizes_addresses_but_counts_every_line() {
+    let one = "00001000-00002000 r-xp 00001000 00:23 10 /var/tmp/aaaa/seed-provider.so\n\
+               00002000-00003000 rw-p 00000000 00:00 0\n\
+               00003000-00004000 rw-p 00000000 00:00 0 [heap]\n";
+    let same = "0000a000-0000b000 r-xp 00001000 00:23 99 /var/tmp/bbbb/seed-provider.so\n\
+                0000c000-0000d000 rw-p 00000000 00:00 0\n\
+                0000e000-0000f000 rw-p 00000000 00:00 0 [heap]\n";
+    assert_eq!(
+        maps_census_of_text(one),
+        maps_census_of_text(same),
+        "addresses, inodes and tempdir names do not charge scan work"
+    );
+    let one_more_line = format!("{one}00005000-00006000 rw-p 00000000 00:00 0\n");
+    assert_ne!(
+        maps_census_of_text(one),
+        maps_census_of_text(&one_more_line),
+        "one more maps line charges scan work and must change the census"
+    );
+    let longer_path = one.replace("aaaa", "aaaaa");
+    assert_ne!(
+        maps_census_of_text(one),
+        maps_census_of_text(&longer_path),
+        "dependency validation charges per path byte"
+    );
+}
+
+#[test]
+fn peer_census_alignment_respawns_a_mismatched_peer() {
+    let (mut fixture, _view, _module, _pins) = loaded_seed_provider();
+    let good = fixture.spawn_peer();
+    let expected = peer_maps_census(good);
+    // A foreign owned child is a peer with a proven different census.
+    let alien = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn the mismatched peer");
+    let alien_pid = alien.id();
+    fixture.peers.push(alien);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_link(format!("/proc/{alien_pid}/exe"))
+        .is_ok_and(|exe| exe.ends_with("sleep"))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mismatched peer {alien_pid} never exec'd sleep"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_ne!(
+        peer_maps_census(alien_pid),
+        expected,
+        "the injected peer must start mismatched"
+    );
+    let mut peers = [good, alien_pid];
+    let aligned = align_peer_census(&mut fixture, &mut peers, Some(&expected));
+    assert_eq!(aligned, expected);
+    assert_eq!(peers[0], good, "the matching peer is left alone");
+    assert_ne!(peers[1], alien_pid, "the mismatched peer was respawned");
+    assert_eq!(peer_maps_census(peers[1]), expected);
+    // Healthy control: aligning an already aligned pair respawns nothing.
+    let settled = peers;
+    let again = align_peer_census(&mut fixture, &mut peers, Some(&expected));
+    assert_eq!(again, expected);
+    assert_eq!(peers, settled, "aligned peers are never respawned");
+}
+
 /// H5 positive: a fresh EXEC head parked at a full request map waits while
 /// the service pass completes a live retained-provider refresh — a real
 /// rescan, loader rearm and provider publication — then dispatches into the
@@ -37193,6 +37508,9 @@ fn pressure_services_unprotected_request_before_original_head() {
     oracle.frame_work_budget_ns = u64::MAX;
     let oracle_pid = oracle.views[0].pid();
     let mut oracle_peers: Vec<u32> = (0..2).map(|_| oracle_fixture.spawn_peer()).collect();
+    // Exact work equality needs identical maps censuses: a deep scan
+    // charges per maps line, and settled peers can differ by one line.
+    let oracle_census = align_peer_census(&mut oracle_fixture, &mut oracle_peers, None);
     oracle_peers.sort_unstable();
     let (oracle_decoy, oracle_peer) = (oracle_peers[0], oracle_peers[1]);
     for (index, peer) in oracle_peers.iter().enumerate() {
@@ -37328,6 +37646,11 @@ fn pressure_services_unprotected_request_before_original_head() {
     engine.frame_work_budget_ns = u64::MAX;
     let pid = engine.views[0].pid();
     let mut peers: Vec<u32> = (0..2).map(|_| fixture.spawn_peer()).collect();
+    assert_eq!(
+        align_peer_census(&mut fixture, &mut peers, Some(&oracle_census)),
+        oracle_census,
+        "both engines measure peers with the oracle maps census"
+    );
     peers.sort_unstable();
     for peer in &peers {
         wait_peer_mapped(*peer, "seed-provider.so");

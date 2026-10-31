@@ -124,21 +124,31 @@ u32 p11_journal_settle_prepare(const struct owner_start_key *key, u32 reason,
 u32 p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_committed);
 
 /* Whether one header describes an exact version/kind/length/flag
- * combination over a nonzero identity. Mirrors the Rust validators;
- * the fixture cross-checks every combination both sides accept. */
+ * combination over its required identity. Mirrors the Rust validators
+ * (`validate_begin`/`validate_end`/`validate_abandon`): BEGIN and
+ * ABANDON keep a nonzero identity, while an UNJOURNALED END carries a
+ * zero identity and every other END a nonzero one. The parity fixture
+ * cross-checks every combination of the union both sides accept. */
 static __always_inline int journal_header_valid(u64 bytes, u64 kind, u64 flags, u64 reserved,
                                                 u64 thread, u64 sequence)
 {
-    if (!thread || !sequence || reserved)
+    if (reserved)
         return 0;
     switch (kind) {
     case JOURNAL_KIND_BEGIN:
-        return bytes == JOURNAL_BEGIN_BYTES && (flags == 0 || flags == JOURNAL_FLAG_NO_END);
+        return thread && sequence && bytes == JOURNAL_BEGIN_BYTES &&
+            (flags == 0 || flags == JOURNAL_FLAG_NO_END);
     case JOURNAL_KIND_END:
-        return (bytes == JOURNAL_END_FULL_BYTES || bytes == JOURNAL_END_COMPACT_BYTES) &&
-            (flags == 0 || flags == JOURNAL_FLAG_ABSENT_TAIL);
+        if (bytes != JOURNAL_END_FULL_BYTES && bytes != JOURNAL_END_COMPACT_BYTES)
+            return 0;
+        if (flags == 0 || flags == JOURNAL_FLAG_ABSENT_TAIL)
+            return thread && sequence;
+        if (flags == JOURNAL_FLAG_UNJOURNALED ||
+            flags == (JOURNAL_FLAG_ABSENT_TAIL | JOURNAL_FLAG_UNJOURNALED))
+            return !thread && !sequence;
+        return 0;
     case JOURNAL_KIND_ABANDON:
-        return bytes == JOURNAL_ABANDON_BYTES && flags == 0;
+        return thread && sequence && bytes == JOURNAL_ABANDON_BYTES && flags == 0;
     default:
         return 0;
     }

@@ -119,9 +119,31 @@ pub(crate) fn completion_reason(words: &ReturnWords) -> u32 {
     }
 }
 
+/// Checked END flag conversion: only the finite Rust-validated END bits
+/// survive into the header byte. Any unknown bit — including any bit at
+/// or above 0x100 from a future native leaf — refuses instead of
+/// truncating, so the writer can only emit validatable headers.
+#[inline(always)]
+fn end_flags_byte(flags: u32, absent_tail: bool) -> Option<u8> {
+    if flags & !(u32::from(JOURNAL_END_TAIL_ABSENT | JOURNAL_END_UNJOURNALED)) != 0 {
+        return None;
+    }
+    let narrowed = u8::try_from(flags).ok()?;
+    Some(
+        narrowed
+            | if absent_tail {
+                JOURNAL_END_TAIL_ABSENT
+            } else {
+                0
+            },
+    )
+}
+
 /// Initialize the exact header in reserved storage. Native returning supplies
 /// both identity words and its finite flags, including zero UNJOURNALED words.
-/// No PID/current-owner value can substitute for them.
+/// No PID/current-owner value can substitute for them. Returns false without
+/// writing any byte when the flag conversion refuses; the caller must treat
+/// the reservation as uninitialized and refuse the record.
 ///
 /// # Safety
 /// `record` is an aligned, exclusively owned 632-byte reservation; `words`
@@ -131,19 +153,15 @@ pub(crate) unsafe fn initialize_end(
     record: *mut JournalEndFull,
     words: &ReturnWords,
     absent_tail: bool,
-) {
+) -> bool {
+    let Some(flags) = end_flags_byte(words.flags, absent_tail) else {
+        return false;
+    };
     unsafe {
         core::ptr::addr_of_mut!((*record).header.version).write(JOURNAL_VERSION);
         core::ptr::addr_of_mut!((*record).header.length).write(JOURNAL_END_FULL_BYTES as u16);
         core::ptr::addr_of_mut!((*record).header.kind).write(JOURNAL_KIND_END);
-        core::ptr::addr_of_mut!((*record).header.flags).write(
-            words.flags as u8
-                | if absent_tail {
-                    JOURNAL_END_TAIL_ABSENT
-                } else {
-                    0
-                },
-        );
+        core::ptr::addr_of_mut!((*record).header.flags).write(flags);
         core::ptr::addr_of_mut!((*record).header.reserved).write(0);
         core::ptr::addr_of_mut!((*record).header.thread).write(words.thread);
         core::ptr::addr_of_mut!((*record).header.sequence).write(words.sequence);
@@ -160,6 +178,7 @@ pub(crate) unsafe fn initialize_end(
             );
         }
     }
+    true
 }
 
 #[cfg(target_arch = "bpf")]
@@ -277,11 +296,14 @@ pub(super) mod program {
         record: *mut JournalEndFull,
         key: &StartKey,
         absent: bool,
-    ) -> u32 {
+    ) -> Option<u32> {
         let mut words = ReturnWords::default();
         unsafe { p11_journal_returning(key, &mut words) };
-        unsafe { initialize_end(record, &words, absent) };
-        completion_reason(&words)
+        if unsafe { initialize_end(record, &words, absent) } {
+            Some(completion_reason(&words))
+        } else {
+            None
+        }
     }
 
     #[inline(never)]
@@ -350,7 +372,19 @@ pub(super) mod program {
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             return 0;
         }
-        let reason = unsafe { complete(record, &key, true) };
+        let Some(reason) = (unsafe { complete(record, &key, true) }) else {
+            // The flag conversion refused: the reservation holds no
+            // header, so it can never submit. Retire the call like a
+            // lost result, then gap, mirroring the reserve-failure arm.
+            if remove(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST) != 0 {
+                unsafe { p11_object_fault() };
+                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            }
+            entry.discard(0);
+            gap();
+            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            return 0;
+        };
         if remove(&key, true, reason) != 0 {
             unsafe { p11_object_fault() };
             entry.discard(0);

@@ -4728,7 +4728,24 @@ fn object_return<const JOURNAL: bool, Record: ReturnPayload>(
     let reason = JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
     #[cfg(p11scope_journal_roots)]
     let reason = if JOURNAL && emitted {
-        unsafe { journal_roots::program::complete(reservation.cast(), &key, false) }
+        let Some(reason) =
+            (unsafe { journal_roots::program::complete(reservation.cast(), &key, false) })
+        else {
+            // The flag conversion refused: the reservation holds no
+            // header, so it can never submit. Retire the call like a
+            // lost result, then gap, mirroring the reserve-failure arm.
+            if start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)
+                .is_err()
+            {
+                unsafe { p11_object_fault() };
+                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            }
+            entry.discard(0);
+            journal_roots::program::gap();
+            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            return 0;
+        };
+        reason
     } else {
         reason
     };

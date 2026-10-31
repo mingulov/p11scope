@@ -378,12 +378,12 @@ impl ExtensiveState {
     }
 
     /// Row A: seed one pending exe identity from an EXEC record. The
-    /// stash is never bare-PID addressed: seeding requires the nonzero
+    /// stash is never bare-PID addressed: seeding requires the bounded
     /// producer ticket, and consumption requires the stash timestamp to
     /// precede the exit timestamp. A re-exec overwrites (latest wins);
     /// a full stash evicts the smallest PID first (deterministic).
     pub(crate) fn note_exec_record(&mut self, record: &DiscoveryRecord) {
-        if !self.enabled || record.binding_id == 0 {
+        if !self.enabled || record.exec_task_ticket().is_none() {
             return;
         }
         let pid = (record.pid_tgid >> 32) as u32;

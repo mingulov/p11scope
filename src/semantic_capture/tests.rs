@@ -6592,15 +6592,37 @@ mod b17_capture_disclosure {
         let second = scan(&mut capture, &mut io, endpoint, 2, 1);
         assert_eq!(second.observations, vec![ObserveOutcome::Continued]);
         assert_eq!(joined(route(&mut capture, 2, 2, 1)), id);
+        assert_eq!(
+            second.reload_not_excluded.len(),
+            1,
+            "one identity disclosed"
+        );
+        assert_eq!(
+            second.reload_not_excluded[0].label, RELOAD_NOT_EXCLUDED_LABEL,
+            "the frozen finite label"
+        );
+        assert_eq!(
+            second.reload_not_excluded[0].label,
+            "instance_reload_not_excluded"
+        );
+        assert_eq!(second.reload_not_excluded[0].image, image());
+        assert_eq!(second.reload_not_excluded[0].file_slot, endpoint.file_slot);
+        assert_eq!(second.reload_not_excluded[0].ids, vec![id]);
+        assert_eq!(second.continued_across_global, 1);
+        assert_eq!(second.joined_across_global, 0);
         let evidence = format!("{:?}", second);
         assert!(
             evidence.contains("instance_reload_not_excluded"),
             "global-only continuation must disclose, got: {evidence}"
         );
         // A same-triple refresh over the tainted entry continues without
-        // re-yielding the disclosure.
+        // re-yielding the disclosure; the joined counter now shows the
+        // tainted join.
         let third = scan(&mut capture, &mut io, endpoint, 2, 1);
         assert_eq!(third.observations, vec![ObserveOutcome::Continued]);
+        assert!(third.reload_not_excluded.is_empty(), "no re-yield");
+        assert_eq!(third.continued_across_global, 1);
+        assert_eq!(third.joined_across_global, 1);
         let refresh = format!("{:?}", third);
         assert!(
             !refresh.contains("instance_reload_not_excluded"),
@@ -6617,6 +6639,9 @@ mod b17_capture_disclosure {
         let second = scan(&mut capture, &mut io, endpoint, 2, 0);
         assert_eq!(second.observations, vec![ObserveOutcome::Continued]);
         assert_eq!(joined(route(&mut capture, 2, 2, 0)), id);
+        assert!(second.reload_not_excluded.is_empty(), "nothing undecidable");
+        assert_eq!(second.continued_across_global, 0);
+        assert_eq!(second.joined_across_global, 0);
         let evidence = format!("{:?}", second);
         assert!(
             !evidence.contains("instance_reload_not_excluded"),

@@ -10,7 +10,7 @@ use crate::discovery::caller_registry::now_ns;
 use crate::discovery::identity::{PinnedObjectId, RetainedInventoryTarget};
 use crate::discovery::instances::{
     CallFacts, EntryIp, InstanceId, InstanceRouter, MAX_INSTANCES, MAX_PENDING, ObserveOutcome,
-    Route, RouterLimits, UnknownReason,
+    RELOAD_NOT_EXCLUDED_LABEL, Route, RouterLimits, UnknownReason,
 };
 use crate::events::{DecodedEventRecord, DiscoveryItem};
 use crate::process::{PidPin, process_start_time};
@@ -852,6 +852,17 @@ impl TickOutcome {
         }
     }
 }
+
+/// One B17 reload-not-excluded disclosure in the semantic-capture report:
+/// the finite label plus the affected identity, pushed once per identity
+/// on its first tainted continuation. No epochs, ranges or addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReloadNotExcludedReport {
+    pub(crate) label: &'static str,
+    pub(crate) image: ImageIdentity,
+    pub(crate) file_slot: u32,
+    pub(crate) ids: Vec<InstanceId>,
+}
 #[derive(Default, Debug)]
 pub(crate) struct TickReport {
     outcomes: Vec<TickOutcome>,
@@ -860,6 +871,15 @@ pub(crate) struct TickReport {
     pub(crate) scans: usize,
     pub(crate) observations: Vec<ObserveOutcome>,
     pub(crate) scan_refusals: Vec<ImageQueryRefusal>,
+    /// B17 W1 disclosures drained from the router beside the observation
+    /// losses: one entry per newly tainted identity, drained once.
+    pub(crate) reload_not_excluded: Vec<ReloadNotExcludedReport>,
+    /// B17 W1 router totals at drain time: observations that took the
+    /// global-only continuation arm, and calls that joined through a
+    /// tainted entry. Capture-monotonic and saturating, like the
+    /// router counters they snapshot.
+    pub(crate) continued_across_global: u64,
+    pub(crate) joined_across_global: u64,
     /// Guard signals for the Joint no-progress tripwire: scans attempted
     /// for awaited keys this tick (joined-refresh scans excluded), whether
     /// any job for an awaited key still has a future deadline, and whether
@@ -2219,6 +2239,7 @@ impl SemanticCapture {
             || report.current.capacity() != 0
             || report.observations.capacity() != 0
             || report.scan_refusals.capacity() != 0
+            || report.reload_not_excluded.capacity() != 0
             || report.allocated_below != 0
             || report.awaiting_floor.is_some()
             || report.shed_floor.is_some()
@@ -2337,6 +2358,7 @@ impl SemanticCapture {
             || report.current.capacity() != 0
             || report.observations.capacity() != 0
             || report.scan_refusals.capacity() != 0
+            || report.reload_not_excluded.capacity() != 0
             || report.allocated_below != 0
             || report.awaiting_floor.is_some()
             || report.shed_floor.is_some()
@@ -2432,6 +2454,7 @@ impl SemanticCapture {
             || report.current.capacity() != 0
             || report.observations.capacity() != 0
             || report.scan_refusals.capacity() != 0
+            || report.reload_not_excluded.capacity() != 0
             || report.allocated_below != 0
             || report.awaiting_floor.is_some()
             || report.shed_floor.is_some()
@@ -3243,6 +3266,20 @@ impl SemanticCapture {
                 report,
             );
         }
+        // B17 W1: drain the newly tainted identities beside the losses.
+        // Draining reports the qualification; the router keeps its sticky
+        // taint and counters. Non-verdict: no outcome or decision changes.
+        for disclosure in self.router.take_reload_not_excluded() {
+            report.reload_not_excluded.push(ReloadNotExcludedReport {
+                label: RELOAD_NOT_EXCLUDED_LABEL,
+                image: disclosure.image,
+                file_slot: disclosure.file_slot,
+                ids: disclosure.ids,
+            });
+        }
+        let counters = self.router.counters();
+        report.continued_across_global = counters.continued_across_global;
+        report.joined_across_global = counters.joined_across_global;
         if outcome == ObserveOutcome::New && !prior_ids.is_empty() {
             self.invalidate(
                 InvalidationScope::InstancesRetired {

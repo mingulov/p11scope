@@ -781,8 +781,6 @@ pub(crate) struct ObservationLoss {
 /// instance whose global-only continuation cannot exclude a same-address
 /// reload between the scans. Finite label only; never epochs, ranges or
 /// addresses.
-#[cfg_attr(not(test), allow(dead_code))] // Staged for the integrator's
-// semantic-capture drain call + report publication; remove the allow with it.
 pub(crate) const RELOAD_NOT_EXCLUDED_LABEL: &str = "instance_reload_not_excluded";
 
 /// One identity newly qualified by a global-only continuation, drained by
@@ -790,8 +788,6 @@ pub(crate) const RELOAD_NOT_EXCLUDED_LABEL: &str = "instance_reload_not_excluded
 /// on its first tainted continuation — so the queue is bounded by the
 /// retained-history caps (each push names minted IDs, never re-pushed for
 /// the same IDs), never a side table.
-#[cfg_attr(not(test), allow(dead_code))] // Staged for the integrator's
-// semantic-capture drain call + report publication; remove the allow with it.
 pub(crate) struct ReloadNotExcluded {
     pub(crate) image: ImageIdentity,
     pub(crate) file_slot: u32,
@@ -948,8 +944,6 @@ impl InstanceRouter {
 
     /// Drains the identities newly qualified since the last drain. Draining
     /// reports the qualification; it never clears the sticky entry taint.
-    #[cfg_attr(not(test), allow(dead_code))] // Staged for the integrator's
-    // semantic-capture drain call + report publication; remove the allow with it.
     pub(crate) fn take_reload_not_excluded(&mut self) -> Vec<ReloadNotExcluded> {
         std::mem::take(&mut self.reload_not_excluded)
     }

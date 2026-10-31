@@ -785,6 +785,13 @@ def check_trace_output(text, *, expected):
 # --- Provisional L4 loader/image transition receipts. D2/T-L4b owns the
 # final public field names; when they land, ONLY the map below changes:
 # every L4 read goes through _l4_receipt. ---
+# Activation target (frozen before production wiring): G16 judges
+# `loader_transitions{arms, reclaims, retained_peak, refusals}` (300
+# arms, retained peak <= 8, zero refusals); G17 judges
+# `image_transitions{tickets_issued, bank_cuts, bank_refusals}`
+# (issuance crosses 16,384, exactly one bank cut, zero refusals) plus
+# one `invocation_receipt{id}`. No D2/T-L4b rename has landed; if those
+# owners rename first, only the map below changes.
 
 L4_RECEIPT_FIELD_MAP = {
     # Logical receipt name -> path of components under the capture

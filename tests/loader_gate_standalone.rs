@@ -60,6 +60,9 @@ fn compile_harness(source_file: &str, tag: &str, scenario: &str) -> (PathBuf, Pa
     if tag == "owner-gate" || tag == "tickets" {
         command.arg("-DP11SCOPE_LOADER_GATE");
     }
+    if tag == "gate-hook" {
+        command.arg("-DGATE_HOST_CAS_HOOK");
+    }
     let compile = command.output().expect("spawn host cc for the harness");
     assert!(
         compile.status.success(),
@@ -97,6 +100,12 @@ fn run_scenario(binary: &Path, scenario: &str, asserts: &[&str]) {
 
 fn drive_gate(scenario: &str, asserts: &[&str]) {
     let (work, binary) = compile_harness("loader_gate_harness.c", "gate", scenario);
+    run_scenario(&binary, scenario, asserts);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+fn drive_gate_hook(scenario: &str, asserts: &[&str]) {
+    let (work, binary) = compile_harness("loader_gate_harness.c", "gate-hook", scenario);
     run_scenario(&binary, scenario, asserts);
     let _ = std::fs::remove_dir_all(&work);
 }
@@ -317,6 +326,248 @@ fn loader_ticket_harness_ignores_exec_id() {
     );
 }
 
+/// L4b loader cells: arms count admits, retained charges live and
+/// retired-unacknowledged rows until the acknowledged reclaim, the peak
+/// is monotonic across retire/reclaim cycles.
+#[test]
+fn loader_gate_harness_l4b_counters() {
+    drive_gate(
+        "l4b-counters",
+        &[
+            "ASSERT arms_counted",
+            "ASSERT retained_tracks_live",
+            "ASSERT peak_tracks_max",
+            "ASSERT reclaims_counted",
+            "ASSERT peak_never_falls",
+        ],
+    );
+}
+
+/// Every counting cell saturates at U64_MAX and never wraps; the
+/// retained gauge floors at zero on a caller-fault retire.
+#[test]
+fn loader_gate_harness_counter_saturation() {
+    drive_gate(
+        "counter-saturation",
+        &[
+            "ASSERT admitted_never_wraps",
+            "ASSERT refusals_never_wrap",
+            "ASSERT reclaims_never_wrap",
+            "ASSERT retained_floor_holds",
+        ],
+    );
+}
+
+/// A retired row refuses until the native acknowledgement consumes the
+/// T-L3 flag; exactly one successor generation admits after.
+#[test]
+fn loader_gate_harness_native_ack() {
+    drive_gate(
+        "native-ack",
+        &[
+            "ASSERT retired_refuses_until_ack",
+            "ASSERT ack_pending_uncounted_post_cutover",
+            "ASSERT ack_empties_exact_row",
+            "ASSERT successor_admits_once",
+            "ASSERT row_gen_value",
+            "ASSERT latch_reads_latched",
+            "ASSERT ack_refusals_counted",
+        ],
+    );
+}
+
+/// G17-shaped cut: with B prepared, the 16,385th birth cuts to B
+/// exactly once; B quota refuses honestly with counted refusals.
+#[test]
+fn loader_ticket_harness_bank_cut_once() {
+    drive_tickets(
+        "bank-cut-once",
+        &[
+            "ASSERT cut_flips_to_b_once",
+            "ASSERT total_crosses_16384",
+            "ASSERT b_quota_honest",
+            "ASSERT bank_refusals_saturate",
+        ],
+    );
+}
+
+/// Retained routes: a pre-cut ticket still resolves from its bank
+/// after the cut, and A storage is undisturbed by B traffic.
+#[test]
+fn loader_ticket_harness_bank_query_routes() {
+    drive_tickets(
+        "bank-query-routes",
+        &[
+            "ASSERT pre_cut_ticket_retained",
+            "ASSERT post_cut_new_bank_b",
+            "ASSERT a_storage_undisturbed",
+        ],
+    );
+}
+
+/// Probe-hit transaction through the exact producer call sequence:
+/// healthy and pending hits keep refusals zero, genuine rejections
+/// count exactly once.
+#[test]
+fn loader_gate_harness_hit_transaction() {
+    drive_gate(
+        "hit-transaction",
+        &[
+            "ASSERT hit_admits_fresh",
+            "ASSERT hit_peer_resolves",
+            "ASSERT hit_pending_uncounted",
+            "ASSERT hit_reuse_admits_successor",
+            "ASSERT hit_refusals_exact",
+            "ASSERT hit_pre_cutover_admits",
+        ],
+    );
+}
+
+/// Stale floor: retired generations never resurrect, successors admit
+/// over the floor, the u32 wrap admits generation 1 over a max floor.
+#[test]
+fn loader_gate_harness_hit_stale_floor() {
+    drive_gate(
+        "hit-stale-floor",
+        &[
+            "ASSERT stale_refused_after_reclaim",
+            "ASSERT successor_admits_over_floor",
+            "ASSERT wrap_gen1_admits",
+            "ASSERT wrap_old_refuses",
+        ],
+    );
+}
+
+/// Eight threads race one token: all resolve, one admission counts.
+#[test]
+fn loader_gate_harness_hit_concurrent_same_token() {
+    drive_gate(
+        "hit-concurrent-same-token",
+        &[
+            "ASSERT same_token_all_resolve",
+            "ASSERT same_token_admitted_once",
+            "ASSERT same_token_no_refusals",
+        ],
+    );
+}
+
+/// Four threads race a successor generation: all resolve, one reclaim
+/// and one admission count.
+#[test]
+fn loader_gate_harness_hit_successor_race() {
+    drive_gate(
+        "hit-successor-race",
+        &[
+            "ASSERT successor_all_resolve",
+            "ASSERT successor_admitted_once",
+            "ASSERT successor_reclaim_once",
+            "ASSERT successor_no_refusals",
+        ],
+    );
+}
+
+/// Ordered admission/reclaim crossings: the peak equals the true
+/// maximum live count in both orders.
+#[test]
+fn loader_gate_harness_admission_reclaim_interleave() {
+    drive_gate(
+        "admission-reclaim-interleave",
+        &[
+            "ASSERT ordered_admit_then_ack_peak_two",
+            "ASSERT ordered_ack_then_admit_peak_one",
+        ],
+    );
+}
+
+/// Sixteen threads drive 64 slots through admit/retire/ack: every
+/// count settles exactly with no update loss.
+#[test]
+fn loader_gate_harness_gauge_contention() {
+    drive_gate(
+        "gauge-contention",
+        &[
+            "ASSERT contended_admit_all_resolve",
+            "ASSERT contended_peak_exact",
+            "ASSERT retired_stays_charged",
+            "ASSERT contended_reclaim_exact",
+        ],
+    );
+}
+
+/// Saturation under contention: operations take their verdicts while
+/// both cells stop exactly at the maximum.
+#[test]
+fn loader_gate_harness_saturation_contention() {
+    drive_gate(
+        "saturation-contention",
+        &[
+            "ASSERT saturated_admit_succeeds",
+            "ASSERT admitted_exact_max",
+            "ASSERT refusals_exact_max",
+        ],
+    );
+}
+
+/// Delayed acknowledgement: nine retired rows stay charged with zero
+/// live rows, then drain exactly through acknowledged reclaims.
+#[test]
+fn loader_gate_harness_delayed_ack_retained() {
+    drive_gate(
+        "delayed-ack-retained",
+        &[
+            "ASSERT retired_nine_charged",
+            "ASSERT peak_nine_despite_zero_armed",
+            "ASSERT reuse_pending_uncounted",
+            "ASSERT delayed_retained_drains",
+        ],
+    );
+}
+
+/// Quarantine: retired-never-armed rows stay charged beside live rows;
+/// fresh traffic resolves while quarantined reuse waits.
+#[test]
+fn loader_gate_harness_quarantine_retained() {
+    drive_gate(
+        "quarantine-retained",
+        &[
+            "ASSERT quarantine_nine_charged",
+            "ASSERT eighteen_retained_nine_armed",
+            "ASSERT quarantine_pending_forever",
+            "ASSERT fresh_unaffected",
+        ],
+    );
+}
+
+/// Forced CAS exhaustion: settled updates land through the fallback
+/// and every unsettled update reports through update_losses.
+#[test]
+fn loader_gate_harness_cas_exhaustion_counts() {
+    drive_gate_hook(
+        "cas-exhaustion-counts",
+        &[
+            "ASSERT fallback_settles_count",
+            "ASSERT skip_reports_loss",
+            "ASSERT peak_loss_reported",
+            "ASSERT drop_loss_reported",
+        ],
+    );
+}
+
+/// Selection validation: unpublished, corrupt or missing SELECT
+/// refuses new issues; cut validates its target and prepared bit.
+#[test]
+fn loader_ticket_harness_bank_select_validation() {
+    drive_tickets(
+        "bank-select-validation",
+        &[
+            "ASSERT unpublished_select_refuses",
+            "ASSERT missing_select_refuses",
+            "ASSERT cut_flips_once_ready",
+            "ASSERT bad_select_counted",
+        ],
+    );
+}
+
 /// The gate unit lowers to BPF bitcode warning-free under the exact BPF
 /// object flags, so the host-only unit can never rot. Host-only; emits
 /// LLVM bitcode to a temp dir, no BPF load, no attach.
@@ -365,4 +616,259 @@ fn loader_gate_unit_compiles_to_bpf_bitcode() {
         );
         assert!(output_path.exists(), "native {unit} gate bitcode emitted");
     }
+    // The same units compile without the gate define: the gate-off
+    // production flavors must never rot behind the new guarded code.
+    for unit in ["loader_gate", "task_owner", "image_identity"] {
+        let output_name = format!("{unit}-loader-gate-off.bc");
+        let output_path = temporary.path().join(&output_name);
+        let source = format!("{manifest}/crates/ebpf/native/{unit}.c");
+        let output = std::process::Command::new("clang-18")
+            .current_dir(temporary.path())
+            .args([
+                "-target",
+                target,
+                "-O2",
+                "-g",
+                "-gno-record-gcc-switches",
+                "-fdebug-compilation-dir=/p11scope/native",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-emit-llvm",
+                "-c",
+            ])
+            .arg(&prefix)
+            .arg(&source)
+            .arg("-I")
+            .arg(format!("{manifest}/crates/ebpf/native"))
+            .arg("-o")
+            .arg(&output_name)
+            .output()
+            .expect("compile loader gate unit without the define");
+        assert!(
+            output.status.success(),
+            "native {unit} gate-off compile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output_path.exists(),
+            "native {unit} gate-off bitcode emitted"
+        );
+    }
+    assert_loader_producer_verifier_probe(temporary.path());
+}
+
+/// Count LLVM instructions in one named function of disassembled
+/// bitcode: indented non-comment lines in its define body, excluding
+/// debug intrinsics (they lower to nothing). Returns None when the
+/// function is absent.
+fn llvm_function_insns(disassembly: &str, name: &str) -> Option<usize> {
+    let mut in_body = false;
+    let mut count = 0usize;
+    let mut found = false;
+    let define_needle = format!("@{name}(");
+    for line in disassembly.lines() {
+        if !in_body {
+            if line.starts_with("define ") && line.contains(&define_needle) {
+                in_body = true;
+                found = true;
+            }
+            continue;
+        }
+        if line == "}" {
+            break;
+        }
+        let trimmed = line.trim_start();
+        if line.len() == trimmed.len() {
+            continue; // label or unindented directive
+        }
+        let trimmed = trimmed.trim_end();
+        if trimmed.is_empty() || trimmed.starts_with(';') {
+            continue;
+        }
+        if trimmed.contains("@llvm.dbg.") {
+            continue;
+        }
+        count += 1;
+    }
+    found.then_some(count)
+}
+
+/// F1: the loader producer selects its path before reserving.
+/// `dl_debug_state_impl` holds no ring reservation across the
+/// token/legacy branch: the token arm returns before any reserve, and
+/// each arm reserves inside its own emitter. The old shape reserved a
+/// legacy entry and leaked it on every token hit (neither submitted nor
+/// discarded). This pins the source shape in CI; the compiled cfg-on
+/// shape is proven by the repeatable LLVM procedure in the P1 repair
+/// evidence (disassemble the unlinked cfg-on bitcode and show the impl
+/// holds no reserve call), and the cfg-on root enters the later
+/// verifier lane before activation.
+#[test]
+fn cfgon_producer_selects_path_before_reserving() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let source = std::fs::read_to_string(format!("{manifest}/crates/ebpf/src/main.rs"))
+        .expect("BPF producer source must exist");
+    let marker = "fn dl_debug_state_impl(ctx: ProbeContext) -> u32 {";
+    let mut occurrences = source.match_indices(marker);
+    let (start, _) = occurrences.next().expect("producer impl must exist");
+    assert!(
+        occurrences.next().is_none(),
+        "producer impl marker must be unique"
+    );
+    let body = brace_matched_body(&source[start + marker.len() - 1..]);
+    assert!(
+        body.contains("loader_gate_latched_for_producer"),
+        "impl must select the token path on the latch:\n{body}"
+    );
+    assert!(
+        !body.contains("reserve_discovery"),
+        "impl must hold no reservation across the branch:\n{body}"
+    );
+}
+
+/// Extract one brace-matched `{...}` body, skipping line comments, block
+/// comments and string literals so braces inside them cannot miscount.
+/// Fails closed on char-literal braces and unterminated input: the test
+/// must break loudly, never miscount silently.
+fn brace_matched_body(text: &str) -> String {
+    let bytes = text.as_bytes();
+    assert!(
+        !bytes.is_empty() && bytes[0] == b'{',
+        "body must open a brace"
+    );
+    let mut depth = 0usize;
+    let mut end = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied().unwrap_or(0);
+        if byte == b'/' && next == b'/' {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && next == b'*' {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            assert!(index + 1 < bytes.len(), "unterminated block comment");
+            index += 2;
+            continue;
+        }
+        if byte == b'"' {
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index += 2;
+                    continue;
+                }
+                if bytes[index] == b'"' {
+                    break;
+                }
+                index += 1;
+            }
+            assert!(index < bytes.len(), "unterminated string literal");
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' {
+            panic!("char literal in producer body: extend the matcher");
+        }
+        if byte == b'{' {
+            depth += 1;
+        } else if byte == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(index + 1);
+                break;
+            }
+        }
+        index += 1;
+    }
+    let end = end.expect("producer body must close its brace");
+    text[..end].to_owned()
+}
+
+/// Verifier-cost probe for the loader/image producer: disassemble the
+/// gate-enabled unit bitcode, count LLVM instructions in the touched
+/// BPF functions, and score the total against the existing loader-root
+/// pin (minimum across kernels) further limited by the configured
+/// headroom against the verifier limit. Both the numeric pin and the
+/// headroom apply; no new numbers are pinned here. LLVM counts are a
+/// documented proxy (gross-blowup tripwire), never a verifier proof:
+/// genuinely new gate costs are measured and pinned from kernel data
+/// in the later qualification stage.
+fn assert_loader_producer_verifier_probe(bitcode_dir: &Path) {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let budgets_text =
+        std::fs::read_to_string(format!("{manifest}/tests/bpf-verifier-budgets.json"))
+            .expect("verifier budgets file must exist");
+    let budgets: serde_json::Value =
+        serde_json::from_str(&budgets_text).expect("verifier budgets must parse");
+    let limit = budgets["limit"].as_u64().expect("verifier limit pin");
+    let min_headroom = budgets["min_headroom_percent"]
+        .as_f64()
+        .expect("headroom pin");
+    let root = &budgets["programs"]["detailed/dl_debug_state"];
+    let pin = root
+        .as_object()
+        .expect("loader root pin")
+        .values()
+        .map(|value| value.as_u64().expect("per-kernel pin"))
+        .min()
+        .expect("at least one kernel pin");
+    let bound = pin.min((limit as f64 * (1.0 - min_headroom / 100.0)) as u64);
+    assert!(bound > 0, "pin bound must be positive");
+    let touched: &[(&str, &[&str])] = &[
+        (
+            "loader_gate",
+            &[
+                "p11_loader_gate_ack",
+                "p11_loader_gate_row_generation",
+                "p11_loader_gate_cutover_latched",
+                "p11_loader_gate_admit",
+                "p11_loader_gate_note_producer_end",
+                "p11_loader_gate_hit",
+            ],
+        ),
+        (
+            "image_identity",
+            &[
+                "p11_image_bank_select",
+                "p11_image_bank_cut",
+                "p11_link_task_ticket",
+                "p11_image_identity_issued",
+            ],
+        ),
+    ];
+    let mut total = 0usize;
+    for (unit, functions) in touched {
+        let bitcode = bitcode_dir.join(format!("{unit}-loader-gate.bc"));
+        let disassembly = std::process::Command::new("llvm-dis-18")
+            .arg(&bitcode)
+            .arg("-o")
+            .arg("-")
+            .output()
+            .expect("disassemble loader gate bitcode");
+        assert!(
+            disassembly.status.success(),
+            "native {unit} disassembly: {}",
+            String::from_utf8_lossy(&disassembly.stderr)
+        );
+        let text = String::from_utf8(disassembly.stdout).expect("llvm disassembly is utf-8");
+        for name in *functions {
+            let count = llvm_function_insns(&text, name)
+                .unwrap_or_else(|| panic!("touched BPF function {name} must be present"));
+            println!("verifier probe: {unit}::{name} = {count} llvm insns");
+            total += count;
+        }
+    }
+    println!("verifier probe: touched total = {total} llvm insns, bound = {bound}");
+    assert!(
+        total as u64 <= bound,
+        "touched loader producer {total} llvm insns exceed the loader-root pin {bound}"
+    );
 }

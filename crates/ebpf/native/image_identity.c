@@ -16,6 +16,35 @@ struct {
     __type(value, struct control);
 } COOKIE_CTL SEC(".maps");
 
+#ifdef P11SCOPE_LOADER_GATE
+/* Production bank B: same shapes as bank A. The proof's B ticket maps
+ * extern to these once the gate define is on, so proof issues feed
+ * the shared watermarks the L4b producer sums. */
+struct {
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, u64);
+} TASK_COOKIE_B SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct control);
+} COOKIE_CTL_B SEC(".maps");
+
+/* The SELECT flip word: current bank plus prepared bits and the L4b
+ * image cells. Single-word flip needs no torn-read recheck; the
+ * prepared bits are write-once per bank in the single-cut design. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct image_bank_select);
+} IMAGE_BANK_SELECT SEC(".maps");
+#endif
+
 struct cookie_result {
     u64 cookie;
     u32 status;
@@ -35,6 +64,186 @@ static __always_inline void finite_increment(u64 *counter)
         __sync_fetch_and_add(counter, 1);
 }
 
+#ifdef P11SCOPE_LOADER_GATE
+static __always_inline struct image_bank_select *bank_select_word(void)
+{
+    u32 key = 0;
+    return bpf_map_lookup_elem(&IMAGE_BANK_SELECT, &key);
+}
+
+/* Count a quota or no-slot refusal. A missing SELECT has no cell, so
+ * like the gate's missing control it refuses uncounted. */
+static __always_inline void bank_refuse(struct image_bank_select *select)
+{
+    if (select)
+        finite_increment(&select->refusals);
+}
+
+__attribute__((noinline)) u32 p11_image_bank_select(void)
+{
+    struct image_bank_select *select;
+    u64 bank;
+
+    select = bank_select_word();
+    if (!select)
+        return IMAGE_BANK_NO_SLOT;
+    bank = select->bank;
+    if (bank >= IMAGE_BANK_SLOTS)
+        return IMAGE_BANK_NO_SLOT;
+    if (!select->prepared[bank])
+        return IMAGE_BANK_NO_SLOT;
+    return (u32)bank;
+}
+
+__attribute__((noinline)) u32 p11_image_bank_cut(u64 target)
+{
+    struct image_bank_select *select;
+    u64 bank;
+
+    if (target >= IMAGE_BANK_SLOTS)
+        return IMAGE_BANK_NO_SLOT;
+    select = bank_select_word();
+    if (!select)
+        return IMAGE_BANK_NO_SLOT;
+    bank = select->bank;
+    if (bank == target)
+        return (u32)target;
+    if (bank >= IMAGE_BANK_SLOTS || !select->prepared[target])
+        return IMAGE_BANK_NO_SLOT;
+    if (__sync_val_compare_and_swap(&select->bank, bank, target) != bank) {
+        if (select->bank == target)
+            return (u32)target;
+        return IMAGE_BANK_NO_SLOT;
+    }
+    finite_increment(&select->cuts);
+    return (u32)target;
+}
+#endif
+
+#ifdef P11SCOPE_LOADER_GATE
+/* Bank-aware allocator: select first (no storage touched on a bad
+ * SELECT), fast-path the current bank then the retained bank, and cut
+ * to B exactly once on a prepared A-quota. Any other quota refuses
+ * honestly; there is no third bank. */
+static __always_inline struct cookie_result cookie_for(struct task_struct *task)
+{
+    struct cookie_result result = { .cookie = 0, .status = COOKIE_STATUS_BAD_TASK };
+    u64 *cell;
+    struct control *control;
+    void *storage_map;
+    u32 bank;
+    u32 key = 0;
+
+    if (!task)
+        return result;
+
+    bank = p11_image_bank_select();
+    if (bank == IMAGE_BANK_NO_SLOT) {
+        bank_refuse(bank_select_word());
+        result.status = COOKIE_STATUS_BAD_CONFIG;
+        return result;
+    }
+    if (bank == 0) {
+        storage_map = &TASK_COOKIE;
+        control = bpf_map_lookup_elem(&COOKIE_CTL, &key);
+    } else {
+        storage_map = &TASK_COOKIE_B;
+        control = bpf_map_lookup_elem(&COOKIE_CTL_B, &key);
+    }
+    if (!control) {
+        result.status = COOKIE_STATUS_NO_CONTROL;
+        return result;
+    }
+    if (control->limit != IMAGE_IDENTITY_TICKET_LIMIT ||
+        control->next_ticket > IMAGE_IDENTITY_TICKET_LIMIT) {
+        finite_increment(&control->unavailable);
+        result.status = COOKIE_STATUS_BAD_CONFIG;
+        return result;
+    }
+
+    cell = bpf_task_storage_get(storage_map, task, (void *)0, 0);
+    if (!cell) {
+        void *retained = (bank == 0) ? (void *)&TASK_COOKIE_B : (void *)&TASK_COOKIE;
+        cell = bpf_task_storage_get(retained, task, (void *)0, 0);
+    }
+    if (cell) {
+        if (*cell) {
+            result.cookie = *cell;
+            result.status = COOKIE_STATUS_OK;
+        } else {
+            finite_increment(&control->unavailable);
+            result.status = COOKIE_STATUS_ZERO_CELL;
+        }
+        return result;
+    }
+
+#pragma unroll
+    for (int attempt = 0; attempt < COOKIE_CAS_TRIES; attempt++) {
+        u64 ticket = control->next_ticket;
+        u64 observed;
+        u64 proposed;
+
+        if (ticket >= control->limit) {
+            if (bank == 0 && p11_image_bank_cut(1) == 1) {
+                bank = 1;
+                storage_map = &TASK_COOKIE_B;
+                control = bpf_map_lookup_elem(&COOKIE_CTL_B, &key);
+                if (!control) {
+                    result.status = COOKIE_STATUS_NO_CONTROL;
+                    return result;
+                }
+                if (control->limit != IMAGE_IDENTITY_TICKET_LIMIT ||
+                    control->next_ticket > IMAGE_IDENTITY_TICKET_LIMIT) {
+                    finite_increment(&control->unavailable);
+                    result.status = COOKIE_STATUS_BAD_CONFIG;
+                    return result;
+                }
+                continue;
+            }
+            finite_increment(&control->unavailable);
+            bank_refuse(bank_select_word());
+            result.status = COOKIE_STATUS_QUOTA;
+            return result;
+        }
+
+        observed = __sync_val_compare_and_swap(&control->next_ticket,
+                                                ticket, ticket + 1);
+        if (observed != ticket)
+            continue;
+
+        proposed = ticket + 1;
+        cell = bpf_task_storage_get(storage_map, task, &proposed,
+                                    BPF_LOCAL_STORAGE_GET_F_CREATE);
+        if (cell) {
+            if (*cell) {
+                result.cookie = *cell;
+                result.status = COOKIE_STATUS_OK;
+            } else {
+                finite_increment(&control->unavailable);
+                result.status = COOKIE_STATUS_ZERO_CELL;
+            }
+            return result;
+        }
+
+        cell = bpf_task_storage_get(storage_map, task, (void *)0, 0);
+        if (cell && *cell) {
+            result.cookie = *cell;
+            result.status = COOKIE_STATUS_OK;
+            return result;
+        }
+
+        finite_increment(&control->create_failures);
+        finite_increment(&control->unavailable);
+        result.status = COOKIE_STATUS_CREATE_FAILED;
+        return result;
+    }
+
+    finite_increment(&control->retry_exhausted);
+    finite_increment(&control->unavailable);
+    result.status = COOKIE_STATUS_RETRY_EXHAUSTED;
+    return result;
+}
+#else
 static __always_inline struct cookie_result cookie_for(struct task_struct *task)
 {
     struct cookie_result result = { .cookie = 0, .status = COOKIE_STATUS_BAD_TASK };
@@ -117,6 +326,7 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
     result.status = COOKIE_STATUS_RETRY_EXHAUSTED;
     return result;
 }
+#endif
 
 /* Same typed task supplies both fields. Volatile aligned u64 is READ_ONCE-equivalent
  * on the selected x86-64 kernels; exec_id zero is valid, status is separate. */
@@ -196,10 +406,14 @@ __attribute__((noinline)) u32 p11_link_task_ticket(struct task_struct *task, u64
 
 /* T-L2 issuance watermark: factual observation for incarnation pairing
  * and the later L4b producer. Read-only: never spends a ticket and never
- * bumps a counter, so observers cannot perturb the issuance they read. */
+ * bumps a counter, so observers cannot perturb the issuance they read.
+ * tickets_issued is the derived sum of both watermarks, monotonic
+ * across the cut by construction. */
 __attribute__((noinline)) u32 p11_image_identity_issued(u64 *watermark_out)
 {
     struct control *control;
+    struct control *control_b;
+    u32 key = 0;
     if (!watermark_out)
         return COOKIE_STATUS_BAD_TASK;
     *watermark_out = 0;
@@ -209,7 +423,13 @@ __attribute__((noinline)) u32 p11_image_identity_issued(u64 *watermark_out)
     if (control->limit != IMAGE_IDENTITY_TICKET_LIMIT ||
         control->next_ticket > IMAGE_IDENTITY_TICKET_LIMIT)
         return COOKIE_STATUS_BAD_CONFIG;
-    *watermark_out = control->next_ticket;
+    control_b = bpf_map_lookup_elem(&COOKIE_CTL_B, &key);
+    if (!control_b)
+        return COOKIE_STATUS_NO_CONTROL;
+    if (control_b->limit != IMAGE_IDENTITY_TICKET_LIMIT ||
+        control_b->next_ticket > IMAGE_IDENTITY_TICKET_LIMIT)
+        return COOKIE_STATUS_BAD_CONFIG;
+    *watermark_out = control->next_ticket + control_b->next_ticket;
     return COOKIE_STATUS_OK;
 }
 #endif

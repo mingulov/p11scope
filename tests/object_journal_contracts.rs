@@ -2256,13 +2256,30 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
             }
             // One outer cast prefix (`(u32)7`) tolerated: a leading
             // group with trailing content is a cast, not grouping.
-            if trimmed.starts_with('(')
-                && let Some(close) = trimmed.find(')')
-            {
-                let rest = trimmed[close + 1..].trim();
-                if !rest.is_empty() {
-                    argument = rest;
-                    continue;
+            // Strip through the `)` matching the leading `(`: the
+            // cast type itself may contain parentheses
+            // (`(__typeof__(reason))0x7UL`).
+            if trimmed.starts_with('(') {
+                let bytes = trimmed.as_bytes();
+                let mut depth = 0u32;
+                let mut close = None;
+                for (index, &byte) in bytes.iter().enumerate() {
+                    if byte == b'(' {
+                        depth += 1;
+                    } else if byte == b')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(index);
+                            break;
+                        }
+                    }
+                }
+                if let Some(close) = close {
+                    let rest = trimmed[close + 1..].trim();
+                    if !rest.is_empty() {
+                        argument = rest;
+                        continue;
+                    }
                 }
             }
             argument = trimmed;
@@ -2653,6 +2670,86 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
         (
             "grouped-8U",
             owner_c.replacen("P11_OWNER_START_REASON_RETURN", "(8U)", 1),
+        ),
+    ] {
+        assert!(
+            mutant.contains("P11_OWNER_START_REASON_COLLISION")
+                && mutant.contains("P11_OWNER_START_REASON_EXEC_EXIT"),
+            "{label} keeps named emitters: token presence stays green"
+        );
+        assert!(
+            !reserved_numeric_sites(&mutant).is_empty(),
+            "{label} numeric reason argument rejected"
+        );
+    }
+    // Round-5 counterexample: a cast whose type contains
+    // parentheses, at the unanchored forwarding call. Stripping
+    // only through the first `)` leaves `)0x7UL`, which no parser
+    // recognizes. Sibling cast-with-parens spellings and the
+    // retained ordinary cast/grouping forms ride the same anchor.
+    // All keep the named emitters intact.
+    let forward_call = "long rc = remove_start(ctl, owner, key, reason);";
+    assert_eq!(
+        owner_c.matches(forward_call).count(),
+        1,
+        "forwarding call anchor"
+    );
+    for (label, mutant) in [
+        (
+            "typeof-cast-7",
+            owner_c.replacen(
+                forward_call,
+                "long rc = remove_start(ctl, owner, key, (__typeof__(reason))0x7UL);",
+                1,
+            ),
+        ),
+        (
+            "typeof-cast-8",
+            owner_c.replacen(
+                forward_call,
+                "long rc = remove_start(ctl, owner, key, (__typeof__(x))8);",
+                1,
+            ),
+        ),
+        (
+            "grouped-typeof-cast-8",
+            owner_c.replacen(
+                forward_call,
+                "long rc = remove_start(ctl, owner, key, ((__typeof__(reason))8U));",
+                1,
+            ),
+        ),
+        (
+            "cast-grouped-hex-8",
+            owner_c.replacen(
+                forward_call,
+                "long rc = remove_start(ctl, owner, key, (u32)(0X8ULL));",
+                1,
+            ),
+        ),
+        (
+            "double-cast-7",
+            owner_c.replacen(
+                forward_call,
+                "long rc = remove_start(ctl, owner, key, ((u32))7);",
+                1,
+            ),
+        ),
+        (
+            "cast-7",
+            owner_c.replacen(
+                forward_call,
+                "long rc = remove_start(ctl, owner, key, (u32)7);",
+                1,
+            ),
+        ),
+        (
+            "nested-grouped-7",
+            owner_c.replacen(
+                forward_call,
+                "long rc = remove_start(ctl, owner, key, ((7U)));",
+                1,
+            ),
         ),
     ] {
         assert!(

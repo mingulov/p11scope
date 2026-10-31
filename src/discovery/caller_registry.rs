@@ -1243,7 +1243,6 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// native-exact (an already rolled-back caller is healthy and
     /// stays). Caller IDs are never reused, so the retirement cannot
     /// land on a newer incarnation.
-    #[cfg_attr(not(test), allow(dead_code))] // Wired by the rollback fix; twins drive it first.
     pub(crate) fn retire_native_caller_without_owner(
         &mut self,
         caller: CallerId,

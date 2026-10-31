@@ -3410,7 +3410,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// preflighted reconciliation with no provider I/O), binds owner
     /// to caller, and projects the commit. Any failure releases the
     /// staged reservation and lease with a named gap; an installed
-    /// authority rolls back when the engine commit refuses.
+    /// authority rolls back when the engine commit refuses, and a
+    /// rollback that misses its installed image retires the caller
+    /// instead of leaving native-exact authority without an owner.
     fn commit_staged_native_owner(
         &mut self,
         staged: StagedNativeOwner,
@@ -3475,9 +3477,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Roll back one installed native authority after its staged
     /// activation failed: restore scan-pinned authority when the
-    /// installed image still stands, and report the activation
-    /// failure by name. Bounded pure work: no provider I/O. Every
-    /// outcome reports its own named gap; nothing drops silently.
+    /// installed image still stands. When the rollback misses its
+    /// installed image, the installed authority survives with no
+    /// activated owner, so retire the caller (evidence retained)
+    /// instead of leaving a live `NativeExact` caller without its
+    /// owner. Bounded pure work: no provider I/O. Every outcome
+    /// reports its own named gap; nothing drops silently.
     fn rollback_installed_native_authority(
         &mut self,
         caller: CallerId,
@@ -3486,12 +3491,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         error: &anyhow::Error,
         now_ns: u64,
     ) {
-        let _ = now_ns;
         if let Err(rollback) = self
             .adapter
             .cancel_scoped_native_authority(caller, expected)
         {
             self.refuse_scoped_native_owner(caller, pid, rollback);
+            if self.adapter.retire_native_caller_without_owner(
+                caller,
+                "native authority rollback missed its installed image after a failed activation; the caller retires with its evidence rather than keep native-exact authority without an activated owner".into(),
+                now_ns,
+            ) {
+                self.retire_caller_in_registry(caller, now_ns);
+                self.refuse_scoped_native_owner(
+                    caller,
+                    pid,
+                    "the installed native authority survived a missed rollback with no activated owner; the caller retired with its evidence; scan-pinned fallback is not claimed",
+                );
+            }
         }
         self.refuse_scoped_native_owner(
             caller,

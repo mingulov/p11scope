@@ -57,11 +57,14 @@ fn compile_harness(source_file: &str, tag: &str, scenario: &str) -> (PathBuf, Pa
         .arg(&source)
         .arg("-o")
         .arg(&binary);
-    if tag == "owner-gate" || tag == "tickets" {
+    if tag == "owner-gate" || tag == "tickets" || tag == "tickets-hook" {
         command.arg("-DP11SCOPE_LOADER_GATE");
     }
     if tag == "gate-hook" {
         command.arg("-DGATE_HOST_CAS_HOOK");
+    }
+    if tag == "tickets-hook" {
+        command.arg("-DIMAGE_HOST_CAS_HOOK");
     }
     let compile = command.output().expect("spawn host cc for the harness");
     assert!(
@@ -114,6 +117,16 @@ fn drive_tickets(scenario: &str, asserts: &[&str]) {
     let (work, binary) = compile_harness(
         "tests/fixtures/image-identity/ticket_query_tests.c",
         "tickets",
+        scenario,
+    );
+    run_scenario(&binary, scenario, asserts);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+fn drive_tickets_hook(scenario: &str, asserts: &[&str]) {
+    let (work, binary) = compile_harness(
+        "tests/fixtures/image-identity/ticket_query_tests.c",
+        "tickets-hook",
         scenario,
     );
     run_scenario(&binary, scenario, asserts);
@@ -553,6 +566,187 @@ fn loader_gate_harness_cas_exhaustion_counts() {
     );
 }
 
+/// Bank-qualified identity: A holds its identity while B reissues
+/// the local ticket; identities stay distinct and stable.
+#[test]
+fn loader_ticket_harness_identity_distinct() {
+    drive_tickets(
+        "identity-distinct",
+        &[
+            "ASSERT identity_a_legacy_cookie",
+            "ASSERT identity_b_disjoint",
+            "ASSERT identity_a_survives_cut",
+            "ASSERT identity_b_requery_stable",
+            "ASSERT identity_ticket_stays_local",
+            "ASSERT identity_watermark_monotonic",
+        ],
+    );
+}
+
+/// Full bank lifecycle: stale-cut refusal, exactly-once fold,
+/// re-prepare under a fresh incarnation, reissue without repeats.
+#[test]
+fn loader_ticket_harness_bank_fold_lifecycle() {
+    drive_tickets(
+        "bank-fold-lifecycle",
+        &[
+            "ASSERT stale_cut_refuses_until_folded",
+            "ASSERT fold_claim_retires_once",
+            "ASSERT fold_never_repeats",
+            "ASSERT reprepare_cuts_back_fresh",
+            "ASSERT reissue_never_repeats_cookie",
+            "ASSERT watermark_monotonic_across_incarnations",
+        ],
+    );
+}
+
+/// Eight threads race the fold claim and the re-prepare: each
+/// applies once and reissued tickets stay distinct and disjoint.
+#[test]
+fn loader_ticket_harness_bank_reprepare_race() {
+    drive_tickets(
+        "bank-reprepare-race",
+        &[
+            "ASSERT concurrent_fold_once",
+            "ASSERT concurrent_reprepare_once",
+            "ASSERT concurrent_reissue_disjoint",
+        ],
+    );
+}
+
+/// Exec/return isolation at the seam: each bank's exec invalidates
+/// only its own rows, returns join only identical identities.
+#[test]
+fn loader_ticket_harness_exec_return_isolation() {
+    drive_tickets(
+        "exec-return-isolation",
+        &[
+            "ASSERT exec_invalidates_only_own_bank",
+            "ASSERT exec_isolation_symmetric",
+            "ASSERT return_mismatches_across_banks",
+        ],
+    );
+}
+
+/// Forced CAS exhaustion: settled updates land through the fallback
+/// and every unsettled update reports through update_losses.
+#[test]
+fn loader_ticket_harness_identity_cas_exhaustion() {
+    drive_tickets_hook(
+        "identity-cas-exhaustion",
+        &[
+            "ASSERT identity_fallback_settles",
+            "ASSERT identity_skip_reports",
+            "ASSERT identity_bank_refusal_settles",
+            "ASSERT identity_folded_saturates",
+            "ASSERT identity_watermark_saturates",
+        ],
+    );
+}
+
+/// Incarnation guard: the top incarnation still issues a qualified
+/// identity; one past the 48-bit range refuses without wrapping.
+#[test]
+fn loader_ticket_harness_bank_incarnation_guard() {
+    drive_tickets(
+        "incarnation-guard",
+        &[
+            "ASSERT incarnation_top_issues",
+            "ASSERT incarnation_overflow_refuses",
+        ],
+    );
+}
+
+/// Empty slots never fold: admissions leave fold marks alone when the
+/// unprepared bank has no issuance to retire.
+#[test]
+fn loader_ticket_harness_bank_fold_skips_empty() {
+    drive_tickets("fold-skips-empty", &["ASSERT fold_skips_empty"]);
+}
+
+/// EXEC binding stays local: the current-task cookie returns the
+/// per-bank ticket on both banks, never the qualified identity.
+#[test]
+fn loader_ticket_harness_bank_binding_stays_local() {
+    drive_tickets(
+        "binding-stays-local",
+        &[
+            "ASSERT binding_b_stays_local",
+            "ASSERT binding_a_stays_local",
+        ],
+    );
+}
+
+/// Pending-fold watermark: a healthy admission folds the claimed
+/// bank, the retired count is excluded while pending, the retired
+/// epoch still serves, and re-prepare completes without cutting.
+#[test]
+fn loader_ticket_harness_bank_fold_pending_excludes() {
+    drive_tickets(
+        "fold-pending-excludes",
+        &[
+            "ASSERT fold_runs_on_healthy_admission",
+            "ASSERT pending_fold_excluded_from_watermark",
+            "ASSERT retired_epoch_still_serves",
+            "ASSERT reprepare_without_cut_stays",
+        ],
+    );
+}
+
+/// The incarnation guard refuses before spending a ticket.
+#[test]
+fn loader_ticket_harness_bank_guard_spends_nothing() {
+    drive_tickets("guard-spends-nothing", &["ASSERT guard_spends_nothing"]);
+}
+
+/// A corrupt retained cell charges its owning bank, not the current one.
+#[test]
+fn loader_ticket_harness_bank_retained_zero_charges_source() {
+    drive_tickets(
+        "retained-zero-charges-source",
+        &["ASSERT retained_zero_charges_source"],
+    );
+}
+
+/// A retained re-query validates the source domain before serving.
+#[test]
+fn loader_ticket_harness_bank_retained_validates_source() {
+    drive_tickets(
+        "retained-validates-source",
+        &["ASSERT retained_validates_source"],
+    );
+}
+
+/// A quota never cuts into a prepared target with a corrupt epoch.
+#[test]
+fn loader_ticket_harness_bank_cut_refuses_corrupt_target() {
+    drive_tickets(
+        "cut-refuses-corrupt-target",
+        &["ASSERT cut_refuses_corrupt_target"],
+    );
+}
+
+/// Fold help runs even when the current bank refuses as corrupt.
+#[test]
+fn loader_ticket_harness_bank_fold_despite_corrupt_current() {
+    drive_tickets(
+        "fold-despite-corrupt-current",
+        &["ASSERT fold_despite_corrupt_current"],
+    );
+}
+
+/// Re-queries from an overflowed epoch refuse on both entries.
+#[test]
+fn loader_ticket_harness_bank_hit_overflow_refuses() {
+    drive_tickets("hit-overflow-refuses", &["ASSERT hit_overflow_refuses"]);
+}
+
+/// Domain before row: the epoch guard fires before the zero-cell check.
+#[test]
+fn loader_ticket_harness_bank_guard_before_zero_cell() {
+    drive_tickets("guard-before-zero-cell", &["ASSERT guard_before_zero_cell"]);
+}
+
 /// Selection validation: unpublished, corrupt or missing SELECT
 /// refuses new issues; cut validates its target and prepared bit.
 #[test]
@@ -700,10 +894,10 @@ fn llvm_function_insns(disassembly: &str, name: &str) -> Option<usize> {
 /// each arm reserves inside its own emitter. The old shape reserved a
 /// legacy entry and leaked it on every token hit (neither submitted nor
 /// discarded). This pins the source shape in CI; the compiled cfg-on
-/// shape is proven by the repeatable LLVM procedure in the P1 repair
-/// evidence (disassemble the unlinked cfg-on bitcode and show the impl
-/// holds no reserve call), and the cfg-on root enters the later
-/// verifier lane before activation.
+/// shape is proven by the repeatable MIR procedure in the P1 repair
+/// evidence (dump the impl's MIR and show it holds no reserve call;
+/// the LLVM link of that procedure failed in the toolchain), and the
+/// cfg-on root enters the later verifier lane before activation.
 #[test]
 fn cfgon_producer_selects_path_before_reserving() {
     let manifest = env!("CARGO_MANIFEST_DIR");

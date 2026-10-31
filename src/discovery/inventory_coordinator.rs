@@ -8028,8 +8028,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // (absent members, retired callers, proven exec changes,
             // admitted members lost at their later permit proof)
             // before the tail revision: release mutates engine
-            // facts. An incomplete outcome suspends nobody.
-            if transaction_complete {
+            // facts. Poll the current outcome here, after every
+            // returning commit/refusal check above: permit and
+            // proof charges inside the loop can latch cancellation
+            // or work exhaustion after the pre-loop sample, and a
+            // transaction no longer complete suspends nobody.
+            if collection.outcome() == ScopedCollectionOutcome::Complete {
                 self.suspend_absent_scoped_owners(
                     &allowed_callers,
                     &invalidated_owners,

@@ -53,6 +53,7 @@ RUN = [
     ("test_automatic_exec_oracle.py", []),
     ("test_automatic_exec_system_disclosures.py", []),
     ("test_automatic_initial_readiness.py", []),
+    ("test_bank_object_proof_off_on.py", []),
     ("test_bench_count_overhead.py", []),
     ("test_bpf_kernels_contract.py", []),
     ("test_bpf_load_report.py", []),

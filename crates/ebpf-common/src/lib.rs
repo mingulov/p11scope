@@ -1512,6 +1512,69 @@ pub struct ImageIdentityControl {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ImageIdentityControl {}
 
+/// T-L2c loader gate slots, shared with native `loader_gate.h`
+/// (`LOADER_GATE_SLOTS`). Reuse recycles storage, never identity.
+pub const LOADER_GATE_SLOTS: u32 = 256;
+
+/// One loader gate row, shared with native `struct loader_gate_row`.
+/// BPF owns every field; userspace sets `acked` once per retired
+/// generation after its T-L3 acknowledgement completes. Userspace never
+/// reads rows into output (privacy); the BPF map needs the value type.
+/// `state` is 64 bits: the BPF backend selects compare-and-swap only
+/// at 64 bits, and claim/retire each need exactly one CAS winner.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoaderGateRow {
+    pub generation: u64,
+    pub state: u64,
+    pub disposition: u32,
+    pub acked: u32,
+    pub last_gen: u32,
+}
+
+/// LOADER_GATE_CTL[0], shared with native `struct loader_gate_control`.
+/// Before links, the loader publishes limit=LOADER_GATE_SLOTS and all
+/// other fields zero, then freezes userspace mutation. While linked,
+/// BPF alone mutates. Counting cells saturate, never wrap.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoaderGateControl {
+    pub limit: u64,
+    pub cutover: u64,
+    pub admitted: u64,
+    pub refusals: u64,
+    pub retired: u64,
+    pub reclaims: u64,
+    pub retained: u64,
+    pub retained_peak: u64,
+    pub update_losses: u64,
+}
+
+/// IMAGE_BANK_SELECT[0], shared with native `struct image_bank_select`.
+/// Single-word bank flip plus the L4b image cells. The loader publishes
+/// bank=0, prepared={1,0} and zero counts before links. Counting cells
+/// saturate, never wrap.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageBankSelect {
+    pub bank: u64,
+    pub prepared: [u64; 2],
+    pub cuts: u64,
+    pub refusals: u64,
+    pub incarnation: [u64; 2],
+    pub folded: [u64; 2],
+    pub folds: u64,
+    pub folded_issued: u64,
+    pub update_losses: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for LoaderGateRow {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for LoaderGateControl {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ImageBankSelect {}
+
 /// Task 3 Stage A: kernel-side load-instance continuity witness.
 ///
 /// The hooks read only kernel VMA/file/mm metadata (never syscall arguments,
@@ -2274,6 +2337,38 @@ mod tests {
         assert_eq!(offset_of!(Event, image), 288);
         assert_eq!(offset_of!(Event, child_image), 304);
         assert_eq!(offset_of!(Event, root_affiliation), 320);
+    }
+
+    #[test]
+    fn loader_gate_and_bank_select_have_exact_native_layouts() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(LOADER_GATE_SLOTS, 256);
+        assert_eq!(size_of::<LoaderGateRow>(), 32);
+        assert_eq!(offset_of!(LoaderGateRow, generation), 0);
+        assert_eq!(offset_of!(LoaderGateRow, state), 8);
+        assert_eq!(offset_of!(LoaderGateRow, disposition), 16);
+        assert_eq!(offset_of!(LoaderGateRow, acked), 20);
+        assert_eq!(offset_of!(LoaderGateRow, last_gen), 24);
+        assert_eq!(size_of::<LoaderGateControl>(), 72);
+        assert_eq!(offset_of!(LoaderGateControl, limit), 0);
+        assert_eq!(offset_of!(LoaderGateControl, cutover), 8);
+        assert_eq!(offset_of!(LoaderGateControl, admitted), 16);
+        assert_eq!(offset_of!(LoaderGateControl, refusals), 24);
+        assert_eq!(offset_of!(LoaderGateControl, retired), 32);
+        assert_eq!(offset_of!(LoaderGateControl, reclaims), 40);
+        assert_eq!(offset_of!(LoaderGateControl, retained), 48);
+        assert_eq!(offset_of!(LoaderGateControl, retained_peak), 56);
+        assert_eq!(offset_of!(LoaderGateControl, update_losses), 64);
+        assert_eq!(size_of::<ImageBankSelect>(), 96);
+        assert_eq!(offset_of!(ImageBankSelect, bank), 0);
+        assert_eq!(offset_of!(ImageBankSelect, prepared), 8);
+        assert_eq!(offset_of!(ImageBankSelect, cuts), 24);
+        assert_eq!(offset_of!(ImageBankSelect, refusals), 32);
+        assert_eq!(offset_of!(ImageBankSelect, incarnation), 40);
+        assert_eq!(offset_of!(ImageBankSelect, folded), 56);
+        assert_eq!(offset_of!(ImageBankSelect, folds), 72);
+        assert_eq!(offset_of!(ImageBankSelect, folded_issued), 80);
+        assert_eq!(offset_of!(ImageBankSelect, update_losses), 88);
     }
 
     #[test]

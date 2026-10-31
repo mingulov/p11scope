@@ -150,6 +150,11 @@ use p11scope_ebpf_common::{
 #[allow(unexpected_cfgs)]
 #[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
 use p11scope_ebpf_common::{DISCOVERY_STATUS_LOADER_ACK_PENDING, valid_loader_token};
+// Staged gate storage (activation builds only): the row and control
+// value types behind the real map symbols.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+use p11scope_ebpf_common::{LOADER_GATE_SLOTS, LoaderGateControl, LoaderGateRow};
 
 // Package G: the BPF slot universe and the native task-owner bound are one
 // literal. Changing either without the other corrupts START ownership.
@@ -341,6 +346,22 @@ static PAUSE_PIDS: HashMap<PauseKey, u64> = HashMap::with_max_entries(1, 0);
 #[cfg(not(feature = "inventory-only"))]
 #[map]
 static STOP_GATE: Array<u64> = Array::with_max_entries(1, BPF_F_MMAPABLE);
+
+/// T-L2c loader gate storage (activation builds only): one row per
+/// loader slot plus the single control cell the L4b producer counts
+/// in. Native `loader_gate.c` externs these symbols; host harnesses
+/// define stub bytes until activation wires the real maps.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+#[map]
+static LOADER_GATE: Array<LoaderGateRow> = Array::with_max_entries(LOADER_GATE_SLOTS, 0);
+
+/// The gate control cell. BPF alone mutates while linked; userspace
+/// publishes the limit before links and reads the counters after.
+#[allow(unexpected_cfgs)]
+#[cfg(all(p11scope_loader_gate, not(feature = "inventory-only")))]
+#[map]
+static LOADER_GATE_CTL: Array<LoaderGateControl> = Array::with_max_entries(1, 0);
 
 /// Stop-gate admission for the static Detailed programs. Reads the shared
 /// word with a compare-exchange against (0, 0) and counts with a non-fetch

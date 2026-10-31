@@ -1170,7 +1170,7 @@ fn cgroup_native_owner_reused_generation_never_inherits_native_image() {
     ]);
     let completion = scene.commit_membership_pass(false);
     assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
-    let first_owner = scene
+    let _first_owner = scene
         .coordinator
         .owner_of(scene.caller)
         .expect("leg 1: the settled child activates before the reuse");
@@ -1222,8 +1222,24 @@ fn cgroup_native_owner_reused_generation_never_inherits_native_image() {
     );
     assert_eq!(
         scene.coordinator.owner_of(scene.caller),
-        Some(first_owner),
-        "activation does not invalidate: refresh/suspend (packet 3) owns it"
+        None,
+        "the dead caller's owner is suspended on the next complete pass"
+    );
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == "native owner suspended"
+                && gap.caller == Some(scene.caller)
+                && gap.pid == Some(dead_pid)
+                && gap.reason == "the caller retired; its native owner was released"
+        }),
+        "the suspend reports by name: {:?}",
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         scene.coordinator.registry().witness_census().bound,
@@ -1415,6 +1431,51 @@ impl ScopedNativeScene {
                 post_sample: post_sample.get(),
             },
         )
+    }
+
+    /// Commit the staged batch through the scene's one commit entry:
+    /// the membership helpers and the refresh/suspend twins all commit
+    /// here, so the acquisition handle delivery has a single seam.
+    fn commit_scene_batch(&mut self) {
+        self.coordinator.commit_batch(false).unwrap();
+    }
+
+    /// One pass over the membership file exactly as the twin last
+    /// rewrote it, with no member preparation to assert: collect,
+    /// apply, commit, and carry the walk state forward. Suspend twins
+    /// use this after rewriting a member out (or emptying the file);
+    /// the completion proves whether the rewritten membership still
+    /// forms a complete transaction.
+    fn commit_rewritten_membership_pass(&mut self) -> CgroupCompletion {
+        let collection = self
+            .coordinator
+            .cgroup_collector(
+                std::mem::take(&mut self.state),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        self.coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        self.commit_scene_batch();
+        let completion = self.coordinator.take_cgroup_completion().unwrap();
+        let CgroupCompletion {
+            state,
+            outcome,
+            events,
+            admitted,
+            scan_callers,
+        } = completion;
+        self.state = state;
+        CgroupCompletion {
+            state: CgroupWalkState::default(),
+            outcome,
+            events,
+            admitted,
+            scan_callers,
+        }
     }
 
     /// Admit an already spawned second member mapping the scene's
@@ -2239,14 +2300,16 @@ fn cgroup_native_owner_shared_provider_members_keep_consistent_claims() {
 
 #[test]
 fn cgroup_native_owner_handleless_pass_keeps_standing_deferral_disclosure() {
-    // R3 oracle-compat control: without an acquisition handle (the
-    // production path), the coordinator emits the standing deferral
-    // disclosure the installed H6 consumer recognizes, with its exact
-    // reason and caller-less shape, recorded every pass. The
-    // uncoordinated replacement subject never emits. RED while the
-    // producer emits the replacement instead.
-    const OLD_SUBJECT: &str = "scoped native owner admission deferred";
-    const OLD_REASON: &str = "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; sampled scan-pinned callers and retained native totals remain available";
+    // Coordinated replacement: without an acquisition handle, the
+    // coordinator emits the precise unavailable disclosure the H6
+    // consumer now recognizes under its controlled proof, with its
+    // exact reason and caller-less shape, recorded every pass. The
+    // superseded deferral subject never emits from current code (old
+    // reports keep their own recognition). RED while the producer
+    // still emits the superseded subject.
+    const OLD_SUBJECT: &str = "native owner activation unavailable";
+    const OLD_REASON: &str =
+        "no image acquisition handle is installed; scan-pinned fallback retained";
     let mut scene = ScopedNativeScene::new();
     // No acquisition installed: the production handle-less path.
     let gaps = scene.coordinator.registry().gaps();
@@ -2282,8 +2345,8 @@ fn cgroup_native_owner_handleless_pass_keeps_standing_deferral_disclosure() {
     );
     assert!(
         gaps.iter()
-            .all(|gap| gap.subject != "native owner activation unavailable"),
-        "the uncoordinated replacement never reaches the live consumer: {:?}",
+            .all(|gap| gap.subject != "scoped native owner admission deferred"),
+        "the superseded deferral subject never emits from current code: {:?}",
         gaps.iter()
             .map(|gap| gap.subject.clone())
             .collect::<Vec<_>>()
@@ -3041,4 +3104,1061 @@ fn cgroup_native_owner_permit_death_between_validate_and_install_refuses_with_fa
         None,
         "the control binds no owner"
     );
+}
+
+// --- Refresh/suspend lifecycle twins -----------------------------------
+// An activated owner refreshes through the same in-transaction path
+// on later passes, and a member absent from a complete transaction
+// (or retired, or proven exec-changed) suspends: native authority
+// cancels back to scan-pinned where the caller still stands, the
+// engine owner releases, and a named gap reports the event. The
+// handle-less pass emits the coordinated unavailable disclosure.
+
+const UNAVAILABLE_SUBJECT: &str = "native owner activation unavailable";
+const UNAVAILABLE_REASON: &str =
+    "no image acquisition handle is installed; scan-pinned fallback retained";
+const REFRESH_REFUSED_SUBJECT: &str = "native owner refresh refused";
+const SUSPENDED_SUBJECT: &str = "native owner suspended";
+const SUSPENDED_ABSENT_REASON: &str = "the caller was absent from the complete cgroup transaction; its native owner was released and scan-pinned fallback retained";
+const SUSPENDED_RETIRED_REASON: &str = "the caller retired; its native owner was released";
+const SUSPENDED_EXEC_REASON: &str = "the caller's image changed; native authority was cancelled and its native owner was released; scan-pinned fallback retained";
+
+fn staged_counts(scene: &ScopedNativeScene) -> (usize, usize, usize) {
+    scene
+        .coordinator
+        .engine
+        .inventory_staged_counts_for_test()
+        .unwrap()
+}
+
+fn assert_suspended_gap(scene: &ScopedNativeScene, caller: CallerId, pid: u32, reason: &str) {
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == SUSPENDED_SUBJECT
+                && gap.caller == Some(caller)
+                && gap.pid == Some(pid)
+                && gap.module.is_none()
+                && gap.budget.is_none()
+                && gap.reason == reason
+        }),
+        "the suspend reports by name for {caller:?}: {:?}",
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect::<Vec<_>>()
+    );
+}
+
+fn assert_no_suspended_gap(scene: &ScopedNativeScene) {
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| gap.subject != SUSPENDED_SUBJECT),
+        "no suspend reports: {:?}",
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| gap.subject.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn cgroup_native_owner_handle_transition_replaces_standing_disclosure() {
+    // Handle-less passes emit the coordinated unavailable disclosure
+    // every pass and activate nothing; once the scene installs its
+    // acquisition, the next pass activates and adds no further
+    // standing disclosure.
+    let mut scene = ScopedNativeScene::new();
+    let gaps = scene.coordinator.registry().gaps();
+    let index = gaps
+        .iter()
+        .position(|gap| gap.subject == UNAVAILABLE_SUBJECT)
+        .expect("the unavailable disclosure emits on the handle-less path");
+    let gap = &gaps[index];
+    assert_eq!(gap.reason, UNAVAILABLE_REASON);
+    assert_eq!(
+        (gap.caller, gap.module, gap.pid, gap.budget),
+        (None, None, None, None),
+        "the standing disclosure names no caller, module, pid, or budget"
+    );
+    assert!(
+        gaps.iter()
+            .all(|gap| gap.subject != "scoped native owner admission deferred"),
+        "the superseded deferral subject never emits"
+    );
+    let repeats_before = scene.coordinator.registry().gap_repeats()[index];
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(scene.coordinator.owner_of(scene.caller), None);
+    assert_eq!(
+        scene.coordinator.registry().gap_repeats()[index],
+        repeats_before + 1,
+        "each handle-less pass repeats the standing disclosure"
+    );
+
+    let acquired = scene.set_scripted_acquisition(&[
+        (1, 41, 1),
+        (2, 41, 1),
+        (3, 41, 1),
+        (4, 41, 1),
+        (5, 41, 1),
+    ]);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert!(
+        scene.coordinator.owner_of(scene.caller).is_some(),
+        "the handled pass activates"
+    );
+    assert_eq!(acquired.borrow().calls(), 5);
+    assert_eq!(
+        scene.coordinator.registry().gap_repeats()[index],
+        repeats_before + 1,
+        "handled passes add no standing disclosure"
+    );
+}
+
+#[test]
+fn cgroup_native_owner_refresh_commits_in_transaction() {
+    // Healthy refresh: the pass after activation re-acquires the
+    // member image, rescans under the final bracket, services the
+    // requested epoch, and republishes consistent revisions without
+    // any refusal. The stopped child cannot change its mappings, so
+    // the pins are acquisition count, epoch service, and revisions.
+    let mut scene = ScopedNativeScene::new();
+    let script: Vec<_> = (1..=10).map(|generation| (generation, 41, 1)).collect();
+    let acquired = scene.set_scripted_acquisition(&script);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let owner = scene
+        .coordinator
+        .owner_of(scene.caller)
+        .expect("the stable member activates");
+    assert_eq!(acquired.borrow().calls(), 5);
+    let epochs = scene
+        .coordinator
+        .engine
+        .inventory_owner_epochs(owner)
+        .unwrap();
+    assert_eq!((epochs.requested, epochs.serviced), (0, 0));
+
+    let pid = scene.child_id();
+    let (completion, receipt, reads) = scene.commit_observed_pass(None, pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(
+        scene.coordinator.owner_of(scene.caller),
+        Some(owner),
+        "refresh keeps the same owner"
+    );
+    assert_eq!(
+        acquired.borrow().calls(),
+        10,
+        "refresh re-acquires before the final sample"
+    );
+    let epochs = scene
+        .coordinator
+        .engine
+        .inventory_owner_epochs(owner)
+        .unwrap();
+    assert_eq!(
+        (epochs.requested, epochs.serviced),
+        (1, 1),
+        "the requested refresh epoch is serviced, none pending"
+    );
+    assert_eq!(
+        epochs.image_state,
+        super::super::inventory::ImageCheck::Exact
+    );
+    assert!(
+        epochs.complete.is_some(),
+        "refresh commits a complete receipt"
+    );
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| gap.subject != REFRESH_REFUSED_SUBJECT),
+        "a healthy refresh refuses nothing"
+    );
+    assert_no_suspended_gap(&scene);
+    assert_eq!(staged_counts(&scene), (1, 0, 0));
+    assert_eq!(reads.post_sample, 0, "refresh reads nothing post-sample");
+    assert_eq!(
+        receipt.engine_facts, receipt.engine_published,
+        "refresh revisions publish"
+    );
+    scene.assert_conserved_physical_use();
+}
+
+#[test]
+fn cgroup_native_owner_refresh_migration_refuses_without_commit() {
+    // Migration-out while the commit runs: refresh preparation ran,
+    // but the final sample grants no permit, so nothing commits, the
+    // owner and its facts stand, the refusal names the permit, and
+    // no provider metadata is read after the sample. The incomplete
+    // transaction suspends nobody.
+    let mut scene = ScopedNativeScene::new();
+    let script: Vec<_> = (1..=10).map(|generation| (generation, 41, 1)).collect();
+    let acquired = scene.set_scripted_acquisition(&script);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let owner = scene
+        .coordinator
+        .owner_of(scene.caller)
+        .expect("the stable member activates");
+
+    let pid = scene.child_id();
+    let (completion, _receipt, reads) =
+        scene.commit_observed_pass(None, pid, PassAction::MigrateOut);
+    assert!(matches!(
+        completion.outcome,
+        ScopedCollectionOutcome::Incomplete(_)
+    ));
+    assert_eq!(
+        scene.coordinator.owner_of(scene.caller),
+        Some(owner),
+        "the owner stands across a refused refresh"
+    );
+    assert_eq!(
+        acquired.borrow().calls(),
+        10,
+        "refresh preparation ran before the sample"
+    );
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == REFRESH_REFUSED_SUBJECT
+                && gap.caller == Some(scene.caller)
+                && gap.pid == Some(pid)
+                && gap.module.is_none()
+                && gap.budget.is_none()
+                && gap.reason.contains("final-sample permit")
+        }),
+        "the permitless refresh refuses by name: {:?}",
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_no_suspended_gap(&scene);
+    assert_eq!(staged_counts(&scene), (1, 0, 0));
+    let epochs = scene
+        .coordinator
+        .engine
+        .inventory_owner_epochs(owner)
+        .unwrap();
+    assert_eq!(
+        epochs.image_state,
+        super::super::inventory::ImageCheck::Exact,
+        "prior exact facts are retained"
+    );
+    assert_eq!(reads.post_sample, 0, "no post-sample provider reads");
+    scene.assert_conserved_physical_use();
+}
+
+#[test]
+fn cgroup_native_owner_refresh_replay_mismatch_refuses_without_publication() {
+    // The stored refresh observation names a changed exec while the
+    // preparation's fresh checks match, so the commit replay refuses:
+    // no new facts publish for the owner, the refusal names the
+    // changed image, native authority cancels, and the owner
+    // suspends in the same complete pass.
+    let mut scene = ScopedNativeScene::new();
+    let acquired = scene.set_scripted_acquisition(&[
+        (1, 41, 1),
+        (2, 41, 1),
+        (3, 41, 1),
+        (4, 41, 1),
+        (5, 41, 1),
+        (6, 41, 2),
+        (7, 41, 1),
+        (8, 41, 1),
+        (9, 41, 1),
+        (10, 41, 1),
+    ]);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let owner = scene
+        .coordinator
+        .owner_of(scene.caller)
+        .expect("the stable member activates");
+    let facts_before = scene.engine_module_facts();
+
+    let pid = scene.child_id();
+    let (completion, receipt, reads) = scene.commit_observed_pass(None, pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(acquired.borrow().calls(), 10, "refresh fully prepared");
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == REFRESH_REFUSED_SUBJECT
+                && gap.caller == Some(scene.caller)
+                && gap.pid == Some(pid)
+                && gap.reason.contains("refresh commit failed")
+                && gap.reason.contains("Changed")
+        }),
+        "the replay mismatch refuses by name: {:?}",
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        scene.coordinator.owner_of(scene.caller),
+        None,
+        "the changed image suspends its owner"
+    );
+    assert_suspended_gap(&scene, scene.caller, pid, SUSPENDED_EXEC_REASON);
+    assert_eq!(
+        scene
+            .coordinator
+            .adapter()
+            .record(scene.caller)
+            .unwrap()
+            .authority,
+        ImageAuthority::ScanPinned,
+        "native authority cancels back to the fallback"
+    );
+    let facts_after = scene.engine_module_facts();
+    assert!(
+        facts_after.is_subset(&facts_before),
+        "the refused refresh publishes no new facts: {facts_after:?}"
+    );
+    assert!(
+        facts_after.iter().all(|(view, _)| *view != owner.0),
+        "the released owner retains no engine facts"
+    );
+    assert_eq!(staged_counts(&scene), (0, 0, 0));
+    assert_eq!(reads.post_sample, 0, "no post-sample provider reads");
+    assert_eq!(
+        receipt.engine_facts, receipt.engine_published,
+        "the refusal publishes the dirtied revisions"
+    );
+    scene.assert_conserved_physical_use();
+}
+
+#[test]
+fn cgroup_native_owner_activation_precedes_refresh_in_one_transaction() {
+    // One scoped commit per transaction, shared by activation and
+    // refresh with activations first: the race pass activates the
+    // early member, the follow-up activates the late member while
+    // the early owner's refresh waits silently, and only then do
+    // refreshes land, stalest owner first, one per pass, with the
+    // other owner's facts intact throughout.
+    let mut scene = ScopedNativeScene::new();
+    let provider_a = scene.dir.path().join("scoped-provider.so");
+    let provider_b = scene.build_second_provider();
+    scene
+        .coordinator
+        .engine
+        .module_hints
+        .push(provider_b.clone());
+    let second_child = scene.spawn_second_child_with_provider("ready-b", &provider_b);
+    let (second_caller, second_pid, _) =
+        scene.admit_and_settle_distinct_member(second_child, &provider_b, 42, 11);
+    let first_pid = scene.child_id();
+    let first_caller = scene.caller;
+    let first_member_first = first_pid < second_pid;
+    let (early_caller, early_pid, early_ticket) = if first_member_first {
+        (first_caller, first_pid, 41)
+    } else {
+        (second_caller, second_pid, 42)
+    };
+    let (late_caller, late_pid, late_ticket) = if first_member_first {
+        (second_caller, second_pid, 42)
+    } else {
+        (first_caller, first_pid, 41)
+    };
+    // Preparation order per pass: race (early, late), follow-up
+    // (late activation only), refresh pass (early, late), stalest
+    // refresh pass (late, early). Five acquisitions each.
+    let mut script = Vec::new();
+    let mut generation = 1u64;
+    for ticket in [
+        early_ticket,
+        late_ticket,
+        late_ticket,
+        early_ticket,
+        late_ticket,
+        late_ticket,
+        early_ticket,
+    ] {
+        for _ in 0..5 {
+            script.push((generation, ticket, 1));
+            generation += 1;
+        }
+    }
+    let acquired = scene.set_scripted_acquisition(&script);
+
+    let (completion, _, _) =
+        scene.commit_observed_pass(Some(early_caller), early_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let early_owner = scene
+        .coordinator
+        .owner_of(early_caller)
+        .expect("the early member activates in the race pass");
+    assert_eq!(scene.coordinator.owner_of(late_caller), None);
+    assert_eq!(acquired.borrow().calls(), 10);
+
+    let (completion, _, _) =
+        scene.commit_observed_pass(Some(late_caller), late_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let late_owner = scene
+        .coordinator
+        .owner_of(late_caller)
+        .expect("the late member activates on the follow-up pass");
+    assert_eq!(
+        acquired.borrow().calls(),
+        15,
+        "the activation pass spends no acquisition on the waiting refresh"
+    );
+    let epochs = scene
+        .coordinator
+        .engine
+        .inventory_owner_epochs(early_owner)
+        .unwrap();
+    assert_eq!(
+        (epochs.requested, epochs.serviced),
+        (0, 0),
+        "the deferred refresh was not requested or serviced"
+    );
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| gap.subject != REFRESH_REFUSED_SUBJECT),
+        "refresh deferral is silent"
+    );
+    let facts_activated = scene.engine_module_facts();
+
+    // Refresh pass: both prepare, the early owner commits, the late
+    // owner's prepared refresh abandons silently with its epoch
+    // pending and its staged state fully released.
+    let (completion, receipt, _) = scene.commit_observed_pass(None, early_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(
+        acquired.borrow().calls(),
+        25,
+        "both owners prepared a refresh"
+    );
+    let epochs = scene
+        .coordinator
+        .engine
+        .inventory_owner_epochs(early_owner)
+        .unwrap();
+    assert_eq!((epochs.requested, epochs.serviced), (1, 1));
+    let epochs = scene
+        .coordinator
+        .engine
+        .inventory_owner_epochs(late_owner)
+        .unwrap();
+    assert_eq!(
+        (epochs.requested, epochs.serviced),
+        (1, 0),
+        "the second prepared refresh stays pending"
+    );
+    assert_eq!(
+        staged_counts(&scene),
+        (2, 0, 0),
+        "no lease survives deferral"
+    );
+    assert!(
+        facts_activated
+            .iter()
+            .all(|fact| scene.engine_module_facts().contains(fact)),
+        "the refresh commit keeps both owners' facts"
+    );
+    assert_eq!(receipt.engine_facts, receipt.engine_published);
+
+    // Stalest first: the late owner's pending refresh lands next.
+    let (completion, _, _) = scene.commit_observed_pass(None, late_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(acquired.borrow().calls(), 35);
+    let epochs = scene
+        .coordinator
+        .engine
+        .inventory_owner_epochs(late_owner)
+        .unwrap();
+    assert_eq!(
+        epochs.requested, epochs.serviced,
+        "the pending refresh landed"
+    );
+    assert!(epochs.serviced >= 1);
+    assert_eq!(staged_counts(&scene), (2, 0, 0));
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| gap.subject != REFRESH_REFUSED_SUBJECT),
+        "no refresh refused across the sharing passes"
+    );
+    assert_no_suspended_gap(&scene);
+    let (early_provider, late_provider) = if first_member_first {
+        (&provider_a, &provider_b)
+    } else {
+        (&provider_b, &provider_a)
+    };
+    assert_eq!(
+        scene.engine_module_views_for(early_provider),
+        BTreeSet::from([early_owner.0])
+    );
+    assert_eq!(
+        scene.engine_module_views_for(late_provider),
+        BTreeSet::from([late_owner.0])
+    );
+}
+
+#[test]
+fn cgroup_native_owner_refresh_exec_cancels_authority_and_suspends() {
+    // Every fresh observation names the changed exec, so the refresh
+    // scan veto fires during preparation: the refusal names the
+    // changed image, authority cancels to scan-pinned, the owner
+    // releases in the same complete pass, and the caller stays a
+    // live scan-pinned member for its new image.
+    let mut scene = ScopedNativeScene::new();
+    let acquired = scene.set_scripted_acquisition(&[
+        (1, 41, 1),
+        (2, 41, 1),
+        (3, 41, 1),
+        (4, 41, 1),
+        (5, 41, 1),
+        (6, 41, 2),
+        (7, 41, 2),
+    ]);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert!(scene.coordinator.owner_of(scene.caller).is_some());
+
+    let pid = scene.child_id();
+    let (completion, receipt, reads) = scene.commit_observed_pass(None, pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(
+        acquired.borrow().calls(),
+        7,
+        "the veto fires at the first refresh scan check"
+    );
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == REFRESH_REFUSED_SUBJECT
+                && gap.caller == Some(scene.caller)
+                && gap.pid == Some(pid)
+                && gap.reason.contains("refresh scan failed")
+                && gap.reason.contains("Changed")
+        }),
+        "the exec veto refuses by name: {:?}",
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(scene.coordinator.owner_of(scene.caller), None);
+    assert_suspended_gap(&scene, scene.caller, pid, SUSPENDED_EXEC_REASON);
+    assert_eq!(
+        scene
+            .coordinator
+            .adapter()
+            .record(scene.caller)
+            .unwrap()
+            .authority,
+        ImageAuthority::ScanPinned,
+        "the successor image starts scan-pinned"
+    );
+    assert_eq!(
+        scene.coordinator.adapter().live_id(pid),
+        Some(scene.caller),
+        "the caller stays live under its new image"
+    );
+    assert_eq!(staged_counts(&scene), (0, 0, 0));
+    assert_eq!(reads.post_sample, 0, "no post-sample provider reads");
+    assert_eq!(
+        receipt.engine_facts, receipt.engine_published,
+        "the refusal publishes the dirtied revisions"
+    );
+    scene.assert_conserved_physical_use();
+}
+
+#[test]
+fn cgroup_native_owner_refresh_incomplete_transaction_abandons_prepared_state() {
+    // A permitted owner's prepared refresh in an incomplete
+    // transaction abandons silently: no commit, no suspend, the
+    // staged flag and lease fully release (the next complete pass
+    // refreshes normally), and the requested epoch stays pending
+    // until that landing pass services it.
+    let mut scene = ScopedNativeScene::new();
+    let script: Vec<_> = (1..=20).map(|generation| (generation, 41, 1)).collect();
+    let acquired = scene.set_scripted_acquisition(&script);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let owner = scene
+        .coordinator
+        .owner_of(scene.caller)
+        .expect("the stable member activates");
+    let first_pid = scene.child_id();
+
+    // Admit an unsettled sibling: it has no binder image, so its
+    // activation preparation vetoes before any acquisition and the
+    // first owner's refresh carries the passes below.
+    let second_child = scene.spawn_second_child("ready-b");
+    let second_pid = second_child.id();
+    scene.extra_children.push(second_child);
+    scene.rewrite_membership(&[first_pid, second_pid]);
+    let (completion, _, _) = scene.commit_observed_pass(None, second_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(completion.admitted, 1, "the sibling is admitted");
+    assert_eq!(
+        acquired.borrow().calls(),
+        10,
+        "the first owner refreshed on the admission pass"
+    );
+    let epochs = scene
+        .coordinator
+        .engine
+        .inventory_owner_epochs(owner)
+        .unwrap();
+    assert_eq!((epochs.requested, epochs.serviced), (1, 1));
+
+    // Incomplete pass: the owner keeps its permit while the sibling
+    // migrates out during provider retention.
+    let (completion, _, _) =
+        scene.commit_observed_pass(None, first_pid, PassAction::RetainOnly(first_pid));
+    assert!(matches!(
+        completion.outcome,
+        ScopedCollectionOutcome::Incomplete(_)
+    ));
+    assert_eq!(scene.coordinator.owner_of(scene.caller), Some(owner));
+    assert_eq!(
+        acquired.borrow().calls(),
+        15,
+        "the refresh prepared before the fence refused"
+    );
+    let epochs = scene
+        .coordinator
+        .engine
+        .inventory_owner_epochs(owner)
+        .unwrap();
+    assert_eq!(
+        (epochs.requested, epochs.serviced),
+        (2, 1),
+        "the abandoned request stays pending"
+    );
+    assert_eq!(staged_counts(&scene), (1, 0, 0), "flag and lease released");
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| gap.subject != REFRESH_REFUSED_SUBJECT),
+        "the fence abandon is silent"
+    );
+    assert_no_suspended_gap(&scene);
+
+    // Landing pass over the retained membership: refresh commits.
+    let completion = scene.commit_membership_pass_for(None, first_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(acquired.borrow().calls(), 20);
+    let epochs = scene
+        .coordinator
+        .engine
+        .inventory_owner_epochs(owner)
+        .unwrap();
+    assert_eq!(
+        (epochs.requested, epochs.serviced),
+        (3, 3),
+        "the landing pass services the pending refresh"
+    );
+    assert_eq!(staged_counts(&scene), (1, 0, 0));
+}
+
+#[test]
+fn cgroup_native_owner_gap_reasons_carry_no_ticket_or_image_values() {
+    // Privacy: across the standing, refusal, and suspend
+    // disclosures one scene emits, reasons carry no scripted ticket
+    // (41), cookie, or image values, and every gap's field shape
+    // matches its subject's contract exactly.
+    let mut scene = ScopedNativeScene::new();
+    let _acquired = scene.set_scripted_acquisition(&[
+        (1, 41, 1),
+        (2, 41, 1),
+        (3, 41, 1),
+        (4, 41, 1),
+        (5, 41, 1),
+        (6, 41, 2),
+        (7, 41, 2),
+    ]);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let pid = scene.child_id();
+    let (completion, _, _) = scene.commit_observed_pass(None, pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+
+    let designed = [
+        UNAVAILABLE_SUBJECT,
+        REFRESH_REFUSED_SUBJECT,
+        SUSPENDED_SUBJECT,
+        "native owner activation refused",
+        "engine tail revision failed",
+    ];
+    let gaps = scene.coordinator.registry().gaps();
+    for subject in [
+        UNAVAILABLE_SUBJECT,
+        REFRESH_REFUSED_SUBJECT,
+        SUSPENDED_SUBJECT,
+    ] {
+        assert!(
+            gaps.iter().any(|gap| gap.subject == subject),
+            "the scene emitted {subject}"
+        );
+    }
+    for gap in gaps
+        .iter()
+        .filter(|gap| designed.contains(&gap.subject.as_str()))
+    {
+        assert!(
+            !gap.reason.contains("41") && !gap.reason.contains("ticket"),
+            "gap reason leaks scripted image values: {} / {}",
+            gap.subject,
+            gap.reason
+        );
+        if gap.subject == UNAVAILABLE_SUBJECT || gap.subject == "engine tail revision failed" {
+            assert_eq!(
+                (gap.caller, gap.module, gap.pid, gap.budget),
+                (None, None, None, None),
+                "{} names nothing",
+                gap.subject
+            );
+        } else {
+            assert!(
+                gap.caller.is_some() && gap.pid.is_some(),
+                "{} names its caller and pid",
+                gap.subject
+            );
+            assert_eq!(
+                (gap.module, gap.budget),
+                (None, None),
+                "{} names no module or budget",
+                gap.subject
+            );
+        }
+    }
+}
+
+#[test]
+fn cgroup_native_owner_suspends_absent_member_and_keeps_other_owner() {
+    // Suspend on absence: both members activate, then a complete
+    // pass over membership without the first member cancels its
+    // authority back to scan-pinned, releases its owner with the
+    // exact suspended gap, and keeps the second owner's facts (the
+    // second owner refreshes on that same pass).
+    let mut scene = ScopedNativeScene::new();
+    let provider = scene.dir.path().join("scoped-provider.so");
+    let second_child = scene.spawn_second_child("ready-b");
+    let (second_caller, second_pid, _) = scene.admit_and_settle_second_member(second_child, 42, 11);
+    let first_pid = scene.child_id();
+    let first_caller = scene.caller;
+    let (early_ticket, late_ticket) = if first_pid < second_pid {
+        (41, 42)
+    } else {
+        (42, 41)
+    };
+    let mut script = Vec::new();
+    let mut generation = 1u64;
+    for ticket in [early_ticket, late_ticket, late_ticket, 42] {
+        for _ in 0..5 {
+            script.push((generation, ticket, 1));
+            generation += 1;
+        }
+    }
+    let acquired = scene.set_scripted_acquisition(&script);
+    let (early_caller, early_pid) = if first_pid < second_pid {
+        (first_caller, first_pid)
+    } else {
+        (second_caller, second_pid)
+    };
+    let (late_caller, late_pid) = if first_pid < second_pid {
+        (second_caller, second_pid)
+    } else {
+        (first_caller, first_pid)
+    };
+    let (completion, _, _) =
+        scene.commit_observed_pass(Some(early_caller), early_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let (completion, _, _) =
+        scene.commit_observed_pass(Some(late_caller), late_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let first_owner = scene
+        .coordinator
+        .owner_of(first_caller)
+        .expect("first active");
+    let second_owner = scene
+        .coordinator
+        .owner_of(second_caller)
+        .expect("second active");
+    assert_eq!(acquired.borrow().calls(), 15);
+    assert_eq!(staged_counts(&scene), (2, 0, 0));
+
+    scene.rewrite_membership(&[second_pid]);
+    let completion = scene.commit_membership_pass_for(None, second_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(
+        scene.coordinator.owner_of(first_caller),
+        None,
+        "the absent member's owner releases"
+    );
+    assert_suspended_gap(&scene, first_caller, first_pid, SUSPENDED_ABSENT_REASON);
+    assert_eq!(
+        scene
+            .coordinator
+            .adapter()
+            .record(first_caller)
+            .unwrap()
+            .authority,
+        ImageAuthority::ScanPinned,
+        "the migrated-out caller falls back to scan-pinned"
+    );
+    assert_eq!(
+        scene.coordinator.owner_of(second_caller),
+        Some(second_owner),
+        "the resident owner is untouched"
+    );
+    assert_eq!(
+        scene.engine_module_views_for(&provider),
+        BTreeSet::from([second_owner.0]),
+        "only the resident owner's facts remain"
+    );
+    assert!(
+        scene
+            .engine_module_facts()
+            .iter()
+            .all(|(view, _)| *view != first_owner.0),
+        "the suspended owner retains no facts"
+    );
+    assert_eq!(staged_counts(&scene), (1, 0, 0), "capacity returns");
+    assert_eq!(
+        acquired.borrow().calls(),
+        20,
+        "the resident owner refreshed on the suspend pass"
+    );
+}
+
+#[test]
+fn cgroup_native_owner_suspends_retired_member_and_keeps_history() {
+    // Suspend on death: the activated child dies and a successor
+    // generation is admitted in a complete pass; the dead caller's
+    // owner releases with the retired suspended gap while its
+    // settled witness row stays bound for history.
+    let mut scene = ScopedNativeScene::new();
+    let script: Vec<_> = (1..=5).map(|generation| (generation, 41, 1)).collect();
+    let acquired = scene.set_scripted_acquisition(&script);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert!(scene.coordinator.owner_of(scene.caller).is_some());
+    assert_eq!(staged_counts(&scene), (1, 0, 0));
+
+    let dead_pid = scene.kill_child();
+    let successor = scene.spawn_second_child("ready-b");
+    let successor_pid = successor.id();
+    scene.child = Some(successor);
+    scene.rewrite_membership(&[successor_pid]);
+    let completion = scene.commit_membership_pass_for(None, successor_pid, PassAction::Stable);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(completion.admitted, 1);
+    assert!(
+        scene
+            .coordinator
+            .adapter()
+            .record(scene.caller)
+            .unwrap()
+            .retired,
+        "the dead generation retires"
+    );
+    assert_eq!(scene.coordinator.owner_of(scene.caller), None);
+    assert_suspended_gap(&scene, scene.caller, dead_pid, SUSPENDED_RETIRED_REASON);
+    assert_eq!(
+        scene.coordinator.registry().witness_census().bound,
+        1,
+        "the settled row stays bound for history"
+    );
+    assert_eq!(staged_counts(&scene), (0, 0, 0), "capacity returns");
+    assert_eq!(acquired.borrow().calls(), 5, "suspend acquires nothing");
+    let successor_caller = scene
+        .coordinator
+        .adapter()
+        .live_id(successor_pid)
+        .expect("the successor is admitted");
+    assert_eq!(scene.coordinator.owner_of(successor_caller), None);
+}
+
+#[test]
+fn cgroup_native_owner_incomplete_pass_never_suspends() {
+    // A failed collection proves no absence: the member migrates
+    // out mid-commit, the transaction is incomplete, and the owner
+    // stands unsuspended even though its refresh prepared and was
+    // refused for want of a permit.
+    let mut scene = ScopedNativeScene::new();
+    let script: Vec<_> = (1..=10).map(|generation| (generation, 41, 1)).collect();
+    let acquired = scene.set_scripted_acquisition(&script);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let owner = scene.coordinator.owner_of(scene.caller).expect("active");
+
+    let pid = scene.child_id();
+    let (completion, _, _) = scene.commit_observed_pass(None, pid, PassAction::MigrateOut);
+    assert!(matches!(
+        completion.outcome,
+        ScopedCollectionOutcome::Incomplete(_)
+    ));
+    assert_eq!(
+        acquired.borrow().calls(),
+        10,
+        "the refresh reached the suspend decision point"
+    );
+    assert_eq!(
+        scene.coordinator.owner_of(scene.caller),
+        Some(owner),
+        "an incomplete pass retains the owner"
+    );
+    assert_no_suspended_gap(&scene);
+    assert_eq!(staged_counts(&scene), (1, 0, 0));
+}
+
+#[test]
+fn cgroup_native_owner_migration_back_in_reactivates_fresh() {
+    // Migration out suspends to scan-pinned; migration back in is
+    // an ordinary fresh activation: a new owner id, exact authority
+    // re-proved through scripted acquisition, and no reuse of the
+    // released owner's state.
+    let mut scene = ScopedNativeScene::new();
+    let script: Vec<_> = (1..=10).map(|generation| (generation, 41, 1)).collect();
+    let acquired = scene.set_scripted_acquisition(&script);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let first_owner = scene.coordinator.owner_of(scene.caller).expect("active");
+    let pid = scene.child_id();
+
+    scene.rewrite_membership(&[]);
+    let completion = scene.commit_rewritten_membership_pass();
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    assert_eq!(scene.coordinator.owner_of(scene.caller), None);
+    assert_suspended_gap(&scene, scene.caller, pid, SUSPENDED_ABSENT_REASON);
+    assert_eq!(
+        scene
+            .coordinator
+            .adapter()
+            .record(scene.caller)
+            .unwrap()
+            .authority,
+        ImageAuthority::ScanPinned
+    );
+    assert_eq!(staged_counts(&scene), (0, 0, 0));
+
+    scene.rewrite_membership(&[pid]);
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let second_owner = scene
+        .coordinator
+        .owner_of(scene.caller)
+        .expect("migration back in reactivates");
+    assert_ne!(
+        second_owner, first_owner,
+        "reactivation mints a fresh owner id"
+    );
+    assert!(matches!(
+        scene
+            .coordinator
+            .adapter()
+            .record(scene.caller)
+            .unwrap()
+            .authority,
+        ImageAuthority::NativeExact { .. }
+    ));
+    let epochs = scene
+        .coordinator
+        .engine
+        .inventory_owner_epochs(second_owner)
+        .unwrap();
+    assert_eq!(
+        epochs.image_state,
+        super::super::inventory::ImageCheck::Exact
+    );
+    assert_eq!((epochs.requested, epochs.serviced), (0, 0));
+    assert_eq!(acquired.borrow().calls(), 10);
+    assert_eq!(staged_counts(&scene), (1, 0, 0));
+}
+
+#[test]
+fn cgroup_native_owner_suspend_cycles_conserve_capacity() {
+    // Repeated activate/suspend cycles return owner, reservation,
+    // and lease counts to baseline every cycle, and a fresh
+    // activation still succeeds afterwards with live pin claims:
+    // suspend leaks no retained capacity.
+    let mut scene = ScopedNativeScene::new();
+    assert_eq!(staged_counts(&scene), (0, 0, 0), "baseline");
+    let script: Vec<_> = (1..=20).map(|generation| (generation, 41, 1)).collect();
+    let acquired = scene.set_scripted_acquisition(&script);
+    let pid = scene.child_id();
+
+    for cycle in 0..3 {
+        let completion = scene.commit_membership_pass(false);
+        assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+        assert!(
+            scene.coordinator.owner_of(scene.caller).is_some(),
+            "cycle {cycle}: activation succeeds"
+        );
+        assert_eq!(staged_counts(&scene), (1, 0, 0), "cycle {cycle}: one owner");
+        scene.rewrite_membership(&[]);
+        let completion = scene.commit_rewritten_membership_pass();
+        assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+        assert_eq!(
+            scene.coordinator.owner_of(scene.caller),
+            None,
+            "cycle {cycle}: suspend releases"
+        );
+        assert_eq!(
+            staged_counts(&scene),
+            (0, 0, 0),
+            "cycle {cycle}: counts return to baseline"
+        );
+        scene.rewrite_membership(&[pid]);
+    }
+
+    let completion = scene.commit_membership_pass(false);
+    assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+    let owner = scene
+        .coordinator
+        .owner_of(scene.caller)
+        .expect("activation still succeeds after the cycles");
+    let claims = scene
+        .coordinator
+        .engine
+        .pinned
+        .view_claims(owner)
+        .expect("the fresh owner retains pin claims");
+    assert!(
+        !claims.pins.is_empty() || !claims.tables.is_empty() || !claims.targets.is_empty(),
+        "claim capacity is conserved"
+    );
+    assert_eq!(acquired.borrow().calls(), 20);
+    assert_eq!(staged_counts(&scene), (1, 0, 0));
 }

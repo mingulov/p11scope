@@ -536,6 +536,104 @@ fn llvm_function_insns(disassembly: &str, name: &str) -> Option<usize> {
     found.then_some(count)
 }
 
+/// F1: the loader producer selects its path before reserving.
+/// `dl_debug_state_impl` holds no ring reservation across the
+/// token/legacy branch: the token arm returns before any reserve, and
+/// each arm reserves inside its own emitter. The old shape reserved a
+/// legacy entry and leaked it on every token hit (neither submitted nor
+/// discarded). This pins the source shape in CI; the compiled cfg-on
+/// shape is proven by the repeatable LLVM procedure in the P1 repair
+/// evidence (disassemble the unlinked cfg-on bitcode and show the impl
+/// holds no reserve call), and the cfg-on root enters the later
+/// verifier lane before activation.
+#[test]
+fn cfgon_producer_selects_path_before_reserving() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let source = std::fs::read_to_string(format!("{manifest}/crates/ebpf/src/main.rs"))
+        .expect("BPF producer source must exist");
+    let marker = "fn dl_debug_state_impl(ctx: ProbeContext) -> u32 {";
+    let mut occurrences = source.match_indices(marker);
+    let (start, _) = occurrences.next().expect("producer impl must exist");
+    assert!(
+        occurrences.next().is_none(),
+        "producer impl marker must be unique"
+    );
+    let body = brace_matched_body(&source[start + marker.len() - 1..]);
+    assert!(
+        body.contains("loader_gate_latched_for_producer"),
+        "impl must select the token path on the latch:\n{body}"
+    );
+    assert!(
+        !body.contains("reserve_discovery"),
+        "impl must hold no reservation across the branch:\n{body}"
+    );
+}
+
+/// Extract one brace-matched `{...}` body, skipping line comments, block
+/// comments and string literals so braces inside them cannot miscount.
+/// Fails closed on char-literal braces and unterminated input: the test
+/// must break loudly, never miscount silently.
+fn brace_matched_body(text: &str) -> String {
+    let bytes = text.as_bytes();
+    assert!(
+        !bytes.is_empty() && bytes[0] == b'{',
+        "body must open a brace"
+    );
+    let mut depth = 0usize;
+    let mut end = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied().unwrap_or(0);
+        if byte == b'/' && next == b'/' {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && next == b'*' {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            assert!(index + 1 < bytes.len(), "unterminated block comment");
+            index += 2;
+            continue;
+        }
+        if byte == b'"' {
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index += 2;
+                    continue;
+                }
+                if bytes[index] == b'"' {
+                    break;
+                }
+                index += 1;
+            }
+            assert!(index < bytes.len(), "unterminated string literal");
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' {
+            panic!("char literal in producer body: extend the matcher");
+        }
+        if byte == b'{' {
+            depth += 1;
+        } else if byte == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(index + 1);
+                break;
+            }
+        }
+        index += 1;
+    }
+    let end = end.expect("producer body must close its brace");
+    text[..end].to_owned()
+}
+
 /// Verifier-cost probe for the loader/image producer: disassemble the
 /// gate-enabled unit bitcode, count LLVM instructions in the touched
 /// BPF functions, and score the total against the existing loader-root

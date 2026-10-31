@@ -3647,7 +3647,12 @@ fn object_journal_end_writer_refuses_unknown_flags_without_writing() {
                     flags,
                     pad: 0,
                 };
-                unsafe { root_writers::initialize_end(storage.as_mut_ptr(), &words, absent) };
+                let wrote =
+                    unsafe { root_writers::initialize_end(storage.as_mut_ptr(), &words, absent) };
+                assert!(
+                    !wrote,
+                    "flags {flags:#x} absent={absent} thread={thread} seq={sequence} must refuse"
+                );
                 let bytes = unsafe {
                     std::slice::from_raw_parts(
                         storage.as_ptr().cast::<u8>(),
@@ -3691,7 +3696,9 @@ fn object_journal_end_writer_refuses_unknown_flags_without_writing() {
                 flags,
                 pad: 0,
             };
-            unsafe { root_writers::initialize_end(storage.as_mut_ptr(), &words, absent) };
+            let wrote =
+                unsafe { root_writers::initialize_end(storage.as_mut_ptr(), &words, absent) };
+            assert!(wrote, "flags {flags:#x} absent={absent} must initialize");
             let bytes = unsafe {
                 std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), JOURNAL_END_FULL_BYTES)
             };

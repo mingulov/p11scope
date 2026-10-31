@@ -13933,7 +13933,8 @@ exit 0
         // path refused (zero/mismatch/cross-domain) records its gap, mints
         // nothing, retires nothing, and keeps the provider observation
         // useful (S1 intact). The marker half of this twin lives in
-        // semantic_capture/tests.rs: the marker row stays un-READY-able.
+        // the semantic-capture tests module: the marker row stays
+        // un-READY-able.
         let foreign = NativeDomainId::mint();
         for (binding, setup) in [
             (0u64, "zero ticket performs no lookup"),

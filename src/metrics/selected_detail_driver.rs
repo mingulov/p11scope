@@ -2826,7 +2826,6 @@ mod tests {
                 &scene.pool,
             )
             .expect("reselect reserves after the terminal close");
-
     }
 
     #[test]

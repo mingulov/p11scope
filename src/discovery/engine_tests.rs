@@ -37368,6 +37368,9 @@ fn pressure_services_unprotected_request_before_original_head() {
     oracle.frame_work_budget_ns = u64::MAX;
     let oracle_pid = oracle.views[0].pid();
     let mut oracle_peers: Vec<u32> = (0..2).map(|_| oracle_fixture.spawn_peer()).collect();
+    // Exact work equality needs identical maps censuses: a deep scan
+    // charges per maps line, and settled peers can differ by one line.
+    let oracle_census = align_peer_census(&mut oracle_fixture, &mut oracle_peers, None);
     oracle_peers.sort_unstable();
     let (oracle_decoy, oracle_peer) = (oracle_peers[0], oracle_peers[1]);
     for (index, peer) in oracle_peers.iter().enumerate() {
@@ -37503,6 +37506,11 @@ fn pressure_services_unprotected_request_before_original_head() {
     engine.frame_work_budget_ns = u64::MAX;
     let pid = engine.views[0].pid();
     let mut peers: Vec<u32> = (0..2).map(|_| fixture.spawn_peer()).collect();
+    assert_eq!(
+        align_peer_census(&mut fixture, &mut peers, Some(&oracle_census)),
+        oracle_census,
+        "both engines measure peers with the oracle maps census"
+    );
     peers.sort_unstable();
     for peer in &peers {
         wait_peer_mapped(*peer, "seed-provider.so");

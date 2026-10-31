@@ -375,6 +375,13 @@ def chain(key, path=()):
     cost, subpath = max(paths, default=(0, ()))
     return frame(key) + cost, (names.get(key, bodies[key][0]),) + subpath
 
+def depth(key, path=()):
+    assert key not in path, 'recursive journal BPF graph'
+    kids = children(key)
+    if not kids:
+        return 1
+    return 1 + max(depth(child, path + (key,)) for child in kids)
+
 # Synthetic control: a 9-frame low-stack branch beside a 3-frame high-stack
 # branch. chain() selects by stack cost, so its path length cannot prove the
 # frame bound; depth() must report the deep branch independently. The real
@@ -515,7 +522,9 @@ for name, required in {
     cost, path = chain(root)
     assert cost <= 480, f'{name} stack chain {cost} lacks >=5% headroom: {" > ".join(path)}'
     assert len(path) <= 8, f'{name} exceeds eight call frames: {path}'
-    print(f'{name}: stack-chain={cost}/512, path={" > ".join(path)}')
+    frames = depth(root)
+    assert frames <= 8, f'{name} call depth {frames} exceeds eight frames'
+    print(f'{name}: stack-chain={cost}/512, depth={frames}/8, path={" > ".join(path)}')
 for name in ('p11_entry', 'p11_return'):
     assert not any(symbol[0] == name for symbol in bodies.values()), \
         f'private ELF retained the inapplicable duplicate ordinary root {name}'
@@ -525,7 +534,10 @@ for root in programs:
     cost, path = chain(root)
     assert cost <= 480, f'exported {bodies[root][0]} chain {cost} lacks >=5% headroom: {" > ".join(path)}'
     assert len(path) <= 8, f'exported {bodies[root][0]} exceeds eight call frames'
-print(f'all {len(programs)} exported private-ELF program chains <=480/512 and <=8 frames')
+    frames = depth(root)
+    assert frames <= 8, f'exported {bodies[root][0]} call depth {frames} exceeds eight frames'
+    print(f'exported {bodies[root][0]}: stack-chain={cost}/512, depth={frames}/8, path={" > ".join(path)}')
+print(f'all {len(programs)} exported private-ELF program chains <=480/512 and depth <=8 frames')
 functions = [node for node in btf.types[1:] if node[0] == 12]
 assert functions
 for function in functions:

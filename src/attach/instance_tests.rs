@@ -2025,6 +2025,74 @@ fn privileged_instance_routing_separates_reload_sibling_and_mutation() -> Result
     Ok(())
 }
 
+/// Live marker twin: a sharer's global-only churn must taint the router
+/// end-to-end. Zero before the `v` step (negative control), then one
+/// tainted continuation and one tainted join after it. RED live while the
+/// router twins stay green means live epochs diverge from the router
+/// predicate — a finding, never a marker-widening license.
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_instance_b17_counters_observe_sharer_churn() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let provider = compile(directory.path(), true)?;
+    let driver = compile(directory.path(), false)?;
+    let mut target = Target::spawn(&driver, &["cmd".as_ref(), provider.as_os_str()], &[])?;
+    let ready = target.line(Duration::from_secs(10))?;
+    ensure!(ready.starts_with("READY"), "{ready}");
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    // Gen 0, three calls: one instance, no churn yet.
+    for _ in 0..3 {
+        target.command(b'c')?;
+    }
+    let a = single_join(&pump_until(&mut harness, &target, 3)?)?;
+    // Negative control: nothing global-only crossed the router yet.
+    let before = harness.capture.router().counters();
+    ensure!(
+        before.continued_across_global == 0 && before.joined_across_global == 0,
+        "marker counters nonzero before sharer churn: {before:?}"
+    );
+    // A CLONE_VM non-thread child mutating the provider in the shared mm:
+    // marked at fork, its mutations go to the file's global epoch only.
+    let shared_before = harness.session.instance_maps().counters()?;
+    let sharer = target.command(b'v')?;
+    ensure!(sharer == "SHARER", "{sharer}");
+    let shared_after = harness.session.instance_maps().counters()?;
+    ensure!(
+        shared_after.shared >= shared_before.shared + 2
+            && shared_after.global_bumps >= shared_before.global_bumps + 2
+            && shared_after.local_bumps == shared_before.local_bumps,
+        "CLONE_VM sharer was not globalized: {shared_before:?} -> {shared_after:?}"
+    );
+    // Continuation + one joined call: the same instance, now tainted.
+    target.command(b'c')?;
+    let after_sharer = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        after_sharer == a,
+        "a sharer's mutation did not continue the instance"
+    );
+    let counters = harness.capture.router().counters();
+    ensure!(
+        counters.continued_across_global >= 1,
+        "live global-only continuation left no marker: {counters:?}"
+    );
+    ensure!(
+        counters.joined_across_global >= 1,
+        "join through the tainted entry left no marker: {counters:?}"
+    );
+    ensure!(
+        counters.continued >= counters.continued_across_global,
+        "continued total below its global-only subset: {counters:?}"
+    );
+    let kernel = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "B17_COUNTERS a={a:?} after={after_sharer:?} counters={counters:?} kernel={kernel:?} scans={:?} minted={}",
+        harness.scan,
+        harness.capture.router().instances_minted()
+    );
+    Ok(())
+}
+
 /// Decision §3c mapping controls that reach the provider file: each must
 /// end the old incarnation (new ID) when witnessed, or keep it only when no
 /// witness event fired and the mapping set is unchanged; no

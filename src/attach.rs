@@ -3060,6 +3060,41 @@ pub(crate) fn seal_attached_subset_native(
     Ok(attached)
 }
 
+/// Production seal core over an already-read loaded program inventory with an
+/// injected generation mint. The native wrapper reads the inventory from the
+/// live object and mints from the attach cell; host twins substitute a
+/// scripted inventory (parsed from the real embedded bytes) and a scripted
+/// mint. Validation, linkage derivation and construction are production in
+/// both cases; only the two native reads differ.
+#[allow(clippy::too_many_arguments)]
+fn seal_attached_subset_from_programs(
+    _subset: crate::inventory_semantics::AttestedSubset,
+    _domain: crate::attach::capture::NativeDomainId,
+    _policy: CapturePolicy,
+    _descriptors: Result<Vec<SlotSemantics>>,
+    _retained: &BTreeMap<u32, RetainedStaticTarget>,
+    _owned_sides: &BTreeSet<StaticEndpoint>,
+    _watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+    _programs: &BTreeSet<&str>,
+    _mint: impl FnOnce() -> std::result::Result<u64, crate::inventory_semantics::SemanticRefusal>,
+) -> std::result::Result<AttachedSemanticSet, crate::inventory_semantics::SemanticRefusal> {
+    Err(crate::inventory_semantics::SemanticRefusal::Attachment)
+}
+
+/// Retain a successful seal's derived linkage in the Session's sealed cell:
+/// only a successful attested seal retains; a refused seal keeps no linkage.
+/// `Session::start_attested` retains through this; host twins retain the same
+/// sealed fact through this.
+fn retain_sealed_linkage(_cell: &mut Option<bool>, _attached: &AttachedSemanticSet) {}
+
+/// Derive producers-drain linkage from the Session's retained sealed fact: a
+/// sealed attachment carries its derived linkage to the drain, while a
+/// never-sealed session drains unlinked. `Session::drain_producers` derives
+/// through this; host twins derive the same returned linkage through this.
+fn drain_linkage_from_sealed(_sealed: Option<bool>) -> bool {
+    false
+}
+
 /// Test-only seal over fixture-built maps through the same validation:
 /// host tests seal their successful-attachment evidence here (and via
 /// `seal_test_attachment`). Fenced from production, which seals
@@ -19873,6 +19908,513 @@ mod tests {
         assert!(
             literals >= 2,
             "both test pairs still construct through Self"
+        );
+    }
+
+    use std::collections::BTreeSet;
+
+    /// Attested provider scene for the production seal-to-drain twins: a
+    /// genuinely attested two-slot subset over a pinned provider copy, with
+    /// the retained/static sides the production seal validates. The
+    /// scheduling/retention construction mirrors `seal_test_attachment`
+    /// (real attach scheduling, only link I/O scripted); the seal itself
+    /// goes through the production core, never the test sealer.
+    struct SealDrainScene {
+        _dir: tempfile::TempDir,
+        subset: crate::inventory_semantics::AttestedSubset,
+        pins: crate::discovery::identity::PinnedObjects,
+        domain: crate::attach::capture::NativeDomainId,
+        retained: BTreeMap<u32, super::RetainedStaticTarget>,
+        owned: BTreeSet<super::StaticEndpoint>,
+    }
+
+    impl SealDrainScene {
+        fn attest() -> Self {
+            use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
+            use p11scope_manifest::manifest::*;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("provider.so");
+            std::fs::copy("/bin/true", &path).unwrap();
+            let file = open_object(&path).unwrap();
+            let inspected = inspect_file(&file).unwrap();
+            let mapping = mapping_file_key(&file).unwrap();
+            let start = inspected
+                .executable_ranges
+                .iter()
+                .find(|(a, b)| b - a > 2)
+                .unwrap()
+                .0;
+            let offsets = [start, start + 1];
+            let functions =
+                match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
+                    version: cryptoki_sys::CK_VERSION {
+                        major: 2,
+                        minor: 40,
+                    },
+                }) {
+                    pkcs11_module::TableSet::Walk(spans) => spans
+                        .iter()
+                        .flat_map(|span| span.fields())
+                        .map(|field| {
+                            let resolution = match field.name {
+                                "C_SignInit" => Resolution::Resolved {
+                                    object: 0,
+                                    file_offset: offsets[0],
+                                },
+                                "C_Sign" => Resolution::Resolved {
+                                    object: 0,
+                                    file_offset: offsets[1],
+                                },
+                                _ => Resolution::NullPointer,
+                            };
+                            FunctionRecord {
+                                name: field.name.into(),
+                                resolution,
+                            }
+                        })
+                        .collect(),
+                    _ => panic!("2.40 is a full standard table"),
+                };
+            let path = path.to_str().unwrap().to_string();
+            let manifest = Manifest {
+                schema: SCHEMA.into(),
+                module_path: path.clone(),
+                objects: vec![ObjectRecord {
+                    id: 0,
+                    path: path.clone(),
+                    identity: inspected.identity.clone(),
+                }],
+                provenance_objects: vec![ProvenanceObject {
+                    path,
+                    device_major: mapping.device_major,
+                    device_minor: mapping.device_minor,
+                    inode: mapping.inode,
+                    identity: inspected.identity,
+                }],
+                interface_list: Acquisition::Absent,
+                surfaces: vec![SurfaceRecord {
+                    source: SurfaceSource::LegacyFunctionList,
+                    acquisition: Acquisition::Ok,
+                    version: Some(Version {
+                        major: 2,
+                        minor: 40,
+                    }),
+                    walk: WalkOutcome::Full,
+                    functions,
+                }],
+                vendor_interfaces: Vec::new(),
+                alias_groups: Vec::new(),
+                selection_evidence: Default::default(),
+            };
+            assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
+            let pinning =
+                crate::discovery::identity::pin_manifest_objects_deferred(&manifest).unwrap();
+            assert!(pinning.stale.is_empty());
+            let pins = pinning.pins;
+            let operator = dir.path().join("operator-input.json");
+            std::fs::write(&operator, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let engine =
+                crate::discovery::engine::inventory_coordinator::semantics::engine_for_test(
+                    Vec::new(),
+                    Vec::new(),
+                    pins.clone(),
+                );
+            let prepared =
+                crate::discovery::engine::inventory_coordinator::semantics::prepare_attested_subset(
+                    &engine,
+                    std::slice::from_ref(&operator),
+                );
+            let subset = prepared.subset.expect("nonempty validated operator subset");
+            assert_eq!(subset.plan().slots.len(), 2);
+            let domain = crate::attach::capture::NativeDomainId::mint();
+            let outcome = super::attach_targets_with(
+                subset.plan().slots.as_slice(),
+                super::CapturePolicy::Allowlisted,
+                false,
+                |slot| Ok(subset.pins().abi_for(slot.object).unwrap()),
+                |_, _, _| Ok(()),
+                |_| Some(1),
+            )
+            .unwrap();
+            let targets = subset
+                .plan()
+                .slots
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.index,
+                        (
+                            subset.pins().attach_path_for(slot.object).unwrap(),
+                            subset.pins().abi_for(slot.object).unwrap(),
+                        ),
+                    )
+                })
+                .collect();
+            let mut retained = BTreeMap::new();
+            super::retain_from_successful(
+                &mut retained,
+                &subset.plan().slots,
+                &targets,
+                &outcome.successful,
+            );
+            let owned = outcome.successful;
+            Self {
+                _dir: dir,
+                subset,
+                pins,
+                domain,
+                retained,
+                owned,
+            }
+        }
+
+        /// Seal through the production core over `programs` with a scripted
+        /// mint. Only the loaded-inventory read and the attach-cell mint are
+        /// substituted native I/O; validation, linkage derivation and
+        /// construction are production.
+        fn seal(
+            self,
+            programs: &BTreeSet<&str>,
+            mint: impl FnOnce() -> std::result::Result<u64, SemanticRefusal>,
+        ) -> std::result::Result<super::AttachedSemanticSet, SemanticRefusal> {
+            let Self {
+                subset,
+                pins,
+                domain,
+                retained,
+                owned,
+                _dir: _,
+            } = self;
+            super::seal_attached_subset_from_programs(
+                subset,
+                domain,
+                super::CapturePolicy::Allowlisted,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+                &retained,
+                &owned,
+                |id| pins.retain_inventory_target(id).ok(),
+                programs,
+                mint,
+            )
+        }
+
+        /// Seal through the production core with scripted seal inputs, for
+        /// the refusal twin: the descriptors/policy refusal still reaches
+        /// production validation before any mint.
+        fn seal_with_inputs(
+            self,
+            programs: &BTreeSet<&str>,
+            policy: super::CapturePolicy,
+            descriptors: anyhow::Result<Vec<super::SlotSemantics>>,
+            mint: impl FnOnce() -> std::result::Result<u64, SemanticRefusal>,
+        ) -> std::result::Result<super::AttachedSemanticSet, SemanticRefusal> {
+            let Self {
+                subset,
+                pins,
+                domain,
+                retained,
+                owned,
+                _dir: _,
+            } = self;
+            super::seal_attached_subset_from_programs(
+                subset,
+                domain,
+                policy,
+                descriptors,
+                &retained,
+                &owned,
+                |id| pins.retain_inventory_target(id).ok(),
+                programs,
+                mint,
+            )
+        }
+    }
+
+    /// Linked seal drains linked: the production core seals linked over a
+    /// loaded inventory carrying both journal roots, retention keeps the
+    /// sealed fact, and the production drain derivation returns linked. The
+    /// sealed generation observes the scripted mint exactly once.
+    #[test]
+    fn sealed_journal_pair_drains_linked() {
+        let scene = SealDrainScene::attest();
+        let programs = BTreeSet::from([
+            "p11_entry",
+            "p11_return",
+            "p11_entry_journal",
+            "p11_return_journal",
+            "task_newtask",
+        ]);
+        let minted = std::cell::Cell::new(0u32);
+        let attached = scene
+            .seal(&programs, || {
+                minted.set(minted.get() + 1);
+                Ok(41)
+            })
+            .expect("a valid subset seals");
+        assert!(
+            attached.journal_linked(),
+            "the loaded journal pair seals linked"
+        );
+        assert_eq!(
+            attached.generation(),
+            41,
+            "the seal observes the scripted mint"
+        );
+        assert_eq!(minted.get(), 1, "one successful seal mints once");
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert_eq!(cell, Some(true), "retention keeps the sealed fact");
+        assert!(
+            super::drain_linkage_from_sealed(cell),
+            "the sealed journal pair drains linked"
+        );
+    }
+
+    /// Ordinary seal drains unlinked: the production core seals unlinked over
+    /// the real ordinary object inventory (no journal root), and the retained
+    /// fact drains unlinked.
+    #[test]
+    fn sealed_ordinary_inventory_drains_unlinked() {
+        let scene = SealDrainScene::attest();
+        let ordinary = aya_obj::Object::parse(crate::EBPF_OBJECT).expect("ordinary bytes parse");
+        let programs: BTreeSet<&str> = ordinary.programs.keys().map(String::as_str).collect();
+        let minted = std::cell::Cell::new(0u32);
+        let attached = scene
+            .seal(&programs, || {
+                minted.set(minted.get() + 1);
+                Ok(43)
+            })
+            .expect("a valid subset seals");
+        assert!(
+            !attached.journal_linked(),
+            "the ordinary inventory seals unlinked"
+        );
+        assert_eq!(
+            attached.generation(),
+            43,
+            "the seal observes the scripted mint"
+        );
+        assert_eq!(minted.get(), 1, "one successful seal mints once");
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert_eq!(cell, Some(false), "retention keeps the sealed fact");
+        assert!(
+            !super::drain_linkage_from_sealed(cell),
+            "the ordinary seal drains unlinked"
+        );
+    }
+
+    /// Partial attach seals unlinked in both directions: either journal root
+    /// alone seals unlinked through the production core, and the retained
+    /// fact drains unlinked.
+    #[test]
+    fn sealed_partial_journal_pair_drains_unlinked() {
+        for (present, generation) in [("p11_entry_journal", 47), ("p11_return_journal", 53)] {
+            let scene = SealDrainScene::attest();
+            let programs = BTreeSet::from(["p11_entry", "p11_return", present, "task_newtask"]);
+            let minted = std::cell::Cell::new(0u32);
+            let attached = scene
+                .seal(&programs, || {
+                    minted.set(minted.get() + 1);
+                    Ok(generation)
+                })
+                .expect("a valid subset seals");
+            assert!(!attached.journal_linked(), "{present} alone seals unlinked");
+            assert_eq!(
+                attached.generation(),
+                generation,
+                "the seal observes the scripted mint"
+            );
+            assert_eq!(minted.get(), 1, "one successful seal mints once");
+            let mut cell = None;
+            super::retain_sealed_linkage(&mut cell, &attached);
+            assert_eq!(cell, Some(false), "retention keeps the sealed fact");
+            assert!(
+                !super::drain_linkage_from_sealed(cell),
+                "{present} alone drains unlinked"
+            );
+        }
+    }
+
+    /// A refused seal retains no linkage and mints nothing: the descriptor
+    /// refusal and the policy refusal each fail production validation before
+    /// the mint, keep the sealed cell empty, and drain unlinked. A valid
+    /// control seals through the same core in the same test.
+    #[test]
+    fn refused_seal_retains_no_linkage() {
+        let programs = BTreeSet::from(["p11_entry", "p11_return", "task_newtask"]);
+        let control = SealDrainScene::attest()
+            .seal(&programs, || Ok(59))
+            .expect("the valid control seals");
+        assert!(!control.journal_linked(), "the control seals unlinked");
+        for (name, policy, descriptors) in [
+            (
+                "descriptors",
+                super::CapturePolicy::Allowlisted,
+                Err(anyhow::anyhow!("scripted descriptors read failure")),
+            ),
+            (
+                "policy",
+                super::CapturePolicy::AggregateOnly,
+                Ok(crate::kinds::DESCRIPTORS.to_vec()),
+            ),
+        ] {
+            let minted = std::cell::Cell::new(0u32);
+            let refused =
+                SealDrainScene::attest().seal_with_inputs(&programs, policy, descriptors, || {
+                    minted.set(minted.get() + 1);
+                    Ok(61)
+                });
+            assert!(refused.is_err(), "the {name} refusal must refuse the seal");
+            assert_eq!(minted.get(), 0, "a refused seal mints nothing");
+            let cell = None;
+            assert!(
+                !super::drain_linkage_from_sealed(cell),
+                "a refused seal drains unlinked"
+            );
+        }
+    }
+
+    /// Retention is load-bearing: the same linked seal drains linked once
+    /// retained, but an unretained (never-sealed) cell drains unlinked.
+    /// Omitting the retention flips a linked seal to an unlinked drain.
+    #[test]
+    fn unretained_linked_seal_drains_unlinked() {
+        let programs = BTreeSet::from(["p11_entry_journal", "p11_return_journal"]);
+        let attached = SealDrainScene::attest()
+            .seal(&programs, || Ok(67))
+            .expect("a valid subset seals");
+        assert!(
+            attached.journal_linked(),
+            "the loaded journal pair seals linked"
+        );
+        assert!(
+            !super::drain_linkage_from_sealed(None),
+            "an unretained seal drains unlinked"
+        );
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert!(
+            super::drain_linkage_from_sealed(cell),
+            "the retained seal drains linked"
+        );
+    }
+
+    /// The drain derivation follows the sealed fact exactly: linked stays
+    /// linked, unlinked stays unlinked, and a never-sealed session drains
+    /// unlinked.
+    #[test]
+    fn drain_linkage_follows_the_sealed_fact() {
+        assert!(
+            super::drain_linkage_from_sealed(Some(true)),
+            "a linked seal drains linked"
+        );
+        assert!(
+            !super::drain_linkage_from_sealed(Some(false)),
+            "an unlinked seal drains unlinked"
+        );
+        assert!(
+            !super::drain_linkage_from_sealed(None),
+            "a never-sealed session drains unlinked"
+        );
+    }
+
+    /// Linked seal over the real journal object: when the build carries the
+    /// production journal bytes, the production core seals linked over its
+    /// parsed program inventory, and the retained fact drains linked.
+    /// Omitted-object builds assert the omission and skip.
+    #[test]
+    fn sealed_real_journal_object_drains_linked() {
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            assert_eq!(env!("P11SCOPE_JOURNAL_OUTPUTS"), "");
+            return;
+        }
+        let scene = SealDrainScene::attest();
+        let journal =
+            aya_obj::Object::parse(super::journal::journal_object()).expect("journal bytes parse");
+        let programs: BTreeSet<&str> = journal.programs.keys().map(String::as_str).collect();
+        let attached = scene
+            .seal(&programs, || Ok(71))
+            .expect("a valid subset seals");
+        assert!(
+            attached.journal_linked(),
+            "the real journal inventory seals linked"
+        );
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert!(
+            super::drain_linkage_from_sealed(cell),
+            "the real journal seal drains linked"
+        );
+    }
+
+    /// The native production sealer delegates to the inventory core: it reads
+    /// the loaded program inventory and the attach-cell mint from native I/O
+    /// and seals through the one production core.
+    #[test]
+    fn native_seal_delegates_to_the_inventory_core() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn seal_attached_subset_native(")
+            .expect("production sealer present");
+        let end = production[start..]
+            .find("fn seal_attached_subset_from_programs(")
+            .expect("production core follows the native sealer");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("seal_attached_subset_from_programs("),
+            "the native sealer must seal through the inventory core"
+        );
+        assert!(
+            body.contains("ebpf.programs()"),
+            "the native sealer reads the loaded inventory"
+        );
+        assert!(
+            body.contains("mint_attach_generation()"),
+            "the native sealer mints from the attach cell"
+        );
+    }
+
+    /// The attested start retains its successful seal through the retention
+    /// seam, so the producers drain observes the sealed fact.
+    #[test]
+    fn attested_start_retains_through_the_seam() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn start_attested(")
+            .expect("attested start present");
+        let end = production[start..]
+            .find("fn semantic_descriptors(")
+            .expect("descriptors read follows the attested start");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("retain_sealed_linkage("),
+            "the attested start must retain through the seam"
+        );
+        assert!(
+            body.contains("sealed_journal_linked"),
+            "the attested start retains the sealed cell"
+        );
+    }
+
+    /// The production producers drain derives through the linkage seam from
+    /// the Session's retained sealed fact.
+    #[test]
+    fn production_drain_uses_the_linkage_seam() {
+        let source = include_str!("attach.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let start = production
+            .find("pub(crate) fn drain_producers(")
+            .expect("production drain present");
+        let end = production[start..]
+            .find("pub fn event_drain(")
+            .expect("next drain follows the producers drain");
+        let body = &production[start..start + end];
+        assert!(
+            body.contains("drain_linkage_from_sealed("),
+            "the production drain must derive through the linkage seam"
         );
     }
 

@@ -4305,14 +4305,18 @@ fn attach_targets_observed_with_roots_journal(
     {
         bail!("private counter bank attachment requires the LP64 aggregate-only fixed pair");
     }
-    // Journal sessions reuse Detailed roots with the pair swapped (see the
-    // grouping selection above); journal takes precedence over bank roots.
-    let return_program = if journal {
-        "p11_return_journal"
-    } else if roots == StaticRoots::CounterBanks {
+    let return_program = if roots == StaticRoots::CounterBanks {
         "p11_counter_bank_return"
     } else {
         "p11_return"
+    };
+    // Journal sessions reuse Detailed roots with the pair swapped: the
+    // journal return overrides the pinned ordinary selection above. A
+    // counter/journal combination is refused at preparation.
+    let return_program = if journal {
+        "p11_return_journal"
+    } else {
+        return_program
     };
     let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
@@ -7872,82 +7876,97 @@ impl Session {
             let ebpf = &mut self.ebpf;
             let links = &mut self.links;
             let pairs = &mut self.pid_pairs;
-            attach_targets_observed_with_roots_journal(
-                targets,
-                self.policy,
-                self.embedded_flavor.unsafe_present,
-                roots,
-                counter_mode,
-                self.journal,
-                |slot| {
-                    Ok(attach_targets
+            // Named once: both scheduler entries below share this link
+            // I/O; only the selected roots differ.
+            let abi_for = |slot: &Slot| {
+                Ok(attach_targets
+                    .get(&slot.index)
+                    .expect("every selected target has retained pinned facts")
+                    .1)
+            };
+            let attach = |program: &'static str, slot: &Slot, point: UProbeAttachPoint<'static>| {
+                let prepared = (|| -> Result<pid_continuity::NativeAttempt<(), anyhow::Error>> {
+                    let path = &attach_targets
                         .get(&slot.index)
                         .expect("every selected target has retained pinned facts")
-                        .1)
-                },
-                |program, slot, point| {
-                    let prepared =
-                        (|| -> Result<pid_continuity::NativeAttempt<(), anyhow::Error>> {
-                            let path = &attach_targets
-                                .get(&slot.index)
-                                .expect("every selected target has retained pinned facts")
-                                .0;
-                            let prog: &mut UProbe = ebpf
-                                .program_mut(program)
-                                .with_context(|| format!("program {program} missing from object"))?
-                                .try_into()?;
-                            #[cfg(feature = "h6-reexec-diagnostic")]
-                            let diagnostic_span = diagnostic
-                                .as_ref()
-                                .filter(|diag| diag.active())
-                                .map(|diag| {
-                                    diag.begin(
-                                        if program == "p11_return"
-                                            || program == "p11_return_journal"
-                                        {
-                                            DiagnosticPhase::NativeReturn
-                                        } else {
-                                            DiagnosticPhase::NativeEntry
-                                        },
-                                        [
-                                            Some(1),
-                                            Some(u64::from(
-                                                slot.names.iter().any(|name| name == "C_GetInfo"),
-                                            )),
-                                            None,
-                                            None,
-                                        ],
-                                    )
-                                });
-                            let attempt = pid_continuity::NativeAttempt::run(
-                                pid_continuity::comparable_monotonic_ns,
-                                || prog.attach([point], path, scope),
-                            );
-                            #[cfg(feature = "h6-reexec-diagnostic")]
-                            if let Some(span) = diagnostic_span {
-                                span.finish_result(&attempt.result);
-                            }
-                            let result = match attempt.result {
-                                Ok(id) => {
-                                    links.push(RegisteredLink::UProbe {
-                                        program,
-                                        slot: slot.index,
-                                        id,
-                                        registration: pairs.register(),
-                                    });
-                                    Ok(())
-                                }
-                                Err(error) => Err(static_attach_error(program, slot, error)),
-                            };
-                            Ok(pid_continuity::NativeAttempt {
-                                started_ns: attempt.started_ns,
-                                result,
-                            })
-                        })();
-                    prepared.unwrap_or_else(pid_continuity::NativeAttempt::not_attempted)
-                },
-                |_| monotonic_ns(),
-            )?
+                        .0;
+                    let prog: &mut UProbe = ebpf
+                        .program_mut(program)
+                        .with_context(|| format!("program {program} missing from object"))?
+                        .try_into()?;
+                    #[cfg(feature = "h6-reexec-diagnostic")]
+                    let diagnostic_span =
+                        diagnostic
+                            .as_ref()
+                            .filter(|diag| diag.active())
+                            .map(|diag| {
+                                diag.begin(
+                                    if program == "p11_return" || program == "p11_return_journal" {
+                                        DiagnosticPhase::NativeReturn
+                                    } else {
+                                        DiagnosticPhase::NativeEntry
+                                    },
+                                    [
+                                        Some(1),
+                                        Some(u64::from(
+                                            slot.names.iter().any(|name| name == "C_GetInfo"),
+                                        )),
+                                        None,
+                                        None,
+                                    ],
+                                )
+                            });
+                    let attempt = pid_continuity::NativeAttempt::run(
+                        pid_continuity::comparable_monotonic_ns,
+                        || prog.attach([point], path, scope),
+                    );
+                    #[cfg(feature = "h6-reexec-diagnostic")]
+                    if let Some(span) = diagnostic_span {
+                        span.finish_result(&attempt.result);
+                    }
+                    let result = match attempt.result {
+                        Ok(id) => {
+                            links.push(RegisteredLink::UProbe {
+                                program,
+                                slot: slot.index,
+                                id,
+                                registration: pairs.register(),
+                            });
+                            Ok(())
+                        }
+                        Err(error) => Err(static_attach_error(program, slot, error)),
+                    };
+                    Ok(pid_continuity::NativeAttempt {
+                        started_ns: attempt.started_ns,
+                        result,
+                    })
+                })();
+                prepared.unwrap_or_else(pid_continuity::NativeAttempt::not_attempted)
+            };
+            if self.journal {
+                attach_targets_observed_with_roots_journal(
+                    targets,
+                    self.policy,
+                    self.embedded_flavor.unsafe_present,
+                    roots,
+                    counter_mode,
+                    true,
+                    abi_for,
+                    attach,
+                    |_| monotonic_ns(),
+                )?
+            } else {
+                attach_targets_observed_with_roots(
+                    targets,
+                    self.policy,
+                    self.embedded_flavor.unsafe_present,
+                    roots,
+                    counter_mode,
+                    abi_for,
+                    attach,
+                    |_| monotonic_ns(),
+                )?
+            }
         };
         let AttachOutcome {
             successful,

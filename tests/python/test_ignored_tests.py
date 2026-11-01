@@ -90,6 +90,28 @@ SRC_LIVE_KERNEL_SKIP_EXPECTED = [
     "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins",
 ]
 
+# The residual privileged cells: the installed linked control and the two
+# B17 live twins run in the default campaign; the lane-B-only K1 overlay
+# twins are static skips with reasons. Pinned literally so a dropped
+# curation fails here.
+RESIDUAL_DEFAULT_EXPECTED = [
+    "attach::tests::sealed_session_drain_linkage_is_behavioral",
+    "attach::instance_tests::privileged_instance_b17_counters_observe_sharer_churn",
+    "attach::instance_tests::privileged_instance_b17_drain_yields_identity_once_live",
+]
+
+RESIDUAL_SKIP_EXPECTED = [
+    "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_fresh_upper_joins",
+    "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_stale_lower_refuses",
+]
+
+# The R57 future positive: an unprivileged expected-RED cell that stays in
+# the performance inventory cell but must still be curated (as a static
+# skip) so the runner's exact-cover check matches the binary.
+RESIDUAL_REDBYDESIGN_SKIP_EXPECTED = (
+    "discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation"
+)
+
 
 def write_fixture(root, sources, entries, registered, wide_registered=(),
                   integration_registered=(), counter_proof_registered=(),
@@ -471,6 +493,55 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("privileged a::t_priv is not curated", result.stdout)
 
+    def test_privileged_marked_reason_in_a_curation_free_cell_fails(self):
+        # A `privileged:`/`root:` #[ignore] reason filed as performance or
+        # helper hides a privileged test from runner curation: the checker
+        # must refuse it, naming the marker and the test.
+        for marker in ("privileged: needs root", "root: needs mounts"):
+            for cell in ("performance", "helper"):
+                with self.subTest(marker=marker, cell=cell):
+                    sources = {
+                        "src/lib.rs": "mod a;\n",
+                        "src/a.rs": (
+                            "#[test]\n"
+                            f'#[ignore = "{marker}"]\n'
+                            "fn t_marked() {}\n"
+                        ),
+                    }
+                    entries = [
+                        {"file": "src/a.rs", "path": "a::t_marked",
+                         "reason": marker, "cell": cell},
+                    ]
+                    with tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        write_fixture(root, sources, entries, [])
+                        result = run_checker(root)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("a::t_marked", result.stdout)
+                    self.assertIn("privileged", result.stdout)
+
+    def test_privileged_marked_reason_passes_in_the_privileged_cell(self):
+        # The same marker filed as privileged is the honest shape: curation
+        # (not the marker) decides, so a curated entry passes.
+        sources = {
+            "src/lib.rs": "mod a;\n",
+            "src/a.rs": (
+                "#[test]\n"
+                '#[ignore = "privileged: needs root"]\n'
+                "fn t_marked() {}\n"
+            ),
+        }
+        entries = [
+            {"file": "src/a.rs", "path": "a::t_marked",
+             "reason": "privileged: needs root", "cell": "privileged"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, sources, entries, ["a::t_marked"])
+            result = run_checker(root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 inventoried site(s) match", result.stdout)
+
     def test_comment_and_string_mentions_are_not_sites(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -676,6 +747,40 @@ class IgnoredTestsTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(name, lists["SKIP_TESTS"])
 
+    def test_residual_privileged_cells_are_curated_in_their_campaign_lists(self):
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        runnable = (lists["DEFAULT_TESTS"] | lists["ALTERNATIVE_TESTS"]
+                    | lists["LONG_TESTS"])
+        for name in RESIDUAL_DEFAULT_EXPECTED:
+            with self.subTest(name=name):
+                self.assertIn(name, lists["DEFAULT_TESTS"])
+                self.assertNotIn(name, lists["SKIP_TESTS"])
+        names = runner_array_lines(RUNNER, "SKIP_TESTS")
+        reasons = runner_array_lines(RUNNER, "SKIP_REASONS")
+        for name in RESIDUAL_SKIP_EXPECTED:
+            with self.subTest(name=name):
+                self.assertIn(name, lists["SKIP_TESTS"])
+                self.assertFalse({name} & runnable)
+                reason = reasons[names.index(name)]
+                self.assertIn("lane-B", reason)
+                self.assertIn("by hand", reason)
+        with self.subTest(name=RESIDUAL_REDBYDESIGN_SKIP_EXPECTED):
+            self.assertIn(RESIDUAL_REDBYDESIGN_SKIP_EXPECTED,
+                          lists["SKIP_TESTS"])
+            self.assertFalse({RESIDUAL_REDBYDESIGN_SKIP_EXPECTED} & runnable)
+            reason = reasons[names.index(RESIDUAL_REDBYDESIGN_SKIP_EXPECTED)]
+            self.assertIn("RED by design", reason)
+            self.assertIn("R57", reason)
+
+    def test_residual_inventory_cells_match_what_each_test_needs(self):
+        entries = {entry["path"]: entry
+                   for entry in json.loads(INVENTORY.read_text())["sites"]}
+        for name in RESIDUAL_DEFAULT_EXPECTED + RESIDUAL_SKIP_EXPECTED:
+            with self.subTest(name=name):
+                self.assertEqual(entries[name]["cell"], "privileged")
+        self.assertEqual(entries[RESIDUAL_REDBYDESIGN_SKIP_EXPECTED]["cell"],
+                         "performance")
+
     def test_skip_reasons_align_with_skip_tests(self):
         tests = runner_array_lines(RUNNER, "SKIP_TESTS")
         reasons = runner_array_lines(RUNNER, "SKIP_REASONS")
@@ -749,10 +854,10 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=117",
+            "DEFAULT_TESTS=120",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
-            "SKIP_TESTS=93",
+            "SKIP_TESTS=96",
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",

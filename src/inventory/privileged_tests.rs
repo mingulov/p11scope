@@ -4382,7 +4382,7 @@ fn privileged_key_operations_linked_lane_pumps_live_discovery() -> Result<()> {
 /// lane stays live, and a second pump refuses the same way. Root
 /// BPF lane, serial.
 #[test]
-#[ignore = "privileged: live DD transport fault refuses without latching"]
+#[ignore = "privileged: live discovery transport fault refuses without latching"]
 fn privileged_key_operations_live_discovery_fault_refuses_without_latching() -> Result<()> {
     use std::time::{Duration, Instant};
     let workload = JointWorkload::build()?;

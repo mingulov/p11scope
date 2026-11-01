@@ -2154,10 +2154,7 @@ fn object_journal_release_birth_marker_wiring_matches_build() {
     }
     let mut others: Vec<(&str, &[u8])> = vec![
         ("inventory", p11scope::EBPF_INVENTORY_OBJECT),
-        (
-            "inventory-callers",
-            p11scope::EBPF_INVENTORY_CALLERS_OBJECT,
-        ),
+        ("inventory-callers", p11scope::EBPF_INVENTORY_CALLERS_OBJECT),
     ];
     for (name, bytes) in [
         ("counter-counts", p11scope::EBPF_COUNTER_COUNTS_OBJECT),
@@ -2187,16 +2184,14 @@ fn object_journal_release_birth_marker_wiring_matches_build() {
         }
     }
     for (index, bytes) in artifact_bodies.iter().enumerate() {
-        others.push(
-            (
-                [
-                    "counter-counts-artifact",
-                    "counter-timestamps-artifact",
-                    "counter-latency-artifact",
-                ][index],
-                bytes.as_slice(),
-            ),
-        );
+        others.push((
+            [
+                "counter-counts-artifact",
+                "counter-timestamps-artifact",
+                "counter-latency-artifact",
+            ][index],
+            bytes.as_slice(),
+        ));
     }
     assert!(
         others.len() >= 2,
@@ -2337,10 +2332,13 @@ fn object_journal_marker_wired_detailed_only() {
 #[test]
 fn object_journal_elf_matches_detailed_attribute_capture() {
     if !expected_journal_selected() {
+        eprintln!(
+            "journal not selected in this build (P11SCOPE_JOURNAL=0, or a SMALL, WIDE, \
+             unsafe, proof or counter build): no journal ELF to compare"
+        );
         return;
     }
-    let journal =
-        std::path::Path::new(env!("OUT_DIR")).join("journal-v1/p11scope-ebpf-journal-v1");
+    let journal = std::path::Path::new(env!("OUT_DIR")).join("journal-v1/p11scope-ebpf-journal-v1");
     assert!(
         journal.is_file(),
         "expected production journal ELF is absent: build-selection interface gap: {}",
@@ -2378,6 +2376,131 @@ fn object_journal_elf_matches_detailed_attribute_capture() {
     assert!(
         !report.contains("skipped"),
         "skipped journal proof: {report}"
+    );
+}
+
+/// Journal/marker inventory policy: the five pure-policy
+/// `JournalMarkerInventoryTests` cases (marker presence, variant
+/// forbids, journal accept/refusals) run here by name on every
+/// flavor, beside the release-marker twin in `bpf_map_contracts`.
+#[test]
+fn object_journal_variant_inventory_policy_cases_are_driven() {
+    let output = std::process::Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "-I",
+            "tests/python/test_bpf_map_defs.py",
+            "JournalMarkerInventoryTests.test_release_detailed_marker_presence_accepts",
+            "JournalMarkerInventoryTests.test_release_diagnostic_and_wide_variants_forbid_marker",
+            "JournalMarkerInventoryTests.test_journal_variant_accepts_frozen_inventory",
+            "JournalMarkerInventoryTests.test_journal_variant_refuses_birth_and_missing_gap",
+            "JournalMarkerInventoryTests.test_journal_variant_refuses_inventory_map_and_drift",
+        ])
+        .output()
+        .expect("run journal variant inventory policy cases");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "journal variant inventory: {report}"
+    );
+    assert!(report.contains("Ran 5 tests"), "zero selection: {report}");
+    assert!(report.contains("\nOK\n"), "skipped journal proof: {report}");
+}
+
+/// Journal-roots discipline: the Detailed object refuses journal
+/// entry/return roots (its capture rule runs under Detailed roots
+/// only), on every flavor, from the embedded object.
+#[test]
+fn object_journal_roots_require_journal_programs_is_driven() {
+    let directory = tempfile::tempdir().expect("temporary detailed object");
+    let detailed = directory.path().join("p11scope-ebpf");
+    std::fs::write(&detailed, p11scope::EBPF_OBJECT).expect("write embedded detailed object");
+    let output = std::process::Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("P11SCOPE_OBJECT_CAPTURE_OBJECT", &detailed)
+        .args([
+            "-I",
+            "tests/python/test_bpf_map_defs.py",
+            "ObjectCaptureGlobalsTests.test_object_capture_journal_roots_require_journal_programs",
+        ])
+        .output()
+        .expect("run journal-roots discipline proof");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "journal roots discipline: {report}"
+    );
+    assert!(report.contains("Ran 1 test"), "zero selection: {report}");
+    assert!(
+        !report.contains("skipped"),
+        "skipped journal proof: {report}"
+    );
+}
+
+/// Release seal: a caller-set `P11SCOPE_JOURNAL=0` or
+/// `P11SCOPE_BIRTH_MARKER=0` cannot change the official bytes. The
+/// sealed-environment allowlist names neither switch, and the
+/// release-driver fixture proves both are stripped from the sealed
+/// child when planted.
+#[test]
+fn object_journal_release_seal_strips_caller_switches() {
+    let release = std::fs::read_to_string("scripts/build-release.sh").expect("read release driver");
+    let environment = release
+        .split_once("\nRECEIPT_SEALED_ENVIRONMENT='")
+        .expect("sealed-environment allowlist")
+        .1
+        .split_once('\'')
+        .expect("sealed-environment end")
+        .0;
+    for switch in ["P11SCOPE_JOURNAL", "P11SCOPE_BIRTH_MARKER"] {
+        assert!(
+            !environment.lines().any(|line| line.trim() == switch),
+            "the sealed environment must not pass {switch} through"
+        );
+    }
+    const DRIVER: &str = r#"
+import runpy
+import tempfile
+from pathlib import Path
+native = runpy.run_path("tests/fixtures/release-seal/fixture.py")
+with tempfile.TemporaryDirectory(prefix="p11scope-release-seal-journal-") as base:
+    fixture = native["ReleaseSealFixture"](
+        Path(base) / "case", native["Task11FixtureOptions"]()
+    )
+    run = fixture.run_to_sudo_probe(
+        {"P11SCOPE_JOURNAL": "0", "P11SCOPE_BIRTH_MARKER": "0"}
+    )
+    assert run.output.returncode == 77, run.output.stderr
+    dumped = run.environment_dump.read_text()
+    assert "P11SCOPE_JOURNAL=" not in dumped, dumped
+    assert "P11SCOPE_BIRTH_MARKER=" not in dumped, dumped
+    print("caller journal switches stripped")
+"#;
+    let output = std::process::Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["-I", "-c", DRIVER])
+        .output()
+        .expect("run release-seal switch stripping proof");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "release seal strips caller switches: {report}"
+    );
+    assert!(
+        report.contains("caller journal switches stripped"),
+        "zero selection: {report}"
     );
 }
 

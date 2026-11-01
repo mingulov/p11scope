@@ -3990,6 +3990,150 @@ fn privileged_journal_marker_abandoned_call_at_thread_exit_dirties() -> Result<(
     Ok(())
 }
 
+/// The production live birth-row read's marker word for the target,
+/// or `None` when the kernel holds no row at all. A short row is a
+/// hard error: native rows are always complete.
+fn live_birth_word_of(
+    harness: &Harness,
+    binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+) -> Result<Option<u64>> {
+    use crate::attach::{BirthRowError, BirthRowReader};
+    let maps = harness.session.instance_maps();
+    let mut rows = crate::attach::LiveBirthRows::over(&maps, binding);
+    match rows.read_marker_row() {
+        Ok(record) => Ok(Some(record.journal_bootstrap)),
+        Err(BirthRowError::Unreadable) => Ok(None),
+        Err(BirthRowError::Short) => Err(anyhow!("a live birth row is never short")),
+    }
+}
+
+/// Birth marker, ordinary capture: with no closure minted (the
+/// generation-0 seal of a capture without the per-key-tracking
+/// opt-in), a post-seal exec leaves the target's marker word
+/// unpublished (word 0, generation 0) and spends no admission — and
+/// the birth observation mints a witness only for a READY word
+/// naming the admitted exec, so no birth witness can mint. The
+/// production live birth-row read reports no row before the exec and
+/// the unpublished word after it, then returns the READY row under a
+/// minted closure in the live-read control, proving it reads live
+/// row state rather than a stubbed reader.
+#[test]
+#[ignore = "privileged: birth marker ordinary capture mints no birth"]
+fn privileged_journal_marker_ordinary_capture_mints_no_birth() -> Result<()> {
+    use crate::discovery::caller_registry::{CallerId, ModuleKey};
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, pid, &pins)?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == 0,
+        "an ordinary capture seals with generation 0"
+    );
+    // One joined call proves the hooks observe before the exec.
+    target.command(b'c')?;
+    single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let before = harness.take_images();
+    ensure!(before.len() == 1, "one call, one image");
+    let domain = harness
+        .session
+        .native_domain()
+        .context("the live session owns its native domain")?;
+    // The binding carries the live custody, domain and image; the
+    // production row read uses its pin, nothing else.
+    let binding = SemanticCallerBinding::scripted(
+        CallerId(0),
+        ModuleKey::physical(
+            key.device.major,
+            key.device.minor,
+            key.inode,
+            None,
+            &provider.display().to_string(),
+        ),
+        domain,
+        before[0],
+        target.pin.clone(),
+    );
+    // No row exists before the exec; the exec's hook creates it.
+    let pre = live_birth_word_of(&harness, &binding)?;
+    ensure!(
+        pre.is_none(),
+        "before the exec the kernel holds no row: {pre:?}"
+    );
+    // Post-seal exec on the ordinary lane: the hooks stop at the
+    // gated read and the word stays unpublished.
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == 0,
+        "the ordinary seal still holds generation 0 after the exec"
+    );
+    let row = proc_record_of(&harness, &target)?;
+    ensure!(
+        row.map(|row| (row.journal_bootstrap, row.exec_attach_gen)) == Some((0, 0)),
+        "an ordinary post-seal exec must publish no READY row: {}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "an ordinary post-seal exec must spend nothing: {control:?}"
+    );
+    let post = live_birth_word_of(&harness, &binding)?;
+    ensure!(
+        post == Some(0),
+        "after the exec the live marker word is still unpublished: {post:?}"
+    );
+    // Live-read control on the same session: mint, re-exec, and run
+    // the same production read. The row publishes READY under the
+    // minted closure, so the read must return it.
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the post-closure control exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "one control exec, one admission: {control:?}"
+    );
+    let reread = {
+        let maps = harness.session.instance_maps();
+        crate::attach::LiveBirthRows::over(&maps, &binding).read_marker_row()
+    };
+    let reread =
+        reread.map_err(|error| anyhow!("the control row must read back live: {error:?}"))?;
+    ensure!(
+        journal_marker::read_word(reread.journal_bootstrap)
+            == journal_marker::MarkerRead::Ready(exec)
+            && reread.exec_attach_gen == minted,
+        "the production live read must return the published READY row"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_ORDINARY exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
 /// Task 1d overhead gate: the mapping hooks attach for profile sessions
 /// but stay down for metrics (aggregate-only) sessions, whose attach still
 /// succeeds with every slot unmapped (`NO_FILE`: no stamp can ever route).

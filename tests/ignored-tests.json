@@ -262,6 +262,12 @@
     },
     {
       "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_ordinary_capture_mints_no_birth",
+      "reason": "privileged: birth marker ordinary capture mints no birth",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_pid_outsider_stays_unobserved",
       "reason": "privileged: birth marker PID outsider stays unobserved",
       "cell": "privileged"
@@ -1451,7 +1457,7 @@
     {
       "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_key_operations_live_discovery_fault_refuses_without_latching",
-      "reason": "privileged: live DD transport fault refuses without latching (serial; omitted journal build asserts the refusal)",
+      "reason": "privileged: live discovery transport fault refuses without latching (serial; omitted journal build asserts the refusal)",
       "cell": "privileged"
     },
     {

@@ -363,7 +363,6 @@ impl RetainedBirthWitness {
         Ok(())
     }
 
-    #[allow(dead_code)] // The later lane activation borrows this actual Session port.
     pub(crate) fn fresh_evidence(
         &self,
         session: &mut Session,
@@ -2049,7 +2048,6 @@ impl SemanticCapture {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)] // The later lane activation consumes this actual H0 handoff.
     pub(crate) fn consume_birth(
         &mut self,
         session: &mut Session,

@@ -1204,13 +1204,11 @@ fn birth_rows_pidfd(
     pin.pidfd().map_err(|_| BirthRowError::Unreadable)
 }
 
-#[allow(dead_code)] // No Session-loop wire until live activation; tests drive fixtures.
 pub(crate) struct LiveBirthRows<'m> {
     maps: &'m InstanceMaps<'m>,
     pin: std::sync::Arc<crate::process::PidPin>,
 }
 
-#[allow(dead_code)] // As above.
 impl<'m> LiveBirthRows<'m> {
     pub(crate) fn over(
         maps: &'m InstanceMaps<'m>,
@@ -1294,7 +1292,6 @@ fn marker_control_verdict(
     }
 }
 
-#[allow(dead_code)] // As above.
 impl BirthRowReader for LiveBirthRows<'_> {
     fn read_marker_row(&mut self) -> std::result::Result<InstanceRecord, BirthRowError> {
         let pidfd = birth_rows_pidfd(&self.pin)?;
@@ -1314,13 +1311,15 @@ impl BirthRowReader for LiveBirthRows<'_> {
     }
 }
 
-/// Production exec-marker birth source: each take re-runs the exec
-/// observation through the injected reader against live native state.
-/// The seal pulls this (never a reusable value); the spent issuance
-/// token drops with the take (the grant was issued at attestation).
-/// UNRUN: the Session loop wires the live reader when the journal
-/// activates.
-#[allow(dead_code)] // No Session-loop wire until live activation; tests drive fixtures.
+/// Exec-marker birth source: each take re-runs the exec observation
+/// through the injected reader against live native state; the spent
+/// issuance token drops with the take (the grant was issued at
+/// attestation). Compiled into production builds but constructed only by
+/// tests: the live seal checks births through `observe_retained_birth`
+/// in `semantic_capture`. No live exec-marker birth can succeed at this
+/// revision anyway: the only object that publishes a generation (the
+/// journal object, under `--key-operations`) has no READY writer.
+#[allow(dead_code)] // Production-compiled, test-constructed (see above).
 pub(crate) struct ExecBirthSource<'a, R> {
     rows: R,
     binding: &'a crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
@@ -1360,11 +1359,10 @@ impl<R: BirthRowReader> crate::semantics_objects::journal::BirthEvidenceSource
     }
 }
 
-/// Production absence-appearance birth source: each take re-runs the
+/// Test-only absence-appearance birth source: each take re-runs the
 /// absence observation (committed negative witness, advanced-epoch
-/// appearance) against live native state. UNRUN: the Session loop
-/// wires live scans when the journal activates.
-#[allow(dead_code)] // No Session-loop wire until live activation; tests drive fixtures.
+/// appearance) against injected native state. The live seal checks
+/// absence births through `observe_retained_birth` in `semantic_capture`.
 #[cfg(test)]
 pub(crate) struct AbsenceBirthSource<'a, R> {
     rows: R,
@@ -1376,7 +1374,6 @@ pub(crate) struct AbsenceBirthSource<'a, R> {
     admitted: &'a crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
 }
 
-#[allow(dead_code)] // As above.
 #[cfg(test)]
 impl<'a, R: BirthRowReader> AbsenceBirthSource<'a, R> {
     /// Wire one absence birth: live rows, the sealed negative
@@ -1405,7 +1402,6 @@ impl<'a, R: BirthRowReader> AbsenceBirthSource<'a, R> {
     }
 }
 
-#[allow(dead_code)] // As above.
 #[cfg(test)]
 impl<R: BirthRowReader> crate::semantics_objects::journal::BirthEvidenceSource
     for AbsenceBirthSource<'_, R>

@@ -638,10 +638,7 @@ fn journal_unset_selects_exactly_carriable_builds() {
     );
     assert_eq!(entries, ["preserved"]);
     assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "1");
-    assert_eq!(
-        selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"),
-        "1"
-    );
+    assert_eq!(selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"), "1");
     // Unset with SMALL, WIDE, unsafe or a private proof/counter
     // configuration: omitted silently, never refused.
     for setting in [
@@ -686,10 +683,7 @@ fn journal_unset_selects_exactly_carriable_builds() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "1");
-        assert_eq!(
-            selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"),
-            "1"
-        );
+        assert_eq!(selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"), "1");
     }
     // Explicit =1 with WIDE keeps today's refusal.
     let (output, reached, entries) = preflight_switch(
@@ -705,10 +699,7 @@ fn journal_unset_selects_exactly_carriable_builds() {
     );
     assert_eq!(entries, ["preserved"]);
     // Explicit =0 is off in every build.
-    for settings in [
-        Vec::new(),
-        vec![("CARGO_FEATURE_WIDE_DETAILED_2112", "1")],
-    ] {
+    for settings in [Vec::new(), vec![("CARGO_FEATURE_WIDE_DETAILED_2112", "1")]] {
         let (output, reached, _) =
             preflight_switch("P11SCOPE_JOURNAL", Some(OsStr::new("0")), &settings);
         assert!(
@@ -717,10 +708,7 @@ fn journal_unset_selects_exactly_carriable_builds() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "0");
-        assert_eq!(
-            selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"),
-            "0"
-        );
+        assert_eq!(selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"), "0");
     }
     // An unset marker follows an explicit journal decision ...
     let (output, reached, _) = preflight_switch("P11SCOPE_JOURNAL", Some(OsStr::new("1")), &[]);
@@ -730,10 +718,7 @@ fn journal_unset_selects_exactly_carriable_builds() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "1");
-    assert_eq!(
-        selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"),
-        "1"
-    );
+    assert_eq!(selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"), "1");
     // ... and =1 keeps today's meaning on a build the journal cannot carry.
     let (output, reached, _) = preflight_switch(
         "P11SCOPE_BIRTH_MARKER",
@@ -746,22 +731,17 @@ fn journal_unset_selects_exactly_carriable_builds() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "0");
-    assert_eq!(
-        selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"),
-        "1"
-    );
+    assert_eq!(selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"), "1");
     // Marker =0 is off even when the journal is on.
-    let (output, reached, _) = preflight_switch("P11SCOPE_BIRTH_MARKER", Some(OsStr::new("0")), &[]);
+    let (output, reached, _) =
+        preflight_switch("P11SCOPE_BIRTH_MARKER", Some(OsStr::new("0")), &[]);
     assert!(
         reached,
         "marker =0 FULL preflight refused: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "1");
-    assert_eq!(
-        selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"),
-        "0"
-    );
+    assert_eq!(selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"), "0");
 }
 
 #[test]

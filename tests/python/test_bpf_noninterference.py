@@ -1070,7 +1070,7 @@ if os.environ.get("CI_FIXTURE_MISSING_RECEIPT") != "true":
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         control, integration = self.calls()
-        baseline = "b3b753469df76553bba7fb0e8dec48666f45569a"
+        baseline = "16a7bd538535c6d8fb29680dabf6939ca5573a8e"
         self.assertEqual((control["baseline"], control["candidate"], control["repeat_baseline"]),
                          (baseline, baseline, True))
         self.assertEqual((integration["baseline"], integration["candidate"], integration["repeat_baseline"]),

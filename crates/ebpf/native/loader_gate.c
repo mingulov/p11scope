@@ -67,8 +67,8 @@ static __always_inline void gate_report_loss(struct loader_gate_control *ctl)
         __sync_fetch_and_add(losses, 1);
 }
 
-/* Saturating increment. Returns 1 with the post-increment value when
- * the increment lands: exact on the CAS-winner path, a re-read on the
+/* Saturating increment. Returns 1 with the exact post-increment value
+ * on the CAS-winner path; returns 2 with a re-read post-value on the
  * headroom-fallback path (BPF cannot use a fetch-add result at the
  * link CPU, so the fallback add settles silently and the value is
  * re-read: exact absent a concurrent drop, never above the true
@@ -105,7 +105,7 @@ static __always_inline int gate_sat_inc(struct loader_gate_control *ctl, u64 *ce
             __sync_fetch_and_sub(cell, 1);
 #endif
         *out = *(volatile u64 *)cell;
-        return 1;
+        return 2;
     }
     gate_report_loss(ctl);
     *out = ~0ULL;
@@ -148,7 +148,7 @@ static __always_inline long gate_refuse(struct loader_gate_control *ctl)
  * the crossing on the CAS path because the raiser carries the value,
  * not a re-read; on the fallback path a reclaim landing between the
  * add and the re-read can understate the raise (never overstate it),
- * and the peak still never falls. */
+ * which the caller reports as a loss, and the peak still never falls. */
 static __always_inline void gate_peak_raise(struct loader_gate_control *ctl, u64 newval)
 {
     int tries;
@@ -163,12 +163,20 @@ static __always_inline void gate_peak_raise(struct loader_gate_control *ctl, u64
     gate_report_loss(ctl);
 }
 
+/* Retained add with peak tracking: the CAS-winner path carries the
+ * exact post-value to the peak, while the headroom-fallback re-read
+ * may understate under a concurrent reclaim, so the fallback reports
+ * one loss to keep zero losses meaning exact. */
 static __always_inline void gate_retained_add(struct loader_gate_control *ctl)
 {
     u64 out = 0;
+    int rc = gate_sat_inc(ctl, &ctl->retained, &out);
 
-    if (gate_sat_inc(ctl, &ctl->retained, &out))
-        gate_peak_raise(ctl, out);
+    if (!rc)
+        return;
+    if (rc == 2)
+        gate_report_loss(ctl);
+    gate_peak_raise(ctl, out);
 }
 
 static __always_inline void gate_retained_drop(struct loader_gate_control *ctl)

@@ -97,9 +97,10 @@ struct loader_gate_row {
  * refusals; retired stays an end-report diagnostic. All counting cells
  * saturate, never wrap. update_losses counts contention events the
  * bounded accounting protocol could not settle (a skipped near-ceiling
- * increment, a lost gauge drop, a lost peak raise): nonzero means the
- * gauges may over- or understate and must be read as bounds, never as
- * exact facts. Contention-free operation never increments it. */
+ * increment, a retained fallback add with a re-read peak, a lost gauge
+ * drop, a lost peak raise): nonzero means the gauges may over- or
+ * understate and must be read as bounds, never as exact facts.
+ * Contention-free operation never increments it. */
 struct loader_gate_control {
     u64 limit;
     u64 cutover;

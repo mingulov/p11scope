@@ -7697,6 +7697,28 @@ fn joint_machine_unlinked_resync_followup_publishes() {
         "only an unlinked lane re-syncs after a break"
     );
     fixture.prime_unlinked();
+    // Pre-break H3/H0 baselines for the mechanism pin below: the
+    // break quantum must mint new positions and move staged_max.
+    let (staged_before, h0_before) = {
+        let h3_before = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_last_disposition()
+            .expect("the prime leg finalizes H3 evidence");
+        let staged_before = match &h3_before {
+            H3DispositionEvidence::Clean { staged_max, .. } => *staged_max,
+            other => panic!("the prime leg stages clean H3, not {other:?}"),
+        };
+        let held = fixture.scene.real.h0.0.borrow();
+        let h0_before = held
+            .capture
+            .pending_h3_watermark()
+            .expect("the lane still mints after the prime")
+            .0;
+        (staged_before, h0_before)
+    };
     // Break the stream exactly like the linked negative twin.
     fixture.scene.drain.source_mut().push_record(vec![0; 17]);
     fixture.published_labeled("resync-break", None);
@@ -7712,6 +7734,61 @@ fn joint_machine_unlinked_resync_followup_publishes() {
             adapter.stream_broken_for_test() || adapter.invalidated_for_test(),
             "the malformed quantum breaks the stream before the re-sync"
         );
+    }
+    // Mechanism pin: the break quantum's minted positions ride
+    // invalidation outcomes that the finalizer counts into the
+    // monotone staged_max, so the break's own H3 already covers
+    // its watermark (h0_below - 1) before the follow-up stages
+    // anything further. A mutant that excludes invalidation
+    // positions from staged_max leaves staged_max at the prime's
+    // value and fails here, even though the follow-up's later
+    // position would still cover the seal gate.
+    {
+        let h3_last = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_last_disposition()
+            .expect("the break leg finalizes H3 evidence");
+        let held = fixture.scene.real.h0.0.borrow();
+        let (h0_below, awaiting, _) = held
+            .capture
+            .pending_h3_watermark()
+            .expect("the lane still mints after the break");
+        assert!(
+            h0_below > h0_before,
+            "the break quantum mints new H0 positions: {h0_before} -> {h0_below}"
+        );
+        assert_eq!(
+            awaiting, None,
+            "immediate routing leaves nothing awaiting at the break"
+        );
+        match &h3_last {
+            H3DispositionEvidence::Clean {
+                staged_max,
+                pending_floor,
+            } => {
+                assert_eq!(
+                    *pending_floor, None,
+                    "no pending floor below the break watermark: {h3_last:?}"
+                );
+                assert!(
+                    *staged_max >= h0_below.saturating_sub(1),
+                    "the break's invalidation positions are counted into staged_max: \
+                     {h3_last:?} covers h0_below={h0_below}"
+                );
+                assert!(
+                    *staged_max > staged_before,
+                    "the break moves staged_max past the prime: \
+                     {staged_before} -> {staged_max} (h0_below={h0_below})"
+                );
+            }
+            other => panic!(
+                "the break leg stages clean H3 covering its watermark, not {other:?} \
+                 (h0_below={h0_below})"
+            ),
+        }
     }
     let api_returns = |fixture: &MachineScene| -> u64 {
         fixture

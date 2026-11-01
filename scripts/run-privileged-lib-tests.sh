@@ -133,6 +133,17 @@ attach::instance_tests::privileged_instance_routing_separates_reload_sibling_and
 attach::instance_tests::privileged_instance_vfork_unmap_globalizes
 attach::instance_tests::privileged_instance_zombie_leader_sharer_globalizes
 attach::instance_tests::privileged_object_continuity_refusal_preserves_s1_base
+# Birth-marker cells: live READY/DIRTY behavior on marker-enabled builds;
+# on markerless builds each cell asserts the marker absence instead.
+attach::instance_tests::privileged_journal_marker_abandoned_call_at_thread_exit_dirties
+attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec
+attach::instance_tests::privileged_journal_marker_cgroup_outsider_call_creates_dirty_row
+attach::instance_tests::privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready
+attach::instance_tests::privileged_journal_marker_exec_after_closure_publishes_ready
+attach::instance_tests::privileged_journal_marker_fork_without_exec_has_no_ready
+attach::instance_tests::privileged_journal_marker_nonleader_exec_creates_fresh_ready_row
+attach::instance_tests::privileged_journal_marker_pid_outsider_stays_unobserved
+attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties
 # H6 observer mapping interactions: owned idle target and genuine external
 # mutation control; distinguish ordinary scans from System identity anchors.
 attach::instance_tests::privileged_inventory_worker_scan_preserves_watched_instance
@@ -407,16 +418,6 @@ attach::image_bank_proof::tests::privileged_image_bank_exec_query_span_cut
 attach::image_bank_proof::tests::privileged_image_bank_attach_cookie_through_dispatcher
 attach::image_bank_proof::tests::privileged_image_bank_inflight_cut_counts_once
 attach::image_bank_proof::tests::privileged_image_bank_per_call_overhead
-# R52: preserve the marker assertions for the 0.6.0 marker-enabled build.
-attach::instance_tests::privileged_journal_marker_abandoned_call_at_thread_exit_dirties
-attach::instance_tests::privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec
-attach::instance_tests::privileged_journal_marker_cgroup_outsider_call_creates_dirty_row
-attach::instance_tests::privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready
-attach::instance_tests::privileged_journal_marker_exec_after_closure_publishes_ready
-attach::instance_tests::privileged_journal_marker_fork_without_exec_has_no_ready
-attach::instance_tests::privileged_journal_marker_nonleader_exec_creates_fresh_ready_row
-attach::instance_tests::privileged_journal_marker_pid_outsider_stays_unobserved
-attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties
 attach::instance_tests::privileged_instance_cross_process_punch_hole_renews
 attach::instance_tests::privileged_instance_routing_on_btrfs_tmpdir
 attach::instance_tests::privileged_instance_small_state_lru_eviction_never_joins
@@ -535,15 +536,6 @@ SKIP_REASONS=(
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; prior E3 acceptance, a quiet exclusive host and matched production cost inputs P11_BANK_N5_PRODUCTION_NS_1/P11_BANK_N5_PRODUCTION_NS_4 required; run this --exact selector --ignored as root in an authorized BPF lane (E4/N5)"
-"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
-"R52: deferred to 0.6.0; requires a marker-enabled future build, with original assertions preserved"
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
 "needs TMPDIR on btrfs (it asserts the statfs magic); no BPF; run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
 "needs a P11SCOPE_SMALL_STATE_MAPS=1 libtest build (the default binary fails its build gate by design); run by hand as root from that build with the variable set"

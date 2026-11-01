@@ -389,9 +389,9 @@ class IgnoredTestsTests(unittest.TestCase):
                     self.assertNotIn("verify: curation matches", result.stdout)
                     self.assertNotIn("proof group not built", result.stdout)
 
-    def test_r52_defers_only_marker_cells_and_keeps_core_instance_cells(self):
+    def test_marker_cells_run_and_keep_core_instance_cells(self):
         prefix = "attach::instance_tests::privileged_journal_marker_"
-        deferred = {prefix + name for name in (
+        cells = {prefix + name for name in (
             "abandoned_call_at_thread_exit_dirties",
             "cgroup_gap_sticks_across_reentry_and_exec",
             "cgroup_outsider_call_creates_dirty_row",
@@ -403,18 +403,19 @@ class IgnoredTestsTests(unittest.TestCase):
             "return_outside_scope_dirties",
         )}
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
-        self.assertEqual({name for name in lists["SKIP_TESTS"] if name.startswith(prefix)},
-                         deferred)
-        self.assertFalse(deferred & lists["DEFAULT_TESTS"])
+        self.assertEqual({name for name in lists["DEFAULT_TESTS"] if name.startswith(prefix)},
+                         cells)
+        self.assertFalse(cells & lists["SKIP_TESTS"])
         for name in ("exec_renews_the_instance", "fork_without_exec_stays_consistent",
                      "nonleader_exec_detaches_without_misrouting"):
             self.assertIn("attach::instance_tests::privileged_instance_" + name,
                           lists["DEFAULT_TESTS"])
         entries = json.loads(INVENTORY.read_text())["sites"]
         reasons = {entry["path"]: entry["reason"] for entry in entries
-                   if entry["path"] in deferred}
-        self.assertEqual(set(reasons), deferred)
-        self.assertTrue(all("0.6.0" in reason for reason in reasons.values()))
+                   if entry["path"] in cells}
+        self.assertEqual(set(reasons), cells)
+        self.assertTrue(all(reason.startswith("privileged: birth marker ")
+                            for reason in reasons.values()))
 
     def test_checked_in_inventory_matches_the_sources(self):
         result = run_checker(ROOT)
@@ -856,10 +857,10 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=124",
+            "DEFAULT_TESTS=133",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
-            "SKIP_TESTS=96",
+            "SKIP_TESTS=87",
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",

@@ -2381,6 +2381,65 @@ fn object_journal_elf_matches_detailed_attribute_capture() {
     );
 }
 
+/// Release seal: a caller-set `P11SCOPE_JOURNAL=0` or
+/// `P11SCOPE_BIRTH_MARKER=0` cannot change the official bytes. The
+/// sealed-environment allowlist names neither switch, and the
+/// release-driver fixture proves both are stripped from the sealed
+/// child when planted.
+#[test]
+fn object_journal_release_seal_strips_caller_switches() {
+    let release = std::fs::read_to_string("scripts/build-release.sh").expect("read release driver");
+    let environment = release
+        .split_once("\nRECEIPT_SEALED_ENVIRONMENT='")
+        .expect("sealed-environment allowlist")
+        .1
+        .split_once('\'')
+        .expect("sealed-environment end")
+        .0;
+    for switch in ["P11SCOPE_JOURNAL", "P11SCOPE_BIRTH_MARKER"] {
+        assert!(
+            !environment.lines().any(|line| line.trim() == switch),
+            "the sealed environment must not pass {switch} through"
+        );
+    }
+    const DRIVER: &str = r#"
+import runpy
+import tempfile
+from pathlib import Path
+native = runpy.run_path("tests/fixtures/release-seal/fixture.py")
+with tempfile.TemporaryDirectory(prefix="p11scope-release-seal-journal-") as base:
+    fixture = native["ReleaseSealFixture"](
+        Path(base) / "case", native["Task11FixtureOptions"]()
+    )
+    run = fixture.run_to_sudo_probe(
+        {"P11SCOPE_JOURNAL": "0", "P11SCOPE_BIRTH_MARKER": "0"}
+    )
+    assert run.output.returncode == 77, run.output.stderr
+    dumped = run.environment_dump.read_text()
+    assert "P11SCOPE_JOURNAL=" not in dumped, dumped
+    assert "P11SCOPE_BIRTH_MARKER=" not in dumped, dumped
+    print("caller journal switches stripped")
+"#;
+    let output = std::process::Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["-I", "-c", DRIVER])
+        .output()
+        .expect("run release-seal switch stripping proof");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "release seal strips caller switches: {report}"
+    );
+    assert!(
+        report.contains("caller journal switches stripped"),
+        "zero selection: {report}"
+    );
+}
+
 /// Every finite ABANDON reason is either emitted by a named producer
 /// site or explicitly reserved in the shared contract. A reason with
 /// neither would let the fixture's wire coverage (removal reasons

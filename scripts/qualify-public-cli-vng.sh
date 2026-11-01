@@ -4,6 +4,7 @@
 # inside a virtme-ng guest booted on KERNEL (a mainline tag such as v6.1.188, or a vmlinuz path).
 # The guest shares the host rootfs read-only and hides /tmp and /var/tmp, so the binary and
 # OUTDIR must live under /home. Take the VM lane lock around this script.
+# MODULE, when set, is forwarded to the guest (a provider path under /home or /usr).
 set -u
 K=$1; BIN=$(realpath -e "$2"); OUT=$3
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -17,7 +18,7 @@ uname -r > $OUT/uname.txt
 # host user and remaps ownership, which p11scope's -o trust and private temp-file
 # identity checks rightly refuse for a root observer. Evidence is copied out after.
 mkdir -p /tmp/qual && chmod 755 /tmp/qual
-THREADS=4 $REPO/scripts/qualify-public-cli.sh $BIN /tmp/qual/cells > $OUT/qual.log 2>&1
+${MODULE:+MODULE=$MODULE }THREADS=4 $REPO/scripts/qualify-public-cli.sh $BIN /tmp/qual/cells > $OUT/qual.log 2>&1
 echo "qual_exit=\$?" >> $OUT/qual.log
 cp -r /tmp/qual/cells $OUT/cells
 INNER

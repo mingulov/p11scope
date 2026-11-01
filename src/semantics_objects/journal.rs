@@ -893,6 +893,21 @@ impl JournalAdapter {
         self.consumed_through
     }
 
+    /// Test-only read of the stream break flag: the re-sync
+    /// positives pin the broken stream after the malformed quantum
+    /// and its clearing on the next unlinked collect. Production
+    /// resolves and clears this only through `resolve_birth_cut`.
+    #[cfg(test)]
+    pub(crate) fn stream_broken_for_test(&self) -> bool {
+        self.stream_broken
+    }
+
+    /// Test-only read of the adapter invalidation flag; see above.
+    #[cfg(test)]
+    pub(crate) fn invalidated_for_test(&self) -> bool {
+        self.invalidated
+    }
+
     /// Read-only allocation identity check; this never binds a new producer.
     pub(crate) fn retains_producers(
         &self,

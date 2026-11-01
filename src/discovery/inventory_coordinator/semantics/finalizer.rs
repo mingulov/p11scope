@@ -439,6 +439,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 (state.h3_takes, state.h3_pending.is_some())
             })
     }
+
+    #[cfg(test)]
+    pub(crate) fn reference_h3_last_disposition(
+        &self,
+    ) -> Option<crate::semantics_objects::journal::H3DispositionEvidence> {
+        self.semantic_finalizer
+            .as_ref()
+            .map(|state| state.h3_last.clone())
+    }
 }
 
 #[cfg(test)]

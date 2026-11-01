@@ -32,7 +32,24 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const SOURCE: &str = include_str!("../../tests/fixtures/instance-continuity.c");
-const SOFTHSM: &str = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so";
+/// SoftHSM2 provider layouts across hosts and guest images (Debian
+/// multiarch, the /usr/lib layout of the vng guests, Fedora /usr/lib64).
+/// The first present one wins; the Debian path is named when none is.
+fn softhsm() -> &'static str {
+    static FOUND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    FOUND.get_or_init(|| {
+        const CANDIDATES: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+            "/usr/lib/softhsm/libsofthsm2.so",
+            "/usr/lib64/pkcs11/libsofthsm2.so",
+        ];
+        CANDIDATES
+            .iter()
+            .copied()
+            .find(|path| Path::new(path).is_file())
+            .unwrap_or(CANDIDATES[0])
+    })
+}
 const TAG_MAIN: u64 = 0x7000_0000;
 const TAG_SIBLING: u64 = 0x7100_0000;
 const TAG_RACE: u64 = 0x7200_0000;
@@ -2460,7 +2477,7 @@ fn privileged_instance_continuity_experiment_softhsm() -> Result<()> {
         &driver,
         &[
             "churn".as_ref(),
-            SOFTHSM.as_ref(),
+            softhsm().as_ref(),
             unrelated_file.as_os_str(),
             unrelated_so.as_os_str(),
             seconds_arg.as_ref(),
@@ -2473,7 +2490,7 @@ fn privileged_instance_continuity_experiment_softhsm() -> Result<()> {
     let key_line = target.line(Duration::from_secs(10))?;
     let (_view, pins, plan, _key) = pin_and_plan(
         target.pid(),
-        Path::new(SOFTHSM),
+        Path::new(softhsm()),
         &["C_GetSlotInfo", "C_EncryptInit", "C_Encrypt"],
     )?;
     let _stats = enable_bpf_stats()?;

@@ -8592,6 +8592,84 @@ mod tests {
         );
     }
 
+    /// WU-13 P-A fixture: a real provider .so exporting two standard-name
+    /// functions (proved).
+    fn prearm_provider_with_proved_exports_for_test(dir: &std::path::Path) -> PathBuf {
+        let src = dir.join("prearm-proved.c");
+        std::fs::write(
+            &src,
+            "unsigned long C_Initialize(void *p){(void)p;return 0;}\n\
+             unsigned long C_GetFunctionList(void *l){(void)l;return 0;}\n",
+        )
+        .unwrap();
+        let provider = dir.join("prearm-proved.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&provider)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        provider
+    }
+
+    #[test]
+    fn inventory_run_with_prearm_holds_proved_endpoints_in_the_attach_set() {
+        // WU-13 P-A twin-1 (production-wiring half): a full inventory run
+        // with --prearm-module holds the proved offsets in the run's attach
+        // set (budgets.inventory_endpoints.occupied), even when the --module
+        // filter matches nothing (R2-D1-1: filtering never drops pre-arm).
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports_for_test(dir.path());
+        let out = dir.path().join("out.json");
+        let mut stdout = Vec::new();
+        let code = super::native_preparation_test::with(
+            |_, _, _| Err(anyhow::anyhow!("injected native unavailable for test")),
+            || {
+                run_with_terminal_budget(
+                    InspectScope::Pid(std::process::id()),
+                    &[PathBuf::from("/definitely/not/mapped-prearm-t8.so")],
+                    &[],
+                    &[provider],
+                    &HookRegistry::builtin(),
+                    true,
+                    Some(1),
+                    None,
+                    inventory_endpoint_budget(None).unwrap(),
+                    None,
+                    Some(&out),
+                    false,
+                    None,
+                    None,
+                    None,
+                    CaptureMode::Auto,
+                    crate::attach::BackendSelection::Singles,
+                    None,
+                    false,
+                    &|| false,
+                    &|| {},
+                    false,
+                    &mut WriterStdout(&mut stdout),
+                    &DashboardIo::stdio(),
+                    DiagnosticRequest::disabled(),
+                    None,
+                    &|| Ok(crate::attach::MultiCapableHost::for_test()),
+                    None,
+                    None,
+                )
+            },
+        )
+        .expect("inventory with --prearm-module under auto must not refuse");
+        assert_eq!(code, 0);
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            document["budgets"]["inventory_endpoints"]["occupied"], 2,
+            "the run's attach set holds exactly the two proved offsets"
+        );
+    }
+
     #[test]
     fn genuine_inventory_scan_never_requests_live_host_admission() {
         let mut stdout = Vec::new();

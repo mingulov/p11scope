@@ -1968,10 +1968,13 @@ fn module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
 
 /// One named gap line's body: the status, the planner's reason, and the
 /// hint. A refused proxy layer points at the attached providers that count
-/// its forwarded calls; a refused provider points at `--module` (unless the
-/// reason already carries that hint, as shared-scope refusals do).
+/// its forwarded calls; a prefix-admitted proxy layer names its covered
+/// templates with no further hint; a refused provider points at `--module`
+/// (unless the reason already carries that hint, as shared-scope refusals do).
 fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) -> String {
-    let status = if crate::plan::is_growth_omission(&skipped.reason) {
+    let status = if crate::plan::is_growth_omission(&skipped.reason)
+        || crate::plan::is_closure_array_prefix(&skipped.reason)
+    {
         "partially covered"
     } else {
         "not attached"
@@ -1979,6 +1982,8 @@ fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) ->
     let mut body = format!("{status} — {}", escape_controls(&skipped.reason));
     if crate::plan::is_closure_array_refusal(&skipped.reason) {
         body.push_str(&closure_forwarding_hint(ev, reports));
+    } else if crate::plan::is_closure_array_prefix(&skipped.reason) {
+        // The reason already names the covered templates; no hint.
     } else if !skipped.reason.contains("--module") {
         body.push_str(&format!(
             "; capture it alone with --module {}",
@@ -2371,11 +2376,15 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
             "modules_skipped" => {
                 // A module still attached on the endpoints it had when its
                 // growth did not fit is partially covered, not refused (G-03).
+                // A Part 0 prefix-admitted closure array is likewise partial.
                 let partially_covered = ev
                     .discovery
                     .modules_skipped
                     .iter()
-                    .filter(|module| crate::plan::is_growth_omission(&module.reason))
+                    .filter(|module| {
+                        crate::plan::is_growth_omission(&module.reason)
+                            || crate::plan::is_closure_array_prefix(&module.reason)
+                    })
                     .count() as u64;
                 let refused = ev.discovery.modules_skipped.len() as u64 - partially_covered;
                 for (n, label) in [
@@ -6067,6 +6076,28 @@ pub(crate) mod tests {
             ),
             "{text}"
         );
+    }
+
+    /// Part 0: a prefix-admitted closure array names its covered templates
+    /// as partially covered, with no `--module` hint (the prefix already
+    /// counts; narrowing to it alone changes nothing).
+    #[test]
+    fn scope_summary_names_a_prefix_admitted_closure_array() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/p11-kit-client.so".into(),
+            reason: "4 of 64 template tables attached; calls through the others are not counted"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 modules partially covered"), "{text}");
+        assert!(
+            text.contains("/opt/p11-kit-client.so: partially covered — "),
+            "{text}"
+        );
+        assert!(text.contains("4 of 64 template tables attached"), "{text}");
+        assert!(!text.contains("--module"), "{text}");
     }
 
     /// A refused closure array with nothing captured below it says so: its

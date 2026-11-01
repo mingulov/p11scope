@@ -294,6 +294,13 @@ pub(crate) fn is_closure_array_refusal(reason: &str) -> bool {
     reason.contains("(a proxy closure array is admitted whole or not at all)")
 }
 
+/// Whether a `modules_skipped` reason records a Part 0 prefix-admitted
+/// proxy closure array: some leading templates attached, the rest not
+/// counted. Partially covered, never a whole refusal.
+pub(crate) fn is_closure_array_prefix(reason: &str) -> bool {
+    reason.contains("template tables attached; calls through the others are not counted")
+}
+
 /// The omitted count a growth omission states — the `N` of
 /// `admitted module needs N more;` — or `None` for any other reason.
 pub(crate) fn growth_omitted_count(reason: &str) -> Option<usize> {
@@ -470,6 +477,9 @@ enum AdmissionDecision {
         kept: BTreeSet<AttachKey>,
         /// Allocated slots once this module was admitted.
         allocated_slots: usize,
+        /// Part 0: a closure array admitted as a leading-templates prefix
+        /// (not whole) names its covered tables for the report.
+        closure_prefix: Option<(usize, usize)>,
     },
     Refused(Skipped),
 }
@@ -2612,17 +2622,27 @@ fn merge(
     let mut decisions: Vec<Option<AdmissionDecision>> = (0..groups.len()).map(|_| None).collect();
     let mut uncorroborated_candidates = 0u64;
     let mut allocated_slots = allocated.slots;
+    // Part 0: a closure array takes leftover room only when no real provider
+    // was refused whole ahead of it. Closures decide last, so this is known.
+    let mut provider_refused = false;
     for position in order {
         let group = &groups[position];
         let object = group[0].object;
         let path = group[0].path;
         let (class, table_count) = classes[position];
+        // Part 0: a Detailed closure array with no provider refused ahead of
+        // it falls back to its leading-templates prefix when whole does not
+        // fit (remote-access clients have no backend; their templates are the
+        // only observation). Otherwise a closure array is whole-or-nothing.
+        let closure_prefix_allowed = class == AdmissionClass::ClosureArray
+            && matches!(admission_policy, AdmissionPolicy::Detailed)
+            && !broad_admit
+            && !provider_refused;
         // Shared scope: every module but an operator-attested one is admitted
         // whole or not at all, and uncorroborated ones leave the reserve free.
-        // A proxy closure array is admitted whole or not at all in every
-        // scope: a strongest-prefix exploration would crowd out the real
-        // providers behind the proxy.
-        let whole = broad_admit
+        // A proxy closure array is admitted whole or not at all unless Part 0
+        // prefix fallback applies (tried below on whole failure).
+        let whole_original = broad_admit
             || admission_policy.admits_complete_validated_union()
             || class == AdmissionClass::ClosureArray
             || (shared && class != AdmissionClass::Operator);
@@ -2657,7 +2677,8 @@ fn merge(
         // endpoints to keep. Admission then runs once more over `kept` alone:
         // the module keeps every endpoint it has, no prefix of its growth is
         // attached, and the growth is reported as omitted below. A module
-        // with nothing to keep is refused whole, as before.
+        // with nothing to keep is refused whole, as before — unless Part 0
+        // prefix fallback retries it as a leading-templates prefix below.
         let mut refused_growth: Option<BTreeSet<AttachKey>> = None;
         // The refused table — the strongest one, or a non-leading one that
         // holds kept endpoints: its endpoints are all in the omission
@@ -2669,7 +2690,15 @@ fn merge(
         // first pass spilled before the refusal would be counted again on
         // the retry — a double spill alongside the omission.
         let spill_baseline = uncorroborated_candidates;
+        // Part 0: whole is tried first; on whole failure a prefix-allowed
+        // closure retries once as a K4 prefix into the leftover room.
+        let mut use_prefix_fallback = false;
         let outcome = 'admission: loop {
+            let whole = if closure_prefix_allowed && use_prefix_fallback {
+                false
+            } else {
+                whole_original
+            };
             let kept_only = refused_growth.is_some();
             let admissible = |key: &AttachKey| !kept_only || kept.contains(key);
             let refused: BTreeSet<AttachKey> = 'refused: {
@@ -2856,6 +2885,9 @@ fn merge(
                 // promise (spill is informational, never PARTIAL), so broad never
                 // spills — it refuses, loudly, with the same shape. Empty tables cost
                 // nothing either way and admit, never spilling.
+                // Part 0: prefix fallback reports its covered templates; whole
+                // admission and provider K4 spill report nothing here.
+                let mut closure_prefix: Option<(usize, usize)> = None;
                 if whole {
                     let mut scan_union = fresh.clone();
                     for (key, _, _, _) in &ordered {
@@ -2950,8 +2982,11 @@ fn merge(
                         admitted.insert(*key);
                         heuristic_admitted += 1;
                     }
+                    if use_prefix_fallback {
+                        closure_prefix = Some((heuristic_admitted, table_count));
+                    }
                 }
-                break 'admission Ok((fresh, admitted));
+                break 'admission Ok((fresh, admitted, closure_prefix));
             };
             // Over `kept` alone nothing is fresh, so only the first pass
             // refuses; were that ever broken, the module is refused whole
@@ -2986,11 +3021,23 @@ fn merge(
                 uncorroborated_candidates = spill_baseline;
                 continue 'admission;
             }
+            // Part 0: whole failed for a prefix-allowed closure with nothing
+            // to keep — retry once as a leading-templates prefix. Whole
+            // never spills, so the baseline reset is exact.
+            if closure_prefix_allowed && !use_prefix_fallback && kept.is_empty() {
+                use_prefix_fallback = true;
+                uncorroborated_candidates = spill_baseline;
+                refused_top = None;
+                continue 'admission;
+            }
             break 'admission Err(refused);
         };
-        let (fresh, admitted) = match outcome {
+        let (fresh, admitted, closure_prefix) = match outcome {
             Ok(admission) => admission,
             Err(refused) => {
+                if class != AdmissionClass::ClosureArray {
+                    provider_refused = true;
+                }
                 holding.remove(&object);
                 let refusal = CapacityRefusal {
                     policy: admission_policy,
@@ -3020,6 +3067,7 @@ fn merge(
             refused_growth,
             kept,
             allocated_slots,
+            closure_prefix,
         });
     }
 
@@ -3038,7 +3086,7 @@ fn merge(
         let path = group[0].path;
         let source = group[0].source;
         entries_seen += decoded_occurrence_count(&group);
-        let (admitted, refused_growth, kept, allocated_slots) =
+        let (admitted, refused_growth, kept, allocated_slots, closure_prefix) =
             match decision.expect("merge decides every module before building it") {
                 AdmissionDecision::Refused(refusal) => {
                     refused_module_objects.push((object, refusal.clone()));
@@ -3050,8 +3098,28 @@ fn merge(
                     refused_growth,
                     kept,
                     allocated_slots,
-                } => (admitted, refused_growth, kept, allocated_slots),
+                    closure_prefix,
+                } => (
+                    admitted,
+                    refused_growth,
+                    kept,
+                    allocated_slots,
+                    closure_prefix,
+                ),
             };
+        // Part 0: a prefix-admitted closure names its covered templates.
+        // The module is admitted (its prefix counts), but calls through the
+        // other templates are not observed — a partial gap, never silent.
+        if let Some((covered, total)) = closure_prefix {
+            let prefix = Skipped {
+                subject: path.to_string(),
+                reason: format!(
+                    "{covered} of {total} template tables attached; calls through the others are not counted"
+                ),
+            };
+            refused_module_objects.push((object, prefix.clone()));
+            modules_skipped.push(prefix);
+        }
         // Per scan piece, per table index: admitted above. Manifest pieces
         // carry `None` and admit every target.
         let admitted_instance: Vec<Option<Vec<bool>>> = group
@@ -10937,17 +11005,19 @@ mod tests {
     }
 
     #[test]
-    fn inventory_admits_all_sixty_four_heuristic_tables_while_detailed_refuses_the_family_whole() {
+    fn inventory_admits_all_sixty_four_heuristic_tables_while_detailed_admits_a_prefix() {
         let scanned = provider_with_tables(92, "/opt/heuristic.so", 64, 103, false);
 
+        // Part 0: Detailed admits the leading-templates prefix with a named
+        // partial gap when no provider is refused; Inventory admits whole.
         let detailed = build_from_reconciled_modules(std::slice::from_ref(&scanned));
         assert_eq!(detailed.admission_policy(), AdmissionPolicy::detailed());
-        assert!(detailed.slots.is_empty());
+        assert_eq!(detailed.slots.len(), 4 * 103);
         assert_eq!(detailed.modules_skipped.len(), 1);
         assert!(
             detailed.modules_skipped[0]
                 .reason
-                .contains("(a proxy closure array is admitted whole or not at all)"),
+                .contains("4 of 64 template tables attached"),
             "{:?}",
             detailed.modules_skipped[0]
         );
@@ -11692,11 +11762,9 @@ mod tests {
 
     /// GT-5, the stock-desktop shape: an ambient `libp11-kit` decoding 64
     /// closure tables, ambient `p11-kit-trust`, and the SoftHSM2 the workload
-    /// uses, all heuristic. A shared scope admits both single-table providers
-    /// in every discovery order, and refuses the closure array whole, saying
-    /// why and how to aim the capture. Named scope defers the closure array
-    /// the same way: both providers are admitted and the family is refused
-    /// whole, so it never crowds them out.
+    /// uses, all heuristic. Both scopes admit both single-table providers in
+    /// every discovery order, and the family takes the leftover room as a
+    /// prefix with a named partial gap (Part 0), never crowding providers out.
     #[test]
     fn shared_scope_admits_single_table_providers_ahead_of_a_proxy_closure_array() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
@@ -11710,10 +11778,19 @@ mod tests {
         assert_eq!(named.admission_scope(), AdmissionScope::Named);
         assert_eq!(slots_of(&named, 32), 68, "named scope admits p11-kit-trust");
         assert_eq!(slots_of(&named, 33), 68, "named scope admits SoftHSM");
-        assert_eq!(slots_of(&named, 31), 0, "no closure prefix in named scope");
+        // 136 in use, 376 left: 3 tables (309) fit, the 4th does not.
+        assert_eq!(
+            slots_of(&named, 31),
+            3 * 103,
+            "named scope prefix in leftover room"
+        );
+        let named_partial = refusal_of(&named, P11_KIT).expect("prefix partial");
         assert!(
-            refusal_of(&named, P11_KIT).is_some(),
-            "named scope refuses the closure array whole"
+            named_partial
+                .reason
+                .contains("3 of 64 template tables attached"),
+            "{}",
+            named_partial.reason
         );
 
         let orders = [
@@ -11740,55 +11817,43 @@ mod tests {
                 68,
                 "p11-kit-trust admitted: {label:?}"
             );
-            assert_eq!(slots_of(&shared, 31), 0, "no p11-kit prefix: {label:?}");
+            // Shared reserve 128, ceiling 384 for uncorroborated: 136 in use,
+            // 248 open — 2 tables (206) fit, the 3rd does not.
+            assert_eq!(
+                slots_of(&shared, 31),
+                2 * 103,
+                "closure prefix in leftover room: {label:?}"
+            );
             assert_eq!(
                 shared.modules_skipped.len(),
                 1,
                 "{:?}",
                 shared.modules_skipped
             );
-            let refusal = refusal_of(&shared, P11_KIT).expect("p11-kit refused whole");
+            let partial = refusal_of(&shared, P11_KIT).expect("prefix partial");
             assert!(
-                refusal.reason.starts_with(&format!(
-                    "module needs {} more; only {MAX_SLOTS} attach slots are available; ",
-                    64 * 103
-                )),
+                partial.reason.contains("2 of 64 template tables attached"),
                 "{}",
-                refusal.reason
+                partial.reason
             );
             assert!(
-                refusal.reason.contains(
-                    "refusing to attach a prefix of its 64 lookalike function tables \
-                     (a proxy closure array is admitted whole or not at all)"
-                ),
-                "{}",
-                refusal.reason
-            );
-            assert!(
-                refusal.reason.contains(&format!(
-                    "136 are in use (136 active, 0 retired; held by {SOFTHSM} 68, {TRUST} 68)"
-                )),
-                "{}",
-                refusal.reason
-            );
-            assert!(
-                refusal
+                partial
                     .reason
-                    .ends_with("; to capture one provider, name it with --module <path>"),
+                    .contains("calls through the others are not counted"),
                 "{}",
-                refusal.reason
+                partial.reason
             );
             assert_eq!(
-                shared.uncorroborated_candidates, 0,
-                "a whole refusal spills nothing"
+                shared.uncorroborated_candidates, 62,
+                "the 62 spilled templates: {label:?}"
             );
         }
     }
 
-    /// Named scope defers a proxy closure array behind real providers: the
-    /// family is decided last and refused whole with its named reason, and a
+    /// Named scope defers a proxy closure array behind real providers: a
     /// heuristic backend it used to crowd out is admitted, in every discovery
-    /// order. Named scope keeps no reserve, so the refusal names none.
+    /// order, and the family takes the leftover room as a leading-templates
+    /// prefix with a named partial gap (Part 0). Named scope keeps no reserve.
     #[test]
     fn named_scope_admits_a_heuristic_provider_ahead_of_a_proxy_closure_array() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
@@ -11803,32 +11868,27 @@ mod tests {
                 68,
                 "the backend is admitted: {label:?}"
             );
-            assert_eq!(slots_of(&named, 31), 0, "no closure prefix: {label:?}");
-            let refusal = refusal_of(&named, P11_KIT).expect("closure refused whole");
+            assert_eq!(
+                slots_of(&named, 31),
+                4 * 103,
+                "closure prefix in leftover room: {label:?}"
+            );
+            let partial = refusal_of(&named, P11_KIT).expect("prefix partial reported");
             assert!(
-                refusal.reason.starts_with(&format!(
-                    "module needs {} more; only {MAX_SLOTS} attach slots are available; ",
-                    64 * 103
-                )),
+                partial.reason.contains("4 of 64 template tables attached"),
                 "{}",
-                refusal.reason
+                partial.reason
             );
             assert!(
-                refusal.reason.contains(
-                    "refusing to attach a prefix of its 64 lookalike function tables \
-                     (a proxy closure array is admitted whole or not at all)"
-                ),
+                partial
+                    .reason
+                    .contains("calls through the others are not counted"),
                 "{}",
-                refusal.reason
-            );
-            assert!(
-                !refusal.reason.contains("are reserved"),
-                "named scope keeps no reserve: {}",
-                refusal.reason
+                partial.reason
             );
             assert_eq!(
-                named.uncorroborated_candidates, 0,
-                "a whole refusal spills nothing: {label:?}"
+                named.uncorroborated_candidates, 60,
+                "the 60 spilled templates: {label:?}"
             );
         }
     }
@@ -11844,17 +11904,23 @@ mod tests {
             let label: Vec<_> = modules.iter().map(|module| module.object.0).collect();
 
             assert_eq!(slots_of(&named, 32), 68, "corroborated backend: {label:?}");
-            assert_eq!(slots_of(&named, 31), 0, "no closure prefix: {label:?}");
+            assert_eq!(
+                slots_of(&named, 31),
+                4 * 103,
+                "closure prefix in leftover room: {label:?}"
+            );
+            let partial = refusal_of(&named, P11_KIT).expect("prefix partial: {label:?}");
             assert!(
-                refusal_of(&named, P11_KIT).is_some(),
-                "closure refused whole: {label:?}"
+                partial.reason.contains("4 of 64 template tables attached"),
+                "{}",
+                partial.reason
             );
         }
     }
 
     /// The live `trust list` shape: the closure family, p11-kit-trust and
-    /// SoftHSM, all heuristic. Both backends are admitted and the family is
-    /// refused whole, in every discovery order.
+    /// SoftHSM, all heuristic. Both backends are admitted and the family
+    /// takes the leftover room as a prefix (Part 0), in every discovery order.
     #[test]
     fn named_scope_admits_both_backends_ahead_of_a_proxy_closure_array() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
@@ -11875,11 +11941,18 @@ mod tests {
 
             assert_eq!(slots_of(&named, 32), 68, "p11-kit-trust: {label:?}");
             assert_eq!(slots_of(&named, 33), 68, "SoftHSM: {label:?}");
-            assert_eq!(slots_of(&named, 31), 0, "no closure prefix: {label:?}");
+            // 136 in use, 376 left: 3 tables (309) fit, the 4th does not.
+            assert_eq!(
+                slots_of(&named, 31),
+                3 * 103,
+                "closure prefix in leftover room: {label:?}"
+            );
             assert_eq!(named.modules_skipped.len(), 1, "{label:?}");
+            let partial = refusal_of(&named, P11_KIT).expect("prefix partial: {label:?}");
             assert!(
-                refusal_of(&named, P11_KIT).is_some(),
-                "closure refused whole: {label:?}"
+                partial.reason.contains("3 of 64 template tables attached"),
+                "{}",
+                partial.reason
             );
         }
     }
@@ -11897,17 +11970,24 @@ mod tests {
         assert!(named.modules_skipped.is_empty());
     }
 
-    /// A closure family that fits no budget when nothing else competes is
-    /// refused whole with its named reason: the p11-kit proxy layer needs
-    /// thousands of slots, so a 512-slot capture reports the named gap
-    /// instead of a strongest-four prefix.
+    /// Part 0: a closure array is refused whole when a real provider was
+    /// refused ahead of it — leftover room goes to providers first, and a
+    /// prefix behind a loss would hide the crowding. (Closure-alone prefix
+    /// is pinned by `named_scope_admits_closure_prefix_when_no_provider_competes`.)
     #[test]
-    fn named_scope_refuses_an_unfitting_closure_array_whole_when_nothing_competes() {
+    fn named_scope_refuses_closure_whole_when_a_provider_is_refused() {
+        let filler = provider_with_tables(50, "/opt/filler.so", 1, 400, true);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let crowded = provider_with_tables(33, SOFTHSM, 1, 68, false);
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
-        let named = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        let modules = [filler, trust, crowded, p11_kit];
+        let named = scoped_plan(&modules, AdmissionScope::Named);
 
-        assert!(named.slots.is_empty(), "no prefix without competition");
-        assert_eq!(named.modules_skipped.len(), 1);
+        assert_eq!(slots_of(&named, 50), 400);
+        assert_eq!(slots_of(&named, 32), 68);
+        assert_eq!(slots_of(&named, 33), 0, "provider crowded out");
+        assert_eq!(slots_of(&named, 31), 0, "no prefix behind a loss");
+        assert!(refusal_of(&named, SOFTHSM).is_some());
         let refusal = refusal_of(&named, P11_KIT).expect("closure refused whole");
         assert!(
             refusal.reason.contains(
@@ -11916,6 +11996,32 @@ mod tests {
             ),
             "{}",
             refusal.reason
+        );
+    }
+
+    /// Part 0: a closure array alone (no provider to crowd out) keeps its
+    /// leading-templates prefix, not a whole refusal: the remote-access
+    /// client (`p11-kit-client.so`, no local backend) counts through its
+    /// attached templates. The report names the covered templates.
+    #[test]
+    fn named_scope_admits_closure_prefix_when_no_provider_competes() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let named = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+
+        assert_eq!(slots_of(&named, 31), 4 * 103, "leading-templates prefix");
+        assert_eq!(named.modules_skipped.len(), 1);
+        let partial = refusal_of(&named, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("4 of 64 template tables attached"),
+            "{}",
+            partial.reason
+        );
+        assert!(
+            partial
+                .reason
+                .contains("calls through the others are not counted"),
+            "{}",
+            partial.reason
         );
     }
 
@@ -12219,14 +12325,20 @@ mod tests {
         for modules in [&[nss.clone(), closure.clone()], &[closure, nss]] {
             let plan = scoped_plan(modules, AdmissionScope::Shared);
             assert_eq!(slots_of(&plan, 83), 66, "the provider admits whole");
-            assert_eq!(slots_of(&plan, 82), 0, "no closure-array prefix");
-            let refusal = refusal_of(&plan, P11_KIT).expect("closure refused whole");
+            // Part 0: 66 in use, 318 open under the 384 ceiling — 4 tables
+            // (256) fit, the 5th spills as a named partial gap.
+            assert_eq!(
+                slots_of(&plan, 82),
+                4 * entries,
+                "closure prefix in leftover room"
+            );
+            let partial = refusal_of(&plan, P11_KIT).expect("prefix partial");
             assert!(
-                refusal
+                partial
                     .reason
-                    .contains("a proxy closure array is admitted whole or not at all"),
+                    .contains(&format!("4 of 5 template tables attached")),
                 "{}",
-                refusal.reason
+                partial.reason
             );
             assert!(
                 refusal_of(&plan, "/opt/nss-softokn.so").is_none(),

@@ -453,16 +453,17 @@ proving renderers never receive the tail.
 
 ## Post-attach birth marker (object journal slice D)
 
-**Status: IMPLEMENTED in development for v0.6.0 behind two build switches, both default off:
-`P11SCOPE_BIRTH_MARKER=1` compiles the marker into Detailed objects, and `P11SCOPE_JOURNAL=1`
-builds the journal object. The owner approved both for FULL/P0 release builds (owner B2, 2026-11-01;
-final yes/no at freeze); the embedding is WU-2 work, and shipping it is gated on the WU-4 live cells
-(the R52 cells and marker cost) and the freeze decision. The linked birth seals
-activate only when the user opts in to per-key tracking (owner B1, 2026-11-01), with no new read.
+**Status: IMPLEMENTED in development for v0.6.0. FULL and P0 builds contain the
+marker in their Detailed objects and the journal object by default
+(`P11SCOPE_BIRTH_MARKER=0` or `P11SCOPE_JOURNAL=0` omits each); SMALL, WIDE and
+unsafe builds omit both. The owner approved FULL/P0 inclusion (owner B2, 2026-11-01;
+final yes/no at freeze). Shipping is gated on the live cells and the freeze decision.
+The linked birth seals activate only when the user opts in to per-key tracking
+(owner B1, 2026-11-01), with no new read.
 No formal privacy sign-off before about v0.9 (OD25).** The opt-in is
 `p11scope inventory --key-operations` (default off; selection ruling 2026-11-01).
-At this revision the kernel publish/dirty hooks are implemented
-and the Session-loop seal wire is pending (WU-2); until it lands, no production
+At this revision the kernel publish/dirty hooks are implemented and arming works
+under the opt-in, but the Session loop still wires no live reader, so no production
 caller mints births from marker state.
 In a marker build, this adds state only in a lane Session that has published an attach generation
 (closure): only an `inventory --manifest --key-operations` capture whose semantic lane seals over the
@@ -535,7 +536,8 @@ private capture-lifetime userspace copies (`src/semantics_objects/journal.rs`), 
 and never published: `SessionBirthEvidence` (the image cookie/exec pair, the marker word, the admission
 failure state, the attach generation and custody) and `SessionBirthGrant` (the domain proof, the birth kind,
 the birth cut, the closure generation, the bundled evidence and the optional stream binding). Their raw-value
-`Debug` output must be redacted before activation. The Session-loop seal wire lands in the WU-2 packet.
+`Debug` output must be redacted before activation. The Session loop still wires no live
+reader, so no production caller mints births from marker state.
 
 Output: nothing new is emitted. The marker only decides whether a process's key operations are reported as
 complete or withheld with a finite `joint_birth_native_<reason>`. No argv, environment, PIN, key, payload or
@@ -904,8 +906,8 @@ scan limitation. These receipts provide no trace-event naming authority.
 ## Object producer activation (H7 slice D, 2026-10-14)
 
 **Status: IMPLEMENTED the reviewed finite producer. H8 journal transactions and linked birth seals are
-planned for v0.6.0 release builds (owner B2 approved FULL/P0 inclusion, final at freeze; the embedding is
-WU-2 work, and shipping it is gated on the WU-4 live cells) and will activate only under the per-key-tracking opt-in
+contained in v0.6.0 FULL/P0 builds (owner B2 approved inclusion, final at freeze; shipping is gated on
+the live cells and the freeze decision) and activate only under the per-key-tracking opt-in
 `inventory --key-operations` (the
 post-attach birth marker read and retention is described in
 [Post-attach birth marker](#post-attach-birth-marker-object-journal-slice-d)).

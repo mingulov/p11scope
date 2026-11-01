@@ -265,6 +265,7 @@ glibc and musl in digest-pinned containers, and runs the canary, attach and host
 smokes against the packaged binaries. The helper lane
 (`scripts/verify-discover-containers.sh`) pins `rust:1.99.1-bookworm`,
 `rust:1.99.1-alpine3.22` and the `ubuntu:noble-20260810` run image by digest.
+FULL and P0 official bytes embed the journal object and the birth marker, and the official build strips caller switches.
 Qualify the packaged FULL bytes on the release candidate before publishing.
 
 Ordinary source builds default to FULL; `--no-default-features` alone does not

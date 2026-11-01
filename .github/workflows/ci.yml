@@ -502,7 +502,11 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin the post-loader-gate-wiring tree 30208b48. Since 90b8cf9f the BPF
+      # Pin 9a0b277a, the reviewed PID-scope EXEC ticket fix: emit_lifecycle no
+      # longer takes the EXEC task ticket under PID scope, a code change in the
+      # Detailed and InventoryCallers objects (the inventory object should differ
+      # only in line info). No other BPF input changed since 30208b48.
+      # Earlier pin 30208b48, the post-loader-gate-wiring tree. Since 90b8cf9f the BPF
       # inputs changed in 76098298, a785b4a3 and d63208ac (objects still
       # matched 90b8cf9f at d63208ac), then 5f67b34f, 32e7dd9a and 523323e0:
       # at 30208b48 only .debug_* and .BTF.ext line info differ in all three
@@ -533,7 +537,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=30208b48bfaa494420cd05f28ba950be41279470
+          BASELINE=9a0b277ad47401c19cca62ad146cabd98f42985d
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

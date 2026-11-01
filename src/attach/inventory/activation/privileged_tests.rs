@@ -1274,23 +1274,44 @@ impl OwnedIds {
     }
 
     fn prepared(prepared: &PreparedInventory) -> Result<Self> {
+        // The caller object also carries the identity-only image baseline
+        // iterator and its two maps (886ce765b): preparation checks that
+        // the iterator is present but never loads it (the baseline query
+        // loads it on demand), so it has no program ID here. Every other
+        // program must be loaded.
+        const BASELINE: &str = "p11_inventory_image_baseline";
+        let callers = matches!(prepared.flavor, InventoryFlavor::Callers(_));
         let mut ids = Self::default();
         for (name, map) in prepared.ebpf.maps() {
             let id = super::super::inventory_map_data(name, map)?.1.info()?.id();
             ensure!(id_exists(bpf_cmd::BPF_MAP_GET_NEXT_ID, id)?);
             ids.maps.insert(id);
         }
-        for (_, program) in prepared.ebpf.programs() {
+        let mut baseline_unloaded = false;
+        for (name, program) in prepared.ebpf.programs() {
+            if callers && name == BASELINE {
+                ensure!(
+                    matches!(program.info(), Err(ProgramError::NotLoaded)),
+                    "caller preparation loaded the on-demand baseline iterator"
+                );
+                baseline_unloaded = true;
+                continue;
+            }
             let id = program.info()?.id();
             ensure!(id_exists(bpf_cmd::BPF_PROG_GET_NEXT_ID, id)?);
             ids.programs.insert(id);
         }
-        let expected_maps = if matches!(prepared.flavor, InventoryFlavor::Callers(_)) {
-            19
-        } else {
-            14
-        };
-        ensure!(ids.maps.len() == expected_maps && ids.programs.len() == 12);
+        ensure!(
+            baseline_unloaded == callers,
+            "caller baseline iterator presence differs from the flavor"
+        );
+        let expected_maps = if callers { 21 } else { 14 };
+        ensure!(
+            ids.maps.len() == expected_maps && ids.programs.len() == 12,
+            "prepared Inventory census (maps, programs) = ({}, {}), expected ({expected_maps}, 12)",
+            ids.maps.len(),
+            ids.programs.len()
+        );
         Ok(ids)
     }
 

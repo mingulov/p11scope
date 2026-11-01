@@ -234,6 +234,14 @@ struct FinishMachineFixture {
     at_q_coverage_failures: usize,
     stops: usize,
     at_stop: Option<FinishStopObservation>,
+    /// F2 arm, default-off: a disclosing H0 stop simulation. The real
+    /// `stop_collected_at_q` never drains disclosures, so a stop whose
+    /// quadrant carries identities exists only when a twin arms these.
+    /// The armed quadrant joins the stop report after the real stop,
+    /// ahead of the collected stop union; existing tests arm nothing
+    /// and observe byte-identical behavior.
+    stop_disclosures: Vec<ReloadNotExcludedReport>,
+    stop_snapshots: (u64, u64),
 }
 
 struct FinishStopObservation {
@@ -456,6 +464,17 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
             .map_err(|_| SemanticRefusal::Unavailable)?;
         assert!(capture.stopped);
         assert!(report.current().is_empty());
+        // Armed twins simulate a disclosing H0 stop: the quadrant joins
+        // after the real stop's pristine checks, so matching, permission
+        // and capacity gates observe the same report as an unarmed stop.
+        if !finish.stop_disclosures.is_empty() {
+            report
+                .reload_not_excluded
+                .extend(std::mem::take(&mut finish.stop_disclosures));
+            let (continued, joined) = std::mem::take(&mut finish.stop_snapshots);
+            report.continued_across_global = report.continued_across_global.max(continued);
+            report.joined_across_global = report.joined_across_global.max(joined);
+        }
         finish.stops += 1;
         finish.at_stop = Some(FinishStopObservation {
             raw: raw.h0_identity(),
@@ -1373,6 +1392,8 @@ impl MachineScene {
             at_q_coverage_failures: 0,
             stops: 0,
             at_stop: None,
+            stop_disclosures: Vec::new(),
+            stop_snapshots: (0, 0),
         });
     }
 
@@ -2407,6 +2428,204 @@ fn joint_machine_finish_without_landed_row_publishes() {
         "the quiet finish publishes no new effects"
     );
     assert!(fixture.scene.real.lane.is_finished());
+}
+
+/// F2: a disclosing collected stop must reach the namespace ledger
+/// through the stop-union take+drain composition. The armed stop
+/// quadrant (one identity plus snapshots) unions into the staged
+/// batch at `merge_collected_stop_report`, and the take+drain moves
+/// exactly that contribution into the ledger: without it the stop
+/// disclosure would strand in the staged batch.
+#[test]
+fn joint_collected_stop_report_drains_stop_disclosures_into_the_ledger() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+    use crate::inventory_semantics::JointServiceProgress;
+    use p11scope_ebpf_common::ImageIdentity;
+
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("Finish quiet-prefix Init", None);
+    assert_eq!(fixture.reduced(), [2]);
+    assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
+    for _ in 0..3 {
+        let progress = fixture.service(1024).unwrap();
+        assert_eq!(progress, JointServiceProgress::Pending);
+    }
+    fixture.enable_finish_fixture(Vec::new());
+    // Arm the disclosing stop: one tainted identity plus snapshots.
+    {
+        let armed = fixture.finish.as_mut().expect("finish fixture enabled");
+        armed.stop_disclosures = vec![ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: 0x51,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(1)],
+        }];
+        armed.stop_snapshots = (6, 1);
+    }
+    fixture.begin_finish().unwrap();
+    let mut saw_stop_ready = false;
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.poll_finish(1).unwrap() {
+            JointCommitProgress::Published(_) => {
+                published = true;
+                break;
+            }
+            JointCommitProgress::Pending => {
+                saw_stop_ready |= fixture.machine.finish_stop_ready_for_test();
+            }
+        }
+    }
+    assert!(published, "the armed finish publishes within its bound");
+    assert!(
+        saw_stop_ready,
+        "the armed finish runs the collected stop union"
+    );
+    let armed = fixture.finish.as_ref().expect("finish fixture enabled");
+    assert_eq!(armed.stops, 1, "exactly one H0 stop ran");
+    assert!(
+        armed.stop_disclosures.is_empty(),
+        "the armed quadrant must fire into the stop report"
+    );
+    // The stop's contribution lands in the ledger, not stranded.
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let projected = coordinator
+        .reload_not_excluded_evidence()
+        .expect("the stop disclosure must reach the ledger");
+    assert_eq!(projected.continued_across_global, 6);
+    assert_eq!(projected.joined_across_global, 1);
+    assert_eq!(
+        projected.identities.len(),
+        1,
+        "exactly the stop identity: {:?}",
+        projected.identities
+    );
+    assert_eq!(projected.identities[0].file_slot, 3);
+    assert_eq!(projected.identities[0].ids, vec![1]);
+    // A fresh ledger absorbs one identity: no shed gap fires. The
+    // finish published, so committed gaps (not pre-commit staged ones)
+    // carry the disclosure.
+    let gaps = coordinator.registry().gaps();
+    assert!(
+        gaps.iter()
+            .all(|gap| gap.subject != "reload disclosure identities shed"),
+        "no shed on a fresh ledger: {gaps:?}"
+    );
+}
+
+/// F2 shed half: under a full ledger the same stop composition sheds
+/// the stop identity with the cumulative total under the one shed
+/// vocabulary, while the count snapshots still max-merge.
+#[test]
+fn joint_collected_stop_report_sheds_stop_disclosures_past_a_full_ledger() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+    use crate::inventory_semantics::JointServiceProgress;
+    use p11scope_ebpf_common::ImageIdentity;
+
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("Finish quiet-prefix Init", None);
+    // Fill the namespace ledger to its cap through the drained seam
+    // (one entry per distinct image), ahead of the machine's finish.
+    let domain = fixture.scene.real.lane.domain();
+    let fill: Vec<ReloadNotExcludedReport> = (0..MAX_INSTANCES as u64)
+        .map(|cookie| ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(cookie + 1)],
+        })
+        .collect();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .drain_reload_disclosures_into_ledger(domain, fill, 0, 0, 0);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reload_not_excluded_evidence()
+            .expect("a full ledger projects")
+            .identities
+            .len(),
+        MAX_INSTANCES
+    );
+    for _ in 0..3 {
+        let progress = fixture.service(1024).unwrap();
+        assert_eq!(progress, JointServiceProgress::Pending);
+    }
+    fixture.enable_finish_fixture(Vec::new());
+    // Arm past the cap: a fresh image the full ledger must shed.
+    {
+        let armed = fixture.finish.as_mut().expect("finish fixture enabled");
+        armed.stop_disclosures = vec![ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: 10_000,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(10_001)],
+        }];
+        armed.stop_snapshots = (6, 1);
+    }
+    fixture.begin_finish().unwrap();
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.poll_finish(1).unwrap() {
+            JointCommitProgress::Published(_) => {
+                published = true;
+                break;
+            }
+            JointCommitProgress::Pending => {}
+        }
+    }
+    assert!(published, "the armed finish publishes within its bound");
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let projected = coordinator
+        .reload_not_excluded_evidence()
+        .expect("a full ledger still projects");
+    assert_eq!(
+        projected.identities.len(),
+        MAX_INSTANCES,
+        "the ledger never grows past its cap"
+    );
+    assert_eq!(projected.continued_across_global, 6);
+    assert_eq!(projected.joined_across_global, 1);
+    assert!(
+        !projected
+            .identities
+            .iter()
+            .flat_map(|entry| entry.ids.iter())
+            .any(|id| *id == 10_001),
+        "the over-cap stop identity sheds"
+    );
+    let gaps = coordinator.registry().gaps();
+    let shed_gaps: Vec<_> = gaps
+        .iter()
+        .filter(|gap| gap.subject == "reload disclosure identities shed")
+        .collect();
+    assert_eq!(shed_gaps.len(), 1, "one shed gap fires: {gaps:?}");
+    assert!(
+        shed_gaps[0].reason.contains("(1 shed this capture)"),
+        "the gap carries the cumulative total: {:?}",
+        shed_gaps[0].reason
+    );
 }
 
 /// The staged "joint finish made no progress" gaps on a fixture.

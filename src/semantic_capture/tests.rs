@@ -549,6 +549,53 @@ mod current_receipts_tests {
     }
 
     #[test]
+    fn stashed_disclosure_shed_hands_off_into_the_next_tick_report() {
+        use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+        use crate::inventory_semantics::{
+            RefreshReceiptStash, SemanticBatch, merge_stash_into_report, stash_refresh_report,
+        };
+
+        // The same disclosure-only overflow as the neighbor twin: 4097
+        // identities through a 4096-capped stash, one carried shed.
+        let mut stash = RefreshReceiptStash::new();
+        for cookie in 0..=MAX_INSTANCES as u64 {
+            let mut refresh = TickReport::default();
+            refresh.reload_not_excluded.push(ReloadNotExcludedReport {
+                label: RELOAD_NOT_EXCLUDED_LABEL,
+                image: ImageIdentity {
+                    task_cookie: cookie,
+                    exec_id: 7,
+                },
+                file_slot: 3,
+                ids: vec![InstanceId::from_raw(cookie + 1)],
+            });
+            let (_, shed) = stash_refresh_report(&mut stash, &mut refresh);
+            assert_eq!(shed, 0, "disclosure shed is never a refused endpoint");
+        }
+        assert_eq!(stash.disclosure_shed(), 1);
+        // The handoff: the carried shed rides the next tick report's
+        // own disclosure shed, never the refused-endpoint total, and
+        // the batch constructor carries it to the staged batch.
+        let mut tick = TickReport::default();
+        let refused = merge_stash_into_report(&mut stash, &mut tick);
+        assert_eq!(
+            refused, 0,
+            "the handoff carries no refused endpoints: {refused}"
+        );
+        assert_eq!(
+            tick.reload_shed, 1,
+            "the stashed shed must reach the tick report"
+        );
+        let batch = SemanticBatch::from_tick_report(NativeDomainId::mint(), tick, Vec::new(), 130)
+            .expect("the handed-off tick respects lane bounds");
+        assert_eq!(
+            batch.reload_shed(),
+            1,
+            "the staged batch must carry the handed-off shed"
+        );
+    }
+
+    #[test]
     fn quiet_report_treats_snapshots_and_shed_as_content() {
         use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
 
@@ -7248,6 +7295,165 @@ mod b17_wire_projection {
         );
         let mut evidence = crate::render::tests::evidence();
         evidence.instance_reload_not_excluded = None;
+        let value = crate::render::versioned_evidence(&evidence);
+        assert!(
+            value.get("instance_reload_not_excluded").is_none(),
+            "absent, never zero: {value}"
+        );
+    }
+
+    /// Build terminal profile evidence through the real `evidence_for`
+    /// feed point, exactly as the capture loops do, with the staged
+    /// ledger supplied (lane-backed) or not (no producer).
+    fn evidence_through_feed(
+        engine: &crate::discovery::engine::Engine,
+        state: &crate::semantics::State,
+        ledger: Option<&InventoryCoordinator<OsProcessSource>>,
+    ) -> crate::render::Evidence {
+        let scheduling = crate::run::SchedulingAccumulator::default()
+            .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+        crate::run::evidence_for(
+            engine,
+            engine.capture_facts(),
+            0,
+            false,
+            false,
+            Default::default(),
+            crate::render::ObjectCaptureEvidence::for_build(cfg!(
+                feature = "stub-object-attributes"
+            )),
+            &[],
+            &[],
+            crate::metrics::KernelEvidence::default(),
+            crate::process::TrackingEvidence::default(),
+            0,
+            state,
+            false,
+            true,
+            Default::default(),
+            None,
+            false,
+            scheduling,
+            None,
+            None,
+            ledger,
+        )
+    }
+
+    // Producer: a capture whose semantic lane carries a reload
+    // disclosure must project `Some` into the terminal evidence
+    // through the real feed point, with the churned identity's IDs
+    // plus the capture counts, the clean control absent, the ruled
+    // key rendered, and the verdict untouched.
+    #[test]
+    fn b17_producer_projects_staged_disclosure_through_evidence_for() {
+        let (mut capture, mut io, endpoint) = fixture();
+        let churned_new = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 0);
+        assert_eq!(churned_new.observations, vec![ObserveOutcome::New]);
+        let id_churned = joined(route(&mut capture, CHURNED, 1, 2, 0));
+        let churned_tainted = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 1);
+        assert_eq!(
+            churned_tainted.observations,
+            vec![ObserveOutcome::Continued]
+        );
+        assert_eq!(
+            churned_tainted.reload_not_excluded.len(),
+            1,
+            "the churn must disclose"
+        );
+        assert_eq!(joined(route(&mut capture, CHURNED, 2, 2, 1)), id_churned);
+        let churned_refresh = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 1);
+        assert_eq!(
+            churned_refresh.observations,
+            vec![ObserveOutcome::Continued]
+        );
+        assert!(
+            churned_refresh.reload_not_excluded.is_empty(),
+            "no re-yield"
+        );
+        let clean_new = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(clean_new.observations, vec![ObserveOutcome::New]);
+        let id_clean = joined(route(&mut capture, CLEAN, 3, 2, 0));
+        assert_ne!(id_clean, id_churned);
+        let clean_quiet = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(clean_quiet.observations, vec![ObserveOutcome::Continued]);
+        assert!(
+            clean_quiet.reload_not_excluded.is_empty(),
+            "the clean control must stay silent"
+        );
+
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        for report in [
+            churned_new,
+            churned_tainted,
+            churned_refresh,
+            clean_new,
+            clean_quiet,
+        ] {
+            commit(&mut coordinator, &mut lane, report);
+        }
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = crate::semantics::State::new(engine.plan());
+        let evidence = evidence_through_feed(&engine, &state, Some(&coordinator));
+        let projected = evidence
+            .instance_reload_not_excluded
+            .as_ref()
+            .expect("a disclosing capture must project Some through evidence_for");
+        assert_eq!(projected.continued_across_global, 1);
+        assert_eq!(projected.joined_across_global, 1);
+        assert_eq!(projected.identities.len(), 1);
+        assert_eq!(projected.identities[0].file_slot, endpoint.file_slot);
+        assert_eq!(projected.identities[0].ids, vec![id_churned.get()]);
+        assert!(
+            !projected
+                .identities
+                .iter()
+                .flat_map(|entry| entry.ids.iter())
+                .any(|id| *id == id_clean.get()),
+            "the clean control must have no entry"
+        );
+        let value = crate::render::versioned_evidence(&evidence);
+        assert_eq!(
+            value["instance_reload_not_excluded"],
+            serde_json::json!({
+                "continued_across_global": 1,
+                "joined_across_global": 1,
+                "identities": [{"file_slot": endpoint.file_slot, "ids": [id_churned.get()]}],
+            }),
+        );
+        // Verdict neutrality: the same capture without the ledger
+        // reaches the identical verdict, with the key absent.
+        let control = evidence_through_feed(&engine, &state, None);
+        assert!(control.instance_reload_not_excluded.is_none());
+        assert_eq!(evidence.completeness, control.completeness);
+        assert_eq!(evidence.verdict_detail, control.verdict_detail);
+    }
+
+    // Producer absent-half: a staged but clean ledger projects `None`
+    // through the feed point, and the key stays absent from the render.
+    #[test]
+    fn b17_producer_clean_capture_omits_the_key_through_evidence_for() {
+        let (mut capture, mut io, endpoint) = fixture();
+        let first = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(first.observations, vec![ObserveOutcome::New]);
+        let _ = joined(route(&mut capture, CLEAN, 1, 2, 0));
+        let second = scan(&mut capture, &mut io, endpoint, CLEAN, 2, 0);
+        assert_eq!(second.observations, vec![ObserveOutcome::Continued]);
+        assert!(second.reload_not_excluded.is_empty());
+
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        for report in [first, second] {
+            commit(&mut coordinator, &mut lane, report);
+        }
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = crate::semantics::State::new(engine.plan());
+        let evidence = evidence_through_feed(&engine, &state, Some(&coordinator));
+        assert!(
+            evidence.instance_reload_not_excluded.is_none(),
+            "a clean ledger projects nothing through the feed"
+        );
         let value = crate::render::versioned_evidence(&evidence);
         assert!(
             value.get("instance_reload_not_excluded").is_none(),

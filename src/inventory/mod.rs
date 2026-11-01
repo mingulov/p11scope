@@ -5659,43 +5659,13 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             };
             let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
             if let Some(lane) = semantic.as_mut() {
-                // The machine owns its latch and retries; a refused
-                // hook simply services again on the next tick. The
-                // first refusal is kept instead of dropped: it names
-                // the lane's stop if the lane later holds with no
-                // latched reason of its own.
-                if let Err(reason) = lane.service_joint_with_acquisition(
+                Self::service_linked_joint_hook(
+                    lane,
                     coordinator,
-                    crate::inventory_semantics::JointServiceMode::Running,
                     &mut budget,
                     reborrow_acquisition(&mut acquisition),
-                ) {
-                    self.joint_tick_refusal.get_or_insert(reason);
-                }
-                // Linked-DD pump (§6.06): after machine service, on the
-                // shared per-hook budget, pump linked live DISCOVERY
-                // through the lane's owner seam. The machine keeps
-                // priority; the pump runs regardless of the machine
-                // outcome, and a fault only names the fallback stop
-                // reason — it never latches the machine. The pump is
-                // last in the hook, so the drained count needs no spend
-                // bookkeeping (re-add it if a later consumer follows
-                // the pump); an over-work answer still names the
-                // fallback reason, like the machine's distrust.
-                let work = budget
-                    .remaining_actions
-                    .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM);
-                match lane.service_linked_live_discovery(work, budget.deadline) {
-                    Ok(records) if records <= work => {}
-                    Ok(_) => {
-                        self.joint_tick_refusal.get_or_insert(
-                            crate::inventory_semantics::SemanticRefusal::Unavailable,
-                        );
-                    }
-                    Err(reason) => {
-                        self.joint_tick_refusal.get_or_insert(reason);
-                    }
-                }
+                    &mut self.joint_tick_refusal,
+                );
             }
             return;
         }
@@ -5928,6 +5898,55 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
 }
 
 impl ClassicDriver<'_> {
+    /// Linked Joint hook (§6.06): service the machine and pump linked
+    /// live DISCOVERY on the shared per-hook budget. Test-commit shape
+    /// preserves the pre-R1 machine-first order; the R1 change flips
+    /// it to pump-first with a guaranteed discovery share.
+    fn service_linked_joint_hook(
+        lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        budget: &mut crate::inventory_semantics::JointWorkBudget,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+        tick_refusal: &mut Option<crate::inventory_semantics::SemanticRefusal>,
+    ) {
+        // The machine owns its latch and retries; a refused
+        // hook simply services again on the next tick. The
+        // first refusal is kept instead of dropped: it names
+        // the lane's stop if the lane later holds with no
+        // latched reason of its own.
+        if let Err(reason) = lane.service_joint_for_linked_hook(
+            coordinator,
+            crate::inventory_semantics::JointServiceMode::Running,
+            budget,
+            acquisition,
+        ) {
+            tick_refusal.get_or_insert(reason);
+        }
+        // Linked-DD pump (§6.06): after machine service, on the
+        // shared per-hook budget, pump linked live DISCOVERY
+        // through the lane's owner seam. The machine keeps
+        // priority; the pump runs regardless of the machine
+        // outcome, and a fault only names the fallback stop
+        // reason — it never latches the machine. The pump is
+        // last in the hook, so the drained count needs no spend
+        // bookkeeping (re-add it if a later consumer follows
+        // the pump); an over-work answer still names the
+        // fallback reason, like the machine's distrust.
+        let work = budget
+            .remaining_actions
+            .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM);
+        match lane.service_linked_live_discovery(work, budget.deadline) {
+            Ok(records) if records <= work => {}
+            Ok(_) => {
+                tick_refusal
+                    .get_or_insert(crate::inventory_semantics::SemanticRefusal::Unavailable);
+            }
+            Err(reason) => {
+                tick_refusal.get_or_insert(reason);
+            }
+        }
+    }
+
     /// The settle above with an explicit wall bound (tests pose a
     /// short one; production passes the settle backstop). At the
     /// bound the finish abandons with its own settle-bound gap,
@@ -14498,6 +14517,271 @@ mod tests {
             discovery.get(),
             1,
             "the classic arm still services live discovery"
+        );
+    }
+
+    #[test]
+    fn linked_hook_pump_first_share_with_spending_machine() {
+        // R1: the pump runs first with `(remaining - 1).min(256)` and
+        // spends its drained records; the machine sees the remainder
+        // even when it wants the whole budget, so discovery still
+        // advances. Order pinned: pump precedes machine service.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        for (remaining, expect_work) in [(1024usize, 256usize), (300, 256), (100, 99), (2, 1)] {
+            let mut coordinator = coordinator();
+            let discovery = Rc::new(Cell::new(0));
+            let mut io = WindDownIo::completing();
+            io.discovery = Rc::clone(&discovery);
+            let mut lane = joint_lane(io, false);
+            lane.set_test_joint_linked(true);
+            lane.set_scripted_pump_drained_for_test(Some(expect_work));
+            lane.set_scripted_service_spend_for_test(Some(usize::MAX));
+            let mut budget = crate::inventory_semantics::JointWorkBudget {
+                remaining_actions: remaining,
+                deadline: Instant::now() + Duration::from_secs(10),
+            };
+            let mut tick_refusal = None;
+            ClassicDriver::service_linked_joint_hook(
+                &mut lane,
+                &mut coordinator,
+                &mut budget,
+                None,
+                &mut tick_refusal,
+            );
+            assert_eq!(
+                lane.pump_work_seen_for_test(),
+                &[expect_work],
+                "remaining={remaining}: pump work is (remaining - 1).min(256)"
+            );
+            assert_eq!(
+                lane.service_budget_seen_for_test(),
+                &[remaining - expect_work],
+                "remaining={remaining}: the machine sees remaining minus drained"
+            );
+            assert_eq!(
+                lane.hook_order_for_test(),
+                &["pump", "machine"],
+                "remaining={remaining}: the pump precedes machine service"
+            );
+            assert_eq!(
+                discovery.get(),
+                1,
+                "remaining={remaining}: discovery advances despite a greedy machine"
+            );
+            assert_eq!(
+                budget.remaining_actions, 0,
+                "remaining={remaining}: the machine spent the rest"
+            );
+            assert_eq!(
+                tick_refusal, None,
+                "remaining={remaining}: no refusal on the healthy path"
+            );
+            assert!(
+                lane.has_joint_machine(),
+                "remaining={remaining}: no latch on the healthy path"
+            );
+        }
+    }
+
+    #[test]
+    fn linked_hook_one_credit_skips_pump() {
+        // R1: a one-credit hook skips the pump and advances the
+        // machine, as in the unlinked rule.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        let mut coordinator = coordinator();
+        let discovery = Rc::new(Cell::new(0));
+        let mut io = WindDownIo::completing();
+        io.discovery = Rc::clone(&discovery);
+        let mut lane = joint_lane(io, false);
+        lane.set_test_joint_linked(true);
+        lane.set_scripted_pump_drained_for_test(Some(1));
+        lane.set_scripted_service_spend_for_test(Some(1));
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let mut tick_refusal = None;
+        ClassicDriver::service_linked_joint_hook(
+            &mut lane,
+            &mut coordinator,
+            &mut budget,
+            None,
+            &mut tick_refusal,
+        );
+        assert_eq!(
+            lane.pump_work_seen_for_test(),
+            &[] as &[usize],
+            "one credit never pumps"
+        );
+        assert_eq!(
+            lane.hook_order_for_test(),
+            &["machine"],
+            "one credit still advances the machine"
+        );
+        assert_eq!(
+            lane.service_budget_seen_for_test(),
+            &[1],
+            "the machine sees the one credit"
+        );
+        assert_eq!(discovery.get(), 0, "no discovery service on one credit");
+        assert_eq!(budget.remaining_actions, 0, "the machine spent it");
+        assert_eq!(tick_refusal, None, "no refusal on the one-credit path");
+    }
+
+    #[test]
+    fn linked_hook_pump_fault_services_machine_without_latch() {
+        // R1/D4: a pump fault never latches the machine; the machine
+        // is still serviced on the same budget, and the fallback stop
+        // reason keeps D4 precedence (the machine's refusal from the
+        // same hook wins over the pump's Unavailable).
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        // Fault alone: machine serviced, no latch, Unavailable kept.
+        {
+            let mut coordinator = coordinator();
+            let discovery = Rc::new(Cell::new(0));
+            let mut io = WindDownIo::completing();
+            io.discovery = Rc::clone(&discovery);
+            let mut lane = joint_lane(io, false);
+            lane.set_test_joint_linked(true);
+            lane.set_scripted_pump_fault_for_test(true);
+            lane.set_scripted_service_spend_for_test(Some(0));
+            let mut budget = crate::inventory_semantics::JointWorkBudget {
+                remaining_actions: 1024,
+                deadline: Instant::now() + Duration::from_secs(10),
+            };
+            let mut tick_refusal = None;
+            ClassicDriver::service_linked_joint_hook(
+                &mut lane,
+                &mut coordinator,
+                &mut budget,
+                None,
+                &mut tick_refusal,
+            );
+            assert_eq!(
+                lane.hook_order_for_test(),
+                &["pump", "machine"],
+                "a faulting pump still runs first"
+            );
+            assert_eq!(lane.pump_work_seen_for_test(), &[256]);
+            assert_eq!(
+                lane.service_budget_seen_for_test(),
+                &[1024],
+                "a fault spends nothing, so the machine sees the full budget"
+            );
+            assert_eq!(discovery.get(), 1, "the faulting pump still ran");
+            assert_eq!(
+                tick_refusal,
+                Some(crate::inventory_semantics::SemanticRefusal::Unavailable),
+                "the pump fault names the fallback stop reason"
+            );
+            assert!(
+                lane.has_joint_machine(),
+                "a pump fault never latches the machine"
+            );
+            assert_eq!(
+                lane.joint_disposition_reason(),
+                None,
+                "no disposition latched by a pump fault"
+            );
+        }
+        // Precedence: the machine's refusal from the same hook wins.
+        let mut coordinator2 = coordinator();
+        let discovery2 = Rc::new(Cell::new(0));
+        let mut io2 = WindDownIo::completing();
+        io2.discovery = Rc::clone(&discovery2);
+        let mut lane2 = joint_lane(io2, false);
+        lane2.set_test_joint_linked(true);
+        lane2.set_scripted_pump_fault_for_test(true);
+        lane2.set_scripted_service_spend_for_test(Some(0));
+        lane2.set_scripted_service_outcome_for_test(Some(Err(
+            crate::inventory_semantics::SemanticRefusal::ProviderStorage,
+        )));
+        let mut budget2 = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let mut tick_refusal2 = None;
+        ClassicDriver::service_linked_joint_hook(
+            &mut lane2,
+            &mut coordinator2,
+            &mut budget2,
+            None,
+            &mut tick_refusal2,
+        );
+        assert_eq!(
+            tick_refusal2,
+            Some(crate::inventory_semantics::SemanticRefusal::ProviderStorage),
+            "the machine's refusal wins over the pump's Unavailable"
+        );
+        assert_eq!(
+            lane2.hook_order_for_test(),
+            &["pump", "machine"],
+            "precedence still runs the pump first"
+        );
+    }
+
+    #[test]
+    fn linked_hook_after_finish_begins_pumps_nothing() {
+        // Driver-level Finish pin: once Finish begins, hooks step the
+        // finish and never pump linked discovery, so the discovery
+        // counter stays put. The machine-level no-re-entry twin lives
+        // beside the machine (`linked_finish_never_reenters_running_service`).
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let discovery = Rc::new(Cell::new(0));
+        let mut io = WindDownIo::completing();
+        io.discovery = Rc::clone(&discovery);
+        driver.semantic = Some(wind_down_lane(io));
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_scripted_joint_init_for_test(Some(Ok(())));
+        driver.initialize_joint_lane();
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_test_joint_linked(true);
+        driver.on_tick();
+        assert_eq!(discovery.get(), 1, "a running hook pumps linked discovery");
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_scripted_finish_begin_for_test(Some(Ok(())));
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_scripted_finish_poll_for_test(Some(Ok(
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending,
+            )));
+        driver.on_stop_requested();
+        assert!(
+            matches!(driver.joint_finish, JointFinishDriver::Polling),
+            "the stop begins the joint finish"
+        );
+        driver.on_tick();
+        assert_eq!(
+            discovery.get(),
+            1,
+            "no pump after Finish begins (first hook)"
+        );
+        driver.on_tick();
+        assert_eq!(
+            discovery.get(),
+            1,
+            "no pump after Finish begins (second hook)"
         );
     }
 

@@ -1640,7 +1640,8 @@ impl SemanticCapture {
         self.service_live_discovery_with(|| session.discovery_dequeue());
     }
 
-    /// Bounded service for the running, unlinked-journal machine. Transport
+    /// Bounded live-discovery service, shared by the running unlinked-journal
+    /// machine and the linked-DD pump. Transport
     /// faults stay sticky and refuse even when an audited original needs no
     /// further H0 tick. This creates no empty-prefix or publication evidence.
     pub(crate) fn service_live_discovery_until(

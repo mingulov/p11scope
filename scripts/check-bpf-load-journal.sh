@@ -1,0 +1,532 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Load the journal object in throwaway vng guests and score its verifier cost.
+#
+# Usage: check-bpf-load-journal.sh [--budgets FILE] OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]
+#
+# OBSERVER is the prebuilt observer under test (a build with the journal
+# object; it must live on the vng shared filesystem, never under /var/tmp
+# which the shared fs hides), PROBE the verifier-stats probe built by
+# `measure-verifier-headroom.py build`, MANIFEST a p11scope-discover manifest
+# for the guest-visible SoftHSM provider, OUTDIR an existing empty directory
+# under /home/user/.cache/p11scope-vng/<tag>/ shared with the guests.
+# Default kernels: v6.6.157 v6.12.111 v6.18.58 v7.0.14.
+# --budgets defaults to the checked-in tests/bpf-verifier-budgets.json when
+# that file exists. The journal rows are scored against it only when it
+# carries journal/ keys for the kernel; otherwise the gate is loaded +
+# stats + 5% headroom and the row says unbudgeted.
+#
+# Per kernel one throwaway guest runs a bounded linked inventory,
+# `inventory --system --capture native --key-operations --manifest
+# MANIFEST --duration 60s`, under the probe. Before the observer starts,
+# the guest initializes a guest-local SoftHSM token and starts a loop of
+# short PKCS#11 info workloads against the guest SoftHSM module, so the
+# linked lane seals on an attested provider and observes calls. The
+# workload loop, token and logs live on guest-local storage (the work
+# image); only the finished probe rows, observer text and workload log
+# are copied back to OUTDIR.
+#
+# A load kernel passes only when the probe rows carry both journal roots
+# loaded with verifier stats, the per-program report passes, and the
+# observer text reports the linked lane started (`key operations:
+# unavailable (bootstrap_unavailable)`, or a populated `key operations:
+# rev ...` line when births occur). Zero journal rows, a refused journal
+# start, a timeout, a crash or a missing count is FAIL. The finite
+# refusal reasons (`journal-pair-unavailable-in-build` on a build that
+# omits the object, `uprobe-multi-required` on pre-Multi kernels) are
+# named in the row detail, never mistaken for a pass.
+#
+# v5.15.* kernels are a refusal control, not a load: the finite
+# `uprobe-multi-required` refusal with no loaded journal row is a pass
+# for that cell; a load or a crash is FAIL.
+#
+# Writes OUTDIR/results.jsonl, one row per kernel:
+# {"cell": "journal-load-<kernel>", "pass": bool,
+#  "qualification": "qualified"|"failed"|"nonqualifying", "detail": str}.
+# Exit 0 only when every row passes; 1 when a cell failed or could not
+# run; 2 on harness misuse; 77 when a prerequisite is missing.
+#
+# Apt prerequisites on the host (a vng guest runs the host userspace,
+# so the guest needs the same): gcc, softhsm2, libsofthsm2, python3,
+# and virtme-ng (`pipx install virtme-ng`) with a kernel cache holding
+# the requested kernels. Expected time is about three minutes per
+# kernel, mostly one guest boot plus the 60 s linked run.
+set -eu
+
+BUDGETS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --budgets)
+            [ $# -ge 2 ] || { echo "missing value for --budgets" >&2; exit 2; }
+            BUDGETS="$2"
+            shift 2
+            ;;
+        --budgets=*)
+            BUDGETS="${1#--budgets=}"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "check-bpf-load-journal.sh: unknown option $1" >&2
+            exit 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+if [ $# -lt 4 ]; then
+    echo "usage: check-bpf-load-journal.sh [--budgets FILE] OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]" >&2
+    exit 2
+fi
+OBSERVER=$1
+PROBE=$2
+MANIFEST=$3
+OUTDIR=$4
+shift 4
+if [ $# -eq 0 ]; then
+    set -- v6.6.157 v6.12.111 v6.18.58 v7.0.14
+fi
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+REPORT="$SCRIPT_DIR/bpf-load-report.py"
+SELECTOR="$SCRIPT_DIR/release-matrix-contract.py"
+WORKLOAD_SRC="$SCRIPT_DIR/../tests/fixtures/counter-softhsm-workload.c"
+if [ -z "$BUDGETS" ] && [ -f "$SCRIPT_DIR/../tests/bpf-verifier-budgets.json" ]; then
+    BUDGETS="$SCRIPT_DIR/../tests/bpf-verifier-budgets.json"
+fi
+
+[ -f "$OBSERVER" ] || { echo "observer not found: $OBSERVER" >&2; exit 2; }
+[ -f "$PROBE" ] || { echo "probe not found: $PROBE" >&2; exit 2; }
+[ -f "$MANIFEST" ] || { echo "manifest not found: $MANIFEST" >&2; exit 2; }
+[ -d "$OUTDIR" ] || { echo "output dir not found: $OUTDIR" >&2; exit 2; }
+[ -f "$REPORT" ] || { echo "report script not found: $REPORT" >&2; exit 2; }
+[ -f "$WORKLOAD_SRC" ] || { echo "workload source not found: $WORKLOAD_SRC" >&2; exit 2; }
+if [ -n "$BUDGETS" ] && [ ! -f "$BUDGETS" ]; then
+    echo "budgets not found: $BUDGETS" >&2
+    exit 2
+fi
+case "$OBSERVER" in
+    /*) ;;
+    *) echo "observer must be an absolute guest-visible path: $OBSERVER" >&2; exit 2 ;;
+esac
+case "$OBSERVER" in
+    /var/tmp/*) echo "observer under /var/tmp is hidden from vng guests: $OBSERVER" >&2; exit 2 ;;
+esac
+case "$OUTDIR" in
+    /*) ;;
+    *) echo "output dir must be absolute: $OUTDIR" >&2; exit 2 ;;
+esac
+case "$OUTDIR" in
+    /var/tmp/*) echo "output dir under /var/tmp is hidden from vng guests: $OUTDIR" >&2; exit 2 ;;
+esac
+command -v vng >/dev/null || { echo "vng not on PATH" >&2; exit 2; }
+command -v cc >/dev/null || { echo "cc not on PATH" >&2; exit 77; }
+command -v softhsm2-util >/dev/null || { echo "softhsm2-util not on PATH" >&2; exit 77; }
+MODULE=""
+if ! MODULE=$(python3 -I "$SELECTOR" --select-module 2>/dev/null); then
+    echo "no SoftHSM provider module found" >&2
+    exit 77
+fi
+[ -f "$MODULE" ] || { echo "provider module not found: $MODULE" >&2; exit 77; }
+
+OBSERVER_SHA=$(sha256sum "$OBSERVER" | cut -d' ' -f1)
+echo "# observer: $OBSERVER"
+echo "# observer-sha256: $OBSERVER_SHA"
+echo "# probe: $PROBE"
+echo "# manifest: $MANIFEST"
+echo "# module: $MODULE"
+if [ -n "$BUDGETS" ]; then
+    echo "# budgets: $BUDGETS"
+else
+    echo "# budgets: none (gate is loaded + stats + 5% headroom)"
+fi
+
+# Single-quote a path for the guest shell.
+q() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# One results.jsonl row. $1=cell $2=pass(1/0) $3=qualification $4=detail.
+emit_row() {
+    python3 - "$1" "$2" "$3" "$4" <<'PY' >>"$OUTDIR/results.jsonl"
+import json,sys
+print(json.dumps({"cell": sys.argv[1], "pass": sys.argv[2] == "1",
+                  "qualification": sys.argv[3], "detail": sys.argv[4]}))
+PY
+}
+
+FAILED=0
+VNG_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/virtme-ng"
+GUEST_ENV="$OUTDIR/guest-env.sh"
+WORK_IMAGE="$OUTDIR/guest-work.img"
+GUEST_LEG="$OUTDIR/journal-guest.sh"
+STAGED_PROBE="$OUTDIR/journal-probe.so"
+STAGED_MANIFEST="$OUTDIR/journal-manifest.json"
+STAGED_WORKLOAD="$OUTDIR/journal-workload"
+if [ -e "$GUEST_ENV" ] || [ -L "$GUEST_ENV" ] || [ -e "$WORK_IMAGE" ] || [ -L "$WORK_IMAGE" ] \
+    || [ -e "$GUEST_LEG" ] || [ -L "$GUEST_LEG" ] || [ -e "$OUTDIR/results.jsonl" ]; then
+    echo "# error: guest helper/work image/results already exist; use a fresh output directory" >&2
+    exit 2
+fi
+# The probe and manifest are staged into OUTDIR so any host path works:
+# the guest sees them through the shared dir even when the caller keeps
+# the originals somewhere the shared fs hides. The observer runs from
+# its own path (checked guest-visible above), like the kernels driver.
+cp "$PROBE" "$STAGED_PROBE"
+cp "$MANIFEST" "$STAGED_MANIFEST"
+chmod 644 "$STAGED_PROBE" "$STAGED_MANIFEST"
+if ! cc -O1 -Wall -Wextra -Werror -o "$STAGED_WORKLOAD" "$WORKLOAD_SRC" -ldl; then
+    echo "# error: cannot compile the guest workload" >&2
+    exit 2
+fi
+# Only this invocation owns the image. Sequential fresh guests reuse it
+# after checked unmount/detach; product temp I/O never inherits host /tmp/9p.
+(umask 077; set -C; : > "$WORK_IMAGE"; truncate -s 536870912 "$WORK_IMAGE")
+mkfs.ext4 -q -F "$WORK_IMAGE"
+(
+    umask 077
+    set -C
+    {
+        printf 'BPF_VNG_CACHE=%s\nBPF_GUEST_IMAGE=%s\n' "$(q "$VNG_CACHE")" "$(q "$WORK_IMAGE")"
+        cat <<'GUEST_ENV_EOF'
+umask 022
+BPF_GUEST_LOOP=
+BPF_GUEST_MOUNTED=0
+BPF_GUEST_TMP=
+BPF_GUEST_TMP_OWNED=0
+bpf_guest_cleanup() {
+    BPF_GUEST_RC=$?
+    trap - 0
+    cd / || BPF_GUEST_RC=1
+    if [ "$BPF_GUEST_TMP_OWNED" = 1 ]; then
+        rm -rf --one-file-system -- "$BPF_GUEST_TMP" || BPF_GUEST_RC=1
+    fi
+    if [ "$BPF_GUEST_MOUNTED" = 1 ]; then
+        umount /var/tmp || BPF_GUEST_RC=1
+    fi
+    if [ -n "$BPF_GUEST_LOOP" ]; then
+        losetup -d "$BPF_GUEST_LOOP" || BPF_GUEST_RC=1
+    fi
+    exit "$BPF_GUEST_RC"
+}
+trap bpf_guest_cleanup 0
+[ "$(id -u)" = 0 ] || return 1
+K=$(uname -r)
+if [ ! -r "/boot/config-$K" ]; then
+    C=$(ls "$BPF_VNG_CACHE"/*/amd64/boot/config-"$K" 2>/dev/null | head -n 1)
+    [ -n "$C" ] || { echo "no-kernel-config-for-$K"; return 1; }
+    mount -t tmpfs -o mode=755 guestboot /boot && cp "$C" /boot/ || { echo "stage-boot-failed-$K"; return 1; }
+    echo "staged-boot-config-$K"
+else
+    echo "boot-config-present-$K"
+fi
+BPF_GUEST_LOOP=$(losetup -f --show "$BPF_GUEST_IMAGE") || return 1
+case "$BPF_GUEST_LOOP" in /dev/loop[0-9]*) ;; *) BPF_GUEST_LOOP=; return 1;; esac
+mount -t ext4 -o nodev,nosuid "$BPF_GUEST_LOOP" /var/tmp || return 1
+BPF_GUEST_MOUNTED=1
+BPF_GUEST_TMP=$(mktemp -d /var/tmp/p11scope-bpf.XXXXXX) || return 1
+case "$BPF_GUEST_TMP" in /var/tmp/*) ;; *) return 1;; esac
+[ "$(stat -c '%u:%a' "$BPF_GUEST_TMP")" = 0:700 ] || return 1
+BPF_GUEST_TMP_OWNED=1
+TMPDIR=$BPF_GUEST_TMP
+export TMPDIR
+BPF_GUEST_READY=1
+echo "guest-work-ready=ext4 uid-mode=0:700 TMPDIR=$TMPDIR"
+GUEST_ENV_EOF
+    } > "$GUEST_ENV"
+)
+# One journal leg inside the guest: a guest-local token, a background
+# loop of short PKCS#11 info workloads, then the bounded linked
+# inventory under the probe. All guest-local I/O stays on the work
+# image; only finished artifacts are copied back to OUTDIR.
+(umask 022; set -C; cat <<'GUEST_LEG_EOF' > "$GUEST_LEG")
+#!/bin/sh
+# One journal-load guest leg, invoked after STAGE sets TMPDIR.
+set -eu
+KERNEL=$1
+OBSERVER=$2
+PROBE=$3
+MANIFEST=$4
+WORKLOAD=$5
+MODULE=$6
+TOKENS=$TMPDIR/journal-tokens
+CONF=$TMPDIR/softhsm2.conf
+mkdir -p "$TOKENS"
+printf 'directories.tokendir = %s\nobjectstore.backend = file\nlog.level = ERROR\n' "$TOKENS" > "$CONF"
+if SOFTHSM2_CONF="$CONF" softhsm2-util --init-token --free --label "journal-$KERNEL" --so-pin 5678 --pin 1234 >/dev/null 2>&1; then
+    echo "guest-stage=token-ok"
+else
+    echo "guest-stage=token-failed"
+    exit 3
+fi
+( while :; do SOFTHSM2_CONF="$CONF" "$WORKLOAD" "$MODULE" 3 5 >>"$TMPDIR/workload-$KERNEL.log" 2>&1; done ) &
+WLLOOP=$!
+echo "guest-stage=workload-started"
+cleanup() { kill "$WLLOOP" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+ulimit -n 65536
+RC=0
+timeout -k 10 -s INT 150 env LD_PRELOAD="$PROBE" P11SCOPE_VERIFIER_STATS_FD=9 "$OBSERVER" inventory --system --capture native --key-operations --manifest "$MANIFEST" --duration 60s 9>"journal-probe-$KERNEL.jsonl" >"journal-$KERNEL.txt" 2>&1 || RC=$?
+echo "guest-stage=observer-rc=$RC"
+if [ -f "$TMPDIR/workload-$KERNEL.log" ]; then
+    cp "$TMPDIR/workload-$KERNEL.log" "./workload-$KERNEL.log"
+fi
+trap - EXIT INT TERM
+cleanup
+exit "$RC"
+GUEST_LEG_EOF
+chmod 755 "$GUEST_LEG"
+: > "$OUTDIR/results.jsonl"
+# A short sourced helper fits virtme's kernel command line. Reset readiness
+# before sourcing: a missing, bad or failed setup never runs the observer.
+STAGE="{ BPF_GUEST_READY=0; . $(q "$GUEST_ENV") && [ x\$BPF_GUEST_READY = x1 ]; } || exit 2"
+
+# $1=detail: a kernel whose gate could not run (guest, staging or
+# command-line failure, never a product verdict).
+infra_fail() {
+    echo "# error: $1 (see $VNG_LOG)"
+    emit_row "journal-load-$KERNEL" 0 nonqualifying "$1"
+    FAILED=1
+}
+
+REASONS=""
+add_reason() {
+    if [ -z "$REASONS" ]; then
+        REASONS="$1"
+    else
+        REASONS="$REASONS; $1"
+    fi
+}
+
+for KERNEL in "$@"; do
+    echo "## kernel $KERNEL"
+    case "$KERNEL" in
+        v5.15.*) CONTROL=1 ;;
+        *) CONTROL=0 ;;
+    esac
+    J_TXT="$OUTDIR/journal-$KERNEL.txt"
+    J_PROBE="$OUTDIR/journal-probe-$KERNEL.jsonl"
+    J_WL="$OUTDIR/workload-$KERNEL.log"
+    J_REPORT="$OUTDIR/journal-report-$KERNEL.txt"
+    VNG_LOG="$OUTDIR/vng-journal-$KERNEL.log"
+    rm -f "$J_TXT" "$J_PROBE" "$J_WL" "$J_REPORT" "$VNG_LOG"
+    EXEC="cd $(q "$OUTDIR") && $STAGE; sh ./journal-guest.sh $(q "$KERNEL") $(q "$OBSERVER") $(q "$STAGED_PROBE") $(q "$STAGED_MANIFEST") $(q "$STAGED_WORKLOAD") $(q "$MODULE"); echo journal-rc=\$?; echo guest-release=\$(uname -r)"
+    # Fail fast past the kernel command line: 950 raw bytes encode to
+    # ~1270 base64 bytes, which still fits the 2048 budget beside
+    # virtme's own arguments; past it the guest silently never runs.
+    if [ "${#EXEC}" -gt 950 ]; then
+        infra_fail "guest command exceeds the kernel-cmdline budget"
+        continue
+    fi
+    if ! timeout -k 30 300 vng --run "$KERNEL" --user root --cpus 4 --memory 4G \
+        --rwdir "$OUTDIR" --exec "$EXEC" < /dev/null >"$VNG_LOG" 2>&1; then
+        infra_fail "vng run failed or timed out"
+        continue
+    fi
+    if ! grep -q '^journal-rc=' "$VNG_LOG"; then
+        infra_fail "no guest exit line"
+        continue
+    fi
+    if ! grep -Eq '^(staged-boot-config|boot-config-present)-' "$VNG_LOG"; then
+        infra_fail "kernel config not staged"
+        continue
+    fi
+    grep -E '^(staged-boot-config|boot-config-present)-' "$VNG_LOG" | tail -1
+    GUEST_RELEASE=$(grep '^guest-release=' "$VNG_LOG" | tail -1 | cut -d= -f2)
+    case "$GUEST_RELEASE" in
+        "${KERNEL#v}"|"${KERNEL#v}-"*)
+            echo "# guest release $GUEST_RELEASE (expected $KERNEL)"
+            ;;
+        *)
+            infra_fail "guest booted $GUEST_RELEASE, expected $KERNEL"
+            continue
+            ;;
+    esac
+    if grep -q '^guest-stage=token-failed' "$VNG_LOG"; then
+        infra_fail "guest SoftHSM token setup failed"
+        continue
+    fi
+    if ! grep -q '^guest-stage=token-ok' "$VNG_LOG" \
+        || ! grep -q '^guest-stage=workload-started' "$VNG_LOG"; then
+        infra_fail "guest stages never ran"
+        continue
+    fi
+    J_RC=$(grep '^journal-rc=' "$VNG_LOG" | tail -1 | cut -d= -f2)
+    echo "# journal rc=$J_RC"
+    # Both journal roots loaded, from the raw probe rows (the report
+    # below gates counts, but only budgets gate presence, so the pair
+    # is checked explicitly for the unbudgeted kernels too).
+    PAIR_OUT="0 0"
+    if [ -f "$J_PROBE" ]; then
+        PAIR_OUT=$(python3 - "$J_PROBE" <<'PY'
+import json,sys
+pair = ("p11_entry_journal", "p11_return_journal")
+loaded = set()
+try:
+    with open(sys.argv[1], encoding="ascii") as stream:
+        for line in stream:
+            row = json.loads(line)
+            if row.get("record") == "load" and row.get("loaded") is True:
+                loaded.add(row.get("root"))
+except (OSError, ValueError):
+    print("0 0")
+else:
+    print(("1" if all(root in loaded for root in pair) else "0"),
+          ("1" if any(root in loaded for root in pair) else "0"))
+PY
+) || PAIR_OUT="0 0"
+    fi
+    PAIR_OK=${PAIR_OUT%% *}
+    PAIR_ANY=${PAIR_OUT##* }
+    if [ "$CONTROL" = 1 ]; then
+        # Refusal control: the finite pre-Multi refusal, no loaded
+        # journal row, no crash. A load or a crash is FAIL.
+        REASONS=""
+        if [ ! -f "$J_TXT" ] || ! grep -q 'uprobe-multi-required' "$J_TXT"; then
+            add_reason "finite uprobe-multi-required refusal missing"
+        fi
+        if [ "$J_RC" = 0 ]; then
+            add_reason "observer exited 0 on a pre-Multi kernel"
+        fi
+        if [ "$PAIR_ANY" = 1 ]; then
+            add_reason "journal pair loaded on a pre-Multi kernel"
+        fi
+        if [ ! -f "$J_TXT" ] || grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$J_TXT"; then
+            add_reason "observer crashed or left no log"
+        fi
+        if [ -z "$REASONS" ]; then
+            echo "# control $KERNEL: PASS (refused uprobe-multi-required)"
+            emit_row "journal-load-$KERNEL" 1 qualified \
+                "refused uprobe-multi-required; no journal loads; rc=$J_RC"
+        else
+            echo "# control $KERNEL: FAIL ($REASONS)"
+            emit_row "journal-load-$KERNEL" 0 failed "$REASONS"
+            FAILED=1
+        fi
+        continue
+    fi
+    # Load gate: the observer ran to its duration, reported the linked
+    # lane started, and both journal roots loaded with verifier stats.
+    REASONS=""
+    case "$J_RC" in
+        0) ;;
+        124) add_reason "observer timed out past its backstop" ;;
+        *) add_reason "observer exited rc=$J_RC" ;;
+    esac
+    if [ ! -f "$J_TXT" ]; then
+        add_reason "observer left no log"
+    elif grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$J_TXT"; then
+        add_reason "observer crashed"
+    fi
+    LINKED_HOW=""
+    if [ -f "$J_TXT" ] && grep -q 'key operations: unavailable (bootstrap_unavailable)' "$J_TXT"; then
+        LINKED_HOW="linked bootstrap_unavailable"
+    elif [ -f "$J_TXT" ] && grep -q 'key operations: rev ' "$J_TXT"; then
+        LINKED_HOW="linked populated"
+    elif [ -f "$J_TXT" ] && grep -q 'key operations unavailable' "$J_TXT"; then
+        REFUSAL=$(grep 'key operations unavailable' "$J_TXT" | head -1 | cut -c1-160)
+        add_reason "linked lane refused: $REFUSAL"
+    elif [ -f "$J_TXT" ] && grep -Eq 'not reported by this version|journal_unavailable' "$J_TXT"; then
+        add_reason "linked lane not reported (unlinked lane sealed)"
+    else
+        add_reason "linked lane not reported"
+    fi
+    if [ "$PAIR_OK" != 1 ]; then
+        if [ ! -f "$J_PROBE" ]; then
+            add_reason "no probe rows (probe file missing)"
+        elif [ "$PAIR_ANY" = 1 ]; then
+            add_reason "journal pair incomplete (one root missing)"
+        else
+            add_reason "journal pair missing from probe rows"
+        fi
+    fi
+    LEDGERS=0
+    if [ -f "$J_WL" ]; then
+        LEDGERS=$(grep -c '^LEDGER ' "$J_WL" || true)
+    fi
+    # Score the journal object from its own BTF groups: budgeted when
+    # the budgets file carries journal/ keys for this kernel, else
+    # loaded + stats + 5% headroom.
+    BUDGETED="unbudgeted"
+    USE_BUDGETS=0
+    if [ -n "$BUDGETS" ]; then
+        if [ "$(python3 - "$BUDGETS" "$KERNEL" <<'PY'
+import json,sys
+document = json.load(open(sys.argv[1], encoding="ascii"))
+print("yes" if any(name.startswith("journal/") and sys.argv[2] in cells
+                   for name, cells in document.get("programs", {}).items())
+      else "no")
+PY
+)" = "yes" ]; then
+            USE_BUDGETS=1
+            BUDGETED="budgeted"
+        fi
+    fi
+    REPORT_RC=0
+    if [ "$USE_BUDGETS" = 1 ]; then
+        python3 -I "$REPORT" --budgets "$BUDGETS" --object journal --kernel "$KERNEL" \
+            --observer-sha256 "$OBSERVER_SHA" "$J_PROBE" >"$J_REPORT" 2>&1 || REPORT_RC=$?
+    else
+        python3 -I "$REPORT" --object journal --kernel "$KERNEL" \
+            --observer-sha256 "$OBSERVER_SHA" "$J_PROBE" >"$J_REPORT" 2>&1 || REPORT_RC=$?
+    fi
+    cat "$J_REPORT"
+    BITS=$(python3 - "$J_REPORT" <<'PY'
+import sys
+count, best_proc, best_root, best_head, failed = 0, -1, "-", 101.0, None
+try:
+    lines = open(sys.argv[1], encoding="ascii").read().splitlines()
+except OSError:
+    lines = []
+for line in lines:
+    parts = line.split()
+    if len(parts) < 8 or not parts[1].startswith("journal/"):
+        continue
+    count += 1
+    try:
+        proc, head = int(parts[2]), float(parts[4])
+    except ValueError:
+        continue
+    if proc > best_proc:
+        best_proc, best_root = proc, parts[1]
+    if head < best_head:
+        best_head = head
+    if parts[6] == "FAIL" and failed is None:
+        failed = parts[1] + ": " + " ".join(parts[7:])
+print(count, best_proc, best_root,
+      ("%.2f" % best_head) if best_head <= 100 else "-")
+print(failed if failed is not None else "-")
+PY
+)
+    BITS1=$(printf '%s\n' "$BITS" | sed -n '1p')
+    BITS_FAIL=$(printf '%s\n' "$BITS" | sed -n '2p')
+    BITS_REST=$BITS1
+    BITS_COUNT=${BITS_REST%% *}; BITS_REST=${BITS_REST#* }
+    BITS_PROC=${BITS_REST%% *}; BITS_REST=${BITS_REST#* }
+    BITS_ROOT=${BITS_REST%% *}; BITS_HEAD=${BITS_REST##* }
+    if [ "$REPORT_RC" != 0 ]; then
+        if [ "$BITS_FAIL" != "-" ]; then
+            add_reason "verifier report FAIL ($BITS_FAIL)"
+        else
+            add_reason "verifier report FAIL"
+        fi
+    fi
+    if [ -z "$REASONS" ]; then
+        DETAIL="$LINKED_HOW; $BITS_COUNT journal rows; max $BITS_PROC $BITS_ROOT; min headroom $BITS_HEAD%; $LEDGERS workload LEDGERs; $BUDGETED"
+        echo "# load $KERNEL: PASS ($DETAIL)"
+        emit_row "journal-load-$KERNEL" 1 qualified "$DETAIL"
+    else
+        echo "# load $KERNEL: FAIL ($REASONS)"
+        emit_row "journal-load-$KERNEL" 0 failed "$REASONS"
+        FAILED=1
+    fi
+done
+
+if [ "$FAILED" -ne 0 ]; then
+    echo "# OVERALL: FAIL"
+    exit 1
+fi
+echo "# OVERALL: PASS"

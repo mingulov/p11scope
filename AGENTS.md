@@ -101,9 +101,10 @@ boundaries and whitespace; do not claim runtime qualification from those checks.
   verify its SHA, configuration and required jobs/shards instead of duplicating
   it locally. Installed/kernel-specific acceptance remains separate. Later
   changes invalidate affected checks, not every unrelated historical result.
-- The ordinary CI matrix covers default unignored tests. Track required
-  ignored/excluded/feature/live cells separately and run exact selectors;
-  membership counts alone do not prove a positive executed. Register new or
+- `ci.yml` covers default unignored tests and `privileged-tests.yml` the
+  curated privileged cells. Track other ignored/feature/live cells separately
+  and run exact selectors; membership counts alone do not prove a positive
+  executed. Register new or
   renamed Python suites in the same patch and run
   `python3 -I scripts/run-python-suites.py --check` before remote pushes.
   Use that runner with filenames to execute affected standalone suites.
@@ -155,25 +156,22 @@ Honor authorization already given for the task, check ownership of resources,
 and clean up only resources created by the experiment. Do not disturb an
 unrelated browser, service, VM, container or another agent's capture.
 
-Ordinary tests and CI do not exercise capture: CI runs only the unprivileged
-default tests. Changes to capture, attachment, BPF, discovery or session
-lifecycle, and every integration candidate, also need real-system runs on
-authorized hosts, done continuously rather than deferred to release time:
-- the privileged library cells (`scripts/run-privileged-lib-tests.sh`; cells
-  that drive the CLI need the observer binary beside the test executable or
-  `P11SCOPE_E2E_OBSERVER`);
-- the real browser cells (`tests/python/test_browser_cells.py` with
-  `P11SCOPE_BIN` and `P11SCOPE_BROWSER_STRICT=1`, which start Firefox and
-  Chromium through Playwright);
-- the virtme-ng kernel runners (`scripts/qualify-*-vng.sh`) across the
-  supported kernel range;
-- `--system` captures with real workloads.
+Hosted CI runs privileged tests: GitHub runners provide passwordless root,
+BTF and KVM. `.github/workflows/privileged-tests.yml` runs on every push:
+- the curated privileged library cells (`scripts/run-privileged-lib-tests.sh`,
+  sharded, with a coverage check);
+- the system-scale capture cells;
+- the public CLI cells on the runner kernel and in virtme-ng guests;
+- real Firefox and Chromium cells (Playwright, strict).
 
-A self-skip is not a pass. Report a cell that cannot run, with the reason, and
-fix the blocker. Test fixtures must probe provider locations rather than
-hard-code one distribution's path. For example, SoftHSM is under
-`/usr/lib/x86_64-linux-gnu/softhsm/` on Debian and Ubuntu and under
-`/usr/lib64/pkcs11/` on Fedora.
+`bpf-kernels.yml` loads every program across kernels. Keep both green for
+capture, attachment, BPF, discovery and lifecycle changes, and add a cell when
+a mode or scope ships. Kernels, distributions, long cells and quiet performance
+runs that CI lacks still need authorized hosts.
+
+A self-skip is not a pass. Fixtures must probe provider paths rather than
+hard-code one: SoftHSM is under `/usr/lib/x86_64-linux-gnu/softhsm/` on
+Debian/Ubuntu and under `/usr/lib64/pkcs11/` on Fedora.
 
 ## Changes and Git history
 

@@ -1142,6 +1142,10 @@ impl PendingH3Continuation<'_> {
                 })
     }
 
+    /// Calls only: a stashed invalidation is not an original. If the
+    /// unpublished floor ever becomes decisive while it is an
+    /// invalidation, the continuation cannot clear it; the resulting
+    /// wedge is bounded by the no-progress guard (about 6 s).
     pub(crate) fn originals(
         &self,
     ) -> impl Iterator<Item = crate::semantic_capture::PendingH3Original<'_>> {

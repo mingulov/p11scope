@@ -12000,8 +12000,22 @@ impl TabledSeedProvider {
     }
 
     fn copy_tabled_runner(&self) -> PathBuf {
+        // Copy through a waited-for child, never in-process: an in-process
+        // copy holds the destination open for writing, and a concurrent fork
+        // from another test thread inherits that fd — if the fork-child has
+        // not exec'd yet when the runner execs the copy, the exec fails with
+        // ETXTBSY. A child writer owns the write fd privately, so no
+        // in-process fork can inherit it, and the wait proves the fd is
+        // closed before any exec of the copy.
         let target = self.dir.path().join("tabled-runner.copy");
-        std::fs::copy(self.dir.path().join("tabled-runner"), &target).unwrap();
+        assert!(
+            std::process::Command::new("cp")
+                .arg(self.dir.path().join("tabled-runner"))
+                .arg(&target)
+                .status()
+                .unwrap()
+                .success()
+        );
         target
     }
 
@@ -12035,13 +12049,24 @@ impl TabledSeedProvider {
             .unwrap()
             .write_all(if different { b"d" } else { b"s" })
             .unwrap();
-        let output = self.child.stdout.as_mut().unwrap();
-        assert!(
-            system_scope_poll_fd(output.as_raw_fd(), std::time::Duration::from_secs(5)).unwrap()
-        );
-        let mut ack = [0];
-        output.read_exact(&mut ack).unwrap();
-        assert_eq!(ack, *b"E");
+        let ack_error = {
+            let output = self.child.stdout.as_mut().unwrap();
+            assert!(
+                system_scope_poll_fd(output.as_raw_fd(), std::time::Duration::from_secs(5))
+                    .unwrap()
+            );
+            let mut ack = [0];
+            match output.read_exact(&mut ack) {
+                Ok(()) => {
+                    assert_eq!(ack, *b"E");
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        };
+        if let Some(error) = ack_error {
+            panic!("{}", reexec_ack_report(&mut self.child, different, &error));
+        }
         wait_tabled_ready(&mut self.child, &self.dir.path().join("tabled-provider.so")).unwrap();
     }
 
@@ -12077,6 +12102,44 @@ impl TabledSeedProvider {
         output.read_exact(&mut ack).unwrap();
         assert_eq!(ack, *b"C");
         replacement
+    }
+}
+
+/// Report a failed reexec ack read with the child's exit state: when the
+/// runner's exec fails it exits before the `E` ack, which surfaces here as
+/// EOF. Name that exec failure instead of the bare EOF.
+fn reexec_ack_report(
+    child: &mut std::process::Child,
+    different: bool,
+    error: &std::io::Error,
+) -> String {
+    let target = if different {
+        "the tabled-runner.copy"
+    } else {
+        "the tabled-runner"
+    };
+    // The ack arrived as EOF, so the child has closed its stdout: it is
+    // exiting or dead. Still, its exit may not be reaped-reportable yet —
+    // the kernel closes fds before the zombie is visible, and a parent that
+    // calls try_wait immediately after EOF can observe the mid-exit child
+    // as alive. Settle briefly so the report names the real exit status.
+    // This grace only runs on this already-failing path and never hangs.
+    let mut waited = child.try_wait();
+    for _ in 0..20 {
+        if !matches!(waited, Ok(None)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited = child.try_wait();
+    }
+    match waited {
+        Ok(Some(status)) => format!(
+            "tabled-runner failed to exec {target} (child {status}) before the reexec ack: {error}"
+        ),
+        Ok(None) => format!("tabled-runner is alive but the reexec ack read failed: {error}"),
+        Err(wait_error) => format!(
+            "the reexec ack read failed ({error}) and the child state is unknown ({wait_error})"
+        ),
     }
 }
 

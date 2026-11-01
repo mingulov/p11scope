@@ -6109,6 +6109,37 @@ fn immutable_policy_maps() {
     }
 }
 
+/// Independent marker expectation from the switch requests and the build
+/// inputs, never from the build's own output.
+fn artifact_expected_marker_enabled() -> bool {
+    fn small_requested() -> bool {
+        option_env!("P11SCOPE_SMALL_RING").is_some_and(|value| value == "1" || value == "true")
+            || option_env!("P11SCOPE_SMALL_STATE_MAPS")
+                .is_some_and(|value| value == "1" || value == "true")
+            || option_env!("P11SCOPE_SMALL_DISCOVERY_RING")
+                .is_some_and(|value| value == "1" || value == "true")
+    }
+    let journal_selected = match option_env!("P11SCOPE_JOURNAL") {
+        None => {
+            !cfg!(feature = "wide-detailed-2112")
+                && !cfg!(feature = "unsafe-unvalidated-metadata")
+                && !small_requested()
+                && option_env!("P11SCOPE_JOURNAL_PROOF") != Some("1")
+                && option_env!("P11SCOPE_IMAGE_BANK_PROOF") != Some("1")
+                && option_env!("P11SCOPE_COUNTER_ARTIFACTS") != Some("1")
+        }
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => panic!("malformed P11SCOPE_JOURNAL request {other:?}"),
+    };
+    match option_env!("P11SCOPE_BIRTH_MARKER") {
+        None => journal_selected,
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => panic!("malformed P11SCOPE_BIRTH_MARKER request {other:?}"),
+    }
+}
+
 /// The frozen inventory in `scripts/check-bpf-map-defs.py` is what the G3
 /// privacy lane, the induced-gaps lane, and the Lane 14 receipt compare a built
 /// object against, so it must match the object this crate embeds — `--self-test`
@@ -6138,11 +6169,16 @@ fn frozen_policy_inventory_matches_embedded_object() {
     let directory = tempfile::tempdir().expect("temporary inventory directory");
     let object = directory.path().join("p11scope-ebpf");
     fs::write(&object, p11scope::EBPF_OBJECT).expect("write embedded eBPF object");
-    let (variant, other_metadata, other_capacity) = match (
-        cfg!(feature = "wide-detailed-2112"),
-        cfg!(feature = "unsafe-unvalidated-metadata"),
-    ) {
-        (false, false) => ("default", "diagnostic", "wide-default"),
+    let wide = cfg!(feature = "wide-detailed-2112");
+    let unsafe_build = cfg!(feature = "unsafe-unvalidated-metadata");
+    let marker = artifact_expected_marker_enabled();
+    if marker && (wide || unsafe_build) {
+        eprintln!("explicit-marker test shape on a journalless build; no frozen variant covers it");
+        return;
+    }
+    let (variant, other_metadata, other_capacity) = match (wide, unsafe_build) {
+        (false, false) if marker => ("default", "diagnostic", "wide-default"),
+        (false, false) => ("default-no-marker", "default", "wide-default"),
         (false, true) => ("diagnostic", "default", "wide-diagnostic"),
         (true, false) => ("wide-default", "wide-diagnostic", "default"),
         (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
@@ -6152,9 +6188,15 @@ fn frozen_policy_inventory_matches_embedded_object() {
     // three subordinate-custody maps (OBJECT_START, OBJECT_DESCRIPTORS,
     // OBJECT_ZERO) with no new programs. Selected detailed adds the
     // three SELECTED_* maps and the bootstrap/cgroup-migrate programs.
-    // R52 omits the deferred birth-marker map without removing a core program.
-    let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
+    // The birth-marker control map adds one map without a new program in
+    // carriable builds; journalless builds omit it, and the unsafe
+    // decoder maps add two more maps with five extra programs.
+    let (maps, programs) = if unsafe_build {
         (44, 25)
+    } else if wide {
+        (42, 20)
+    } else if marker {
+        (43, 20)
     } else {
         (42, 20)
     };

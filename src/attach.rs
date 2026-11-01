@@ -847,11 +847,15 @@ fn validate_pid_start_tick_map(ebpf: &Ebpf, roots: StaticRoots, journal: bool) -
     Ok(())
 }
 
-fn freeze_map(name: &str, map: &Map) -> Result<()> {
-    let data = if IDENTITY_MAPS
+fn is_identity_map(name: &str) -> bool {
+    IDENTITY_MAPS
         .iter()
+        .chain(GATE_IDENTITY_MAPS.iter())
         .any(|(candidate, _)| *candidate == name)
-    {
+}
+
+fn freeze_map(name: &str, map: &Map) -> Result<()> {
+    let data = if is_identity_map(name) {
         identity_map_data(name, map)
     } else {
         policy_map_data(name, map)

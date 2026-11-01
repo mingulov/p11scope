@@ -478,8 +478,11 @@ PY
     # key-operations display latch (bootstrap_unavailable) does not
     # complete in production runs at this base, so the display state
     # is recorded in the row, never gated.
-    if [ -f "$J_TXT" ] && grep -q 'key operations unavailable' "$J_TXT"; then
-        REFUSAL=$(grep 'key operations unavailable' "$J_TXT" | head -1 | cut -c1-160)
+    # Both refusal shapes: the gap subject from a runtime journal
+    # refusal (with an ordinary retry behind it), and the bare finite
+    # reason from a build that rejects --key-operations up front.
+    if [ -f "$J_TXT" ] && grep -Eq 'key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT"; then
+        REFUSAL=$(grep -E 'key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT" | head -1 | cut -c1-160)
         add_reason "linked lane refused: $REFUSAL"
     elif [ ! -f "$J_TXT" ] || ! grep -q 'p11scope: semantic lane ready' "$J_TXT"; then
         add_reason "semantic lane never sealed"

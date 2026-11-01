@@ -4039,6 +4039,11 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: b
                 if let Some(value) = capture_scalar(&ctx, semantics.async_value_arg, layout, start)
                 {
                     start.async_value = value;
+                } else {
+                    // The id argument could not be read (capture_scalar
+                    // already counted the failure): mark the value
+                    // unreadable so no join runs on the default id.
+                    start.capture |= capture::ASYNC_VALUE_UNREADABLE;
                 }
             }
             lifecycle::ASYNC_GET_ID => {
@@ -4403,12 +4408,19 @@ fn capture_return_facts<const DEFER_ROUTING: bool>(
         }
     }
     let mut async_value = start.async_value;
-    if accounting.rv == 0 && start.out_ptr != 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
-        match read_word(start.out_ptr, layout) {
-            Ok(value) => async_value = value,
-            Err(_) => {
-                capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
-                bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+    if accounting.rv == 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
+        // An OK GetID with a null output pointer produced no id: mark the
+        // value unreadable instead of leaving a valid-looking default.
+        if start.out_ptr == 0 {
+            capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+        } else {
+            match read_word(start.out_ptr, layout) {
+                Ok(value) => async_value = value,
+                Err(_) => {
+                    capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+                    bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+                }
             }
         }
     }

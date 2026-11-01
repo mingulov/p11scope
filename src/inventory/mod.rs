@@ -14683,8 +14683,8 @@ mod tests {
             assert_eq!(lane.pump_work_seen_for_test(), &[256]);
             assert_eq!(
                 lane.service_budget_seen_for_test(),
-                &[1024],
-                "a fault spends nothing, so the machine sees the full budget"
+                &[768],
+                "a fault charges the pump share, so the machine sees the remainder"
             );
             assert_eq!(discovery.get(), 1, "the faulting pump still ran");
             assert_eq!(
@@ -14735,6 +14735,64 @@ mod tests {
             lane2.hook_order_for_test(),
             &["pump", "machine"],
             "precedence still runs the pump first"
+        );
+    }
+
+    #[test]
+    fn linked_hook_pump_over_work_charges_share_without_latch() {
+        // Over-work: a pump that drains past its share refuses
+        // `Unavailable`, yet still charges the share it was given, so
+        // the machine sees the remainder and the hook keeps the
+        // 1024-action bound. The machine is still serviced on the
+        // same budget, and nothing latches.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        let mut coordinator = coordinator();
+        let discovery = Rc::new(Cell::new(0));
+        let mut io = WindDownIo::completing();
+        io.discovery = Rc::clone(&discovery);
+        let mut lane = joint_lane(io, false);
+        lane.set_test_joint_linked(true);
+        lane.set_scripted_pump_drained_for_test(Some(257));
+        lane.set_scripted_service_spend_for_test(Some(0));
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let mut tick_refusal = None;
+        ClassicDriver::service_linked_joint_hook(
+            &mut lane,
+            &mut coordinator,
+            &mut budget,
+            None,
+            &mut tick_refusal,
+        );
+        assert_eq!(
+            lane.hook_order_for_test(),
+            &["pump", "machine"],
+            "an over-work pump still runs first"
+        );
+        assert_eq!(lane.pump_work_seen_for_test(), &[256]);
+        assert_eq!(
+            lane.service_budget_seen_for_test(),
+            &[768],
+            "over-work charges the pump share, so the machine sees the remainder"
+        );
+        assert_eq!(discovery.get(), 1, "the over-work pump still ran");
+        assert_eq!(
+            tick_refusal,
+            Some(crate::inventory_semantics::SemanticRefusal::Unavailable),
+            "the over-work pump names the fallback stop reason"
+        );
+        assert!(
+            lane.has_joint_machine(),
+            "over-work never latches the machine"
+        );
+        assert_eq!(
+            lane.joint_disposition_reason(),
+            None,
+            "no disposition latched by over-work"
         );
     }
 
@@ -14794,6 +14852,16 @@ mod tests {
             discovery.get(),
             1,
             "no pump after Finish begins (second hook)"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .pump_work_seen_for_test()
+                .len(),
+            1,
+            "no pump call after Finish begins (driver-level freeze)"
         );
     }
 

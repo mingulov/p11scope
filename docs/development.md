@@ -164,3 +164,17 @@ mise exec -- ./scripts/cargo.sh +1.99.1 check --locked --workspace --all-targets
 mise exec -- ./scripts/cargo.sh +1.99.1 test --locked --workspace --all-targets
 mise exec -- ./scripts/cargo.sh +1.99.1 clippy --locked --workspace --all-targets -- -D warnings
 ```
+
+## Build switches
+
+Three environment switches select optional build content. Each accepts unset
+(the default below), `0` for off, or `1` for on; anything else fails the build.
+
+- `P11SCOPE_JOURNAL`: builds the production journal object. On by default in
+  FULL and P0 builds; SMALL, WIDE and unsafe builds omit it silently, and
+  explicit `=1` there fails instead. `=0` omits it everywhere.
+- `P11SCOPE_BIRTH_MARKER`: compiles the birth marker into Detailed objects.
+  Unset follows the journal decision; `=0` omits it everywhere, and `=1`
+  selects it on any Detailed build.
+- `P11SCOPE_LOADER_GATE`: compiles the experimental loader gate. Off by
+  default; leave it off unless a task explicitly asks for it.

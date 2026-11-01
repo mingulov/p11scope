@@ -299,6 +299,13 @@ python3 -I scripts/check-bpf-map-defs.py --inventory default "$DEFAULT_BPF"
 else
 python3 -I scripts/check-bpf-map-defs.py --policy-inventory "$DEFAULT_BPF" "$FEATURE_BPF"
 fi
+if [ -n "$PREBUILT_DIR" ]; then
+echo "journal object check skipped: prebuilt inputs carry no journal ELF"
+else
+set -- "$WORK"/default-build/release/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "journal BPF object is not unique"; exit 1; }
+python3 -I scripts/check-bpf-map-defs.py --inventory journal "$1"
+fi
 
 refuse_lane_destinations() {
     for candidate in "$WORK/$1".* "$WORK"/mapdump_*_"$1".json "$WORK"/mapdump_*_"$1".bin; do

@@ -356,6 +356,63 @@ def decode_btf_maps(elf, *, decoder_class=Btf):
     return maps
 
 
+def decode_journal_native_maps(elf):
+    """Journal-only `.maps` decode matched by symbol name.
+
+    The journal link leaves the trailing native DATASEC entries at
+    offset zero (the ELF symbols carry the true offsets), so the
+    DATASEC-offset cross-check in decode_btf_maps cannot apply. This
+    decoder instead requires a one-to-one name match between BTF VARs
+    and `.maps` symbols, contiguous symbol coverage of the section,
+    and a valid map definition per VAR; the DATASEC must name exactly
+    the same set.
+    """
+    if ".BTF" not in elf.sections:
+        raise RuntimeError("native .maps missing .BTF")
+    btf = Btf(elf.sections[".BTF"][1])
+    row, raw = elf.sections[".maps"]
+    if row[1] != 1 or not raw or any(raw):
+        raise RuntimeError("unsupported native map section size/content")
+    objects = {}
+    for name, info, other, section, offset, size in elf.symbols:
+        if section != elf.indices[".maps"] or info & 15 == 3:
+            continue
+        if info not in (1, 0x11) or other != 0 or not name or name in objects:
+            raise RuntimeError("duplicate/unsupported native map symbol")
+        objects[name] = (offset, size)
+    by_name = {}
+    for node in btf.types[1:]:
+        if node[0] != 14 or node[1] not in objects:
+            continue
+        if node[1] in by_name or node[5][0] not in (0, 1):
+            raise RuntimeError("invalid/duplicate journal BTF VAR")
+        by_name[node[1]] = node
+    if set(by_name) != set(objects):
+        raise RuntimeError("journal VAR/symbol name mismatch")
+    sections = [node for node in btf.types[1:] if node[0] == 15 and node[1] == ".maps"]
+    if len(sections) != 1:
+        raise RuntimeError("missing/duplicate journal .maps BTF DATASEC")
+    declared = set()
+    for i in range(sections[0][3]):
+        var = btf.resolve(sections[0][5][i * 3])
+        if var[0] != 14:
+            raise RuntimeError("journal DATASEC entry is not VAR")
+        declared.add(var[1])
+    if declared != set(objects):
+        raise RuntimeError("journal DATASEC names differ from map symbols")
+    maps = {}
+    cursor = 0
+    for name, (offset, size) in sorted(objects.items(), key=lambda item: item[1][0]):
+        definition, struct_size = btf.map_definition(by_name[name][2])
+        if offset != cursor or offset % 8 or size != struct_size or size > len(raw) - offset:
+            raise RuntimeError("journal map bounds/coverage mismatch")
+        cursor += size
+        maps[name] = definition
+    if cursor != len(raw):
+        raise RuntimeError("journal map incomplete coverage/extra symbol")
+    return maps
+
+
 def decode_map_definitions(records, section, data):
     objects = sorted(
         (offset, size, name)
@@ -414,6 +471,18 @@ REQUIRED_LOCAL_ROOT_HELPERS = frozenset({
     "p11_root_propagate_thread", "p11_root_current_tag", "p11_root_current_exit",
 })
 OPTIONAL_LOCAL_OWNER_HELPERS = frozenset({"p11_owner_healthy"})
+# The journal object swaps the plain START removal for the reason-bearing
+# one (exported, so the journal roots can settle with a cause) and keeps
+# the current-owner lookup its transaction core calls.
+JOURNAL_LOCAL_OWNER_HELPERS = (REQUIRED_LOCAL_OWNER_HELPERS - {"p11_owner_start_remove"}
+                                | {"p11_owner_current"})
+JOURNAL_GLOBAL_OWNER_HELPERS = frozenset({"p11_owner_start_remove_reason"})
+# The journal transaction boundary: the four exported native producers.
+# Only the journal object defines them.
+JOURNAL_GLOBAL_PRODUCERS = frozenset({
+    "p11_journal_begin", "p11_journal_returning",
+    "p11_journal_settle_prepare", "p11_journal_settle_finish",
+})
 EXACT_PROGRAM_SECTIONS = {
     "task_newtask": "tp_btf/task_newtask",
     "sched_process_exec": "raw_tp/sched_process_exec",
@@ -453,7 +522,8 @@ DIAGNOSTIC_GLOBAL_HELPERS = frozenset({
 
 def validate_private_helpers(elf, prefix, required, optional, label,
                              global_helpers=frozenset(), required_map=None, inventory=False,
-                             global_result_bytes=4, global_param_kinds=()):
+                             global_result_bytes=4, global_param_kinds=(),
+                             global_proto_overrides=None):
     """Verify exact native helper linkage, metadata, calls and map boundaries.
 
     Pointer-taking owner APIs stay LOCAL/STATIC; only the supplied scalar owner
@@ -461,6 +531,9 @@ def validate_private_helpers(elf, prefix, required, optional, label,
     not retain dummy bodies or admit arbitrary clones/attachment targets.
     A nonempty global_param_kinds tuple replaces the no-argument global
     rule with an exact parameter-kind list (BTF kind per parameter).
+    global_proto_overrides maps one global name to its own
+    (result_bytes, param_kinds) pair, for boundaries whose arity differs
+    from the uniform rule.
     """
     owners = [s for s in elf.symbols if s[0].startswith(prefix)]
     production = any(s[0] in EXACT_PROGRAM_SECTIONS or s[0] in REQUIRED_GLOBAL_HELPERS
@@ -523,7 +596,19 @@ def validate_private_helpers(elf, prefix, required, optional, label,
         if name in global_helpers:
             proto = btf.types[node[2]]
             scalar = btf.resolve(proto[2])
-            if global_param_kinds:
+            override = (global_proto_overrides or {}).get(name)
+            if override is not None:
+                result_bytes, kinds = override
+                params = proto[5]
+                if (proto[3] != len(kinds)
+                        or len(params) != 2 * len(kinds)
+                        or scalar[0] != 1 or scalar[2] != result_bytes
+                        or any(btf.resolve(params[2 * i + 1])[0] != kind
+                               for i, kind in enumerate(kinds))):
+                    raise RuntimeError(
+                        f"{label} helper {name} requires the exact documented FUNC_PROTO"
+                    )
+            elif global_param_kinds:
                 params = proto[5]
                 # Lengths first: resolving runs only when the arity
                 # already matches, so a short proto fails, never
@@ -660,14 +745,21 @@ def validate_private_helpers(elf, prefix, required, optional, label,
                 )
 
 
-def validate_owner_helpers(elf, inventory=False):
+def validate_owner_helpers(elf, inventory=False, *, journal=False):
     exported = (REQUIRED_GLOBAL_OWNER_HELPERS
                 if any(symbol[0] == "OWNER_CTL" for symbol in elf.symbols)
                 else frozenset())
-    required = (REQUIRED_LOCAL_OWNER_HELPERS - {"p11_owner_start_get", "p11_owner_start_aggregate", "p11_owner_start_begin", "p11_owner_start_remove"}
-                if inventory else REQUIRED_LOCAL_OWNER_HELPERS)
+    overrides = None
+    if journal:
+        required = JOURNAL_LOCAL_OWNER_HELPERS
+        exported |= JOURNAL_GLOBAL_OWNER_HELPERS
+        overrides = {"p11_owner_start_remove_reason": (8, (2, 1, 1))}
+    else:
+        required = (REQUIRED_LOCAL_OWNER_HELPERS - {"p11_owner_start_get", "p11_owner_start_aggregate", "p11_owner_start_begin", "p11_owner_start_remove"}
+                    if inventory else REQUIRED_LOCAL_OWNER_HELPERS)
     validate_private_helpers(elf, "p11_owner_", required,
-                             OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL", inventory=inventory)
+                             OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL", inventory=inventory,
+                             global_proto_overrides=overrides)
 
 
 def validate_exec_helpers(elf, inventory=False):
@@ -775,29 +867,67 @@ def validate_marker_helpers(elf, inventory=False):
         raise RuntimeError("Inventory contains birth marker globals")
     if {symbol[0] for symbol in selected} != REQUIRED_GLOBAL_MARKER_HELPERS:
         raise RuntimeError("birth marker requires the complete unique set of globals")
+    for symbol in selected:
+        check_marker_body(elf, symbol)
+
+
+def check_marker_body(elf, symbol):
+    """One marker body: GLOBAL DEFAULT FUNC in .text reading only maps,
+    task storage and the current task. Shared by the Detailed pair and
+    the journal gap writer."""
+    name, info, other, section, value, size = symbol
+    text = elf.indices.get(".text")
+    if info != 0x12 or other != 0 or section != text:
+        raise RuntimeError(f"birth marker {name} must be GLOBAL DEFAULT FUNC in .text")
+    if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
+        raise RuntimeError(f"birth marker {name} has invalid/empty body")
+    body = checked_slice(elf.sections[".text"][1], value, size, "marker body")
+    helpers = set()
+    for pos in range(0, len(body), 8):
+        op, reg, _, imm = struct.unpack_from("<BBhi", body, pos)
+        # A BPF-to-BPF pseudo-call (source register 1) is a local
+        # leaf call, not a kernel helper boundary.
+        if op == 0x85 and reg >> 4 == 0:
+            helpers.add(imm)
+    if helpers != {1, 156, 158}:
+        raise RuntimeError(
+            f"birth marker {name} permits only map lookup, task storage and "
+            f"current-task helpers, saw {sorted(helpers)}"
+        )
+
+
+def validate_journal_marker_helpers(elf):
+    """The journal object carries the DIRTY gap writer and the control
+    map, never the READY publish body: the journal dirties refused
+    calls but publishes no birth and reads no exec ID.
+    """
+    if any(symbol[0] == "p11_instance_exec_birth" for symbol in elf.symbols):
+        raise RuntimeError("journal object contains the READY publish body")
+    gap = [symbol for symbol in elf.symbols
+           if symbol[0] == "p11_instance_scope_gap"]
+    if len(gap) != 1:
+        raise RuntimeError("journal object requires one scope gap body")
+    check_marker_body(elf, gap[0])
+
+
+def validate_journal_producers(elf):
+    """The journal transaction boundary: all four producers present as
+    GLOBAL DEFAULT FUNCs in .text with real bodies. Arity and pointer
+    ABIs are pinned by the native linkage test.
+    """
+    selected = [symbol for symbol in elf.symbols
+                if symbol[0] in JOURNAL_GLOBAL_PRODUCERS]
+    if {symbol[0] for symbol in selected} != JOURNAL_GLOBAL_PRODUCERS:
+        raise RuntimeError("journal object requires the complete producer set")
     text = elf.indices.get(".text")
     for name, info, other, section, value, size in selected:
         if info != 0x12 or other != 0 or section != text:
-            raise RuntimeError(f"birth marker {name} must be GLOBAL DEFAULT FUNC in .text")
+            raise RuntimeError(f"journal producer {name} must be GLOBAL DEFAULT FUNC in .text")
         if not size or value % 8 or size % 8 or value + size > len(elf.sections[".text"][1]):
-            raise RuntimeError(f"birth marker {name} has invalid/empty body")
-    for name, _, _, _, value, size in selected:
-        body = checked_slice(elf.sections[".text"][1], value, size, "marker body")
-        helpers = set()
-        for pos in range(0, len(body), 8):
-            op, reg, _, imm = struct.unpack_from("<BBhi", body, pos)
-            # A BPF-to-BPF pseudo-call (source register 1) is a local
-            # leaf call, not a kernel helper boundary.
-            if op == 0x85 and reg >> 4 == 0:
-                helpers.add(imm)
-        if helpers != {1, 156, 158}:
-            raise RuntimeError(
-                f"birth marker {name} permits only map lookup, task storage and "
-                f"current-task helpers, saw {sorted(helpers)}"
-            )
+            raise RuntimeError(f"journal producer {name} has invalid/empty body")
 
 
-def validate_marker_call_sites(elf):
+def validate_marker_call_sites(elf, *, journal=False):
     """Keep the birth marker wired: every defined Detailed root that can
     birth or gap must call its marker global.
 
@@ -807,10 +937,15 @@ def validate_marker_call_sites(elf):
     unsafe-only roots (p11_entry_ia32, the template entries and the
     template continuation) must call when defined. Each call must
     resolve to the GLOBAL .text definition, never a same-named local.
+    The journal object instead wires its two journal roots to the gap
+    writer; it publishes no birth.
     """
     markers = {symbol[0] for symbol in elf.symbols
                if symbol[0] in REQUIRED_GLOBAL_MARKER_HELPERS}
-    if markers != REQUIRED_GLOBAL_MARKER_HELPERS:
+    if journal:
+        if markers != {"p11_instance_scope_gap"}:
+            return
+    elif markers != REQUIRED_GLOBAL_MARKER_HELPERS:
         return
     text = elf.indices.get(".text")
     relocs = {}
@@ -830,22 +965,31 @@ def validate_marker_call_sites(elf):
     by_name = {}
     for symbol in bodies:
         by_name.setdefault(symbol[0], []).append(symbol)
-    required = {
-        "p11_entry": "p11_instance_scope_gap",
-        "p11_return": "p11_instance_scope_gap",
-        "sched_process_exec": "p11_instance_exec_birth",
-        "sched_process_exit": "p11_instance_scope_gap",
-    }
-    optional = {
-        "p11_entry_ia32": "p11_instance_scope_gap",
-        "p11_entry_template": "p11_instance_scope_gap",
-        "p11_entry_template_types": "p11_instance_scope_gap",
-        "p11_entry_template_pair": "p11_instance_scope_gap",
-        "p11_entry_template_second": "p11_instance_scope_gap",
-    }
+    if journal:
+        label = "journal"
+        required = {
+            "p11_entry_journal": "p11_instance_scope_gap",
+            "p11_return_journal": "p11_instance_scope_gap",
+        }
+        optional = {}
+    else:
+        label = "Detailed"
+        required = {
+            "p11_entry": "p11_instance_scope_gap",
+            "p11_return": "p11_instance_scope_gap",
+            "sched_process_exec": "p11_instance_exec_birth",
+            "sched_process_exit": "p11_instance_scope_gap",
+        }
+        optional = {
+            "p11_entry_ia32": "p11_instance_scope_gap",
+            "p11_entry_template": "p11_instance_scope_gap",
+            "p11_entry_template_types": "p11_instance_scope_gap",
+            "p11_entry_template_pair": "p11_instance_scope_gap",
+            "p11_entry_template_second": "p11_instance_scope_gap",
+        }
     for root in required:
         if root not in by_name:
-            raise RuntimeError(f"Detailed {root} program is missing")
+            raise RuntimeError(f"{label} {root} program is missing")
     for root, marker in list(required.items()) + list(optional.items()):
         for _, _, _, section, start, size in by_name.get(root, []):
             body = checked_slice(sections.get(section, b""), start, size,
@@ -872,7 +1016,7 @@ def validate_marker_call_sites(elf):
                         wired = True
                         break
             if not wired:
-                raise RuntimeError(f"Detailed {root} must call {marker}")
+                raise RuntimeError(f"{label} {root} must call {marker}")
 
 
 def validate_diagnostic_helper_linkage(elf):
@@ -1182,7 +1326,7 @@ def validate_ia32_raw_span(insns, read):
                             register_transfer=transfer)
 
 
-def validate_ia32_reader(elf, inventory=False):
+def validate_ia32_reader(elf, inventory=False, *, journal=False):
     """Verify the scalar-only ia32 user-read boundary and one reachable call."""
     selected = [symbol for symbol in elf.symbols if symbol[0] == "p11_read_ia32_arg"]
     production = any(symbol[0] == "p11_entry" for symbol in elf.symbols)
@@ -1356,9 +1500,14 @@ def validate_ia32_reader(elf, inventory=False):
                     destination = (section_index, start + pos + (imm + 1) * 8)
                 if destination in bodies:
                     edges[section_index, start].add(destination)
-    root_name = ("function_list_entry" if inventory else "p11_entry_ia32"
-                 if any(candidate[0] == "p11_entry_ia32" for candidate in elf.symbols)
-                 else "p11_entry")
+    if journal:
+        root_name = "p11_entry_journal"
+    elif inventory:
+        root_name = "function_list_entry"
+    elif any(candidate[0] == "p11_entry_ia32" for candidate in elf.symbols):
+        root_name = "p11_entry_ia32"
+    else:
+        root_name = "p11_entry"
     roots = [candidate for candidate in elf.symbols if candidate[0] == root_name]
     if len(roots) != 1:
         raise RuntimeError(f"ia32 reader requires exact {root_name} entry root")
@@ -1467,6 +1616,15 @@ MULTI_LOADED_PROGRAMS = frozenset({
     "p11_entry", "p11_entry_ia32", "p11_entry_template", "p11_entry_template_types",
     "p11_entry_template_pair", "p11_entry_template_second", "p11_return",
     "p11_usage_entry_lp64", "p11_usage_entry_ia32",
+})
+# The journal twins load with the multi flag exactly like the ordinary
+# static endpoint twins they replace (pinned by
+# journal_pair_takes_the_multi_load_flag in src/attach.rs), so they
+# reference STACK_GUARD, never TAIL_CALLS. Kept beside the ordinary set
+# above, which the object-checker cross-pin derives from the
+# ordinary/inventory loaders alone.
+JOURNAL_MULTI_LOADED_PROGRAMS = frozenset({
+    "p11_entry_journal", "p11_return_journal",
 })
 
 
@@ -1658,7 +1816,7 @@ def program_array_relocations(elf):
     return found
 
 
-def validate_classic_uprobe_kernel_stack(elf):
+def validate_classic_uprobe_kernel_stack(elf, *, journal=False):
     """Every uprobe/uretprobe program keeps the task's kernel stack.
 
     From Linux 6.13 the x86 JIT gives a KPROBE-type program with a >= 64-byte
@@ -1726,7 +1884,7 @@ def validate_classic_uprobe_kernel_stack(elf):
         used = {array for _, array in references.get(name, ())}
         if name == "p11_entry_template_pair":
             allowed = {"PAIR_CALLS"}
-        elif name in MULTI_LOADED_PROGRAMS:
+        elif name in MULTI_LOADED_PROGRAMS or (journal and name in JOURNAL_MULTI_LOADED_PROGRAMS):
             allowed = {"STACK_GUARD"}
         else:
             allowed = {"TAIL_CALLS"}
@@ -1948,7 +2106,10 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
             raise RuntimeError("LLVM/raw legacy section mismatch")
         maps = decode_map_definitions(records, sections["maps"], data)
     if ".maps" in sections:
-        native = decode_btf_maps(elf)
+        if variant == "journal":
+            native = decode_journal_native_maps(elf)
+        else:
+            native = decode_btf_maps(elf)
         if maps.keys() & native.keys():
             raise RuntimeError("cross-section duplicate map names")
         maps.update(native)
@@ -1956,14 +2117,19 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
         btf = Btf(elf.sections[".BTF"][1])
         if any(node[0] == 15 and node[1] == ".maps" for node in btf.types[1:]):
             raise RuntimeError("native BTF DATASEC missing ELF .maps section")
-    validate_ia32_reader(elf, inventory)
+    validate_ia32_reader(elf, inventory, journal=(variant == "journal"))
     validate_object_capture_globals(elf, inventory)
-    validate_owner_helpers(elf, inventory)
+    validate_owner_helpers(elf, inventory, journal=(variant == "journal"))
     validate_exec_helpers(elf, inventory)
     validate_exe_helpers(elf, inventory)
     validate_exec_cookie_helper(elf, inventory, callers)
-    validate_marker_helpers(elf, inventory)
-    validate_marker_call_sites(elf)
+    if variant == "journal":
+        validate_journal_marker_helpers(elf)
+        validate_marker_call_sites(elf, journal=True)
+        validate_journal_producers(elf)
+    else:
+        validate_marker_helpers(elf, inventory)
+        validate_marker_call_sites(elf)
     if not inventory:
         validate_selected_leaf(elf)
         validate_root_helpers(elf)
@@ -1972,7 +2138,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
         validate_inventory_caller_entry_reachability(elf)
     else:
         validate_inventory_entry_reachability(elf)
-    validate_classic_uprobe_kernel_stack(elf)
+    validate_classic_uprobe_kernel_stack(elf, journal=(variant == "journal"))
     # A literal pool or static (.rodata*/.data*/.bss*) becomes one more loaded
     # map: it breaks the exact owned-map inventory and the live map counts.
     global_data = sorted(name for name in elf.sections
@@ -1985,7 +2151,9 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     return maps, classify(records, sections, allowed_text_globals | image_helpers
                           | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
                           | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS
-                          | (frozenset() if inventory else OBJECT_CAPTURE_GLOBAL_HELPERS),
+                          | (frozenset() if inventory else OBJECT_CAPTURE_GLOBAL_HELPERS)
+                          | (JOURNAL_GLOBAL_OWNER_HELPERS | JOURNAL_GLOBAL_PRODUCERS
+                             if variant == "journal" else frozenset()),
                           inventory=inventory), {
         record[-1] for record in records
     }
@@ -2030,6 +2198,8 @@ def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=F
                     | REQUIRED_GLOBAL_EXE_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
                     | DIAGNOSTIC_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS
                     | REQUIRED_GLOBAL_MARKER_HELPERS
+                    | JOURNAL_GLOBAL_OWNER_HELPERS
+                    | JOURNAL_GLOBAL_PRODUCERS
                     | OBJECT_CAPTURE_GLOBAL_HELPERS):
             if name in allowed_text_globals and location == ".text":
                 helpers.add(name)
@@ -2062,7 +2232,7 @@ def map_def(map_type, key, value, maximum, flags=0):
     return dict(zip(MAP_FIELDS, (map_type, key, value, maximum, flags, 0, 0)))
 
 
-SAFE_MAPS = {
+_DETAILED_BASE_MAPS = {
     name: map_def(*values)
     for name, values in {
         "ASYNC_FUNCTIONS": (1, 32, 4, 128, 128),
@@ -2117,11 +2287,17 @@ SAFE_MAPS = {
         "INSTANCE_START": (9, 16, 24, 16_384),
     }.items()
 }
-UNSAFE_MAPS = SAFE_MAPS | {
+# The birth-marker control row ships in default FULL/P0 objects. Builds
+# that cannot carry the journal (unsafe, wide) omit it, so only the
+# default variant requires it.
+SAFE_MAPS = _DETAILED_BASE_MAPS | {
+    "JOURNAL_MARKER_CTL": map_def(2, 4, 16, 1, 0),
+}
+UNSAFE_MAPS = _DETAILED_BASE_MAPS | {
     "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
     "PAIR_CALLS": map_def(3, 4, 4, 1),
 }
-WIDE_MAPS = SAFE_MAPS | {
+WIDE_MAPS = _DETAILED_BASE_MAPS | {
     "STATS": map_def(6, 4, 296, 2_112),
     "RV_COUNTS": map_def(5, 16, 8, 8_192),
     "SLOT_FILE": map_def(2, 4, 4, 2_112, 128),
@@ -2158,6 +2334,19 @@ UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
     "p11_entry_ia32",
     "p11_entry_template", "p11_entry_template_pair",
     "p11_entry_template_second", "p11_entry_template_types",
+}
+# The production journal object: Detailed maps plus the four journal maps
+# (its own marker control row included), with the entry/return pair
+# replaced by the journal roots. Built only at FULL capacities, with the
+# build's own attribute-capture selection (P0 stubs it, like Detailed).
+JOURNAL_MAPS = _DETAILED_BASE_MAPS | {
+    "JOURNAL_START": map_def(1, 16, 24, 16_384, 0),
+    "JOURNAL_CTL": map_def(2, 4, 24, 1, 0),
+    "JOURNAL_MARKER_CTL": map_def(2, 4, 16, 1, 0),
+    "JOURNAL_CLASSES": map_def(2, 4, 4, 105, 128),
+}
+JOURNAL_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return"}) | {
+    "p11_entry_journal", "p11_return_journal",
 }
 
 
@@ -2206,9 +2395,11 @@ FROZEN_INVENTORY = {
     "inventory-callers": (INVENTORY_CALLER_MAPS, INVENTORY_CALLER_PROGRAMS),
     "inventory-callers-small-discovery": (INVENTORY_CALLER_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_CALLER_PROGRAMS),
     "default": (SAFE_MAPS, SAFE_PROGRAMS),
+    "default-no-marker": (_DETAILED_BASE_MAPS, SAFE_PROGRAMS),
     "diagnostic": (UNSAFE_MAPS, UNSAFE_PROGRAMS),
     "wide-default": (WIDE_MAPS, SAFE_PROGRAMS),
     "wide-diagnostic": (WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS),
+    "journal": (JOURNAL_MAPS, JOURNAL_PROGRAMS),
 }
 
 
@@ -2223,9 +2414,11 @@ FROZEN_SYMBOLS = {
     "inventory-callers": (False, False, False, 0, 0, 0),
     "inventory-callers-small-discovery": (False, False, False, 0, 0, 0),
     "default": (False, False, False, 0, 0, 0),
+    "default-no-marker": (False, False, False, 0, 0, 0),
     "diagnostic": (True, True, True, 2, 2, 2),
     "wide-default": (False, False, False, 0, 0, 0),
     "wide-diagnostic": (True, True, True, 2, 2, 2),
+    "journal": (False, False, False, 0, 0, 0),
 }
 
 
@@ -2255,9 +2448,23 @@ def validate_inventory(variant, maps, programs, symbols):
         raise RuntimeError(f"{variant} program inventory differs")
     inventory = variant.startswith("inventory")
     callers = variant.startswith("inventory-callers")
-    if not inventory:
+    journal = variant == "journal"
+    if journal:
+        # The exact map comparison above already excludes every map the
+        # journal must not carry, including inventory-only maps; here
+        # only the marker wiring needs its own rule.
+        if "p11_instance_exec_birth" in symbols:
+            raise RuntimeError("journal object contains the forbidden READY publish body")
+        missing = {"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"} - symbols
+        if missing:
+            raise RuntimeError(f"journal object lacks required marker symbols: {sorted(missing)}")
+    elif not inventory:
         markers = symbols & (REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"})
-        if markers:
+        if variant == "default":
+            missing = (REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}) - symbols
+            if missing:
+                raise RuntimeError(f"default object lacks required birth marker symbols: {sorted(missing)}")
+        elif markers:
             raise RuntimeError(f"release object contains forbidden birth marker symbols: {sorted(markers)}")
     if inventory:
         allowed = {"TASK_COOKIE", "COOKIE_CTL", "p11_link_current_identity", "p11_link_current_cookie",
@@ -2314,7 +2521,10 @@ def self_test():
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
     assert SAFE_MAPS["STACK_GUARD"] == map_def(3, 4, 4, 1)
     assert SAFE_MAPS["OBJECT_START"] == map_def(1, 16, 432, 16_384)
-    assert "JOURNAL_MARKER_CTL" not in SAFE_MAPS
+    assert SAFE_MAPS["JOURNAL_MARKER_CTL"] == map_def(2, 4, 16, 1, 0)
+    assert "JOURNAL_MARKER_CTL" not in _DETAILED_BASE_MAPS
+    assert "JOURNAL_MARKER_CTL" not in UNSAFE_MAPS
+    assert "JOURNAL_MARKER_CTL" not in WIDE_MAPS
     assert "JOURNAL_MARKER_CTL" in INVENTORY_FORBIDDEN_MAPS
     assert SAFE_MAPS["OBJECT_DESCRIPTORS"] == map_def(2, 4, 16, 105, 128)
     assert SAFE_MAPS["OBJECT_ZERO"] == map_def(2, 4, 432, 1, 128)
@@ -2323,15 +2533,24 @@ def self_test():
     assert WIDE_UNSAFE_MAPS["PAIR_CALLS"] == UNSAFE_MAPS["PAIR_CALLS"]
     assert "PAIR_CALLS" not in SAFE_MAPS
     assert "PAIR_CALLS" not in INVENTORY_MAPS
-    assert len(SAFE_MAPS) == 42
+    assert JOURNAL_MAPS["JOURNAL_START"] == map_def(1, 16, 24, 16_384, 0)
+    assert JOURNAL_MAPS["JOURNAL_CTL"] == map_def(2, 4, 24, 1, 0)
+    assert JOURNAL_MAPS["JOURNAL_MARKER_CTL"] == map_def(2, 4, 16, 1, 0)
+    assert JOURNAL_MAPS["JOURNAL_CLASSES"] == map_def(2, 4, 4, 105, 128)
+    assert len(SAFE_MAPS) == 43
     assert len(UNSAFE_MAPS) == 44
     assert len(WIDE_MAPS) == 42
     assert len(WIDE_UNSAFE_MAPS) == 44
+    assert len(JOURNAL_MAPS) == 46
     assert len(SAFE_PROGRAMS) == 20
     assert len(UNSAFE_PROGRAMS) == 25
+    assert len(JOURNAL_PROGRAMS) == 20
+    assert JOURNAL_PROGRAMS == (SAFE_PROGRAMS - {"p11_entry", "p11_return"}) | {"p11_entry_journal", "p11_return_journal"}
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
-    good = (SAFE_MAPS, SAFE_PROGRAMS,
-            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS | SELECTED_GLOBAL_HELPERS)
+    base_helpers = (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
+                    | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS | SELECTED_GLOBAL_HELPERS)
+    marked_helpers = base_helpers | REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
+    good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | marked_helpers)
     diagnostic = (
         UNSAFE_MAPS,
         UNSAFE_PROGRAMS,
@@ -2348,30 +2567,41 @@ def self_test():
         } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS | SELECTED_GLOBAL_HELPERS,
     )
     validate_policy_inventory(good, diagnostic)
-    validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, good[2])
+    validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | base_helpers)
     validate_inventory("wide-diagnostic", WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS, diagnostic[2])
+    validate_inventory("default-no-marker", _DETAILED_BASE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | base_helpers)
+    validate_inventory("journal", JOURNAL_MAPS, JOURNAL_PROGRAMS,
+                       {"p11_entry_journal"} | base_helpers | {"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"})
 
     def rejected(check, *arguments):
         if check is validate_inventory:
             *prefix, symbols = arguments
-            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS | SELECTED_GLOBAL_HELPERS)
+            extra = base_helpers
+            if prefix[0] == "default":
+                extra |= REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
+            elif prefix[0] == "journal":
+                extra |= {"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"}
+            arguments = (*prefix, symbols | extra)
         errors = io.StringIO()
         try:
             with contextlib.redirect_stderr(errors):
                 check(*arguments)
-        except RuntimeError:
-            return errors.getvalue().splitlines()
+        except RuntimeError as error:
+            lines = errors.getvalue().splitlines()
+            return lines if lines else [str(error)]
         raise AssertionError(f"{check.__name__} accepted {arguments!r}")
 
     assert rejected(
         validate_policy_inventory, (UNSAFE_MAPS, SAFE_PROGRAMS, {"decode_params"}), diagnostic
-    ) == ["map added: ATTR_BOOL_BITS", "map added: PAIR_CALLS"]
+    ) == ["map added: ATTR_BOOL_BITS", "map added: PAIR_CALLS", "map removed: JOURNAL_MARKER_CTL"]
     # Each variant is compared against ITS OWN freeze, not the other one's.
     assert rejected(validate_inventory, "diagnostic", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
+        "map added: JOURNAL_MARKER_CTL",
         "map removed: ATTR_BOOL_BITS",
         "map removed: PAIR_CALLS",
     ]
     assert rejected(validate_inventory, "wide-default", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
+        "map added: JOURNAL_MARKER_CTL",
         "RV_COUNTS.max_entries: object=4096 frozen=8192",
         "SLOT_FILE.max_entries: object=512 frozen=2112",
         "STATS.max_entries: object=512 frozen=2112",
@@ -2379,6 +2609,51 @@ def self_test():
     assert rejected(validate_inventory, "default", UNSAFE_MAPS, UNSAFE_PROGRAMS, set()) == [
         "map added: ATTR_BOOL_BITS",
         "map added: PAIR_CALLS",
+        "map removed: JOURNAL_MARKER_CTL",
+    ]
+    # The default object requires the marker set; the other Detailed
+    # variants forbid any of it; the journal requires the gap writer and
+    # the control map but never the READY publish body.
+    for extra, missing in [
+        (set(), "['JOURNAL_MARKER_CTL', 'p11_instance_exec_birth', 'p11_instance_scope_gap']"),
+        ({"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"}, "['p11_instance_exec_birth']"),
+    ]:
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                validate_inventory("default", SAFE_MAPS, SAFE_PROGRAMS,
+                                   {"p11_entry"} | base_helpers | extra)
+        except RuntimeError as error:
+            assert str(error) == f"default object lacks required birth marker symbols: {missing}", error
+        else:
+            raise AssertionError(f"default accepted a markerless object with {sorted(extra)}")
+    assert rejected(validate_inventory, "diagnostic", UNSAFE_MAPS, UNSAFE_PROGRAMS,
+                    {"p11_entry", "JOURNAL_MARKER_CTL"}) == [
+        "release object contains forbidden birth marker symbols: ['JOURNAL_MARKER_CTL']"
+    ]
+    assert rejected(validate_inventory, "default-no-marker", _DETAILED_BASE_MAPS, SAFE_PROGRAMS,
+                    {"p11_entry", "p11_instance_scope_gap"}) == [
+        "release object contains forbidden birth marker symbols: ['p11_instance_scope_gap']"
+    ]
+    assert rejected(validate_inventory, "journal", JOURNAL_MAPS, JOURNAL_PROGRAMS,
+                    {"p11_entry_journal", "p11_instance_exec_birth"}) == [
+        "journal object contains the forbidden READY publish body"
+    ]
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            validate_inventory("journal", JOURNAL_MAPS, JOURNAL_PROGRAMS,
+                               {"p11_entry_journal"} | base_helpers | {"JOURNAL_MARKER_CTL"})
+    except RuntimeError as error:
+        assert str(error) == "journal object lacks required marker symbols: ['p11_instance_scope_gap']", error
+    else:
+        raise AssertionError("journal accepted an object without the gap writer")
+    assert rejected(validate_inventory, "journal", JOURNAL_MAPS | {"USAGE": INVENTORY_MAPS["USAGE"]},
+                    JOURNAL_PROGRAMS, {"p11_entry_journal"}) == [
+        "map added: USAGE"
+    ]
+    drifted_journal = JOURNAL_MAPS | {"JOURNAL_CTL": JOURNAL_MAPS["JOURNAL_CTL"] | {"value_size": 25}}
+    assert rejected(validate_inventory, "journal", drifted_journal, JOURNAL_PROGRAMS,
+                    {"p11_entry_journal"}) == [
+        "JOURNAL_CTL.value_size: object=25 frozen=24"
     ]
     # A one-field drift names exactly that field, nothing else (the W3 CONFIG
     # shape: same maps, one max_entries apart).
@@ -2510,8 +2785,9 @@ def self_test():
 def usage():
     return (
         f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
-        "--inventory VARIANT BPF_ELF (default, diagnostic, inventory[-small-discovery], "
-        "inventory-callers[-small-discovery], wide-default, wide-diagnostic) | "
+        "--inventory VARIANT BPF_ELF (default, default-no-marker, diagnostic, "
+        "inventory[-small-discovery], inventory-callers[-small-discovery], "
+        "wide-default, wide-diagnostic, journal) | "
         "--policy-inventory DEFAULT_ELF DIAGNOSTIC_ELF | --json BPF_ELF | --self-test"
     )
 

@@ -3222,12 +3222,40 @@ fn privileged_instance_fork_without_exec_stays_consistent() -> Result<()> {
     Ok(())
 }
 
+/// Off-flavor guard shared by the birth-marker cells: without a
+/// marker-enabled build the Detailed object carries no marker map or
+/// bodies, and the cell asserts that absence instead of running live.
+/// This is a healthy twin, not a skip.
+fn assert_marker_absent_from_detailed() -> Result<()> {
+    let object =
+        aya_obj::Object::parse(crate::EBPF_OBJECT).expect("parse Detailed object for marker");
+    ensure!(
+        !object.maps.contains_key("JOURNAL_MARKER_CTL"),
+        "a markerless build must not allocate the marker control map"
+    );
+    for global in ["p11_instance_exec_birth", "p11_instance_scope_gap"] {
+        ensure!(
+            !object
+                .functions
+                .values()
+                .any(|function| function.name == global),
+            "a markerless build must not retain {global}"
+        );
+    }
+    eprintln!("MARKER_OFF flavor=off");
+    Ok(())
+}
+
 /// Birth marker: an exec before closure publishes nothing; the first exec
 /// after the mint publishes READY with the minted generation and one
 /// admission, and the next call carries the same exec ID.
 #[test]
-#[ignore = "R52 deferred to 0.6.0: requires a marker-enabled BPF build"]
+#[ignore = "privileged: birth marker exec after closure publishes READY"]
 fn privileged_journal_marker_exec_after_closure_publishes_ready() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
     let CmdSetup {
         _directory,
         provider,
@@ -3311,8 +3339,12 @@ fn privileged_journal_marker_exec_after_closure_publishes_ready() -> Result<()> 
 /// (the neighbor detachment gate pins that bound), so this cell reads the
 /// row, never events.
 #[test]
-#[ignore = "R52 deferred to 0.6.0: requires a marker-enabled BPF build"]
+#[ignore = "privileged: birth marker non-leader exec creates a fresh READY row"]
 fn privileged_journal_marker_nonleader_exec_creates_fresh_ready_row() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
     let CmdSetup {
         _directory,
         provider,
@@ -3364,8 +3396,12 @@ fn privileged_journal_marker_nonleader_exec_creates_fresh_ready_row() -> Result<
 /// re-execing from a thread. Reads the row after the exec, never events.
 /// The private cgroup is removed at the end.
 #[test]
-#[ignore = "R52 deferred to 0.6.0: requires a marker-enabled BPF build"]
+#[ignore = "privileged: birth marker dirty non-leader exec publishes fresh READY"]
 fn privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
     let CmdSetup {
         _directory,
         provider,
@@ -3455,8 +3491,12 @@ fn privileged_journal_marker_dirty_nonleader_exec_publishes_fresh_ready() -> Res
 /// keeps no row (task storage dies with the task), every marker write
 /// charges first, and the parent's row is untouched.
 #[test]
-#[ignore = "R52 deferred to 0.6.0: requires a marker-enabled BPF build"]
+#[ignore = "privileged: birth marker fork without exec publishes no READY"]
 fn privileged_journal_marker_fork_without_exec_has_no_ready() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
     let CmdSetup {
         _directory,
         provider,
@@ -3515,8 +3555,12 @@ fn privileged_journal_marker_fork_without_exec_has_no_ready() -> Result<()> {
 /// stops creating (no row), stops charging once (spent moves), or faults.
 /// The in-scope twin joins clean. The private cgroup is removed at the end.
 #[test]
-#[ignore = "R52 deferred to 0.6.0: requires a marker-enabled BPF build"]
+#[ignore = "privileged: birth marker cgroup-outsider call creates a DIRTY row"]
 fn privileged_journal_marker_cgroup_outsider_call_creates_dirty_row() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
     let PairSetup {
         _directory,
         provider,
@@ -3609,8 +3653,12 @@ fn privileged_journal_marker_cgroup_outsider_call_creates_dirty_row() -> Result<
 /// (No vfork child runs here, so the CLONE_VM-sharer exception is out of
 /// scope for this cell.)
 #[test]
-#[ignore = "R52 deferred to 0.6.0: requires a marker-enabled BPF build"]
+#[ignore = "privileged: birth marker PID outsider stays unobserved"]
 fn privileged_journal_marker_pid_outsider_stays_unobserved() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
     let PairSetup {
         _directory,
         provider,
@@ -3670,8 +3718,12 @@ fn privileged_journal_marker_pid_outsider_stays_unobserved() -> Result<()> {
 /// and one call stick DIRTY across the move back, another call, and a
 /// later in-scope exec. The private cgroup is removed at the end.
 #[test]
-#[ignore = "R52 deferred to 0.6.0: requires a marker-enabled BPF build"]
+#[ignore = "privileged: birth marker cgroup gap sticks across re-entry and exec"]
 fn privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
     let CmdSetup {
         _directory,
         provider,
@@ -3752,8 +3804,12 @@ fn privileged_journal_marker_cgroup_gap_sticks_across_reentry_and_exec() -> Resu
 /// provider while the process leaves the cgroup dirties on return, with no
 /// other call in between. The same held call released in scope leaves READY.
 #[test]
-#[ignore = "R52 deferred to 0.6.0: requires a marker-enabled BPF build"]
+#[ignore = "privileged: birth marker return outside scope dirties"]
 fn privileged_journal_marker_return_outside_scope_dirties() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
     let CmdSetup {
         _directory,
         provider,
@@ -3850,8 +3906,12 @@ fn privileged_journal_marker_return_outside_scope_dirties() -> Result<()> {
 /// READY. The process keeps running throughout; the private cgroup is
 /// removed at the end.
 #[test]
-#[ignore = "R52 deferred to 0.6.0: requires a marker-enabled BPF build"]
+#[ignore = "privileged: birth marker abandoned call at thread exit dirties"]
 fn privileged_journal_marker_abandoned_call_at_thread_exit_dirties() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
     let CmdSetup {
         _directory,
         provider,

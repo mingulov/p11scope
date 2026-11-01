@@ -819,6 +819,9 @@ set -- "$CANARY_WORK"/feature-build/release/build/p11scope-*/out/p11scope-ebpf
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "diagnostic BPF object is not unique"; exit 1; }
 DIAGNOSTIC_BPF=$1
 "$T4_TOOL_python3" -I scripts/check-bpf-map-defs.py --policy-inventory "$OFFICIAL_BPF" "$DIAGNOSTIC_BPF"
+set -- "$OFFICIAL_TARGET"/x86_64-unknown-linux-musl/release/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "official journal object is not unique"; exit 1; }
+"$T4_TOOL_python3" -I scripts/check-bpf-map-defs.py --inventory journal "$1"
 
 if "$P11SCOPE_STATIC" profile --unsafe-unvalidated-metadata \
     --manifest /nonexistent/manifest.json --pid 1 \

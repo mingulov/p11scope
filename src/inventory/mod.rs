@@ -1364,19 +1364,14 @@ fn run_with_terminal_budget(
         coordinator.enable_caller_metadata(started_ns)?;
     }
     coordinator.set_manifests(manifests.to_vec());
-    // Packet 6.13 round-2 (F5): the startup pinning above is retained for
-    // the run. Detailed-subset offset activation follows in a later packet
-    // — disclosed, never silently dropped — but the validation, pin and
-    // held-FD custody here are real.
+    // Packet 6.13 round-2 (F5): the startup pinning above is retained
+    // for the run, its proved offsets lower into the run's attach set
+    // before passes, and one interval row per input renders in `prearm[]`.
     if let Some(pinning) = prearm_pinning {
-        let retained = pinning.inputs.len();
         coordinator.set_prearm_pinning(pinning);
-        coordinator.note_scope_gap(
-            "pre-arm subset pending".into(),
-            format!(
-                "{retained} --prearm-module input(s) retained; Detailed-subset offset activation follows in a later packet"
-            ),
-        );
+        // Lower the proved offsets into the run's attach set before passes,
+        // so the capture attaches them through the existing native lane.
+        coordinator.absorb_prearm_plan(started_ns);
     }
     // F4 (review): a document with no `exact` flag still says, as a
     // scope-level gap, that /proc PIDs are not the kernel's here.
@@ -1639,6 +1634,21 @@ fn run_with_terminal_budget(
     };
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
+    // Terminal pre-arm close: end every watch exactly once before the
+    // final view, so pass views show live watches and the report shows
+    // terminal ones. An operator stop ends `Stop`, a deadline `ScopeEnd`.
+    // The plain commit publishes the hook's staged changed-identity gap
+    // (gaps stage, then publish); while a publication pends it refuses
+    // and the final keeps its prior view, gap and all, as before.
+    let watch_end = if stop() {
+        crate::render::PrearmWatchEnd::Stop
+    } else {
+        crate::render::PrearmWatchEnd::ScopeEnd
+    };
+    driver
+        .coordinator
+        .finish_prearm_watches(watch_end, Some(now_ns()));
+    let _ = driver.coordinator.commit_batch(false);
     let presentation =
         final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
     // Both owners stay alive through the final commit, the immutable
@@ -1828,6 +1838,11 @@ fn finish_failed_startup_guarded<Source: ProcessSource>(
             format!("capture failed before event stream started: {error:#}"),
         );
     }
+    // Terminal pre-arm close on failed startup: the scope ended
+    // without arming, so watches end `ScopeEnd` (no `failed` variant).
+    // Staged before the failure gap so the one commit below publishes
+    // both.
+    coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(now_ns()));
     coordinator.note_scope_gap("inventory capture failed".into(), format!("{error:#}"));
     let _ = coordinator.commit_batch(false);
     stdout.begin_finalization();
@@ -7097,6 +7112,10 @@ fn final_view_guarded(
     {
         let mut view = prior.clone();
         view.semantic_capture = driver.semantic_summary();
+        // Terminal pre-arm rows are a pure coordinator read, not a
+        // registry publication: the hook already ended the watches, so
+        // the pending final shows them terminal, like every fresh final.
+        view.prearm = driver.coordinator.prearm_rows();
         return view;
     }
     let mut presentation = Presentation::capture(
@@ -7334,6 +7353,20 @@ fn run_dashboard(
     };
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
+    // Terminal pre-arm close, as on the classic path: the dashboard
+    // quit flag is an operator-initiated end (`Stop`), a deadline end
+    // is `ScopeEnd`. The plain commit publishes the hook's staged
+    // changed-identity gap; while a publication pends it refuses and
+    // the final keeps its prior view, as before.
+    let watch_end = if ending() {
+        crate::render::PrearmWatchEnd::Stop
+    } else {
+        crate::render::PrearmWatchEnd::ScopeEnd
+    };
+    driver
+        .coordinator
+        .finish_prearm_watches(watch_end, Some(now_ns()));
+    let _ = driver.coordinator.commit_batch(false);
     let presentation =
         final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
     begin_scan_stdout(stdout, stopped.is_some());
@@ -7668,6 +7701,39 @@ fn caller_json(
     value
 }
 
+/// One `--prearm-module` input's report row (additive within v1):
+/// the operator spelling, the pinned file's identity, whether any
+/// scope member maps it, and the 6.13 interval keys merged from this
+/// lane's own attach stamps. The watch value reuses the frozen
+/// `PrearmWatch` shape (`since_ns` always present, `until_ns` /
+/// `ended_by` / `changed` omitted when unset); `sha256` and
+/// `attached_at_ns` render null when unknown; `unobserved_windows` is
+/// absent when undisclosed (never-mapped pre-arm, unattached modules)
+/// — an explicitly empty list would read as exact, which no producer
+/// in this packet claims.
+fn prearm_json(
+    row: &crate::discovery::engine::inventory_coordinator::PrearmReportRow,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "path": row.path,
+        "identity": {
+            "device": {"major": row.dev.0, "minor": row.dev.1},
+            "inode": row.ino,
+            "sha256": row.sha256,
+        },
+        "mapped": row.mapped,
+        "watch": row.watch.as_ref().map(|watch| {
+            serde_json::to_value(watch).expect("a pre-arm watch interval serializes")
+        }),
+        "attached_at_ns": row.attached_at_ns,
+    });
+    if let Some(windows) = row.unobserved_windows.as_ref() {
+        value["unobserved_windows"] =
+            serde_json::to_value(windows).expect("unobserved windows serialize");
+    }
+    value
+}
+
 fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Value {
     let record = module;
     let sha256 = record
@@ -7960,6 +8026,7 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         "budgets": budgets_json(&presentation.budgets),
         "callers": presentation.callers.iter().map(|caller| caller_json(caller, &presentation.caller_metadata)).collect::<Vec<_>>(),
         "modules": presentation.modules.iter().map(module_json).collect::<Vec<_>>(),
+        "prearm": presentation.prearm.iter().map(prearm_json).collect::<Vec<_>>(),
         "edges": presentation.edges.iter().map(edge_json).collect::<Vec<_>>(),
         "instances": presentation.instances.iter().map(instance_json).collect::<Vec<_>>(),
         "semantic_edges": presentation.semantic_edges.iter().map(instance_semantic_json).collect::<Vec<_>>(),
@@ -8514,13 +8581,14 @@ mod tests {
     }
 
     /// Packet 6.13 round-2 (F5): a valid `--prearm-module` under auto/native
-    /// pins and retains the provider instead of refusing every mode. The
-    /// Detailed-subset offset activation stays pending (disclosed gap), but
-    /// startup validation, pin and held-FD custody are real.
+    /// pins and retains the provider instead of refusing every mode.
+    /// Activation is live: the proved offsets lower into the run's
+    /// attach set (none for the exportless fixture below) and no
+    /// pending-rows gap remains.
     #[test]
-    fn inventory_run_accepts_valid_prearm_under_auto_with_retained_gap() {
+    fn inventory_run_accepts_valid_prearm_under_auto_with_activated_attach_set() {
         // A trivial provider with no standard exports: pinning succeeds,
-        // retention is real, activation stays pending.
+        // retention is real, and activation holds zero proved offsets.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("prearm-valid.c");
         std::fs::write(&src, "int prearm_valid_marker;\n").unwrap();
@@ -8534,10 +8602,10 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        // Auto falls back to scan when native is unavailable in tests; the
-        // pre-arm pin must not block that fallback, and the pending gap
-        // must disclose the retained input. The stubbed preparation fails
-        // generic (not a typed host refusal), so auto continues on scan.
+        // Auto falls back to scan when native is unavailable in tests;
+        // the pre-arm pin must not block that fallback. The stubbed
+        // preparation fails generic (not a typed host refusal), so auto
+        // continues on scan.
         let out = dir.path().join("out.json");
         let mut stdout = Vec::new();
         let code = super::native_preparation_test::with(
@@ -8582,14 +8650,539 @@ mod tests {
         let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
         let gaps = document["gaps"].as_array().cloned().unwrap_or_default();
         assert!(
-            gaps.iter().any(|gap| {
+            !gaps.iter().any(|gap| {
                 gap["subject"]
                     .as_str()
                     .unwrap_or_default()
-                    .contains("pre-arm")
+                    .contains("pre-arm interval rows pending")
             }),
-            "a retained pre-arm input discloses its pending activation: {gaps:?}"
+            "activation replaced the pending-rows gap: {gaps:?}"
         );
+        assert_eq!(
+            document["budgets"]["inventory_endpoints"]["occupied"], 0,
+            "the exportless fixture proves no offsets, so the attach set holds none"
+        );
+    }
+
+    /// Pre-arm activation fixture: a real provider .so exporting two
+    /// standard-name functions (proved).
+    fn prearm_provider_with_proved_exports_for_test(dir: &std::path::Path) -> PathBuf {
+        let src = dir.join("prearm-proved.c");
+        std::fs::write(
+            &src,
+            "unsigned long C_Initialize(void *p){(void)p;return 0;}\n\
+             unsigned long C_GetFunctionList(void *l){(void)l;return 0;}\n",
+        )
+        .unwrap();
+        let provider = dir.join("prearm-proved.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&provider)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        provider
+    }
+
+    #[test]
+    fn inventory_run_with_prearm_holds_proved_endpoints_in_the_attach_set() {
+        // Production-wiring half: a full inventory run with --prearm-module
+        // holds the proved offsets in the run's attach
+        // set (budgets.inventory_endpoints.occupied), even when the --module
+        // filter matches nothing (R2-D1-1: filtering never drops pre-arm).
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports_for_test(dir.path());
+        let out = dir.path().join("out.json");
+        let mut stdout = Vec::new();
+        let code = super::native_preparation_test::with(
+            |_, _, _| Err(anyhow::anyhow!("injected native unavailable for test")),
+            || {
+                run_with_terminal_budget(
+                    InspectScope::Pid(std::process::id()),
+                    &[PathBuf::from("/definitely/not/mapped-prearm-t8.so")],
+                    &[],
+                    &[provider],
+                    &HookRegistry::builtin(),
+                    true,
+                    Some(1),
+                    None,
+                    inventory_endpoint_budget(None).unwrap(),
+                    None,
+                    Some(&out),
+                    false,
+                    None,
+                    None,
+                    None,
+                    CaptureMode::Auto,
+                    crate::attach::BackendSelection::Singles,
+                    None,
+                    false,
+                    &|| false,
+                    &|| {},
+                    false,
+                    &mut WriterStdout(&mut stdout),
+                    &DashboardIo::stdio(),
+                    DiagnosticRequest::disabled(),
+                    None,
+                    &|| Ok(crate::attach::MultiCapableHost::for_test()),
+                    None,
+                    None,
+                )
+            },
+        )
+        .expect("inventory with --prearm-module under auto must not refuse");
+        assert_eq!(code, 0);
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            document["budgets"]["inventory_endpoints"]["occupied"], 2,
+            "the run's attach set holds exactly the two proved offsets"
+        );
+    }
+
+    /// Full inventory run with `--prearm-module` under auto, through the
+    /// production classic path with the two documented unprivileged
+    /// seams: the host probe answers test-eligible and native
+    /// preparation is stubbed unavailable, so auto deterministically
+    /// takes scan fallback. (The public run cannot serve here: the host
+    /// gate hard-refuses unprivileged auto/native before any lane
+    /// opens, and scan refuses pre-arm by name.) Returns the exit code
+    /// and the stdout JSON document.
+    fn inventory_prearm_run_json(
+        pid: u32,
+        prearm: &[PathBuf],
+        duration: Option<std::time::Duration>,
+        event_log: Option<&std::path::Path>,
+    ) -> (i32, serde_json::Value) {
+        let mut stdout = Vec::new();
+        let code = super::native_preparation_test::with(
+            |_, _, _| Err(anyhow::anyhow!("injected native unavailable for test")),
+            || {
+                run_with_terminal_budget(
+                    InspectScope::Pid(pid),
+                    &[],
+                    &[],
+                    prearm,
+                    &HookRegistry::builtin(),
+                    true,
+                    Some(1),
+                    None,
+                    inventory_endpoint_budget(None).unwrap(),
+                    duration,
+                    None,
+                    false,
+                    event_log,
+                    None,
+                    None,
+                    CaptureMode::Auto,
+                    crate::attach::BackendSelection::Singles,
+                    None,
+                    false,
+                    &|| false,
+                    &|| {},
+                    false,
+                    &mut WriterStdout(&mut stdout),
+                    &DashboardIo::stdio(),
+                    DiagnosticRequest::disabled(),
+                    None,
+                    &|| Ok(crate::attach::MultiCapableHost::for_test()),
+                    None,
+                    None,
+                )
+            },
+        )
+        .expect("inventory with --prearm-module under auto must not refuse");
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        (code, document)
+    }
+
+    /// The scan-fallback gap: the lane proof. Every JSON twin asserts
+    /// it, so the scan-terminal watch shapes are non-vacuous — a
+    /// silently native run cannot pass them.
+    fn assert_scan_fallback(document: &serde_json::Value) {
+        let gaps = document["gaps"].as_array().cloned().unwrap_or_default();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap["subject"] == "native usage feed unavailable"),
+            "the stubbed run takes scan fallback: {gaps:?}"
+        );
+    }
+
+    /// The expected whole-file digest, computed in-test from the file
+    /// bytes, never from the pin under test.
+    fn sha256_of(path: &std::path::Path) -> String {
+        use sha2::Digest as _;
+        let bytes = std::fs::read(path).unwrap();
+        p11scope_manifest::identity::hex(&sha2::Sha256::digest(bytes))
+    }
+
+    /// The `tests/fixtures/discovery-lifecycle.c` provider plus its
+    /// acknowledged loader driver, compiled like the engine-tests
+    /// fixture (inventory twins need only a pid plus a mapping).
+    struct PrearmLifecycle {
+        _dir: tempfile::TempDir,
+        provider: PathBuf,
+        driver: PathBuf,
+    }
+
+    fn compile_prearm_lifecycle() -> PrearmLifecycle {
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/discovery-lifecycle.c");
+        let provider = dir.path().join("lifecycle-provider.so");
+        let driver = dir.path().join("lifecycle-driver");
+        for (output, extra) in [
+            (
+                &provider,
+                &["-shared", "-fPIC", "-DDISCOVERY_LIFECYCLE_PROVIDER"][..],
+            ),
+            (&driver, &[][..]),
+        ] {
+            assert!(
+                std::process::Command::new("gcc")
+                    .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+                    .args(extra)
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(output)
+                    .arg("-ldl")
+                    .status()
+                    .expect("compile the owned discovery fixture")
+                    .success()
+            );
+        }
+        PrearmLifecycle {
+            _dir: dir,
+            provider,
+            driver,
+        }
+    }
+
+    fn poll_fd_readable(fd: i32, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pollfd names one initialized descriptor for this process.
+            let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            if result > 0 {
+                return true;
+            }
+            if result == 0 || std::time::Instant::now() >= deadline {
+                return false;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted,
+                "poll failed"
+            );
+        }
+    }
+
+    /// The acknowledged loader behind its pre-load barrier: `READY
+    /// <pid>`, `L` → `LOADED <pid> <dev> <ino> 68`, `X` → clean exit.
+    struct PrearmBarrier {
+        child: std::process::Child,
+        stdout: std::process::ChildStdout,
+        pid: u32,
+    }
+
+    impl PrearmBarrier {
+        fn start(driver: &std::path::Path, provider: &std::path::Path) -> Self {
+            let mut child = std::process::Command::new(driver)
+                .arg(provider)
+                .env_clear()
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("start the owned loader behind its pre-load barrier");
+            let pid = child.id();
+            let stdout = child.stdout.take().unwrap();
+            let mut barrier = Self { child, stdout, pid };
+            assert_eq!(barrier.read_ack(), format!("READY {pid}\n"));
+            barrier
+        }
+
+        fn read_ack(&mut self) -> String {
+            use std::io::Read as _;
+            use std::os::fd::AsRawFd as _;
+            let mut ack = Vec::new();
+            while !ack.ends_with(b"\n") {
+                assert!(
+                    ack.len() < 256
+                        && poll_fd_readable(
+                            self.stdout.as_raw_fd(),
+                            std::time::Duration::from_secs(10)
+                        ),
+                    "bounded fixture acknowledgement: {ack:?}"
+                );
+                let mut byte = [0];
+                assert_eq!(
+                    self.stdout.read(&mut byte).unwrap(),
+                    1,
+                    "fixture exited before acknowledgement: {ack:?}"
+                );
+                ack.push(byte[0]);
+            }
+            String::from_utf8(ack).unwrap()
+        }
+
+        fn load(&mut self) {
+            use std::io::Write as _;
+            self.child.stdin.as_mut().unwrap().write_all(b"L").unwrap();
+            let ack = self.read_ack();
+            assert!(
+                ack.starts_with(&format!("LOADED {} ", self.pid)) && ack.ends_with(" 68\n"),
+                "unexpected load acknowledgement: {ack:?}"
+            );
+        }
+
+        fn shutdown(&mut self) {
+            use std::io::Write as _;
+            if let Some(stdin) = self.child.stdin.as_mut() {
+                let _ = stdin.write_all(b"X");
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => return,
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl Drop for PrearmBarrier {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Inventory JSON twin: a mapped lifecycle provider pre-armed
+    /// before the run renders one `prearm[]` row with its file
+    /// identity, `mapped` and its terminal watch.
+    #[test]
+    fn inventory_prearm_mapped_renders_terminal_watch() {
+        let lifecycle = compile_prearm_lifecycle();
+        let mut barrier = PrearmBarrier::start(&lifecycle.driver, &lifecycle.provider);
+        barrier.load();
+
+        let (code, document) = inventory_prearm_run_json(
+            barrier.pid,
+            std::slice::from_ref(&lifecycle.provider),
+            None,
+            None,
+        );
+        assert_eq!(code, 0);
+        assert_scan_fallback(&document);
+        let rows = document["prearm"]
+            .as_array()
+            .expect("the unified prearm[] section");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        // Operator spelling plus the pinned file's identity (the
+        // mapped-device key and an independently computed digest).
+        assert_eq!(
+            row["path"].as_str().unwrap(),
+            lifecycle.provider.to_string_lossy()
+        );
+        let file = p11scope_manifest::identity::open_object(&lifecycle.provider).unwrap();
+        let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        assert_eq!(
+            row["identity"]["device"]["major"].as_u64(),
+            Some(key.device_major)
+        );
+        assert_eq!(
+            row["identity"]["device"]["minor"].as_u64(),
+            Some(key.device_minor)
+        );
+        assert_eq!(row["identity"]["inode"].as_u64(), Some(key.inode));
+        assert_eq!(
+            row["identity"]["sha256"].as_str(),
+            Some(sha256_of(&lifecycle.provider).as_str()),
+            "the row carries the pinned file's whole-file digest: {row}"
+        );
+        assert_eq!(row["mapped"], true);
+        // Every production row carries a watch; the scan lane never
+        // arms it, so the terminal hook ends the unarmed wait.
+        assert!(row["watch"].is_object(), "a watch interval: {row}");
+        assert_eq!(row["watch"]["state"], "ended");
+        assert_eq!(row["watch"]["ended_by"], "scope_end");
+        assert!(row["watch"]["until_ns"].as_u64().unwrap() > 0);
+        assert!(row["watch"]["since_ns"].is_null());
+        assert!(row["watch"].get("changed").is_none());
+        assert!(row["attached_at_ns"].is_null());
+        assert!(row.get("unobserved_windows").is_none());
+        // The proved offsets occupy attach-set endpoints (lowering
+        // precedes passes); scan may hold more beside them.
+        assert!(
+            document["budgets"]["inventory_endpoints"]["occupied"]
+                .as_u64()
+                .unwrap()
+                >= 1,
+            "the proved offsets occupy attach-set endpoints: {}",
+            document["budgets"]["inventory_endpoints"]["occupied"]
+        );
+        barrier.shutdown();
+    }
+
+    /// Inventory JSON twin: pre-arm over a scope member that maps
+    /// nothing renders a bounded watch that ends at scope end — no
+    /// attach instant, no window (its watch speaks), no guessed
+    /// mapping.
+    #[test]
+    fn inventory_prearm_never_mapped_renders_bounded_watch() {
+        let lifecycle = compile_prearm_lifecycle();
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let (code, document) = inventory_prearm_run_json(
+            child.id(),
+            std::slice::from_ref(&lifecycle.provider),
+            None,
+            None,
+        );
+        assert_eq!(code, 0);
+        assert_scan_fallback(&document);
+        let rows = document["prearm"]
+            .as_array()
+            .expect("the unified prearm[] section");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        assert_eq!(row["mapped"], false);
+        assert_eq!(row["watch"]["state"], "ended");
+        assert_eq!(row["watch"]["ended_by"], "scope_end");
+        assert!(row["watch"]["until_ns"].as_u64().unwrap() > 0);
+        assert!(row["watch"]["since_ns"].is_null());
+        assert!(
+            row.get("unobserved_windows").is_none(),
+            "never-mapped pre-arm carries no window: {row}"
+        );
+        assert!(row["watch"].get("changed").is_none());
+        assert!(row["attached_at_ns"].is_null());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// Inventory JSON twin: rename-over between pin and capture end
+    /// keeps the pinned inode and reports the change — the `changed`
+    /// uncertainty bracket, the `object_changed` end, and the
+    /// changed-identity gap. The replacement lands mid-run
+    /// (`--duration` + a rename past the run's startup, sequenced off
+    /// the event-log prologue the pin precedes).
+    #[test]
+    fn inventory_prearm_replacement_reports_change() {
+        let lifecycle = compile_prearm_lifecycle();
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let file = p11scope_manifest::identity::open_object(&lifecycle.provider).unwrap();
+        let old_ino = p11scope_manifest::identity::mapping_file_key(&file)
+            .unwrap()
+            .inode;
+        drop(file);
+        let events = lifecycle._dir.path().join("events.jsonl");
+
+        let provider = lifecycle.provider.clone();
+        let events_for_run = events.clone();
+        let run = std::thread::spawn(move || {
+            inventory_prearm_run_json(
+                pid,
+                std::slice::from_ref(&provider),
+                Some(std::time::Duration::from_secs(5)),
+                Some(&events_for_run),
+            )
+        });
+        // Pinning precedes the event-log prologue: the `started`
+        // record proves the old inode is held before the rename lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let log = std::fs::read_to_string(&events).unwrap_or_default();
+            if log.contains("\"started\"") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the inventory run never wrote its prologue"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50)); // ctime granularity margin
+        let src = lifecycle._dir.path().join("other.c");
+        std::fs::write(&src, "int g(void){return 2;}\n").unwrap();
+        let other = lifecycle._dir.path().join("other.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&other)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::rename(&other, &lifecycle.provider).unwrap();
+
+        let (code, document) = run.join().unwrap();
+        assert_eq!(code, 0);
+        assert_scan_fallback(&document);
+        let rows = document["prearm"]
+            .as_array()
+            .expect("the unified prearm[] section");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        assert_eq!(row["watch"]["state"], "ended");
+        assert_eq!(row["watch"]["ended_by"], "object_changed");
+        // Terminal clamping: the hook ends watches at the sampled stop
+        // instant, and the refresh detects microseconds later, so until
+        // (clamped to the first stop) precedes the detection instant.
+        assert!(row["watch"]["until_ns"].as_u64().unwrap() > 0);
+        assert!(
+            row["watch"]["until_ns"].as_u64().unwrap()
+                <= row["watch"]["changed"]["detected_ns"].as_u64().unwrap(),
+            "until is clamped to the first stop: {row}"
+        );
+        assert_eq!(
+            row["watch"]["changed"]["previous_ino"].as_u64(),
+            Some(old_ino),
+            "the bracket names the pinned inode: {row}"
+        );
+        assert!(row["watch"]["changed"]["last_ok_ns"].as_u64().unwrap() > 0);
+        assert!(
+            row["watch"]["changed"]["detected_ns"].as_u64().unwrap()
+                >= row["watch"]["changed"]["last_ok_ns"].as_u64().unwrap(),
+            "the bracket orders last-ok before detection: {row}"
+        );
+        let gaps = document["gaps"].as_array().cloned().unwrap_or_default();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap["subject"] == "inventory attach target changed identity"),
+            "the changed-identity gap discloses the replacement: {gaps:?}"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
@@ -15036,6 +15629,144 @@ mod tests {
             gaps.iter()
                 .any(|gap| gap["subject"] == "inventory capture failed"),
             "the fallback reports the failure gap: {gaps:?}"
+        );
+    }
+
+    /// Pre-arm pinning over one tiny proved-exports provider, compiled
+    /// like the coordinator twins' fixture: two standard-name functions
+    /// (proved) — enough to open a watch and end it terminally.
+    fn prearm_pinning_for_test(
+        dir: &tempfile::TempDir,
+        name: &str,
+    ) -> crate::discovery::identity::PrearmPinning {
+        let src = dir.path().join(format!("{name}.c"));
+        std::fs::write(
+            &src,
+            "unsigned long C_Initialize(void *p){(void)p;return 0;}\n\
+             unsigned long C_GetFunctionList(void *l){(void)l;return 0;}\n",
+        )
+        .unwrap();
+        let so = dir.path().join(format!("{name}.so"));
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&so)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+            &[so],
+            &[],
+            None,
+            0,
+            0,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
+        )
+        .expect("test pre-arm pins")
+    }
+
+    #[test]
+    fn presentation_guard_final_refreshes_terminal_prearm_rows() {
+        // While a publication pends, the final keeps the prior view —
+        // except `prearm[]`, which refreshes to the terminal watches
+        // from the live coordinator: the terminal hook already ended
+        // them, and the row assembly is a pure read, not a registry
+        // publication. Every other section still reuses the prior.
+        let dir = tempfile::tempdir().unwrap();
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(prearm_pinning_for_test(&dir, "pending-final"));
+        coordinator.absorb_prearm_plan(1_000);
+        coordinator.take_target_delta();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        let mut state = StreamState::new();
+        let prior = stream_view_guarded(&driver, &mut state, "system", 1, 2)
+            .expect("the unpending pass publishes");
+        assert_eq!(
+            prior.prearm[0].watch.as_ref().unwrap().state,
+            crate::render::PrearmWatchState::PinnedUnarmed,
+            "the prior carries the live watch"
+        );
+        // The terminal close lands, then the publication pends behind
+        // it: the hook's commit refuses and the final keeps the prior.
+        driver
+            .coordinator
+            .finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(9_000));
+        driver.joint_commit_pending = true;
+        assert!(driver.publication_pending(), "the harness driver pends");
+        let final_view = final_view_guarded(&driver, &state, "system", 1, 9);
+        let watch = final_view.prearm[0].watch.as_ref().unwrap();
+        assert_eq!(
+            watch.state,
+            crate::render::PrearmWatchState::Ended,
+            "the pending final shows the terminal watch, not the prior's live one"
+        );
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::ScopeEnd)
+        );
+        assert_eq!(watch.until_ns, Some(9_000));
+        assert_eq!(
+            render_json_from_presentation(&final_view)["gaps"],
+            render_json_from_presentation(&prior)["gaps"],
+            "every other section still reuses the prior view"
+        );
+    }
+
+    #[test]
+    fn failed_startup_final_publishes_scope_end_watches_with_failure_gap() {
+        // The failure choke ends pre-arm watches `ScopeEnd` and stages
+        // the failure gap before the one commit, so the fresh final
+        // publishes both together.
+        let dir = tempfile::tempdir().unwrap();
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(prearm_pinning_for_test(&dir, "failed-startup"));
+        coordinator.absorb_prearm_plan(1_000);
+        coordinator.take_target_delta();
+        let output = private_tempdir();
+        let report_path = output.path().join("report.json");
+        let events_path = output.path().join("events.jsonl");
+        let writer = EventWriter::anonymous_test_sink(std::fs::File::create(&events_path).unwrap());
+        let mut stream = EventLogState::new(Some(writer));
+        let mut stdout: Vec<u8> = Vec::new();
+        let error = anyhow::anyhow!("scripted native failure");
+        let finalized = std::cell::Cell::new(false);
+        finish_failed_startup_guarded(
+            false,
+            None,
+            &mut coordinator,
+            "system",
+            1,
+            Some(crate::output::atomic_file_test_fixture(&report_path)),
+            &mut stream,
+            None,
+            true,
+            &mut crate::inventory_output::WriterStdout(&mut stdout),
+            &error,
+            &|| false,
+            &|| finalized.set(true),
+            None,
+        );
+        assert!(finalized.get(), "outputs were attempted");
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        let rows = document["prearm"]
+            .as_array()
+            .expect("the fresh final renders prearm[]");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["watch"]["state"], "ended");
+        assert_eq!(rows[0]["watch"]["ended_by"], "scope_end");
+        assert!(
+            rows[0]["watch"]["until_ns"].as_u64().unwrap() > 0,
+            "the choke ends the watch: {rows:?}"
+        );
+        let gaps = document["gaps"].as_array().unwrap();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap["subject"] == "inventory capture failed"),
+            "the failure gap publishes beside the watches: {gaps:?}"
         );
     }
 

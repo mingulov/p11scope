@@ -3418,6 +3418,30 @@ pub fn build_from_sources_for_policy_scoped(
     )
 }
 
+/// [`build_from_sources_for_policy_scoped`] plus resolved `--prearm-module`
+/// pieces: the inventory lane lowers proved pre-arm offsets under its own
+/// policy through the same merge, so admission caps and the
+/// count-only-unless-manifest-authorized rule are unchanged. An empty slice
+/// builds exactly the old plan.
+pub fn build_from_sources_for_policy_scoped_with_prearm(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
+    pinned: &PinnedObjects,
+    admission_policy: AdmissionPolicy,
+    admission_scope: AdmissionScope,
+) -> AttachPlan {
+    build_from_sources_with_policy(
+        scanned,
+        manifests,
+        prearm,
+        pinned,
+        false,
+        admission_policy,
+        admission_scope,
+    )
+}
+
 /// Complete target requirements before table/slot admission. These are negative
 /// completeness and ambiguity facts, never permission to read arguments.
 pub(crate) struct SemanticSourceClaims {
@@ -7148,6 +7172,83 @@ mod tests {
             plan.slots[0].semantics,
             crate::kinds::descriptor("C_SignInit").unwrap()
         );
+    }
+
+    fn inventory_budget_for_prearm_test(endpoints: u64) -> crate::capacity::InventoryBudget {
+        crate::capacity::InventoryBudget::new(endpoints, endpoints * 8).unwrap()
+    }
+
+    #[test]
+    fn inventory_policy_with_prearm_plans_proved_offsets_count_only() {
+        // Proved pre-arm offsets lower into an Inventory-policy plan like
+        // manifest-side operator input: count-only without
+        // independent manifest authority, carrying the Inventory admission
+        // policy the inventory attach set requires.
+        let budget = inventory_budget_for_prearm_test(4096);
+        let plan = build_from_sources_for_policy_scoped_with_prearm(
+            &[],
+            &[],
+            &[prearm_piece(vec![("C_SignInit".into(), 0x10)])],
+            &PinnedObjects::empty(),
+            AdmissionPolicy::Inventory(budget),
+            AdmissionScope::Shared,
+        );
+        assert_eq!(plan.admission_policy(), AdmissionPolicy::Inventory(budget));
+        assert_eq!(plan.refused_modules().count(), 0);
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].names, ["C_SignInit"]);
+        assert_eq!(plan.slots[0].file_offset, 0x10);
+        assert_eq!(plan.slots[0].descriptor_index, 0);
+        assert_eq!(plan.slots[0].semantics, SlotSemantics::COUNT_ONLY);
+        assert!(!plan.slots[0].semantic_authorized);
+        assert!(plan.is_active(plan.slots[0].index));
+        plan.validate_slot_index().unwrap();
+    }
+
+    #[test]
+    fn inventory_policy_with_empty_prearm_builds_the_old_plan() {
+        // Additive-only: an empty pre-arm slice builds exactly the plan the
+        // old entry builds — every non-pre-arm capture is untouched.
+        let scanned = scanned_with(TEST_OBJECT, "/opt/p11.so", [0x10]);
+        let manifest = manifest_with(vec![resolved("C_Sign", 0x10)]);
+        let policy = AdmissionPolicy::Inventory(inventory_budget_for_prearm_test(4096));
+        let old = build_from_sources_for_policy_scoped(
+            std::slice::from_ref(&scanned),
+            std::slice::from_ref(&manifest),
+            &PinnedObjects::empty(),
+            policy,
+            AdmissionScope::Shared,
+        );
+        let new = build_from_sources_for_policy_scoped_with_prearm(
+            std::slice::from_ref(&scanned),
+            std::slice::from_ref(&manifest),
+            &[],
+            &PinnedObjects::empty(),
+            policy,
+            AdmissionScope::Shared,
+        );
+        assert_eq!(old, new);
+    }
+
+    #[test]
+    fn inventory_policy_prearm_beyond_budget_is_refused_not_admitted() {
+        // No admission-cap change: proved offsets compete within the
+        // Inventory budget; past it the module is refused whole, never
+        // silently admitted beyond the cap.
+        let budget = inventory_budget_for_prearm_test(4096);
+        let proved: Vec<(String, u64)> = (0..5000u64)
+            .map(|index| (format!("C_Extra{index:04}"), 0x10 + index * 8))
+            .collect();
+        let plan = build_from_sources_for_policy_scoped_with_prearm(
+            &[],
+            &[],
+            &[prearm_piece(proved)],
+            &PinnedObjects::empty(),
+            AdmissionPolicy::Inventory(budget),
+            AdmissionScope::Shared,
+        );
+        assert_eq!(plan.refused_modules().count(), 1);
+        assert!(plan.slots.is_empty());
     }
 
     #[test]

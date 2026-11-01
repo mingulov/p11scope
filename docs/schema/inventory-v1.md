@@ -939,6 +939,64 @@ Finite reasons are `permission_denied`, `identity_unavailable`,
 `ambiguous_pattern`, `refresh_overdue` and `stopped`. Hints are display
 context only and never join callers across captures or revise counters.
 
+## Pre-arm interval rows (additive within v1)
+
+`prearm[]` carries one row per `--prearm-module` input, in flag order
+(`[]` without the flag). Inventory `modules[]` rows cover mapped
+instances only and cannot carry never-mapped watches, so pre-arm rows
+live in their own section — stable whether the input ever maps. Each
+row is `{path, identity, mapped, watch, attached_at_ns,
+unobserved_windows?}`:
+
+- `path` is the operator's spelling (messages and the module path
+  only, never identity); `identity` is `{device: {major, minor},
+  inode, sha256}` of the retained pin (`sha256` null when unproven).
+- `mapped` tells at a glance whether the object was observed mapped
+  by a scope member during the capture (any published registry module
+  record names it; records are never removed, so unload evidence is
+  retained and this stays true after an unload).
+- `watch` is `{since_ns, state, until_ns?, ended_by?, changed?}`:
+  `state` is exactly `pinned_unarmed`, `armed`, `armed_idle`,
+  `unavailable`, or `ended`; `since_ns` is always present (null
+  until armed, never pin time); `until_ns`/`ended_by` appear only
+  when the end actually happened (`ended_by` is exactly `attached`,
+  `scope_end`, `stop`, `object_changed`, `health_loss`, or
+  `scope_uncertain`); `changed` is the `{last_ok_ns, detected_ns,
+  previous_ino}` uncertainty bracket of a retained-object change.
+  `watch` is null only when the input resolved to no retained object
+  (defensive: retained pins always resolve).
+- `attached_at_ns` is always present: null when assembled with
+  nothing attached, otherwise the max over the declared set's real
+  attach stamps (only when every member carries one — a subset
+  maximum is not declared-set readiness).
+- `unobserved_windows` is a list of `{start_ns, end_ns, reason}`
+  with `reason` exactly `pre_attach`, `late_discovery`,
+  `mapped_unattached`, `health_loss`, or `scope_uncertain`; absent
+  means undisclosed (never-mapped pre-arm, unattached modules), and
+  an explicitly empty list reads as exact only with an R2-D1-6 proof
+  behind it. Key presence never proves exactness. Inventory emits
+  only `pre_attach` and `mapped_unattached` window reasons;
+  `late_discovery` is Detailed-only, and `health_loss`/`scope_uncertain`
+  appear as `ended_by`, never as window reasons, on this lane.
+
+Never-mapped rule: a pre-armed input no scope member maps carries no
+window — its watch speaks. When the declared set never attached, it
+ends at scope end with no arm instant and no attach instant; on the
+native lane the declared set attaches and arms without any mapping
+(`mapped` false, `armed`, `since`/`attached_at` set). Attached modules
+without an R2-D1-6 proof always disclose their
+`[scope_start_ns, attached_at_ns]` window with reason `pre_attach`;
+inventory has no exactness producer, so a quiet pre-armed interval is
+a stated watch interval, not proven-exact coverage. Refusals and
+replacement ride the existing gap subjects (`inventory attach set
+refused module`, `inventory attach target changed identity`).
+
+Declared-set scope: inventory freezes each watch's declared endpoint
+set from proved offsets only (no manifest claims), while the Detailed
+lane also includes manifest-claimed offsets. The inventory set is
+conservative: manifest-only offsets that later attach surface as
+`mapped_unattached` windows, never as silent coverage.
+
 ## Example (abridged)
 
 ```json

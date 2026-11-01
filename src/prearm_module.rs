@@ -109,11 +109,11 @@
 //!
 //! O4 allowlist row: the needed amendment is noted in the packet report;
 //! this patch never writes `docs/privacy/allowlist-v1.md`. Fresh-file
-//! attribution stays 6.12's. Installed exactness positives stay C6-D. The
-//! inventory Detailed-subset offset activation follows the input surface in
-//! a later packet: inventory pins and retains `--prearm-module` inputs at
-//! startup, refuses them by name under `--capture scan`, and discloses the
-//! pending activation as a scope gap.
+//! attribution stays 6.12's. Installed exactness positives stay C6-D.
+//! Inventory activation is live: inventory pins and retains
+//! `--prearm-module` inputs at startup, refuses them by name under
+//! `--capture scan`, attaches proved offsets through the inventory lane,
+//! and reports one interval row per input in `prearm[]`.
 
 use std::collections::{BTreeMap, BTreeSet};
 

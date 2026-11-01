@@ -398,10 +398,11 @@ with the gap disclosed. Records seen only through pre-arm stay
 
 Under inventory, `--prearm-module` requires `--capture auto` or `native`
 and is refused by name under `scan`. Inventory pins and retains the inputs
-at startup, but Detailed-subset offset activation follows in a later
-packet: the report discloses a scope gap of the form "N `--prearm-module`
-input(s) retained; Detailed-subset offset activation follows in a later
-packet".
+at startup, attaches their proved offsets through the inventory lane, and
+reports one interval row per input in the top-level `prearm[]` section
+(path, file identity, `mapped`, `watch`, `attached_at_ns`,
+`unobserved_windows`); a never-mapped input carries a bounded watch that
+ends at scope end. See the [inventory v1 schema](schema/inventory-v1.md).
 
 ### Attaching to an existing Kubernetes pod
 

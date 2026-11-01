@@ -27,7 +27,7 @@ use crate::discovery::caller_registry::{
     ExeIdentity, ImageAuthority, JointPublicationPending, MappingState, ModuleId, ModuleLifecycle,
     ModuleRecord, ProcessSource, SEMANTIC_UNKNOWN, UnknownReason, UseCoverage,
 };
-use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
+use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, PrearmReportRow};
 use crate::render::escape_controls;
 use crate::semantics_edge::resources::SemanticResourceSnapshot;
 use crate::semantics_edge::{EdgeEvidence, EdgeSemantics, S1Occupancy};
@@ -541,6 +541,10 @@ pub(crate) struct Presentation {
     /// immutable observation JSON, JSONL and the dashboard share.
     /// Unavailable until Joint evidence exists; S1 never waits for it.
     pub object_observations: crate::key_operation_projection::ObjectObservations,
+    /// One assembled row per `--prearm-module` input, in flag order;
+    /// empty without the flag. Pass views show live watches, the final
+    /// view terminal ones — no special-casing.
+    pub prearm: Vec<PrearmReportRow>,
 }
 
 /// What an edge's activity label answers (Choice 3).
@@ -866,6 +870,7 @@ impl Presentation {
             // before (production holds no receipts, seals or
             // projections).
             object_observations: coordinator.registry().joint_observations(passes),
+            prearm: coordinator.prearm_rows(),
             budgets: BudgetView {
                 callers_limit: limits.max_callers,
                 callers_occupied: coordinator.adapter().len(),

@@ -16,8 +16,9 @@ compares them both ways against tests/ignored-tests.json:
   resolves to no owned entry fails;
 - a `privileged` or `live-kernel` entry outside tests/ whose test is
   not curated in scripts/run-privileged-lib-tests.sh fails. A
-  `performance`/`helper` lib entry whose source #[ignore] reason carries
-  a `privileged:`/`root:` marker fails too: the marker declares a
+  `performance`/`helper` lib entry whose source #[ignore] reason starts
+  (after leading whitespace) with a `privileged:`/`root:` marker fails
+  too: the marker declares a
   privileged test, so the row must be curated as privileged instead of
   hiding in a curation-free cell. Macro-defined
   sites (path ending in `!`) expand to their `name!(test, ...)`
@@ -588,7 +589,7 @@ def check(root=ROOT, inventory=None, runner=None):
         if entry["cell"] not in LIB_CELLS:
             _line, _macro, reason = matches[0]
             marker = next((mark for mark in PRIVILEGED_REASON_MARKERS
-                           if reason.startswith(mark)), None)
+                           if reason.strip().startswith(mark)), None)
             if marker is not None:
                 failures.append(
                     f"FAIL {where}: {entry['cell']} {entry['path']} carries "

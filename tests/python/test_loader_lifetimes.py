@@ -704,6 +704,10 @@ class L4ReceiptTests(unittest.TestCase):
                          (1, False, "failed"))
         with self.assertRaises(ORACLE.Blocked):
             self.judge_report("g16", 300, {})
+        # A partial container (other counters missing too) is a missing
+        # seam, not a broken producer: it stays BLOCKED.
+        with self.assertRaises(ORACLE.Blocked):
+            self.judge_report("g16", 300, {"loader_transitions": {"arms": 300}})
 
     def test_l4_tickets_never_crossed_is_fail(self):
         l4 = self.with_receipt(

@@ -496,8 +496,10 @@ class IgnoredTestsTests(unittest.TestCase):
     def test_privileged_marked_reason_in_a_curation_free_cell_fails(self):
         # A `privileged:`/`root:` #[ignore] reason filed as performance or
         # helper hides a privileged test from runner curation: the checker
-        # must refuse it, naming the marker and the test.
-        for marker in ("privileged: needs root", "root: needs mounts"):
+        # must refuse it, naming the marker and the test. Leading
+        # whitespace before the marker must not hide it.
+        for marker in ("privileged: needs root", "root: needs mounts",
+                       " privileged: needs root"):
             for cell in ("performance", "helper"):
                 with self.subTest(marker=marker, cell=cell):
                     sources = {

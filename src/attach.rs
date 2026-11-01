@@ -12047,7 +12047,185 @@ mod tests {
             ("OWNER_CTL", false),
             ("ROOT_CTL", false),
         ];
-        validate_identity_inventory(gate1.into_iter()).unwrap();
+        validate_identity_inventory(gate1.into_iter(), true).unwrap();
+    }
+
+    #[test]
+    fn gate0_inventory_refuses_gate1_task_storage() {
+        // The same bank-B map is refused in a gate-0 inventory: a gate-0
+        // build must never silently accept gate-1 bytes.
+        let gate1 = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("TASK_COOKIE_B", true),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        let error = validate_identity_inventory(gate1.into_iter(), false).unwrap_err();
+        assert!(
+            error.to_string().contains("TASK_COOKIE_B"),
+            "the refusal must name the map: {error:?}"
+        );
+    }
+
+    #[test]
+    fn gate_inventory_refuses_missing_gate1_task_storage() {
+        // A gate-1 build refuses an object without its required bank map.
+        let no_bank = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        assert!(validate_identity_inventory(no_bank.into_iter(), true).is_err());
+    }
+
+    #[test]
+    fn gate_inventory_refuses_wrong_variant_gate1_task_storage() {
+        // Bank task storage must be an Unsupported map, like its twin.
+        let wrong_variant = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("TASK_COOKIE_B", false),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        let error =
+            validate_identity_inventory(wrong_variant.into_iter(), true).unwrap_err();
+        assert!(
+            error.to_string().contains("TASK_COOKIE_B"),
+            "the refusal must name the map: {error:?}"
+        );
+    }
+
+    #[test]
+    fn gate_identity_table_names_exactly_the_gate1_maps() {
+        // The preflight pins every map a gate-1 Detailed object adds: no
+        // more, no fewer. Membership only; prepare order is unconstrained.
+        let mut names: Vec<&str> = super::GATE_IDENTITY_MAPS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "COOKIE_CTL_B",
+                "IMAGE_BANK_SELECT",
+                "LOADER_GATE",
+                "LOADER_GATE_CTL",
+                "TASK_COOKIE_B",
+            ]
+        );
+    }
+
+    #[test]
+    fn gate_identity_metadata_checks_every_tuple_field() {
+        // Wrong metadata on any gate-1 map refuses, field by field.
+        for (name, expected) in super::GATE_IDENTITY_MAPS {
+            compare_map_metadata(name, expected, expected).unwrap();
+            for actual in [
+                ExactMapMetadata {
+                    map_type: MapType::Hash,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    key_size: expected.key_size + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    value_size: expected.value_size + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    max_entries: expected.max_entries + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    flags: expected.flags ^ 1,
+                    ..expected
+                },
+            ] {
+                assert!(
+                    compare_map_metadata(name, actual, expected).is_err(),
+                    "{name}: {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate_identity_metadata_matches_embedded_gate_object() {
+        // The build flavor and the embedded Detailed bytes agree: gate-1
+        // carries all five maps with exact metadata, gate-0 carries none.
+        let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        if super::LOADER_GATE_BUILD {
+            for (name, expected) in super::GATE_IDENTITY_MAPS {
+                let actual = detailed
+                    .maps
+                    .get(name)
+                    .unwrap_or_else(|| panic!("{name} missing from the gate-1 object"));
+                assert_eq!(actual.map_type(), expected.map_type as u32, "{name} type");
+                assert_eq!(actual.key_size(), expected.key_size, "{name} key");
+                assert_eq!(actual.value_size(), expected.value_size, "{name} value");
+                assert_eq!(
+                    actual.max_entries(),
+                    expected.max_entries,
+                    "{name} entries"
+                );
+                assert_eq!(actual.map_flags(), expected.flags, "{name} flags");
+            }
+        } else {
+            for (name, _) in super::GATE_IDENTITY_MAPS {
+                assert!(
+                    detailed.maps.get(name).is_none(),
+                    "{name} must be absent from the gate-0 object"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate_maps_are_absent_from_inventory_objects() {
+        // The gate wires Detailed only; inventory objects never carry it.
+        for bytes in [
+            crate::EBPF_INVENTORY_OBJECT,
+            crate::EBPF_INVENTORY_CALLERS_OBJECT,
+        ] {
+            let inventory = aya_obj::Object::parse(bytes).unwrap();
+            for (name, _) in super::GATE_IDENTITY_MAPS {
+                assert!(
+                    inventory.maps.get(name).is_none(),
+                    "{name} must be absent from inventory objects"
+                );
+            }
+        }
+    }
+
+    #[cfg(p11scope_counter_objects)]
+    #[test]
+    fn gate_maps_are_absent_from_counter_objects() {
+        // Counter flavors compile without the gate define; their objects
+        // stay gate-free in every flavor of this build.
+        for bytes in [
+            crate::EBPF_COUNTER_COUNTS_OBJECT,
+            crate::EBPF_COUNTER_TIMESTAMPS_OBJECT,
+            crate::EBPF_COUNTER_LATENCY_OBJECT,
+        ] {
+            let counter = aya_obj::Object::parse(bytes).unwrap();
+            for (name, _) in super::GATE_IDENTITY_MAPS {
+                assert!(
+                    counter.maps.get(name).is_none(),
+                    "{name} must be absent from counter objects"
+                );
+            }
+        }
     }
 
     #[test]

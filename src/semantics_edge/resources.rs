@@ -50,8 +50,10 @@ const _: () = {
     assert!(std::mem::size_of::<super::OpMachine>() == 64);
     assert!(std::mem::size_of::<super::EdgeMechStat>() == 104);
     // Final lease-bearing layouts, rather than the earlier probe types.
-    assert!(std::mem::size_of::<super::PendingCall>() == 144);
-    assert!(std::mem::size_of::<super::AsyncId>() == 160);
+    // Each record carries its originating H0 position (`Option<u64>`
+    // has no niche: +16 over the pre-position layout).
+    assert!(std::mem::size_of::<super::PendingCall>() == 160);
+    assert!(std::mem::size_of::<super::AsyncId>() == 176);
     assert!(std::mem::size_of::<ResourceLease>() == 16);
     assert!(std::mem::align_of::<crate::inventory_semantics::SemanticProviderTarget>() <= 8);
     assert!(std::mem::size_of::<crate::inventory_semantics::SemanticProviderTarget>() <= 1024);

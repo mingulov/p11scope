@@ -90,6 +90,19 @@ impl SessionHandle {
     }
 }
 
+/// A PKCS#11 3.2 async id word: the `C_AsyncJoin` argument scalar or
+/// the `C_AsyncGetID` output scalar. Internal correlation key only;
+/// never rendered, never serialized.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct AsyncValue(u64);
+redacted_debug!(AsyncValue);
+
+impl From<u64> for AsyncValue {
+    fn from(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 /// Exact outer semantic domain: caller incarnation, process image, native
 /// source (image-domain tag), proven load instance and initialization era.
 ///
@@ -1300,5 +1313,34 @@ impl ObjectSemantics {
     /// O(1) global upper bound, sampled before journal conversion mutates it.
     pub(in crate::semantics_objects) fn replay_pending_count(&self) -> usize {
         self.state.replay_pending_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AsyncValue;
+
+    // Async ids are private correlation keys: Debug names the type
+    // but never renders the raw value, in any base.
+    #[test]
+    fn async_value_debug_redacts_raw_value() {
+        let raw = 0x1234_5678_9abc_def0u64;
+        let rendered = format!("{:?}", AsyncValue::from(raw));
+        assert!(
+            !rendered.contains(&raw.to_string()),
+            "decimal raw value must never render: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{raw:x}")),
+            "lower-hex raw value must never render: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{raw:X}")),
+            "upper-hex raw value must never render: {rendered}"
+        );
+        assert!(
+            rendered.contains("AsyncValue"),
+            "Debug still names the type: {rendered}"
+        );
     }
 }

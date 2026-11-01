@@ -396,6 +396,11 @@ struct CallOrigin {
 struct PendingCall {
     call: SemanticCall,
     origin: CallOrigin,
+    /// Originating H0 admission position for Joint-replayed
+    /// originals; `None` for S1Only or unassociated starts. The
+    /// Activation compares this to the redeemed origin's position:
+    /// same origin means equal positions.
+    origin_pos: Option<u64>,
     sequence: u64,
     // Payload fields precede the move-only owner: refund after destruction.
     resource: Option<ResourceLease>,
@@ -411,8 +416,20 @@ struct AsyncId {
     owner: Option<u64>,
     call: SemanticCall,
     origin: CallOrigin,
+    /// The pending record's H0 position, carried over at the GetID
+    /// mint — never re-snapshotted, like `origin`.
+    origin_pos: Option<u64>,
     sequence: u64,
     resource: Option<ResourceLease>,
+}
+
+/// Same-origin check for an S1 async record against a redeemed
+/// origin (CP-3a groundwork): both sides must carry the origin's H0
+/// position and they must be equal. An unknown (S1Only) side never
+/// confirms.
+#[cfg_attr(not(test), allow(dead_code))] // First production caller: the Activation's receipt gate.
+fn same_origin_position(stored: Option<u64>, redeemed: Option<u64>) -> bool {
+    matches!((stored, redeemed), (Some(a), Some(b)) if a == b)
 }
 
 /// First-wins PENDING routing (§3.5): preflight reserves exactly the
@@ -445,7 +462,7 @@ enum CompleteEligible {
     /// The unique pending (session, target) record.
     Pending((u64, u32)),
     /// The unique detached (slot, target, value) record.
-    Detached((u64, u32, u64)),
+    Detached((u64, u32, crate::semantics_objects::AsyncValue)),
 }
 
 /// One mechanism id's per-edge aggregates. The id stays verbatim
@@ -503,7 +520,7 @@ pub(crate) struct EdgeSemantics {
     /// and one module instance, so a second independent claimant
     /// cannot exist inside this map (successive incarnations live on
     /// different edges).
-    detached: BTreeMap<(u64, u32, u64), AsyncId>,
+    detached: BTreeMap<(u64, u32, crate::semantics_objects::AsyncValue), AsyncId>,
     sequence: u64,
     /// Next operation-machine generation (F2/H9): every machine and
     /// every direct operation takes a fresh value via checked
@@ -2021,7 +2038,11 @@ impl EdgeSemantics {
                 // refuses/orphans the second mint and counts
                 // ambiguity — it never overwrites the first origin,
                 // and the refused mint's pending stays intact.
-                let detached_key = (slot, call.target_function, call.async_value);
+                let detached_key = (
+                    slot,
+                    call.target_function,
+                    crate::semantics_objects::AsyncValue::from(call.async_value),
+                );
                 if self.detached.contains_key(&detached_key) {
                     self.orphans = self.orphans.saturating_add(1);
                     self.evidence.async_duplicates =
@@ -2041,6 +2062,7 @@ impl EdgeSemantics {
                         owner: Some(call.session),
                         call: pending.call,
                         origin: pending.origin,
+                        origin_pos: pending.origin_pos,
                         sequence,
                         resource: pending.resource,
                     },
@@ -2052,10 +2074,11 @@ impl EdgeSemantics {
                     self.orphans = self.orphans.saturating_add(1);
                     return;
                 };
-                match self
-                    .detached
-                    .get_mut(&(slot, call.target_function, call.async_value))
-                {
+                match self.detached.get_mut(&(
+                    slot,
+                    call.target_function,
+                    crate::semantics_objects::AsyncValue::from(call.async_value),
+                )) {
                     Some(id) => {
                         // A successful join assigns custody whole to
                         // the joining session.
@@ -2098,6 +2121,9 @@ impl EdgeSemantics {
             PendingCall {
                 call: call.clone(),
                 origin,
+                // No H0 channel yet: S1Only queueing stores no
+                // origin position. Joint replay will supply it.
+                origin_pos: None,
                 sequence,
                 resource,
             },
@@ -2934,6 +2960,53 @@ mod tests {
         bogus.async_value = 44;
         edge.observe(&bogus);
         assert_eq!(edge.orphans(), 2);
+    }
+
+    #[test]
+    fn same_origin_position_truth_table() {
+        // Same origin means equal carried positions; an unknown
+        // (S1Only) side never confirms.
+        assert!(same_origin_position(Some(900), Some(900)));
+        assert!(!same_origin_position(Some(900), Some(901)));
+        assert!(!same_origin_position(Some(900), None));
+        assert!(!same_origin_position(None, Some(900)));
+        assert!(!same_origin_position(None, None));
+    }
+
+    #[test]
+    fn queued_pending_carries_no_origin_position() {
+        // S1Only queueing stores no origin position; Joint replay
+        // will supply it (Activation wires the channel).
+        let mut edge = EdgeSemantics::default();
+        let sign_id = crate::kinds::function_id("C_Sign").unwrap();
+        let mut pending = op("C_Sign", 7, 110);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        assert_eq!(edge.pending[&(7, sign_id)].origin_pos, None);
+    }
+
+    #[test]
+    fn get_id_carries_origin_position_to_detached() {
+        // A Joint-replayed original's H0 position rides with its
+        // record across the GetID mint, never re-snapshotted.
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&call("C_OpenSession", 7, CkRv::OK.0, 90));
+        let sign_id = crate::kinds::function_id("C_Sign").unwrap();
+        let mut pending = op("C_Sign", 7, 110);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        edge.pending
+            .get_mut(&(7, sign_id))
+            .expect("queued")
+            .origin_pos = Some(900);
+        let mut get_id = call("C_AsyncGetID", 7, CkRv::OK.0, 120);
+        get_id.target_function = sign_id;
+        get_id.async_value = 42;
+        edge.observe(&get_id);
+        assert_eq!(edge.detached.len(), 1);
+        let id = edge.detached.values().next().expect("detached");
+        assert_eq!(id.owner, Some(7));
+        assert_eq!(id.origin_pos, Some(900));
     }
 
     #[test]

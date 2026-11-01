@@ -14,19 +14,20 @@
 //! and no unapplied call can overlap them.
 
 use super::{
-    AffectedScope, AttributeList, Attribution, Birth, CallKey, CallToken, CompleteInputPrefix,
-    CompletedFact, CreationFamily, FieldState, FieldValue, FindResult, HandleInput, KeyLabel,
-    Lifetime, LostOutcome, METADATA_FIELDS, MechanismEvidence, MetadataView, ObjectDomain,
-    ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId, ObjectLimits, ObjectProjection,
-    ObjectView, OriginFact, OutputEvidence, QueryStatus, ResultSlot, SessionEnd, SessionHandle,
-    SessionIncarnation, SessionOrigin, SessionState, SessionView, SlotScope, StateEstimate,
-    StateUsage, ViewOrigin, field_index,
+    AffectedScope, AsyncValue, AttributeList, Attribution, Birth, CallKey, CallToken,
+    CompleteInputPrefix, CompletedFact, CreationFamily, FieldState, FieldValue, FindResult,
+    HandleInput, KeyLabel, KnownScope, Lifetime, LostOutcome, METADATA_FIELDS, MechanismEvidence,
+    MetadataView, ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId,
+    ObjectLimits, ObjectProjection, ObjectView, OriginFact, OutputEvidence, QueryStatus,
+    ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin, SessionState,
+    SessionView, SlotScope, StateEstimate, StateUsage, ViewOrigin, field_index,
 };
+use crate::semantics::{KNOWN_CANCEL_FLAGS, cancel_operation_mask, direct_cancel_flag};
 use p11scope_ebpf_common::object_policy::{
     DeriveResultProtocol, ObjectAction, SafeAttributeKind, authorized_result_pointer_args,
     derive_result_protocol, object_descriptor,
 };
-use p11scope_ebpf_common::{ARG_NONE, lifecycle, semantic_flags, transition};
+use p11scope_ebpf_common::{ARG_NONE, SlotSemantics, lifecycle, semantic_flags, transition};
 use pkcs11_types::CkRv;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
@@ -666,9 +667,11 @@ pub(super) struct ModelState {
     /// Live deferred origins by (origin session, target function):
     /// PENDING origins awaiting GetID or direct completion (6.07b).
     deferred_pending: BTreeMap<(SessionIncarnation, u32), DeferredOrigin>,
-    /// Detached deferred origins by (domain, target, value word):
-    /// GetID-minted custody awaiting Join or completion (6.07b).
-    deferred_detached: BTreeMap<(ObjectDomain, u32, u64), DetachedDeferred>,
+    /// Detached deferred origins by (domain, known scope, target,
+    /// value): GetID-minted custody awaiting Join or completion
+    /// (6.07b). The scope mirrors S1's slot dimension: the same id
+    /// on two known slots names two records.
+    deferred_detached: BTreeMap<(ObjectDomain, KnownScope, u32, AsyncValue), DetachedDeferred>,
     /// Mint order for oldest-first deferred eviction.
     deferred_sequence: u64,
     /// Origin tickets whose deferred records were consumed or
@@ -1718,6 +1721,7 @@ impl ModelState {
                 }
                 lifecycle::LOGOUT => self.apply_logout(call, outcome, session, effects),
                 lifecycle::FINALIZE => self.apply_finalize(call, outcome, effects, ledger),
+                lifecycle::SESSION_CANCEL => self.apply_cancel(outcome, session),
                 _ => {}
             },
             // Neutral terminals apply no object effect: ordering, overlap
@@ -2594,7 +2598,7 @@ impl ModelState {
             + self
                 .deferred_detached
                 .keys()
-                .filter(|(held, _, _)| *held == domain)
+                .filter(|(held, _, _, _)| *held == domain)
                 .count();
         if held < bound {
             return;
@@ -2691,7 +2695,7 @@ impl ModelState {
             self.deferred_pending.remove(&key);
             self.deferred_releases.push(ticket);
         }
-        let dead_detached: Vec<((ObjectDomain, u32, u64), u64)> = self
+        let dead_detached: Vec<((ObjectDomain, KnownScope, u32, AsyncValue), u64)> = self
             .deferred_detached
             .iter()
             .filter(|(_, detached)| detached.origin.session == Some(s))
@@ -2705,6 +2709,47 @@ impl ModelState {
             if detached.holder == Some(s) {
                 detached.holder = None;
             }
+        }
+    }
+
+    /// Cancel-selected disposal: the session's pending origins plus
+    /// the detached records it holds, for operations the (full)
+    /// cancel mask names. The per-record predicate mirrors S1's
+    /// (`descriptor.operations & mask`, `direct_cancel_flag`), so an
+    /// operation-less record survives on both trackers. Records the
+    /// session originated but no longer holds stay, like S1's
+    /// non-owned ids. Queued releases flush at the trailing disposal
+    /// return with ledger access.
+    fn dispose_cancelled_deferred(&mut self, s: SessionIncarnation) {
+        let mask = cancel_operation_mask(KNOWN_CANCEL_FLAGS);
+        let selected = |function: u32| {
+            let descriptor = pkcs11_module::function_name(function as usize)
+                .and_then(crate::kinds::descriptor)
+                .unwrap_or(SlotSemantics::COUNT_ONLY);
+            descriptor.operations & mask != 0
+                || direct_cancel_flag(descriptor.direct) & KNOWN_CANCEL_FLAGS != 0
+        };
+        let dead_pending: Vec<((SessionIncarnation, u32), u64)> = self
+            .deferred_pending
+            .iter()
+            .filter(|((session, function), _)| *session == s && selected(*function))
+            .map(|(key, record)| (*key, record.ticket.0))
+            .collect();
+        for (key, ticket) in dead_pending {
+            self.deferred_pending.remove(&key);
+            self.deferred_releases.push(ticket);
+        }
+        let dead_detached: Vec<((ObjectDomain, KnownScope, u32, AsyncValue), u64)> = self
+            .deferred_detached
+            .iter()
+            .filter(|(_, detached)| {
+                detached.holder == Some(s) && selected(detached.origin.function)
+            })
+            .map(|(key, detached)| (*key, detached.origin.ticket.0))
+            .collect();
+        for (key, ticket) in dead_detached {
+            self.deferred_detached.remove(&key);
+            self.deferred_releases.push(ticket);
         }
     }
 
@@ -3627,6 +3672,25 @@ impl ModelState {
         self.retire_scope(call.domain, scope, ObjectGap::LogoutUncertain, effects);
     }
 
+    /// `C_SessionCancel` OK ends the acting session's selected
+    /// deferred custody, mirroring S1's `clear_selected` pending and
+    /// detached retains. The model sees no flags word through sealed
+    /// facts, so every OK cancel selects all known operations: a full
+    /// cancel agrees exactly, while partial-mask precision and the
+    /// failed-cancel flag count await the flags channel. Only OK
+    /// clears — anything else, like S1, clears nothing. Silent like
+    /// every other deferred disposal; charges release at the trailing
+    /// flush.
+    fn apply_cancel(&mut self, outcome: Outcome, session: Option<SessionIncarnation>) {
+        if outcome != Outcome::Ok {
+            return;
+        }
+        let Some(s) = session else {
+            return;
+        };
+        self.dispose_cancelled_deferred(s);
+    }
+
     fn apply_finalize(
         &mut self,
         call: &PendingCall,
@@ -4089,10 +4153,10 @@ impl ModelState {
         let Some(record) = self.deferred_pending.get(&(session, target)).copied() else {
             return Err(DeferredRefusal::NoRecord);
         };
-        if self.session_scope(Some(session)) == SlotScope::Unknown {
+        let SlotScope::Known(scope) = self.session_scope(Some(session)) else {
             return Err(DeferredRefusal::UnknownSlot);
-        }
-        let key = (record.domain, target, value);
+        };
+        let key = (record.domain, scope, target, AsyncValue::from(value));
         if self.deferred_detached.contains_key(&key) {
             return Err(DeferredRefusal::Occupied);
         }
@@ -4115,8 +4179,11 @@ impl ModelState {
 
     /// Move whole detached custody to the joiner (Join transfer):
     /// origin, frozen inputs and position unchanged; the
-    /// shared-budget charge follows the origin ticket. Join acquires
-    /// no destination key; a missing record mutates nothing.
+    /// shared-budget charge follows the origin ticket. The record is
+    /// resolved under the joiner's own scope, mirroring S1's
+    /// slot-keyed Join; an unknown-scope joiner resolves nothing.
+    /// Join acquires no destination key; a missing record mutates
+    /// nothing.
     #[cfg_attr(not(test), allow(dead_code))] // First Q2 seal-path caller lands with journal P1.
     pub(super) fn join_deferred_holder(
         &mut self,
@@ -4125,7 +4192,13 @@ impl ModelState {
         value: u64,
         joiner: SessionIncarnation,
     ) -> bool {
-        match self.deferred_detached.get_mut(&(domain, target, value)) {
+        let SlotScope::Known(scope) = self.session_scope(Some(joiner)) else {
+            return false;
+        };
+        match self
+            .deferred_detached
+            .get_mut(&(domain, scope, target, AsyncValue::from(value)))
+        {
             Some(detached) => {
                 detached.holder = Some(joiner);
                 true
@@ -4331,7 +4404,10 @@ impl ModelState {
         let deferred_origins = self.deferred_pending.len()
             * size_of::<((SessionIncarnation, u32), DeferredOrigin)>()
             + self.deferred_detached.len()
-                * size_of::<((ObjectDomain, u32, u64), DetachedDeferred)>();
+                * size_of::<(
+                    (ObjectDomain, KnownScope, u32, AsyncValue),
+                    DetachedDeferred,
+                )>();
         let prune_lists: usize = self
             .domains
             .values()
@@ -4729,10 +4805,78 @@ mod tests {
             self.state.apply_end(token, &mut effects, ledger);
         }
 
+        /// Drive one C_SessionCancel END through begin+end replay
+        /// against a caller-held ledger, so cancel disposal runs on
+        /// the production end path with ledger access.
+        fn session_cancel_with_ledger(
+            &mut self,
+            session: HandleInput<SessionHandle>,
+            rv: u64,
+            ledger: &mut super::super::journal::StagingLedger,
+        ) {
+            self.next_key += 1;
+            self.next_token += 1;
+            let token = CallToken(self.next_token);
+            let call = PendingCall {
+                domain: self.domain,
+                key: CallKey::reference(self.next_key),
+                begin: 10,
+                entry_ns: 100,
+                function: crate::kinds::function_id("C_SessionCancel").expect("catalog function"),
+                kind: CallKind::Lifecycle(lifecycle::SESSION_CANCEL),
+                session,
+                inputs: [HandleInput::Absent, HandleInput::Absent],
+                requested: [None, None],
+                derive_protocol: DeriveResultProtocol::Unavailable,
+                entry_mechanism: MechClass::Value,
+                entry_output: OutputEvidence::NotCaptured,
+                scope: SlotScope::Unknown,
+                completion: Some(Completion {
+                    cut: 11,
+                    end_ns: 110,
+                    rv,
+                    return_mechanism: MechanismEvidence::NotCaptured,
+                    results: [ResultSlot::NotCaptured, ResultSlot::NotCaptured],
+                    session_out: HandleInput::Absent,
+                    found: FindResult::NotCaptured,
+                    attributes: None,
+                    malformed: false,
+                }),
+                fenced: false,
+                begin_applied: false,
+                end_applied: false,
+                snapshot: EMPTY_SNAPSHOT,
+            };
+            self.state.pending.insert(token, call);
+            self.state.apply_begin(token);
+            let mut effects = ObjectEffects::default();
+            self.state.apply_end(token, &mut effects, ledger);
+        }
+
         fn minted(effects: &ObjectEffects, token: CallToken) -> bool {
             effects
                 .effects
                 .contains(&ObjectEffect::DeferredMinted { call: token })
+        }
+
+        /// Current holder of one live detached record, by origin
+        /// ticket: key-shape independent.
+        fn detached_holder(&self, ticket: CallToken) -> Option<SessionIncarnation> {
+            self.state
+                .deferred_detached
+                .values()
+                .find(|detached| detached.origin.ticket == ticket)
+                .expect("detached record live")
+                .holder
+        }
+    }
+
+    /// The known scope value behind a reference scope, for detached
+    /// key literals.
+    fn known_scope(slot: u64, token_epoch: u64) -> KnownScope {
+        match SlotScope::reference_known(slot, token_epoch) {
+            SlotScope::Known(known) => known,
+            SlotScope::Unknown => unreachable!("reference scope is known"),
         }
     }
 
@@ -5270,7 +5414,7 @@ mod tests {
         let detached = fx
             .state
             .deferred_detached
-            .get(&(fx.domain, target, 42))
+            .get(&(fx.domain, known_scope(0, 0), target, AsyncValue::from(42)))
             .expect("record survives holder death");
         assert_eq!(detached.holder, None, "holder floats, still joinable");
         assert_eq!(detached.origin.ticket, token);
@@ -5399,7 +5543,8 @@ mod tests {
         fx.state
             .detach_deferred(fx.session, target, 42)
             .expect("A detaches");
-        let seq_a = fx.state.deferred_detached[&(fx.domain, target, 42)]
+        let seq_a = fx.state.deferred_detached
+            [&(fx.domain, known_scope(0, 0), target, AsyncValue::from(42))]
             .origin
             .sequence;
         let seq_b = fx.state.deferred_pending[&(session_b, target)].sequence;
@@ -5430,9 +5575,12 @@ mod tests {
             "model evicts B, the oldest still-pending record"
         );
         assert!(
-            fx.state
-                .deferred_detached
-                .contains_key(&(fx.domain, target, 42)),
+            fx.state.deferred_detached.contains_key(&(
+                fx.domain,
+                known_scope(0, 0),
+                target,
+                AsyncValue::from(42),
+            )),
             "model keeps the detached A"
         );
         assert_eq!(fx.state.gaps.get(&ObjectGap::PendingCapacity), Some(&1));
@@ -5873,7 +6021,10 @@ mod tests {
             .detach_deferred(fx.session, target, 42)
             .expect("A detaches");
         let pending_entry = size_of::<((SessionIncarnation, u32), DeferredOrigin)>();
-        let detached_entry = size_of::<((ObjectDomain, u32, u64), DetachedDeferred)>();
+        let detached_entry = size_of::<(
+            (ObjectDomain, KnownScope, u32, AsyncValue),
+            DetachedDeferred,
+        )>();
         let live = fx.state.estimate();
         assert_eq!(
             live.deferred_origins,
@@ -5916,7 +6067,8 @@ mod tests {
             )
             .expect("joiner session opens");
         assert!(fx.state.join_deferred_holder(fx.domain, target, 42, joiner));
-        let detached = fx.state.deferred_detached[&(fx.domain, target, 42)];
+        let detached = fx.state.deferred_detached
+            [&(fx.domain, known_scope(0, 0), target, AsyncValue::from(42))];
         assert_eq!(detached.holder, Some(joiner));
         assert_eq!(detached.origin.ticket, token);
         assert_eq!(detached.origin.session, Some(fx.session));
@@ -6004,7 +6156,8 @@ mod tests {
             "refused detach advances no sequence"
         );
         assert_eq!(
-            fx.state.deferred_detached[&(fx.domain, target, 42)]
+            fx.state.deferred_detached
+                [&(fx.domain, known_scope(0, 0), target, AsyncValue::from(42),)]
                 .origin
                 .ticket,
             first
@@ -6040,6 +6193,314 @@ mod tests {
             fx.state.deferred_sequence, sequence_before_unknown_slot,
             "refused detach advances no sequence"
         );
+    }
+
+    // Two known slots, the same target and the same id: each slot's
+    // detach succeeds (S1 keys detached ids by slot), and each
+    // record redeems once under its own origin ticket.
+    #[test]
+    fn deferred_detach_scopes_same_id_by_known_slot() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (first, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("first slot detaches");
+        let other = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(1, 0),
+            )
+            .expect("second session opens");
+        let (second, effects) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        assert!(
+            DeferredFixture::minted(&effects, second),
+            "second slot mints its own origin"
+        );
+        fx.state
+            .detach_deferred(other, target, 42)
+            .expect("second slot detaches the same id");
+        assert_eq!(
+            fx.state.deferred_detached.len(),
+            2,
+            "each scope holds its own record"
+        );
+        assert!(fx.state.redeem_deferred(first).is_some());
+        assert!(fx.state.redeem_deferred(second).is_some());
+    }
+
+    // Join resolves under the joiner's own scope: a foreign-scope or
+    // unknown-scope joiner moves nothing, while a same-scope joiner
+    // takes custody.
+    #[test]
+    fn deferred_join_resolves_under_joiner_scope() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (first, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("slot detaches");
+        let foreign = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(1, 0),
+            )
+            .expect("foreign-scope session opens");
+        assert!(
+            !fx.state
+                .join_deferred_holder(fx.domain, target, 42, foreign),
+            "a foreign-scope join moves nothing"
+        );
+        assert_eq!(fx.detached_holder(first), Some(fx.session));
+        let floating = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 2).unwrap(),
+                SessionOrigin::FirstObserved,
+                SlotScope::Unknown,
+            )
+            .expect("unknown-scope session opens");
+        assert!(
+            !fx.state
+                .join_deferred_holder(fx.domain, target, 42, floating),
+            "an unknown-scope join moves nothing"
+        );
+        assert_eq!(fx.detached_holder(first), Some(fx.session));
+        let joiner = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 3).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("same-scope session opens");
+        assert!(
+            fx.state.join_deferred_holder(fx.domain, target, 42, joiner),
+            "a same-scope join takes custody"
+        );
+        assert_eq!(fx.detached_holder(first), Some(joiner));
+    }
+
+    // Cancel → re-init → complete: a session cancel disposes the
+    // session's deferred records, so the re-init mints fresh and the
+    // completion redeems the new origin — the same record S1
+    // consumes. Without disposal the model would redeem the stale
+    // origin against the new completion.
+    #[test]
+    fn deferred_session_cancel_disposes_for_remint() {
+        use crate::semantics_edge::{EdgeSemantics, EffectOrigin, OperationEffect, SemanticCall};
+
+        // Model side: mint A, cancel, re-mint B, redeem B only.
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let mut ledger = super::super::journal::StagingLedger::new();
+        let session = HandleInput::Value(SessionHandle::new(DSESSION).unwrap());
+        let (token_a, effects_a) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        assert!(
+            DeferredFixture::minted(&effects_a, token_a),
+            "first origin mints"
+        );
+        fx.session_cancel_with_ledger(session, CkRv::OK.0, &mut ledger);
+        assert!(
+            !fx.state
+                .deferred_pending
+                .contains_key(&(fx.session, target)),
+            "cancel disposes the pending origin"
+        );
+        let (token_b, effects_b) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        assert!(
+            DeferredFixture::minted(&effects_b, token_b),
+            "re-init mints fresh after cancel"
+        );
+        assert_ne!(token_a, token_b);
+        assert_eq!(
+            fx.state.deferred_pending[&(fx.session, target)].ticket,
+            token_b,
+            "the live record is the re-minted origin"
+        );
+        assert!(fx.state.redeem_deferred(token_a).is_none());
+        assert!(fx.state.redeem_deferred(token_b).is_some());
+
+        // S1 side: the same script consumes the re-minted origin.
+        let mut edge = EdgeSemantics::default();
+        let mut pending_a = SemanticCall {
+            function: "C_SignInit".into(),
+            rv: CkRv::PENDING.0,
+            session: DSESSION,
+            ts_ns: 100,
+            ..SemanticCall::default()
+        };
+        edge.observe(&pending_a);
+        let cancel = SemanticCall {
+            function: "C_SessionCancel".into(),
+            rv: CkRv::OK.0,
+            session: DSESSION,
+            flags: crate::semantics::KNOWN_CANCEL_FLAGS,
+            ts_ns: 200,
+            ..SemanticCall::default()
+        };
+        edge.observe(&cancel);
+        pending_a.ts_ns = 300;
+        edge.observe(&pending_a);
+        let complete = SemanticCall {
+            function: "C_AsyncComplete".into(),
+            rv: CkRv::OK.0,
+            session: DSESSION,
+            target_function: target,
+            ts_ns: 400,
+            ..SemanticCall::default()
+        };
+        let origin = EffectOrigin {
+            function: "C_AsyncComplete".into(),
+            session: DSESSION,
+            ts_ns: 400,
+        };
+        let mut sink = Vec::new();
+        edge.observe_with_effects(&complete, &origin, &mut sink);
+        assert_eq!(sink.len(), 1, "the completion replays exactly one start");
+        match &sink[0] {
+            OperationEffect::Started {
+                origin, category, ..
+            } => {
+                assert_eq!(*category, "sign");
+                assert_eq!(
+                    origin.ts_ns, 300,
+                    "S1 consumes the re-minted origin, like the model"
+                );
+            }
+            other => panic!("expected the replayed start, got {other:?}"),
+        }
+    }
+
+    // Cancel disposal is selective: another session's origins, an
+    // operation-less origin (no cancel flag names it, on either
+    // tracker) and a failed cancel's target all survive.
+    #[test]
+    fn deferred_session_cancel_keeps_foreign_and_operation_less_origins() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let mut ledger = super::super::journal::StagingLedger::new();
+        let session = HandleInput::Value(SessionHandle::new(DSESSION).unwrap());
+        fx.state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("second session opens");
+        let other_handle = HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap());
+        let (token_a, effects_a) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        assert!(DeferredFixture::minted(&effects_a, token_a));
+        let (token_b, effects_b) =
+            fx.pending_access_with_ledger(other_handle, HandleInput::Absent, target, &mut ledger);
+        assert!(DeferredFixture::minted(&effects_b, token_b));
+        fx.session_cancel_with_ledger(session, CkRv::OK.0, &mut ledger);
+        assert!(
+            !fx.state
+                .deferred_pending
+                .contains_key(&(fx.session, target)),
+            "the cancelled session's origin is disposed"
+        );
+        assert!(
+            fx.state.redeem_deferred(token_b).is_some(),
+            "another session's origin survives the cancel"
+        );
+
+        // An operation-less origin survives even a full cancel.
+        let size_target = fx.target("C_GetObjectSize");
+        let (token_size, effects_size) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, size_target, &mut ledger);
+        assert!(
+            DeferredFixture::minted(&effects_size, token_size),
+            "operation-less origin mints"
+        );
+        fx.session_cancel_with_ledger(session, CkRv::OK.0, &mut ledger);
+        assert!(
+            fx.state.redeem_deferred(token_size).is_some(),
+            "no cancel flag names an operation-less origin"
+        );
+
+        // A failed cancel disposes nothing.
+        let (token_c, effects_c) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        assert!(DeferredFixture::minted(&effects_c, token_c));
+        fx.session_cancel_with_ledger(session, CkRv::GENERAL_ERROR.0, &mut ledger);
+        assert!(
+            fx.state.redeem_deferred(token_c).is_some(),
+            "a failed cancel disposes nothing"
+        );
+    }
+
+    // Detached disposal follows the holder, like S1: cancelling the
+    // holding session removes the record, while cancelling a
+    // non-holding origin session keeps it.
+    #[test]
+    fn deferred_session_cancel_disposes_by_holder() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let mut ledger = super::super::journal::StagingLedger::new();
+        let session = HandleInput::Value(SessionHandle::new(DSESSION).unwrap());
+        let joiner = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("joiner session opens");
+        let joiner_handle = HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap());
+
+        // Holder == origin: cancelling the session removes the record.
+        let (token_a, _) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("origin detaches");
+        fx.session_cancel_with_ledger(session, CkRv::OK.0, &mut ledger);
+        assert!(fx.state.deferred_detached.is_empty());
+        assert!(fx.state.redeem_deferred(token_a).is_none());
+
+        // Joined away: cancelling the origin keeps the holder's record.
+        let (token_b, _) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("re-detach succeeds after disposal");
+        assert!(
+            fx.state.join_deferred_holder(fx.domain, target, 42, joiner),
+            "same-scope join takes custody"
+        );
+        fx.session_cancel_with_ledger(session, CkRv::OK.0, &mut ledger);
+        assert_eq!(fx.state.deferred_detached.len(), 1);
+        assert_eq!(fx.detached_holder(token_b), Some(joiner));
+        fx.session_cancel_with_ledger(joiner_handle, CkRv::OK.0, &mut ledger);
+        assert!(fx.state.deferred_detached.is_empty());
+        assert!(fx.state.redeem_deferred(token_b).is_none());
     }
 
     // Mint-before-dispatch ordering: a destroy-PENDING freezes its

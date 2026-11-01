@@ -8511,3 +8511,109 @@ fn batch_without_disclosure_stays_quiet() {
     assert_eq!(batch.joined_across_global(), 0);
     assert!(batch.is_empty());
 }
+
+// The collected Stop union appends the stop report's disclosure
+// quadrant onto the accumulator's and maxes the count snapshots.
+#[test]
+fn stop_merge_appends_reload_disclosures_and_maxes_snapshots() {
+    use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+    use crate::semantic_capture::{
+        Invalidation, InvalidationScope, ReloadNotExcludedReport, TickOutcome, TickReport,
+    };
+    use p11scope_ebpf_common::ImageIdentity;
+
+    let conv = ConversionScene::new();
+    let domain = conv.detailed();
+    let disclosure = |cookie: u64, id: u64| ReloadNotExcludedReport {
+        label: RELOAD_NOT_EXCLUDED_LABEL,
+        image: ImageIdentity {
+            task_cookie: cookie,
+            exec_id: 7,
+        },
+        file_slot: 3,
+        ids: vec![InstanceId::from_raw(id)],
+    };
+    // The production accumulator holds its outcome capacity before
+    // the union; the scripted one reserves it explicitly.
+    let mut accumulated = TickReport::scripted(Vec::with_capacity(MAX_INSTANCES), Vec::new());
+    accumulated.reload_not_excluded.push(disclosure(0x51, 1));
+    accumulated.continued_across_global = 4;
+    accumulated.joined_across_global = 2;
+    let mut batch = SemanticBatch::from_tick_report(domain, accumulated, Vec::new(), 100)
+        .expect("the accumulator respects lane bounds");
+    let mut stop = TickReport::scripted(
+        vec![TickOutcome::Invalidation(Invalidation::scripted(
+            domain,
+            InvalidationScope::CoverageFailed,
+            None,
+        ))],
+        Vec::new(),
+    );
+    stop.reload_not_excluded.push(disclosure(0x52, 2));
+    stop.continued_across_global = 6;
+    stop.joined_across_global = 1;
+    batch
+        .merge_collected_stop(&mut stop)
+        .expect("a bounded stop union merges");
+    assert_eq!(batch.reload_not_excluded().len(), 2);
+    assert_eq!(batch.continued_across_global(), 6);
+    assert_eq!(batch.joined_across_global(), 2);
+    assert!(
+        stop.reload_not_excluded.is_empty(),
+        "the union takes the stop quadrant"
+    );
+}
+
+// The Stop union refuses an over-bound disclosure total instead of
+// staging past the batch cap both sides met alone. Refusal leaves
+// both sides untouched: nothing is lost, the stop simply cannot
+// merge.
+#[test]
+fn stop_merge_refuses_overbound_reload_disclosures() {
+    use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+    use crate::semantic_capture::{
+        Invalidation, InvalidationScope, ReloadNotExcludedReport, TickOutcome, TickReport,
+    };
+    use p11scope_ebpf_common::ImageIdentity;
+
+    let conv = ConversionScene::new();
+    let domain = conv.detailed();
+    let disclosure = |cookie: u64| ReloadNotExcludedReport {
+        label: RELOAD_NOT_EXCLUDED_LABEL,
+        image: ImageIdentity {
+            task_cookie: cookie,
+            exec_id: 7,
+        },
+        file_slot: 3,
+        ids: vec![InstanceId::from_raw(cookie + 1)],
+    };
+    // The production accumulator holds its outcome capacity before
+    // the union; the scripted one reserves it explicitly.
+    let mut accumulated = TickReport::scripted(Vec::with_capacity(MAX_INSTANCES), Vec::new());
+    accumulated.reload_not_excluded = (0..MAX_INSTANCES as u64).map(disclosure).collect();
+    let mut batch = SemanticBatch::from_tick_report(domain, accumulated, Vec::new(), 100)
+        .expect("a full accumulator respects lane bounds");
+    let mut stop = TickReport::scripted(
+        vec![TickOutcome::Invalidation(Invalidation::scripted(
+            domain,
+            InvalidationScope::CoverageFailed,
+            None,
+        ))],
+        Vec::new(),
+    );
+    stop.reload_not_excluded.push(disclosure(10_000));
+    assert_eq!(
+        batch.merge_collected_stop(&mut stop),
+        Err(SemanticRefusal::ProviderStorage)
+    );
+    assert_eq!(
+        batch.reload_not_excluded().len(),
+        MAX_INSTANCES,
+        "refusal leaves the original untouched"
+    );
+    assert_eq!(
+        stop.reload_not_excluded.len(),
+        1,
+        "refusal leaves the incoming report untouched"
+    );
+}

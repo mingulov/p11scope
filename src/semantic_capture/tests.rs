@@ -417,6 +417,56 @@ mod current_receipts_tests {
     }
 
     #[test]
+    fn refresh_disclosure_quadrant_survives_stash_roundtrip_into_batch() {
+        use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+        use crate::inventory_semantics::{
+            RefreshReceiptStash, SemanticBatch, merge_stash_into_report, stash_refresh_report,
+        };
+
+        // A refresh scan that discloses: router identities drain once,
+        // so the stash must take the quadrant beside the receipts and
+        // outcomes instead of dropping it.
+        let mut refresh = TickReport::default();
+        refresh.reload_not_excluded.push(ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: 0x51,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(1)],
+        });
+        refresh.continued_across_global = 4;
+        refresh.joined_across_global = 2;
+        let mut stash = RefreshReceiptStash::new();
+        let (_, shed) = stash_refresh_report(&mut stash, &mut refresh);
+        assert_eq!(shed, 0);
+        assert!(
+            refresh.reload_not_excluded.is_empty(),
+            "the stash takes the drained quadrant"
+        );
+        let mut tick = TickReport::default();
+        assert_eq!(merge_stash_into_report(&mut stash, &mut tick), 0);
+        assert_eq!(
+            tick.reload_not_excluded.len(),
+            1,
+            "the stashed disclosure must reach the tick batch"
+        );
+        assert_eq!(tick.reload_not_excluded[0].file_slot, 3);
+        assert_eq!(
+            tick.reload_not_excluded[0].ids,
+            vec![InstanceId::from_raw(1)]
+        );
+        assert_eq!(tick.continued_across_global, 4);
+        assert_eq!(tick.joined_across_global, 2);
+        let batch = SemanticBatch::from_tick_report(NativeDomainId::mint(), tick, Vec::new(), 100)
+            .expect("the merged quadrant respects lane bounds");
+        assert_eq!(batch.reload_not_excluded().len(), 1);
+        assert_eq!(batch.continued_across_global(), 4);
+        assert_eq!(batch.joined_across_global(), 2);
+    }
+
+    #[test]
     fn drained_receipt_expires_inside_quiescence_wait_but_validates_promptly() {
         let mut io = ScriptIo::new(NativeDomainId::mint());
         let mut capture = capture(&io);
@@ -6951,6 +7001,87 @@ mod b17_wire_projection {
         assert!(
             value.get("instance_reload_not_excluded").is_none(),
             "absent, never zero: {value}"
+        );
+    }
+
+    // Backpressure drops keep their disclosures: two disclosure
+    // batches staged without an intervening finalize both project,
+    // with maxed count snapshots.
+    #[test]
+    fn backpressure_stages_keep_both_disclosure_quadrants() {
+        use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        let report = |cookie: u64, id: u64, continued: u64, joined: u64| {
+            let mut report = TickReport::default();
+            report.reload_not_excluded.push(ReloadNotExcludedReport {
+                label: RELOAD_NOT_EXCLUDED_LABEL,
+                image: ImageIdentity {
+                    task_cookie: cookie,
+                    exec_id: 7,
+                },
+                file_slot: 3,
+                ids: vec![InstanceId::from_raw(id)],
+            });
+            report.continued_across_global = continued;
+            report.joined_across_global = joined;
+            report
+        };
+        for disclosed in [report(0x51, 1, 4, 2), report(0x52, 2, 6, 1)] {
+            let batch =
+                SemanticBatch::from_tick_report(lane.domain(), disclosed, Vec::new(), 130).unwrap();
+            coordinator.stage_semantic_batch(batch);
+        }
+        let projected = coordinator
+            .reload_not_excluded_evidence()
+            .expect("both staged quadrants project");
+        assert_eq!(projected.identities.len(), 2);
+        assert_eq!(projected.continued_across_global, 6);
+        assert_eq!(projected.joined_across_global, 2);
+    }
+
+    // The namespace ledger caps distinct disclosed identities at the
+    // batch bound: the 4097th new identity sheds with a named gap
+    // while the count snapshots stay exact.
+    #[test]
+    fn ledger_caps_reload_identities_and_names_shed() {
+        use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        let disclosure = |cookie: u64| ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(cookie + 1)],
+        };
+        let mut full = TickReport::default();
+        full.reload_not_excluded = (0..MAX_INSTANCES as u64).map(disclosure).collect();
+        full.continued_across_global = 4;
+        full.joined_across_global = 2;
+        commit(&mut coordinator, &mut lane, full);
+        let mut overflow = TickReport::default();
+        overflow.reload_not_excluded = vec![disclosure(10_000)];
+        overflow.continued_across_global = 9;
+        overflow.joined_across_global = 3;
+        let batch =
+            SemanticBatch::from_tick_report(lane.domain(), overflow, Vec::new(), 130).unwrap();
+        coordinator.stage_semantic_batch(batch);
+        let projected = coordinator
+            .reload_not_excluded_evidence()
+            .expect("the capped ledger still projects");
+        assert_eq!(projected.identities.len(), MAX_INSTANCES);
+        assert_eq!(projected.continued_across_global, 9);
+        assert_eq!(projected.joined_across_global, 3);
+        let gaps = coordinator.registry().staged_scope_gaps_for_test();
+        assert!(
+            gaps.iter()
+                .any(|(subject, _)| subject == "reload disclosure identities shed"),
+            "the shed identity must be a named gap: {gaps:?}"
         );
     }
 }

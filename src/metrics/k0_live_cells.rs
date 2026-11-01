@@ -11,10 +11,12 @@
 //!
 //! Gate discipline (no sleeps on the critical path): every phase the
 //! test drives waits on a workload line (`READY`, `WATCH_READY`,
-//! `DONE`) or an observer line (a `C_Sign` row proves attach plus
-//! discovery plus the pre-loop selection read), each under an outer
-//! deadline that fails loudly. `--hold` keeps the watched pid mapped
-//! through close so no leader exit voids the window.
+//! `DONE`) or the observer's `capturing` readiness line (it proves
+//! attach plus discovery plus the pre-loop selection read; live
+//! frames are TTY-only, so a function row never lands in the log),
+//! each under an outer deadline that fails loudly. `--hold` keeps
+//! the watched pid mapped through close so no leader exit voids the
+//! window.
 
 use anyhow::{Context as _, Result, ensure};
 use std::path::{Path, PathBuf};
@@ -204,6 +206,7 @@ impl K0Workload {
                 gate.to_str().context("gate path")?,
                 "--chain",
                 &format!("leader:{}", self.ledger.display()),
+                "--ledger-singletons",
                 "--c8-gate-prefix",
                 gates.to_str().context("gates path")?,
                 "--c8-gated-images",
@@ -403,10 +406,13 @@ fn observer_evidence(log: &Path, report: &Path, status: &str) -> String {
     )
 }
 
-/// Wait for the observer's first row naming `needle`: attach plus
-/// discovery plus the pre-loop selection read all precede the first
-/// frame, so opening the workload gate here keeps every main-phase
-/// call strictly inside the K0 window.
+/// The observer readiness line the cells gate on: attach plus
+/// discovery plus the pre-loop selection read all precede it, so
+/// opening the workload gate here keeps every main-phase call
+/// strictly inside the K0 window.
+const CAPTURE_READY_NEEDLE: &str = "p11scope: capturing: ";
+
+/// Wait for the observer line containing `needle`.
 fn wait_for_observer_row(
     observer_out: &Path,
     needle: &str,
@@ -463,6 +469,37 @@ fn wait_for_observer_stop(
     }
 }
 
+/// Require a nonzero probe count on the capture line: a zero-probe
+/// capture observes nothing, so passing it on would fail downstream
+/// instead of at the cause.
+fn require_attached_probes(log: &Path, report: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix(CAPTURE_READY_NEEDLE) else {
+            continue;
+        };
+        let count = rest
+            .split_whitespace()
+            .next()
+            .and_then(|first| first.parse::<usize>().ok());
+        match count {
+            Some(probes) => {
+                ensure!(
+                    probes > 0,
+                    "the observer attached no probes: {}",
+                    observer_evidence(log, report, "capture line shows 0 probes")
+                );
+                return Ok(());
+            }
+            None => break,
+        }
+    }
+    anyhow::bail!(
+        "the observer showed no readable capture line: {}",
+        observer_evidence(log, report, "capture line missing")
+    )
+}
+
 /// Keep the workload directory on failure so the printed report path
 /// stays readable; on success the directory drops as before.
 fn keep_workload_on_failure(workload: K0Workload, outcome: Result<()>, tag: &str) -> Result<()> {
@@ -505,7 +542,7 @@ fn spawn_observer(
 }
 
 #[test]
-#[ignore = "privileged K0 cell (Fedora, root): profile --select-endpoint counts on a real SoftHSM workload with an exact ledger-known C_Sign count"]
+#[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): profile --select-endpoint counts on a real SoftHSM workload with an exact ledger-known C_Sign count"]
 fn k0_live_detail_matches_ledger_counts_lp64() -> Result<()> {
     let module = softhsm_path()?;
     let observer = observer_binary()?;
@@ -525,7 +562,14 @@ fn k0_detail_inner(workload: &K0Workload, module: &str, observer: &Path) -> Resu
     target.wait_for("READY ", Duration::from_secs(60))?;
     let pid = target.child.id();
     let mut child = spawn_observer(&observer, pid, 60, &out, &log)?;
-    wait_for_observer_row(&log, "C_Sign", &mut child, &out, Duration::from_secs(120))?;
+    wait_for_observer_row(
+        &log,
+        CAPTURE_READY_NEEDLE,
+        &mut child,
+        &out,
+        Duration::from_secs(120),
+    )?;
+    require_attached_probes(&log, &out)?;
     std::fs::write(&gate, b"open\n")?;
     target.wait_for("DONE ", Duration::from_secs(60))?;
     // The held pid stays mapped while the observer closes on its own
@@ -577,7 +621,7 @@ fn k0_detail_inner(workload: &K0Workload, module: &str, observer: &Path) -> Resu
 }
 
 #[test]
-#[ignore = "privileged K0 cell (Fedora, root): profile --select-endpoint counts voids as caller-changed when the SoftHSM workload execs mid-window"]
+#[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): profile --select-endpoint counts voids as caller-changed when the SoftHSM workload execs mid-window"]
 fn k0_live_exec_voids_detail_counts_lp64() -> Result<()> {
     let module = softhsm_path()?;
     let observer = observer_binary()?;
@@ -605,7 +649,14 @@ fn k0_exec_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result
     target.wait_for("READY ", Duration::from_secs(60))?;
     let pid = target.child.id();
     let mut child = spawn_observer(&observer, pid, 150, &out, &log)?;
-    wait_for_observer_row(&log, "C_Sign", &mut child, &out, Duration::from_secs(120))?;
+    wait_for_observer_row(
+        &log,
+        CAPTURE_READY_NEEDLE,
+        &mut child,
+        &out,
+        Duration::from_secs(120),
+    )?;
+    require_attached_probes(&log, &out)?;
     std::fs::write(&gate, b"open\n")?;
     target.wait_for_line(&["DONE", "gen=0"], "gen0 done", Duration::from_secs(60))?;
     std::fs::write(c8_gate(&gates, 0, "next"), b"open\n")?;

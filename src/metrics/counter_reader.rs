@@ -4509,16 +4509,71 @@ mod tests {
         extra: Slot,
     }
 
-    fn engine_counter_fixture() -> EngineCounterFixture {
-        use sha2::Digest;
-        use std::io::Read;
-        use std::os::unix::fs::MetadataExt;
-        use std::path::PathBuf;
-        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
-        assert_eq!(
-            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
-            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+    /// Owned growth fixtures a cell compiles itself: the provider and
+    /// its dlopen/pthread driver from
+    /// `tests/fixtures/counter-bank-growth.c`. The tempdir outlives
+    /// the capture through the owning cell.
+    struct OwnedGrowthFixtures {
+        _dir: tempfile::TempDir,
+        provider: std::path::PathBuf,
+        workload: std::path::PathBuf,
+    }
+
+    /// Compile the owned growth fixtures with `cc`, as other cells
+    /// compile theirs: the provider shares the source with
+    /// `-DCOUNTER_BANK_GROWTH_PROVIDER`, the driver links
+    /// `-ldl -lpthread`.
+    fn build_owned_growth_fixtures() -> OwnedGrowthFixtures {
+        use std::process::Command;
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/counter-bank-growth.c");
+        assert!(source.is_file(), "growth fixture source is missing");
+        let dir = tempfile::tempdir().expect("fixture tempdir");
+        let provider = dir.path().join("provider.so");
+        let workload = dir.path().join("driver");
+        let output = Command::new("cc")
+            .args([
+                "-std=c11",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-fPIC",
+                "-shared",
+                "-DCOUNTER_BANK_GROWTH_PROVIDER",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&provider)
+            .output()
+            .expect("running cc for the growth provider");
+        assert!(
+            output.status.success(),
+            "growth provider build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
+        let output = Command::new("cc")
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&workload)
+            .args(["-ldl", "-lpthread"])
+            .output()
+            .expect("running cc for the growth driver");
+        assert!(
+            output.status.success(),
+            "growth driver build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        OwnedGrowthFixtures {
+            _dir: dir,
+            provider,
+            workload,
+        }
+    }
+
+    fn engine_counter_fixture() -> EngineCounterFixture {
+        use std::path::PathBuf;
         let provider = PathBuf::from(
             std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER")
                 .expect("prebuild counter-bank-growth.c with -DCOUNTER_BANK_GROWTH_PROVIDER"),
@@ -4527,7 +4582,25 @@ mod tests {
             std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD")
                 .expect("prebuild counter-bank-growth.c's LP64 dlopen/pthread driver"),
         );
-        let mut file = std::fs::File::open(&provider).unwrap();
+        engine_counter_fixture_from(&provider, &workload)
+    }
+
+    /// The Engine-driven counter fixture over explicit provider and
+    /// workload paths: the same pins, slots and driver the env-based
+    /// entry builds, for cells that compile their own fixtures.
+    fn engine_counter_fixture_from(
+        provider: &std::path::Path,
+        workload: &std::path::Path,
+    ) -> EngineCounterFixture {
+        use sha2::Digest;
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+        );
+        let mut file = std::fs::File::open(provider).unwrap();
         let elf = p11scope_manifest::elf::ElfSnapshot::read(&file).unwrap();
         assert_eq!(elf.abi(), p11scope_manifest::elf::ElfAbi::Lp64);
         let wanted: Vec<_> = (0..GROWTH_ENDPOINTS)
@@ -4560,7 +4633,7 @@ mod tests {
         file.read_to_end(&mut bytes).unwrap();
         let digest = p11scope_manifest::identity::hex(&sha2::Sha256::digest(&bytes));
         let pins =
-            crate::discovery::identity::test_fixture::real_scan_pin(&provider, None, 1, &digest);
+            crate::discovery::identity::test_fixture::real_scan_pin(provider, None, 1, &digest);
         let object = pins.pinned().next().unwrap().id;
         let selected = file.metadata().unwrap();
         let pinned = pins.file_for(object).unwrap().metadata().unwrap();
@@ -4584,9 +4657,9 @@ mod tests {
         let mut extra = slots[0].clone();
         extra.file_offset = extra_offset;
         extra.names = vec!["endpoint_body".into()];
-        let fixture = GrowthDriver::spawn(&workload, &provider);
+        let fixture = GrowthDriver::spawn(workload, provider);
         EngineCounterFixture {
-            provider,
+            provider: provider.to_path_buf(),
             digest,
             object,
             fixture,
@@ -5827,8 +5900,25 @@ mod tests {
     /// equals the workload ledger exactly, so selection adds no
     /// duplicate counts.
     fn counter_cli_capture_cell_with_selection(mode: CounterMode, select: Option<&str>) {
+        let parts = engine_counter_fixture();
+        counter_cli_capture_cell_with_selection_inner(mode, select, parts);
+    }
+
+    /// The CLI cell over owned `cc`-built fixtures instead of the
+    /// prebuilt env inputs: the same real path once the owned binaries
+    /// exist on disk (the tempdir outlives the capture).
+    fn counter_cli_capture_cell_with_selection_owned(mode: CounterMode, select: Option<&str>) {
+        let owned = build_owned_growth_fixtures();
+        let parts = engine_counter_fixture_from(&owned.provider, &owned.workload);
+        counter_cli_capture_cell_with_selection_inner(mode, select, parts);
+    }
+
+    fn counter_cli_capture_cell_with_selection_inner(
+        mode: CounterMode,
+        select: Option<&str>,
+        mut parts: EngineCounterFixture,
+    ) {
         const STAGED: usize = 512;
-        let mut parts = engine_counter_fixture();
         let first = parts.slots[..STAGED].to_vec();
         let offsets: Vec<u64> = first.iter().map(|slot| slot.file_offset).collect();
         let pid = parts.fixture.child.id();
@@ -6125,9 +6215,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: K0 profile --select-endpoint counts to -o JSON with live-plan resolution, exact workload-ledger aggregate and explicit zero-call detail"]
+    #[ignore = "requires cc-built owned LP64 growth fixtures and authorized native Multi staging as root: K0 profile --select-endpoint counts to -o JSON with live-plan resolution, exact workload-ledger aggregate and explicit zero-call detail"]
     fn selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64() {
-        counter_cli_capture_cell_with_selection(
+        counter_cli_capture_cell_with_selection_owned(
             CounterMode::Counts,
             Some("counter_bank_growth_e0007"),
         );

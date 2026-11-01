@@ -25,6 +25,17 @@ class TLSError(RuntimeError):
     """A flow server could not start."""
 
 
+class _HandshakeRefused(Exception):
+    """A classified handshake refusal (the outcome is already recorded).
+
+    Raised by the acceptor after ``note_handshake`` counted the
+    connection, so the ``_handle_request_noblock`` override can contain
+    it and keep serving. Refusals must never escape into
+    ``serve_forever`` (a ``ValueError`` there kills the acceptor thread
+    and every later assertion about the server's ground truth).
+    """
+
+
 #: First byte of a TLS handshake record: a ClientHello always opens one,
 #: so a peeked first byte distinguishes TLS speakers from garbage.
 TLS_HANDSHAKE_FIRST_BYTE = 0x16
@@ -156,9 +167,11 @@ class FlowServer:
     ``handshakes_ok`` (completed handshakes), ``client_certs_presented``
     (peer cert seen at handshake time, independent of requests),
     ``empty_certs`` (full handshake with an empty client certificate),
-    ``selection_stalls`` (peers that saw CertificateRequest and never
     finished: stuck at selection), ``client_cert_alerts``
-    (certificate_unknown refusals: tolerated, never a witness),
+    (certificate_unknown refusals: tolerated, never a witness on their
+    own), ``cert_refusals`` (certificate_unknown refusals on
+    connections that saw the server's outbound CertificateRequest: a
+    fail-fast selection refusal, and a PINBOUND witness),
     ``abandoned`` (peers that went away without selection information:
     EOF, reset, silence, an incomplete ClientHello, or a timeout before
     CertificateRequest such as HelloRetryRequest waiting for
@@ -181,6 +194,7 @@ class FlowServer:
     empty_certs: int = 0
     selection_stalls: int = 0
     client_cert_alerts: int = 0
+    cert_refusals: int = 0
     abandoned: int = 0
     handshake_failures: int = 0
     handshake_errors: list[str] = field(default_factory=list)
@@ -302,6 +316,15 @@ class FlowServer:
         class AcceptingServer(http.server.ThreadingHTTPServer):
             daemon_threads = True
 
+            def _handle_request_noblock(self):  # noqa: ANN202 - stdlib override
+                try:
+                    super()._handle_request_noblock()
+                except _HandshakeRefused:
+                    # A classified refusal: counted, connection closed,
+                    # nothing left to serve. Contained here so one bad
+                    # peer never kills the acceptor thread.
+                    pass
+
             def get_request(self):  # noqa: ANN202 - stdlib override
                 conn, client_address = super().get_request()
                 server.connections += 1
@@ -330,11 +353,11 @@ class FlowServer:
                     except OSError as exc:
                         server.note_handshake("abandoned", f"peek {type(exc).__name__}: {exc}"[:160])
                         conn.close()
-                        raise
+                        raise _HandshakeRefused(f"peek {type(exc).__name__}") from exc
                     if not chunk:
                         server.note_handshake("abandoned", "peer closed before sending bytes")
                         conn.close()
-                        raise ConnectionError("peer closed before sending TLS bytes")
+                        raise _HandshakeRefused("peer closed before sending TLS bytes")
                     if len(chunk) == len(buf):
                         time.sleep(0.02)  # no new bytes yet; avoid spinning
                         continue
@@ -347,16 +370,16 @@ class FlowServer:
                         "abandoned",
                         f"incomplete ClientHello: {len(buf)} bytes before the deadline")
                     conn.close()
-                    raise TimeoutError("TLS ClientHello never completed before the deadline")
+                    raise _HandshakeRefused("TLS ClientHello never completed before the deadline")
                 if status == "non_tls":
                     server.note_handshake("failure", f"non-TLS first byte {buf[0]:#04x}")
                     conn.close()
-                    raise ValueError(f"peer spoke non-TLS bytes: {bytes(buf[:5])!r}")
+                    raise _HandshakeRefused(f"peer spoke non-TLS bytes: {bytes(buf[:5])!r}")
                 server.spoke_tls += 1
                 if status == "not_hello":
                     server.note_handshake("failure", "TLS first record is not a ClientHello")
                     conn.close()
-                    raise ValueError("peer spoke TLS but not a ClientHello first")
+                    raise _HandshakeRefused("peer spoke TLS but not a ClientHello first")
                 server.client_hello_complete += 1
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -365,7 +388,7 @@ class FlowServer:
                     # began — no witness without that proof.
                     server.note_handshake("abandoned", "deadline exhausted before the wrap")
                     conn.close()
-                    raise TimeoutError("TLS handshake deadline exhausted after the ClientHello")
+                    raise _HandshakeRefused("TLS handshake deadline exhausted after the ClientHello")
                 conn.settimeout(remaining)
                 tls_progress.cert_request_seen = False
                 try:
@@ -375,15 +398,20 @@ class FlowServer:
                     # is a selection stall only when this connection
                     # observed its outbound CertificateRequest; without
                     # that (for example HRR waiting for ClientHello2) it
-                    # is pre-selection abandonment.
+                    # is pre-selection abandonment. A certificate_unknown
+                    # alert after CertificateRequest is likewise tied to
+                    # its connection: a fail-fast selection refusal.
                     cert_seen = bool(getattr(tls_progress, "cert_request_seen", False))
                     if cert_seen:
                         server.cert_requests_sent += 1
+                    outcome = classify_handshake_error(exc, cert_request_seen=cert_seen)
+                    if outcome == "cert_alert" and cert_seen:
+                        server.cert_refusals += 1
                     server.note_handshake(
-                        classify_handshake_error(exc, cert_request_seen=cert_seen),
-                        f"{type(exc).__name__}: {exc}"[:160])
+                        outcome, f"{type(exc).__name__}: {exc}"[:160])
                     conn.close()
-                    raise
+                    raise _HandshakeRefused(
+                        f"{type(exc).__name__}: {outcome}") from exc
                 if bool(getattr(tls_progress, "cert_request_seen", False)):
                     server.cert_requests_sent += 1
                 tls_conn.settimeout(None)

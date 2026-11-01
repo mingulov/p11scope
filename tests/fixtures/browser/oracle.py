@@ -363,9 +363,12 @@ def check_s1_sessions(report: dict[str, Any], opened_min: int = 0,
 
     The six counters must be present u64 values with
     balance == opened+inherited-closed (saturating, as rendered);
-    ``opened_min`` floors opened sessions for cells whose floored
-    calls need one (FindObjects cannot run without a session), and
-    ``zero`` requires all counters at zero for never-mapped cells.
+    ``opened_min`` floors sessions opened inside the capture window,
+    and ``zero`` requires all counters at zero for never-mapped cells.
+    A floored call needs a session, not an in-window open: attach-mode
+    cells observe enumeration on sessions the browser opened at
+    startup, strictly before capture, so they must leave ``opened_min``
+    at zero.
     """
     if "sessions" not in report:
         return ["sessions section missing: cannot verify S1 sessions"]

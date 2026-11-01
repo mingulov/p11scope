@@ -112,7 +112,8 @@ def _stall_outcomes(server) -> str:
         f"spoke={server.spoke_tls} hello={server.client_hello_complete} "
         f"certreq={cert_reqs} "
         f"empty={server.empty_certs} stalls={server.selection_stalls} "
-        f"alerts={server.client_cert_alerts} abandoned={server.abandoned} "
+        f"alerts={server.client_cert_alerts} refusals={server.cert_refusals} "
+        f"abandoned={server.abandoned} "
         f"failures={server.handshake_failures} errors={server.handshake_errors}")
 
 
@@ -195,9 +196,12 @@ class BrowserCells(unittest.TestCase):
         ``s1`` opts into the v0.5.0 S1 proof over the report's S1
         sections (no Joint content, no mechanism use, no logins,
         balanced sessions): a dict with ``sessions_opened_min`` for
-        cells whose floored calls need a session, or
-        ``sessions_zero`` for never-mapped cells. None (the twin
-        default) skips the S1 checks.
+        cells whose window must contain a session open, or
+        ``sessions_zero`` for never-mapped cells. Attach-drive cells
+        must not set ``sessions_opened_min``: the browser opens its
+        sessions at startup, strictly before capture, so floored calls
+        legitimately ride cached sessions. None (the twin default)
+        skips the S1 checks.
         """
         report = oracle.load_report(result.report_path)
         module_sha = oracle.sha256_of(store.lib)
@@ -247,18 +251,25 @@ class BrowserCells(unittest.TestCase):
     def assert_pinbound_stall(self, label, facts, server):
         """The CERT_REQUIRED flow stalled at the PIN boundary (P2-2).
 
-        Requires affirmative selection progress on the stalled
-        connection: a complete ClientHello plus a token-selection
-        witness — an empty certificate or a CertificateRequest-backed
-        stall — with no successful handshake, no presented cert, no
-        served request, no protocol failure, and a TLS-flow (not crashed
-        or never-launched) browser outcome. A stall counts only when the
-        same connection observed the server's outbound CertificateRequest
-        (a complete hello alone can yield HelloRetryRequest waiting for
-        ClientHello2, which is pre-selection). Client cert alerts and
-        abandoned transports are tolerated but never sufficient: alerts
-        are ambiguous (selection refusal vs server-cert rejection) and
-        abandons carry no selection information. A navigation timeout
+        Requires affirmative selection progress: a complete ClientHello
+        plus a token-selection witness — an empty certificate, a
+        CertificateRequest-backed stall, or a CertificateRequest-backed
+        refusal (the client answering the received CertificateRequest
+        with a fatal certificate_unknown alert) — with no successful
+        handshake, no presented cert, no served request, no protocol
+        failure, and a TLS-flow (not crashed or never-launched) browser
+        outcome. A stall or refusal counts only when the same connection
+        observed the server's outbound CertificateRequest (a complete
+        hello alone can yield HelloRetryRequest waiting for
+        ClientHello2, which is pre-selection). Bare alerts and abandoned
+        transports are tolerated but never sufficient: a bare alert is
+        ambiguous (selection refusal vs server-cert rejection) and an
+        abandon carries no selection information. The refusal leg is
+        unambiguous here: the cells run with ignored server-cert errors
+        (the paired plain cell loads the same certificate with HTTP 200,
+        and the no-token control yields an empty certificate instead),
+        so a fatal alert after the CertificateRequest flight refuses
+        selection, not the server certificate. A navigation timeout
         alone proves nothing about selection and is never a witness.
         """
         outcomes = _stall_outcomes(server)
@@ -279,11 +290,13 @@ class BrowserCells(unittest.TestCase):
                 getattr(server, "cert_requests_sent", 0), 1,
                 f"{label}: stall without outbound CertificateRequest "
                 f"(selection never began) [{outcomes}]")
-        witness = server.empty_certs + server.selection_stalls
+        witness = (server.empty_certs + server.selection_stalls
+                   + server.cert_refusals)
         self.assertGreaterEqual(
             witness, 1,
             f"{label}: no token-selection witness "
-            f"(need empty-cert or CertificateRequest-backed stall) [{outcomes}]")
+            f"(need empty-cert, CertificateRequest-backed stall, or "
+            f"CertificateRequest-backed refusal) [{outcomes}]")
         self.assertNotIn("flow_error", facts,
                          f"{label}: flow setup failed: {facts.get('flow_error')}")
         self.assertFalse(facts.get("loaded", True),
@@ -316,9 +329,13 @@ class BrowserCells(unittest.TestCase):
         self.assertTrue(result.flow.get("target_alive"), "browser target disappeared?!")
         self.assertTrue(result.flow.get("target_identity"), "browser target PID reused?!")
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
+        # No opened floor: Firefox opens its NSS token sessions at
+        # startup, strictly before the profiler can attach, so the
+        # window sees enumeration on cached sessions (C_OpenSession=0
+        # with C_FindObjects>0) and sessions.opened is legitimately 0.
         self.check_report(result, store, oracle.FF_STARTUP_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_FLOOR,
-                          s1={"sessions_opened_min": 1})
+                          s1={})
 
     @gate("chromium")
     def test_cr_plain_validates_without_private_token_use(self):
@@ -341,9 +358,12 @@ class BrowserCells(unittest.TestCase):
         self.assertTrue(result.flow.get("target_alive"), "browser target disappeared?!")
         self.assertTrue(result.flow.get("target_identity"), "browser target PID reused?!")
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
+        # No opened floor: Chromium opens its NSS token sessions at
+        # startup, strictly before the profiler can attach (same
+        # window argument as FF-STARTUP).
         self.check_report(result, store, oracle.CR_ENUMERATION_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT,
-                          s1={"sessions_opened_min": 1})
+                          s1={})
 
     @gate("firefox")
     def test_ff_nomod_observes_nothing(self):
@@ -414,9 +434,10 @@ class BrowserCells(unittest.TestCase):
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
         # Selection enumerates stably (x5 on every run) but the
         # interactive-PIN boundary holds: login and signing never happen.
+        # No opened floor (same window argument as FF-STARTUP).
         self.check_report(result, store, oracle.CR_ENUMERATION_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT,
-                          s1={"sessions_opened_min": 1})
+                          s1={})
 
     # -- Unprivileged counterexample twins (P2-2/P2-3; run everywhere) --
     #

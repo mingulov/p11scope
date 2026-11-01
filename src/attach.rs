@@ -25,7 +25,8 @@ use p11scope_ebpf_common::{
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
     EVIDENCE_ABI_REFUSALS, EVIDENCE_RING_LOSS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
-    IMAGE_IDENTITY_TICKET_LIMIT, ImageIdentityControl, MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT,
+    IMAGE_IDENTITY_TICKET_LIMIT, ImageBankSelect, ImageIdentityControl, MAX_DESCRIPTORS,
+    PAIR_CALLS_SECOND_SLOT,
     PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE, RootAffiliationControl, SlotSemantics,
     TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT,
     ThreadOwnerControl, attach_cookie,
@@ -468,6 +469,8 @@ fn identity_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::maps::MapD
 enum IdentityPreparation {
     WriteCookie,
     ReadCookie,
+    WriteBankSelect,
+    ReadBankSelect,
     WriteOwner,
     ReadOwner,
     WriteRoot,
@@ -479,22 +482,33 @@ enum IdentityPreparation {
 
 fn prepare_identity_with(
     owned: bool,
+    gate: bool,
     mut operation: impl FnMut(IdentityPreparation) -> Result<()>,
 ) -> Result<()> {
-    let controls = [
+    let image = [
         IdentityPreparation::WriteCookie,
         IdentityPreparation::ReadCookie,
+    ];
+    let bank = gate.then_some([
+        IdentityPreparation::WriteBankSelect,
+        IdentityPreparation::ReadBankSelect,
+    ]);
+    let rest = [
         IdentityPreparation::WriteOwner,
         IdentityPreparation::ReadOwner,
         IdentityPreparation::WriteRoot,
         IdentityPreparation::ReadRoot,
     ];
-    for step in controls
+    let bank_storage = gate.then_some(IdentityPreparation::Freeze("TASK_COOKIE_B"));
+    for step in image
         .into_iter()
+        .chain(bank.into_iter().flatten())
+        .chain(rest)
         .chain(owned.then_some(IdentityPreparation::SeedRoot))
         .chain(owned.then_some(IdentityPreparation::ReadSeed))
+        .chain([IdentityPreparation::Freeze("TASK_COOKIE")])
+        .chain(bank_storage)
         .chain([
-            IdentityPreparation::Freeze("TASK_COOKIE"),
             IdentityPreparation::Freeze("THREAD_OWNER"),
             IdentityPreparation::Freeze("ROOT_AFFILIATION"),
             IdentityPreparation::Freeze("COOKIE_CTL"),
@@ -557,6 +571,47 @@ fn initial_root_control(owned: bool) -> RootAffiliationControl {
         affiliation_reserved: u64::from(owned),
         ..Default::default()
     }
+}
+
+/// The bank-A prepared select image every gate-1 load publishes before
+/// links: bank A current and prepared, every count and incarnation zero.
+/// The bank-aware allocator refuses all issuance until this exists, so no
+/// gate-1 identity can precede it. Bank B stays unprepared here; its
+/// preparation (fresh `COOKIE_CTL_B` plus the `prepared[1]` flip before
+/// bank A fills) has no owner yet and lands with the cutover work.
+fn initial_bank_select() -> ImageBankSelect {
+    ImageBankSelect {
+        bank: 0,
+        prepared: [1, 0],
+        ..Default::default()
+    }
+}
+
+fn bank_select_fields(c: ImageBankSelect) -> [u64; 12] {
+    [
+        c.bank,
+        c.prepared[0],
+        c.prepared[1],
+        c.cuts,
+        c.refusals,
+        c.incarnation[0],
+        c.incarnation[1],
+        c.folded[0],
+        c.folded[1],
+        c.folds,
+        c.folded_issued,
+        c.update_losses,
+    ]
+}
+
+fn validate_bank_select_readback(
+    expected: ImageBankSelect,
+    actual: ImageBankSelect,
+) -> Result<()> {
+    if bank_select_fields(actual) != bank_select_fields(expected) {
+        bail!("IMAGE_BANK_SELECT exact readback differs from initial select");
+    }
+    Ok(())
 }
 
 fn root_seed_authority<'fd>(
@@ -659,7 +714,8 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
         .map(|child| root_seed_authority(scope, child.pid(), child.pin().pidfd()))
         .transpose()?;
     let root = initial_root_control(root_pidfd.is_some());
-    prepare_identity_with(root_pidfd.is_some(), |step| {
+    let bank_select = initial_bank_select();
+    prepare_identity_with(root_pidfd.is_some(), LOADER_GATE_BUILD, |step| {
         match step {
             IdentityPreparation::WriteCookie => {
                 let mut control: Array<_, ImageIdentityControl> =
@@ -672,6 +728,20 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
                 if cookie_control_fields(control.get(&0, 0)?) != cookie_control_fields(cookie) {
                     bail!("COOKIE_CTL exact readback differs from initial control");
                 }
+            }
+            IdentityPreparation::WriteBankSelect => {
+                let mut select: Array<_, ImageBankSelect> = Array::try_from(
+                    ebpf.map_mut("IMAGE_BANK_SELECT")
+                        .context("IMAGE_BANK_SELECT map")?,
+                )?;
+                select.set(0, bank_select, 0)?;
+            }
+            IdentityPreparation::ReadBankSelect => {
+                let select: Array<_, ImageBankSelect> = Array::try_from(
+                    ebpf.map("IMAGE_BANK_SELECT")
+                        .context("IMAGE_BANK_SELECT map")?,
+                )?;
+                validate_bank_select_readback(bank_select, select.get(&0, 0)?)?;
             }
             IdentityPreparation::WriteOwner => {
                 let mut control: Array<_, ThreadOwnerControl> =
@@ -12306,7 +12376,7 @@ mod tests {
     #[test]
     fn identity_preparation_stops_at_every_write_readback_and_freeze_failure() {
         let mut expected = Vec::new();
-        prepare_identity_with(true, |step| {
+        prepare_identity_with(true, false, |step| {
             expected.push(step);
             Ok(())
         })
@@ -12333,7 +12403,7 @@ mod tests {
         for fail in 0..expected.len() {
             let mut calls = Vec::new();
             let mut linked = false;
-            let result = prepare_identity_with(true, |step| {
+            let result = prepare_identity_with(true, false, |step| {
                 calls.push(step);
                 if calls.len() == fail + 1 {
                     bail!("injected setup failure");
@@ -12349,7 +12419,7 @@ mod tests {
         }
 
         let mut unowned = Vec::new();
-        prepare_identity_with(false, |step| {
+        prepare_identity_with(false, false, |step| {
             unowned.push(step);
             Ok(())
         })
@@ -12369,7 +12439,7 @@ mod tests {
         for fail in 0..unowned.len() {
             let mut calls = Vec::new();
             let mut completed = false;
-            let result = prepare_identity_with(false, |step| {
+            let result = prepare_identity_with(false, false, |step| {
                 calls.push(step);
                 if calls.len() == fail + 1 {
                     bail!("injected unowned setup failure");
@@ -12412,23 +12482,21 @@ mod tests {
         // Twelve u64 words; each one alone must fail the exact readback.
         for word in 0..12 {
             let mut actual = expected;
-            {
-                let words = [
-                    &mut actual.bank,
-                    &mut actual.prepared[0],
-                    &mut actual.prepared[1],
-                    &mut actual.cuts,
-                    &mut actual.refusals,
-                    &mut actual.incarnation[0],
-                    &mut actual.incarnation[1],
-                    &mut actual.folded[0],
-                    &mut actual.folded[1],
-                    &mut actual.folds,
-                    &mut actual.folded_issued,
-                    &mut actual.update_losses,
-                ];
-                *words[word] = words[word].wrapping_add(1);
-            }
+            let cell = match word {
+                0 => &mut actual.bank,
+                1 => &mut actual.prepared[0],
+                2 => &mut actual.prepared[1],
+                3 => &mut actual.cuts,
+                4 => &mut actual.refusals,
+                5 => &mut actual.incarnation[0],
+                6 => &mut actual.incarnation[1],
+                7 => &mut actual.folded[0],
+                8 => &mut actual.folded[1],
+                9 => &mut actual.folds,
+                10 => &mut actual.folded_issued,
+                _ => &mut actual.update_losses,
+            };
+            *cell = cell.wrapping_add(1);
             assert!(
                 super::validate_bank_select_readback(expected, actual).is_err(),
                 "word {word} must fail the readback"

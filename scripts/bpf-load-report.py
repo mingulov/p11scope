@@ -17,16 +17,20 @@ its largest count. Auxiliary rows never supply coverage and are ignored.
 With ``--object NAME`` loads are grouped by BTF id first and each
 group is assigned to one object by its unique roots (Inventory-only
 ``p11_usage_entry_*``, Detailed-only image/instance roots, counter
-``p11_counter_bank_*``); only the requested object's groups supply
-coverage. Shared-only groups of known roots belong to Detailed (the
-lone Detailed return), and to Inventory only when every root sits in
-its program set; counter modes take only bank-carrying groups. A group
-matching two objects or no known object FAILs naming its BTF id. Every
-observed root is scored as ``NAME/<root>`` against budget keys of that
-form, and the budgeted-but-missing check is scoped to ``NAME/`` keys,
-so two BPF objects sharing program names (the Detailed and Inventory
-objects share ten) are gated without mixing their counts, even from
-one mixed probe file.
+``p11_counter_bank_*``, journal ``p11_*_journal``); only the requested
+object's groups supply coverage. Shared-only groups of known roots
+belong to Detailed (the lone Detailed return), and to Inventory only
+when every root sits in its program set; counter modes take only
+bank-carrying groups and journal takes only pair-carrying groups. A
+journal group also carries Detailed-only roots (the journal object is
+a Detailed object with the entry/return pair swapped), so the journal
+pair wins over Detailed; a group matching two other objects, or no
+known object, FAILs naming its BTF id. Every observed root is scored
+as ``NAME/<root>`` against budget keys of that form, and the
+budgeted-but-missing check is scoped to ``NAME/`` keys, so two BPF
+objects sharing program names (the Detailed and Inventory objects
+share ten) are gated without mixing their counts, even from one mixed
+probe file.
 
 One refused shape is expected, never a failure: the 2-instruction
 ``bpf_loop`` (helper 181) capability probe that ``doctor`` runs for its
@@ -77,6 +81,13 @@ DETAILED_UNIQUE_ROOTS = frozenset({
     "p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy",
     "p11_selected_bootstrap", "p11_selected_cgroup_migrate",
 })
+# The journal pair replaces the ordinary entry/return roots in the
+# journal object (src/attach/journal.rs PROGRAMS), which is otherwise
+# a Detailed object: every journal group also carries Detailed-only
+# roots, so the pair wins over Detailed in assign_btf_group.
+JOURNAL_UNIQUE_ROOTS = frozenset({
+    "p11_entry_journal", "p11_return_journal",
+})
 # Every root any shipped object loads (for foreign-group detection).
 # The 13 defaults are shared by Detailed and counter; 10 of them are
 # also shared by Inventory (which lacks p11_entry/p11_return/task_newtask).
@@ -88,7 +99,8 @@ KNOWN_SHARED_ROOTS = frozenset({
     "sched_process_exec", "sched_process_exit",
 })
 KNOWN_ROOTS = (KNOWN_SHARED_ROOTS | INVENTORY_UNIQUE_ROOTS
-               | COUNTER_UNIQUE_ROOTS | DETAILED_UNIQUE_ROOTS)
+               | COUNTER_UNIQUE_ROOTS | DETAILED_UNIQUE_ROOTS
+               | JOURNAL_UNIQUE_ROOTS)
 # Inventory's 12 loaded programs (for partial-group compatibility: a
 # shared-only group whose roots all sit in this set is an Inventory
 # partial that failed before its usage roots loaded).
@@ -180,16 +192,27 @@ def assign_btf_group(entries):
     """One object's name for a BTF group, or None when shared-only.
 
     Returns (object, error) where object is "inventory", "counter",
-    "detailed", or None, and error names an ambiguous (two objects) or
-    foreign (no known root) group. Shared-only groups of known roots
-    (the lone Detailed return, partial loads that failed before their
-    unique roots) return (None, None); the caller decides by the
-    requested object whether they belong.
+    "detailed", "journal", or None, and error names an ambiguous (two
+    objects) or foreign (no known root) group. Shared-only groups of
+    known roots (the lone Detailed return, partial loads that failed
+    before their unique roots) return (None, None); the caller decides
+    by the requested object whether they belong. The journal pair wins
+    over Detailed (every journal group carries Detailed-only roots);
+    journal with inventory or counter roots is still ambiguous.
     """
     roots = {entry["root"] for entry in entries}
     has_inventory = bool(roots & INVENTORY_UNIQUE_ROOTS)
     has_counter = bool(roots & COUNTER_UNIQUE_ROOTS)
     has_detailed = bool(roots & DETAILED_UNIQUE_ROOTS)
+    has_journal = bool(roots & JOURNAL_UNIQUE_ROOTS)
+    if has_journal and (has_inventory or has_counter):
+        kinds = sorted(kind for kind, has in
+                       (("counter", has_counter),
+                        ("inventory", has_inventory),
+                        ("journal", has_journal)) if has)
+        return None, f"matches two objects ({','.join(kinds)})"
+    if has_journal:
+        return "journal", None
     hits = sum((has_inventory, has_counter, has_detailed))
     if hits > 1:
         kinds = sorted(kind for kind, has in
@@ -271,7 +294,8 @@ def select_object_loads(parsed_loads, object_name, group_errors):
     Detailed return; partial loads that failed before their unique
     roots) belong to Detailed, and to Inventory only when every root
     sits in Inventory's program set; counter objects always carry
-    their bank roots, so shared-only groups never belong to them.
+    their bank roots and journal objects always carry their pair, so
+    shared-only groups never belong to them.
     """
     unresolved = [entry for entry in parsed_loads
                   if entry["root"] == "unresolved"]
@@ -300,6 +324,9 @@ def select_object_loads(parsed_loads, object_name, group_errors):
         if assigned == "inventory":
             if object_name == "inventory":
                 selected.extend(entries)
+        elif assigned == "journal":
+            if object_name == "journal":
+                selected.extend(entries)
         elif assigned == "counter":
             if want_counter:
                 selected.extend(entries)
@@ -312,8 +339,9 @@ def select_object_loads(parsed_loads, object_name, group_errors):
                 selected.extend(entries)
             elif object_name == "inventory" and roots <= INVENTORY_PROGRAMS:
                 selected.extend(entries)
-            # Counter modes take only bank-carrying groups; shared-only
-            # groups (the lone Detailed return) never belong to them.
+            # Counter modes take only bank-carrying groups and journal
+            # takes only pair-carrying groups; shared-only groups (the
+            # lone Detailed return) never belong to them.
     return selected
 
 

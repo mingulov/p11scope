@@ -300,10 +300,19 @@ impl BankLoad {
 
     fn map_data(&self, name: &str) -> &aya::maps::MapData {
         let map = self.bpf.map(name).expect("proof map present");
+        // Every variant class the proof object holds: plain and
+        // per-CPU arrays/hashes, program arrays, the ringbufs, the
+        // cgroup array, the sk storage, and task storages (which
+        // load unsupported). Anything else fails loudly by name.
         match map {
             aya::maps::Map::Array(data)
             | aya::maps::Map::HashMap(data)
             | aya::maps::Map::ProgramArray(data)
+            | aya::maps::Map::PerCpuArray(data)
+            | aya::maps::Map::PerCpuHashMap(data)
+            | aya::maps::Map::RingBuf(data)
+            | aya::maps::Map::CgroupArray(data)
+            | aya::maps::Map::SkStorage(data)
             | aya::maps::Map::Unsupported(data) => data,
             _ => panic!("unexpected {name} proof map variant"),
         }

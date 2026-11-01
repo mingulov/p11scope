@@ -241,7 +241,6 @@ struct PendingExecSuccessor<Pin> {
 /// interval keys (`watch`, `attached_at_ns`, `unobserved_windows`) merged
 /// from this lane's own attach stamps. The presentation builder renders one
 /// JSON row per input from these, in flag order.
-#[cfg_attr(not(test), allow(dead_code))] // STAGED: constructed only for the presentation builder.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PrearmReportRow {
     /// Normalized operator spelling: messages and the module path only,
@@ -304,7 +303,6 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// The capture's scope start for pre-arm window bounds: the run start,
     /// never absorb time (which would understate the unobserved outer
     /// bound). Set by [`Self::absorb_prearm_plan`].
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED: read only by prearm_rows.
     prearm_scope_start_ns: Option<u64>,
     /// Declared pre-arm keys (prearm-pin id space) to the attach-set
     /// endpoint ids their absorb minted: how receipt stamps address
@@ -918,7 +916,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// changed-identity gap: the global disclosure beside the per-module
     /// bracket. An `fstat` failure records nothing here — the attach path's
     /// global check is the backstop that surfaces it.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED: the terminal hook calls this.
     pub(crate) fn refresh_prearm_object_changes(
         &mut self,
     ) -> Vec<crate::discovery::identity::PinnedObjectId> {
@@ -968,7 +965,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// here ends its watch with the exact bracket), then every watch ends
     /// for `cause` exactly once, clamped to the first stop. The run loop
     /// calls this after the capture stops, before the final view.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED: the terminal hook calls this.
     pub(crate) fn finish_prearm_watches(
         &mut self,
         cause: crate::render::PrearmWatchEnd,
@@ -1001,7 +997,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ///   one `mapped_unattached` window to their max attach instant.
     /// * Anything unboundable (no stamps, no scope start) stays undisclosed:
     ///   absence claims nothing.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED: the presentation builder reads this.
     pub(crate) fn prearm_rows(&self) -> Vec<PrearmReportRow> {
         let Some(prearm) = self.prearm.as_ref() else {
             return Vec::new();
@@ -1065,7 +1060,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// The declared set's attach instant: the max over its members' real
     /// stamps — only when every member carries one. A subset maximum is not
     /// declared-set readiness.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED: read by prearm_rows.
     fn prearm_attached_at(
         &self,
         object: crate::discovery::identity::PinnedObjectId,
@@ -1087,7 +1081,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// declared set (scan-corroborated unproved offsets), if any: same-object
     /// endpoints matched by retained identity over the dense id range,
     /// skipping keys the declared set already owns.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED: read by prearm_rows.
     fn prearm_undeclared_max(
         &self,
         object: crate::discovery::identity::PinnedObjectId,
@@ -1127,7 +1120,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// (including the entry-carried maps rendering on a pre-6.8 overlay
     /// split), plus the retained whole-file digest when the record carries
     /// one.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED: read by prearm_rows.
     fn prearm_object_mapped(
         &self,
         pins: &crate::discovery::identity::PinnedObjects,

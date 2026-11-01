@@ -1338,6 +1338,7 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
             0,
             "bootstrap_unavailable",
         ),
+        prearm: Vec::new(),
     };
     std::sync::Arc::new(super::PromotionView::new(
         super::CaptureId::new(11),

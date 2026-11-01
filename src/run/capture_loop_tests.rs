@@ -2782,6 +2782,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             1,
             "bootstrap_unavailable",
         ),
+        prearm: Vec::new(),
         budgets: BudgetView {
             callers_limit: 8,
             callers_occupied: 1,

@@ -811,6 +811,143 @@ class ReportTests(unittest.TestCase):
         self.assertIn("matches no object", result.stdout)
         self.assertIn("p11_foreign_probe", result.stdout)
 
+    def mixed_journal_loads(self):
+        # One file holding journal rows (BTF 61, with the journal pair
+        # plus a Detailed-only root the journal object also carries)
+        # and Inventory rows (BTF 48) under different BTF ids, as the
+        # linked inventory run's probe file does. The shared names
+        # carry different counts per object so cross-object max mixing
+        # is visible.
+        journal = [
+            load_row("p11_entry_journal", processed=99123, btf_id=61),
+            load_row("p11_return_journal", processed=234567, btf_id=61),
+            load_row("p11_image_query", processed=445, btf_id=61),
+            load_row("interface_entry", processed=83350, btf_id=61),
+            load_row("interface_return", processed=750806, btf_id=61),
+        ]
+        inventory = [
+            load_row("p11_usage_entry_lp64", processed=873, btf_id=48),
+            load_row("interface_entry", processed=84937, btf_id=48),
+            load_row("interface_return", processed=453148, btf_id=48),
+        ]
+        return journal + inventory
+
+    def mixed_journal_budgets(self):
+        # Test-only budgets above the fixture counts (grouping, not the
+        # real per-kernel pins, is under test here).
+        return self.write_budgets({
+            "journal/p11_entry_journal": {KERNEL: 120000},
+            "journal/p11_return_journal": {KERNEL: 300000},
+            "journal/p11_image_query": {KERNEL: 512},
+            "journal/interface_entry": {KERNEL: 95853},
+            "journal/interface_return": {KERNEL: 863427},
+            "inventory/p11_usage_entry_lp64": {KERNEL: 1025},
+            "inventory/interface_entry": {KERNEL: 97386},
+            "inventory/interface_return": {KERNEL: 520000},
+        })
+
+    def test_mixed_journal_inventory_file_scores_journal_only(self):
+        # The linked inventory run loads the journal object (semantic
+        # lane) and the Inventory object (broad) in one probed
+        # process; the scorer must group by BTF id and score the
+        # journal object from its own rows only. The journal pair
+        # identifies the group even though it also carries
+        # Detailed-only roots (the journal object is a Detailed
+        # object with the entry/return pair swapped).
+        loads = self.mixed_journal_loads()
+        budgets = self.mixed_journal_budgets()
+        result = self.run_report(self.write_loads("journal.jsonl", loads),
+                                 budgets=budgets, object_name="journal")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("journal/p11_entry_journal", result.stdout)
+        self.assertIn("journal/p11_return_journal", result.stdout)
+        self.assertIn("journal/interface_entry", result.stdout)
+        self.assertIn("83350", result.stdout)
+        self.assertNotIn("84937", result.stdout)
+        self.assertNotIn("p11_usage_entry", result.stdout)
+        # The other direction separates too: Inventory keeps its own
+        # counts and never sees the journal pair.
+        result = self.run_report(self.write_loads("journal.jsonl", loads),
+                                 budgets=budgets, object_name="inventory")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("inventory/interface_entry", result.stdout)
+        self.assertIn("84937", result.stdout)
+        self.assertNotIn("83350", result.stdout)
+        self.assertNotIn("p11_entry_journal", result.stdout)
+
+    def test_journal_group_does_not_supply_detailed_coverage(self):
+        # The journal group carries p11_image_query, a Detailed-only
+        # root, but it is a journal group, not a Detailed one:
+        # scoring as detailed must FAIL missing instead of borrowing
+        # the journal count.
+        loads = self.mixed_journal_loads()
+        budgets = self.write_budgets({
+            "detailed/p11_image_query": {KERNEL: 512},
+        })
+        result = self.run_report(self.write_loads("journal.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("detailed/p11_image_query", result.stdout)
+        self.assertIn("missing from probe rows", result.stdout)
+
+    def test_journal_group_with_inventory_root_is_ambiguous(self):
+        # A BTF group holding both the journal pair and an
+        # Inventory-only root matches two objects: it FAILs naming
+        # its BTF id, whichever object is scored.
+        loads = [
+            load_row("p11_entry_journal", processed=99123, btf_id=61),
+            load_row("p11_usage_entry_lp64", processed=873, btf_id=61),
+        ]
+        budgets = self.write_budgets({
+            "journal/p11_entry_journal": {KERNEL: 120000},
+        })
+        result = self.run_report(self.write_loads("mixed.jsonl", loads),
+                                 budgets=budgets, object_name="journal")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("btf-61-ambiguous", result.stdout)
+        self.assertIn("matches two objects", result.stdout)
+
+    def test_journal_missing_root_fails(self):
+        # The journal return root never loaded: scoring as journal
+        # must FAIL missing, naming the budgeted row.
+        loads = [load for load in self.mixed_journal_loads()
+                 if load["root"] != "p11_return_journal"]
+        budgets = self.mixed_journal_budgets()
+        result = self.run_report(self.write_loads("journal.jsonl", loads),
+                                 budgets=budgets, object_name="journal")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("journal/p11_return_journal", result.stdout)
+        self.assertIn("missing from probe rows", result.stdout)
+
+    def test_journal_root_over_budget_fails_with_both_numbers(self):
+        loads = [load_row("p11_entry_journal", processed=99123, btf_id=61),
+                 load_row("p11_return_journal", processed=234567, btf_id=61)]
+        budgets = self.write_budgets({
+            "journal/p11_entry_journal": {KERNEL: 120000},
+            "journal/p11_return_journal": {KERNEL: 200000}})
+        result = self.run_report(self.write_loads("journal.jsonl", loads),
+                                 budgets=budgets, object_name="journal")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("journal/p11_return_journal", result.stdout)
+        self.assertIn("234567", result.stdout)
+        self.assertIn("200000", result.stdout)
+
+    def test_journal_low_headroom_fails_even_under_budget(self):
+        loads = [load_row("p11_entry_journal", processed=960000, btf_id=61),
+                 load_row("p11_return_journal", processed=1000, btf_id=61)]
+        budgets = self.write_budgets({
+            "journal/p11_entry_journal": {KERNEL: 970000},
+            "journal/p11_return_journal": {KERNEL: 2000}})
+        result = self.run_report(self.write_loads("journal.jsonl", loads),
+                                 budgets=budgets, object_name="journal")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("journal/p11_entry_journal", result.stdout)
+
 
 # The FNV-1a 64 of `call 181; exit` (BPF_LOOP_PROBE_INSNS), cross-checked
 # against src/attach.rs by the fingerprint test above.

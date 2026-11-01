@@ -840,7 +840,11 @@ def _l4_counter(evidence, name):
 
 
 def check_g16_l4_receipts(evidence, expected):
-    """Gate G16 on owned loader-transition receipts; BLOCKED when absent."""
+    """Gate G16 on owned loader-transition receipts; BLOCKED when absent.
+
+    A present receipt carries all five producer fields: the other four
+    without update_losses is a broken producer, never a missing seam.
+    """
     arms = _l4_counter(evidence, "loader_arms")
     reclaims = _l4_counter(evidence, "loader_reclaims")
     peak = _l4_counter(evidence, "loader_retained_peak")
@@ -867,6 +871,8 @@ def check_g16_l4_receipts(evidence, expected):
                  "transition counters, L4); retained controlled contexts "
                  "(at most 8), held-return cutoff and delayed-record ack "
                  "(LoaderRetirementFence) likewise have no public proof")
+    if losses is _MISSING:
+        _fail("L4 loader receipt present without update_losses")
 
 
 def check_g17_l4_receipts(evidence, expected):

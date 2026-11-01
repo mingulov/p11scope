@@ -154,7 +154,8 @@ def valid_l4_transitions(cell, expected):
     """Provisional L4 receipts proving the full population for one cell."""
     if cell == "g16":
         return {"loader_transitions": {"arms": expected, "reclaims": expected,
-                                       "retained_peak": 1, "refusals": 0}}
+                                       "retained_peak": 1, "refusals": 0,
+                                       "update_losses": 0}}
     return {"image_transitions": {"tickets_issued": expected, "bank_cuts": 1,
                                   "bank_refusals": 0},
             "invocation_receipt": {"id": "invocation-1"}}
@@ -376,7 +377,8 @@ class InstalledJudgeTests(unittest.TestCase):
         # current captures have no L4 producer and still block below.
         report = valid_report(300)
         report["evidence"]["loader_transitions"] = {
-            "arms": 300, "reclaims": 299, "retained_peak": 1, "refusals": 0}
+            "arms": 300, "reclaims": 299, "retained_peak": 1, "refusals": 0,
+            "update_losses": 0}
         with tempfile.TemporaryDirectory(prefix="p11scope-l4-cli-") as raw:
             ledger = self.write(raw, "ledger.jsonl", self.ledger_text("g16", 300))
             output = self.write(raw, "report.json", json.dumps(report))

@@ -232,9 +232,11 @@ judge_inventory_capture() {
 FIX=$OUT/fix; mkdir -p "$FIX"
 gcc -O1 -o "$FIX/through-proxy" "$FIXSRC/through-proxy.c" -ldl || exit 2
 gcc -O1 -o "$FIX/run-with-env" "$FIXSRC/run-with-env.c" || exit 2
-chmod 755 "$FIX" "$FIX/through-proxy" "$FIX/run-with-env"
+gcc -O1 -shared -fPIC -o "$FIX/premap.so" "$FIXSRC/premap.c" -ldl || exit 2
+chmod 755 "$FIX" "$FIX/through-proxy" "$FIX/run-with-env" "$FIX/premap.so"
 WORKLOAD=$FIX/through-proxy
 WRAPPER=$FIX/run-with-env
+PREMAP_SO=$FIX/premap.so
 
 mkdir -p "$OUT/provider" "$OUT/home"
 OWNED_COPY=$OUT/provider/libsofthsm2-owned.so
@@ -292,11 +294,13 @@ chmod 644 owned.pin proxy.pin spy.pin client.pin trust.pin libp11kit.pin
 asuser() {
   # Exec the workload as the unprivileged user with the cell's p11-kit/spy/
   # token environment (plus an owned HOME so no tool writes to a real home).
-  # Callers set XDG_CELL and SPYLOG; LD_PRELOAD (T3) and
-  # P11_KIT_SERVER_ADDRESS (T7) pass through when set.
+  # Callers set XDG_CELL and SPYLOG; LD_PRELOAD (premap wrapper),
+  # P11KIT_PREMAPPED (premap path list) and P11_KIT_SERVER_ADDRESS (T7)
+  # pass through when set.
   exec setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups \
     env HOME="$OUT/home" SOFTHSM2_CONF="$SOFTHSM2_CONF" XDG_CONFIG_HOME="$XDG_CELL" \
     PKCS11SPY="$OWNED_COPY" PKCS11SPY_OUTPUT="$SPYLOG" LD_PRELOAD="${LD_PRELOAD:-}" \
+    P11KIT_PREMAPPED="${P11KIT_PREMAPPED:-}" \
     P11_KIT_SERVER_ADDRESS="${P11_KIT_SERVER_ADDRESS:-}" "$@"
 }
 receipt() {
@@ -425,13 +429,15 @@ t7() {
   rm -f -- "$sock" "$cell.server.log" "$cell.spy.log" "$cell.spy-ledger.log"
   rm -f -- "$cell.client."* "$cell.server."*
   : > "$OUT/$cell.spy.log" && chown "$RUNUID:$RUNGID" "$OUT/$cell.spy.log" && chmod 644 "$OUT/$cell.spy.log"
-  # LD_PRELOAD maps the owned copy into the server parent (the per-connection
-  # children inherit it): --system arms no loader hooks, and the parent never
-  # loads the provider itself, so without the preload the filtered module is
-  # "not mapped in the target" at scan time and never picked up (as in T3).
+  # The premap wrapper maps the owned copy RTLD_LOCAL into the server
+  # parent (the per-connection children inherit it): --system arms no loader
+  # hooks, and the parent never loads the provider itself, so without the
+  # premap the filtered module is "not mapped in the target" at scan time
+  # and never picked up (as in T3). Local, never global (see system_run).
   setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups \
     env HOME="$OUT/home" SOFTHSM2_CONF="$SOFTHSM2_CONF" PKCS11SPY="$OWNED_COPY" \
-    PKCS11SPY_OUTPUT="$OUT/$cell.spy.log" LD_PRELOAD="$OWNED_COPY" \
+    PKCS11SPY_OUTPUT="$OUT/$cell.spy.log" LD_PRELOAD="$PREMAP_SO" \
+    P11KIT_PREMAPPED="$OWNED_COPY" \
     p11-kit server -f -n "$sock" -p "$SPY" -t 600 'pkcs11:token=wp3b' \
     > "$cell.server.log" 2>&1 &
   server=$!; register "$server" && servergen=${CHILDREN[$server]}
@@ -575,19 +581,24 @@ t5() { pid_cell p11kit-proxy-pid-merge profile 20 merge cover \
 t8() { pid_cell p11kit-prearm profile 20 isolated exact "" whole --prearm-module "$OWNED_COPY"; }
 
 system_run() {
-  # system_run PREFIX XDG PRELOAD -- OBSERVER...: one gated workload plus one
+  # system_run PREFIX XDG PREMAP -- OBSERVER...: one gated workload plus one
   # --system observer (profile or inventory). Leaves $PREFIX.json/.wl/.spy.log
   # and run facts in SYS_WL/SYS_GEN/SYS_READYGEN/SYS_READY/SYS_CAPTURING/
   # SYS_RELEASED/SYS_OBSERVER_RC/SYS_WORKLOAD_RC for the caller's receipt.
   # Uses the quiet (subprocess-free) waits: every fork during a --system
-  # capture is a descendant gap. PRELOAD empty maps nothing extra.
-  local prefix=$1 xdg=$2 preload=$3; shift 3
+  # capture is a descendant gap. PREMAP is a colon-separated path list (or
+  # empty): the premap wrapper maps each RTLD_LOCAL before main, never
+  # globally (a globally preloaded provider makes OpenSC 0.27.1's spy
+  # return direct pointers from C_GetInterface, bypassing the log).
+  local prefix=$1 xdg=$2 premap=$3; shift 3
   [ "${1:-}" = -- ] && shift
   local gate=$OUT/$prefix.gate
-  rm -f -- "$gate" "$prefix.json" "$prefix.wl" "$prefix.stderr" "$prefix.stdout" "$prefix.receipt.json" "$prefix.spy.log"
+  rm -f -- "$gate" "$prefix.json" "$prefix.wl" "$prefix.stderr" "$prefix.stdout" "$prefix.spy.log"
   : > "$OUT/$prefix.spy.log" && chown "$RUNUID:$RUNGID" "$OUT/$prefix.spy.log" && chmod 644 "$OUT/$prefix.spy.log"
   local wl gen='' readygen='' pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
-  LD_PRELOAD=$preload XDG_CELL=$OUT/xdg-$xdg SPYLOG=$OUT/$prefix.spy.log \
+  local wrapper=
+  [ -n "$premap" ] && wrapper=$PREMAP_SO
+  LD_PRELOAD=$wrapper P11KIT_PREMAPPED=$premap XDG_CELL=$OUT/xdg-$xdg SPYLOG=$OUT/$prefix.spy.log \
     asuser "$WORKLOAD" "$PROXY" "$ITERS" "$SLEEP_US" "$SETTLE_MS" "$gate" > "$prefix.wl" 2>&1 &
   wl=$!; register "$wl" && gen=${CHILDREN[$wl]}
   if waitfor "$prefix.wl" "^READY pid=$wl$" "$wl" "$READY_TICKS"; then
@@ -611,11 +622,13 @@ system_run() {
 }
 
 # --- T3: profile --system --module <owned copy>, isolated config ---
-# The owned copy is pre-mapped via LD_PRELOAD (same inode the spy later
-# dlopens; refcount only): --system arms no loader hooks, so a filtered
-# module that first appears after attach is never picked up ("not mapped
-# in the target"). Pre-mapping keeps T3's property (system-scope counts
-# equal the spy ledger) while pid cells prove the late-load shape.
+# The owned copy is pre-mapped RTLD_LOCAL by the premap wrapper (same inode
+# the spy later dlopens; refcount only): --system arms no loader hooks, so
+# a filtered module that first appears after attach is never picked up
+# ("not mapped in the target"). The mapping must stay local: a globally
+# preloaded provider makes OpenSC 0.27.1's spy bypass its log (Fedora).
+# Pre-mapping keeps T3's property (system-scope counts equal the spy
+# ledger) while pid cells prove the late-load shape.
 t3() {
   local cell=p11kit-proxy-system-isolated
   system_run "$cell" isolated "$OWNED_COPY" -- \
@@ -634,10 +647,10 @@ t3() {
 # workload maps its backends: the owned copy and p11-kit-trust must be
 # admitted whole (exact endpoint counts, never >=) and the libp11-kit
 # closure refusal must carry its pinned text. The backends are pre-mapped
-# via LD_PRELOAD (same files the proxy later dlopens; refcount only): the
-# gated workload's ~8 s life fits between inventory passes, so without the
-# preload no pass ever sees the late dlopen and the identities are absent
-# (late-load coverage itself is proven by T1). Phase B runs
+# RTLD_LOCAL by the premap wrapper (same files the proxy later dlopens;
+# refcount only): the gated workload's ~8 s life fits between inventory
+# passes, so without the premap no pass ever sees the late dlopen and the
+# identities are absent (late-load coverage itself is proven by T1). Phase B runs
 # profile --system --module <owned copy> (T3 shape, merge config): the
 # provider row equals the spy ledger. One row passes iff both do.
 # Endpoint pins are per provider/p11-kit version (env-overridable for
@@ -650,7 +663,7 @@ T6_TRUST_ENDPOINTS=${T6_TRUST_ENDPOINTS:-68}
 T6_CLOSURE_REFUSAL=${T6_CLOSURE_REFUSAL:-'a proxy closure array is admitted whole or not at all'}
 t6() {
   local cell=p11kit-proxy-system-merge
-  system_run "$cell.inv" merge "$OWNED_COPY $TRUST_SO" -- \
+  system_run "$cell.inv" merge "$OWNED_COPY:$TRUST_SO" -- \
     "$P" inventory --system --max-endpoints 8192 --duration 30
   judge_inventory_capture "$cell" "$cell.inv.json" -- \
     --expect-admitted "$OUT/owned.pin:$T6_OWNED_ENDPOINTS" \

@@ -11855,6 +11855,8 @@ const TABLED_RUNNER_C: &str = r#"
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <errno.h>
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
     if (getenv("P11S_REEXEC") != NULL) {
@@ -11873,11 +11875,14 @@ int main(int argc, char **argv) {
         if (command == 's' || command == 'd') {
             setenv("P11S_REEXEC", "1", 1);
             char alternate[4096];
+            const char *target = argv[0];
             if (command == 'd') {
                 if (strlen(argv[0]) + 6 >= sizeof(alternate)) return 10;
                 strcpy(alternate, argv[0]); strcat(alternate, ".copy");
+                target = alternate;
             }
-            execl(command == 'd' ? alternate : argv[0], argv[0], argv[1], argv[2], (char *)NULL);
+            execl(target, argv[0], argv[1], argv[2], (char *)NULL);
+            fprintf(stderr, "tabled-runner: exec %s failed: %s\n", target, strerror(errno));
             return 8;
         }
         if (command == 'a') {
@@ -11994,16 +11999,36 @@ impl TabledSeedProvider {
         assert_eq!(ack, *b"T");
     }
 
+    fn copy_tabled_runner(&self) -> PathBuf {
+        let target = self.dir.path().join("tabled-runner.copy");
+        std::fs::copy(self.dir.path().join("tabled-runner"), &target).unwrap();
+        target
+    }
+
     fn reexec(&mut self, different: bool) {
+        if different {
+            self.copy_tabled_runner();
+        }
+        self.reexec_handshake(different);
+    }
+
+    /// Negative control for the reexec ack path: hold the copy open for
+    /// writing across the `d` handshake, so the runner's exec of it
+    /// deterministically fails and the child exits before the `E` ack.
+    /// Used only by the exec-failure report test.
+    fn reexec_with_held_copy(&mut self) {
+        let target = self.copy_tabled_runner();
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap();
+        self.reexec_handshake(true);
+        std::mem::drop(held);
+    }
+
+    fn reexec_handshake(&mut self, different: bool) {
         use std::io::Read as _;
         use std::os::fd::AsRawFd as _;
-        if different {
-            std::fs::copy(
-                self.dir.path().join("tabled-runner"),
-                self.dir.path().join("tabled-runner.copy"),
-            )
-            .unwrap();
-        }
         self.child
             .stdin
             .as_mut()
@@ -43853,6 +43878,17 @@ fn automatic_exec_pid_continuity_different_executable_keeps_unchanged_pairs() {
             .all(|(slot, _, _)| !new.iter().any(|(current, _, _)| current == slot)),
         "a changed real held provider follows its ordinary new/retire delta"
     );
+}
+
+/// The `d` reexec execs a copy of the runner; when that exec fails the child
+/// exits before the `E` ack. The parent must report the exec failure itself,
+/// not a bare EOF at the ack read. Holding the copy open for writing makes
+/// the exec deterministically fail with ETXTBSY.
+#[test]
+#[should_panic(expected = "tabled-runner failed to exec")]
+fn reexec_reports_child_exec_failure_instead_of_eof() {
+    let (mut fixture, _view, _library) = loaded_tabled_provider();
+    fixture.reexec_with_held_copy();
 }
 
 fn continuity_exec_class(

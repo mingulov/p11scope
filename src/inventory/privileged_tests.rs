@@ -3737,6 +3737,7 @@ fn privileged_joint_driver_live_finish_begin_poll_wound_down_lp64() -> Result<()
         convert_subset,
         &scope,
         crate::attach::BackendSelection::Auto,
+        None,
     )
     .map_err(|refusal| anyhow::anyhow!("live lane attaches: {refusal}"))?;
     ensure!(lane.is_live(), "the lane owns its live session");
@@ -4217,6 +4218,7 @@ fn start_joint_lane(
         convert_subset,
         &scope,
         crate::attach::BackendSelection::Auto,
+        None,
     )
     .map_err(|refusal| anyhow::anyhow!("live lane attaches: {refusal}"))?;
     ensure!(lane.is_live(), "the lane owns its live session");
@@ -4225,6 +4227,578 @@ fn start_joint_lane(
     ensure!(lane.has_joint_machine(), "the machine initializes live");
     joint_drive_line(&lane, coordinator, "r16-lane", "started");
     Ok(lane)
+}
+
+/// Flag-on variant of [`start_joint_lane`]: the lane starts with a
+/// journal request, so on a journal build the session seals linked.
+/// Requires `P11SCOPE_JOURNAL=1`; the twins ensure it loudly.
+fn start_joint_lane_with_journal(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    manifests: Vec<PathBuf>,
+) -> Result<crate::inventory_semantics::AttestedSemanticLane> {
+    use anyhow::Context as _;
+    ensure!(
+        env!("P11SCOPE_JOURNAL_ENABLED") == "1",
+        "a linked lane requires P11SCOPE_JOURNAL=1"
+    );
+    coordinator.set_semantic_manifests(manifests);
+    let attach_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the attach subset prepares")?;
+    let convert_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the conversion subset prepares")?;
+    let scope = Scope::System;
+    let spec = crate::attach::journal::JournalSpec;
+    let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
+        attach_subset,
+        convert_subset,
+        &scope,
+        crate::attach::BackendSelection::Auto,
+        Some(&spec),
+    )
+    .map_err(|refusal| anyhow::anyhow!("linked live lane attaches: {refusal}"))?;
+    ensure!(lane.is_live(), "the lane owns its live session");
+    lane.initialize_joint(coordinator)
+        .map_err(|refusal| anyhow::anyhow!("the joint machine initializes: {refusal}"))?;
+    ensure!(lane.has_joint_machine(), "the machine initializes live");
+    Ok(lane)
+}
+
+/// Default-build arm of the linked twins: without the journal pair a
+/// build cannot seal linked, so the twin asserts the two refusals it
+/// owns (journal preparation names the omitted build; a linked start
+/// refuses attachment) and reports the cell inapplicable — the same
+/// shape as the seal twin's flag-off arm.
+fn refuse_linked_without_journal(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    manifests: Vec<PathBuf>,
+    report: &str,
+) -> Result<()> {
+    use anyhow::Context as _;
+    let spec = crate::attach::journal::JournalSpec;
+    let error = spec
+        .prepare()
+        .err()
+        .context("the omitted build refuses journal preparation")?;
+    ensure!(
+        format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+        "the omitted build refuses with its finite reason: {error:#}"
+    );
+    coordinator.set_semantic_manifests(manifests);
+    let attach_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the attach subset prepares")?;
+    let convert_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the conversion subset prepares")?;
+    let scope = Scope::System;
+    let refused = crate::inventory_semantics::AttestedSemanticLane::start_live(
+        attach_subset,
+        convert_subset,
+        &scope,
+        crate::attach::BackendSelection::Auto,
+        Some(&spec),
+    );
+    ensure!(
+        matches!(
+            refused,
+            Err(crate::inventory_semantics::SemanticRefusal::Attachment)
+        ),
+        "a linked start refuses attachment without the journal pair: {refused:?}"
+    );
+    eprintln!("{report} journal=inapplicable");
+    Ok(())
+}
+
+/// Linked live-discovery positive: a real linked lane pumps discovery
+/// through the live arm. Post-attach spawns guarantee traffic; the
+/// pump must observe records (an unlinked lane skips with Ok(0), and
+/// the neutered-live mutant returns Ok(0) forever — both fail the
+/// poll loop). Root BPF lane, serial.
+#[test]
+#[ignore = "privileged: live linked lane pumps discovery through the live arm"]
+fn privileged_key_operations_linked_lane_pumps_live_discovery() -> Result<()> {
+    use anyhow::Context as _;
+    use std::time::{Duration, Instant};
+    let workload = JointWorkload::build()?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-pump-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-pump-held.dr37.json",
+    )?;
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        return refuse_linked_without_journal(
+            &mut coordinator,
+            vec![manifest_soft, manifest_held],
+            "KEY_OPS_PUMP",
+        );
+    }
+    let mut lane =
+        start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    // Post-attach spawns are genuine discovery traffic (fork, exec,
+    // exit) the pump must observe; fresh traffic per iteration keeps
+    // the poll self-healing under ring pressure from parallel tests.
+    let started = Instant::now();
+    let pumped = loop {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .context("spawn discovery traffic")?;
+        child.wait().context("reap discovery traffic")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pumped = lane
+            .service_linked_live_discovery(64, deadline)
+            .map_err(|refusal| anyhow::anyhow!("the live pump serves: {refusal}"))?;
+        if pumped > 0 {
+            break pumped;
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(60),
+            "the live pump never observed post-attach spawns"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    ensure!(lane.has_joint_machine(), "the machine stays installed");
+    eprintln!("KEY_OPS_PUMP pumped={pumped}");
+    Ok(())
+}
+
+/// Live discovery fault: a malformed staged record faults the live
+/// arm on a running capture; the pump refuses with Unavailable, and
+/// nothing latches — the machine stays installed and unlatched, the
+/// lane stays live, and a second pump refuses the same way. Root
+/// BPF lane, serial.
+#[test]
+#[ignore = "privileged: live DD transport fault refuses without latching"]
+fn privileged_key_operations_live_discovery_fault_refuses_without_latching() -> Result<()> {
+    use std::time::{Duration, Instant};
+    let workload = JointWorkload::build()?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-fault-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-fault-held.dr37.json",
+    )?;
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        return refuse_linked_without_journal(
+            &mut coordinator,
+            vec![manifest_soft, manifest_held],
+            "KEY_OPS_FAULT",
+        );
+    }
+    let mut lane =
+        start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    lane.stage_malformed_discovery_for_test();
+    for attempt in 0..2 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let refused = lane.service_linked_live_discovery(64, deadline);
+        ensure!(
+            matches!(
+                &refused,
+                Err(crate::inventory_semantics::SemanticRefusal::Unavailable)
+            ),
+            "attempt {attempt}: a faulted live pump refuses: {refused:?}"
+        );
+        ensure!(lane.has_joint_machine(), "attempt {attempt}: no latch");
+        ensure!(
+            lane.joint_disposition_reason().is_none(),
+            "attempt {attempt}: no disposition latched: {:?}",
+            lane.joint_disposition_reason()
+        );
+        ensure!(lane.is_live(), "attempt {attempt}: the lane stays live");
+    }
+    eprintln!("KEY_OPS_FAULT refused=Unavailable latched=false");
+    Ok(())
+}
+
+/// Live discovery fault with coverage consequence: a malformed staged
+/// record faults the live pump with `Unavailable` on a running
+/// capture, without latching the machine; the next audited batch
+/// carries the coverage failure and routes post-fault provider calls
+/// to the coverage fault, the driver's fallback stop reason names
+/// `Unavailable`, and Finish still publishes. Root BPF lane, serial.
+#[test]
+#[ignore = "privileged: live linked fault fails coverage without latching, finish publishes"]
+fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> Result<()> {
+    use crate::discovery::instances::{Route, UnknownReason};
+    use crate::semantic_capture::{InvalidationScope, TickOutcome};
+    use anyhow::Context as _;
+    use std::time::{Duration, Instant};
+    let workload = JointWorkload::build()?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-cov-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-cov-held.dr37.json",
+    )?;
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        return refuse_linked_without_journal(
+            &mut coordinator,
+            vec![manifest_soft, manifest_held],
+            "KEY_OPS_COVFAULT",
+        );
+    }
+    let mut lane =
+        start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    // Fault the pump on the running capture.
+    lane.stage_malformed_discovery_for_test();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let refused = lane.service_linked_live_discovery(64, deadline);
+    ensure!(
+        matches!(
+            &refused,
+            Err(crate::inventory_semantics::SemanticRefusal::Unavailable)
+        ),
+        "a faulted live pump refuses: {refused:?}"
+    );
+    ensure!(lane.has_joint_machine(), "no latch: machine installed");
+    ensure!(
+        lane.joint_disposition_reason().is_none(),
+        "not DispositionRequired after a pump fault: {:?}",
+        lane.joint_disposition_reason()
+    );
+    ensure!(lane.is_live(), "the lane stays live");
+    // Post-fault provider calls: a gated script process maps first,
+    // then runs its calls right before the audit drive, so the next
+    // audited batch carries them.
+    let go = workload.path("keyops-cov-go");
+    let go_arg = go.to_str().context("go path")?.to_string();
+    let soft_arg = workload
+        .soft_copy
+        .to_str()
+        .context("soft-copy path")?
+        .to_string();
+    let process = workload.spawn(
+        "cov",
+        &[
+            "b", "--cell", "C", "--module", &soft_arg, "--go", &go_arg, "--iters", "2", "--hold",
+        ],
+        &[],
+    )?;
+    drive_until_mapped(&mut coordinator, &[process.pid()])?;
+    std::fs::write(&go, b"")?;
+    process.wait_for("DONE ", Duration::from_secs(60))?;
+    let (_by_fn, total, bad) = ledger_calls(&process.out)?;
+    ensure!(
+        bad == 0,
+        "the post-fault script never fails: {:?}",
+        process.lines()
+    );
+    ensure!(total > 0, "the script made post-fault provider calls");
+    // Drive the begun transaction one machine step at a time until
+    // the audited batch stages, then assert the coverage failure on
+    // it directly.
+    lane.begin_joint_commit(true).map_err(|refusal| {
+        let reason = match refusal {
+            crate::inventory_semantics::JointCommitRefusal::NotInitialized => "not initialized",
+            crate::inventory_semantics::JointCommitRefusal::OutstandingRequest => {
+                "outstanding request"
+            }
+            crate::inventory_semantics::JointCommitRefusal::DispositionRequired => {
+                "disposition required"
+            }
+        };
+        anyhow::anyhow!("keyops-cov: begin refused: {reason}")
+    })?;
+    let revision_before = coordinator.registry().published_revision();
+    let audit_started = Instant::now();
+    let (outcome_count, covfault_calls) = loop {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        lane.service_joint(
+            &mut coordinator,
+            crate::inventory_semantics::JointServiceMode::Running,
+            &mut budget,
+        )
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "keyops-cov: audit service refused: {reason} disposition={:?} waiters={:?}",
+                lane.joint_disposition_reason(),
+                lane.joint_stuck_diagnostic_for_test(),
+            )
+        })?;
+        if let Some(batch) = coordinator.pending_semantic_batch_for_test() {
+            let outcomes = batch.outcomes();
+            ensure!(
+                outcomes.iter().any(|outcome| matches!(
+                    outcome,
+                    TickOutcome::Invalidation(loss)
+                        if matches!(loss.scope(), InvalidationScope::CoverageFailed)
+                )),
+                "the audited batch carries CoverageFailed ({} outcomes)",
+                outcomes.len()
+            );
+            let covfault = outcomes
+                .iter()
+                .filter(|outcome| {
+                    matches!(
+                        outcome,
+                        TickOutcome::Call(call)
+                            if matches!(call.route(), Route::Unknown(UnknownReason::CoverageFault))
+                    )
+                })
+                .count();
+            ensure!(
+                covfault > 0,
+                "the audited batch routes post-fault calls to CoverageFault ({} outcomes)",
+                outcomes.len()
+            );
+            break (outcomes.len(), covfault);
+        }
+        ensure!(
+            audit_started.elapsed() < Duration::from_secs(120),
+            "keyops-cov: no audited batch after 120 s; stuck audit={:?} h3={:?} waiters={:?}",
+            lane.joint_audit_diagnostic_for_test(),
+            coordinator.reference_h3_audit_state(),
+            lane.joint_stuck_diagnostic_for_test(),
+        );
+    };
+    // One driver hook on the faulted lane: the pump refuses again
+    // on the sticky fault, the hook still services the machine, and
+    // the fallback stop reason names Unavailable.
+    let service_calls_before = lane.joint_service_calls_for_test();
+    let mut driver = ClassicDriver {
+        coordinator: &mut coordinator,
+        inventory_scope: None,
+        scope: InventoryRunScope::System,
+        cgroup: None,
+        max_scan_pids: None,
+        guard: UnavailableImageGuard,
+        deadline: None,
+        attach_backend: crate::attach::BackendSelection::Auto,
+        identity: None,
+        display: None,
+        semantic: Some(lane),
+        semantic_staged: false,
+        seated_summary: None,
+        second_signal: None,
+        lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+        completion_source: None,
+        pending_install: None,
+        installed_promotion: None,
+        retiring: None,
+        joint_finish: JointFinishDriver::NotBegun,
+        stop_requested: false,
+        joint_first_error: None,
+        suspended: false,
+        joint_commit_pending: false,
+        joint_tick_refusal: None,
+        joint_commit_retries: 0,
+        #[cfg(test)]
+        terminal_seq_calls: 0,
+        #[cfg(test)]
+        reclaim_calls: Vec::new(),
+        #[cfg(test)]
+        joint_begin_calls: 0,
+        #[cfg(test)]
+        joint_step_calls: 0,
+        #[cfg(test)]
+        joint_commit_polls: 0,
+        #[cfg(test)]
+        take_promotion_work_calls: 0,
+        #[cfg(test)]
+        drive_pending_install_calls: 0,
+        #[cfg(test)]
+        service_caller_metadata_calls: 0,
+        #[cfg(test)]
+        commit_calls: 0,
+    };
+    driver.on_tick();
+    let lane = driver.semantic.as_ref().expect("lane stays seated");
+    ensure!(
+        lane.joint_service_calls_for_test() == service_calls_before + 1,
+        "the hook services the machine despite the pump fault"
+    );
+    ensure!(
+        lane.joint_disposition_reason().is_none(),
+        "the serviced machine latches nothing: {:?}",
+        lane.joint_disposition_reason()
+    );
+    ensure!(
+        driver.joint_tick_refusal == Some(crate::inventory_semantics::SemanticRefusal::Unavailable),
+        "the fallback stop reason names Unavailable: {:?}",
+        driver.joint_tick_refusal
+    );
+    let mut lane = driver.semantic.take().expect("lane stays seated");
+    let coordinator = &mut *driver.coordinator;
+    // The faulted transaction still publishes with coverage failed.
+    let publish_started = Instant::now();
+    loop {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        lane.service_joint(
+            &mut *coordinator,
+            crate::inventory_semantics::JointServiceMode::Running,
+            &mut budget,
+        )
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "keyops-cov: publish service refused: {reason} disposition={:?} waiters={:?}",
+                lane.joint_disposition_reason(),
+                lane.joint_stuck_diagnostic_for_test(),
+            )
+        })?;
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let commit = lane
+            .poll_joint_commit(&mut *coordinator, &mut budget)
+            .map_err(|reason| {
+                anyhow::anyhow!(
+                    "keyops-cov: commit poll refused: {reason} disposition={:?} waiters={:?}",
+                    lane.joint_disposition_reason(),
+                    lane.joint_stuck_diagnostic_for_test(),
+                )
+            })?;
+        if matches!(
+            commit,
+            crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_)
+        ) {
+            let revision_after = coordinator.registry().published_revision();
+            ensure!(
+                revision_after == revision_before + 1,
+                "keyops-cov: one published revision per transaction: \
+                 {revision_before} -> {revision_after}"
+            );
+            break;
+        }
+        ensure!(
+            publish_started.elapsed() < Duration::from_secs(120),
+            "keyops-cov: unpublished after 120 s; stuck audit={:?} h3={:?} waiters={:?}",
+            lane.joint_audit_diagnostic_for_test(),
+            coordinator.reference_h3_audit_state(),
+            lane.joint_stuck_diagnostic_for_test(),
+        );
+    }
+    ensure!(
+        lane.joint_disposition_reason().is_none(),
+        "the published machine latches nothing: {:?}",
+        lane.joint_disposition_reason()
+    );
+    // Finish still publishes on the faulted lane.
+    lane.begin_joint_finish(coordinator)
+        .map_err(|reason| anyhow::anyhow!("finish begins on the faulted lane: {reason}"))?;
+    let mut published = false;
+    for _ in 0..512 {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        match lane.poll_joint_finish(coordinator, &mut budget) {
+            Ok(
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_),
+            ) => {
+                published = true;
+                break;
+            }
+            Ok(crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending) => {}
+            Err(reason) => anyhow::bail!("finish polls on the faulted lane: {reason}"),
+        }
+    }
+    ensure!(published, "Finish publishes with coverage failed");
+    drop(driver);
+    eprintln!(
+        "KEY_OPS_COVFAULT refused=Unavailable latched=false outcomes={outcome_count} \
+         covfault={covfault_calls} finish=published"
+    );
+    Ok(())
+}
+
+/// Marker gate: an ordinary live seal publishes no attach
+/// generation (0, cell untouched), while a journal live seal mints
+/// one (>= 1). Root BPF lane, serial.
+#[test]
+#[ignore = "privileged: live seal generation publishes only with the journal pair"]
+fn privileged_key_operations_seal_generation_gated_by_flag() -> Result<()> {
+    let workload = JointWorkload::build()?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-gen-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-gen-held.dr37.json",
+    )?;
+    // Flag off: the ordinary seal keeps generation 0 in every build.
+    let lane = start_joint_lane(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    assert_eq!(
+        lane.live_seal_generation_for_test(),
+        Some(0),
+        "an ordinary live seal publishes nothing"
+    );
+    drop(lane);
+    drop(coordinator);
+    // Flag on: only a journal build can seal linked and publish.
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        eprintln!("KEY_OPS_GENERATION ordinary=0 journal=inapplicable");
+        return Ok(());
+    }
+    let workload = JointWorkload::build()?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-gen-soft2.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-gen-held2.dr37.json",
+    )?;
+    let lane = start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    let generation = lane.live_seal_generation_for_test();
+    assert!(
+        generation.is_some_and(|generation| generation >= 1),
+        "a journal live seal publishes its generation: {generation:?}"
+    );
+    eprintln!(
+        "KEY_OPS_GENERATION ordinary=0 journal={}",
+        generation.unwrap_or(0)
+    );
+    Ok(())
 }
 
 /// One JOINT_R16 drive-state line: the lane gates plus the machine's

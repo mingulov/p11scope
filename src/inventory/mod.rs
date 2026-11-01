@@ -711,12 +711,23 @@ pub fn run(
     identity_backend: crate::cli::IdentityBackendSelection,
     identity_backend_explicit: bool,
     caller_metadata: crate::cli::CallerMetadataMode,
+    key_operations: bool,
 ) -> Result<i32> {
     if !manifests.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--manifest requires --capture auto or native");
     }
     if !prearm_modules.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--prearm-module requires --capture auto or native");
+    }
+    // The opt-in gates before any load: a scan pairing refuses by
+    // name (mirroring the parse refusal for programmatic callers),
+    // and a build without the journal object refuses with the finite
+    // build reason. Never silently ignored.
+    if key_operations && capture == CaptureMode::Scan {
+        anyhow::bail!("--key-operations requires --capture auto or native");
+    }
+    if key_operations {
+        crate::attach::journal::JournalSpec.prepare().map(|_| ())?;
     }
     let scope: crate::cli::ScopeArg = scope.into();
     if identity_backend_explicit && !matches!(scope, crate::cli::ScopeArg::System) {
@@ -768,6 +779,7 @@ pub fn run(
         None,
         #[cfg(test)]
         None,
+        key_operations,
     )
 }
 
@@ -973,6 +985,7 @@ fn run_with_terminal_diagnostics(
         &|| Ok(crate::attach::MultiCapableHost::for_test()),
         event_fault,
         None,
+        false,
     )
 }
 
@@ -1175,6 +1188,10 @@ fn run_with_terminal_budget(
     host: &dyn Fn() -> crate::attach::MultiHostVerdict,
     #[cfg(test)] event_fault: Option<crate::inventory_events::EventFault>,
     #[cfg(test)] identity_checks: Option<Box<dyn crate::inspect_system::IdentityChecks>>,
+    // `--key-operations`: the semantic lane attempts a linked journal
+    // start when set (scan pairings and omitted builds already refused
+    // at the run entry); the run stays ordinary otherwise.
+    key_operations: bool,
 ) -> Result<i32> {
     let (engine_scope, numbering) = scope.into().resolve()?;
     let scope = InventoryRunScope::from(&engine_scope);
@@ -1375,7 +1392,12 @@ fn run_with_terminal_budget(
     let semantic = if manifests.is_empty() {
         None
     } else {
-        start_semantic_lane(&mut coordinator, &engine_scope, attach_backend)
+        start_semantic_lane(
+            &mut coordinator,
+            &engine_scope,
+            attach_backend,
+            key_operations,
+        )
     };
     // Interactive dashboard takes over stdout's terminal; a pipe
     // degrades honestly to snapshots/JSON below (never ANSI).
@@ -4756,10 +4778,14 @@ fn note_semantic_lane_sealed() {
 /// Optional lane startup: no manifests means no Detailed Session, maps,
 /// links or cursor. A refused live startup keeps the shell lane for
 /// its honest `unavailable` summary; broad Inventory runs either way.
+/// Under `--key-operations` the lane first attempts a linked journal
+/// start; a refused journal start keeps S1 with the finite journal
+/// reason and retries ordinary.
 fn start_semantic_lane(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     scope: &Scope,
     backend: crate::attach::BackendSelection,
+    key_operations: bool,
 ) -> Option<crate::inventory_semantics::AttestedSemanticLane> {
     // The bytes rule before any semantic-lane BPF work: a stale or
     // mismatched embedded object degrades here with the plain mismatch
@@ -4775,6 +4801,55 @@ fn start_semantic_lane(
         ));
         return fallback_shell(coordinator, scope, backend);
     }
+    if key_operations {
+        let spec = crate::attach::journal::JournalSpec;
+        // Guard refusals at the mints disclose and end the startup
+        // here, exactly as without the flag: only a refused journal
+        // *start* retries ordinary, never a refused subset.
+        let (attach_subset, convert_subset) = seal_mint_start_subsets(coordinator)?;
+        match seal_start_live(attach_subset, convert_subset, scope, backend, Some(&spec)) {
+            Ok(lane) => {
+                note_semantic_lane_sealed();
+                return Some(lane);
+            }
+            Err(journal_refusal) => {
+                let reason = key_operations_refusal_reason(&journal_refusal);
+                coordinator.note_scope_gap(
+                    "key operations unavailable".into(),
+                    format!(
+                        "{reason}; broad inventory continues with S1 mechanisms and API results"
+                    ),
+                );
+            }
+        }
+    }
+    let (attach_subset, convert_subset) = seal_mint_start_subsets(coordinator)?;
+    match seal_start_live(attach_subset, convert_subset, scope, backend, None) {
+        Ok(lane) => {
+            note_semantic_lane_sealed();
+            Some(lane)
+        }
+        Err(refusal) => {
+            coordinator.note_scope_gap(
+                "semantic lane unavailable".into(),
+                format!("{refusal}; broad inventory continues without instance semantics"),
+            );
+            fallback_shell(coordinator, scope, backend)
+        }
+    }
+}
+
+/// Mint the attach + conversion subset pair over the same retained
+/// accepted sources, disclosing subset refusals; `None` when either
+/// mint fails (the retained inputs moved under the startup). The
+/// flag-on ordinary retry re-mints through this after the refused
+/// journal start consumed its subsets.
+fn seal_mint_start_subsets(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+) -> Option<(
+    crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
+    crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
+)> {
     let preparation = seal_prepare_subset(coordinator);
     for refusal in &preparation.refusals {
         coordinator.note_scope_gap(
@@ -4799,17 +4874,41 @@ fn start_semantic_lane(
             return None;
         }
     };
-    match seal_start_live(attach_subset, convert_subset, scope, backend) {
-        Ok(lane) => {
-            note_semantic_lane_sealed();
-            Some(lane)
+    Some((attach_subset, convert_subset))
+}
+
+/// Finite reason for a refused journal start. The build gate's own
+/// message is the single source for an omitted-build refusal;
+/// otherwise the parsed-bytes verdict decides (see below). Static
+/// causes win over the coarse live refusal so a missing pair or a
+/// build without the object is never hidden behind it.
+fn key_operations_refusal_reason(refusal: &crate::inventory_semantics::SemanticRefusal) -> String {
+    if let Err(error) = crate::attach::journal::JournalSpec.prepare() {
+        return format!("{error:#}");
+    }
+    key_operations_refusal_reason_from(crate::attach::journal_pair_preflight(), refusal)
+}
+
+/// Pure verdict behind [`key_operations_refusal_reason`]: a present,
+/// flavor-clean pair names the live refusal's own code; every other
+/// parsed shape names its static cause. (The omitted build never
+/// reaches here — the gate above refused it — so it folds into the
+/// live refusal's code.)
+fn key_operations_refusal_reason_from(
+    preflight: crate::attach::JournalPairPreflight,
+    refusal: &crate::inventory_semantics::SemanticRefusal,
+) -> String {
+    match preflight {
+        crate::attach::JournalPairPreflight::Available
+        | crate::attach::JournalPairPreflight::UnavailableInBuild => refusal.to_string(),
+        crate::attach::JournalPairPreflight::PairMissing(missing) => {
+            format!("journal-pair-missing: {missing}")
         }
-        Err(refusal) => {
-            coordinator.note_scope_gap(
-                "semantic lane unavailable".into(),
-                format!("{refusal}; broad inventory continues without instance semantics"),
-            );
-            fallback_shell(coordinator, scope, backend)
+        crate::attach::JournalPairPreflight::LoadError(detail) => {
+            format!("journal-pair-load-error: {detail}")
+        }
+        crate::attach::JournalPairPreflight::WrongDomain(detail) => {
+            format!("journal-pair-wrong-domain: {detail}")
         }
     }
 }
@@ -4852,6 +4951,7 @@ fn seal_start_live(
     convert_subset: crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
     scope: &Scope,
     backend: crate::attach::BackendSelection,
+    journal: Option<&crate::attach::journal::JournalSpec>,
 ) -> Result<
     crate::inventory_semantics::AttestedSemanticLane,
     crate::inventory_semantics::SemanticRefusal,
@@ -4865,6 +4965,7 @@ fn seal_start_live(
         convert_subset,
         scope,
         backend,
+        journal,
     )
 }
 
@@ -4886,29 +4987,39 @@ mod seal_startup_test {
     thread_local! {
         static PREPARE: std::cell::RefCell<VecDeque<Preparation>> =
             const { std::cell::RefCell::new(VecDeque::new()) };
-        static START: std::cell::RefCell<Option<StartVerdict>> =
-            const { std::cell::RefCell::new(None) };
+        static START: std::cell::RefCell<VecDeque<StartVerdict>> =
+            const { std::cell::RefCell::new(VecDeque::new()) };
     }
     pub(super) fn take_prepared() -> Option<Preparation> {
         PREPARE.with(|queued| queued.borrow_mut().pop_front())
     }
     pub(super) fn take_start_verdict() -> Option<StartVerdict> {
-        START.with(|verdict| verdict.borrow_mut().take())
+        START.with(|queued| queued.borrow_mut().pop_front())
     }
     pub(super) fn with<R>(
         prepares: Vec<Preparation>,
         start: Option<StartVerdict>,
         run: impl FnOnce() -> R,
     ) -> R {
+        with_start_queue(prepares, start.into_iter().collect(), run)
+    }
+    /// Queue several live-start verdicts, consumed in order: the
+    /// fallback twin scripts the journal refusal and the ordinary
+    /// retry behind it. Like `with`, leftovers are cleared.
+    pub(super) fn with_start_queue<R>(
+        prepares: Vec<Preparation>,
+        starts: Vec<StartVerdict>,
+        run: impl FnOnce() -> R,
+    ) -> R {
         struct Restore;
         impl Drop for Restore {
             fn drop(&mut self) {
                 PREPARE.with(|queued| queued.borrow_mut().clear());
-                START.with(|verdict| verdict.borrow_mut().take());
+                START.with(|queued| queued.borrow_mut().clear());
             }
         }
         PREPARE.with(|queued| queued.borrow_mut().extend(prepares));
-        START.with(|verdict| *verdict.borrow_mut() = start);
+        START.with(|queued| queued.borrow_mut().extend(starts));
         let _restore = Restore;
         run()
     }
@@ -5548,43 +5659,13 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             };
             let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
             if let Some(lane) = semantic.as_mut() {
-                // The machine owns its latch and retries; a refused
-                // hook simply services again on the next tick. The
-                // first refusal is kept instead of dropped: it names
-                // the lane's stop if the lane later holds with no
-                // latched reason of its own.
-                if let Err(reason) = lane.service_joint_with_acquisition(
+                Self::service_linked_joint_hook(
+                    lane,
                     coordinator,
-                    crate::inventory_semantics::JointServiceMode::Running,
                     &mut budget,
                     reborrow_acquisition(&mut acquisition),
-                ) {
-                    self.joint_tick_refusal.get_or_insert(reason);
-                }
-                // Linked-DD pump (§6.06): after machine service, on the
-                // shared per-hook budget, pump linked live DISCOVERY
-                // through the lane's owner seam. The machine keeps
-                // priority; the pump runs regardless of the machine
-                // outcome, and a fault only names the fallback stop
-                // reason — it never latches the machine. The pump is
-                // last in the hook, so the drained count needs no spend
-                // bookkeeping (re-add it if a later consumer follows
-                // the pump); an over-work answer still names the
-                // fallback reason, like the machine's distrust.
-                let work = budget
-                    .remaining_actions
-                    .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM);
-                match lane.service_linked_live_discovery(work, budget.deadline) {
-                    Ok(records) if records <= work => {}
-                    Ok(_) => {
-                        self.joint_tick_refusal.get_or_insert(
-                            crate::inventory_semantics::SemanticRefusal::Unavailable,
-                        );
-                    }
-                    Err(reason) => {
-                        self.joint_tick_refusal.get_or_insert(reason);
-                    }
-                }
+                    &mut self.joint_tick_refusal,
+                );
             }
             return;
         }
@@ -5817,6 +5898,74 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
 }
 
 impl ClassicDriver<'_> {
+    /// Linked Joint hook (§6.06): pump linked live DISCOVERY first
+    /// with a guaranteed share, then service the machine on the same
+    /// shared per-hook budget (R1, mirroring the unlinked rule).
+    fn service_linked_joint_hook(
+        lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        budget: &mut crate::inventory_semantics::JointWorkBudget,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+        tick_refusal: &mut Option<crate::inventory_semantics::SemanticRefusal>,
+    ) {
+        // Linked-DD pump (§6.06): pump first with a guaranteed share.
+        // When the shared budget holds more than one action and the
+        // hook deadline stands, pump `(remaining - 1).min(256)`
+        // through the lane's owner seam and spend the drained records,
+        // reserving one action for the machine below. The budget gates
+        // mirror `JointWorkBudget::available`/`spend`, which stay
+        // private to the machine (`machine.rs`); this arm reads and
+        // spends the shared fields directly. A fault or over-work
+        // answer records `Unavailable` for the fallback stop reason
+        // and charges the share it was given, but never latches the
+        // machine: it sets the capture's sticky discovery status, so
+        // the lane's coverage fails permanently at the next audit
+        // while publication proceeds with coverage failed. One-credit
+        // hooks skip the pump and advance the machine, as in the
+        // unlinked rule.
+        let mut pump_refusal = None;
+        if budget.remaining_actions > 1 && Instant::now() < budget.deadline {
+            let work = (budget.remaining_actions - 1)
+                .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM);
+            match lane.service_linked_live_discovery(work, budget.deadline) {
+                Ok(records) if records <= work => {
+                    budget.remaining_actions = budget.remaining_actions.saturating_sub(records);
+                }
+                // A refused pump drained up to its share before failing,
+                // so both refusal arms charge the share: `work` never
+                // exceeds `remaining - 1`, so the machine keeps at least
+                // one action and the hook keeps the 1024-action bound.
+                Ok(_) => {
+                    budget.remaining_actions -= work;
+                    pump_refusal = Some(crate::inventory_semantics::SemanticRefusal::Unavailable);
+                }
+                Err(reason) => {
+                    budget.remaining_actions -= work;
+                    pump_refusal = Some(reason);
+                }
+            }
+        }
+        // Then service the machine on the same budget, whatever the
+        // pump returned, so a DD fault cannot pre-empt EVENTS service.
+        // The machine owns its latch and retries; a refused hook
+        // simply services again on the next tick. The first refusal is
+        // kept instead of dropped: the machine's refusal from this
+        // hook wins over the pump's `Unavailable`, and it names the
+        // lane's stop if the lane later holds with no latched reason
+        // of its own.
+        if let Err(reason) = lane.service_joint_for_linked_hook(
+            coordinator,
+            crate::inventory_semantics::JointServiceMode::Running,
+            budget,
+            acquisition,
+        ) {
+            tick_refusal.get_or_insert(reason);
+        }
+        if let Some(reason) = pump_refusal {
+            tick_refusal.get_or_insert(reason);
+        }
+    }
+
     /// The settle above with an explicit wall bound (tests pose a
     /// short one; production passes the settle backstop). At the
     /// bound the finish abandons with its own settle-bound gap,
@@ -8100,6 +8249,7 @@ mod tests {
                         &|| Err(refusal),
                         None,
                         None,
+                        false,
                     )
                     .unwrap_err();
                     assert_eq!(
@@ -8143,6 +8293,7 @@ mod tests {
             crate::cli::IdentityBackendSelection::Auto,
             false,
             crate::cli::CallerMetadataMode::None,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -8190,6 +8341,7 @@ mod tests {
                 &|| panic!("refusal must precede host probing"),
                 None,
                 None,
+                false,
             )
             .expect_err("inventory with a bad --prearm-module path must refuse");
             assert!(
@@ -8298,6 +8450,7 @@ mod tests {
                     &|| Ok(crate::attach::MultiCapableHost::for_test()),
                     None,
                     None,
+                    false,
                 )
             },
         )
@@ -8349,6 +8502,7 @@ mod tests {
             &|| panic!("a genuine scan must not probe or load capture BPF"),
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(code, 0);
@@ -8411,6 +8565,7 @@ mod tests {
             &mut coordinator,
             &Scope::Pid(std::process::id()),
             crate::attach::BackendSelection::Auto,
+            false,
         );
         assert!(
             lane.as_ref().is_none_or(|lane| !lane.is_live()),
@@ -8611,6 +8766,7 @@ mod tests {
                     crate::cli::IdentityBackendSelection::Auto,
                     false,
                     crate::cli::CallerMetadataMode::None,
+                    false,
                 )
                 .unwrap_err();
                 assert!(
@@ -14380,6 +14536,339 @@ mod tests {
             discovery.get(),
             1,
             "the classic arm still services live discovery"
+        );
+    }
+
+    #[test]
+    fn linked_hook_pump_first_share_with_spending_machine() {
+        // R1: the pump runs first with `(remaining - 1).min(256)` and
+        // spends its drained records; the machine sees the remainder
+        // even when it wants the whole budget, so discovery still
+        // advances. Order pinned: pump precedes machine service.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        for (remaining, expect_work) in [(1024usize, 256usize), (300, 256), (100, 99), (2, 1)] {
+            let mut coordinator = coordinator();
+            let discovery = Rc::new(Cell::new(0));
+            let mut io = WindDownIo::completing();
+            io.discovery = Rc::clone(&discovery);
+            let mut lane = joint_lane(io, false);
+            lane.set_test_joint_linked(true);
+            lane.set_scripted_pump_drained_for_test(Some(expect_work));
+            lane.set_scripted_service_spend_for_test(Some(usize::MAX));
+            let mut budget = crate::inventory_semantics::JointWorkBudget {
+                remaining_actions: remaining,
+                deadline: Instant::now() + Duration::from_secs(10),
+            };
+            let mut tick_refusal = None;
+            ClassicDriver::service_linked_joint_hook(
+                &mut lane,
+                &mut coordinator,
+                &mut budget,
+                None,
+                &mut tick_refusal,
+            );
+            assert_eq!(
+                lane.pump_work_seen_for_test(),
+                &[expect_work],
+                "remaining={remaining}: pump work is (remaining - 1).min(256)"
+            );
+            assert_eq!(
+                lane.service_budget_seen_for_test(),
+                &[remaining - expect_work],
+                "remaining={remaining}: the machine sees remaining minus drained"
+            );
+            assert_eq!(
+                lane.hook_order_for_test(),
+                &["pump", "machine"],
+                "remaining={remaining}: the pump precedes machine service"
+            );
+            assert_eq!(
+                discovery.get(),
+                1,
+                "remaining={remaining}: discovery advances despite a greedy machine"
+            );
+            assert_eq!(
+                budget.remaining_actions, 0,
+                "remaining={remaining}: the machine spent the rest"
+            );
+            assert_eq!(
+                tick_refusal, None,
+                "remaining={remaining}: no refusal on the healthy path"
+            );
+            assert!(
+                lane.has_joint_machine(),
+                "remaining={remaining}: no latch on the healthy path"
+            );
+        }
+    }
+
+    #[test]
+    fn linked_hook_one_credit_skips_pump() {
+        // R1: a one-credit hook skips the pump and advances the
+        // machine, as in the unlinked rule.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        let mut coordinator = coordinator();
+        let discovery = Rc::new(Cell::new(0));
+        let mut io = WindDownIo::completing();
+        io.discovery = Rc::clone(&discovery);
+        let mut lane = joint_lane(io, false);
+        lane.set_test_joint_linked(true);
+        lane.set_scripted_pump_drained_for_test(Some(1));
+        lane.set_scripted_service_spend_for_test(Some(1));
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let mut tick_refusal = None;
+        ClassicDriver::service_linked_joint_hook(
+            &mut lane,
+            &mut coordinator,
+            &mut budget,
+            None,
+            &mut tick_refusal,
+        );
+        assert_eq!(
+            lane.pump_work_seen_for_test(),
+            &[] as &[usize],
+            "one credit never pumps"
+        );
+        assert_eq!(
+            lane.hook_order_for_test(),
+            &["machine"],
+            "one credit still advances the machine"
+        );
+        assert_eq!(
+            lane.service_budget_seen_for_test(),
+            &[1],
+            "the machine sees the one credit"
+        );
+        assert_eq!(discovery.get(), 0, "no discovery service on one credit");
+        assert_eq!(budget.remaining_actions, 0, "the machine spent it");
+        assert_eq!(tick_refusal, None, "no refusal on the one-credit path");
+    }
+
+    #[test]
+    fn linked_hook_pump_fault_services_machine_without_latch() {
+        // R1/D4: a pump fault never latches the machine; the machine
+        // is still serviced on the same budget, and the fallback stop
+        // reason keeps D4 precedence (the machine's refusal from the
+        // same hook wins over the pump's Unavailable).
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        // Fault alone: machine serviced, no latch, Unavailable kept.
+        {
+            let mut coordinator = coordinator();
+            let discovery = Rc::new(Cell::new(0));
+            let mut io = WindDownIo::completing();
+            io.discovery = Rc::clone(&discovery);
+            let mut lane = joint_lane(io, false);
+            lane.set_test_joint_linked(true);
+            lane.set_scripted_pump_fault_for_test(true);
+            lane.set_scripted_service_spend_for_test(Some(0));
+            let mut budget = crate::inventory_semantics::JointWorkBudget {
+                remaining_actions: 1024,
+                deadline: Instant::now() + Duration::from_secs(10),
+            };
+            let mut tick_refusal = None;
+            ClassicDriver::service_linked_joint_hook(
+                &mut lane,
+                &mut coordinator,
+                &mut budget,
+                None,
+                &mut tick_refusal,
+            );
+            assert_eq!(
+                lane.hook_order_for_test(),
+                &["pump", "machine"],
+                "a faulting pump still runs first"
+            );
+            assert_eq!(lane.pump_work_seen_for_test(), &[256]);
+            assert_eq!(
+                lane.service_budget_seen_for_test(),
+                &[768],
+                "a fault charges the pump share, so the machine sees the remainder"
+            );
+            assert_eq!(discovery.get(), 1, "the faulting pump still ran");
+            assert_eq!(
+                tick_refusal,
+                Some(crate::inventory_semantics::SemanticRefusal::Unavailable),
+                "the pump fault names the fallback stop reason"
+            );
+            assert!(
+                lane.has_joint_machine(),
+                "a pump fault never latches the machine"
+            );
+            assert_eq!(
+                lane.joint_disposition_reason(),
+                None,
+                "no disposition latched by a pump fault"
+            );
+        }
+        // Precedence: the machine's refusal from the same hook wins.
+        let mut coordinator2 = coordinator();
+        let discovery2 = Rc::new(Cell::new(0));
+        let mut io2 = WindDownIo::completing();
+        io2.discovery = Rc::clone(&discovery2);
+        let mut lane2 = joint_lane(io2, false);
+        lane2.set_test_joint_linked(true);
+        lane2.set_scripted_pump_fault_for_test(true);
+        lane2.set_scripted_service_spend_for_test(Some(0));
+        lane2.set_scripted_service_outcome_for_test(Some(Err(
+            crate::inventory_semantics::SemanticRefusal::ProviderStorage,
+        )));
+        let mut budget2 = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let mut tick_refusal2 = None;
+        ClassicDriver::service_linked_joint_hook(
+            &mut lane2,
+            &mut coordinator2,
+            &mut budget2,
+            None,
+            &mut tick_refusal2,
+        );
+        assert_eq!(
+            tick_refusal2,
+            Some(crate::inventory_semantics::SemanticRefusal::ProviderStorage),
+            "the machine's refusal wins over the pump's Unavailable"
+        );
+        assert_eq!(
+            lane2.hook_order_for_test(),
+            &["pump", "machine"],
+            "precedence still runs the pump first"
+        );
+    }
+
+    #[test]
+    fn linked_hook_pump_over_work_charges_share_without_latch() {
+        // Over-work: a pump that drains past its share refuses
+        // `Unavailable`, yet still charges the share it was given, so
+        // the machine sees the remainder and the hook keeps the
+        // 1024-action bound. The machine is still serviced on the
+        // same budget, and nothing latches.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        let mut coordinator = coordinator();
+        let discovery = Rc::new(Cell::new(0));
+        let mut io = WindDownIo::completing();
+        io.discovery = Rc::clone(&discovery);
+        let mut lane = joint_lane(io, false);
+        lane.set_test_joint_linked(true);
+        lane.set_scripted_pump_drained_for_test(Some(257));
+        lane.set_scripted_service_spend_for_test(Some(0));
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let mut tick_refusal = None;
+        ClassicDriver::service_linked_joint_hook(
+            &mut lane,
+            &mut coordinator,
+            &mut budget,
+            None,
+            &mut tick_refusal,
+        );
+        assert_eq!(
+            lane.hook_order_for_test(),
+            &["pump", "machine"],
+            "an over-work pump still runs first"
+        );
+        assert_eq!(lane.pump_work_seen_for_test(), &[256]);
+        assert_eq!(
+            lane.service_budget_seen_for_test(),
+            &[768],
+            "over-work charges the pump share, so the machine sees the remainder"
+        );
+        assert_eq!(discovery.get(), 1, "the over-work pump still ran");
+        assert_eq!(
+            tick_refusal,
+            Some(crate::inventory_semantics::SemanticRefusal::Unavailable),
+            "the over-work pump names the fallback stop reason"
+        );
+        assert!(
+            lane.has_joint_machine(),
+            "over-work never latches the machine"
+        );
+        assert_eq!(
+            lane.joint_disposition_reason(),
+            None,
+            "no disposition latched by over-work"
+        );
+    }
+
+    #[test]
+    fn linked_hook_after_finish_begins_pumps_nothing() {
+        // Driver-level Finish pin: once Finish begins, hooks step the
+        // finish and never pump linked discovery, so the discovery
+        // counter stays put. The machine-level no-re-entry twin lives
+        // beside the machine (`linked_finish_never_reenters_running_service`).
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let discovery = Rc::new(Cell::new(0));
+        let mut io = WindDownIo::completing();
+        io.discovery = Rc::clone(&discovery);
+        driver.semantic = Some(wind_down_lane(io));
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_scripted_joint_init_for_test(Some(Ok(())));
+        driver.initialize_joint_lane();
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_test_joint_linked(true);
+        driver.on_tick();
+        assert_eq!(discovery.get(), 1, "a running hook pumps linked discovery");
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_scripted_finish_begin_for_test(Some(Ok(())));
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_scripted_finish_poll_for_test(Some(Ok(
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending,
+            )));
+        driver.on_stop_requested();
+        assert!(
+            matches!(driver.joint_finish, JointFinishDriver::Polling),
+            "the stop begins the joint finish"
+        );
+        driver.on_tick();
+        assert_eq!(
+            discovery.get(),
+            1,
+            "no pump after Finish begins (first hook)"
+        );
+        driver.on_tick();
+        assert_eq!(
+            discovery.get(),
+            1,
+            "no pump after Finish begins (second hook)"
+        );
+        assert_eq!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .pump_work_seen_for_test()
+                .len(),
+            1,
+            "no pump call after Finish begins (driver-level freeze)"
         );
     }
 
@@ -21835,6 +22324,7 @@ mod seal_readiness_tests {
                     &mut coordinator,
                     &scope,
                     crate::attach::BackendSelection::Auto,
+                    false,
                 )
             },
         );
@@ -21861,6 +22351,7 @@ mod seal_readiness_tests {
             &mut coordinator,
             &scope,
             crate::attach::BackendSelection::Auto,
+            false,
         );
         assert!(lane.is_none(), "no subset seats no lane");
         assert!(
@@ -21889,6 +22380,7 @@ mod seal_readiness_tests {
                     &mut coordinator,
                     &scope,
                     crate::attach::BackendSelection::Auto,
+                    false,
                 )
             },
         );
@@ -21927,6 +22419,7 @@ mod seal_readiness_tests {
                     &mut coordinator,
                     &scope,
                     crate::attach::BackendSelection::Auto,
+                    false,
                 )
             },
         );
@@ -21960,6 +22453,7 @@ mod seal_readiness_tests {
                     &mut coordinator,
                     &scope,
                     crate::attach::BackendSelection::Auto,
+                    false,
                 )
             },
         );
@@ -21974,5 +22468,341 @@ mod seal_readiness_tests {
             1,
             "the refusal's own disclosure stays"
         );
+    }
+
+    /// The run gates the flag before any load: on a non-journal build
+    /// the refusal names the finite build reason. On a journal build
+    /// the gate passes — the twin proves it with a colliding
+    /// destination pair, which refuses later (pre-lane, no BPF)
+    /// instead of the build reason.
+    #[test]
+    fn key_operations_run_gates_build_before_any_load() {
+        use crate::cli::{CallerMetadataMode, IdentityBackendSelection, ScopeArg};
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            let error = super::run(
+                ScopeArg::Pid(std::process::id()),
+                &[],
+                &[],
+                &[],
+                &HookRegistry::builtin(),
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                CaptureMode::Auto,
+                crate::attach::BackendSelection::Auto,
+                None,
+                None,
+                IdentityBackendSelection::Auto,
+                false,
+                CallerMetadataMode::None,
+                true,
+            )
+            .expect_err("a flag-on run on a non-journal build refuses");
+            assert!(
+                format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+                "the refusal names the build reason: {error:#}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let shared = dir.path().join("result.json");
+        std::fs::write(&shared, b"existing event log\n").unwrap();
+        let error = super::run(
+            ScopeArg::Pid(std::process::id()),
+            &[],
+            &[],
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some(&shared),
+            false,
+            Some(&shared),
+            None,
+            None,
+            CaptureMode::Auto,
+            crate::attach::BackendSelection::Auto,
+            None,
+            None,
+            IdentityBackendSelection::Auto,
+            false,
+            CallerMetadataMode::None,
+            true,
+        )
+        .expect_err("colliding destinations refuse");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("aliases"),
+            "past the gate, the later check fires: {text}"
+        );
+        assert!(
+            !text.contains("journal-pair-unavailable-in-build"),
+            "past the gate, the build reason never fires: {text}"
+        );
+    }
+
+    /// The run refuses the flag under `--capture scan` for
+    /// programmatic callers too, mirroring the parse refusal.
+    #[test]
+    fn key_operations_run_refuses_scan() {
+        use crate::cli::{CallerMetadataMode, IdentityBackendSelection, ScopeArg};
+        let error = super::run(
+            ScopeArg::Pid(std::process::id()),
+            &[],
+            &[],
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
+            None,
+            None,
+            IdentityBackendSelection::Auto,
+            false,
+            CallerMetadataMode::None,
+            true,
+        )
+        .expect_err("a flag-on scan run refuses");
+        assert!(
+            format!("{error:#}").contains("--key-operations requires --capture auto or native"),
+            "the refusal names the pairing: {error:#}"
+        );
+    }
+
+    /// A refused journal start keeps S1: the lane retries ordinary
+    /// with fresh mints, seats the live lane, and the output names
+    /// the finite journal reason. (The scripted refusal stands in for
+    /// a pair/load/domain failure; the classifier re-derives the
+    /// static reason from the real build and bytes.)
+    #[test]
+    fn key_operations_journal_refusal_keeps_s1_with_reason() {
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with_start_queue(
+            vec![
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+            ],
+            vec![
+                Err(SemanticRefusal::Attachment),
+                Ok(joint_lane(WindDownIo::completing(), false)),
+            ],
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                )
+            },
+        );
+        let lane = lane.expect("the ordinary retry seats");
+        assert!(lane.is_live(), "the retry seats a live lane");
+        assert_eq!(
+            take_sealed_for_test().len(),
+            1,
+            "the reseated lane seals once"
+        );
+        let gaps = gaps_for_subject(&mut coordinator, "key operations unavailable");
+        assert_eq!(gaps.len(), 1, "the journal reason is named");
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            assert!(
+                gaps[0].1.contains("journal-pair-unavailable-in-build"),
+                "the build reason is named: {}",
+                gaps[0].1
+            );
+        } else {
+            assert!(
+                gaps[0].1.contains("semantic_attachment_refused"),
+                "the refusal class is named: {}",
+                gaps[0].1
+            );
+        }
+    }
+
+    /// A journal refusal followed by an ordinary refusal keeps
+    /// today's shell fallback: no live lane, no seal line, and the
+    /// ordinary refusal's own disclosure.
+    #[test]
+    fn key_operations_double_refusal_keeps_shell_fallback() {
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with_start_queue(
+            vec![
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+            ],
+            vec![
+                Err(SemanticRefusal::Attachment),
+                Err(SemanticRefusal::Unavailable),
+            ],
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                )
+            },
+        );
+        let lane = lane.expect("the shell fallback seats");
+        assert!(!lane.is_live(), "the fallback owns no session");
+        assert!(
+            take_sealed_for_test().is_empty(),
+            "no seal line on a refused start"
+        );
+        let gaps = gaps_for_subject(&mut coordinator, "semantic lane unavailable");
+        assert_eq!(gaps.len(), 1, "the ordinary refusal's own disclosure stays");
+        assert!(
+            gaps[0].1.contains("semantic_unavailable"),
+            "the disclosure names the ordinary (second) refusal: {}",
+            gaps[0].1
+        );
+    }
+
+    /// Semantic guards refuse identically under the flag: subset
+    /// refusals (multi/PID/target/safety) at either mint keep their
+    /// disclosures with no bypass and no journal attempt.
+    #[test]
+    fn key_operations_guard_refusals_keep_disclosures_without_bypass() {
+        take_sealed_for_test();
+        // Subset-level refusals never reach the start verdicts: no
+        // verdict is queued, so any start attempt would run the real
+        // factory (and fail the twin on BPF access). Both mints are
+        // covered: the attach mint and the conversion envelope.
+        for preparations in [
+            vec![SubsetPreparation {
+                subset: None,
+                refusals: vec![
+                    SemanticRefusal::Unattested,
+                    SemanticRefusal::IncompleteProvider,
+                ],
+            }],
+            vec![
+                some_preparation(),
+                SubsetPreparation {
+                    subset: None,
+                    refusals: vec![SemanticRefusal::Unattested],
+                },
+            ],
+        ] {
+            let expected = preparations
+                .iter()
+                .map(|preparation| preparation.refusals.len())
+                .sum::<usize>();
+            let mut coordinator = coordinator();
+            let scope = Scope::Pid(std::process::id());
+            let lane = seal_startup_test::with_start_queue(preparations, vec![], || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                )
+            });
+            assert!(lane.is_none(), "refused subsets seat no lane");
+            assert!(
+                take_sealed_for_test().is_empty(),
+                "no seal line on a refused subset"
+            );
+            assert_eq!(
+                gaps_for_subject(&mut coordinator, "semantic subset refused").len(),
+                expected,
+                "the guard disclosures stay"
+            );
+        }
+    }
+
+    /// Flag off adds nothing: an ordinary sealed start seats its lane
+    /// with exactly one seal line and no key-operations gap.
+    #[test]
+    fn key_operations_absent_flag_off_seals_plain() {
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    false,
+                )
+            },
+        );
+        assert!(lane.is_some(), "the scripted seal seats a lane");
+        assert_eq!(
+            take_sealed_for_test().len(),
+            1,
+            "exactly one seal line with the exact wording"
+        );
+        assert!(
+            gaps_for_subject(&mut coordinator, "key operations unavailable").is_empty(),
+            "flag off names no key-operations gap"
+        );
+    }
+
+    /// Every parsed pair shape maps to its finite reason: a present
+    /// pair names the live refusal's own code, and each corrupt shape
+    /// names its static cause.
+    #[test]
+    fn key_operations_refusal_reason_names_every_pair_shape() {
+        use crate::attach::JournalPairPreflight;
+        for (preflight, expected) in [
+            (
+                JournalPairPreflight::Available,
+                "semantic_attachment_refused",
+            ),
+            (
+                JournalPairPreflight::PairMissing("p11_entry_journal".into()),
+                "journal-pair-missing: p11_entry_journal",
+            ),
+            (
+                JournalPairPreflight::LoadError("journal object unparseable".into()),
+                "journal-pair-load-error: journal object unparseable",
+            ),
+            (
+                JournalPairPreflight::WrongDomain("ordinary roots present".into()),
+                "journal-pair-wrong-domain: ordinary roots present",
+            ),
+        ] {
+            assert_eq!(
+                super::key_operations_refusal_reason_from(preflight, &SemanticRefusal::Attachment),
+                expected,
+            );
+        }
     }
 }

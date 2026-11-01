@@ -32,6 +32,7 @@ use crate::attach::{
 };
 use crate::discovery::caller_registry::ModuleKey;
 use crate::discovery::caller_registry::{OsProcessSource, now_ns};
+use crate::discovery::engine::inventory::image_guard::ImageAcquisition;
 use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
 use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
 use crate::discovery::identity::RetainedInventoryTarget;
@@ -941,6 +942,39 @@ pub(crate) struct AttestedSemanticLane {
     /// machine: the pump requires both (§6.06).
     #[cfg(test)]
     test_joint_linked: bool,
+    /// Tests-only scripted pump drain: when set, the substituted pump
+    /// arm returns this many records instead of zero, so the driver's
+    /// shared-budget spend is observable without a live Session.
+    #[cfg(test)]
+    scripted_pump_drained: Option<usize>,
+    /// Tests-only pump fault: when set, the substituted pump arm
+    /// refuses `Unavailable` after touching the owner seam, mirroring
+    /// a live transport fault that sets the sticky capture status.
+    #[cfg(test)]
+    scripted_pump_fault: bool,
+    /// Tests-only pump work log: every linked pump call records its
+    /// `work` here, including zero-work calls that service nothing.
+    #[cfg(test)]
+    pump_work_seen: Vec<usize>,
+    /// Tests-only machine budget log: the driver-hook machine service
+    /// records the shared budget's remaining actions at entry.
+    #[cfg(test)]
+    service_budget_seen: Vec<usize>,
+    /// Tests-only hook order log: the pump records `"pump"` and the
+    /// driver-hook machine service records `"machine"`, pinning the
+    /// R1 pump-first order.
+    #[cfg(test)]
+    hook_order: Vec<&'static str>,
+    /// Tests-only scripted machine spend: when set, the driver-hook
+    /// machine service spends this many shared-budget actions instead
+    /// of running a live machine, so budget sharing is observable
+    /// without privilege. A huge value spends all that remains.
+    #[cfg(test)]
+    scripted_service_spend: Option<usize>,
+    /// Tests-only scripted machine outcome: when set, the driver-hook
+    /// machine service answers it instead of running a live machine.
+    #[cfg(test)]
+    scripted_service_outcome: Option<Result<JointServiceProgress, SemanticRefusal>>,
     /// Tests-only scripted Joint-machine init outcome: when set,
     /// `initialize_joint` answers it without a live Session, so
     /// the driver's D5 wiring runs unprivileged. A scripted Ok
@@ -1575,6 +1609,20 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             test_joint_linked: false,
             #[cfg(test)]
+            scripted_pump_drained: None,
+            #[cfg(test)]
+            scripted_pump_fault: false,
+            #[cfg(test)]
+            pump_work_seen: Vec::new(),
+            #[cfg(test)]
+            service_budget_seen: Vec::new(),
+            #[cfg(test)]
+            hook_order: Vec::new(),
+            #[cfg(test)]
+            scripted_service_spend: None,
+            #[cfg(test)]
+            scripted_service_outcome: None,
+            #[cfg(test)]
             scripted_joint_init: None,
             #[cfg(test)]
             joint_init_calls: 0,
@@ -1644,16 +1692,18 @@ impl AttestedSemanticLane {
     /// conversion envelope. A second mint fails only when the retained
     /// inputs moved under the startup, which refuses honestly. The
     /// minted shell domain is replaced with the Session's native domain.
+    /// A journal request starts the linked session; `None` stays ordinary.
     pub(crate) fn start_live(
         attach_subset: AttestedSubset,
         convert_subset: AttestedSubset,
         scope: &Scope,
         backend: BackendSelection,
+        journal: Option<&crate::attach::journal::JournalSpec>,
     ) -> Result<Self, SemanticRefusal> {
         if convert_subset.plan().slots.is_empty() {
             return Err(SemanticRefusal::Unattested);
         }
-        let (session, attached) = Session::start_attested(attach_subset, scope, backend)
+        let (session, attached) = Session::start_attested(attach_subset, scope, backend, journal)
             .map_err(|_| SemanticRefusal::Attachment)?;
         Self::from_live_owner(session, attached, convert_subset).map_err(|(_, reason)| reason)
     }
@@ -1725,6 +1775,20 @@ impl AttestedSemanticLane {
             test_joint_machine: false,
             #[cfg(test)]
             test_joint_linked: false,
+            #[cfg(test)]
+            scripted_pump_drained: None,
+            #[cfg(test)]
+            scripted_pump_fault: false,
+            #[cfg(test)]
+            pump_work_seen: Vec::new(),
+            #[cfg(test)]
+            service_budget_seen: Vec::new(),
+            #[cfg(test)]
+            hook_order: Vec::new(),
+            #[cfg(test)]
+            scripted_service_spend: None,
+            #[cfg(test)]
+            scripted_service_outcome: None,
             #[cfg(test)]
             scripted_joint_init: None,
             #[cfg(test)]
@@ -2171,6 +2235,83 @@ impl AttestedSemanticLane {
         self.test_joint_linked = on;
     }
 
+    /// Script the substituted pump drain (or clear it with `None`):
+    /// the pump returns this many records so the driver's spend is
+    /// observable without a live Session.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_pump_drained_for_test(&mut self, drained: Option<usize>) {
+        self.scripted_pump_drained = drained;
+    }
+
+    /// Script a substituted pump fault: the pump touches the owner
+    /// seam then refuses `Unavailable`, mirroring a live fault.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_pump_fault_for_test(&mut self, on: bool) {
+        self.scripted_pump_fault = on;
+    }
+
+    /// Script the driver-hook machine spend (or clear it with `None`):
+    /// the machine service spends this many shared-budget actions
+    /// instead of running a live machine.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_service_spend_for_test(&mut self, spend: Option<usize>) {
+        self.scripted_service_spend = spend;
+    }
+
+    /// Script the driver-hook machine outcome (or clear it with
+    /// `None`): the machine service answers it instead of running a
+    /// live machine.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_service_outcome_for_test(
+        &mut self,
+        outcome: Option<Result<JointServiceProgress, SemanticRefusal>>,
+    ) {
+        self.scripted_service_outcome = outcome;
+    }
+
+    /// Pump work observed by this lane, in call order.
+    #[cfg(test)]
+    pub(crate) fn pump_work_seen_for_test(&self) -> &[usize] {
+        &self.pump_work_seen
+    }
+
+    /// Shared-budget remaining observed at each driver-hook machine
+    /// service, in call order.
+    #[cfg(test)]
+    pub(crate) fn service_budget_seen_for_test(&self) -> &[usize] {
+        &self.service_budget_seen
+    }
+
+    /// Hook order observed by this lane (`"pump"`/`"machine"`).
+    #[cfg(test)]
+    pub(crate) fn hook_order_for_test(&self) -> &[&'static str] {
+        &self.hook_order
+    }
+
+    /// Fault the live pump through the test seam, so the live
+    /// discovery fault twins can fault a real linked lane without
+    /// kernel surgery: a malformed marker stages at the head of the
+    /// live session's queue, the next pump observes it first, marks
+    /// the capture's sticky discovery status and refuses — while the
+    /// capture keeps running, as under a genuine discovery fault.
+    /// Linkage still derives from the real seal: the seam injects
+    /// only the fault, never authority. No live lane means no-op
+    /// (the twin's refusal assertion then fails on its own).
+    #[cfg(test)]
+    pub(crate) fn stage_malformed_discovery_for_test(&mut self) {
+        if let Some(live) = self.live.as_mut() {
+            live.session.stage_malformed_discovery_for_test();
+        }
+    }
+
+    /// Read the live seal's attach generation through the test seam
+    /// (read-only): the marker-gating twin observes publication
+    /// without disturbing the lane. `None` without a live lane.
+    #[cfg(test)]
+    pub(crate) fn live_seal_generation_for_test(&self) -> Option<u64> {
+        self.live.as_ref().map(|live| live.attached.generation())
+    }
+
     /// Script the Joint-machine init outcome (or clear it with
     /// `None`): a scripted Ok marks the lane Joint without a live
     /// machine, so the driver's D5 wiring runs unprivileged.
@@ -2527,10 +2668,11 @@ impl AttestedSemanticLane {
     /// bounded: exit-retained, finished, machineless, unlinked or
     /// budget-empty calls answer `Ok(0)` without touching the seam.
     /// A transport fault answers `Err(Unavailable)` and never latches
-    /// the machine: linked publication completes without DD, and the
-    /// next hook services both again. Complements the machine-side
-    /// prohibition (linked Joint keeps its publication-bearing
-    /// DISCOVERY for its existing owner).
+    /// the machine, but it sets the capture's sticky discovery status,
+    /// so the linked lane's coverage fails permanently at the next
+    /// audit while publication proceeds with coverage failed.
+    /// Complements the machine-side prohibition (linked Joint keeps
+    /// its publication-bearing DISCOVERY for its existing owner).
     pub(crate) fn service_linked_live_discovery(
         &mut self,
         work: usize,
@@ -2554,6 +2696,11 @@ impl AttestedSemanticLane {
         if !linked {
             return Ok(0);
         }
+        #[cfg(test)]
+        {
+            self.pump_work_seen.push(work);
+            self.hook_order.push("pump");
+        }
         if work == 0 || Instant::now() >= deadline {
             return Ok(0);
         }
@@ -2562,21 +2709,56 @@ impl AttestedSemanticLane {
             if !self.test_gated {
                 test.service_live_discovery();
             }
+            if self.scripted_pump_fault {
+                return Err(SemanticRefusal::Unavailable);
+            }
+            if let Some(drained) = self.scripted_pump_drained {
+                return Ok(drained);
+            }
             return Ok(0);
         }
         if let Some(live) = self.live.as_mut()
             && !live.gated
             && !live.finished
         {
-            // A fault refuses without latching the machine: linked
-            // publication completes without DD, and the next hook
-            // services both again.
+            // A fault refuses without latching the machine, but sets
+            // the sticky discovery status: the next audit fails the
+            // lane's coverage permanently while publication proceeds
+            // with coverage failed.
             return live
                 .capture
                 .service_live_discovery_until(&mut live.session, work, deadline)
                 .map_err(|_| SemanticRefusal::Unavailable);
         }
         Ok(0)
+    }
+
+    /// Machine service for the linked driver hook (§6.06): production
+    /// delegates to the Joint machine; tests record the shared-budget
+    /// entry and, when scripted, spend and answer without a live
+    /// machine so R1 order and budget sharing are observable
+    /// unprivileged. Unscripted tests delegate exactly.
+    pub(crate) fn service_joint_for_linked_hook(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        mode: JointServiceMode,
+        budget: &mut JointWorkBudget,
+        acquisition: Option<&mut dyn ImageAcquisition>,
+    ) -> Result<JointServiceProgress, SemanticRefusal> {
+        #[cfg(test)]
+        {
+            self.service_budget_seen.push(budget.remaining_actions);
+            self.hook_order.push("machine");
+            if self.scripted_service_spend.is_some() || self.scripted_service_outcome.is_some() {
+                self.joint_service_calls += 1;
+                let spend = self.scripted_service_spend.unwrap_or(0);
+                budget.remaining_actions = budget.remaining_actions.saturating_sub(spend);
+                return self
+                    .scripted_service_outcome
+                    .unwrap_or(Ok(JointServiceProgress::Pending));
+            }
+        }
+        self.service_joint_with_acquisition(coordinator, mode, budget, acquisition)
     }
 
     /// Whether the live Session retains a linked journal producer (§6.06).
@@ -5155,6 +5337,72 @@ mod joint_terminal_tests {
         let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
         assert_eq!(lane.service_linked_live_discovery(8, expired), Ok(0));
         assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn live_start_refuses_unattested_before_any_factory_work() {
+        // The conversion-envelope guard runs before the attested
+        // factory with or without a journal request: no BPF access,
+        // no bypass under the flag.
+        use crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset;
+        for journal in [None, Some(&crate::attach::journal::JournalSpec)] {
+            let attach = AttestedSubset::scripted(
+                crate::plan::AttachPlan::from_slots(vec![]),
+                PinnedObjects::empty(),
+                BTreeMap::new(),
+            );
+            let convert = AttestedSubset::scripted(
+                crate::plan::AttachPlan::from_slots(vec![]),
+                PinnedObjects::empty(),
+                BTreeMap::new(),
+            );
+            assert!(
+                matches!(
+                    AttestedSemanticLane::start_live(
+                        attach,
+                        convert,
+                        &crate::attach::Scope::Pid(std::process::id()),
+                        crate::attach::BackendSelection::Auto,
+                        journal,
+                    ),
+                    Err(SemanticRefusal::Unattested)
+                ),
+                "journal={}: an empty conversion envelope refuses first",
+                journal.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn live_pump_arm_calls_the_capture_and_maps_faults() {
+        // The live arm needs privilege, so this pins its wiring: the
+        // arm calls the shared live-discovery service on the real
+        // session, maps a transport fault to Unavailable, and never
+        // assigns the machine (a fault must not latch). Kills the
+        // neutered-live mutant, which drops the capture call.
+        let production = include_str!("semantics.rs")
+            .split_once("mod joint_terminal_tests")
+            .unwrap()
+            .0;
+        let arm = production
+            .split_once("fn service_linked_live_discovery(")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        assert!(
+            arm.contains(".service_live_discovery_until(&mut live.session, work, deadline)"),
+            "the live arm pumps through the shared service: {arm}"
+        );
+        assert!(
+            arm.contains("SemanticRefusal::Unavailable"),
+            "a live transport fault refuses: {arm}"
+        );
+        assert!(
+            !arm.contains("live_joint_machine = "),
+            "a live fault never latches the machine: {arm}"
+        );
     }
 
     #[test]

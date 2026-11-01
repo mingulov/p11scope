@@ -72,8 +72,8 @@ refusal during a `--manifest` capture ends the first stop with an incomplete
 report and a nonzero exit. Uncertain native ownership stays retained and
 replacement admission stays blocked; the refusal is not proof of clean detach.
 
-In v0.6.0 release builds, key operations will be reported under the planned per-key-tracking opt-in
-`p11scope inventory --key-operations` (default off; the flag is not implemented yet),
+In v0.6.0 release builds, key operations use the per-key-tracking opt-in
+`p11scope inventory --key-operations` (default off),
 with the following birth-marker limits. If any watched call of a program is
 not fully captured — the call ran outside the selected scope, its binary
 interface was refused, or the call was dropped (a lost identity, start record

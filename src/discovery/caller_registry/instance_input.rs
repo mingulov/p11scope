@@ -2333,12 +2333,15 @@ impl CallerRegistry {
                 &self.joint_keyuse,
             )
         } else {
+            // The linkage derives from the latched flag, never a
+            // literal: this arm means unlinked only while the branch
+            // above tests `linked`.
             crate::key_operation_projection::producer::commit_with_journal_linked(
                 revision,
                 &stagings,
                 projection,
                 &self.joint_keyuse,
-                false,
+                linked,
             )
         }
     }
@@ -4429,5 +4432,27 @@ mod journal_unavailable_tests {
             "linked without births keeps its 0.6.0 meaning"
         );
         let _ = ObjectObservations::unavailable(0, "journal_unavailable");
+    }
+
+    /// The commit entry takes its linkage from the derived `linked`
+    /// flag, never a literal: the unlinked arm must stay honest if
+    /// the branch condition ever moves.
+    #[test]
+    fn joint_observations_commit_derives_linkage_without_literals() {
+        let production = include_str!("instance_input.rs")
+            .split_once("fn joint_observations(")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        assert!(
+            production.contains("commit_with_journal_linked("),
+            "the commit entry is pinned: {production}"
+        );
+        assert!(
+            !production.contains("false"),
+            "linkage derives from the linked flag, not a literal: {production}"
+        );
     }
 }

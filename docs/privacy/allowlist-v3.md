@@ -459,24 +459,23 @@ builds the journal object. The owner approved both for FULL/P0 release builds (o
 final yes/no at freeze); the embedding is WU-2 work, and shipping it is gated on the WU-4 live cells
 (the R52 cells and marker cost) and the freeze decision. The linked birth seals
 activate only when the user opts in to per-key tracking (owner B1, 2026-11-01), with no new read.
-No formal privacy sign-off before about v0.9 (OD25).** The opt-in will be
-`p11scope inventory --key-operations` (default off; selection ruling 2026-11-01, parser lands with WU-2).
+No formal privacy sign-off before about v0.9 (OD25).** The opt-in is
+`p11scope inventory --key-operations` (default off; selection ruling 2026-11-01).
 At this revision the kernel publish/dirty hooks are implemented
 and the Session-loop seal wire is pending (WU-2); until it lands, no production
 caller mints births from marker state.
-In a marker build, this adds state only in a Detailed lane Session that has published an attach generation
-(closure): every `inventory --manifest` capture whose semantic lane seals publishes the attach generation
-and arms the marker, with or without the opt-in. Under `--system` that is one record per process that
-execs after closure. WU-2 is to arm the marker only under the flag if it can (selection ruling item 7);
-this text changes with it.
+In a marker build, this adds state only in a lane Session that has published an attach generation
+(closure): only an `inventory --manifest --key-operations` capture whose semantic lane seals over the
+loaded journal pair publishes the attach generation and arms the marker. Ordinary captures seal with
+generation 0 and never touch the attach cell; their marker hooks stop at the gated read. Under `--system`
+with the flag, that is one record per process that execs after closure.
 In a marker build, non-counter metrics, profile and trace Sessions load the same Detailed object
 (counter-mode Sessions load counter objects), so the control map exists there,
 zeroed and frozen, and the hooks do one gated read. The marker adds no state to them. Inventory and counter
 objects do not contain the map. The journal object instead carries the control map and the DIRTY gap writer
-but no READY publish or exec-ID read, and its control row is only metadata-checked today, not yet read back
-as zero or frozen; WU-2 has the obligation to add the zero-check and freeze. The journal object is
-unreachable in production today. v1 is unchanged; the v2 table carries one row for this read beside the
-Exec task ticket row.
+but no READY publish or exec-ID read, and its control row is read back as zero and frozen before any link.
+The journal object is reachable only through `inventory --key-operations`. v1 is unchanged; the v2 table
+carries one row for this read beside the Exec task ticket row.
 
 Kernel-side state, owned by the exact observer Session:
 - The existing 8-byte `journal_bootstrap` word of the per-process `PROC_EPOCH` record (the record stays
@@ -489,8 +488,8 @@ Kernel-side state, owned by the exact observer Session:
   name.
 - `JOURNAL_MARKER_CTL`: one 16-byte cell `{spent, failed}`, the marker admissions spent in this Session and
   a sticky failure latch. In a Detailed marker Session, userspace reads it back as zero and freezes it
-  before any probe attaches, and never writes it. (The journal object's control row is only
-  metadata-checked today; see Status above.)
+  before any probe attaches, and never writes it. (The journal object's control row is likewise read back
+  as zero and frozen before any link; see Status above.)
 
 Writers, at exec, fork, first watched call or thread exit (before closure the exec and gap hooks each do
 one array read and return; fork only zeroes the marker in fresh task storage):
@@ -906,7 +905,8 @@ scan limitation. These receipts provide no trace-event naming authority.
 
 **Status: IMPLEMENTED the reviewed finite producer. H8 journal transactions and linked birth seals are
 planned for v0.6.0 release builds (owner B2 approved FULL/P0 inclusion, final at freeze; the embedding is
-WU-2 work, and shipping it is gated on the WU-4 live cells) and will activate only under the per-key-tracking opt-in (the
+WU-2 work, and shipping it is gated on the WU-4 live cells) and will activate only under the per-key-tracking opt-in
+`inventory --key-operations` (the
 post-attach birth marker read and retention is described in
 [Post-attach birth marker](#post-attach-birth-marker-object-journal-slice-d)).
 H9 model delivery remains open. No public object field carries observed data**

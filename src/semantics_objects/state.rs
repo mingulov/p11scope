@@ -4734,6 +4734,17 @@ mod tests {
                 .effects
                 .contains(&ObjectEffect::DeferredMinted { call: token })
         }
+
+        /// Current holder of one live detached record, by origin
+        /// ticket: key-shape independent.
+        fn detached_holder(&self, ticket: CallToken) -> Option<SessionIncarnation> {
+            self.state
+                .deferred_detached
+                .values()
+                .find(|detached| detached.origin.ticket == ticket)
+                .expect("detached record live")
+                .holder
+        }
     }
 
     // F1–F4: a qualified PENDING END with a settled input freezes the
@@ -6040,6 +6051,112 @@ mod tests {
             fx.state.deferred_sequence, sequence_before_unknown_slot,
             "refused detach advances no sequence"
         );
+    }
+
+    // Two known slots, the same target and the same id: each slot's
+    // detach succeeds (S1 keys detached ids by slot), and each
+    // record redeems once under its own origin ticket.
+    #[test]
+    fn deferred_detach_scopes_same_id_by_known_slot() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (first, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("first slot detaches");
+        let other = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(1, 0),
+            )
+            .expect("second session opens");
+        let (second, effects) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        assert!(
+            DeferredFixture::minted(&effects, second),
+            "second slot mints its own origin"
+        );
+        fx.state
+            .detach_deferred(other, target, 42)
+            .expect("second slot detaches the same id");
+        assert_eq!(
+            fx.state.deferred_detached.len(),
+            2,
+            "each scope holds its own record"
+        );
+        assert!(fx.state.redeem_deferred(first).is_some());
+        assert!(fx.state.redeem_deferred(second).is_some());
+    }
+
+    // Join resolves under the joiner's own scope: a foreign-scope or
+    // unknown-scope joiner moves nothing, while a same-scope joiner
+    // takes custody.
+    #[test]
+    fn deferred_join_resolves_under_joiner_scope() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let (first, _) = fx.pending_access(
+            HandleInput::Value(SessionHandle::new(DSESSION).unwrap()),
+            HandleInput::Absent,
+            target,
+        );
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("slot detaches");
+        let foreign = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(1, 0),
+            )
+            .expect("foreign-scope session opens");
+        assert!(
+            !fx.state
+                .join_deferred_holder(fx.domain, target, 42, foreign),
+            "a foreign-scope join moves nothing"
+        );
+        assert_eq!(fx.detached_holder(first), Some(fx.session));
+        let floating = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 2).unwrap(),
+                SessionOrigin::FirstObserved,
+                SlotScope::Unknown,
+            )
+            .expect("unknown-scope session opens");
+        assert!(
+            !fx.state
+                .join_deferred_holder(fx.domain, target, 42, floating),
+            "an unknown-scope join moves nothing"
+        );
+        assert_eq!(fx.detached_holder(first), Some(fx.session));
+        let joiner = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 3).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("same-scope session opens");
+        assert!(
+            fx.state.join_deferred_holder(fx.domain, target, 42, joiner),
+            "a same-scope join takes custody"
+        );
+        assert_eq!(fx.detached_holder(first), Some(joiner));
     }
 
     // Mint-before-dispatch ordering: a destroy-PENDING freezes its

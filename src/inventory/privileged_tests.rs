@@ -4819,6 +4819,13 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
             lane.joint_stuck_diagnostic_for_test(),
         );
     };
+    eprintln!(
+        "KEY_OPS_COVFAULT_COVERAGE total={total} covfault={covfault_calls} outcomes={outcome_count}"
+    );
+    ensure!(
+        u64::try_from(covfault_calls).unwrap_or(u64::MAX) >= total,
+        "every post-fault script call routes to CoverageFault: covfault {covfault_calls} >= total {total}"
+    );
     // One driver hook on the faulted lane: the pump refuses again
     // on the sticky fault, the hook still services the machine, and
     // the fallback stop reason names Unavailable.
@@ -4885,11 +4892,59 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
         "the fallback stop reason names Unavailable: {:?}",
         driver.joint_tick_refusal
     );
+    let hook_order = driver
+        .semantic
+        .as_ref()
+        .expect("lane stays seated")
+        .hook_order_for_test();
+    eprintln!("KEY_OPS_COVFAULT_HOOK order={hook_order:?}");
+    ensure!(
+        hook_order.ends_with(&["pump", "machine"]),
+        "the hook pumped before servicing the machine, so Unavailable names the pump: {hook_order:?}"
+    );
     let mut lane = driver.semantic.take().expect("lane stays seated");
     let coordinator = &mut *driver.coordinator;
     // The faulted transaction still publishes with coverage failed.
+    // Poll first: the demand may already have published in the hook
+    // above, and a service before its take would collect an unbound
+    // drain original and re-sample the prepared base the pin reads.
     let publish_started = Instant::now();
     loop {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let commit = lane
+            .poll_joint_commit(&mut *coordinator, &mut budget)
+            .map_err(|reason| {
+                anyhow::anyhow!(
+                    "keyops-cov: commit poll refused: {reason} disposition={:?} waiters={:?}",
+                    lane.joint_disposition_reason(),
+                    lane.joint_stuck_diagnostic_for_test(),
+                )
+            })?;
+        if let crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(
+            receipt,
+        ) = commit
+        {
+            // Per-transaction pin (see service_to_published): the
+            // demand bound at `base` and published exactly once. The
+            // poll-first order keeps the base stable: no service runs
+            // between this demand's publish and its take.
+            let base = lane.joint_drive_state_for_test().7;
+            let revision_after = coordinator.registry().published_revision();
+            eprintln!(
+                "KEY_OPS_COVFAULT_PUBLISH base={base} receipt={} window={revision_before}->{revision_after}",
+                receipt.registry_published,
+            );
+            ensure!(
+                receipt.registry_published == base + 1,
+                "keyops-cov: this transaction published exactly once: base {base} -> \
+                 receipt {} (window {revision_before}->{revision_after})",
+                receipt.registry_published,
+            );
+            break;
+        }
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1024,
             deadline: Instant::now() + Duration::from_millis(10),
@@ -4906,31 +4961,6 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
                 lane.joint_stuck_diagnostic_for_test(),
             )
         })?;
-        let mut budget = crate::inventory_semantics::JointWorkBudget {
-            remaining_actions: 1024,
-            deadline: Instant::now() + Duration::from_millis(10),
-        };
-        let commit = lane
-            .poll_joint_commit(&mut *coordinator, &mut budget)
-            .map_err(|reason| {
-                anyhow::anyhow!(
-                    "keyops-cov: commit poll refused: {reason} disposition={:?} waiters={:?}",
-                    lane.joint_disposition_reason(),
-                    lane.joint_stuck_diagnostic_for_test(),
-                )
-            })?;
-        if matches!(
-            commit,
-            crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_)
-        ) {
-            let revision_after = coordinator.registry().published_revision();
-            ensure!(
-                revision_after == revision_before + 1,
-                "keyops-cov: one published revision per transaction: \
-                 {revision_before} -> {revision_after}"
-            );
-            break;
-        }
         ensure!(
             publish_started.elapsed() < Duration::from_secs(120),
             "keyops-cov: unpublished after 120 s; stuck audit={:?} h3={:?} waiters={:?}",
@@ -5126,15 +5156,31 @@ fn service_to_published(
                 )
             })?;
         polls += 1;
-        if matches!(
-            commit,
-            crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_)
-        ) {
+        if let crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(
+            receipt,
+        ) = commit
+        {
+            // Per-transaction pin: the demand bound at `base` (sampled
+            // when this original prepared, after any earlier demandless
+            // publication landed) and published exactly once, at
+            // base + 1. The global window count stays out: in System
+            // scope an unbound demandless-drain original can publish
+            // inside this window without ever binding the demand, and
+            // that is not this transaction publishing twice. Services
+            // and take-polls strictly alternate here, so no service
+            // re-samples the base between this demand's publish and
+            // its take.
+            let base = lane.joint_drive_state_for_test().7;
             let revision_after = coordinator.registry().published_revision();
+            eprintln!(
+                "JOINT_R16 {tag} published base={base} receipt={} window={revision_before}->{revision_after}",
+                receipt.registry_published,
+            );
             ensure!(
-                revision_after == revision_before + 1,
-                "{tag}: one published revision per transaction: \
-                 {revision_before} -> {revision_after}"
+                receipt.registry_published == base + 1,
+                "{tag}: this transaction published exactly once: base {base} -> \
+                 receipt {} (window {revision_before}->{revision_after})",
+                receipt.registry_published,
             );
             return Ok(polls);
         }

@@ -15176,9 +15176,14 @@ exit 0
                 "the original pin was queried: {answer:?}"
             );
         }
-        for ticket in [0, 42] {
+        for scripted in [Some(42), None] {
             let (mut native, caller) = NativeScene::with_collection_admission_window();
-            native.answer(7, 500, ticket);
+            // A zero cell answers Unavailable in production; Cookie(0)
+            // never occurs.
+            match scripted {
+                Some(ticket) => native.answer(7, 500, ticket),
+                None => native.unavailable_answer(7, 500),
+            }
             native.scene.coordinator.exit_clocks_comparable = true;
             let at = native.stamps.tick();
             let mut drain = exec_hook_drain(native.domain, at, 125);
@@ -15197,6 +15202,143 @@ exit 0
             );
             assert_eq!(native.cookies.queries, 1);
         }
+    }
+
+    #[test]
+    fn cgroup_collection_exec_refuses_mismatch_with_invalidations_only() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn_matching_process(pid);
+        let birth = scene.source.start_time(pid).unwrap();
+        // Collection begins at 50; admission validation finishes at 200.
+        scene.coordinator.adapter.reconcile_detected(
+            &[pid].into_iter().collect(),
+            &mut |_| ImageAuthority::ScanPinned,
+            50,
+            &mut || Some(200),
+        );
+        let caller = scene.coordinator.adapter.live_id(pid).unwrap();
+        let record = scene.coordinator.adapter.record(caller).unwrap();
+        assert_eq!((record.first_seen_ns, record.admitted_ns), (50, 200));
+        scene.project(pid, 300);
+        scene.coordinator.commit_batch(false).unwrap();
+        std::fs::write(scene._dir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        scene.coordinator.engine.scope = crate::scope::cgroup(scene._dir.path()).unwrap();
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        // The staged transaction is usable before the EXEC invalidation.
+        let collection = native
+            .scene
+            .coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(pid)
+                .is_some_and(|preparation| preparation.check()),
+            "the pending scan transaction is usable before EXEC invalidation"
+        );
+        let work = collection.work();
+        assert!(work.charge(0), "the job fence starts fresh");
+        native.scene.coordinator.pending_cgroup = Some((collection, 2_000));
+        // A mismatching in-window ticket refuses: invalidations only.
+        native.answer(pid, birth, 99);
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = 125;
+        record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        drain.records[0].binding_id = 41;
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(!adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(pid), Some(caller));
+        assert_eq!(
+            native.cookies.queries, 1,
+            "the in-window branch queried once"
+        );
+        // These twins never commit (the refused twin holds a directly
+        // staged pending collection), so disclosure is read staged.
+        let staged: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .staged_scope_gaps_for_test()
+            .into_iter()
+            .map(|(subject, _)| subject)
+            .collect();
+        assert!(
+            staged.contains(&"collection-window exec task unproven".to_string()),
+            "the refusal is disclosed: {staged:?}"
+        );
+        assert!(
+            !work.charge(0),
+            "the refused hook invalidated the job fence"
+        );
+        let (pending, _) = native.scene.coordinator.pending_cgroup.as_ref().unwrap();
+        assert!(
+            pending.preparation(pid).is_none(),
+            "the refused hook invalidated the pending collection"
+        );
+    }
+
+    #[test]
+    fn cgroup_collection_exec_matching_ticket_holds_handoff_with_retired_event() {
+        let (mut native, caller) = NativeScene::with_collection_admission_window();
+        std::fs::write(native.scene._dir.path().join("cgroup.procs"), b"").unwrap();
+        native.scene.coordinator.engine.scope =
+            crate::scope::cgroup(native.scene._dir.path()).unwrap();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let mut drain = exec_hook_drain(native.domain, at, 125);
+        drain.records[0].binding_id = 41;
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        let [CallerEvent::Retired { id, .. }] = receipt.events.as_slice() else {
+            panic!(
+                "a matching cgroup EXEC retires with its handoff held: {:?}",
+                receipt.events
+            );
+        };
+        assert_eq!(*id, caller);
+        let coordinator = &native.scene.coordinator;
+        assert!(
+            coordinator.pending_successors.contains_key(&caller),
+            "the successor handoff is held for re-entry"
+        );
+        let adapter = &coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), None);
+        assert_eq!(adapter.len(), 1, "no successor is admitted inline");
+        assert_eq!(
+            adapter.record(caller).unwrap().lifecycle,
+            crate::discovery::caller_registry::CallerLifecycle::ExecRetired
+        );
+        assert_eq!(native.cookies.queries, 1);
+        let staged: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .staged_scope_gaps_for_test()
+            .into_iter()
+            .map(|(subject, _)| subject)
+            .collect();
+        assert!(
+            staged.contains(&"exec successor minted without a held predecessor".to_string()),
+            "the witnessed mint is disclosed: {staged:?}"
+        );
     }
 
     #[test]

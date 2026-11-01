@@ -1,7 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Finite native/CO-RE controls. No verifier, kernel load or link-health claim.
 
-use std::{fs, path::Path, process::Command};
+use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
 const EXEC_TARGET_SHAPES: u32 = 16;
 
@@ -571,5 +571,195 @@ fn exec_task_singles_perf_attributes_preserve_healthy_leader_exec() {
             !constructor.contains(attribute),
             "probe constructor changed {attribute}"
         );
+    }
+}
+
+#[test]
+fn exec_witness_failures_leave_shared_counters_flat() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = temp.path().join("witness-neutrality-tests");
+    let compile = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unknown-attributes",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/image-identity/witness_neutrality_tests.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("execute clang-18 for witness neutrality regression");
+    assert!(
+        compile.status.success(),
+        "native compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(binary)
+        .output()
+        .expect("execute witness neutrality regression");
+    assert!(
+        run.status.success(),
+        "witness neutrality regression failed: {}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn exec_ticket_absent_from_counter_flavors() {
+    let mut checked = 0;
+    for (name, bytes) in [
+        ("counts", p11scope::EBPF_COUNTER_COUNTS_OBJECT),
+        ("timestamps", p11scope::EBPF_COUNTER_TIMESTAMPS_OBJECT),
+        ("latency", p11scope::EBPF_COUNTER_LATENCY_OBJECT),
+    ] {
+        if bytes.is_empty() {
+            continue;
+        }
+        checked += 1;
+        let object = aya_obj::Object::parse(bytes).unwrap();
+        assert!(object.programs.contains_key("sched_process_exec"));
+        let helpers = object
+            .functions
+            .values()
+            .filter(|function| function.name == "p11_link_current_cookie")
+            .count();
+        assert_eq!(helpers, 0, "{name}: counter flavors issue no EXEC ticket");
+        // The allocator stays for fork and caller-entry attribution; only
+        // the EXEC stamp is gone.
+        assert!(object.maps.contains_key("TASK_COOKIE"), "{name}");
+        assert!(object.maps.contains_key("COOKIE_CTL"), "{name}");
+    }
+    assert!(
+        checked > 0,
+        "counter objects must be present to pin the stamp boundary"
+    );
+}
+
+#[test]
+fn exec_ticket_detailed_requires_armed_flags() {
+    let script = r#"
+import re, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+from _loader import load_path
+m = load_path(Path('scripts/check-live-discovery-object.py'), 'exec_ticket_gate')
+dump = subprocess.check_output(['llvm-objdump-18', '-dr', sys.argv[1]], text=True)
+blocks = m.function_blocks(dump)
+owners = [(name, lines) for name, lines in blocks.items()
+          if any(re.search(r'R_BPF_64_32\s+p11_link_current_cookie\s*$', line) for line in lines)]
+assert len(owners) == 1 and owners[0][0].endswith('emit_lifecycle'), owners
+lines = owners[0][1]
+ticket_row = next(i for i, line in enumerate(lines) if re.search(r'R_BPF_64_32\s+p11_link_current_cookie\s*$', line))
+ticket = next(m.line_pc(line) for line in reversed(lines[:ticket_row]) if m.line_pc(line) is not None)
+reserve_row = next(i for i, line in enumerate(lines) if re.search(r'\bcall 0x83\b', line))
+insns, graph = m.instruction_graph(lines)
+branch_row = next(i for i in range(reserve_row + 1, min(len(lines), reserve_row + 8))
+                  if re.search(r'\bif r\d+ (?:==|!=) 0x0 goto ', lines[i]))
+reserve_guard = m.line_pc(lines[branch_row])
+kind_checks = [(pc, text) for pc, text in insns if re.search(r'\bif r\d+ (?:==|!=) 0x5 goto ', text)]
+assert len(kind_checks) == 1, 'only EXEC kind5 may acquire a lifecycle ticket'
+kind_pc = kind_checks[0][0]
+# A branch guards the ticket when exactly one of its arms can reach it.
+# Reserve and kind always guard; Detailed needs one more: the armed-flags
+# gate, so an unarmed or aggregate capture issues no ticket.
+guards = set()
+for pc, text in insns:
+    if not re.search(r'\bif .*\bgoto ', text):
+        continue
+    edges = graph.get(pc, [])
+    if len(edges) != 2:
+        continue
+    reaches = [ticket in m.reachable(graph, [edge]) for edge in edges]
+    if reaches == [True, False] or reaches == [False, True]:
+        guards.add(pc)
+assert reserve_guard in guards and kind_pc in guards, 'reserve and kind must guard the ticket'
+extra = guards - {reserve_guard, kind_pc}
+assert extra, 'Detailed EXEC ticket needs a flags gate beyond reserve and kind'
+"#;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("exec-ticket-gate.o");
+    fs::write(&path, p11scope::EBPF_OBJECT).unwrap();
+    let check = Command::new("python3")
+        .args(["-I", "-c", script])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "detailed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn exec_witness_bank_builds_never_feed_ticket_comparison() {
+    fn has_bank_identity(names: &BTreeSet<&str>) -> bool {
+        const BANK_IDENTITY: [&str; 7] = [
+            "TASK_COOKIE_B",
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "p11_image_bank_select",
+            "p11_image_bank_cut",
+            "p11_link_task_ticket",
+            "p11_image_identity_issued",
+        ];
+        BANK_IDENTITY.iter().any(|name| names.contains(name))
+    }
+    // The detector is non-vacuous: every bank name fires it, while the
+    // single-bank identity surface stays silent.
+    let single: BTreeSet<&str> = [
+        "TASK_COOKIE",
+        "COOKIE_CTL",
+        "p11_link_current_identity",
+        "p11_link_current_cookie",
+    ]
+    .into_iter()
+    .collect();
+    assert!(!has_bank_identity(&single));
+    for bank in [
+        "TASK_COOKIE_B",
+        "COOKIE_CTL_B",
+        "IMAGE_BANK_SELECT",
+        "p11_image_bank_select",
+        "p11_image_bank_cut",
+        "p11_link_task_ticket",
+        "p11_image_identity_issued",
+    ] {
+        let mut banked = single.clone();
+        banked.insert(bank);
+        assert!(
+            has_bank_identity(&banked),
+            "{bank} must read as a bank build"
+        );
+    }
+    // The comparing domain runs on Inventory-lane objects only, so those
+    // objects must never carry bank-local tickets: local numbers recur
+    // across re-prepares and exact equality there would not prove task
+    // incarnation. The loader gate stays Detailed-only.
+    for (name, bytes, identity) in [
+        ("inventory", p11scope::EBPF_INVENTORY_OBJECT, false),
+        ("callers", p11scope::EBPF_INVENTORY_CALLERS_OBJECT, true),
+    ] {
+        let object = aya_obj::Object::parse(bytes).unwrap();
+        assert!(object.programs.contains_key("sched_process_exec"));
+        let mut names: BTreeSet<&str> = object.maps.keys().map(String::as_str).collect();
+        names.extend(
+            object
+                .functions
+                .values()
+                .map(|function| function.name.as_str()),
+        );
+        assert!(
+            !has_bank_identity(&names),
+            "{name}: ticket-comparing domain must be bank-free"
+        );
+        assert_eq!(object.maps.contains_key("TASK_COOKIE"), identity, "{name}");
+        assert_eq!(object.maps.contains_key("COOKIE_CTL"), identity, "{name}");
     }
 }

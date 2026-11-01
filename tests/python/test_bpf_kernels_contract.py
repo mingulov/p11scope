@@ -122,7 +122,7 @@ def matrix_kernels(bpf_text):
             if kernel.strip()]
 
 
-def check_kernel_sums(bpf_text, sums_dir):
+def check_kernel_sums(bpf_text, sums_dir, other_kernels=()):
     """Every matrix kernel has a well-formed sums file; no sums file
     names an unknown kernel; historical 5.15 checksums are retained."""
     problems = []
@@ -157,8 +157,9 @@ def check_kernel_sums(bpf_text, sums_dir):
         if not seen:
             problems.append(f"{path.name}: no deb sums recorded")
     if sums_dir.is_dir():
+        known = set(kernels) | set(other_kernels)
         extra = sorted(path.name for path in sums_dir.glob("*.sums")
-                       if path.stem not in kernels and path.stem != "v5.15.221")
+                       if path.stem not in known and path.stem != "v5.15.221")
         for name in extra:
             problems.append(f"sums file outside the matrix: {name}")
     return problems
@@ -190,7 +191,12 @@ class BpfKernelsContractTests(unittest.TestCase):
         self.assertEqual([], check_action_pins(self.ci, self.bpf))
 
     def test_kernel_sums_cover_the_matrix(self):
-        self.assertEqual([], check_kernel_sums(self.bpf, SUMS_DIR))
+        # privileged-tests.yml's public-cli guests share the sums directory.
+        priv = (ROOT / ".github" / "workflows" / "privileged-tests.yml").read_text(encoding="utf-8")
+        match = re.search(r"kernel:\s*\[host,([^\]]*)\]", priv)
+        others = [k.strip() for k in match.group(1).split(",")] if match else []
+        self.assertTrue(others, "privileged-tests.yml names no guest kernels")
+        self.assertEqual([], check_kernel_sums(self.bpf, SUMS_DIR, others))
 
     def test_active_positives_and_one_combined_stock_refusal_are_separate(self):
         self.assertEqual(matrix_kernels(self.bpf),

@@ -80,6 +80,16 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("MISSING results for shard", body)
         self.assertIn("awk '$1 != \"PASS\"'", body)
 
+    def test_guest_kernels_have_pinned_sums(self):
+        match = re.search(r"kernel:\s*\[host,([^\]]*)\]", self.yml)
+        self.assertIsNotNone(match, "public-cli has no host + guest kernel matrix")
+        guests = [k.strip() for k in match.group(1).split(",") if k.strip()]
+        self.assertTrue(guests)
+        sums = ROOT / "tests" / "fixtures" / "vng-kernel-sha256sums"
+        for kernel in guests:
+            self.assertTrue((sums / f"{kernel}.sums").is_file(), f"missing sums for {kernel}")
+        self.assertIn("sha256sum --check", self.yml)
+
     def test_workflow_cancels_superseded_runs(self):
         self.assertIn("cancel-in-progress: true", self.yml)
 

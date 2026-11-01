@@ -154,9 +154,10 @@ fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
 "#;
     if !comparison
         .lines()
-        // Pinned baseline 90b8cf9f: reviewed loader + bank + journal
-        // delta since ba92b4e2; enumerated in the ci.yml comment.
-        .any(|line| line == "          BASELINE=90b8cf9f6569ad3bf465c143db2cf170c80a617b")
+        // Pinned baseline 30208b48: reviewed loader + bank + journal
+        // delta since ba92b4e2 and the loader-gate wiring since 90b8cf9f;
+        // both enumerated in the ci.yml comment.
+        .any(|line| line == "          BASELINE=30208b48bfaa494420cd05f28ba950be41279470")
         || !comparison.contains(repeat)
         || !comparison.contains(integration)
         || comparison.contains("--host-compiler-transition")
@@ -236,9 +237,10 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
         "a renamed comparison job must be rejected"
     );
     for marker in [
-        // Pinned baseline 90b8cf9f: reviewed loader + bank + journal
-        // delta since ba92b4e2; enumerated in the ci.yml comment.
-        "BASELINE=90b8cf9f6569ad3bf465c143db2cf170c80a617b",
+        // Pinned baseline 30208b48: reviewed loader + bank + journal
+        // delta since ba92b4e2 and the loader-gate wiring since 90b8cf9f;
+        // both enumerated in the ci.yml comment.
+        "BASELINE=30208b48bfaa494420cd05f28ba950be41279470",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"",

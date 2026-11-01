@@ -99,6 +99,15 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # Default campaign: every ignored test except the long cells and the static
 # skips. Order is the binary's --list order; each runs in its own process.
 DEFAULT_TESTS=(
+# Async control value flags: an owned 3.2 stub provider driven through a
+# real Session per ABI; an OK C_AsyncGetID with a NULL output sets the
+# unreadable-value flag, a readable GetID/Join id carries no flag.
+attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32
+attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64
+attach::async_value_flags_tests::privileged_async_getid_valid_output_reads_id_ia32
+attach::async_value_flags_tests::privileged_async_getid_valid_output_reads_id_lp64
+attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_ia32
+attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_lp64
 # W3-2 kernel-identity gates: WRONLY EPERM, the section 6.5 functional
 # probe (hardlink-match vs copy-NONE plus the stale-generation phase),
 # the whole-system shape cell, and the anchor-handle validator.

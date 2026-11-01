@@ -502,7 +502,14 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin 16a7bd53, the default journal and birth-marker lane (FULL and P0
+      # Pin 6641123f, the async control value flags: the default Detailed
+      # object marks an unreadable C_AsyncJoin id argument at entry and an OK
+      # C_AsyncGetID with a null output pointer at return as
+      # ASYNC_VALUE_UNREADABLE (p11_entry +32 B, ordinary_return +160 B,
+      # object_return_ordinary +80 B; .text +240 B, uprobe +32 B; no new map
+      # or program, .maps unchanged); both Inventory objects are
+      # byte-identical to 16a7bd53. No other BPF input changed since 16a7bd53.
+      # Earlier pin 16a7bd53, the default journal and birth-marker lane (FULL and P0
       # builds carry the marker unless P11SCOPE_BIRTH_MARKER=0): the default
       # Detailed object gains JOURNAL_MARKER_CTL (one map, no new program) plus
       # the p11_instance_exec_birth and p11_instance_scope_gap bodies and their
@@ -550,7 +557,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=16a7bd538535c6d8fb29680dabf6939ca5573a8e
+          BASELINE=6641123fdbd29a600da4f41b058afa6e6cd9c9fd
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

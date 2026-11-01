@@ -133,6 +133,8 @@ pub mod identity_iter;
 pub use cleanup_worker::CleanupInterrupted;
 pub(crate) use cleanup_worker::{CleanupWorker, DetachOrder, OwnedLink, drive_cleanup};
 #[cfg(test)]
+mod async_value_flags_tests;
+#[cfg(test)]
 mod instance_tests;
 
 #[cfg(test)]

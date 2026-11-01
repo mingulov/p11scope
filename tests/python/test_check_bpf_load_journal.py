@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/check-bpf-load-journal.sh"
 KERNEL = "v6.6.157"
 CONTROL_KERNEL = "v5.15.221"
+CONTROL_KERNEL_61 = "v6.1.188"
 
 next_program_id = 200
 
@@ -148,7 +149,8 @@ class JournalGateTests(unittest.TestCase):
         self.events = self.work / "events.jsonl"
         self.cache = self.work / "cache"
         for kernel, release in ((KERNEL, "6.6.157-test"),
-                                (CONTROL_KERNEL, "5.15.221-test")):
+                                (CONTROL_KERNEL, "5.15.221-test"),
+                                (CONTROL_KERNEL_61, "6.1.188-test")):
             config = self.cache / f"virtme-ng/{kernel}/amd64/boot/config-{release}"
             config.parent.mkdir(parents=True)
             config.write_text("owned test config\n")
@@ -351,6 +353,17 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(row["qualification"], "qualified")
         self.assertIn("uprobe-multi-required", row["detail"])
 
+    def test_refusal_control_passes_on_61(self):
+        # 6.1 is pre-Multi too: the same finite refusal passes the
+        # control cell there.
+        result, out = self.run_gate(CONTROL_KERNEL_61, mode="refusal-515")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertEqual(row["cell"], f"journal-load-{CONTROL_KERNEL_61}")
+        self.assertTrue(row["pass"])
+        self.assertEqual(row["qualification"], "qualified")
+        self.assertIn("uprobe-multi-required", row["detail"])
+
     def test_control_load_fails(self):
         # The control twin: a 5.15 guest that loads the pair instead of
         # refusing fails the cell.
@@ -540,6 +553,9 @@ class ScriptContractTests(unittest.TestCase):
 
     def test_control_covers_515_releases(self):
         self.assertIn("v5.15.*", self.text)
+
+    def test_control_covers_61_releases(self):
+        self.assertIn("v6.1.*", self.text)
 
     def test_default_kernel_list(self):
         self.assertIn("v6.6.157 v6.12.111 v6.18.58 v7.0.14", self.text)

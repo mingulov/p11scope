@@ -155,12 +155,13 @@ pub static EBPF_COUNTER_TIMESTAMPS_OBJECT: &[u8] = &[];
 #[cfg(not(p11scope_counter_objects))]
 pub static EBPF_COUNTER_LATENCY_OBJECT: &[u8] = &[];
 
-/// Production journal object, built and embedded by the opt-in journal build
-/// (`P11SCOPE_JOURNAL=1`). Unset or `=0` builds omit it; the static below is
-/// then empty and journal preparation refuses with
-/// `journal-pair-unavailable-in-build` before any work. SMALL, WIDE, unsafe
-/// and stub builds refuse the switch instead of omitting the object. The
-/// private journal-proof ELF is never embedded here.
+/// Production journal object, built and embedded by default in FULL builds
+/// that can carry it. `P11SCOPE_JOURNAL=0` omits it, as do SMALL, WIDE,
+/// unsafe and stub builds silently; the static below is then empty and
+/// journal preparation refuses with `journal-pair-unavailable-in-build`
+/// before any work. Explicit `P11SCOPE_JOURNAL=1` with an incompatible
+/// build refuses instead of omitting the object. The private
+/// journal-proof ELF is never embedded here.
 #[cfg(p11scope_journal)]
 pub static EBPF_JOURNAL_OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(
     env!("OUT_DIR"),

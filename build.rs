@@ -33,13 +33,23 @@ mod clang_resolve;
 #[path = "build_support/semantic_rustc.rs"]
 mod semantic_rustc;
 
-// R52: the birth-marker paths stay default-off behind P11SCOPE_BIRTH_MARKER
-// (unset/0 = off, 1 = on). One derived decision controls host expectations
-// and every native/Rust BPF build site.
-fn birth_marker_requested() -> bool {
+// The birth-marker paths stay behind P11SCOPE_BIRTH_MARKER. Unset follows
+// the journal decision (a marker with no journal object can never arm, so
+// it would add hook code and a map for nothing); 0 is off; 1 keeps its
+// meaning on any Detailed build. One derived decision controls host
+// expectations and every native/Rust BPF build site.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BirthMarkerRequest {
+    Unset,
+    Enabled,
+    Disabled,
+}
+
+fn birth_marker_requested() -> BirthMarkerRequest {
     match env::var("P11SCOPE_BIRTH_MARKER").as_deref() {
-        Err(env::VarError::NotPresent) | Ok("0") => false,
-        Ok("1") => true,
+        Err(env::VarError::NotPresent) => BirthMarkerRequest::Unset,
+        Ok("1") => BirthMarkerRequest::Enabled,
+        Ok("0") => BirthMarkerRequest::Disabled,
         _ => panic!("P11SCOPE_BIRTH_MARKER must be unset, 0 or 1"),
     }
 }
@@ -116,10 +126,23 @@ fn journal_proof_requested() -> bool {
     }
 }
 
-fn journal_requested() -> bool {
+// The production journal stays behind P11SCOPE_JOURNAL. Unset selects it
+// exactly when the build can carry it (default capacities, no SMALL/WIDE,
+// no unsafe, no stub, no private proof or counter-artifact configuration);
+// other builds omit it silently, like the counter objects below. Explicit
+// =1 with an incompatible build keeps its refusal; =0 is off.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JournalRequest {
+    Unset,
+    Enabled,
+    Disabled,
+}
+
+fn journal_requested() -> JournalRequest {
     match env::var("P11SCOPE_JOURNAL").as_deref() {
-        Err(env::VarError::NotPresent) | Ok("0") => false,
-        Ok("1") => true,
+        Err(env::VarError::NotPresent) => JournalRequest::Unset,
+        Ok("1") => JournalRequest::Enabled,
+        Ok("0") => JournalRequest::Disabled,
         _ => panic!("P11SCOPE_JOURNAL must be unset, 0 or 1"),
     }
 }
@@ -191,9 +214,60 @@ fn main() {
     let counter_objects_request = counter_objects_requested();
     let image_bank_proof = image_bank_proof_requested();
     let journal_proof = journal_proof_requested();
-    let production_journal = journal_requested();
-    let birth_marker = birth_marker_requested();
+    let journal_request = journal_requested();
+    let birth_marker_request = birth_marker_requested();
     let loader_gate_env = loader_gate_requested();
+    // Capacity reads come before any emission: the journal and marker
+    // selections below depend on them.
+    let small_ring = matches!(
+        env::var("P11SCOPE_SMALL_RING").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    let small_state_maps = matches!(
+        env::var("P11SCOPE_SMALL_STATE_MAPS").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    let small_discovery_ring = matches!(
+        env::var("P11SCOPE_SMALL_DISCOVERY_RING").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    let wide_detailed = env::var_os("CARGO_FEATURE_WIDE_DETAILED_2112").is_some();
+    let stub_object_attributes = env::var_os("CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES").is_some();
+    let unsafe_unvalidated =
+        env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some();
+    let small_build = small_ring || small_state_maps || small_discovery_ring;
+    // Explicit =1 keeps today's refusals; unset omits silently where the
+    // build cannot carry the production journal.
+    assert!(
+        journal_request != JournalRequest::Enabled
+            || !(small_build
+                || wide_detailed
+                || stub_object_attributes
+                || unsafe_unvalidated),
+        "production journal requires default FULL capacities without SMALL, WIDE, unsafe or P0"
+    );
+    assert!(
+        !(journal_request == JournalRequest::Enabled && (image_bank_proof || counter_artifacts)),
+        "production journal requires a separate configuration from image proof and counter artifacts"
+    );
+    let production_journal = match journal_request {
+        JournalRequest::Enabled => true,
+        JournalRequest::Disabled => false,
+        JournalRequest::Unset => {
+            !(small_build
+                || wide_detailed
+                || stub_object_attributes
+                || unsafe_unvalidated
+                || journal_proof
+                || image_bank_proof
+                || counter_artifacts)
+        }
+    };
+    let birth_marker = match birth_marker_request {
+        BirthMarkerRequest::Enabled => true,
+        BirthMarkerRequest::Disabled => false,
+        BirthMarkerRequest::Unset => production_journal,
+    };
     println!("cargo:rustc-check-cfg=cfg(p11scope_journal_roots)");
     if journal_proof {
         println!("cargo:rustc-cfg=p11scope_journal_roots");
@@ -209,6 +283,16 @@ fn main() {
     println!(
         "cargo:rustc-env=P11SCOPE_BIRTH_MARKER_ENABLED={}",
         u8::from(birth_marker)
+    );
+    // Both selections are emitted before any compiler work, so the
+    // preflight harness observes them at the tripwire.
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_ENABLED={}",
+        u8::from(production_journal)
+    );
+    println!(
+        "cargo:rustc-env=P11SCOPE_JOURNAL_OUTPUTS={}",
+        if production_journal { "journal-v1" } else { "" }
     );
     println!("cargo:rerun-if-changed=crates/ebpf/src");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity.c");
@@ -268,18 +352,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
     println!("cargo:rustc-check-cfg=cfg(p11scope_small_discovery_ring)");
     println!("cargo:rustc-check-cfg=cfg(p11scope_image_bank_proof)");
-    let small_ring = matches!(
-        env::var("P11SCOPE_SMALL_RING").as_deref(),
-        Ok("1") | Ok("true")
-    );
-    let small_state_maps = matches!(
-        env::var("P11SCOPE_SMALL_STATE_MAPS").as_deref(),
-        Ok("1") | Ok("true")
-    );
-    let small_discovery_ring = matches!(
-        env::var("P11SCOPE_SMALL_DISCOVERY_RING").as_deref(),
-        Ok("1") | Ok("true")
-    );
     // The Inventory validator pins the DISCOVERY size this build compiled
     // (2 MiB, or 4 KiB here), so the small-ring build loads again.
     if small_discovery_ring {
@@ -288,9 +360,6 @@ fn main() {
     if image_bank_proof {
         println!("cargo:rustc-cfg=p11scope_image_bank_proof");
     }
-    let wide_detailed = env::var_os("CARGO_FEATURE_WIDE_DETAILED_2112").is_some();
-    let stub_object_attributes = env::var_os("CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES").is_some();
-    let small_build = small_ring || small_state_maps || small_discovery_ring;
     assert!(
         !counter_artifacts
             || !(small_build
@@ -322,18 +391,6 @@ fn main() {
     assert!(
         !(journal_proof && (image_bank_proof || counter_artifacts)),
         "private journal proof requires a separate configuration from image proof and counter artifacts"
-    );
-    assert!(
-        !production_journal
-            || !(small_build
-                || wide_detailed
-                || stub_object_attributes
-                || env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some()),
-        "production journal requires default FULL capacities without SMALL, WIDE, unsafe or P0"
-    );
-    assert!(
-        !(production_journal && (image_bank_proof || counter_artifacts)),
-        "production journal requires a separate configuration from image proof and counter artifacts"
     );
     // The ordinary FULL build embeds the three bank objects. SMALL/WIDE omit
     // them silently only when unset; an explicit `=1` with SMALL/WIDE fails
@@ -483,14 +540,6 @@ fn main() {
         } else {
             ""
         }
-    );
-    println!(
-        "cargo:rustc-env=P11SCOPE_JOURNAL_ENABLED={}",
-        u8::from(production_journal)
-    );
-    println!(
-        "cargo:rustc-env=P11SCOPE_JOURNAL_OUTPUTS={}",
-        if production_journal { "journal-v1" } else { "" }
     );
     println!(
         "cargo:rustc-env=P11SCOPE_IMAGE_BANK_PROOF_ENABLED={}",

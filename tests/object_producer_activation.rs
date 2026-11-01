@@ -3157,6 +3157,10 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// and the `LOADER_GATE`/`LOADER_GATE_CTL` maps, its only BPF source
 /// change): 143722 B. The old pin still matches the source at
 /// 32e7dd9a^ with this same lexer.
+/// Re-baselined for the EXEC ticket's PID-scope exclusion (the only BPF
+/// source change: `emit_lifecycle` acquires the ticket only when the
+/// scope flags lack the PID-filter bit, plus its comment lines): 143780 B,
+/// measured with this same lexer; the previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3166,8 +3170,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            143722,
-            "3cb6f6624ca0f58ae9e07073b80e57d90cd1fb004e80a9d28712a789cfaeec5d"
+            143780,
+            "36d08e8ea491ecdd19e7253743a1b8c1cfeb32ed3f456eee649991b38b295c9f"
         ),
         "stripped BPF dump must stay byte-identical"
     );

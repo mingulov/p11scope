@@ -81,8 +81,8 @@ pub(crate) use pid_continuity::engine_fixture::{
     AttachmentBoundaryChange, PidSessionFixture, PreflightChange,
 };
 pub(crate) use pid_continuity::{
-    CompletedRearmReceipt, ExecBinding, PhysicalGapSummary, PidContinuityRefusal, PidLifecycleTap,
-    PreservationReceipt, clock_origins_comparable,
+    CompletedRearmReceipt, ExecBinding, LifecycleFacts, PhysicalGapSummary, PidContinuityRefusal,
+    PidLifecycleTap, PreservationReceipt, clock_origins_comparable,
 };
 
 // I3 will consume this preparation capability; I2b installs no callers or links.
@@ -7685,6 +7685,19 @@ impl Session {
             self.pid_pairs.gap_summary(),
             self.global_retirements.summary(),
         )
+    }
+
+    /// Snapshot the PID-scope exec witness for K0 selected detail:
+    /// the broad tap's lifecycle facts, `None` when this session
+    /// watches no single original, `Err` when the witness failed.
+    /// Read-only; the DISCOVERY drains keep feeding the tap.
+    pub(crate) fn pid_lifecycle_facts(
+        &self,
+    ) -> Result<Option<LifecycleFacts>, PidContinuityRefusal> {
+        self.pid_lifecycle
+            .as_ref()
+            .map(|tap| tap.facts())
+            .transpose()
     }
 
     pub(crate) fn prepare_ended_pid_retirement(

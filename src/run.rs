@@ -5351,15 +5351,34 @@ fn capture_profile(
     // once the final report is written.
     let has_output = output.is_some();
     // 6.15: resolve the CLI endpoint selection once, against the live
-    // broad plan, before the loop. The attempt — resolved slot or named
-    // refusal — records into the additive ledger the report composes;
-    // aggregate capture is untouched on every path.
+    // broad plan, before the loop, and open the K0 detail window over
+    // a resolution with the selection-time broad read. The attempt —
+    // resolved slot or named refusal — records into the additive
+    // ledger the report composes; aggregate capture is untouched on
+    // every path.
     let mut selection_ledger = metrics::selected_detail_driver::SelectionLedger::new();
-    if let Some(name) = select_endpoint {
-        metrics::selected_detail_driver::run_metrics_selection_stage(
+    let mut k0_window: Option<metrics::selected_detail_driver::K0Window> = None;
+    if let Some(name) = select_endpoint
+        && let Some(resolved) = metrics::selected_detail_driver::run_metrics_selection_stage(
             name,
             engine.plan(),
             scope,
+            &mut selection_ledger,
+        )
+    {
+        let crate::plan::AdmissionPolicy::Counters(budget) = engine.plan().admission_policy()
+        else {
+            unreachable!("resolve_selection admits Counters plans only");
+        };
+        k0_window = metrics::selected_detail_driver::open_k0_production(
+            resolved,
+            budget.endpoint_limit() as usize,
+            crate::attach::counter_banks::COUNTER_RV_KEY_POOL,
+            engine.counter_reserver(),
+            session,
+            engine.plan(),
+            engine.pinned(),
+            session.pid_lifecycle_facts(),
             &mut selection_ledger,
         );
     }
@@ -5798,6 +5817,12 @@ fn capture_profile(
     // Diagnostics are optional; closed/slow stderr cannot skip owned cleanup.
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
     let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+    // K0: snapshot the exec witness while the tap is still live.
+    // Quiescence invalidates the PID lifecycle tap (and the later
+    // terminal drain would too), so a snapshot past this point always
+    // reads terminal and would void every window as caller-changed.
+    // The close compares this against the selection-time facts.
+    let mut k0_close_facts = k0_window.as_ref().map(|_| session.pid_lifecycle_facts());
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
     // apply after the poll; EVENTS reduce in place. Every failure below
@@ -5933,6 +5958,17 @@ fn capture_profile(
                             post_q_discovery: false,
                         },
                     };
+                    // K0 on the quiesce-error path: no provable close
+                    // boundary, so the shared close voids the window as
+                    // broad-stopping.
+                    let k0 =
+                        k0_window
+                            .take()
+                            .map(|window| metrics::selected_detail_driver::K0Close {
+                                window,
+                                facts: terminal_context.1.pid_lifecycle_facts(),
+                                clean: false,
+                            });
                     run_terminal(
                         &mut terminal_context,
                         &mut consumers,
@@ -5952,7 +5988,8 @@ fn capture_profile(
                         // stopped, never as a clean scope end.
                         CaptureEnd::Error,
                         watch_stop_ns,
-                        select_endpoint.map(|_| &selection_ledger),
+                        k0,
+                        select_endpoint.map(|_| &mut selection_ledger),
                     )
                     .map(|_| ())
                 },
@@ -6100,6 +6137,19 @@ fn capture_profile(
                 },
                 |context, consumers| {
                     poll_terminal_cancellation();
+                    // K0: the close boundary is clean only with proven
+                    // quiescence and no blind post-quiescence tail.
+                    let k0 = k0_window.take().map(|window| {
+                        let facts = k0_close_facts
+                            .take()
+                            .expect("K0 close facts snapshot with the window");
+                        metrics::selected_detail_driver::K0Close {
+                            window,
+                            facts,
+                            clean: quiesced.is_some()
+                                && !consumers.stop_quiescence.post_q_discovery,
+                        }
+                    });
                     run_terminal(
                         context,
                         consumers,
@@ -6117,7 +6167,8 @@ fn capture_profile(
                         &poll_terminal_cancellation,
                         end,
                         watch_stop_ns,
-                        select_endpoint.map(|_| &selection_ledger),
+                        k0,
+                        select_endpoint.map(|_| &mut selection_ledger),
                     )
                 },
             )
@@ -6148,7 +6199,8 @@ fn capture_profile(
         poll_terminal_cancellation: &impl Fn(),
         end: CaptureEnd,
         stop_ns: Option<u64>,
-        selected_detail: Option<&metrics::selected_detail_driver::SelectionLedger>,
+        k0: Option<metrics::selected_detail_driver::K0Close>,
+        mut selection_ledger: Option<&mut metrics::selected_detail_driver::SelectionLedger>,
     ) -> Result<render::Evidence> {
         poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
@@ -6159,6 +6211,20 @@ fn capture_profile(
                 .terminal(context.1, context.0.plan(), context.0.pinned(), profile)?;
         let reports = snapshot.reports();
         let kernel_evidence = snapshot.kernel_evidence();
+        // K0: close the detail window after the broad terminal read,
+        // while the banks are still live (detach is post-publication).
+        if let Some(k0) = k0 {
+            let ledger = selection_ledger
+                .as_mut()
+                .expect("a K0 window implies a staged selection");
+            metrics::selected_detail_driver::close_k0_production(
+                k0,
+                context.1,
+                context.0.plan(),
+                context.0.pinned(),
+                ledger,
+            );
+        }
         poll_terminal_cancellation();
         consumers
             .scheduling
@@ -6298,7 +6364,7 @@ fn capture_profile(
                 render::json(reports, &ev, &capture)
             };
             let j = render::with_counter_snapshot(j, &snapshot);
-            let j = match selected_detail {
+            let j = match selection_ledger {
                 Some(ledger) => metrics::selected_detail_driver::with_selected_detail(j, ledger),
                 None => j,
             };
@@ -14099,6 +14165,17 @@ mod tests {
         assert!(
             profile.contains("with_selected_detail(j, ledger)"),
             "capture_profile must compose the additive ledger"
+        );
+        // K0: the close witness snapshot precedes quiescence, which
+        // invalidates the PID lifecycle tap; a snapshot past it would
+        // always read terminal and void every window as caller-changed.
+        let snapshot = profile
+            .find("k0_close_facts = k0_window.as_ref()")
+            .expect("K0 close snapshot");
+        let quiesce = profile.find("quiesce_terminal(").expect("quiescence");
+        assert!(
+            snapshot < quiesce,
+            "capture_profile must snapshot the K0 close witness before quiescence"
         );
     }
 

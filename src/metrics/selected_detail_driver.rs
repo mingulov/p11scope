@@ -7,12 +7,12 @@
 //! driver: the `--select-endpoint` name resolves against the live
 //! broad plan (exactly one slot, never first-match) and the scope
 //! resolves to one live original (`--pid`/owned only). The
-//! preparation bundle and the install entry are the host-composition
-//! seam: the metrics host records their honest unavailability
-//! ([`SelectedDriverRefusal::BundleUnavailable`]) and the aggregate
-//! capture continues untouched. The composition packet replaces that
-//! refusal with the genuine producers; nothing else in this module
-//! changes.
+//! K0 window ([`open_k0_window`]/[`close_k0_window`]) details the
+//! selection from the broad banks' own cells between a
+//! selection-time read and the close read; an exec of the selected
+//! caller voids it via the broad exec witness. Unresolvable
+//! selections and voided windows record their named refusal and the
+//! aggregate capture continues untouched.
 //!
 //! The [`PromotionDriver`] runs the full D2.3 ordering over the real
 //! seams — adapter reserve, lifecycle start with the gated source,
@@ -21,14 +21,18 @@
 //! controls drive it end to end; the production metrics path reaches
 //! it once the host composition lands (STAGED below).
 
-use super::counter_collector::{CounterDeltas, CounterRead, ReadStage};
+use super::counter_collector::{
+    CounterCollector, CounterDeltas, CounterLimits, CounterObservation, CounterRead, ReadStage,
+};
+use super::counter_reader::ReaderShapeCause;
 use super::selected_detail::{
     AcceptedBracket, BoundWindow, BroadBracketCollector, BroadSession, DetailCloseRefusal,
     DetailCloseReport, DetailWindowCustody, DetailWindowEvent, GatedActivationSource,
     PreparedChildReceipt, ReserveRefusal, SelectedDetailRefusal,
 };
 use crate::attach::Scope;
-use crate::attach::counter_banks::CounterDetailWindow;
+use crate::attach::counter_banks::{BankRefusal, CounterDetailWindow, DetailToggleRefusal};
+use crate::attach::{LifecycleFacts, PidContinuityRefusal, Session};
 use crate::discovery::engine::inventory_coordinator::semantics::PromotionInstallCapacity;
 use crate::discovery::identity::PinnedObjects;
 use crate::inventory_promotion::lifecycle::{
@@ -41,7 +45,7 @@ use crate::inventory_promotion::{
 };
 use crate::plan::{AdmissionPolicy, AttachKey, AttachPlan, Slot};
 use crate::process::PidPin;
-use crate::semantics_edge::resources::SemanticResourcePool;
+use crate::semantics_edge::resources::{SemanticResourcePool, SemanticResourceReserver};
 use p11scope_ebpf_common::CounterMode;
 use std::sync::Arc;
 
@@ -81,10 +85,9 @@ pub(crate) enum SelectedDriverRefusal {
     Detail(SelectedDetailRefusal),
     /// The CLI name matched zero broad slots.
     EndpointUnknown,
-    /// The metrics host cannot mint the preparation bundle or install
-    /// a lane (no coordinator/baseline producer): the host-composition
-    /// seam. Recorded honestly; aggregate capture continues.
-    BundleUnavailable,
+    // NOTE: the pre-K0 `bundle_unavailable` seam word is retired from
+    // production; it stays in the schema vocabulary (schema JSON +
+    // oracle) so reports written before K0 still validate.
 }
 
 impl SelectedDriverRefusal {
@@ -118,7 +121,6 @@ impl SelectedDriverRefusal {
             },
             Self::Detail(detail) => detail.name(),
             Self::EndpointUnknown => "endpoint_unknown",
-            Self::BundleUnavailable => "bundle_unavailable",
         }
     }
 }
@@ -908,11 +910,11 @@ impl Default for SelectionLedger {
 }
 
 /// Production metrics selection stage (driver stage 0 in the capture
-/// loop): resolve the CLI name, record the selection or its named
-/// refusal, then record the host-composition seam refusal for the
-/// bundle the metrics host cannot mint. Returns the resolution for
-/// the composition packet; the ledger is the durable record either
-/// way. Aggregate capture is untouched on every path.
+/// loop): resolve the CLI name and record the selection or its named
+/// refusal. A resolution carries no refusal yet: the caller opens the
+/// K0 window over it, and the close records the detail or its void.
+/// Returns the resolution for the K0 open; the ledger is the durable
+/// record either way. Aggregate capture is untouched on every path.
 pub(crate) fn run_metrics_selection_stage(
     name: &str,
     broad_plan: &AttachPlan,
@@ -922,11 +924,6 @@ pub(crate) fn run_metrics_selection_stage(
     match resolve_selection(name, broad_plan, scope) {
         Ok(resolved) => {
             ledger.record_selection(name, &resolved);
-            // Host-composition seam: the metrics host cannot mint the
-            // preparation bundle or install a lane (no coordinator /
-            // baseline producer). Recorded honestly; the aggregate
-            // capture continues untouched.
-            ledger.mark_selection_refused(SelectedDriverRefusal::BundleUnavailable.name());
             Some(resolved)
         }
         Err(refusal) => {
@@ -934,6 +931,262 @@ pub(crate) fn run_metrics_selection_stage(
             None
         }
     }
+}
+
+/// One exec-witness snapshot for a K0 window bound: the broad tap's
+/// facts, `None` when the session carries no PID witness, `Err` when
+/// the witness failed. Production snapshots come from
+/// `Session::pid_lifecycle_facts`; twins script them.
+pub(crate) type K0Facts = Result<Option<LifecycleFacts>, PidContinuityRefusal>;
+
+/// The open K0 window: the resolved selection, the detail collector
+/// holding the selection-time read as its baseline, the
+/// selection-time witness facts, and the collector limits (reused for
+/// the close read so both bounds share one budget).
+pub(crate) struct K0Window {
+    resolved: ResolvedSelection,
+    collector: CounterCollector,
+    before: LifecycleFacts,
+    limits: CounterLimits,
+}
+
+/// Map a failed K0 read to its ledger word: quarantine and pool
+/// pressure name themselves, a missing binding names the broad, and
+/// every other stage maps to the topology catch-all (the existing
+/// `read_stage_refusal` precedent, with pool pressure named precisely
+/// instead of folded into the catch-all).
+fn k0_read_refusal(stage: ReadStage) -> SelectedDriverRefusal {
+    match stage {
+        ReadStage::Shape(ReaderShapeCause::BindingAbsent) => SelectedDriverRefusal::Detail(
+            SelectedDetailRefusal::Gate(DetailToggleRefusal::BroadNotCounter),
+        ),
+        ReadStage::BankQuarantined => SelectedDriverRefusal::Detail(SelectedDetailRefusal::Gate(
+            DetailToggleRefusal::Quarantined,
+        )),
+        ReadStage::Budget => {
+            SelectedDriverRefusal::Detail(SelectedDetailRefusal::Gate(DetailToggleRefusal::Budget))
+        }
+        _ => SelectedDriverRefusal::Detail(SelectedDetailRefusal::BroadPlanTopology),
+    }
+}
+
+/// Open the K0 window over an already-recorded resolution: validate
+/// the selection-time witness facts, then observe the selection-time
+/// broad read through a dedicated collector (`Initial` installs the
+/// baseline). A failed read or unprovable witness records its mapped
+/// refusal and opens nothing; aggregate capture is untouched.
+/// Metrics-internal like the reads it observes: production enters
+/// through [`open_k0_production`].
+pub(super) fn open_k0_window(
+    resolved: ResolvedSelection,
+    limits: CounterLimits,
+    reserve: SemanticResourceReserver,
+    before: Result<CounterRead, ReadStage>,
+    before_facts: K0Facts,
+    ledger: &mut SelectionLedger,
+) -> Option<K0Window> {
+    let before_witness = match before_facts {
+        Ok(Some(facts)) => facts,
+        _ => {
+            ledger.mark_selection_refused(
+                SelectedDriverRefusal::Detail(SelectedDetailRefusal::BroadPlanTopology).name(),
+            );
+            return None;
+        }
+    };
+    let mut collector = CounterCollector::new(limits, reserve);
+    match collector.observe(before) {
+        CounterObservation::Initial => {}
+        CounterObservation::ReadFailed(stage) => {
+            ledger.mark_selection_refused(k0_read_refusal(stage).name());
+            return None;
+        }
+        // A first observation never advances (no baseline exists
+        // yet) and never changes generation (none is installed);
+        // both arms refuse closed if the collector ever says so.
+        CounterObservation::Unavailable(_)
+        | CounterObservation::GenerationChanged { .. }
+        | CounterObservation::Advanced { .. } => {
+            ledger.mark_selection_refused(
+                SelectedDriverRefusal::Detail(SelectedDetailRefusal::BroadPlanTopology).name(),
+            );
+            return None;
+        }
+    }
+    Some(K0Window {
+        resolved,
+        collector,
+        before: before_witness,
+        limits,
+    })
+}
+
+/// Close the K0 window: close-boundary, slot-retirement,
+/// exec-witness, and loss checks in contract order, then the close
+/// read through the collector and the aggregate/detail render. Any
+/// void records its named refusal; `lineage`, `aggregate` and
+/// `detail` stay absent and the main report's aggregate alone
+/// carries the capture. Metrics-internal like the reads it observes:
+/// production enters through [`close_k0_production`].
+pub(super) fn close_k0_window(
+    window: K0Window,
+    close_plan: &AttachPlan,
+    after: Result<CounterRead, ReadStage>,
+    after_facts: K0Facts,
+    clean_close: bool,
+    ledger: &mut SelectionLedger,
+) {
+    use super::selected_detail::{render_aggregate_bracket, render_detail_rows};
+    use SelectedDriverRefusal::{Detail, Promotion};
+    let K0Window {
+        resolved,
+        mut collector,
+        before,
+        limits: _,
+    } = window;
+    if !clean_close {
+        ledger.mark_selection_refused(
+            Detail(SelectedDetailRefusal::Gate(
+                DetailToggleRefusal::BroadStopping,
+            ))
+            .name(),
+        );
+        return;
+    }
+    let published = close_plan.slots.iter().any(|slot| {
+        slot.index == resolved.slot
+            && slot.object == resolved.physical.object
+            && slot.file_offset == resolved.physical.file_offset
+    });
+    if !published {
+        ledger.mark_selection_refused(
+            Detail(SelectedDetailRefusal::Gate(
+                DetailToggleRefusal::NotPublished,
+            ))
+            .name(),
+        );
+        return;
+    }
+    let after_witness = match after_facts {
+        Ok(Some(facts)) => facts,
+        _ => {
+            ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
+            return;
+        }
+    };
+    if after_witness.fault_serial != before.fault_serial
+        || after_witness.latest_exec != before.latest_exec
+    {
+        ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
+        return;
+    }
+    if after_witness.greatest_break_ns != before.greatest_break_ns {
+        ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerRetired).name());
+        return;
+    }
+    let mut deltas = match collector.observe(after) {
+        CounterObservation::Advanced { deltas, .. } => deltas,
+        CounterObservation::ReadFailed(stage) => {
+            ledger.mark_selection_refused(k0_read_refusal(stage).name());
+            return;
+        }
+        CounterObservation::Unavailable(_)
+        | CounterObservation::GenerationChanged { .. }
+        | CounterObservation::Initial => {
+            ledger.mark_selection_refused(Detail(SelectedDetailRefusal::BroadPlanTopology).name());
+            return;
+        }
+    };
+    let current = collector
+        .current()
+        .expect("an advanced K0 collector holds its close read");
+    let view = current.view();
+    ledger.aggregate = Some(render_aggregate_bracket(&deltas, view.mode, 1, 2));
+    deltas.retain_slot(resolved.slot);
+    ledger.detail = Some(render_detail_rows(
+        &deltas,
+        view.mode,
+        view.generation.get(),
+    ));
+}
+
+/// One production K0 read off the broad banks: the binding comes only
+/// from actual preparation, and a missing binding or a quarantined
+/// broad maps to its own stage. Charges the caller's reserver — the
+/// Engine's counter pool in production — exactly like a broad tick
+/// read; no new pool, object, or reservation.
+fn k0_broad_read(
+    session: &Session,
+    plan: &AttachPlan,
+    pins: &PinnedObjects,
+    limits: CounterLimits,
+    reserve: &SemanticResourceReserver,
+) -> Result<CounterRead, ReadStage> {
+    let binding = session
+        .counter_reader_binding()
+        .map_err(|refusal| match refusal {
+            BankRefusal::Quarantined => ReadStage::BankQuarantined,
+            _ => ReadStage::BankRouting,
+        })?;
+    match binding {
+        Some(binding) => super::counter_reader::read_bound(binding, plan, pins, limits, reserve),
+        None => Err(ReadStage::Shape(ReaderShapeCause::BindingAbsent)),
+    }
+}
+
+/// Production K0 open inside `capture_profile`: the selection-time
+/// broad read plus the shared open body. Plain budget numbers cross
+/// the metrics boundary (the limits type stays metrics-internal).
+#[allow(clippy::too_many_arguments)] // One production open over all retained inputs; twins drive the core directly.
+pub(crate) fn open_k0_production(
+    resolved: ResolvedSelection,
+    rows: usize,
+    rv_keys: usize,
+    reserve: SemanticResourceReserver,
+    session: &Session,
+    plan: &AttachPlan,
+    pins: &PinnedObjects,
+    before_facts: K0Facts,
+    ledger: &mut SelectionLedger,
+) -> Option<K0Window> {
+    let limits = CounterLimits { rows, rv_keys };
+    let before = k0_broad_read(session, plan, pins, limits, &reserve);
+    open_k0_window(resolved, limits, reserve, before, before_facts, ledger)
+}
+
+/// Everything `run_terminal` needs to close an opened K0 window: the
+/// window, the close witness facts snapshotted before the terminal
+/// discovery drain, and whether the close boundary is proven clean.
+pub(crate) struct K0Close {
+    pub(crate) window: K0Window,
+    pub(crate) facts: K0Facts,
+    pub(crate) clean: bool,
+}
+
+/// Production K0 close inside `run_terminal`: the close read off the
+/// broad banks, then the shared close body. The close read runs even
+/// when the boundary is unclean; the close body discards it before
+/// observing and voids as broad-stopping.
+pub(crate) fn close_k0_production(
+    close: K0Close,
+    session: &Session,
+    plan: &AttachPlan,
+    pins: &PinnedObjects,
+    ledger: &mut SelectionLedger,
+) {
+    let K0Close {
+        window,
+        facts,
+        clean,
+    } = close;
+    let after = k0_broad_read(
+        session,
+        plan,
+        pins,
+        window.limits,
+        window.collector.reserver(),
+    );
+    close_k0_window(window, plan, after, facts, clean, ledger);
 }
 
 /// Compose the additive `selected_detail` evidence object (M2
@@ -1581,19 +1834,20 @@ mod tests {
     }
 
     #[test]
-    fn metrics_selection_stage_records_resolution_then_host_seam() {
+    fn metrics_selection_stage_records_resolution_for_k0_window() {
         // The production metrics call-site through the real invoked
-        // path: resolve genuinely, record the selection or its named
-        // refusal, then record the bundle the metrics host cannot
-        // mint. The composer adds exactly one evidence object and
-        // touches nothing else.
+        // path: resolve genuinely and record the selection or its
+        // named refusal. A resolution carries no refusal yet: the K0
+        // open follows, and the close records the detail or its void.
+        // The composer adds exactly one evidence object and touches
+        // nothing else.
         let pool = test_pool();
         let scene = stage_single_provider(pool, 4);
         let scope = Scope::Pid(std::process::id());
         let mut ledger = SelectionLedger::new();
         let resolved =
             run_metrics_selection_stage("C_Toggle0002", &scene.plan, &scope, &mut ledger)
-                .expect("live name resolves for the composition packet");
+                .expect("live name resolves for the K0 window");
         assert_eq!(resolved.slot, 2);
         assert_eq!(
             resolved.original.pid(),
@@ -1603,7 +1857,7 @@ mod tests {
         let record = ledger.selection.as_ref().expect("selection records");
         assert_eq!(record.endpoint, "C_Toggle0002");
         assert_eq!(record.slot, Some(2));
-        assert_eq!(record.refusal, Some("bundle_unavailable"));
+        assert_eq!(record.refusal, None, "resolution alone refuses nothing");
         let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
         let resolved_record = composed["evidence"]["selected_detail"]["selection"]
             .as_object()
@@ -1614,10 +1868,10 @@ mod tests {
         );
         assert_eq!(
             resolved_record.len(),
-            5,
+            4,
             "resolved selection carries exactly its closed keys: {resolved_record:?}"
         );
-        for key in ["endpoint", "slot", "file_offset", "names", "refusal"] {
+        for key in ["endpoint", "slot", "file_offset", "names"] {
             assert!(
                 resolved_record.contains_key(key),
                 "resolved selection names {key}: {resolved_record:?}"
@@ -3792,5 +4046,1061 @@ mod tests {
         .expect("receipt request verifies after a legacy refusal");
         assert_eq!(resolved.selected, 1);
         assert_eq!(resolved.physical.file_offset, 0x90);
+    }
+
+    // --- K0 (broad-cells detail) twins ---
+    //
+    // The K0 window opens over a resolved selection with the
+    // selection-time broad read as its baseline, and closes with the
+    // close read: the detail is the selected slot's own broad cells
+    // over the window. Twins drive the same open/close bodies
+    // production runs, with scripted reads through the genuine fold
+    // and witness facts through the genuine tap.
+
+    use crate::attach::PidLifecycleTap;
+    use p11scope_ebpf_common::{
+        DISCOVERY_EXEC_TASK_REPLACED, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_LEADER_EXIT,
+        DiscoveryRecord,
+    };
+
+    /// One K0 selection through the production stage: resolve
+    /// genuinely against the live plan and record the attempt.
+    fn k0_stage(
+        scene: &BroadScene,
+        name: &str,
+        ledger: &mut SelectionLedger,
+    ) -> Option<ResolvedSelection> {
+        run_metrics_selection_stage(name, &scene.plan, &Scope::Pid(std::process::id()), ledger)
+    }
+
+    fn k0_exec_record(pid: u32, ts: u64) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = ts;
+        record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+        record.kind = DISCOVERY_KIND_EXEC;
+        record.case_id = DISCOVERY_EXEC_TASK_REPLACED;
+        record
+    }
+
+    fn k0_exit_record(pid: u32, ts: u64) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = ts;
+        record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+        record.kind = DISCOVERY_KIND_LEADER_EXIT;
+        record
+    }
+
+    /// Witness facts through the genuine tap: open a read, apply the
+    /// scripted records, snapshot. A failed read-open fails loudly so
+    /// an exotic clock never silently rewords a twin.
+    fn k0_facts_after(pid: u32, apply: impl FnOnce(&PidLifecycleTap)) -> LifecycleFacts {
+        let tap = PidLifecycleTap::test_for(pid, crate::events::DiscoveryDomain::test_standin(7));
+        assert!(
+            tap.begin_read(Some(100)).is_some(),
+            "the K0 twin read opens"
+        );
+        apply(&tap);
+        tap.test_facts().expect("the K0 twin tap stays readable")
+    }
+
+    fn k0_clean() -> K0Facts {
+        Ok(Some(LifecycleFacts::default()))
+    }
+
+    /// A scripted read with explicit producer health, through the
+    /// genuine fold and pack (mirrors `scripted_read`, which is
+    /// always healthy).
+    fn k0_scripted_read(
+        pool: &SemanticResourcePool,
+        plan: &AttachPlan,
+        generation: NonZeroU64,
+        mode: CounterMode,
+        counts: &[(u64, u64, u64)],
+        window: Option<ReadWindow>,
+        health: CounterHealth,
+    ) -> CounterRead {
+        assert_eq!(
+            counts.len(),
+            plan.slots.len(),
+            "one explicit sample per plan slot"
+        );
+        let mut rows = Vec::with_capacity(plan.slots.len());
+        let held: Vec<CountStats> = counts
+            .iter()
+            .map(|&(entered, returned, errors)| CountStats {
+                entered,
+                returned,
+                errors,
+            })
+            .collect();
+        for (slot, index) in plan.slots.iter().zip(0..) {
+            let cells = vec![CounterCell::Counts(&held[index])];
+            rows.push(
+                CounterRow::fold(slot, mode, cells, Vec::new(), limits_for(plan))
+                    .expect("explicit cells fold"),
+            );
+        }
+        let reservation =
+            ReadReservation::reserve(rows.len(), 0, &pool.reserver()).expect("read reserves");
+        CounterRead::new(
+            generation,
+            mode,
+            window,
+            Ok(rows),
+            health,
+            KernelEvidence::default(),
+            reservation,
+        )
+        .expect("scripted read packs")
+    }
+
+    #[test]
+    fn k0_detail_equals_broad_slot_delta_over_window() {
+        // Healthy K0 (counts): the detail is the selected slot's own
+        // broad cells between the selection-time read and the close
+        // read — (15, 12, 1) here — while other slots carry their own
+        // (10, 10, 0). No refusal records on success.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        assert_eq!(resolved.slot, 2);
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &[(100, 100, 0), (100, 100, 0), (100, 100, 0), (100, 100, 0)],
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &[(110, 110, 0), (110, 110, 0), (115, 112, 1), (110, 110, 0)],
+            window_of(20, 30),
+        );
+        close_k0_window(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &mut ledger,
+        );
+        let record = ledger.selection.as_ref().expect("selection records");
+        assert_eq!(record.refusal, None, "success records no refusal");
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        let detail = section.get("detail").expect("detail renders");
+        assert_eq!(detail["scope"], serde_json::json!("detail"));
+        assert_eq!(detail["mode"], serde_json::json!("counts"));
+        assert_eq!(
+            detail["detail_generation"],
+            serde_json::json!(BROAD_GENERATION),
+            "K0 detail names the broad banks it comes from"
+        );
+        let rows = detail["rows"].as_array().expect("detail rows");
+        assert_eq!(rows.len(), 1, "detail carries only the selected slot");
+        assert_eq!(rows[0]["slot"], serde_json::json!(2));
+        assert_eq!(rows[0]["entered"], serde_json::json!(15));
+        assert_eq!(rows[0]["returned"], serde_json::json!(12));
+        assert_eq!(rows[0]["errors"], serde_json::json!(1));
+        assert!(
+            rows[0].get("total_ns").is_none(),
+            "counts rows carry no time"
+        );
+        let aggregate = section.get("aggregate").expect("aggregate renders");
+        assert_eq!(aggregate["seq_before"], serde_json::json!(1));
+        assert_eq!(aggregate["seq_after"], serde_json::json!(2));
+        let aggregate_rows = aggregate["rows"].as_array().expect("aggregate rows");
+        assert_eq!(aggregate_rows.len(), 4, "aggregate stays scope-wide");
+        assert_eq!(aggregate_rows[2]["entered"], serde_json::json!(15));
+        assert_eq!(aggregate_rows[0]["entered"], serde_json::json!(10));
+        assert!(section.get("lineage").is_none(), "K0 joins no lineage");
+    }
+
+    #[test]
+    fn k0_detail_carries_per_mode_cells() {
+        // One mode per measurement: counts rows carry no time keys,
+        // timestamps rows add totals, latency rows add buckets. Values
+        // are the selected slot's window deltas in every mode.
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let pool = test_pool();
+            let scene = stage_single_provider(pool, 4);
+            let mut ledger = SelectionLedger::new();
+            let resolved = k0_stage(&scene, "C_Toggle0001", &mut ledger)
+                .expect("live name resolves for the K0 window");
+            let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+            let before = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                mode,
+                &counts_for(&scene.plan, 100, 100),
+                window_of(10, 20),
+            );
+            let window = open_k0_window(
+                resolved,
+                limits_for(&scene.plan),
+                scene.pool.reserver(),
+                Ok(before),
+                k0_clean(),
+                &mut ledger,
+            )
+            .expect("a healthy selection-time read opens the window");
+            let after = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                mode,
+                &counts_for(&scene.plan, 110, 110),
+                window_of(20, 30),
+            );
+            close_k0_window(
+                window,
+                &scene.plan,
+                Ok(after),
+                k0_clean(),
+                true,
+                &mut ledger,
+            );
+            assert_eq!(
+                ledger
+                    .selection
+                    .as_ref()
+                    .expect("selection records")
+                    .refusal,
+                None,
+                "success records no refusal in {mode:?}"
+            );
+            let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+            let detail = composed["evidence"]["selected_detail"]
+                .get("detail")
+                .expect("detail renders");
+            assert_eq!(detail["mode"], serde_json::json!(mode.name()));
+            let rows = detail["rows"].as_array().expect("detail rows");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["slot"], serde_json::json!(1));
+            assert_eq!(rows[0]["entered"], serde_json::json!(10));
+            assert_eq!(rows[0]["returned"], serde_json::json!(10));
+            match mode {
+                CounterMode::Counts => {
+                    assert!(rows[0].get("total_ns").is_none(), "counts: no time");
+                    assert!(rows[0].get("max_ns").is_none(), "counts: no time");
+                    assert!(rows[0].get("buckets").is_none(), "counts: no buckets");
+                }
+                CounterMode::Timestamps => {
+                    assert_eq!(rows[0]["total_ns"], serde_json::json!(100));
+                    assert_eq!(rows[0]["max_ns"], serde_json::json!(10));
+                    assert!(rows[0].get("buckets").is_none(), "timestamps: no buckets");
+                }
+                CounterMode::Latency => {
+                    assert_eq!(rows[0]["total_ns"], serde_json::json!(100));
+                    assert_eq!(rows[0]["max_ns"], serde_json::json!(10));
+                    assert_eq!(
+                        rows[0]["buckets"].as_array().expect("buckets").len(),
+                        32,
+                        "latency carries its buckets"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn k0_exec_in_window_voids_detail() {
+        // An exec of the selected caller between the bounds voids the
+        // detail with the caller-changed word: the window's calls can
+        // no longer be attributed to the selected caller. A witness
+        // fault fails closed the same way. Nothing renders on a void.
+        for (label, after_facts) in [
+            (
+                "exec",
+                Ok(Some(k0_facts_after(7, |tap| {
+                    tap.observe_record(&k0_exec_record(7, 200));
+                }))),
+            ),
+            (
+                "fault",
+                Ok(Some(k0_facts_after(7, |tap| {
+                    tap.observe_malformed();
+                }))),
+            ),
+            ("unreadable", Err(PidContinuityRefusal::Terminal)),
+        ] {
+            let pool = test_pool();
+            let scene = stage_single_provider(pool, 4);
+            let mut ledger = SelectionLedger::new();
+            let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+                .expect("live name resolves for the K0 window");
+            let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+            let before = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 100, 100),
+                window_of(10, 20),
+            );
+            let window = open_k0_window(
+                resolved,
+                limits_for(&scene.plan),
+                scene.pool.reserver(),
+                Ok(before),
+                k0_clean(),
+                &mut ledger,
+            )
+            .expect("a healthy selection-time read opens the window");
+            let after = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 110, 110),
+                window_of(20, 30),
+            );
+            close_k0_window(
+                window,
+                &scene.plan,
+                Ok(after),
+                after_facts,
+                true,
+                &mut ledger,
+            );
+            let record = ledger.selection.as_ref().expect("selection records");
+            assert_eq!(
+                record.refusal,
+                Some("promotion_caller_changed"),
+                "{label} voids the detail"
+            );
+            let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+            let section = &composed["evidence"]["selected_detail"];
+            assert!(section.get("detail").is_none(), "{label}: no detail");
+            assert!(
+                section.get("aggregate").is_none(),
+                "{label}: no window aggregate"
+            );
+            assert!(section.get("lineage").is_none(), "{label}: no lineage");
+            assert_eq!(
+                section["events"],
+                serde_json::json!([]),
+                "{label}: no events"
+            );
+        }
+    }
+
+    #[test]
+    fn k0_break_without_exec_voids_as_retired() {
+        // A pure break (leader exit with no exec record) voids as a
+        // retirement, not a change: the caller is gone, not replaced.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let break_only = k0_facts_after(7, |tap| {
+            tap.observe_record(&k0_exit_record(7, 200));
+        });
+        assert!(
+            break_only.latest_exec.is_none(),
+            "the twin stages a break with no exec"
+        );
+        assert!(
+            break_only.greatest_break_ns.is_some(),
+            "the twin stages a break"
+        );
+        close_k0_window(
+            window,
+            &scene.plan,
+            Ok(after),
+            Ok(Some(break_only)),
+            true,
+            &mut ledger,
+        );
+        let record = ledger.selection.as_ref().expect("selection records");
+        assert_eq!(record.refusal, Some("promotion_caller_retired"));
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_none());
+        assert!(section.get("aggregate").is_none());
+    }
+
+    #[test]
+    fn k0_unresolvable_or_ambiguous_selection_refuses() {
+        // Preservation: an unknown or ambiguous endpoint refuses at
+        // the stage exactly as today, and opens no window.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        assert!(
+            k0_stage(&scene, "C_Missing", &mut ledger).is_none(),
+            "unknown names open nothing"
+        );
+        assert_eq!(
+            ledger.selection.as_ref().expect("refusal records").refusal,
+            Some("endpoint_unknown")
+        );
+        let pool = test_pool();
+        let multi = stage_two_providers(pool);
+        let scope = Scope::Pid(std::process::id());
+        let mut ledger = SelectionLedger::new();
+        assert!(
+            run_metrics_selection_stage("C_Sign", &multi.plan, &scope, &mut ledger).is_none(),
+            "ambiguous names open nothing"
+        );
+        assert_eq!(
+            ledger.selection.as_ref().expect("refusal records").refusal,
+            Some("promotion_endpoint_ambiguous")
+        );
+    }
+
+    #[test]
+    fn k0_cgroup_and_system_scopes_refuse_without_detail() {
+        // Preservation: scopes without one original keep today's
+        // named refusal and open no window.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        assert!(
+            run_metrics_selection_stage("C_Toggle0001", &scene.plan, &Scope::System, &mut ledger)
+                .is_none(),
+            "system scope opens nothing"
+        );
+        assert_eq!(
+            ledger.selection.as_ref().expect("refusal records").refusal,
+            Some("promotion_scope_unsupported")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let held =
+            std::sync::Arc::new(std::fs::File::open(dir.path()).expect("cgroup stand-in opens"));
+        let mut ledger = SelectionLedger::new();
+        assert!(
+            run_metrics_selection_stage(
+                "C_Toggle0001",
+                &scene.plan,
+                &Scope::Cgroup {
+                    id: 7,
+                    path: dir.path().to_path_buf(),
+                    dir: held,
+                },
+                &mut ledger,
+            )
+            .is_none(),
+            "cgroup scope opens nothing"
+        );
+        assert_eq!(
+            ledger.selection.as_ref().expect("refusal records").refusal,
+            Some("promotion_scope_unsupported")
+        );
+    }
+
+    #[test]
+    fn k0_zero_call_window_renders_explicit_zeros() {
+        // Nothing happens in the window: the detail still renders,
+        // with explicit zero rows and the reported window — measured
+        // zeros over a proven window, never absence.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0003", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(20, 30),
+        );
+        close_k0_window(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            None,
+            "an idle window is still a success"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        let detail = section.get("detail").expect("detail renders");
+        let rows = detail["rows"].as_array().expect("detail rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["entered"], serde_json::json!(0));
+        assert_eq!(rows[0]["returned"], serde_json::json!(0));
+        assert_eq!(rows[0]["errors"], serde_json::json!(0));
+        let aggregate = section.get("aggregate").expect("the window still reports");
+        assert_eq!(aggregate["seq_before"], serde_json::json!(1));
+        assert_eq!(aggregate["seq_after"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn k0_composer_omits_envelope_without_selection() {
+        // Preservation: without `--select-endpoint` no selection is
+        // ever staged, so the composed envelope carries no selection
+        // and no window products.
+        let ledger = SelectionLedger::new();
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("selection").is_none(), "no selection staged");
+        assert_eq!(section["events"], serde_json::json!([]));
+        assert!(section.get("lineage").is_none());
+        assert!(section.get("aggregate").is_none());
+        assert!(section.get("detail").is_none());
+    }
+
+    #[test]
+    fn k0_detail_matches_aggregate_cells_parity() {
+        // Output parity: the detail row equals the aggregate
+        // bracket's row for the selected slot over the same window —
+        // the same cells, the same mode fields, never a combined
+        // total — under the envelope's closed keys.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0000", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Timestamps,
+            &[(50, 40, 1), (100, 100, 0), (100, 100, 0), (100, 100, 0)],
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Timestamps,
+            &[(70, 55, 3), (110, 110, 0), (110, 110, 0), (110, 110, 0)],
+            window_of(20, 30),
+        );
+        close_k0_window(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &mut ledger,
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        let detail = section.get("detail").expect("detail renders");
+        let aggregate = section.get("aggregate").expect("aggregate renders");
+        let detail_rows = detail["rows"].as_array().expect("detail rows");
+        let aggregate_rows = aggregate["rows"].as_array().expect("aggregate rows");
+        assert_eq!(detail_rows.len(), 1);
+        let selected = aggregate_rows
+            .iter()
+            .find(|row| row["slot"] == serde_json::json!(0))
+            .expect("aggregate carries the selected slot");
+        assert_eq!(
+            detail_rows[0], *selected,
+            "detail cells equal the aggregate cells for the slot"
+        );
+        for fragment in [detail, aggregate] {
+            assert!(fragment.get("total").is_none(), "no combined total renders");
+        }
+        let section_map = section.as_object().expect("envelope is an object");
+        assert!(
+            section_map.keys().all(|key| {
+                ["selection", "events", "lineage", "aggregate", "detail"].contains(&key.as_str())
+            }),
+            "the envelope keeps its closed keys: {section_map:?}"
+        );
+    }
+
+    #[test]
+    fn k0_retired_slot_voids_detail() {
+        // The close plan no longer publishes the selected slot: the
+        // detail voids as not-published. The after read runs over the
+        // retired plan, so observing before checking would latch a
+        // topology issue instead — the word pins the order.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let mut retired = scene.plan.clone();
+        retired.slots.retain(|slot| slot.index != 2);
+        let retired_counts: Vec<(u64, u64, u64)> =
+            retired.slots.iter().map(|_| (110, 110, 0)).collect();
+        let after = scripted_read(
+            &scene.pool,
+            &retired,
+            generation,
+            CounterMode::Counts,
+            &retired_counts,
+            window_of(20, 30),
+        );
+        close_k0_window(window, &retired, Ok(after), k0_clean(), true, &mut ledger);
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("not_published")
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_none());
+        assert!(section.get("aggregate").is_none());
+    }
+
+    #[test]
+    fn k0_failed_close_read_maps_stage() {
+        // A failed close read voids with the read's mapped word —
+        // quarantine, pool pressure and a missing binding name
+        // themselves, every other stage maps to the topology
+        // catch-all — and renders nothing.
+        for (label, stage, word) in [
+            ("quarantined", ReadStage::BankQuarantined, "quarantined"),
+            ("routing", ReadStage::BankRouting, "broad_plan_topology"),
+            ("budget", ReadStage::Budget, "budget"),
+            (
+                "absent",
+                ReadStage::Shape(ReaderShapeCause::BindingAbsent),
+                "broad_not_counter",
+            ),
+        ] {
+            let pool = test_pool();
+            let scene = stage_single_provider(pool, 4);
+            let mut ledger = SelectionLedger::new();
+            let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+                .expect("live name resolves for the K0 window");
+            let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+            let before = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 100, 100),
+                window_of(10, 20),
+            );
+            let window = open_k0_window(
+                resolved,
+                limits_for(&scene.plan),
+                scene.pool.reserver(),
+                Ok(before),
+                k0_clean(),
+                &mut ledger,
+            )
+            .expect("a healthy selection-time read opens the window");
+            close_k0_window(
+                window,
+                &scene.plan,
+                Err(stage),
+                k0_clean(),
+                true,
+                &mut ledger,
+            );
+            assert_eq!(
+                ledger
+                    .selection
+                    .as_ref()
+                    .expect("selection records")
+                    .refusal,
+                Some(word),
+                "{label} maps to {word}"
+            );
+            let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+            let section = &composed["evidence"]["selected_detail"];
+            assert!(section.get("detail").is_none(), "{label}: no detail");
+            assert!(section.get("aggregate").is_none(), "{label}: no aggregate");
+        }
+    }
+
+    #[test]
+    fn k0_capture_loss_latches_unknown() {
+        // Capture loss or overflow in the window — a saturated
+        // producer at either bound, or regressed counters at close —
+        // latches the collector, and the detail voids as unknown
+        // rather than reporting partial numbers.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        // Saturated selection-time read: no window opens.
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let saturated_before = k0_scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+            CounterHealth {
+                saturated: true,
+                contended: false,
+            },
+        );
+        assert!(
+            open_k0_window(
+                resolved,
+                limits_for(&scene.plan),
+                scene.pool.reserver(),
+                Ok(saturated_before),
+                k0_clean(),
+                &mut ledger,
+            )
+            .is_none(),
+            "a saturated selection-time read opens nothing"
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("broad_plan_topology")
+        );
+        // Saturated close read: the opened window voids.
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let saturated_after = k0_scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+            CounterHealth {
+                saturated: true,
+                contended: false,
+            },
+        );
+        close_k0_window(
+            window,
+            &scene.plan,
+            Ok(saturated_after),
+            k0_clean(),
+            true,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("broad_plan_topology"),
+            "a saturated close read voids the window"
+        );
+        // Regressed close read: counters ran backwards, so no honest
+        // interval exists.
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let regressed = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 50, 50),
+            window_of(20, 30),
+        );
+        close_k0_window(
+            window,
+            &scene.plan,
+            Ok(regressed),
+            k0_clean(),
+            true,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("broad_plan_topology"),
+            "a regressed close read voids the window"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_none());
+        assert!(section.get("aggregate").is_none());
+    }
+
+    #[test]
+    fn k0_unclean_close_boundary_voids() {
+        // No proven quiescence (or a blind post-quiescence tail): the
+        // witness may have missed an exec, so the window voids as
+        // broad-stopping without reading the banks.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        close_k0_window(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            false,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("broad_stopping")
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_none());
+        assert!(section.get("aggregate").is_none());
+    }
+
+    #[test]
+    fn k0_failed_selection_read_refuses_at_open() {
+        // A failed selection-time read refuses immediately with the
+        // read's mapped word and opens no window.
+        for (label, stage, word) in [
+            ("quarantined", ReadStage::BankQuarantined, "quarantined"),
+            ("routing", ReadStage::BankRouting, "broad_plan_topology"),
+            (
+                "absent",
+                ReadStage::Shape(ReaderShapeCause::BindingAbsent),
+                "broad_not_counter",
+            ),
+        ] {
+            let pool = test_pool();
+            let scene = stage_single_provider(pool, 4);
+            let mut ledger = SelectionLedger::new();
+            let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+                .expect("live name resolves for the K0 window");
+            assert!(
+                open_k0_window(
+                    resolved,
+                    limits_for(&scene.plan),
+                    scene.pool.reserver(),
+                    Err(stage),
+                    k0_clean(),
+                    &mut ledger,
+                )
+                .is_none(),
+                "{label} opens no window"
+            );
+            assert_eq!(
+                ledger
+                    .selection
+                    .as_ref()
+                    .expect("selection records")
+                    .refusal,
+                Some(word),
+                "{label} maps to {word}"
+            );
+        }
+    }
+
+    #[test]
+    fn k0_unreadable_open_witness_refuses() {
+        // No provable witness at selection time — a failed tap, or a
+        // session with no PID witness at all — refuses at open: no
+        // provable window can open on this broad.
+        for (label, facts) in [
+            ("failed", Err(PidContinuityRefusal::Terminal)),
+            ("absent", Ok(None)),
+        ] {
+            let pool = test_pool();
+            let scene = stage_single_provider(pool, 4);
+            let mut ledger = SelectionLedger::new();
+            let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+                .expect("live name resolves for the K0 window");
+            let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+            let before = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 100, 100),
+                window_of(10, 20),
+            );
+            assert!(
+                open_k0_window(
+                    resolved,
+                    limits_for(&scene.plan),
+                    scene.pool.reserver(),
+                    Ok(before),
+                    facts,
+                    &mut ledger,
+                )
+                .is_none(),
+                "{label} witness opens no window"
+            );
+            assert_eq!(
+                ledger
+                    .selection
+                    .as_ref()
+                    .expect("selection records")
+                    .refusal,
+                Some("broad_plan_topology"),
+                "{label} witness refuses at open"
+            );
+        }
     }
 }

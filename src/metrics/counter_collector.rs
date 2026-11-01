@@ -523,6 +523,15 @@ impl PartialEq for CounterDeltas {
 
 impl Eq for CounterDeltas {}
 
+impl CounterDeltas {
+    /// Keep only one slot's cells for selected-detail rendering. The
+    /// batch keeps its original charge (conservative: the dropped
+    /// cells stay paid for); no second allocation is charged.
+    pub(super) fn retain_slot(&mut self, slot: u32) {
+        self.values.retain(|delta| delta.slot == slot);
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum CounterObservation {
     Initial,

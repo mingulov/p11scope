@@ -4509,16 +4509,71 @@ mod tests {
         extra: Slot,
     }
 
-    fn engine_counter_fixture() -> EngineCounterFixture {
-        use sha2::Digest;
-        use std::io::Read;
-        use std::os::unix::fs::MetadataExt;
-        use std::path::PathBuf;
-        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
-        assert_eq!(
-            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
-            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+    /// Owned growth fixtures a cell compiles itself: the provider and
+    /// its dlopen/pthread driver from
+    /// `tests/fixtures/counter-bank-growth.c`. The tempdir outlives
+    /// the capture through the owning cell.
+    struct OwnedGrowthFixtures {
+        _dir: tempfile::TempDir,
+        provider: std::path::PathBuf,
+        workload: std::path::PathBuf,
+    }
+
+    /// Compile the owned growth fixtures with `cc`, as other cells
+    /// compile theirs: the provider shares the source with
+    /// `-DCOUNTER_BANK_GROWTH_PROVIDER`, the driver links
+    /// `-ldl -lpthread`.
+    fn build_owned_growth_fixtures() -> OwnedGrowthFixtures {
+        use std::process::Command;
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/counter-bank-growth.c");
+        assert!(source.is_file(), "growth fixture source is missing");
+        let dir = tempfile::tempdir().expect("fixture tempdir");
+        let provider = dir.path().join("provider.so");
+        let workload = dir.path().join("driver");
+        let output = Command::new("cc")
+            .args([
+                "-std=c11",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-fPIC",
+                "-shared",
+                "-DCOUNTER_BANK_GROWTH_PROVIDER",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&provider)
+            .output()
+            .expect("running cc for the growth provider");
+        assert!(
+            output.status.success(),
+            "growth provider build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
+        let output = Command::new("cc")
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&workload)
+            .args(["-ldl", "-lpthread"])
+            .output()
+            .expect("running cc for the growth driver");
+        assert!(
+            output.status.success(),
+            "growth driver build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        OwnedGrowthFixtures {
+            _dir: dir,
+            provider,
+            workload,
+        }
+    }
+
+    fn engine_counter_fixture() -> EngineCounterFixture {
+        use std::path::PathBuf;
         let provider = PathBuf::from(
             std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER")
                 .expect("prebuild counter-bank-growth.c with -DCOUNTER_BANK_GROWTH_PROVIDER"),
@@ -4527,7 +4582,25 @@ mod tests {
             std::env::var_os("P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD")
                 .expect("prebuild counter-bank-growth.c's LP64 dlopen/pthread driver"),
         );
-        let mut file = std::fs::File::open(&provider).unwrap();
+        engine_counter_fixture_from(&provider, &workload)
+    }
+
+    /// The Engine-driven counter fixture over explicit provider and
+    /// workload paths: the same pins, slots and driver the env-based
+    /// entry builds, for cells that compile their own fixtures.
+    fn engine_counter_fixture_from(
+        provider: &std::path::Path,
+        workload: &std::path::Path,
+    ) -> EngineCounterFixture {
+        use sha2::Digest;
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
+        assert_eq!(
+            env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
+            "counts-bank-growth-v2,timestamps-bank-growth-v2,latency-bank-growth-v2"
+        );
+        let mut file = std::fs::File::open(provider).unwrap();
         let elf = p11scope_manifest::elf::ElfSnapshot::read(&file).unwrap();
         assert_eq!(elf.abi(), p11scope_manifest::elf::ElfAbi::Lp64);
         let wanted: Vec<_> = (0..GROWTH_ENDPOINTS)
@@ -4560,7 +4633,7 @@ mod tests {
         file.read_to_end(&mut bytes).unwrap();
         let digest = p11scope_manifest::identity::hex(&sha2::Sha256::digest(&bytes));
         let pins =
-            crate::discovery::identity::test_fixture::real_scan_pin(&provider, None, 1, &digest);
+            crate::discovery::identity::test_fixture::real_scan_pin(provider, None, 1, &digest);
         let object = pins.pinned().next().unwrap().id;
         let selected = file.metadata().unwrap();
         let pinned = pins.file_for(object).unwrap().metadata().unwrap();
@@ -4584,9 +4657,9 @@ mod tests {
         let mut extra = slots[0].clone();
         extra.file_offset = extra_offset;
         extra.names = vec!["endpoint_body".into()];
-        let fixture = GrowthDriver::spawn(&workload, &provider);
+        let fixture = GrowthDriver::spawn(workload, provider);
         EngineCounterFixture {
-            provider,
+            provider: provider.to_path_buf(),
             digest,
             object,
             fixture,
@@ -5742,14 +5815,48 @@ mod tests {
         drop(engine);
     }
 
-    /// Guard removing a CLI cell's `-o` report on scope exit (success or
-    /// panic), so TMPDIR keeps no scratch.
+    /// Guard removing a CLI cell's `-o` report on success, so TMPDIR
+    /// keeps no scratch. On panic the report stays and its path plus a
+    /// bounded tail print, so the failure carries its evidence.
     struct RemoveReportOnDrop(std::path::PathBuf);
 
     impl Drop for RemoveReportOnDrop {
         fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("counter CLI evidence kept at {}", self.0.display());
+                for line in report_tail(&self.0) {
+                    eprintln!("counter CLI report: {line}");
+                }
+                return;
+            }
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    /// Bounded report tail for failure evidence: the last 40 lines
+    /// within 8 KiB.
+    fn report_tail(path: &std::path::Path) -> Vec<String> {
+        const MAX_LINES: usize = 40;
+        const MAX_BYTES: usize = 8192;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => return vec![format!("<report unreadable: {error}>")],
+        };
+        let mut lines: Vec<&str> = text.lines().collect();
+        if lines.len() > MAX_LINES {
+            lines.drain(..lines.len() - MAX_LINES);
+        }
+        let mut bytes = 0;
+        let mut kept = Vec::new();
+        for line in lines.into_iter().rev() {
+            if bytes + line.len() + 1 > MAX_BYTES {
+                break;
+            }
+            bytes += line.len() + 1;
+            kept.push(line.to_string());
+        }
+        kept.reverse();
+        kept
     }
 
     /// Row-0 liveness predicate for the CLI cells' `-o` JSON: the held call
@@ -5793,8 +5900,25 @@ mod tests {
     /// equals the workload ledger exactly, so selection adds no
     /// duplicate counts.
     fn counter_cli_capture_cell_with_selection(mode: CounterMode, select: Option<&str>) {
+        let parts = engine_counter_fixture();
+        counter_cli_capture_cell_with_selection_inner(mode, select, parts);
+    }
+
+    /// The CLI cell over owned `cc`-built fixtures instead of the
+    /// prebuilt env inputs: the same real path once the owned binaries
+    /// exist on disk (the tempdir outlives the capture).
+    fn counter_cli_capture_cell_with_selection_owned(mode: CounterMode, select: Option<&str>) {
+        let owned = build_owned_growth_fixtures();
+        let parts = engine_counter_fixture_from(&owned.provider, &owned.workload);
+        counter_cli_capture_cell_with_selection_inner(mode, select, parts);
+    }
+
+    fn counter_cli_capture_cell_with_selection_inner(
+        mode: CounterMode,
+        select: Option<&str>,
+        mut parts: EngineCounterFixture,
+    ) {
         const STAGED: usize = 512;
-        let mut parts = engine_counter_fixture();
         let first = parts.slots[..STAGED].to_vec();
         let offsets: Vec<u64> = first.iter().map(|slot| slot.file_offset).collect();
         let pid = parts.fixture.child.id();
@@ -6001,17 +6125,21 @@ mod tests {
             }
         }
         if let Some(name) = select {
-            // 6.15: the selection resolved against the live plan (slot 7
-            // of the staged 512) and composed additively; the honest
-            // host-composition seam refusal rides the record while the
-            // aggregate above already proved exact.
+            // K0: the selection resolved against the live plan (slot 7
+            // of the staged 512) and the window opened after the
+            // transcript, so the idle window renders explicit zeros:
+            // the transcript stays in the aggregate above (exact) and
+            // out of the windowed detail.
             let selected = &document["evidence"]["selected_detail"];
             let record = &selected["selection"];
             assert_eq!(record["endpoint"], serde_json::json!(name));
             assert_eq!(record["slot"], serde_json::json!(7));
             assert_eq!(record["file_offset"], serde_json::json!(offsets[7]));
             assert_eq!(record["names"], serde_json::json!([name]));
-            assert_eq!(record["refusal"], serde_json::json!("bundle_unavailable"));
+            assert!(
+                record.get("refusal").is_none(),
+                "the idle window succeeds: {record:?}"
+            );
             let record_map = record.as_object().expect("selection is an object");
             assert!(
                 record_map.get("original_pid").is_none(),
@@ -6019,13 +6147,42 @@ mod tests {
             );
             assert_eq!(
                 record_map.len(),
-                5,
+                4,
                 "resolved selection carries exactly its closed keys: {record_map:?}"
             );
             assert_eq!(selected["events"], serde_json::json!([]));
-            assert!(selected.get("lineage").is_none());
-            assert!(selected.get("aggregate").is_none());
-            assert!(selected.get("detail").is_none());
+            assert!(selected.get("lineage").is_none(), "K0 joins no lineage");
+            let aggregate = selected.get("aggregate").expect("window aggregate renders");
+            assert_eq!(aggregate["seq_before"], serde_json::json!(1));
+            assert_eq!(aggregate["seq_after"], serde_json::json!(2));
+            let aggregate_rows = aggregate["rows"].as_array().expect("aggregate rows");
+            assert_eq!(aggregate_rows.len(), STAGED);
+            for (index, row) in aggregate_rows.iter().enumerate() {
+                assert_eq!(row["entered"], serde_json::json!(0), "row {index} idle");
+                assert_eq!(row["returned"], serde_json::json!(0), "row {index} idle");
+                assert_eq!(row["errors"], serde_json::json!(0), "row {index} idle");
+            }
+            let detail = selected.get("detail").expect("window detail renders");
+            assert_eq!(detail["scope"], serde_json::json!("detail"));
+            assert_eq!(detail["mode"], serde_json::json!(mode.name()));
+            assert!(
+                detail["detail_generation"].as_u64().is_some(),
+                "detail names its broad generation"
+            );
+            let detail_rows = detail["rows"].as_array().expect("detail rows");
+            assert_eq!(
+                detail_rows.len(),
+                1,
+                "Detail carries only the selected slot"
+            );
+            assert_eq!(detail_rows[0]["slot"], serde_json::json!(7));
+            assert_eq!(detail_rows[0]["entered"], serde_json::json!(0));
+            assert_eq!(detail_rows[0]["returned"], serde_json::json!(0));
+            assert_eq!(detail_rows[0]["errors"], serde_json::json!(0));
+            assert_eq!(
+                detail_rows[0], aggregate_rows[7],
+                "Detail equals the aggregate cells for the slot"
+            );
         }
         parts.fixture.command("QUIT");
         parts.fixture.expect("DONE 512");
@@ -6058,9 +6215,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: 6.15 profile --select-endpoint counts to -o JSON with live-plan resolution plus exact workload-ledger aggregate"]
+    #[ignore = "requires cc-built owned LP64 growth fixtures and authorized native Multi staging as root: K0 profile --select-endpoint counts to -o JSON with live-plan resolution, exact workload-ledger aggregate and explicit zero-call detail"]
     fn selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64() {
-        counter_cli_capture_cell_with_selection(
+        counter_cli_capture_cell_with_selection_owned(
             CounterMode::Counts,
             Some("counter_bank_growth_e0007"),
         );

@@ -466,8 +466,10 @@ counts reports calls and errors without timing; timestamps adds total and max ca
 Omit --counter-mode to keep existing metrics behavior. Selections can refuse with a named reason, including on kernels without bpf_loop (helper 181), on builds without counter objects, past the mode's endpoint ceiling, and where the kernel verifier rejects the counter programs.
 --select-endpoint <FUNCTION> names one endpoint for full detail while aggregate counters continue; it requires --mode metrics
 with --counter-mode on profile or run. The name must resolve to exactly one broad slot (use --module to narrow providers);
-an unknown or ambiguous name refuses by name and the capture continues aggregate-only. The selection attempt is recorded
-in the report's additive selected_detail ledger; aggregate and detail counts are never summed.
+an unknown or ambiguous name refuses by name and the capture continues aggregate-only. The detail is the function's own
+broad-counter cells between selection and close; if the watched process replaces itself (exec) in between, the detail is
+withheld with a named reason, and --cgroup/--system refuse the selection by name (no single process to detail).
+The selection attempt is recorded in the report's additive selected_detail ledger; aggregate and detail counts are never summed.
 Provider identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
@@ -500,6 +502,8 @@ Aggregate across the selected scope; counts are not per application.
 --mode metrics is the lighter maps-only profile mode; metrics is not a subcommand.
 --select-endpoint <FUNCTION> with --mode metrics and --counter-mode names one endpoint for full
 detail while aggregate counters continue; the name must resolve to exactly one broad slot.
+The detail is the function's own broad-counter cells between selection and close; an exec of the
+watched process in between withholds it with a named reason, and --cgroup/--system refuse by name.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
 --track-short-lived (default off) is extensive mode: the kernel records exec-time
 executable identity and unmatched exits classify into STATIC HINT linkage classes.
@@ -549,6 +553,8 @@ Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
 Profile and metrics counts are aggregate, not per application; --trace selects completed events.
 --select-endpoint <FUNCTION> with --mode metrics and --counter-mode names one endpoint for full
 detail while aggregate counters continue; the name must resolve to exactly one broad slot.
+The detail is the function's own broad-counter cells between selection and close; an exec of the
+owned child in between withholds it with a named reason.
 --pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --track-short-lived (default off) is extensive mode: the kernel records exec-time
@@ -4231,14 +4237,14 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        // 8851 / 0xee7da085a2b63bea (inventory `--key-operations`):
-        // USAGE diff vs the 8794/0x8ade pin is exactly the
-        // `[--key-operations]` synopsis insertions (3 sites, 19 bytes
-        // each); no other drift. Pair measured by this test (old pair
-        // reproduced as `right` by the same extractor before the
-        // update).
-        assert_eq!(USAGE.len(), 8851);
-        assert_eq!(hash, 0xee7da085a2b63bea);
+        // 9117 / 0xc77393c87733b423 (K0 detail, merged over inventory
+        // `--key-operations`): USAGE diff vs the 8794/0x8ade pin is
+        // exactly the [--key-operations] synopsis insertions (3 sites,
+        // 57 bytes) plus the K0 `--select-endpoint` additions (266
+        // bytes); no other drift. Pair measured by the usage-pin
+        // extractor, which reproduces the 8794, 8851 and 9060 pins.
+        assert_eq!(USAGE.len(), 9117);
+        assert_eq!(hash, 0xc77393c87733b423);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

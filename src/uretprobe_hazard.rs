@@ -31,6 +31,30 @@ use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope
 #[cfg(target_arch = "x86_64")]
 const NR_URETPROBE: u32 = 335;
 
+/// The self-probe's program: the cheapest-to-verify `uretprobe` program in
+/// the capture object (1,477 instructions, the fastest verification in the
+/// startup traces; `function_list_return` has fewer instructions at 1,434
+/// but verifies slower, and `p11_return` is 4,960 and the session verifies
+/// it again seconds later).
+///
+/// It must stay a `uretprobe`-section program: aya derives return-vs-entry
+/// attach from the ELF section, and only a real return trampoline
+/// exercises the hazard an entry probe would miss. It stays a real
+/// production return probe from the same object rather than a synthetic
+/// stand-in: attached to a real return under a deny-uretprobe filter, it
+/// exercises the identical kernel path, and with no entry ever recorded
+/// for the probe child it takes its export-state miss and returns 0, so
+/// the probe emits nothing. Which bytecode runs cannot move the verdict —
+/// the signal is the kernel's trampoline issuing the uretprobe syscall in
+/// the child's context — while the loader configuration stays the shared
+/// one a capture uses (J-DOSSIER#28), so load-success agreement is kept.
+/// The one narrowed case is fail-closed both ways: a kernel that verifies
+/// this program but rejects `p11_return` now yields a clean probe verdict
+/// followed by the session's detailed per-program load refusal, instead of
+/// a probe-`Unknown` refusal.
+#[cfg(target_arch = "x86_64")]
+const SELF_PROBE_PROGRAM: &str = "interface_list_return";
+
 /// What this kernel does with the uretprobe syscall when the target is filtered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KernelVerdict {
@@ -382,11 +406,14 @@ fn evaluate_mode(
 /// attach a real uretprobe to it, and see whether it survives its own return.
 ///
 /// The victim is a child of ours, so no target process is ever at risk of
-/// answering this question. `p11_return` is the probe program deliberately —
-/// it is the one that would kill a target, so the probe exercises the exact
-/// path it is protecting rather than a stand-in. With no entry ever recorded
-/// for the child it takes its `START.get` miss and returns 0, so the probe
-/// emits nothing into the ring.
+/// answering this question. The probe program is `SELF_PROBE_PROGRAM`,
+/// the cheapest-to-verify `uretprobe` program in the capture object: which bytecode
+/// runs cannot move the verdict — the signal is the kernel's return
+/// trampoline issuing the uretprobe syscall in the child's context, and any
+/// attached return probe exercises that path — while `p11_return` would
+/// cost a second full verification the session repeats seconds later. With
+/// no entry ever recorded for the child it takes its export-state miss and
+/// returns 0, so the probe emits nothing into the ring.
 ///
 /// Every failure is `Unknown`, never `Clean`: this exists to prevent an
 /// irreversible harm to someone else's process, so silence is not consent.
@@ -627,11 +654,13 @@ fn probe_kernel_inner() -> Result<KernelVerdict> {
     .context("loading the BPF object")?;
     {
         let program: &mut UProbe = ebpf
-            .program_mut("p11_return")
-            .context("program p11_return missing from the BPF object")?
+            .program_mut(SELF_PROBE_PROGRAM)
+            .with_context(|| format!("program {SELF_PROBE_PROGRAM} missing from the BPF object"))?
             .try_into()
             .map_err(|error: aya::programs::ProgramError| anyhow!("{error}"))?;
-        program.load().context("loading p11_return")?;
+        program
+            .load()
+            .with_context(|| format!("loading {SELF_PROBE_PROGRAM}"))?;
     }
     let ebpf = &mut ebpf;
     let offset = own_text_file_offset(probe_point as *const () as usize as u64)
@@ -709,8 +738,8 @@ fn probe_parent(
     }
 
     let program: &mut UProbe = ebpf
-        .program_mut("p11_return")
-        .context("program p11_return missing from the BPF object")?
+        .program_mut(SELF_PROBE_PROGRAM)
+        .with_context(|| format!("program {SELF_PROBE_PROGRAM} missing from the BPF object"))?
         .try_into()
         .map_err(|error: aya::programs::ProgramError| anyhow!("{error}"))?;
     let point = UProbeAttachPoint {
@@ -1275,6 +1304,75 @@ mod tests {
         }
     }
 
+    /// The self-probe must not re-verify the capture's most expensive
+    /// program: `p11_return` (4,960 instructions) is verified again by the
+    /// session seconds later, so the probe loads a cheap production return
+    /// probe through the same shared loader instead. Both the load site
+    /// and the attach site name that one program through
+    /// `SELF_PROBE_PROGRAM`: a mismatch would attach a program the probe
+    /// never loaded. Fails while either site names `p11_return`.
+    #[test]
+    fn the_self_probe_verifies_a_cheap_return_probe_not_p11_return() {
+        let source = include_str!("uretprobe_hazard.rs");
+        for (signature, role) in [
+            (
+                "#[cfg(target_arch = \"x86_64\")]\nfn probe_kernel_inner()",
+                "load site",
+            ),
+            ("fn probe_parent(", "attach site"),
+        ] {
+            let body = source
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("{signature} not found"))
+                .1
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("{signature} body end not found"))
+                .0;
+            assert!(
+                !body.contains("\"p11_return\""),
+                "the self-probe {role} must not name p11_return"
+            );
+            assert!(
+                body.contains("SELF_PROBE_PROGRAM"),
+                "the self-probe {role} must name SELF_PROBE_PROGRAM"
+            );
+        }
+    }
+
+    /// `SELF_PROBE_PROGRAM` must name a real `uretprobe`-section program
+    /// in the embedded object: aya derives return-vs-entry attach from the
+    /// ELF section, and only a real return trampoline exercises the hazard
+    /// an entry probe would miss. Parses the embedded bytes without
+    /// privilege. The negative controls keep the check honest: a present
+    /// entry program must not match, and a bogus name must be absent.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_self_probe_program_is_a_return_probe_in_the_object() {
+        let object = aya_obj::Object::parse(crate::EBPF_OBJECT).expect("embedded object parses");
+        let program = object
+            .programs
+            .get(SELF_PROBE_PROGRAM)
+            .unwrap_or_else(|| panic!("{SELF_PROBE_PROGRAM} is present in the object"));
+        assert!(
+            matches!(program.section, aya_obj::ProgramSection::URetProbe { .. }),
+            "{SELF_PROBE_PROGRAM} must be a uretprobe-section program: {:?}",
+            program.section
+        );
+        let entry = object
+            .programs
+            .get("p11_entry")
+            .expect("the entry control is present in the object");
+        assert!(
+            !matches!(entry.section, aya_obj::ProgramSection::URetProbe { .. }),
+            "the control must stay entry-kind: {:?}",
+            entry.section
+        );
+        assert!(
+            !object.programs.contains_key("no_such_probe_program"),
+            "a bogus name must be absent from the object"
+        );
+    }
+
     /// S4: the self-probe attaches, so it holds the embedded-flavor gate
     /// itself instead of trusting every caller to check first. A planted
     /// mismatch refuses with the same message capture setup refuses with,
@@ -1395,9 +1493,9 @@ mod tests {
     }
 
     /// A refused self-probe program load must not dump the verifier log
-    /// into the verdict: the self-probe loads the real Detailed program
-    /// `p11_return`, and the verdict reaches stderr and doctor as a plain
-    /// string no later seam can bound. The verdict routes through the same
+    /// into the verdict: the self-probe loads a real Detailed return
+    /// probe, and the verdict reaches stderr and doctor as a plain string
+    /// no later seam can bound. The verdict routes through the same
     /// bounded formatter the attach seam uses. Fails while the verdict
     /// formats the whole chain (~300 KB).
     #[test]

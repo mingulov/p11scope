@@ -981,7 +981,7 @@
     {
       "file": "src/events/runtime_tests.rs",
       "path": "events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict",
-      "reason": "loads p11_return and probes a fresh owned seccomp-confined child",
+      "reason": "loads the cheap self-probe return program and probes a fresh owned seccomp-confined child",
       "cell": "privileged"
     },
     {

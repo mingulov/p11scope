@@ -5228,6 +5228,7 @@ mod custody_chain_tests {
     use crate::inventory_semantics::{
         AttestedSemanticLane, LaneDrainOutcome, LaneTestIo, RefreshReceiptStash, SemanticBatch,
         SemanticRefusal, effective_refresh_custody, merge_stash_into_report, stash_refresh_report,
+        tick_collected_with_stash_merge,
     };
     use std::collections::HashMap;
 

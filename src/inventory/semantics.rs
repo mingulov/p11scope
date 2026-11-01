@@ -1351,6 +1351,22 @@ pub(crate) fn stash_refresh_report(
 /// shed joins the report's carried disclosure shed instead, never
 /// this total. Shared by regular ticks and terminal quanta so quiet
 /// proofs register on every path.
+/// One collected H0 tick plus the lane-stash merge behind its
+/// report: the single sequencing the live collected path and the
+/// held machine I/O share, so the merge cannot be dropped on one
+/// path while the other's tests stay green. Returns the report and
+/// the merge shed count (the refused-endpoints share; the stashed
+/// outcomes themselves join the report even when nothing sheds).
+pub(crate) fn tick_collected_with_stash_merge(
+    capture: &mut SemanticCapture,
+    stash: &mut RefreshReceiptStash,
+    tick: impl FnOnce(&mut SemanticCapture) -> anyhow::Result<TickReport>,
+) -> anyhow::Result<(TickReport, u64)> {
+    let mut report = tick(capture)?;
+    let shed = merge_stash_into_report(stash, &mut report);
+    Ok((report, shed))
+}
+
 pub(crate) fn merge_stash_into_report(
     stash: &mut RefreshReceiptStash,
     report: &mut TickReport,
@@ -2890,10 +2906,12 @@ impl AttestedSemanticLane {
             .filter(|binding| binding.scope_current())
             .map(SemanticCallerBinding::pin)
             .collect();
-        let mut report = live
-            .capture
-            .tick_collected(&mut live.session, &pins, raw)
-            .map_err(|_| SemanticRefusal::Unavailable)?;
+        let (mut report, shed) = tick_collected_with_stash_merge(
+            &mut live.capture,
+            &mut live.stashed_refresh,
+            |capture| capture.tick_collected(&mut live.session, &pins, raw),
+        )
+        .map_err(|_| SemanticRefusal::Unavailable)?;
         live.ticks = live.ticks.saturating_add(1);
         live.scan_refusals = live
             .scan_refusals
@@ -2903,7 +2921,6 @@ impl AttestedSemanticLane {
             .collected_calls
             .saturating_add(report.collected_calls as u64);
         live.continuity_cuts = live.capture.continuity_cuts();
-        let shed = merge_stash_into_report(&mut live.stashed_refresh, &mut report);
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
         let counted = unjoined_shed_counts(report.outcomes());
         match SemanticBatch::from_tick_report(self.domain, report, Vec::new(), now_ns()) {

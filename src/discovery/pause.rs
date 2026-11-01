@@ -7401,4 +7401,171 @@ mod tests {
             "nothing acquired past the shared allowance"
         );
     }
+
+    /// The `fn` item enclosing `offset`: the nearest preceding item start,
+    /// plus whether a test attribute sits directly above it.
+    fn enclosing_item(source: &str, offset: usize) -> (String, bool) {
+        let lines: Vec<&str> = source[..offset].split('\n').collect();
+        let mut index = lines.len();
+        loop {
+            assert!(index > 0, "no enclosing item for offset {offset}");
+            index -= 1;
+            if let Some(name) = item_name(lines[index]) {
+                let test = (index.saturating_sub(6)..index)
+                    .any(|above| matches!(lines[above].trim(), "#[test]" | "#[cfg(test)]"));
+                return (name, test);
+            }
+        }
+    }
+
+    fn item_name(line: &str) -> Option<String> {
+        let mut stripped = line.strip_prefix("    ").unwrap_or(line);
+        stripped = stripped.strip_prefix("pub(crate) ").unwrap_or(stripped);
+        stripped = stripped.strip_prefix("pub ").unwrap_or(stripped);
+        for qualifier in ["const ", "async ", "unsafe "] {
+            stripped = stripped.strip_prefix(qualifier).unwrap_or(stripped);
+        }
+        let rest = stripped.strip_prefix("fn ")?;
+        let name = rest.split(['(', '<']).next()?.trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    fn offsets_of(haystack: &str, needle: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(found) = haystack[from..].find(needle) {
+            out.push(from + found);
+            from += found + needle.len();
+        }
+        out
+    }
+
+    /// `run` frees its owned PID only after the pause authorization is gone.
+    /// The `PAUSE_PIDS` entry is keyed by (tgid, generation token), both
+    /// taken from the PID number, so a process reusing the number while an
+    /// entry is armed would be stopped by the discovery hook. Reaping (which
+    /// frees the number) therefore always follows the coordinator's terminal
+    /// cleanup, which removes the authorization. This pins the funnel:
+    /// `Owned::finish` cleans up before it settles, settlement has that one
+    /// call site, and every other production reap precedes the first arm
+    /// (setup and preflight failures return before the coordinator exists).
+    /// The capture loops route every end (exit, error, signal, timeout,
+    /// kill-on-timeout, second SIGINT) through that same finish; that
+    /// routing is an audited property of `run.rs`, documented here:
+    /// - `capture_profile`/`capture_trace` return only through
+    ///   `finish_capture_error`, `finish_quiesce_error` or
+    ///   `finish_capture_with`, each of which runs `Owned::finish` (cleanup
+    ///   then settlement) before any reap or detach;
+    /// - pre-arm failures (`combine_setup_failure`, the preflight closure)
+    ///   reap before `Owned` exists, when no entry was ever armed;
+    /// - `OwnedChild::drop` reaps only what that funnel left behind.
+    #[test]
+    fn owned_reap_follows_pause_cleanup_before_settlement() {
+        let run = include_str!("../run.rs");
+        let production = run
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("tests mod anchor")
+            .0;
+        // The core ordering: cleanup before settlement in the one finish.
+        let finish = production
+            .split_once("    fn finish(\n")
+            .expect("Owned::finish")
+            .1
+            .split_once("\n    }\n}")
+            .expect("finish end")
+            .0;
+        let cleanup = finish
+            .find("self.coordinator.cleanup(")
+            .expect("finish cleans up");
+        let settle = finish.find("settle_owned_child(").expect("finish settles");
+        assert!(
+            cleanup < settle,
+            "Owned::finish must remove the pause authorization before settling the child"
+        );
+        // The single funnel: settlement is defined once and called from
+        // finish only (test calls live past the tests-mod anchor).
+        assert_eq!(
+            offsets_of(production, "settle_owned_child(").len(),
+            2,
+            "settle_owned_child must keep its definition plus the one finish call"
+        );
+        // No new direct reaps: every production terminate_and_reap call
+        // stays in its audited function.
+        let mut reapers = std::collections::BTreeSet::new();
+        let mut preflight_reap = None;
+        for offset in offsets_of(production, "terminate_and_reap(") {
+            let line_start = production[..offset].rfind('\n').map_or(0, |at| at + 1);
+            let line_end = production[offset..]
+                .find('\n')
+                .map_or(production.len(), |at| offset + at);
+            if production[line_start..line_end].contains("fn terminate_and_reap") {
+                continue;
+            }
+            let (item, test) = enclosing_item(production, offset);
+            if test {
+                continue;
+            }
+            if item == "run_owned_inner_with_host" {
+                preflight_reap = Some(offset);
+            }
+            reapers.insert(item);
+        }
+        assert_eq!(
+            reapers,
+            std::collections::BTreeSet::from([
+                "abort_pending_handoff".to_string(),
+                "combine_setup_failure".to_string(),
+                "run_owned_inner_with_host".to_string(),
+                "settle_owned_child".to_string(),
+                "wait_for".to_string(),
+            ]),
+            "a reap moved outside its audited function: {reapers:?}"
+        );
+        // The wait_for kill arm stays dead: every call passes false, and
+        // production calls come only from the post-cleanup settle paths.
+        for line in run.split('\n') {
+            if line.contains("wait_for(") && !line.contains("fn wait_for(") {
+                assert!(
+                    line.contains(", false)"),
+                    "wait_for must never take the kill arm: {line:?}"
+                );
+            }
+        }
+        let mut waiters = std::collections::BTreeSet::new();
+        for offset in offsets_of(production, "wait_for(") {
+            let line_start = production[..offset].rfind('\n').map_or(0, |at| at + 1);
+            let line_end = production[offset..]
+                .find('\n')
+                .map_or(production.len(), |at| offset + at);
+            if production[line_start..line_end].contains("fn wait_for(") {
+                continue;
+            }
+            let (item, test) = enclosing_item(production, offset);
+            assert!(!test, "production wait_for call sits in a test item");
+            waiters.insert(item);
+        }
+        assert_eq!(
+            waiters,
+            std::collections::BTreeSet::from([
+                "settle_after_signal_with_grace_and".to_string(),
+                "stage_handoff".to_string(),
+            ]),
+            "wait_for must stay inside the settle paths: {waiters:?}"
+        );
+        // Pre-arm reaps: setup failures and the preflight closure run
+        // before Owned (and its coordinator) exists, so no entry is armed.
+        let owned = production
+            .find("let mut owned = Owned {")
+            .expect("Owned construction");
+        for offset in offsets_of(production, "combine_setup_failure(") {
+            assert!(
+                offset < owned,
+                "setup failure must precede the owned coordinator"
+            );
+        }
+        assert!(
+            preflight_reap.is_some_and(|offset| offset < owned),
+            "the preflight reap must precede the owned coordinator"
+        );
+    }
 }

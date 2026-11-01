@@ -2980,27 +2980,23 @@ fn service_dd_as_owner(fixture: &MachineScene, dd: &mut LiveMachineDiscovery) ->
         .expect("healthy DD service through the owner seam")
 }
 
-/// Linked dispatch services DD and EVENTS without repolling the
-/// original: the machine owns the EVENTS original (one begin per
-/// original, one reserved phase credit under tiny budgets), DD
-/// progresses through its existing owner seam between machine
-/// services, and neither service moves the other's cursor, mints a
-/// third cursor, or clears a sticky transport error.
+/// Linked DD progresses through its owner seam without repolling the
+/// original: this test hand-drives the Capture's bounded
+/// live-discovery service between machine EVENTS services (one begin
+/// per original, one reserved phase credit under tiny budgets), and
+/// neither service moves the other's cursor, mints a third cursor,
+/// or clears a sticky transport error.
 ///
 /// Honest scope: this test drives the DD owner seam directly
 /// (`service_dd_as_owner`); it proves seam capability and
 /// non-interference with machine EVENTS service, not production
-/// dispatch wiring. No production path pumps that seam for a
-/// linked lane with an installed machine yet: the inventory
-/// driver returns after machine service before reaching the
-/// lane's live-discovery service, that lane service itself
-/// returns early when a joint machine is installed, and the
-/// machine services DD inline only for unlinked lanes (pinned
-/// above: machine-side DD calls stay zero for linked lanes).
-/// The production DD pump for linked+machine lanes is planned
-/// work for a follow-up packet; the controller owns the driver.
+/// dispatch wiring. Production dispatch wiring is pinned beside it:
+/// the inventory driver pumps this seam every hook for linked Joint
+/// lanes (`joint_linked_hook_pumps_live_discovery_alongside_machine`),
+/// while the machine itself never touches linked DD (pinned above:
+/// machine-side DD calls stay zero for linked lanes).
 #[test]
-fn linked_joint_services_dd_without_repolling_original() {
+fn linked_joint_dd_owner_seam_without_repolling_original() {
     let mut fixture = MachineScene::new(1);
     assert!(
         fixture.scene.producers.journal_linked(),

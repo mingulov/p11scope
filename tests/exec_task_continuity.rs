@@ -476,10 +476,13 @@ assert emit[0] not in m.reachable(root_graph, [refused]), 'refused scope emitted
 /// `exec_ticket_absent_from_counter_flavors` pins that absence.
 #[test]
 fn exec_generation_ticket_is_never_acquired_under_pid_scope() {
-    let variants = [
+    let mut variants = vec![
         ("detailed", p11scope::EBPF_OBJECT),
         ("callers", p11scope::EBPF_INVENTORY_CALLERS_OBJECT),
     ];
+    if !p11scope::EBPF_JOURNAL_OBJECT.is_empty() {
+        variants.push(("journal", p11scope::EBPF_JOURNAL_OBJECT));
+    }
     let script = r#"
 import re, subprocess, sys
 from pathlib import Path
@@ -492,7 +495,9 @@ owners = [(name, lines) for name, lines in blocks.items()
           if any(re.search(r'R_BPF_64_32\s+p11_link_current_cookie\s*$', line) for line in lines)]
 assert len(owners) == 1 and owners[0][0].endswith('emit_lifecycle'), owners
 lines = owners[0][1]
-ticket_row = next(i for i, line in enumerate(lines) if re.search(r'R_BPF_64_32\s+p11_link_current_cookie\s*$', line))
+ticket_rows = [i for i, line in enumerate(lines) if re.search(r'R_BPF_64_32\s+p11_link_current_cookie\s*$', line)]
+assert len(ticket_rows) == 1, 'emit_lifecycle must call the ticket helper exactly once'
+ticket_row = ticket_rows[0]
 ticket = next(m.line_pc(line) for line in reversed(lines[:ticket_row]) if m.line_pc(line) is not None)
 insns, graph = m.instruction_graph(lines)
 entry = insns[0][0]

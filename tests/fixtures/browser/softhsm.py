@@ -91,6 +91,9 @@ class SoftHSMStore:
         for candidate in (
             "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
             "/usr/lib/softhsm/libsofthsm2.so",
+            # Fedora / RHEL layout (softhsm package).
+            "/usr/lib64/pkcs11/libsofthsm2.so",
+            "/usr/lib64/softhsm/libsofthsm.so",
         ):
             if os.path.exists(candidate):
                 return Path(candidate)

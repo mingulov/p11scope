@@ -4173,8 +4173,7 @@ impl ClassicDriver<'_> {
                     // then fallback.
                     let held = error.clone();
                     first_error.get_or_insert(error);
-                    coordinator
-                        .note_scope_gap("joint finish held for exit".to_string(), held);
+                    coordinator.note_scope_gap("joint finish held for exit".to_string(), held);
                 } else {
                     let live = lane.take().expect("a failed lane holds");
                     Self::hold_joint_lane_for_exit(
@@ -12886,7 +12885,9 @@ mod tests {
             "the held gap names the latched refusal: {:?}",
             gaps(&mut driver)
         );
-        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(None);
+        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+            None,
+        );
     }
 
     #[test]
@@ -12908,9 +12909,8 @@ mod tests {
             Some(crate::inventory_semantics::SemanticRefusal::ProviderStorage),
         );
         let mut coordinator = coordinator();
-        coordinator.seed_collected_graph_refusal_for_test(
-            "terminal graph refused before native mutation",
-        );
+        coordinator
+            .seed_collected_graph_refusal_for_test("terminal graph refused before native mutation");
         let headless = headless_display();
         let mut driver = driver_with_display(&mut coordinator, headless.display);
         let mut lane = joint_lane(WindDownIo::completing(), true);
@@ -12944,7 +12944,9 @@ mod tests {
             "the held gap names the graph refusal: {:?}",
             gaps(&mut driver)
         );
-        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(None);
+        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+            None,
+        );
     }
 
     #[test]

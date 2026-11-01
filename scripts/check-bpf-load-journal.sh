@@ -20,8 +20,9 @@
 # `inventory --system --capture native --key-operations --manifest
 # MANIFEST --duration 60s`, under the probe. Before the observer starts,
 # the guest initializes a guest-local SoftHSM token and starts one
-# persistent ledger caller (forty mech iterations a second apart, then
-# held) against the guest SoftHSM module, so the linked lane seals on
+# persistent ledger caller (eighty mech iterations a second apart,
+# then held) against the guest SoftHSM module, so the linked lane
+# seals on
 # an attested provider and observes a full call stream from an admitted
 # caller. The caller, token and logs live on guest-local storage (the
 # work image); only the finished probe rows, observer text and ledger
@@ -274,7 +275,11 @@ fi
 # use-before-admission, so the leg waits for READY before the observer
 # starts and the caller outlives the whole run.
 LEDGER_LOG=$TMPDIR/ledger-$KERNEL.log
-SOFTHSM2_CONF="$CONF" "$WORKLOAD" mech --cell jwork --module "$MODULE" --iters 40 --sleep-us 1000000 --hold >>"$LEDGER_LOG" 2>&1 &
+# Eighty paced iterations (~85 s of calls) cover even very slow guest
+# startups: a 6.18 leg admitted its caller only after a 45 s window
+# closed and collected nothing. The ledger is killed when the observer
+# exits whether or not its iterations finished.
+SOFTHSM2_CONF="$CONF" "$WORKLOAD" mech --cell jwork --module "$MODULE" --iters 80 --sleep-us 1000000 --hold >>"$LEDGER_LOG" 2>&1 &
 LEDGER_PID=$!
 cleanup_ledger() {
     kill "$LEDGER_PID" 2>/dev/null || true

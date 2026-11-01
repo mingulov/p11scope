@@ -707,7 +707,8 @@ def check_loss(selected, doc, events, joint=False):
     --joint mode the capture-wide refused/continuity counts are
     recorded, never gated (they count foreign admissions on a
     --system capture), and foreign-scoped gaps are counted, never
-    gated; driver and caller-less gaps stay strict.
+    gated; driver and caller-less gaps stay strict. The proven
+    rotation count is recorded as stream_rotations.
     """
     observation = selected["observation"]
     ring_loss = observation["lifecycle"].get("ring_loss")
@@ -843,6 +844,7 @@ def check_loss(selected, doc, events, joint=False):
     if joint:
         verdict["refused_endpoints"] = refused_endpoints
         verdict["continuity_cuts"] = continuity_cuts
+        verdict["stream_rotations"] = stream["rotations"]
         verdict["foreign_gaps"] = foreign_gaps
         verdict["foreign_callers"] = selected["foreign"]["callers"]
         verdict["foreign_edges"] = selected["foreign"]["edges"]

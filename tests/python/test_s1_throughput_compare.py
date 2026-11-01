@@ -2547,6 +2547,112 @@ class JointConservationGate(unittest.TestCase):
                 self.run_joint(Path(tmp), mutate)
 
 
+def split_joint_events_at(workdir, events_path, cut):
+    """Split a Joint event log into two rotation parts at row `cut`.
+
+    The concatenated stream stays exactly contiguous: the `rotated`
+    marker takes the next sequence number and the tail shifts by one
+    (production shape; the shared loader sorts by seq, so the marker
+    position inside the current part is irrelevant). The ended
+    summary records one rotation with nothing evicted. Returns both
+    part paths.
+    """
+    rows = [json.loads(line) for line in
+            events_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    first, rest = rows[:cut], rows[cut:]
+    older = workdir / (events_path.name + ".1")
+    write_jsonl(older, first)
+    marker_seq = first[-1]["seq"] + 1
+    marker = {"schema": "p11scope/inventory-events/v1", "seq": marker_seq,
+              "at_ns": rest[0]["at_ns"], "kind": "rotated",
+              "event": {"prior_file": older.name,
+                        "prior_events": len(first),
+                        "prior_bytes": older.stat().st_size,
+                        "rotation_seq": 1}}
+    renumbered = []
+    seq = marker_seq + 1
+    for row in rest:
+        row = dict(row)
+        row["seq"] = seq
+        seq += 1
+        renumbered.append(row)
+    for row in renumbered:
+        if row["kind"] == "ended":
+            row["event"]["stream"] = {"rotations": 1, "evicted_events": 0,
+                                      "evicted_bytes": 0}
+    write_jsonl(events_path, [marker] + renumbered)
+    return older, events_path
+
+
+class JointRotation(unittest.TestCase):
+    def test_joint_rotated_stream_passes(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-rot-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            older, current = split_joint_events_at(workdir, events, 3)
+            result = s1.compare([str(path) for path in ledgers],
+                                [str(older), str(current)], str(inventory),
+                                FULL_RATE, joint=True)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["loss"]["stream_rotations"], 1)
+
+    def test_joint_evicted_stream_fails(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-evict-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            older, current = split_joint_events_at(workdir, events, 3)
+            rows = [json.loads(line) for line in
+                    current.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            for row in rows:
+                if row["kind"] == "ended":
+                    row["event"]["stream"]["evicted_events"] = 4
+                    row["event"]["stream"]["evicted_bytes"] = 400
+            write_jsonl(current, rows)
+            with self.assertRaisesRegex(s1.S1Error, "retention"):
+                s1.compare([str(path) for path in ledgers],
+                           [str(older), str(current)], str(inventory),
+                           FULL_RATE, joint=True)
+
+    def test_joint_rotation_hole_fails(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-hole-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            older, current = split_joint_events_at(workdir, events, 3)
+            rows = [json.loads(line) for line in
+                    current.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            for row in rows[1:]:
+                row["seq"] += 1
+            write_jsonl(current, rows)
+            with self.assertRaisesRegex(s1.S1Error, "sequence"):
+                s1.compare([str(path) for path in ledgers],
+                           [str(older), str(current)], str(inventory),
+                           FULL_RATE, joint=True)
+
+    def test_joint_rotation_count_mismatch_fails(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-rotcount-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            older, current = split_joint_events_at(workdir, events, 3)
+            rows = [json.loads(line) for line in
+                    current.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            for row in rows:
+                if row["kind"] == "ended":
+                    row["event"]["stream"]["rotations"] = 2
+            write_jsonl(current, rows)
+            with self.assertRaisesRegex(s1.S1Error, "rotation"):
+                s1.compare([str(path) for path in ledgers],
+                           [str(older), str(current)], str(inventory),
+                           FULL_RATE, joint=True)
+
+
 if __name__ == "__main__":
     unittest.main()
 

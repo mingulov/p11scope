@@ -165,7 +165,10 @@ WORK_IMAGE="$OUTDIR/guest-work.img"
 GUEST_LEG="$OUTDIR/journal-guest.sh"
 STAGED_PROBE="$OUTDIR/journal-probe.so"
 STAGED_MANIFEST="$OUTDIR/journal-manifest.json"
-STAGED_WORKLOAD="$OUTDIR/journal-workload"
+# The workload binary name is short on purpose: the guest leg stops
+# workload processes by exact process name (`pkill -x`), which matches
+# the 15-char comm, so the name must fit comm exactly.
+STAGED_WORKLOAD="$OUTDIR/j-workload"
 if [ -e "$GUEST_ENV" ] || [ -L "$GUEST_ENV" ] || [ -e "$WORK_IMAGE" ] || [ -L "$WORK_IMAGE" ] \
     || [ -e "$GUEST_LEG" ] || [ -L "$GUEST_LEG" ] || [ -e "$OUTDIR/results.jsonl" ]; then
     echo "# error: guest helper/work image/results already exist; use a fresh output directory" >&2
@@ -262,11 +265,28 @@ else
     echo "guest-stage=token-failed"
     exit 3
 fi
-( while :; do SOFTHSM2_CONF="$CONF" "$WORKLOAD" "$MODULE" 3 5 >>"$TMPDIR/workload-$KERNEL.log" 2>&1; done ) &
+# Each iteration stays mapped for 25 s (discovery admits the caller)
+# before its call burst, so calls join instead of shedding as
+# use-before-admission; the loop respawns until the observer exits.
+( while :; do SOFTHSM2_CONF="$CONF" "$WORKLOAD" "$MODULE" 30 25 >>"$TMPDIR/workload-$KERNEL.log" 2>&1; done ) &
 WLLOOP=$!
 echo "guest-stage=workload-started"
-cleanup() { kill "$WLLOOP" 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
+cleanup_workload() {
+    kill "$WLLOOP" 2>/dev/null || true
+    # Exact process-name match only: this leg and the loop subshell are
+    # both `sh`, so the name can only hit workload processes. (Never
+    # match the full command line: our own argv carries the workload
+    # path and would match itself.) The in-flight child must be gone
+    # before the return: it holds its log under /var/tmp open, which
+    # otherwise keeps the work-image unmount busy and fails the guest.
+    pkill -x j-workload 2>/dev/null || true
+    N=0
+    while [ "$N" -lt 10 ] && pgrep -x j-workload >/dev/null 2>&1; do
+        sleep 1
+        N=$((N + 1))
+    done
+}
+trap cleanup_workload EXIT INT TERM
 ulimit -n 65536
 RC=0
 timeout -k 10 -s INT 150 env LD_PRELOAD="$PROBE" P11SCOPE_VERIFIER_STATS_FD=9 "$OBSERVER" inventory --system --capture native --key-operations --manifest "$MANIFEST" --duration 60s 9>"journal-probe-$KERNEL.jsonl" >"journal-$KERNEL.txt" 2>&1 || RC=$?
@@ -275,7 +295,7 @@ if [ -f "$TMPDIR/workload-$KERNEL.log" ]; then
     cp "$TMPDIR/workload-$KERNEL.log" "./workload-$KERNEL.log"
 fi
 trap - EXIT INT TERM
-cleanup
+cleanup_workload
 exit "$RC"
 GUEST_LEG_EOF
 chmod 755 "$GUEST_LEG"
@@ -330,11 +350,17 @@ for KERNEL in "$@"; do
         infra_fail "no guest exit line"
         continue
     fi
-    if ! grep -Eq '^(staged-boot-config|boot-config-present)-' "$VNG_LOG"; then
-        infra_fail "kernel config not staged"
+    # The boot-config staging line is printed but not gated: vng's
+    # console capture demonstrably garbles it (a bare `-generic` tail
+    # was observed on 6.6/6.12) while the leg runs fine. The
+    # guest-work-ready line is the stronger gate: guest-env.sh prints
+    # it strictly after successful boot staging, loop mount and tmp
+    # checks, and every staging failure returns before it.
+    grep -E '^(staged-boot-config|boot-config-present)-' "$VNG_LOG" | tail -1
+    if ! grep -q '^guest-work-ready=' "$VNG_LOG"; then
+        infra_fail "guest work area never readied"
         continue
     fi
-    grep -E '^(staged-boot-config|boot-config-present)-' "$VNG_LOG" | tail -1
     GUEST_RELEASE=$(grep '^guest-release=' "$VNG_LOG" | tail -1 | cut -d= -f2)
     case "$GUEST_RELEASE" in
         "${KERNEL#v}"|"${KERNEL#v}-"*)

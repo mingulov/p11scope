@@ -331,7 +331,7 @@ fn growth_omission_reason(
     )
 }
 
-/// A module's admission class in a shared scope, in admission order.
+/// A module's admission class, in admission order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AdmissionClass {
     /// Named by the operator's `--manifest`: attested, admitted first and
@@ -347,7 +347,7 @@ enum AdmissionClass {
     /// one object: a proxy's closure array (p11-kit decodes 64). A call
     /// through the proxy is seen at the real provider's own functions once
     /// that provider is attached, and the whole array (~6,656 endpoints)
-    /// never fits, so it is admitted last and only whole.
+    /// never fits, so it is admitted last and only whole, in every scope.
     ClosureArray,
 }
 
@@ -556,9 +556,12 @@ impl CapacityRefusal<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AdmissionScope {
     /// One named process (`--pid`, `run`), or a capture the operator aimed
-    /// with `--module`: modules are admitted first-come in discovery order,
+    /// with `--module`: providers are admitted first-come in discovery order,
     /// and an unresolved heuristic object admits its strongest
-    /// [`MAX_TABLES_PER_OBJECT`] tables (K4).
+    /// [`MAX_TABLES_PER_OBJECT`] tables (K4). A recognized proxy closure
+    /// array is decided after every provider and admitted whole or not at
+    /// all, so it never crowds out a real provider; unlike a shared scope,
+    /// a named scope keeps no reserve.
     #[default]
     Named,
     /// Cgroup or system scope without `--module` (GT-5). Every process in
@@ -2575,6 +2578,12 @@ fn merge(
     let mut order: Vec<usize> = (0..groups.len()).collect();
     if shared {
         order.sort_by_key(|&position| (classes[position], groups[position][0].key, position));
+    } else {
+        // Named scope keeps first-come discovery order for providers, but a
+        // recognized proxy closure array is decided last in every scope: it
+        // must never crowd out a real provider. Stable, so discovery order
+        // holds within each partition.
+        order.sort_by_key(|&position| classes[position].0 == AdmissionClass::ClosureArray);
     }
     let reserve = shared_scope_reserve(capacity);
     // Retired slots stay allocated for the capture lifetime and are never
@@ -2603,8 +2612,12 @@ fn merge(
         let (class, table_count) = classes[position];
         // Shared scope: every module but an operator-attested one is admitted
         // whole or not at all, and uncorroborated ones leave the reserve free.
+        // A proxy closure array is admitted whole or not at all in every
+        // scope: a strongest-prefix exploration would crowd out the real
+        // providers behind the proxy.
         let whole = broad_admit
             || admission_policy.admits_complete_validated_union()
+            || class == AdmissionClass::ClosureArray
             || (shared && class != AdmissionClass::Operator);
         let reserved = shared && class.leaves_reserve();
         let budget = GroupBudget {
@@ -2980,8 +2993,7 @@ fn merge(
                     retired,
                     holders: slot_holders(&holding, &paths),
                     reserve: reserved.then_some(reserve),
-                    closure_tables: (shared && class == AdmissionClass::ClosureArray)
-                        .then_some(table_count),
+                    closure_tables: (class == AdmissionClass::ClosureArray).then_some(table_count),
                     aim_hint: shared,
                 };
                 decisions[position] = Some(AdmissionDecision::Refused(Skipped {
@@ -9087,11 +9099,12 @@ mod tests {
         assert_eq!(plan.slots, before.slots);
     }
 
-    /// G-03 against the heuristic cap (whole-branch review finding 1): the
+    /// G-03 for a whole-decided family (whole-branch review finding 1): the
     /// refused growth's new table sorts first and repeats one kept endpoint.
-    /// The kept-only retry must keep every kept endpoint — the newcomer table
-    /// must not consume one of the four cap slots, spill the old fourth
-    /// table, and retire its previously attached endpoint.
+    /// Five heuristic tables are a closure array, so the complete union is
+    /// refused at the ceiling and the kept-only retry must keep every kept
+    /// endpoint — the newcomer must not spill the old fourth table and retire
+    /// its previously attached endpoint.
     #[test]
     fn a_refused_growths_new_table_does_not_spill_a_kept_heuristic_table() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
@@ -9534,22 +9547,23 @@ mod tests {
         assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 1);
     }
 
-    /// G-03 spill accounting (#3): a kept-holding table past
-    /// `MAX_TABLES_PER_OBJECT` with budget still available must route to
-    /// the refused-growth retry, not spill silently. The kept endpoint
-    /// stays, the table's fresh endpoint is omitted explicitly, and the
-    /// four genuinely-new tables spill counted exactly once each.
+    /// G-03 spill accounting (#3): a kept-holding table past the remaining
+    /// budget must route to the refused-growth retry, not spill silently. The
+    /// kept endpoint stays, the table's fresh endpoint is omitted explicitly,
+    /// and the three other tables spill counted exactly once each. (A fifth
+    /// heuristic table would make the object a closure array, decided whole;
+    /// the budget, not the cap, is the frontier here.)
     #[test]
-    fn a_kept_table_past_the_heuristic_cap_routes_to_the_refused_growth_retry() {
+    fn a_kept_table_past_the_budget_routes_to_the_refused_growth_retry() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
 
         let existing = PinnedObjectId(10);
         let filler = PinnedObjectId(12);
         let key = scanned_key(existing);
-        // One kept endpoint plus a little filler: every fresh endpoint
-        // would fit by budget, so only the per-object cap can refuse.
+        // One kept endpoint plus filler to two slots short of the ceiling:
+        // the first two new tables fit, the kept-holding third does not.
         let mut slots = vec![exact_slot(0, existing, 0, 0, vec![ModuleId(0)])];
-        slots.extend((0..10u32).map(|index| {
+        slots.extend((0..MAX_SLOTS - 3).map(|index| {
             exact_slot(
                 1 + index,
                 filler,
@@ -9563,9 +9577,9 @@ mod tests {
             vec![exact_module(0, existing), exact_module(1, filler)],
         );
 
-        // Equal heuristic evidence keeps discovery order: four new tables
-        // admit onto the four cap slots, and the fifth table — holding the
-        // kept endpoint — reaches the cap branch with budget to spare.
+        // Equal heuristic evidence keeps discovery order: the first two new
+        // tables admit, and the third — holding the kept endpoint — reaches
+        // the budget branch with nothing left to spend.
         let table = |address: u64, file_offset: u64, offsets: &[u64]| ScannedTable {
             version: (2, 40),
             walk: "full",
@@ -9590,21 +9604,19 @@ mod tests {
         grown.scanned.tables = vec![
             table(0x7000, 0x0000, &[0x10000]),
             table(0x7100, 0x1000, &[0x10008]),
-            table(0x7200, 0x2000, &[0x10010]),
-            table(0x7300, 0x3000, &[0x10018]),
-            table(0x7400, 0x4000, &[0, 0x10020]),
+            table(0x7200, 0x2000, &[0, 0x10020]),
+            table(0x7300, 0x3000, &[0x10010]),
         ];
         grown.entry_objects = vec![
             vec![existing],
             vec![existing],
-            vec![existing],
-            vec![existing],
             vec![existing; 2],
+            vec![existing],
         ];
         let filler_scan = scanned_with(
             scanned_key(filler),
             "/proc/self/fd/12",
-            (0..10u32).map(|index| 0x2000 + u64::from(index) * 8),
+            (0..MAX_SLOTS - 3).map(|index| 0x2000 + u64::from(index) * 8),
         );
 
         let rebuilt =
@@ -9630,8 +9642,8 @@ mod tests {
             rebuilt.modules_skipped[0]
         );
         assert_eq!(
-            rebuilt.uncorroborated_candidates, 4,
-            "the four genuinely-new tables spill exactly once each"
+            rebuilt.uncorroborated_candidates, 3,
+            "the three other tables spill exactly once each"
         );
         let kept: Vec<u64> = rebuilt
             .slots
@@ -9650,15 +9662,14 @@ mod tests {
         );
         assert!(delta.new.is_empty());
         assert!(delta.replace.is_empty());
-        assert_eq!(plan.active_slot_count(), 11);
+        assert_eq!(plan.active_slot_count(), MAX_SLOTS as usize - 2);
     }
 
     /// C1: an unchanged provider whose five heuristic tables share the same
-    /// attached endpoints must not record a growth refusal. The fifth table
-    /// reaches the cap branch with zero fresh demand, so it routes to the
-    /// kept-only retry for preservation — with empty total demand no
-    /// omission is recorded, every endpoint stays attached, and the snapshot
-    /// stays COMPLETE (`modules_skipped` empty).
+    /// attached endpoints must not record a growth refusal. Five tables are
+    /// a closure array, decided whole: with zero fresh demand the union fits,
+    /// no omission is recorded, every endpoint stays attached, and the
+    /// snapshot stays COMPLETE (`modules_skipped` empty).
     #[test]
     fn an_unchanged_provider_past_the_heuristic_cap_records_no_refusal() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
@@ -9687,9 +9698,9 @@ mod tests {
             vec![exact_module(0, existing), exact_module(1, filler)],
         );
 
-        // Equal heuristic evidence keeps discovery order: four tables admit
-        // onto the four cap slots, and the fifth — listing the same two
-        // attached endpoints — reaches the cap branch with nothing fresh.
+        // Equal heuristic evidence keeps discovery order; all five tables
+        // list the same two attached endpoints, so the whole union carries
+        // zero fresh demand and admits.
         let table = |address: u64, file_offset: u64| ScannedTable {
             version: (2, 40),
             walk: "full",
@@ -9739,7 +9750,7 @@ mod tests {
         );
         assert_eq!(
             rebuilt.uncorroborated_candidates, 0,
-            "the fifth table routes to the kept-only retry and admits there, it does not spill"
+            "the whole union admits, it does not spill"
         );
         let kept: Vec<u64> = rebuilt
             .slots
@@ -9761,14 +9772,13 @@ mod tests {
         assert_eq!(plan.active_slot_count(), 12);
     }
 
-    /// D1: a zero-demand kept table past the cap must be preserved without
-    /// a refusal. The provider owns four attached endpoints; the refresh
-    /// adds an earlier alias table, so five distinct single-endpoint
-    /// heuristic tables ([0], [0], [8], [16], [24]) overflow the cap. The
-    /// fifth holds kept 24 with zero fresh demand: attached is not
-    /// surviving-in-admitted-tables, so it must route to the kept-only
-    /// retry (where the cap is bypassed) instead of spilling — and with
-    /// empty total demand no omission is recorded (COMPLETE intact).
+    /// D1: a zero-demand kept table in a whole-decided family must be
+    /// preserved without a refusal. The provider owns four attached
+    /// endpoints; the refresh adds an earlier alias table, so five distinct
+    /// single-endpoint heuristic tables ([0], [0], [8], [16], [24]) are a
+    /// closure array, decided whole. The fifth holds kept 24 with zero fresh
+    /// demand: the whole union fits, so nothing spills — and with empty
+    /// total demand no omission is recorded (COMPLETE intact).
     #[test]
     fn a_zero_demand_kept_table_past_the_cap_is_preserved_without_a_refusal() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
@@ -9799,10 +9809,9 @@ mod tests {
             vec![exact_module(0, existing), exact_module(1, filler)],
         );
 
-        // Equal heuristic evidence keeps discovery order: the first four
-        // single-endpoint tables admit onto the four cap slots, and the
-        // fifth — holding only kept 24 — reaches the cap branch with
-        // nothing fresh.
+        // Equal heuristic evidence keeps discovery order; every table holds
+        // only kept endpoints, so the whole union carries zero fresh demand
+        // and admits.
         let table = |address: u64, file_offset: u64, offsets: &[u64]| ScannedTable {
             version: (2, 40),
             walk: "full",
@@ -9859,7 +9868,7 @@ mod tests {
         assert_eq!(kept, [0, 8, 16, 24], "every kept endpoint stays slotted");
         assert_eq!(
             rebuilt.uncorroborated_candidates, 0,
-            "the fifth table routes to the kept-only retry, it does not spill"
+            "the whole union admits, nothing spills"
         );
 
         let delta = plan.extend_exact(rebuilt).unwrap();
@@ -10921,20 +10930,27 @@ mod tests {
     }
 
     #[test]
-    fn inventory_admits_all_sixty_four_heuristic_tables_while_detailed_stays_k4() {
-        let scanned = scanned_with_heuristic_tables(64);
+    fn inventory_admits_all_sixty_four_heuristic_tables_while_detailed_refuses_the_family_whole() {
+        let scanned = provider_with_tables(92, "/opt/heuristic.so", 64, 103, false);
 
         let detailed = build_from_reconciled_modules(std::slice::from_ref(&scanned));
         assert_eq!(detailed.admission_policy(), AdmissionPolicy::detailed());
-        assert_eq!(detailed.slots.len(), MAX_TABLES_PER_OBJECT);
-        assert_eq!(detailed.uncorroborated_candidates, 60);
+        assert!(detailed.slots.is_empty());
+        assert_eq!(detailed.modules_skipped.len(), 1);
+        assert!(
+            detailed.modules_skipped[0]
+                .reason
+                .contains("(a proxy closure array is admitted whole or not at all)"),
+            "{:?}",
+            detailed.modules_skipped[0]
+        );
 
         let inventory = build_from_test_sources_with_policy(
             std::slice::from_ref(&scanned),
             &[],
-            inventory_policy(64),
+            inventory_policy(64 * 103),
         );
-        assert_eq!(inventory.slots.len(), 64);
+        assert_eq!(inventory.slots.len(), 64 * 103);
         assert_eq!(inventory.uncorroborated_candidates, 0);
         assert!(inventory.slots.iter().all(|slot| slot.descriptor_index == 0
             && slot.semantics == SlotSemantics::COUNT_ONLY
@@ -10943,7 +10959,7 @@ mod tests {
             inventory
                 .slots
                 .iter()
-                .any(|slot| slot.file_offset == 63 * 8),
+                .any(|slot| slot.file_offset == (64 * 103 - 1) * 8),
             "the endpoint in the last heuristic table is admitted"
         );
     }
@@ -11555,7 +11571,9 @@ mod tests {
     fn whole_module_demand_keeps_named_heuristic_subset_reporting() {
         let existing =
             provider_with_tables(231, "/opt/existing.so", 1, MAX_SLOTS as usize - 2, false);
-        let refused = provider_with_tables(232, "/opt/refused.so", 5, 3, false);
+        // Four tables stay a heuristic object (five would be a closure array,
+        // decided whole): the K4 prefix and spill below are the heuristic rule.
+        let refused = provider_with_tables(232, "/opt/refused.so", 4, 3, false);
         let named = scoped_plan(&[existing, refused.clone()], AdmissionScope::Named);
         let refusal = refusal_of(&named, "/opt/refused.so").unwrap();
         assert!(
@@ -11564,14 +11582,23 @@ mod tests {
         );
         assert_eq!(named.slots.len(), MAX_SLOTS as usize - 2);
 
-        let prefix = scoped_plan(&[refused], AdmissionScope::Named);
+        let prefix = scoped_plan(std::slice::from_ref(&refused), AdmissionScope::Named);
         assert_eq!(
             prefix.slots.len(),
             12,
             "K4 admits its strongest four tables"
         );
-        assert_eq!(prefix.uncorroborated_candidates, 1);
+        assert_eq!(prefix.uncorroborated_candidates, 0);
         assert!(prefix.modules_skipped.is_empty());
+
+        // A heuristic object still takes a strongest-prefix subset with spill
+        // when the budget, not the cap, runs out.
+        let cramped =
+            provider_with_tables(233, "/opt/cramped.so", 1, MAX_SLOTS as usize - 4, false);
+        let subset = scoped_plan(&[cramped, refused], AdmissionScope::Named);
+        assert_eq!(subset.slots.len(), MAX_SLOTS as usize - 1);
+        assert_eq!(subset.uncorroborated_candidates, 3);
+        assert!(subset.modules_skipped.is_empty());
     }
 
     /// Retired keys cost fresh lifetime slots if they reappear. A failed
@@ -11658,10 +11685,11 @@ mod tests {
 
     /// GT-5, the stock-desktop shape: an ambient `libp11-kit` decoding 64
     /// closure tables, ambient `p11-kit-trust`, and the SoftHSM2 the workload
-    /// uses, all heuristic. First-come K4 admission (named scope, unchanged)
-    /// hands p11-kit a 412-endpoint prefix and refuses SoftHSM. A shared scope
-    /// admits both single-table providers in every discovery order, and
-    /// refuses the closure array whole, saying why and how to aim the capture.
+    /// uses, all heuristic. A shared scope admits both single-table providers
+    /// in every discovery order, and refuses the closure array whole, saying
+    /// why and how to aim the capture. Named scope defers the closure array
+    /// the same way: both providers are admitted and the family is refused
+    /// whole, so it never crowds them out.
     #[test]
     fn shared_scope_admits_single_table_providers_ahead_of_a_proxy_closure_array() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
@@ -11673,14 +11701,13 @@ mod tests {
             AdmissionScope::Named,
         );
         assert_eq!(named.admission_scope(), AdmissionScope::Named);
-        assert_eq!(
-            slots_of(&named, 31),
-            MAX_TABLES_PER_OBJECT * 103,
-            "named scope keeps the K4 prefix"
+        assert_eq!(slots_of(&named, 32), 68, "named scope admits p11-kit-trust");
+        assert_eq!(slots_of(&named, 33), 68, "named scope admits SoftHSM");
+        assert_eq!(slots_of(&named, 31), 0, "no closure prefix in named scope");
+        assert!(
+            refusal_of(&named, P11_KIT).is_some(),
+            "named scope refuses the closure array whole"
         );
-        if (MAX_SLOTS as usize) < MAX_TABLES_PER_OBJECT * 103 + 2 * 68 {
-            assert!(refusal_of(&named, SOFTHSM).is_some(), "the GT-5 outcome");
-        }
 
         let orders = [
             [&p11_kit, &trust, &softhsm],
@@ -12065,8 +12092,13 @@ mod tests {
         module
     }
 
+    /// An opaque live-return publication admits its table without granting
+    /// semantic permission: the slots stay count-only and unauthorized.
+    /// Without the publication the five lookalikes are a closure array and
+    /// decide whole — admitted whole here, since they fit — with every name
+    /// still `unknown`.
     #[test]
-    fn observed_opaque_fifth_table_survives_cap_without_semantic_permission() {
+    fn opaque_publication_admits_without_semantic_permission() {
         let observed = opaque_fifth_publication();
         let name_score = TableEvidenceScore {
             linked: false,
@@ -12096,8 +12128,8 @@ mod tests {
             &name_score
         ));
         let plan = build_from_reconciled_modules(&[raw]);
-        assert_eq!(plan.slots.len(), 4);
-        assert_eq!(plan.uncorroborated_candidates, 1);
+        assert_eq!(plan.slots.len(), 5);
+        assert_eq!(plan.uncorroborated_candidates, 0);
         assert!(
             plan.slots
                 .iter()

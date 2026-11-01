@@ -154,10 +154,10 @@ fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
 "#;
     if !comparison
         .lines()
-        // Pinned baseline 30208b48: reviewed loader + bank + journal
-        // delta since ba92b4e2 and the loader-gate wiring since 90b8cf9f;
-        // both enumerated in the ci.yml comment.
-        .any(|line| line == "          BASELINE=30208b48bfaa494420cd05f28ba950be41279470")
+        // Pinned baseline 9a0b277a: the PID-scope EXEC ticket fix on top of
+        // the reviewed loader + bank + journal delta since ba92b4e2 and the
+        // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
+        .any(|line| line == "          BASELINE=9a0b277ad47401c19cca62ad146cabd98f42985d")
         || !comparison.contains(repeat)
         || !comparison.contains(integration)
         || comparison.contains("--host-compiler-transition")
@@ -237,10 +237,10 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
         "a renamed comparison job must be rejected"
     );
     for marker in [
-        // Pinned baseline 30208b48: reviewed loader + bank + journal
-        // delta since ba92b4e2 and the loader-gate wiring since 90b8cf9f;
-        // both enumerated in the ci.yml comment.
-        "BASELINE=30208b48bfaa494420cd05f28ba950be41279470",
+        // Pinned baseline 9a0b277a: the PID-scope EXEC ticket fix on top of
+        // the reviewed loader + bank + journal delta since ba92b4e2 and the
+        // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
+        "BASELINE=9a0b277ad47401c19cca62ad146cabd98f42985d",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"",

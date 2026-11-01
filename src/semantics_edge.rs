@@ -396,6 +396,11 @@ struct CallOrigin {
 struct PendingCall {
     call: SemanticCall,
     origin: CallOrigin,
+    /// Originating H0 admission position for Joint-replayed
+    /// originals; `None` for S1Only or unassociated starts. The
+    /// Activation compares this to the redeemed origin's position:
+    /// same origin means equal positions.
+    origin_pos: Option<u64>,
     sequence: u64,
     // Payload fields precede the move-only owner: refund after destruction.
     resource: Option<ResourceLease>,
@@ -411,8 +416,20 @@ struct AsyncId {
     owner: Option<u64>,
     call: SemanticCall,
     origin: CallOrigin,
+    /// The pending record's H0 position, carried over at the GetID
+    /// mint — never re-snapshotted, like `origin`.
+    origin_pos: Option<u64>,
     sequence: u64,
     resource: Option<ResourceLease>,
+}
+
+/// Same-origin check for an S1 async record against a redeemed
+/// origin (CP-3a groundwork): both sides must carry the origin's H0
+/// position and they must be equal. An unknown (S1Only) side never
+/// confirms.
+#[cfg_attr(not(test), allow(dead_code))] // First production caller: the Activation's receipt gate.
+fn same_origin_position(stored: Option<u64>, redeemed: Option<u64>) -> bool {
+    matches!((stored, redeemed), (Some(a), Some(b)) if a == b)
 }
 
 /// First-wins PENDING routing (§3.5): preflight reserves exactly the
@@ -2045,6 +2062,7 @@ impl EdgeSemantics {
                         owner: Some(call.session),
                         call: pending.call,
                         origin: pending.origin,
+                        origin_pos: pending.origin_pos,
                         sequence,
                         resource: pending.resource,
                     },
@@ -2103,6 +2121,9 @@ impl EdgeSemantics {
             PendingCall {
                 call: call.clone(),
                 origin,
+                // No H0 channel yet: S1Only queueing stores no
+                // origin position. Joint replay will supply it.
+                origin_pos: None,
                 sequence,
                 resource,
             },

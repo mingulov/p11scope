@@ -5606,6 +5606,206 @@ fn loader_budget_refusals_keep_named_causes_and_fail_closed_cleanup() {
     assert!(post_engine.loader_registry.context(context).is_none());
 }
 
+/// One stopped dynamic `/bin/sh` child for the shared-loader arming cells.
+struct StoppedShell(std::process::Child);
+
+impl StoppedShell {
+    fn spawn() -> Self {
+        let mut child = Self(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "printf R; kill -STOP $$"])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = [0_u8; 1];
+        std::io::Read::read_exact(child.0.stdout.as_mut().unwrap(), &mut ready).unwrap();
+        assert_eq!(ready, *b"R");
+        let pid = child.0.id() as libc::pid_t;
+        let mut status = 0;
+        // SAFETY: this process is the parent of the exact unreaped child.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+            pid
+        );
+        assert!(libc::WIFSTOPPED(status));
+        child
+    }
+}
+
+impl Drop for StoppedShell {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Arms one stopped shell on `budget` (the capture's single budget, moved in
+/// and handed back) and returns the bytes that arm attempted.
+fn arm_shell_on_budget(shell: &StoppedShell, budget: &mut CaptureWorkBudget) -> u64 {
+    let pid = shell.0.id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(pid);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
+    engine.budget = std::mem::take(budget);
+    let before = engine.budget.attempted_io_bytes();
+    let mut session = ScriptedSession::default();
+    let armed = engine.arm_loader_or_partial(
+        0,
+        &mut session,
+        &mut true,
+        &mut PendingViewRetirements::new(),
+    );
+    let skips = engine.counters.object_skips.clone();
+    armed.unwrap_or_else(|error| panic!("pid {pid} arm failed: {error:#} {skips:?}"));
+    assert_eq!(
+        session.dynamic_loader_attach_calls, 1,
+        "pid {pid} attaches its loader hook: {skips:?}"
+    );
+    assert_eq!(
+        engine.loader_discovery().strategies.debug_state_every_hit,
+        1,
+        "pid {pid} arms: {skips:?}"
+    );
+    let spent = engine.budget.attempted_io_bytes() - before;
+    *budget = std::mem::take(&mut engine.budget);
+    spent
+}
+
+/// Arming many processes that map one unchanged dynamic loader file must not
+/// re-read that file's bytes for every arm and every revalidation: the
+/// capture's attempted-I/O total is finite, and a large `ld.so` (about 1 MB
+/// on Fedora) read four times per arm exhausted it at about 128 armed views,
+/// stranding every later newcomer. The loader's ELF facts are file-derived,
+/// so once one arm has read and revalidated them, a later arm of the same
+/// unchanged pin reuses them exactly like the scan's export facts.
+#[test]
+fn arming_views_that_share_one_loader_reads_its_bytes_once() {
+    let first = StoppedShell::spawn();
+    let second = StoppedShell::spawn();
+    let third = StoppedShell::spawn();
+    let probe = ProcessView::open(ProcessViewId(0), first.0.id()).unwrap();
+    let mut sizing = CaptureWorkBudget::default();
+    let locator = Engine::loader_locator(&probe, &mut sizing)
+        .unwrap()
+        .expect("/bin/sh is a dynamic executable with a PT_INTERP loader");
+    let loader_bytes = std::fs::metadata(format!(
+        "/proc/{}/root{}",
+        first.0.id(),
+        locator.authority.loader_path.display()
+    ))
+    .unwrap()
+    .len();
+    drop(probe);
+
+    let mut budget = CaptureWorkBudget::default();
+    let first_arm = arm_shell_on_budget(&first, &mut budget);
+    let second_arm = arm_shell_on_budget(&second, &mut budget);
+    let third_arm = arm_shell_on_budget(&third, &mut budget);
+    println!(
+        "loader={loader_bytes} first_arm={first_arm} second_arm={second_arm} third_arm={third_arm}"
+    );
+    // The first arm of a loader file reads and revalidates it exactly as
+    // before (the measurement sees real loader reads, so the bound below is
+    // not vacuous).
+    assert!(
+        first_arm >= 2 * loader_bytes,
+        "the first arm must read the loader itself: loader={loader_bytes} first_arm={first_arm}"
+    );
+    // Later arms of the same unchanged loader read only per-process state
+    // (maps, executable headers): strictly less than one loader read.
+    for (name, spent) in [("second", second_arm), ("third", third_arm)] {
+        assert!(
+            spent < loader_bytes,
+            "{name} arm re-read the shared loader: loader={loader_bytes} spent={spent}"
+        );
+    }
+}
+
+/// The loader-facts reuse is exact-file only. A retained key serves the
+/// unchanged file with zero reads; a byte-identical copy (another inode) and
+/// the same file after any change (a new ctime) both miss and are read and
+/// charged in full, so a flood of distinct or changing loader files still
+/// meets the capture's attempted-I/O ceiling.
+#[test]
+fn loader_facts_reuse_only_the_unchanged_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let shell = StoppedShell::spawn();
+    let view = ProcessView::open(ProcessViewId(0), shell.0.id()).unwrap();
+    let locator = Engine::loader_locator(&view, &mut CaptureWorkBudget::default())
+        .unwrap()
+        .expect("/bin/sh is a dynamic executable with a PT_INTERP loader");
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("loader-copy.so");
+    std::fs::copy(
+        format!(
+            "/proc/{}/root{}",
+            shell.0.id(),
+            locator.authority.loader_path.display()
+        ),
+        &copy,
+    )
+    .unwrap();
+    let size = std::fs::metadata(&copy).unwrap().len();
+    let file = std::fs::File::open(&copy).unwrap();
+    let mut budget = CaptureWorkBudget::default();
+    let charged = |budget: &mut CaptureWorkBudget, file: &std::fs::File| {
+        let before = budget.attempted_io_bytes();
+        let (facts, fresh) = loader_elf_facts(file, budget).unwrap();
+        (facts, fresh, budget.attempted_io_bytes() - before)
+    };
+
+    // A fresh read is charged and offers its key; nothing is retained until
+    // the caller's arm commits, so a second read is charged again.
+    let (facts, fresh, spent) = charged(&mut budget, &file);
+    assert_eq!(spent, size, "a fresh loader read charges the whole file");
+    assert_eq!(facts, locator_facts(&file));
+    let key = fresh.expect("a stable fresh read offers its key");
+    let (_, again, spent) = charged(&mut budget, &file);
+    assert_eq!(spent, size, "unretained facts are read again");
+    assert_eq!(again, Some(key));
+
+    // Retained: the unchanged file reuses the facts with zero reads.
+    assert!(budget.note_loader_elf_facts(key, facts.clone()));
+    let (reused, none, spent) = charged(&mut budget, &file);
+    assert_eq!(spent, 0, "the unchanged file reuses its retained facts");
+    assert_eq!(none, None, "a reuse offers no key to retain");
+    assert_eq!(reused, facts);
+
+    // A byte-identical copy is another file: read and charged in full.
+    let other = dir.path().join("loader-other.so");
+    std::fs::copy(&copy, &other).unwrap();
+    let other_file = std::fs::File::open(&other).unwrap();
+    let (other_facts, other_key, spent) = charged(&mut budget, &other_file);
+    assert_eq!(
+        spent, size,
+        "a distinct loader file is never served the cache"
+    );
+    assert_eq!(other_facts, facts);
+    assert_ne!(other_key, Some(key));
+
+    // Any change to the retained file moves its ctime: a miss, charged again.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_, changed_key, spent) = charged(&mut budget, &file);
+    assert_eq!(spent, size, "a changed loader file is read again");
+    assert_ne!(changed_key, Some(key));
+}
+
+/// The facts a direct snapshot read gives, for comparison with the cache.
+fn locator_facts(file: &std::fs::File) -> LoaderElfFacts {
+    let snapshot = read_elf_snapshot(file, &mut CaptureWorkBudget::default()).unwrap();
+    LoaderElfFacts {
+        abi: snapshot.abi(),
+        hook: snapshot
+            .defined_symbol("_dl_debug_state")
+            .map(|hook| hook.filter(|hook| snapshot.is_executable_offset(hook.file_offset))),
+        state_address: loader_state_address(&snapshot),
+    }
+}
+
 #[test]
 fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
     struct ChildGuard(std::process::Child);

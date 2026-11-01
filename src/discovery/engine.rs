@@ -26,20 +26,21 @@ use crate::discovery::identity::{
     RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
     StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
     open_view_executable_cached, open_view_rooted_object_cached,
-    pin_manifest_objects_deferred_in_views_with_budget, pin_prearm_objects_in_views_with_budget,
-    pin_scanned_view_objects, preexec_object_key, retained_object_key_cached,
-    self_mapped_fallback_key, target_paths_equal,
+    pin_manifest_objects_deferred_in_views_with_budget, pin_of,
+    pin_prearm_objects_in_views_with_budget, pin_scanned_view_objects, preexec_object_key,
+    retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
-    CaptureWorkBudget, MapsReadBuffers, MapsReadLimits, ObjectExports, ScanOutcome, ScanRequest,
-    ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped, decode_exact_table,
-    decode_observed_words, decoded_table_addresses, exact_legacy_prefix_bytes,
-    exact_table_addresses_n, exact_table_bytes, export_agreement, index_maps_or_refuse,
-    published_walk, read_elf_snapshot, read_maps_or_refuse, read_maps_or_refuse_with_buffers,
-    scan_process_view, scan_process_view_without_memory, scan_skip_truncates, table_evidence_score,
-    table_has_only_opaque_interfaces, table_linkage, target_layout,
+    CaptureWorkBudget, LoaderElfFacts, LoaderFactsKey, MapsReadBuffers, MapsReadLimits,
+    ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
+    ScannedTable, Skipped, decode_exact_table, decode_observed_words, decoded_table_addresses,
+    exact_legacy_prefix_bytes, exact_table_addresses_n, exact_table_bytes, export_agreement,
+    index_maps_or_refuse, published_walk, read_elf_snapshot, read_maps_or_refuse,
+    read_maps_or_refuse_with_buffers, scan_process_view, scan_process_view_without_memory,
+    scan_skip_truncates, table_evidence_score, table_has_only_opaque_interfaces, table_linkage,
+    target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
@@ -8953,6 +8954,42 @@ fn loader_state_address(snapshot: &ElfSnapshot) -> std::result::Result<Option<u6
         .transpose()
 }
 
+/// One dynamic loader file's arming facts: reused from an earlier completed
+/// arm when the opened file still has the same `st_dev` and pin, otherwise
+/// read from the file under the capture budget exactly as before. Returns the
+/// key alongside freshly read facts whose pin held across the read, so the
+/// caller can retain them once its arm commits; a reuse returns `None`.
+fn loader_elf_facts(
+    file: &std::fs::File,
+    budget: &mut CaptureWorkBudget,
+) -> std::result::Result<(LoaderElfFacts, Option<LoaderFactsKey>), String> {
+    let key = LoaderFactsKey {
+        device: file
+            .metadata()
+            .map_err(|error| format!("metadata failed: {error}"))?
+            .dev(),
+        pin: pin_of(file)?,
+    };
+    // Nothing is read for this hit, but the file may have changed since the
+    // key was taken; only the still-unchanged file may reuse the facts.
+    if let Some(facts) = budget
+        .loader_elf_facts_for(&key)
+        .filter(|_| pin_of(file).is_ok_and(|after| after == key.pin))
+    {
+        return Ok((facts, None));
+    }
+    let snapshot = read_elf_snapshot(file, budget)?;
+    let facts = LoaderElfFacts {
+        abi: snapshot.abi(),
+        hook: snapshot
+            .defined_symbol("_dl_debug_state")
+            .map(|hook| hook.filter(|hook| snapshot.is_executable_offset(hook.file_offset))),
+        state_address: loader_state_address(&snapshot),
+    };
+    let stable = pin_of(file).is_ok_and(|after| after == key.pin);
+    Ok((facts, stable.then_some(key)))
+}
+
 const NO_EXECUTABLE_MAPPING_REASON: &str = "retained executable has no usable executable mapping";
 const NO_LOADER_MAPPING_REASON: &str = "PT_INTERP has no usable executable loader mapping";
 
@@ -11794,8 +11831,8 @@ impl Engine {
             let (file, key) =
                 open_view_rooted_object_cached(view, Path::new(interpreter), &mut mounts, budget)
                     .map_err(anyhow::Error::msg)?;
-            let object = read_elf_snapshot(&file, budget).map_err(anyhow::Error::msg)?;
-            if object.abi() != executable_abi {
+            let (object, _) = loader_elf_facts(&file, budget).map_err(anyhow::Error::msg)?;
+            if object.abi != executable_abi {
                 bail!("retained executable and PT_INTERP have different target ABIs");
             }
             let snapshot = FileSnapshot::read(&file).map_err(anyhow::Error::msg)?;
@@ -17472,7 +17509,7 @@ impl Engine {
             );
             return Ok(false);
         };
-        let loader_snapshot = read_elf_snapshot(
+        let (loader_facts, fresh_loader_facts) = loader_elf_facts(
             loader_pins
                 .file_for(local_loader_id)
                 .expect("the just-pinned loader has its retained file"),
@@ -17486,7 +17523,7 @@ impl Engine {
         )
         .map_err(anyhow::Error::msg)?;
         if pinned_loader_file != locator.authority.interpreter_file
-            || loader_snapshot.abi() != locator.authority.executable_abi
+            || loader_facts.abi != locator.authority.executable_abi
         {
             self.mark_partial(
                 "live loader arming",
@@ -17494,11 +17531,7 @@ impl Engine {
             );
             return Ok(false);
         }
-        let Some(hook) = loader_snapshot
-            .defined_symbol("_dl_debug_state")
-            .map_err(anyhow::Error::msg)?
-            .filter(|hook| loader_snapshot.is_executable_offset(hook.file_offset))
-        else {
+        let Some(hook) = loader_facts.hook.clone().map_err(anyhow::Error::msg)? else {
             self.mark_partial(
                 "live loader arming",
                 "the exact loader had no executable _dl_debug_state definition",
@@ -17513,7 +17546,10 @@ impl Engine {
                     return Ok(false);
                 }
             };
-        let state_address = loader_state_address(&loader_snapshot).map_err(anyhow::Error::msg)?;
+        let state_address = loader_facts
+            .state_address
+            .clone()
+            .map_err(anyhow::Error::msg)?;
 
         let (candidate, loader) = self
             .loader_candidate(
@@ -17612,6 +17648,11 @@ impl Engine {
                 self.loader_registry
                     .mark_attached(context)
                     .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
+                // This arm read the loader and both revalidation brackets
+                // held: later arms of the unchanged file reuse its facts.
+                if let Some(key) = fresh_loader_facts {
+                    self.budget.note_loader_elf_facts(key, loader_facts);
+                }
                 if matches!(self.scope, Scope::Pid(_))
                     && self.frame_deadline_ns.is_some()
                     && !self.pause_owned_batch

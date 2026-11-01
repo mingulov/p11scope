@@ -6543,6 +6543,10 @@ mod tests {
             body.contains("entry_prog(slot)") && body.contains("birth_prog(slot)"),
             "the program census still pins the slot's two bank programs"
         );
+        assert!(
+            body.contains("Self::check_bank_program_set("),
+            "the census wires the loaded set through the two-program pin"
+        );
     }
 
     #[test]

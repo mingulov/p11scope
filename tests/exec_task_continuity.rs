@@ -466,25 +466,20 @@ assert emit[0] not in m.reachable(root_graph, [refused]), 'refused scope emitted
 /// therefore never be acquired under PID scope (its record carries zero,
 /// unavailable), or the reused PID gets TASK_COOKIE state and an allocator
 /// charge in a capture that never selected it. Every path from the emitter
-/// entry to the only ticket call passes a mask of the scope flags'
-/// PID-filter bit (the flags scalar or the first word of the ScopeAuth the
-/// third argument points to); the set arm cannot reach the call and the
-/// clear arm (cgroup/system) still does.
+/// entry to the only ticket call passes a mask of the scope flags (the flags
+/// scalar or the first word of the ScopeAuth the third argument points to)
+/// that includes the PID-filter bit, compared against a value with that bit
+/// clear; the compiler may merge the bit with other flag tests (Detailed
+/// folds it into the tracking/aggregate test as one mask). Any PID-set
+/// value takes the not-equal arm, which cannot reach the call; the equal
+/// arm (cgroup/system) still does. Counter objects carry no ticket call;
+/// `exec_ticket_absent_from_counter_flavors` pins that absence.
 #[test]
 fn exec_generation_ticket_is_never_acquired_under_pid_scope() {
-    let mut variants = vec![
+    let variants = [
         ("detailed", p11scope::EBPF_OBJECT),
         ("callers", p11scope::EBPF_INVENTORY_CALLERS_OBJECT),
     ];
-    for (name, bytes) in [
-        ("counts", p11scope::EBPF_COUNTER_COUNTS_OBJECT),
-        ("timestamps", p11scope::EBPF_COUNTER_TIMESTAMPS_OBJECT),
-        ("latency", p11scope::EBPF_COUNTER_LATENCY_OBJECT),
-    ] {
-        if !bytes.is_empty() {
-            variants.push((name, bytes));
-        }
-    }
     let script = r#"
 import re, subprocess, sys
 from pathlib import Path
@@ -525,12 +520,12 @@ def names_scope_flags(index, register):
 
 gates = []
 for index, (pc, text) in enumerate(insns[:-2]):
-    mask = re.fullmatch(r'(r\d+) &= 0x1', text)
-    if not mask or not names_scope_flags(index, mask.group(1)):
+    mask = re.fullmatch(r'(r\d+) &= (0x[0-9a-f]+)', text)
+    if not mask or not int(mask.group(2), 16) & 0x1 or not names_scope_flags(index, mask.group(1)):
         continue
     branch_pc, branch = insns[index + 1]
-    test = re.fullmatch(mask.group(1) + r' (==|!=) 0x0 goto [+-]0x[0-9a-f]+', branch.removeprefix('if '))
-    if not test:
+    test = re.fullmatch(mask.group(1) + r' (==|!=) (0x[0-9a-f]+) goto [+-]0x[0-9a-f]+', branch.removeprefix('if '))
+    if not test or int(test.group(2), 16) & 0x1:
         continue
     target = m.relative_target(branch_pc, branch)
     following = insns[index + 2][0]

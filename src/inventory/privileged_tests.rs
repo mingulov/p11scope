@@ -4267,11 +4267,59 @@ fn start_joint_lane_with_journal(
     Ok(lane)
 }
 
-/// WU-2a live-DD positive: a real linked lane pumps discovery
+/// Default-build arm of the linked twins: without the journal pair a
+/// build cannot seal linked, so the twin asserts the two refusals it
+/// owns (journal preparation names the omitted build; a linked start
+/// refuses attachment) and reports the cell inapplicable — the same
+/// shape as the seal twin's flag-off arm.
+fn refuse_linked_without_journal(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    manifests: Vec<PathBuf>,
+    report: &str,
+) -> Result<()> {
+    use anyhow::Context as _;
+    let spec = crate::attach::journal::JournalSpec;
+    let error = spec
+        .prepare()
+        .err()
+        .context("the omitted build refuses journal preparation")?;
+    ensure!(
+        format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+        "the omitted build refuses with its finite reason: {error:#}"
+    );
+    coordinator.set_semantic_manifests(manifests);
+    let attach_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the attach subset prepares")?;
+    let convert_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the conversion subset prepares")?;
+    let scope = Scope::System;
+    let refused = crate::inventory_semantics::AttestedSemanticLane::start_live(
+        attach_subset,
+        convert_subset,
+        &scope,
+        crate::attach::BackendSelection::Auto,
+        Some(&spec),
+    );
+    ensure!(
+        matches!(
+            refused,
+            Err(crate::inventory_semantics::SemanticRefusal::Attachment)
+        ),
+        "a linked start refuses attachment without the journal pair: {refused:?}"
+    );
+    eprintln!("{report} journal=inapplicable");
+    Ok(())
+}
+
+/// Linked live-discovery positive: a real linked lane pumps discovery
 /// through the live arm. Post-attach spawns guarantee traffic; the
 /// pump must observe records (an unlinked lane skips with Ok(0), and
 /// the neutered-live mutant returns Ok(0) forever — both fail the
-/// poll loop). Root BPF lane, serial, journal build only.
+/// poll loop). Root BPF lane, serial.
 #[test]
 #[ignore = "privileged: live linked lane pumps discovery through the live arm"]
 fn privileged_key_operations_linked_lane_pumps_live_discovery() -> Result<()> {
@@ -4292,6 +4340,13 @@ fn privileged_key_operations_linked_lane_pumps_live_discovery() -> Result<()> {
         &["C_SignInit", "C_Sign"],
         "keyops-pump-held.dr37.json",
     )?;
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        return refuse_linked_without_journal(
+            &mut coordinator,
+            vec![manifest_soft, manifest_held],
+            "KEY_OPS_PUMP",
+        );
+    }
     let mut lane =
         start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
     // Post-attach spawns are genuine discovery traffic (fork, exec,
@@ -4321,10 +4376,10 @@ fn privileged_key_operations_linked_lane_pumps_live_discovery() -> Result<()> {
     Ok(())
 }
 
-/// WU-2a live-DD fault: a stopped capture faults the live arm, the
+/// Live discovery fault: a stopped capture faults the live arm, the
 /// pump refuses with Unavailable, and nothing latches — the machine
 /// stays installed, the lane stays live, and a second pump refuses
-/// the same way. Root BPF lane, serial, journal build only.
+/// the same way. Root BPF lane, serial.
 #[test]
 #[ignore = "privileged: live DD transport fault refuses without latching"]
 fn privileged_key_operations_live_discovery_fault_refuses_without_latching() -> Result<()> {
@@ -4344,6 +4399,13 @@ fn privileged_key_operations_live_discovery_fault_refuses_without_latching() -> 
         &["C_SignInit", "C_Sign"],
         "keyops-fault-held.dr37.json",
     )?;
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        return refuse_linked_without_journal(
+            &mut coordinator,
+            vec![manifest_soft, manifest_held],
+            "KEY_OPS_FAULT",
+        );
+    }
     let mut lane =
         start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
     lane.stop_live_capture_for_test();
@@ -4364,14 +4426,12 @@ fn privileged_key_operations_live_discovery_fault_refuses_without_latching() -> 
     Ok(())
 }
 
-/// WU-2a live-DD fault with coverage consequence: a stopped capture
+/// Live discovery fault with coverage consequence: a stopped capture
 /// faults the live pump with `Unavailable` without latching the
 /// machine; the machine stays installed and serviceable (never
 /// DispositionRequired), the terminal batch carries the coverage
 /// failure, Finish still publishes, and the driver's fallback stop
-/// reason names `Unavailable`. Best-effort witness for the WU-4 live
-/// lane: listed here, executed privileged there. Root BPF lane,
-/// serial, journal build only.
+/// reason names `Unavailable`. Root BPF lane, serial.
 #[test]
 #[ignore = "privileged: live linked fault fails coverage without latching, finish publishes"]
 fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> Result<()> {
@@ -4395,6 +4455,13 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
         &["C_SignInit", "C_Sign"],
         "keyops-cov-held.dr37.json",
     )?;
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        return refuse_linked_without_journal(
+            &mut coordinator,
+            vec![manifest_soft, manifest_held],
+            "KEY_OPS_COVFAULT",
+        );
+    }
     let mut lane =
         start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
     lane.stop_live_capture_for_test();
@@ -4549,7 +4616,7 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
     Ok(())
 }
 
-/// WU-2a marker gate: an ordinary live seal publishes no attach
+/// Marker gate: an ordinary live seal publishes no attach
 /// generation (0, cell untouched), while a journal live seal mints
 /// one (>= 1). Root BPF lane, serial.
 #[test]

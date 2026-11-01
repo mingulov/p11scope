@@ -1445,13 +1445,13 @@
     {
       "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_key_operations_linked_lane_pumps_live_discovery",
-      "reason": "privileged: live linked lane pumps discovery through the live arm (journal build, serial)",
+      "reason": "privileged: live linked lane pumps discovery through the live arm (serial; omitted journal build asserts the refusal)",
       "cell": "privileged"
     },
     {
       "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_key_operations_live_discovery_fault_refuses_without_latching",
-      "reason": "privileged: live DD transport fault refuses without latching (journal build, serial)",
+      "reason": "privileged: live DD transport fault refuses without latching (serial; omitted journal build asserts the refusal)",
       "cell": "privileged"
     },
     {
@@ -1463,7 +1463,7 @@
     {
       "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching",
-      "reason": "privileged: live linked fault fails coverage without latching, finish publishes (journal build, serial; WU-4 live)",
+      "reason": "privileged: live linked fault fails coverage without latching, finish publishes (serial; omitted journal build asserts the refusal)",
       "cell": "privileged"
     }
   ]

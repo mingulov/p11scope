@@ -8673,6 +8673,460 @@ mod tests {
         );
     }
 
+    /// Full inventory run with `--prearm-module` under auto, through the
+    /// production classic path with the two documented unprivileged
+    /// seams: the host probe answers test-eligible and native
+    /// preparation is stubbed unavailable, so auto deterministically
+    /// takes scan fallback. (The public run cannot serve here: the host
+    /// gate hard-refuses unprivileged auto/native before any lane
+    /// opens, and scan refuses pre-arm by name.) Returns the exit code
+    /// and the stdout JSON document.
+    fn inventory_prearm_run_json(
+        pid: u32,
+        prearm: &[PathBuf],
+        duration: Option<std::time::Duration>,
+        event_log: Option<&std::path::Path>,
+    ) -> (i32, serde_json::Value) {
+        let mut stdout = Vec::new();
+        let code = super::native_preparation_test::with(
+            |_, _, _| Err(anyhow::anyhow!("injected native unavailable for test")),
+            || {
+                run_with_terminal_budget(
+                    InspectScope::Pid(pid),
+                    &[],
+                    &[],
+                    prearm,
+                    &HookRegistry::builtin(),
+                    true,
+                    Some(1),
+                    None,
+                    inventory_endpoint_budget(None).unwrap(),
+                    duration,
+                    None,
+                    false,
+                    event_log,
+                    None,
+                    None,
+                    CaptureMode::Auto,
+                    crate::attach::BackendSelection::Singles,
+                    None,
+                    false,
+                    &|| false,
+                    &|| {},
+                    false,
+                    &mut WriterStdout(&mut stdout),
+                    &DashboardIo::stdio(),
+                    DiagnosticRequest::disabled(),
+                    None,
+                    &|| Ok(crate::attach::MultiCapableHost::for_test()),
+                    None,
+                    None,
+                )
+            },
+        )
+        .expect("inventory with --prearm-module under auto must not refuse");
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        (code, document)
+    }
+
+    /// The scan-fallback gap: the lane proof. Every JSON twin asserts
+    /// it, so the scan-terminal watch shapes are non-vacuous — a
+    /// silently native run cannot pass them.
+    fn assert_scan_fallback(document: &serde_json::Value) {
+        let gaps = document["gaps"].as_array().cloned().unwrap_or_default();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap["subject"] == "native usage feed unavailable"),
+            "the stubbed run takes scan fallback: {gaps:?}"
+        );
+    }
+
+    /// The expected whole-file digest, computed in-test from the file
+    /// bytes, never from the pin under test.
+    fn sha256_of(path: &std::path::Path) -> String {
+        use sha2::Digest as _;
+        let bytes = std::fs::read(path).unwrap();
+        p11scope_manifest::identity::hex(&sha2::Sha256::digest(bytes))
+    }
+
+    /// The `tests/fixtures/discovery-lifecycle.c` provider plus its
+    /// acknowledged loader driver, compiled like the engine-tests
+    /// fixture (inventory twins need only a pid plus a mapping).
+    struct PrearmLifecycle {
+        _dir: tempfile::TempDir,
+        provider: PathBuf,
+        driver: PathBuf,
+    }
+
+    fn compile_prearm_lifecycle() -> PrearmLifecycle {
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/discovery-lifecycle.c");
+        let provider = dir.path().join("lifecycle-provider.so");
+        let driver = dir.path().join("lifecycle-driver");
+        for (output, extra) in [
+            (
+                &provider,
+                &["-shared", "-fPIC", "-DDISCOVERY_LIFECYCLE_PROVIDER"][..],
+            ),
+            (&driver, &[][..]),
+        ] {
+            assert!(
+                std::process::Command::new("gcc")
+                    .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+                    .args(extra)
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(output)
+                    .arg("-ldl")
+                    .status()
+                    .expect("compile the owned discovery fixture")
+                    .success()
+            );
+        }
+        PrearmLifecycle {
+            _dir: dir,
+            provider,
+            driver,
+        }
+    }
+
+    fn poll_fd_readable(fd: i32, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pollfd names one initialized descriptor for this process.
+            let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            if result > 0 {
+                return true;
+            }
+            if result == 0 || std::time::Instant::now() >= deadline {
+                return false;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted,
+                "poll failed"
+            );
+        }
+    }
+
+    /// The acknowledged loader behind its pre-load barrier: `READY
+    /// <pid>`, `L` → `LOADED <pid> <dev> <ino> 68`, `X` → clean exit.
+    struct PrearmBarrier {
+        child: std::process::Child,
+        stdout: std::process::ChildStdout,
+        pid: u32,
+    }
+
+    impl PrearmBarrier {
+        fn start(driver: &std::path::Path, provider: &std::path::Path) -> Self {
+            let mut child = std::process::Command::new(driver)
+                .arg(provider)
+                .env_clear()
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("start the owned loader behind its pre-load barrier");
+            let pid = child.id();
+            let stdout = child.stdout.take().unwrap();
+            let mut barrier = Self {
+                child,
+                stdout,
+                pid,
+            };
+            assert_eq!(barrier.read_ack(), format!("READY {pid}\n"));
+            barrier
+        }
+
+        fn read_ack(&mut self) -> String {
+            use std::io::Read as _;
+            use std::os::fd::AsRawFd as _;
+            let mut ack = Vec::new();
+            while !ack.ends_with(b"\n") {
+                assert!(
+                    ack.len() < 256
+                        && poll_fd_readable(
+                            self.stdout.as_raw_fd(),
+                            std::time::Duration::from_secs(10)
+                        ),
+                    "bounded fixture acknowledgement: {ack:?}"
+                );
+                let mut byte = [0];
+                assert_eq!(
+                    self.stdout.read(&mut byte).unwrap(),
+                    1,
+                    "fixture exited before acknowledgement: {ack:?}"
+                );
+                ack.push(byte[0]);
+            }
+            String::from_utf8(ack).unwrap()
+        }
+
+        fn load(&mut self) {
+            use std::io::Write as _;
+            self.child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"L")
+                .unwrap();
+            let ack = self.read_ack();
+            assert!(
+                ack.starts_with(&format!("LOADED {} ", self.pid)) && ack.ends_with(" 68\n"),
+                "unexpected load acknowledgement: {ack:?}"
+            );
+        }
+
+        fn shutdown(&mut self) {
+            use std::io::Write as _;
+            if let Some(stdin) = self.child.stdin.as_mut() {
+                let _ = stdin.write_all(b"X");
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => return,
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl Drop for PrearmBarrier {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Inventory JSON twin: a mapped lifecycle provider pre-armed
+    /// before the run renders one `prearm[]` row with its file
+    /// identity, `mapped` and its terminal watch.
+    #[test]
+    fn inventory_prearm_proved_offsets_attach_and_arm() {
+        let lifecycle = compile_prearm_lifecycle();
+        let mut barrier = PrearmBarrier::start(&lifecycle.driver, &lifecycle.provider);
+        barrier.load();
+
+        let (code, document) = inventory_prearm_run_json(
+            barrier.pid,
+            std::slice::from_ref(&lifecycle.provider),
+            None,
+            None,
+        );
+        assert_eq!(code, 0);
+        assert_scan_fallback(&document);
+        let rows = document["prearm"]
+            .as_array()
+            .expect("the unified prearm[] section");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        // Operator spelling plus the pinned file's identity (the
+        // mapped-device key and an independently computed digest).
+        assert_eq!(
+            row["path"].as_str().unwrap(),
+            lifecycle.provider.to_string_lossy()
+        );
+        let file =
+            p11scope_manifest::identity::open_object(&lifecycle.provider).unwrap();
+        let key = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
+        assert_eq!(
+            row["identity"]["device"]["major"].as_u64(),
+            Some(key.device_major)
+        );
+        assert_eq!(
+            row["identity"]["device"]["minor"].as_u64(),
+            Some(key.device_minor)
+        );
+        assert_eq!(row["identity"]["inode"].as_u64(), Some(key.inode));
+        assert_eq!(
+            row["identity"]["sha256"].as_str(),
+            Some(sha256_of(&lifecycle.provider).as_str()),
+            "the row carries the pinned file's whole-file digest: {row}"
+        );
+        assert_eq!(row["mapped"], true);
+        // Every production row carries a watch; the scan lane never
+        // arms it, so the terminal hook ends the unarmed wait.
+        assert!(row["watch"].is_object(), "a watch interval: {row}");
+        assert_eq!(row["watch"]["state"], "ended");
+        assert_eq!(row["watch"]["ended_by"], "scope_end");
+        assert!(row["watch"]["until_ns"].as_u64().unwrap() > 0);
+        assert!(row["watch"]["since_ns"].is_null());
+        assert!(row["watch"].get("changed").is_none());
+        assert!(row["attached_at_ns"].is_null());
+        assert!(row.get("unobserved_windows").is_none());
+        // The proved offsets occupy attach-set endpoints (lowering
+        // precedes passes); scan may hold more beside them.
+        assert!(
+            document["budgets"]["inventory_endpoints"]["occupied"]
+                .as_u64()
+                .unwrap()
+                >= 1,
+            "the proved offsets occupy attach-set endpoints: {}",
+            document["budgets"]["inventory_endpoints"]["occupied"]
+        );
+        barrier.shutdown();
+    }
+
+    /// Inventory JSON twin: pre-arm over a scope member that maps
+    /// nothing renders a bounded watch that ends at scope end — no
+    /// attach instant, no window (its watch speaks), no guessed
+    /// mapping.
+    #[test]
+    fn inventory_prearm_never_mapped_renders_bounded_watch() {
+        let lifecycle = compile_prearm_lifecycle();
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let (code, document) = inventory_prearm_run_json(
+            child.id(),
+            std::slice::from_ref(&lifecycle.provider),
+            None,
+            None,
+        );
+        assert_eq!(code, 0);
+        assert_scan_fallback(&document);
+        let rows = document["prearm"]
+            .as_array()
+            .expect("the unified prearm[] section");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        assert_eq!(row["mapped"], false);
+        assert_eq!(row["watch"]["state"], "ended");
+        assert_eq!(row["watch"]["ended_by"], "scope_end");
+        assert!(row["watch"]["until_ns"].as_u64().unwrap() > 0);
+        assert!(row["watch"]["since_ns"].is_null());
+        assert!(
+            row.get("unobserved_windows").is_none(),
+            "never-mapped pre-arm carries no window: {row}"
+        );
+        assert!(row["watch"].get("changed").is_none());
+        assert!(row["attached_at_ns"].is_null());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// Inventory JSON twin: rename-over between pin and capture end
+    /// keeps the pinned inode and reports the change — the `changed`
+    /// uncertainty bracket, the `object_changed` end, and the
+    /// changed-identity gap. The replacement lands mid-run
+    /// (`--duration` + a rename past the run's startup, sequenced off
+    /// the event-log prologue the pin precedes).
+    #[test]
+    fn inventory_prearm_replacement_reports_change() {
+        let lifecycle = compile_prearm_lifecycle();
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let file =
+            p11scope_manifest::identity::open_object(&lifecycle.provider).unwrap();
+        let old_ino = p11scope_manifest::identity::mapping_file_key(&file)
+            .unwrap()
+            .inode;
+        drop(file);
+        let events = lifecycle._dir.path().join("events.jsonl");
+
+        let provider = lifecycle.provider.clone();
+        let events_for_run = events.clone();
+        let run = std::thread::spawn(move || {
+            inventory_prearm_run_json(
+                pid,
+                std::slice::from_ref(&provider),
+                Some(std::time::Duration::from_secs(5)),
+                Some(&events_for_run),
+            )
+        });
+        // Pinning precedes the event-log prologue: the `started`
+        // record proves the old inode is held before the rename lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let log = std::fs::read_to_string(&events).unwrap_or_default();
+            if log.contains("\"started\"") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the inventory run never wrote its prologue"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50)); // ctime granularity margin
+        let src = lifecycle._dir.path().join("other.c");
+        std::fs::write(&src, "int g(void){return 2;}\n").unwrap();
+        let other = lifecycle._dir.path().join("other.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&other)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::rename(&other, &lifecycle.provider).unwrap();
+
+        let (code, document) = run.join().unwrap();
+        assert_eq!(code, 0);
+        assert_scan_fallback(&document);
+        let rows = document["prearm"]
+            .as_array()
+            .expect("the unified prearm[] section");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        assert_eq!(row["watch"]["state"], "ended");
+        assert_eq!(row["watch"]["ended_by"], "object_changed");
+        assert_eq!(
+            row["watch"]["until_ns"], row["watch"]["changed"]["detected_ns"],
+            "until is the detection instant: {row}"
+        );
+        assert_eq!(
+            row["watch"]["changed"]["previous_ino"].as_u64(),
+            Some(old_ino),
+            "the bracket names the pinned inode: {row}"
+        );
+        assert!(
+            row["watch"]["changed"]["last_ok_ns"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            row["watch"]["changed"]["detected_ns"].as_u64().unwrap()
+                >= row["watch"]["changed"]["last_ok_ns"].as_u64().unwrap(),
+            "the bracket orders last-ok before detection: {row}"
+        );
+        let gaps = document["gaps"].as_array().cloned().unwrap_or_default();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap["subject"] == "inventory attach target changed identity"),
+            "the changed-identity gap discloses the replacement: {gaps:?}"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
     #[test]
     fn genuine_inventory_scan_never_requests_live_host_admission() {
         let mut stdout = Vec::new();

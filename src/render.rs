@@ -2406,7 +2406,7 @@ fn latency_out_for_mode(report: &SlotReport) -> Option<LatencyOut> {
 struct InitializationOut {
     /// `ok`, `already_initialized`, `error`, or `mixed` (more than one
     /// class over the row's completed calls).
-    outcome: &'static str,
+    outcome: InitializationOutcome,
     /// Present and true exactly when at least one completed call returned
     /// CKR_OK or CKR_CRYPTOKI_ALREADY_INITIALIZED: a likelihood that the
     /// row's module behaves as a Cryptoki provider, never proof.
@@ -2414,14 +2414,27 @@ struct InitializationOut {
     potential_provider: Option<bool>,
 }
 
+/// The closed outcome vocabulary, shared by the JSON row and the live
+/// marker so both stay exhaustive.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum InitializationOutcome {
+    Ok,
+    AlreadyInitialized,
+    Error,
+    Mixed,
+}
+
 impl InitializationOut {
     /// The live-table marker uses the same words as the JSON row.
     fn text_suffix(&self) -> &'static str {
         match self.outcome {
-            "ok" => " [init: ok, potential provider]",
-            "already_initialized" => " [init: already_initialized, potential provider]",
-            "mixed" => " [init: mixed, potential provider]",
-            _ => " [init: error]",
+            InitializationOutcome::Ok => " [init: ok, potential provider]",
+            InitializationOutcome::AlreadyInitialized => {
+                " [init: already_initialized, potential provider]"
+            }
+            InitializationOutcome::Mixed => " [init: mixed, potential provider]",
+            InitializationOutcome::Error => " [init: error]",
         }
     }
 }
@@ -2459,13 +2472,13 @@ fn initialization_out(
         return None;
     }
     let outcome = if classes > 1 {
-        "mixed"
+        InitializationOutcome::Mixed
     } else if ok {
-        "ok"
+        InitializationOutcome::Ok
     } else if already {
-        "already_initialized"
+        InitializationOutcome::AlreadyInitialized
     } else {
-        "error"
+        InitializationOutcome::Error
     };
     Some(InitializationOut {
         outcome,

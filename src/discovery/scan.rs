@@ -7836,10 +7836,11 @@ mod tests {
     /// A stable mapping yields an identical admitted set every pass: a
     /// BSS word in the tail span flipping to a version-like value between
     /// deep-scan passes (no mapping change) must not admit a second
-    /// single-entry table. Pass 4 and the stop retired 219k + 184k calls
-    /// on Fedora because the attach set grew 68 to 69 and back; this twin
-    /// pins the sweep half of that stability over the real tail shape
-    /// (executable-led personality slot, data typeinfo slot, BSS tail).
+    /// single-entry table. Such churn was once suspected of the Fedora
+    /// call retirements, but those gaps reproduce with a static scan, so
+    /// this is sweep-stability hardening, not their cause. This twin pins
+    /// that stability over the real tail shape (executable-led
+    /// personality slot, data typeinfo slot, BSS tail).
     #[test]
     fn mislabelled_68_slot_prefix_stays_stable_when_tail_words_change_between_passes() {
         let maps = mislabelled_fixture_maps();

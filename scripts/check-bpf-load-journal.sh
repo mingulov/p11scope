@@ -37,9 +37,9 @@
 # omits the object, `uprobe-multi-required` on pre-Multi kernels) are
 # named in the row detail, never mistaken for a pass.
 #
-# v5.15.* kernels are a refusal control, not a load: the finite
-# `uprobe-multi-required` refusal with no loaded journal row is a pass
-# for that cell; a load or a crash is FAIL.
+# Pre-Multi kernels (v5.15.*, v6.1.*) are a refusal control, not a
+# load: the finite `uprobe-multi-required` refusal with no loaded
+# journal row is a pass for that cell; a load or a crash is FAIL.
 #
 # Writes OUTDIR/results.jsonl, one row per kernel:
 # {"cell": "journal-load-<kernel>", "pass": bool,
@@ -334,7 +334,7 @@ add_reason() {
 for KERNEL in "$@"; do
     echo "## kernel $KERNEL"
     case "$KERNEL" in
-        v5.15.*) CONTROL=1 ;;
+        v5.15.*|v6.1.*) CONTROL=1 ;;
         *) CONTROL=0 ;;
     esac
     J_TXT="$OUTDIR/journal-$KERNEL.txt"

@@ -58,7 +58,13 @@ set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd) || exit 64
 SELF=$REPO/scripts/$(basename "$0")
 SRC=$REPO/tests/fixtures/public-cli/gated.c
-MODULE=${MODULE:-/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so}
+# Debian/Ubuntu and Fedora install SoftHSM2 in different places; MODULE wins.
+if [ -z "${MODULE:-}" ]; then
+    for MODULE in /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so \
+        /usr/lib64/pkcs11/libsofthsm2.so /usr/lib64/softhsm/libsofthsm2.so; do
+        [ -r "$MODULE" ] && break
+    done
+fi
 RUNUID=${RUNUID:-1000} RUNGID=${RUNGID:-1000}
 
 die() { echo "qualify-inventory-c1b: $*" >&2; exit 70; }

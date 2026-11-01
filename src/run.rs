@@ -5379,6 +5379,7 @@ fn capture_profile(
             engine.plan(),
             engine.pinned(),
             session.pid_lifecycle_facts(),
+            engine.capture_facts().discovery_losses(),
             &mut selection_ledger,
         );
     }
@@ -5823,6 +5824,12 @@ fn capture_profile(
     // reads terminal and would void every window as caller-changed.
     // The close compares this against the selection-time facts.
     let mut k0_close_facts = k0_window.as_ref().map(|_| session.pid_lifecycle_facts());
+    // K0 shutdown tail: discovery records drained after the snapshot —
+    // quiescence-staged and terminal-drained — bypass the terminal tap,
+    // so the close scans them PID-matched for exec/exit/fault.
+    let k0_tail_records =
+        std::cell::RefCell::<Vec<p11scope_ebpf_common::DiscoveryRecord>>::new(Vec::new());
+    let k0_tail_malformed = std::cell::Cell::new(0u64);
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
     // apply after the poll; EVENTS reduce in place. Every failure below
@@ -5835,6 +5842,11 @@ fn capture_profile(
         // Items the ticks staged left the ring first: they lead the batch.
         let (mut staged_records, mut staged_malformed) =
             split_staged_discovery(session.take_staged_discovery());
+        // K0 tail starts past the pre-snapshot staged prefix: those items
+        // left the ring before the snapshot and already feed the witness.
+        let k0_prefix_records = staged_records.len();
+        let k0_prefix_malformed = staged_malformed;
+        let k0_active = k0_window.is_some();
         // Quiescence staging shares one allowance with what the Engine still
         // holds (H5); the first record past the cap stays unread and later
         // polls stop draining discovery.
@@ -5911,8 +5923,31 @@ fn capture_profile(
             engine.note_quiesced_discovery_overflow();
         }
         poll_terminal_cancellation();
-        let discovery_result =
-            engine.apply_quiesced_discovery(session, staged_records, staged_malformed);
+        if k0_active {
+            k0_tail_records
+                .borrow_mut()
+                .extend_from_slice(&staged_records[k0_prefix_records..]);
+            k0_tail_malformed.set(
+                k0_tail_malformed
+                    .get()
+                    .saturating_add(staged_malformed.saturating_sub(k0_prefix_malformed)),
+            );
+        }
+        let discovery_result = if k0_active {
+            engine.apply_quiesced_discovery_observed(
+                session,
+                staged_records,
+                staged_malformed,
+                &mut |record: &p11scope_ebpf_common::DiscoveryRecord| {
+                    k0_tail_records.borrow_mut().push(*record);
+                },
+                &mut |count: u64| {
+                    k0_tail_malformed.set(k0_tail_malformed.get().saturating_add(count));
+                },
+            )
+        } else {
+            engine.apply_quiesced_discovery(session, staged_records, staged_malformed)
+        };
         poll_terminal_cancellation();
         if discovery_result? {
             let plan = engine.plan();
@@ -5968,6 +6003,8 @@ fn capture_profile(
                                 window,
                                 facts: terminal_context.1.pid_lifecycle_facts(),
                                 clean: false,
+                                tail_records: Vec::new(),
+                                tail_malformed: 0,
                             });
                     run_terminal(
                         &mut terminal_context,
@@ -6008,6 +6045,7 @@ fn capture_profile(
         }
     };
     let (quiesced, stop_quiescence) = quiesce_outcome;
+    let k0_terminal_active = k0_window.is_some();
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
     let outcome = finish_capture_with(
         &mut finish_context,
@@ -6064,6 +6102,20 @@ fn capture_profile(
                     let phase_start = Instant::now();
                     let mut post_q_discovery = false;
                     let plan_changed = match quiesced {
+                        Some(q) if k0_terminal_active => {
+                            context.0.drain_discovery_terminal_to_position_observed(
+                                context.1,
+                                q.discovery_q,
+                                &mut post_q_discovery,
+                                &mut |record: &p11scope_ebpf_common::DiscoveryRecord| {
+                                    k0_tail_records.borrow_mut().push(*record);
+                                },
+                                &mut |count: u64| {
+                                    k0_tail_malformed
+                                        .set(k0_tail_malformed.get().saturating_add(count));
+                                },
+                            )?
+                        }
                         Some(q) => context.0.drain_discovery_terminal_to_position(
                             context.1,
                             q.discovery_q,
@@ -6138,7 +6190,9 @@ fn capture_profile(
                 |context, consumers| {
                     poll_terminal_cancellation();
                     // K0: the close boundary is clean only with proven
-                    // quiescence and no blind post-quiescence tail.
+                    // quiescence and no blind post-quiescence tail. The
+                    // tail records drained after the snapshot ride into
+                    // the close for their PID-matched scan.
                     let k0 = k0_window.take().map(|window| {
                         let facts = k0_close_facts
                             .take()
@@ -6148,6 +6202,8 @@ fn capture_profile(
                             facts,
                             clean: quiesced.is_some()
                                 && !consumers.stop_quiescence.post_q_discovery,
+                            tail_records: k0_tail_records.take(),
+                            tail_malformed: k0_tail_malformed.take(),
                         }
                     });
                     run_terminal(
@@ -6213,15 +6269,19 @@ fn capture_profile(
         let kernel_evidence = snapshot.kernel_evidence();
         // K0: close the detail window after the broad terminal read,
         // while the banks are still live (detach is post-publication).
+        // The loss snapshot lands after the terminal drain, so growth
+        // inside the window voids the detail.
         if let Some(k0) = k0 {
             let ledger = selection_ledger
                 .as_mut()
                 .expect("a K0 window implies a staged selection");
+            let after_losses = context.0.capture_facts().discovery_losses();
             metrics::selected_detail_driver::close_k0_production(
                 k0,
                 context.1,
                 context.0.plan(),
                 context.0.pinned(),
+                after_losses,
                 ledger,
             );
         }

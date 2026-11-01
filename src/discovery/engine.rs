@@ -2848,6 +2848,14 @@ pub(crate) trait EngineSession {
     /// DISCOVERY items currently held in the session FIFO: staged items
     /// hold shared-allowance credits until a dequeue transfers them.
     fn staged_discovery_len(&self) -> usize;
+    /// One DISCOVERY quantum bounded by the Q `stop` position: the
+    /// collected records, the malformed count, and the
+    /// `(post_q_record, backlog)` contract of the bounded drains.
+    fn collect_discovery_to_position(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)>;
 
     /// Only the actual Session implementation can expose its original
     /// Q-bounded drain here. Other native leaves refuse by default.
@@ -3104,6 +3112,14 @@ impl EngineSession for Session {
 
     fn staged_discovery_len(&self) -> usize {
         Session::staged_discovery_len(self)
+    }
+
+    fn collect_discovery_to_position(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
+        Session::collect_discovery_to_position(self, stop, quantum)
     }
 
     fn collect_collected_finish_discovery(
@@ -23798,14 +23814,44 @@ impl Engine {
         records: Vec<DiscoveryRecord>,
         malformed: u64,
     ) -> Result<bool> {
+        self.apply_quiesced_discovery_observed(
+            session,
+            records,
+            malformed,
+            &mut |_: &DiscoveryRecord| {},
+            &mut |_: u64| {},
+        )
+    }
+
+    /// The quiesced apply with K0 tail observation: the follow-up
+    /// nested pulls ride to the observer (the staged prefix is the
+    /// caller's — it already holds those records).
+    pub(crate) fn apply_quiesced_discovery_observed<F, G>(
+        &mut self,
+        session: &mut dyn EngineSession,
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        mut observe_record: F,
+        mut observe_malformed: G,
+    ) -> Result<bool>
+    where
+        F: FnMut(&DiscoveryRecord),
+        G: FnMut(u64),
+    {
         self.note_graph_inputs_mutated();
         let nested_budget =
             Cell::new(self.shared_allowance_remaining(
                 session,
                 records.len().saturating_add(malformed as usize),
             ));
-        let mut collect =
-            |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
+        let mut collect = |session: &mut dyn EngineSession| {
+            Self::nested_pull_capped_observed(
+                session,
+                &nested_budget,
+                &mut observe_record,
+                &mut observe_malformed,
+            )
+        };
         Ok(self
             .apply_discovery_batch_with(
                 session,
@@ -23825,24 +23871,62 @@ impl Engine {
     /// the post-Q invariant violation.
     pub(crate) fn drain_discovery_terminal_to_position(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         stop: usize,
         post_q_record: &mut bool,
     ) -> Result<bool> {
+        self.drain_discovery_terminal_to_position_observed(
+            session,
+            stop,
+            post_q_record,
+            &mut |_: &DiscoveryRecord| {},
+            &mut |_: u64| {},
+        )
+    }
+
+    /// The Q-bounded terminal drain with K0 tail observation: the outer
+    /// Q-bounded records ride to the observer, as do the follow-up
+    /// nested pulls. The outer malformed count rides too — the
+    /// Q-bounded poll bypasses the PID tap, so the tail is its only
+    /// witness — as does nested malformed.
+    pub(crate) fn drain_discovery_terminal_to_position_observed<F, G>(
+        &mut self,
+        session: &mut dyn EngineSession,
+        stop: usize,
+        post_q_record: &mut bool,
+        mut observe_record: F,
+        mut observe_malformed: G,
+    ) -> Result<bool>
+    where
+        F: FnMut(&DiscoveryRecord),
+        G: FnMut(u64),
+    {
         self.note_graph_inputs_mutated();
         let wall_start = crate::attach::monotonic_ns();
         let totals_before = self.stage_timings.totals_ns();
-        let result = self.drain_discovery_terminal_to_position_inner(session, stop, post_q_record);
+        let result = self.drain_discovery_terminal_to_position_inner(
+            session,
+            stop,
+            post_q_record,
+            &mut observe_record,
+            &mut observe_malformed,
+        );
         self.span_terminal_overhead("terminal_q_overhead", wall_start, &totals_before);
         result
     }
 
-    fn drain_discovery_terminal_to_position_inner(
+    fn drain_discovery_terminal_to_position_inner<F, G>(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         stop: usize,
         post_q_record: &mut bool,
-    ) -> Result<bool> {
+        observe_record: &mut F,
+        observe_malformed: &mut G,
+    ) -> Result<bool>
+    where
+        F: FnMut(&DiscoveryRecord),
+        G: FnMut(u64),
+    {
         let mut changed = false;
         loop {
             // Bounded by the shared allowance: each quantum pulls staged
@@ -23858,6 +23942,12 @@ impl Engine {
             let (records, malformed, post_q, backlog) =
                 session.collect_discovery_to_position(stop, quantum)?;
             *post_q_record |= post_q;
+            for record in &records {
+                observe_record(record);
+            }
+            if malformed > 0 {
+                observe_malformed(malformed);
+            }
             if backlog && records.is_empty() && malformed == 0 {
                 debug_assert_eq!(quantum, 0, "only a zero quantum pulls nothing with backlog");
                 self.note_terminal_capacity_backlog();
@@ -23871,10 +23961,16 @@ impl Engine {
                 .saturating_add(malformed as usize)
                 .saturating_sub(transfers);
             let nested_budget = Cell::new(remaining.saturating_sub(fresh));
-            let mut collect =
-                |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
+            let mut collect = |session: &mut dyn EngineSession| {
+                Self::nested_pull_capped_observed(
+                    session,
+                    &nested_budget,
+                    observe_record,
+                    observe_malformed,
+                )
+            };
             let outcome = self.apply_discovery_batch_with(
-                session,
+                &mut *session,
                 records,
                 malformed,
                 false,
@@ -24126,6 +24222,45 @@ impl Engine {
                 }
             }
             Err(error) => Err(error),
+        }
+    }
+
+    /// One nested pull with K0 tail observation: the pulled records and
+    /// malformed count ride to the observer before the caller sees them.
+    /// Err prefixes (backlog/capacity/failure) are observed too — they
+    /// are already off the ring — then re-wrapped unchanged.
+    fn nested_pull_capped_observed<F, G>(
+        session: &mut dyn EngineSession,
+        budget: &Cell<usize>,
+        observe_record: &mut F,
+        observe_malformed: &mut G,
+    ) -> Result<(Vec<DiscoveryRecord>, u64)>
+    where
+        F: FnMut(&DiscoveryRecord),
+        G: FnMut(u64),
+    {
+        match Self::nested_pull_capped(session, budget) {
+            Ok((records, malformed)) => {
+                for record in &records {
+                    observe_record(record);
+                }
+                if malformed > 0 {
+                    observe_malformed(malformed);
+                }
+                Ok((records, malformed))
+            }
+            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                Ok(incomplete) => {
+                    for record in &incomplete.records {
+                        observe_record(record);
+                    }
+                    if incomplete.malformed > 0 {
+                        observe_malformed(incomplete.malformed);
+                    }
+                    Err(anyhow::Error::new(incomplete))
+                }
+                Err(error) => Err(error),
+            },
         }
     }
 
@@ -29785,6 +29920,35 @@ pub(crate) mod session_fixture {
 
         fn staged_discovery_len(&self) -> usize {
             self.staged.len()
+        }
+
+        fn collect_discovery_to_position(
+            &mut self,
+            _stop: usize,
+            quantum: usize,
+        ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
+            // The script is the Q-bounded content: staged items first
+            // (ring order, like the session FIFO), then scripted
+            // dequeues, up to one quantum. The scripted Q never moves,
+            // so post-Q never fires; backlog reports scripted items
+            // past the quantum exactly.
+            if quantum == 0 {
+                return Ok((Vec::new(), 0, false, true));
+            }
+            let mut records = Vec::new();
+            let mut malformed = 0u64;
+            for _ in 0..quantum {
+                match EngineSession::discovery_dequeue(self)? {
+                    Some(crate::events::DiscoveryItem::Record(record)) => records.push(record),
+                    Some(crate::events::DiscoveryItem::Malformed) => {
+                        malformed = malformed.saturating_add(1);
+                    }
+                    None => return Ok((records, malformed, false, false)),
+                }
+            }
+            let backlog = !self.staged.is_empty()
+                || matches!(self.dequeues.front(), Some(Ok(Some(_))) | Some(Err(_)));
+            Ok((records, malformed, false, backlog))
         }
 
         fn prepare_collected_static_retirement(

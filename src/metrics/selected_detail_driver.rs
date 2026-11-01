@@ -46,7 +46,9 @@ use crate::inventory_promotion::{
 use crate::plan::{AdmissionPolicy, AttachKey, AttachPlan, Slot};
 use crate::process::PidPin;
 use crate::semantics_edge::resources::{SemanticResourcePool, SemanticResourceReserver};
-use p11scope_ebpf_common::CounterMode;
+use p11scope_ebpf_common::{
+    CounterMode, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_LEADER_EXIT, DiscoveryRecord,
+};
 use std::sync::Arc;
 
 /// One resolved CLI selection: the unique broad slot plus the pinned
@@ -941,12 +943,14 @@ pub(crate) type K0Facts = Result<Option<LifecycleFacts>, PidContinuityRefusal>;
 
 /// The open K0 window: the resolved selection, the detail collector
 /// holding the selection-time read as its baseline, the
-/// selection-time witness facts, and the collector limits (reused for
-/// the close read so both bounds share one budget).
+/// selection-time witness facts, the selection-time discovery losses,
+/// and the collector limits (reused for the close read so both bounds
+/// share one budget).
 pub(crate) struct K0Window {
     resolved: ResolvedSelection,
     collector: CounterCollector,
     before: LifecycleFacts,
+    before_losses: [u64; 4],
     limits: CounterLimits,
 }
 
@@ -985,6 +989,28 @@ pub(super) fn open_k0_window(
     before_facts: K0Facts,
     ledger: &mut SelectionLedger,
 ) -> Option<K0Window> {
+    open_k0_window_with_losses(
+        resolved,
+        limits,
+        reserve,
+        before,
+        before_facts,
+        [0, 0, 0, 0],
+        ledger,
+    )
+}
+
+/// Open the K0 window with explicit selection-time discovery losses:
+/// twins script growth, production passes the live snapshot.
+pub(super) fn open_k0_window_with_losses(
+    resolved: ResolvedSelection,
+    limits: CounterLimits,
+    reserve: SemanticResourceReserver,
+    before: Result<CounterRead, ReadStage>,
+    before_facts: K0Facts,
+    before_losses: [u64; 4],
+    ledger: &mut SelectionLedger,
+) -> Option<K0Window> {
     let before_witness = match before_facts {
         Ok(Some(facts)) => facts,
         _ => {
@@ -1017,6 +1043,7 @@ pub(super) fn open_k0_window(
         resolved,
         collector,
         before: before_witness,
+        before_losses,
         limits,
     })
 }
@@ -1028,6 +1055,7 @@ pub(super) fn open_k0_window(
 /// `detail` stay absent and the main report's aggregate alone
 /// carries the capture. Metrics-internal like the reads it observes:
 /// production enters through [`close_k0_production`].
+#[cfg_attr(not(test), allow(dead_code))] // No-tail close for twins; production closes with its tail.
 pub(super) fn close_k0_window(
     window: K0Window,
     close_plan: &AttachPlan,
@@ -1036,15 +1064,146 @@ pub(super) fn close_k0_window(
     clean_close: bool,
     ledger: &mut SelectionLedger,
 ) {
+    close_k0_window_with_tail_and_losses(
+        window,
+        close_plan,
+        after,
+        after_facts,
+        clean_close,
+        &[],
+        0,
+        [0, 0, 0, 0],
+        ledger,
+    );
+}
+
+/// Close the K0 window with explicit close-time discovery losses:
+/// twins script growth, production passes the live snapshot.
+pub(super) fn close_k0_window_with_losses(
+    window: K0Window,
+    close_plan: &AttachPlan,
+    after: Result<CounterRead, ReadStage>,
+    after_facts: K0Facts,
+    clean_close: bool,
+    after_losses: [u64; 4],
+    ledger: &mut SelectionLedger,
+) {
+    close_k0_window_with_tail_and_losses(
+        window,
+        close_plan,
+        after,
+        after_facts,
+        clean_close,
+        &[],
+        0,
+        after_losses,
+        ledger,
+    );
+}
+
+/// Scan the shutdown-tail discovery records for a lifecycle hit on
+/// the selected caller: an EXEC, a leader exit, or a tap fault
+/// (malformed tail). PID-matched like the tap: other PIDs never hit.
+/// An EXEC voids as caller-changed whatever its case (a faulting case
+/// fails closed the same way); a leader exit voids as caller-retired
+/// unless its timestamp is zero, which fails closed as caller-changed
+/// like the tap's zero-timestamp fault. A malformed tail fails closed
+/// as caller-changed: the witness would have faulted on it.
+fn scan_k0_tail(
+    pid: u32,
+    records: &[DiscoveryRecord],
+    malformed: u64,
+) -> Option<SelectedDriverRefusal> {
+    use SelectedDriverRefusal::Promotion;
+    if malformed > 0 {
+        return Some(Promotion(PromotionRefusal::CallerChanged));
+    }
+    let mut saw_exit = false;
+    for record in records {
+        if (record.pid_tgid >> 32) as u32 != pid {
+            continue;
+        }
+        match record.kind {
+            DISCOVERY_KIND_EXEC => {
+                return Some(Promotion(PromotionRefusal::CallerChanged));
+            }
+            DISCOVERY_KIND_LEADER_EXIT => {
+                if record.hook_ts_ns == 0 {
+                    return Some(Promotion(PromotionRefusal::CallerChanged));
+                }
+                saw_exit = true;
+            }
+            _ => {}
+        }
+    }
+    saw_exit.then_some(Promotion(PromotionRefusal::CallerRetired))
+}
+
+/// Close the K0 window with its shutdown-tail records: the shared
+/// close body plus a PID-matched scan of the discovery records that
+/// were staged during quiescence and drained in the terminal drain —
+/// the tail the pre-quiescence witness snapshot cannot see. A tail
+/// EXEC or fault voids as caller-changed, a tail leader exit as
+/// caller-retired, in the witness step's contract position (after
+/// retirement, before loss); within the step a tail change beats a
+/// witnessed break. Twins stage the tail directly; production
+/// collects it from the terminal drains.
+pub(super) fn close_k0_window_with_tail(
+    window: K0Window,
+    close_plan: &AttachPlan,
+    after: Result<CounterRead, ReadStage>,
+    after_facts: K0Facts,
+    clean_close: bool,
+    tail_records: &[DiscoveryRecord],
+    tail_malformed: u64,
+    ledger: &mut SelectionLedger,
+) {
+    close_k0_window_with_tail_and_losses(
+        window,
+        close_plan,
+        after,
+        after_facts,
+        clean_close,
+        tail_records,
+        tail_malformed,
+        [0, 0, 0, 0],
+        ledger,
+    );
+}
+
+/// Close the K0 window with tail plus explicit close-time discovery
+/// losses: twins script growth, production passes the live snapshot.
+#[allow(clippy::too_many_arguments)] // One close over all retained inputs; twins drive it directly.
+pub(super) fn close_k0_window_with_tail_and_losses(
+    window: K0Window,
+    close_plan: &AttachPlan,
+    after: Result<CounterRead, ReadStage>,
+    after_facts: K0Facts,
+    clean_close: bool,
+    tail_records: &[DiscoveryRecord],
+    tail_malformed: u64,
+    after_losses: [u64; 4],
+    ledger: &mut SelectionLedger,
+) {
     use super::selected_detail::{render_aggregate_bracket, render_detail_rows};
     use SelectedDriverRefusal::{Detail, Promotion};
     let K0Window {
         resolved,
         mut collector,
         before,
+        before_losses,
         limits: _,
     } = window;
-    if !clean_close {
+    // Discovery loss inside the window voids the detail: a missed
+    // lifecycle record fails closed like the witness it would have fed.
+    // Truncation (including a terminal drain stopped at its allowance)
+    // voids as broad-stopping with the unclean boundary; ring loss or
+    // export failures void as caller-changed with the exec witness.
+    let truncated_grew = after_losses[3] > before_losses[3];
+    let lifecycle_loss_grew = after_losses[0] > before_losses[0]
+        || after_losses[1] > before_losses[1]
+        || after_losses[2] > before_losses[2];
+    if !clean_close || truncated_grew {
         ledger.mark_selection_refused(
             Detail(SelectedDetailRefusal::Gate(
                 DetailToggleRefusal::BroadStopping,
@@ -1074,10 +1233,18 @@ pub(super) fn close_k0_window(
             return;
         }
     };
+    if lifecycle_loss_grew {
+        ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
+        return;
+    }
     if after_witness.fault_serial != before.fault_serial
         || after_witness.latest_exec != before.latest_exec
     {
         ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
+        return;
+    }
+    if let Some(refusal) = scan_k0_tail(resolved.original.pid(), tail_records, tail_malformed) {
+        ledger.mark_selection_refused(refusal.name());
         return;
     }
     if after_witness.greatest_break_ns != before.greatest_break_ns {
@@ -1147,37 +1314,52 @@ pub(crate) fn open_k0_production(
     plan: &AttachPlan,
     pins: &PinnedObjects,
     before_facts: K0Facts,
+    before_losses: [u64; 4],
     ledger: &mut SelectionLedger,
 ) -> Option<K0Window> {
     let limits = CounterLimits { rows, rv_keys };
     let before = k0_broad_read(session, plan, pins, limits, &reserve);
-    open_k0_window(resolved, limits, reserve, before, before_facts, ledger)
+    open_k0_window_with_losses(
+        resolved,
+        limits,
+        reserve,
+        before,
+        before_facts,
+        before_losses,
+        ledger,
+    )
 }
 
 /// Everything `run_terminal` needs to close an opened K0 window: the
-/// window, the close witness facts snapshotted before the terminal
-/// discovery drain, and whether the close boundary is proven clean.
+/// window, the close witness facts snapshotted before quiescence, the
+/// shutdown-tail discovery records drained after that snapshot, and
+/// whether the close boundary is proven clean.
 pub(crate) struct K0Close {
     pub(crate) window: K0Window,
     pub(crate) facts: K0Facts,
     pub(crate) clean: bool,
+    pub(crate) tail_records: Vec<DiscoveryRecord>,
+    pub(crate) tail_malformed: u64,
 }
 
 /// Production K0 close inside `run_terminal`: the close read off the
-/// broad banks, then the shared close body. The close read runs even
-/// when the boundary is unclean; the close body discards it before
-/// observing and voids as broad-stopping.
+/// broad banks, then the shared close body with the tail. The close
+/// read runs even when the boundary is unclean; the close body
+/// discards it before observing and voids as broad-stopping.
 pub(crate) fn close_k0_production(
     close: K0Close,
     session: &Session,
     plan: &AttachPlan,
     pins: &PinnedObjects,
+    after_losses: [u64; 4],
     ledger: &mut SelectionLedger,
 ) {
     let K0Close {
         window,
         facts,
         clean,
+        tail_records,
+        tail_malformed,
     } = close;
     let after = k0_broad_read(
         session,
@@ -1186,7 +1368,17 @@ pub(crate) fn close_k0_production(
         window.limits,
         window.collector.reserver(),
     );
-    close_k0_window(window, plan, after, facts, clean, ledger);
+    close_k0_window_with_tail_and_losses(
+        window,
+        plan,
+        after,
+        facts,
+        clean,
+        &tail_records,
+        tail_malformed,
+        after_losses,
+        ledger,
+    );
 }
 
 /// Compose the additive `selected_detail` evidence object (M2
@@ -4604,10 +4796,12 @@ mod tests {
     }
 
     #[test]
-    fn k0_composer_omits_envelope_without_selection() {
-        // Preservation: without `--select-endpoint` no selection is
-        // ever staged, so the composed envelope carries no selection
-        // and no window products.
+    fn k0_composer_renders_empty_envelope_for_empty_ledger() {
+        // The composer with an empty ledger renders an empty envelope:
+        // a present `selected_detail` with empty events, no selection
+        // and no window products. Production never calls it this way
+        // (flag absent → composer never called); the no-flag property
+        // lives at the CLI seam, not here.
         let ledger = SelectionLedger::new();
         let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
         let section = &composed["evidence"]["selected_detail"];
@@ -4961,7 +5155,7 @@ mod tests {
     fn k0_unclean_close_boundary_voids() {
         // No proven quiescence (or a blind post-quiescence tail): the
         // witness may have missed an exec, so the window voids as
-        // broad-stopping without reading the banks.
+        // broad-stopping and discards the close read before observing.
         let pool = test_pool();
         let scene = stage_single_provider(pool, 4);
         let mut ledger = SelectionLedger::new();
@@ -5102,5 +5296,1039 @@ mod tests {
                 "{label} witness refuses at open"
             );
         }
+    }
+
+    #[test]
+    fn k0_tail_exec_voids_detail() {
+        // A tail EXEC for the selected caller — staged after the last
+        // loop drain, past the pre-quiescence snapshot — voids as
+        // caller-changed. The witness facts stay clean; only the tail
+        // hits.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let pid = resolved.original.pid();
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let tail = vec![k0_exec_record(pid, 200)];
+        close_k0_window_with_tail(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &tail,
+            0,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("promotion_caller_changed"),
+            "a tail exec voids the detail"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_none());
+        assert!(section.get("aggregate").is_none());
+    }
+
+    #[test]
+    fn k0_tail_exit_voids_as_retired() {
+        // A tail leader exit for the selected caller voids as a
+        // retirement, not a change: the caller is gone, not replaced.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let pid = resolved.original.pid();
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let tail = vec![k0_exit_record(pid, 200)];
+        close_k0_window_with_tail(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &tail,
+            0,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("promotion_caller_retired"),
+            "a tail exit retires the detail"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_none());
+        assert!(section.get("aggregate").is_none());
+    }
+
+    #[test]
+    fn k0_tail_malformed_voids_as_changed() {
+        // A malformed tail record fails closed as caller-changed: the
+        // witness would have faulted on it had the tap been live.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        close_k0_window_with_tail(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &[],
+            1,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("promotion_caller_changed"),
+            "a malformed tail fails closed"
+        );
+    }
+
+    #[test]
+    fn k0_tail_other_pid_ignores() {
+        // Preservation: a tail EXEC for a different PID leaves the
+        // window alone — the scan matches the selected caller only.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let other = resolved.original.pid().wrapping_add(7);
+        assert_ne!(other, resolved.original.pid());
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let tail = vec![k0_exec_record(other, 200)];
+        close_k0_window_with_tail(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &tail,
+            0,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            None,
+            "another PID's tail exec is not our caller"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_some());
+    }
+
+    #[test]
+    fn k0_no_tail_records_unchanged() {
+        // Preservation: an empty tail through the tail close leaves a
+        // healthy window unchanged — the same success as the plain
+        // close.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        close_k0_window_with_tail(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &[],
+            0,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            None,
+            "an empty tail changes nothing"
+        );
+    }
+
+    #[test]
+    fn k0_unclean_and_retired_voids_as_broad_stopping() {
+        // Precedence: an unclean close boundary beats a retired slot —
+        // contract step 1 wins over step 2, so the word pins the order.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let mut retired = scene.plan.clone();
+        retired.slots.retain(|slot| slot.index != 2);
+        let retired_counts: Vec<(u64, u64, u64)> =
+            retired.slots.iter().map(|_| (110, 110, 0)).collect();
+        let after = scripted_read(
+            &scene.pool,
+            &retired,
+            generation,
+            CounterMode::Counts,
+            &retired_counts,
+            window_of(20, 30),
+        );
+        close_k0_window(window, &retired, Ok(after), k0_clean(), false, &mut ledger);
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("broad_stopping"),
+            "unclean beats retired"
+        );
+    }
+
+    #[test]
+    fn k0_retired_and_exec_voids_as_not_published() {
+        // Precedence: a retired slot beats an in-window exec —
+        // contract step 2 wins over step 3, so the word pins the order.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let mut retired = scene.plan.clone();
+        retired.slots.retain(|slot| slot.index != 2);
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let exec = k0_facts_after(7, |tap| {
+            tap.observe_record(&k0_exec_record(7, 200));
+        });
+        close_k0_window(
+            window,
+            &retired,
+            Ok(after),
+            Ok(Some(exec)),
+            true,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("not_published"),
+            "retired beats exec"
+        );
+    }
+
+    #[test]
+    fn k0_exec_and_failed_read_voids_as_caller_changed() {
+        // Precedence: an in-window exec beats a failed close read —
+        // contract step 3 wins over step 4, so the word pins the order.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let exec = k0_facts_after(7, |tap| {
+            tap.observe_record(&k0_exec_record(7, 200));
+        });
+        close_k0_window(
+            window,
+            &scene.plan,
+            Err(ReadStage::BankQuarantined),
+            Ok(Some(exec)),
+            true,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("promotion_caller_changed"),
+            "exec beats a failed read"
+        );
+    }
+
+    #[test]
+    fn k0_terminal_outer_malformed_voids_detail() {
+        // A malformed OUTER item in the Q-bounded terminal drain fails
+        // closed through the real observed drain: the scripted outer
+        // item rides into the tail (the Q-bounded poll bypasses the
+        // PID tap, so the tail is its only witness) and the close
+        // voids as caller-changed.
+        use crate::discovery::engine::Engine;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+        use crate::events::DiscoveryItem;
+
+        let (mut engine, _owner) = Engine::retiring_loader_context(std::process::id());
+        let mut session = ScriptedSession::default();
+        session
+            .dequeues
+            .push_back(Ok(Some(DiscoveryItem::Malformed)));
+        let mut tail_records = Vec::new();
+        let mut tail_malformed = 0u64;
+        let mut post_q = false;
+        engine
+            .drain_discovery_terminal_to_position_observed(
+                &mut session,
+                0,
+                &mut post_q,
+                &mut |record: &DiscoveryRecord| tail_records.push(*record),
+                &mut |count: u64| {
+                    tail_malformed = tail_malformed.saturating_add(count);
+                },
+            )
+            .expect("the scripted terminal drain applies");
+        assert!(!post_q, "the scripted Q never moves past its stop");
+        assert_eq!(
+            tail_malformed, 1,
+            "the outer malformed item reaches the tail"
+        );
+        assert_eq!(
+            engine.malformed_discovery_for_test(),
+            1,
+            "the drain accounts the outer item as malformed"
+        );
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        close_k0_window_with_tail(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &tail_records,
+            tail_malformed,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("promotion_caller_changed"),
+            "an outer malformed voids the detail"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_none());
+        assert!(section.get("aggregate").is_none());
+    }
+
+    #[test]
+    fn k0_tail_exec_and_retired_voids_as_not_published() {
+        // Precedence: a retired slot beats a tail exec — contract
+        // step 2 wins over step 3, so the word pins the order.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let pid = resolved.original.pid();
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let mut retired = scene.plan.clone();
+        retired.slots.retain(|slot| slot.index != 2);
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let tail = vec![k0_exec_record(pid, 200)];
+        close_k0_window_with_tail(
+            window,
+            &retired,
+            Ok(after),
+            k0_clean(),
+            true,
+            &tail,
+            0,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("not_published"),
+            "retired beats a tail exec"
+        );
+    }
+
+    #[test]
+    fn k0_tail_exec_and_failed_read_voids_as_caller_changed() {
+        // Precedence: a tail exec beats a failed close read —
+        // contract step 3 wins over step 4, so the word pins the
+        // order.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let pid = resolved.original.pid();
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let tail = vec![k0_exec_record(pid, 200)];
+        close_k0_window_with_tail(
+            window,
+            &scene.plan,
+            Err(ReadStage::BankQuarantined),
+            k0_clean(),
+            true,
+            &tail,
+            0,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("promotion_caller_changed"),
+            "a tail exec beats a failed read"
+        );
+    }
+
+    #[test]
+    fn k0_witness_retired_and_tail_exec_voids_as_caller_changed() {
+        // Within-step-3 precedence: a tail exec beats a witnessed
+        // break — the contract checks the changed bullet before the
+        // "only ... retired" bullet, first hit wins, so the word
+        // pins the order.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let pid = resolved.original.pid();
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let break_only = k0_facts_after(7, |tap| {
+            tap.observe_record(&k0_exit_record(7, 200));
+        });
+        assert!(
+            break_only.latest_exec.is_none(),
+            "the twin stages a break with no exec"
+        );
+        assert!(
+            break_only.greatest_break_ns.is_some(),
+            "the twin stages a break"
+        );
+        let tail = vec![k0_exec_record(pid, 200)];
+        close_k0_window_with_tail(
+            window,
+            &scene.plan,
+            Ok(after),
+            Ok(Some(break_only)),
+            true,
+            &tail,
+            0,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("promotion_caller_changed"),
+            "a tail exec beats a witnessed break"
+        );
+    }
+
+    #[test]
+    fn k0_discovery_loss_growth_voids_as_changed() {
+        // Ring loss, state failures or bounded-read failures growing
+        // inside the window void as caller-changed: a lifecycle record
+        // for the watched process may have gone unread.
+        for (label, before_losses, after_losses) in [
+            ("ring", [0, 0, 0, 0], [1, 0, 0, 0]),
+            ("state", [0, 0, 0, 0], [0, 1, 0, 0]),
+            ("read", [0, 0, 0, 0], [0, 0, 1, 0]),
+        ] {
+            let pool = test_pool();
+            let scene = stage_single_provider(pool, 4);
+            let mut ledger = SelectionLedger::new();
+            let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+                .expect("live name resolves for the K0 window");
+            let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+            let before = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 100, 100),
+                window_of(10, 20),
+            );
+            let window = open_k0_window_with_losses(
+                resolved,
+                limits_for(&scene.plan),
+                scene.pool.reserver(),
+                Ok(before),
+                k0_clean(),
+                before_losses,
+                &mut ledger,
+            )
+            .expect("a healthy selection-time read opens the window");
+            let after = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 110, 110),
+                window_of(20, 30),
+            );
+            close_k0_window_with_losses(
+                window,
+                &scene.plan,
+                Ok(after),
+                k0_clean(),
+                true,
+                after_losses,
+                &mut ledger,
+            );
+            assert_eq!(
+                ledger
+                    .selection
+                    .as_ref()
+                    .expect("selection records")
+                    .refusal,
+                Some("promotion_caller_changed"),
+                "{label} growth voids the detail"
+            );
+            let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+            let section = &composed["evidence"]["selected_detail"];
+            assert!(section.get("detail").is_none(), "{label}: no detail");
+            assert!(
+                section.get("aggregate").is_none(),
+                "{label}: no window aggregate"
+            );
+        }
+    }
+
+    #[test]
+    fn k0_discovery_truncation_growth_voids_as_stopping() {
+        // Truncation growing inside the window — including a terminal
+        // drain that stopped at its allowance — voids as
+        // broad-stopping: terminal work is unfinished.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window_with_losses(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            [0, 0, 0, 0],
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        close_k0_window_with_losses(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            [0, 0, 0, 1],
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("broad_stopping"),
+            "truncation growth voids the detail"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_none());
+        assert!(section.get("aggregate").is_none());
+    }
+
+    #[test]
+    fn k0_discovery_losses_unchanged_renders() {
+        // Preservation: nonzero but unchanged losses render — the void
+        // is growth inside the window, never an absolute count.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window_with_losses(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            [1, 2, 3, 4],
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        close_k0_window_with_losses(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            [1, 2, 3, 4],
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            None,
+            "unchanged losses render"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_some());
+    }
+
+    #[test]
+    fn k0_truncation_and_retired_voids_as_broad_stopping() {
+        // Precedence: truncation growth beats a retired slot —
+        // contract step 1 wins over step 2, so the word pins the order.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window_with_losses(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            [0, 0, 0, 0],
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let mut retired = scene.plan.clone();
+        retired.slots.retain(|slot| slot.index != 2);
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        close_k0_window_with_losses(
+            window,
+            &retired,
+            Ok(after),
+            k0_clean(),
+            true,
+            [0, 0, 0, 1],
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("broad_stopping"),
+            "truncation beats retired"
+        );
+    }
+
+    #[test]
+    fn k0_ring_loss_and_failed_read_voids_as_caller_changed() {
+        // Precedence: ring-loss growth beats a failed close read —
+        // contract step 3 wins over step 4, so the word pins the order.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window_with_losses(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            [0, 0, 0, 0],
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        close_k0_window_with_losses(
+            window,
+            &scene.plan,
+            Err(ReadStage::BankQuarantined),
+            k0_clean(),
+            true,
+            [1, 0, 0, 0],
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("promotion_caller_changed"),
+            "ring loss beats a failed read"
+        );
     }
 }

@@ -6183,6 +6183,14 @@ mod tests {
                 detail_rows[0], aggregate_rows[7],
                 "Detail equals the aggregate cells for the slot"
             );
+        } else {
+            // No `--select-endpoint`: the report carries no
+            // `selected_detail` key at all — the envelope's presence
+            // is exactly the flag's presence.
+            assert!(
+                document["evidence"].get("selected_detail").is_none(),
+                "no flag means no selected_detail envelope"
+            );
         }
         parts.fixture.command("QUIT");
         parts.fixture.expect("DONE 512");

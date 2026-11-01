@@ -13071,6 +13071,28 @@ impl Engine {
         let mut outcome = ApplyOutcome::default();
         if self.continuity_deferred || self.cancellation_requested() || session.mutation_stopped() {
             *additions_allowed = false;
+            // Stop-time newcomers (item 6): the terminal drain runs after
+            // the stop gate closed, so every candidate refuses here — but
+            // the tick already admitted and scanned its newcomers above.
+            // A scanned newcomer that mapped a provider and is dropped
+            // unpublished must not vanish silently: its calls were never
+            // observed. A fully scanned provider-free newcomer needs no
+            // attach and leaves no mark (the live-tick `undone` predicate
+            // below, reused over the refused views). Live deferrals retry
+            // on a later tick, so only the stopping capture marks.
+            if session.mutation_stopped()
+                && extra_views.iter().any(|view| {
+                    candidate
+                        .modules
+                        .iter()
+                        .any(|module| module.scanned.view == view.id())
+                })
+            {
+                self.mark_partial(
+                    "live inventory transaction",
+                    "a new process mapped a provider after the capture began stopping; its calls were not observed",
+                );
+            }
             return Ok(outcome);
         }
         // A pending batch owns the whole global candidate boundary, including
@@ -14251,16 +14273,30 @@ impl Engine {
             );
         } else if !outcome.unpublished_views.is_empty() {
             let unpublished = outcome.unpublished_views.clone();
+            // A checked-clean newcomer (fully scanned, no reconciled
+            // modules) carries no pins, modules or links, so leaving it
+            // unpublished undoes no attach or publish work; only views with
+            // reconciled modules still have work outstanding. Their own scan
+            // skips, if any, already cover unverified content. Read before
+            // retire drops the unpublished views' modules below.
+            let undone = unpublished.iter().any(|view| {
+                candidate
+                    .modules
+                    .iter()
+                    .any(|module| module.scanned.view == *view)
+            });
             self.retire_stale_candidate_sources(
                 session,
                 &mut candidate,
                 &unpublished,
                 &mut *outcome,
             );
-            self.mark_partial(
-                "live inventory transaction",
-                "additions were blocked; newly observed process generations were left unpublished for a later tick",
-            );
+            if undone {
+                self.mark_partial(
+                    "live inventory transaction",
+                    "additions were blocked; newly observed process generations were left unpublished for a later tick",
+                );
+            }
         }
         if !new_targets_attached {
             let owners = candidate_timing_owners(&candidate);

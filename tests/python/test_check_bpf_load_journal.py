@@ -171,6 +171,7 @@ class JournalGateTests(unittest.TestCase):
             "linked": rows,
             "linked-unlatched": rows,
             "linked-idle": rows,
+            "refused-noseal": [row for row in rows if row["btf_id"] == 48],
             "missing-root": [row for row in rows
                              if row["root"] != "p11_return_journal"],
             "unlinked": [row for row in rows if row["btf_id"] == 48],
@@ -191,6 +192,10 @@ class JournalGateTests(unittest.TestCase):
             "refused-build": {"rc": 0, "text":
                 "p11scope: semantic lane ready; mechanisms and API results "
                 "are recorded from now on (key operations: planned for 0.6.0)\n"
+                "gap: key operations unavailable: "
+                "journal-pair-unavailable-in-build: this build omits the "
+                "production journal object; broad inventory continues\n"},
+            "refused-noseal": {"rc": 0, "text":
                 "gap: key operations unavailable: "
                 "journal-pair-unavailable-in-build: this build omits the "
                 "production journal object; broad inventory continues\n"},
@@ -353,6 +358,16 @@ class JournalGateTests(unittest.TestCase):
         # A build without the journal object fails the cell with the
         # finite build reason, never passing and never crashing.
         result, out = self.run_gate(KERNEL, mode="refused-build")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("journal-pair-unavailable-in-build", row["detail"])
+
+    def test_refused_lane_without_seal_names_the_reason(self):
+        # Both lanes refused, so no seal line exists; the row still
+        # names the finite refusal reason instead of just the seal.
+        result, out = self.run_gate(KERNEL, mode="refused-noseal")
         self.assertEqual(result.returncode, 1, result.stdout)
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])

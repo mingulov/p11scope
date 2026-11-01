@@ -327,6 +327,8 @@ pub(crate) trait JointMachineIo {
         raw: &mut RawJointQuantum,
     ) -> Result<SemanticBatch, SemanticRefusal>;
     /// Fail closed unless an implementation reads the actual owning Capture.
+    /// `Ok(None)` passes the Capture's validated "no call of this original
+    /// waits at Q" through unchanged; every refusal stays a refusal.
     fn pending_h0_at_q_storage_bytes(
         &self,
         _lane: &AttestedSemanticLane,
@@ -334,7 +336,7 @@ pub(crate) trait JointMachineIo {
         _adapter: &JournalAdapter,
         _q: &CollectedFinishQ,
         _discovery: &DiscoveryDomain,
-    ) -> Result<usize, SemanticRefusal> {
+    ) -> Result<Option<usize>, SemanticRefusal> {
         Err(SemanticRefusal::ProviderStorage)
     }
     /// Fail closed unless the same native/Capture owner supplies the operation.
@@ -1558,12 +1560,18 @@ impl LiveJointMachine {
             }
         }
         while budget.available() {
+            // The owned Finish guard above permits only its first genuine
+            // Raw-minted grant after an observed None. Q itself stays
+            // unchanged; the standalone pending-Q wrapper remains strict.
+            // When the Capture validates that no call of the original waits
+            // at Q any more (a pass refresh between hooks resolved it into
+            // the lane stash), nothing is reserved or expired and the
+            // ordinary at-Q tick below collects the original instead.
             if matches!(self.phase.as_ref(), Some(Phase::AwaitH0(original)) if original.raw.h0_waiting())
+                && self
+                    .resolve_checked_pending_h0_at_q(lane, coordinator, io, q, &discovery, budget)?
+                    .is_some()
             {
-                // The owned Finish guard above permits only its first genuine
-                // Raw-minted grant after an observed None. Q itself stays
-                // unchanged; the standalone pending-Q wrapper remains strict.
-                self.resolve_checked_pending_h0_at_q(lane, coordinator, io, q, &discovery, budget)?;
                 return Ok(JointCommitProgress::Pending);
             }
             let phase = self.phase.take().expect("retained original Finish phase");
@@ -1654,11 +1662,17 @@ impl LiveJointMachine {
         {
             return Err(SemanticRefusal::Unavailable);
         }
-        self.resolve_checked_pending_h0_at_q(lane, coordinator, io, q, discovery, budget)
+        // Strict: an original with nothing left to expire is refused here,
+        // exactly as before; only Finish falls back to its ordinary tick.
+        self.resolve_checked_pending_h0_at_q(lane, coordinator, io, q, discovery, budget)?
+            .ok_or(SemanticRefusal::ProviderStorage)
     }
 
     /// Reuse the actual original resolution after the caller's Q/grant guard.
     /// Every report/expiry still checks the same Raw, ledger and Capture.
+    /// `Ok(None)`: the Capture validated this AwaitH0 original and found no
+    /// call of it still waiting at Q. Nothing was reserved, expired or
+    /// latched, and the phase is unchanged.
     #[allow(clippy::too_many_arguments)] // Keep disjoint owners and their shared work budget borrowed.
     fn resolve_checked_pending_h0_at_q<I: JointMachineIo>(
         &mut self,
@@ -1668,7 +1682,7 @@ impl LiveJointMachine {
         q: &CollectedFinishQ,
         discovery: &DiscoveryDomain,
         budget: &mut JointWorkBudget,
-    ) -> Result<JointServiceProgress, SemanticRefusal> {
+    ) -> Result<Option<JointServiceProgress>, SemanticRefusal> {
         // A pending report refusal latches at its site: this branch also
         // serves the standalone pending-Q entry, which has no wrapper.
         if matches!(self.phase, Some(Phase::PendingQ { .. })) {
@@ -1710,7 +1724,7 @@ impl LiveJointMachine {
                 }
                 return Err(reason);
             }
-            return Ok(JointServiceProgress::Pending);
+            return Ok(Some(JointServiceProgress::Pending));
         }
         let Some(Phase::AwaitH0(original)) = self.phase.as_ref() else {
             return Err(SemanticRefusal::Unavailable);
@@ -1731,13 +1745,16 @@ impl LiveJointMachine {
         {
             return Err(SemanticRefusal::Unavailable);
         }
-        let bytes = io.pending_h0_at_q_storage_bytes(
+        let Some(bytes) = io.pending_h0_at_q_storage_bytes(
             lane,
             &original.raw,
             coordinator.joint_capture().adapter(),
             q,
             discovery,
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         if bytes == 0 {
             return Err(SemanticRefusal::ProviderStorage);
         }
@@ -1794,7 +1811,7 @@ impl LiveJointMachine {
                 return Err(reason);
             }
         }
-        Ok(JointServiceProgress::Pending)
+        Ok(Some(JointServiceProgress::Pending))
     }
 
     fn merge_pending_q_phase(
@@ -3781,7 +3798,7 @@ impl JointMachineIo for SessionMachineIo {
         adapter: &JournalAdapter,
         q: &CollectedFinishQ,
         discovery: &DiscoveryDomain,
-    ) -> Result<usize, SemanticRefusal> {
+    ) -> Result<Option<usize>, SemanticRefusal> {
         let live = lane.live.as_deref().ok_or(SemanticRefusal::Unavailable)?;
         if live.finished
             || !live

@@ -615,7 +615,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         adapter: &JournalAdapter,
         q: &crate::attach::CollectedFinishQ,
         discovery: &crate::events::DiscoveryDomain,
-    ) -> Result<usize, SemanticRefusal> {
+    ) -> Result<Option<usize>, SemanticRefusal> {
         // Standalone pending-Q tests borrow their separate original observer;
         // their strict wrapper/Raw checks do not create a global Finish owner.
         if self.finish.is_some() {
@@ -6858,6 +6858,7 @@ fn joint_machine_collected_finish_budget_refusal_preserves_originals() {
                 &q,
             )
             .unwrap()
+            .expect("one call waits at Q")
     };
     assert!(bytes > 0, "the report and all expiry temporaries are paid");
     let snapshot = fixture
@@ -8584,6 +8585,7 @@ fn joint_machine_finish_at_q_expiry_storage_refusal_still_latches() {
                         .expect("observed Q"),
                 )
                 .unwrap()
+                .expect("one call waits at Q")
         };
         assert!(bytes > 0, "one call waits at Q (linked={linked})");
         let resource = fixture

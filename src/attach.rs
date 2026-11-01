@@ -26,10 +26,9 @@ use p11scope_ebpf_common::{
     EVIDENCE_ABI_REFUSALS, EVIDENCE_RING_LOSS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
     IMAGE_IDENTITY_TICKET_LIMIT, ImageBankSelect, ImageIdentityControl, LoaderGateControl,
-    MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT,
-    PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE, RootAffiliationControl, SlotSemantics,
-    TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT,
-    ThreadOwnerControl, attach_cookie,
+    MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT, PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE,
+    RootAffiliationControl, SlotSemantics, TAIL_CALLS_INTERFACE_WORKER_SLOT,
+    TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT, ThreadOwnerControl, attach_cookie,
 };
 use p11scope_manifest::elf::ElfAbi;
 use pkcs11_types::mechanism_registry::MechanismRegistry;
@@ -385,22 +384,13 @@ const GATE_IDENTITY_MAPS: [(&str, ExactMapMetadata); 5] = [
         "TASK_COOKIE_B",
         map_metadata(MapType::TaskStorage, 4, 8, 0, 1),
     ),
-    (
-        "COOKIE_CTL_B",
-        map_metadata(MapType::Array, 4, 40, 1, 0),
-    ),
+    ("COOKIE_CTL_B", map_metadata(MapType::Array, 4, 40, 1, 0)),
     (
         "IMAGE_BANK_SELECT",
         map_metadata(MapType::Array, 4, 96, 1, 0),
     ),
-    (
-        "LOADER_GATE",
-        map_metadata(MapType::Array, 4, 32, 256, 0),
-    ),
-    (
-        "LOADER_GATE_CTL",
-        map_metadata(MapType::Array, 4, 72, 1, 0),
-    ),
+    ("LOADER_GATE", map_metadata(MapType::Array, 4, 32, 256, 0)),
+    ("LOADER_GATE_CTL", map_metadata(MapType::Array, 4, 72, 1, 0)),
 ];
 
 fn validate_identity_inventory<'a>(
@@ -450,13 +440,8 @@ fn identity_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::maps::MapD
             Map::Unsupported(data),
         ) => data,
         (
-            "COOKIE_CTL"
-            | "OWNER_CTL"
-            | "ROOT_CTL"
-            | "COOKIE_CTL_B"
-            | "IMAGE_BANK_SELECT"
-            | "LOADER_GATE"
-            | "LOADER_GATE_CTL",
+            "COOKIE_CTL" | "OWNER_CTL" | "ROOT_CTL" | "COOKIE_CTL_B" | "IMAGE_BANK_SELECT"
+            | "LOADER_GATE" | "LOADER_GATE_CTL",
             Map::Array(data),
         ) => data,
         _ => bail!("unexpected {name} identity map variant"),
@@ -604,10 +589,7 @@ fn bank_select_fields(c: ImageBankSelect) -> [u64; 12] {
     ]
 }
 
-fn validate_bank_select_readback(
-    expected: ImageBankSelect,
-    actual: ImageBankSelect,
-) -> Result<()> {
+fn validate_bank_select_readback(expected: ImageBankSelect, actual: ImageBankSelect) -> Result<()> {
     if bank_select_fields(actual) != bank_select_fields(expected) {
         bail!("IMAGE_BANK_SELECT exact readback differs from initial select");
     }
@@ -865,11 +847,15 @@ fn validate_pid_start_tick_map(ebpf: &Ebpf, roots: StaticRoots, journal: bool) -
     Ok(())
 }
 
-fn freeze_map(name: &str, map: &Map) -> Result<()> {
-    let data = if IDENTITY_MAPS
+fn is_identity_map(name: &str) -> bool {
+    IDENTITY_MAPS
         .iter()
+        .chain(GATE_IDENTITY_MAPS.iter())
         .any(|(candidate, _)| *candidate == name)
-    {
+}
+
+fn freeze_map(name: &str, map: &Map) -> Result<()> {
+    let data = if is_identity_map(name) {
         identity_map_data(name, map)
     } else {
         policy_map_data(name, map)
@@ -7575,8 +7561,7 @@ impl Session {
         let Some(map) = self.ebpf.map(name) else {
             return Ok(None);
         };
-        let cell: Array<_, T> =
-            Array::try_from(map).with_context(|| format!("{name} gate map"))?;
+        let cell: Array<_, T> = Array::try_from(map).with_context(|| format!("{name} gate map"))?;
         Ok(Some(
             cell.get(&0, 0)
                 .with_context(|| format!("{name} gate cell"))?,
@@ -7604,6 +7589,7 @@ impl Session {
     /// The gate rows map for the native acknowledgement: the acknowledgement
     /// wiring arms per-row reuse through it. Borrowed from the session;
     /// `None` wherever the gate is not built in.
+    #[allow(dead_code)] // staged: the acknowledgement wiring is the first caller
     pub(crate) fn loader_gate_rows(&self) -> Option<&Map> {
         if !LOADER_GATE_BUILD {
             return None;
@@ -12287,12 +12273,41 @@ mod tests {
             ("OWNER_CTL", false),
             ("ROOT_CTL", false),
         ];
-        let error =
-            validate_identity_inventory(wrong_variant.into_iter(), true).unwrap_err();
+        let error = validate_identity_inventory(wrong_variant.into_iter(), true).unwrap_err();
         assert!(
             error.to_string().contains("TASK_COOKIE_B"),
             "the refusal must name the map: {error:?}"
         );
+    }
+
+    #[test]
+    fn identity_map_routing_covers_both_tables() {
+        // freeze_map routes identity names to the identity validator and
+        // every other name to the policy validator. A gate name routed to
+        // the policy side refuses live bank task storage (Fedora root
+        // cell); a policy name routed to the identity side would skip its
+        // own contract.
+        for name in [
+            "TASK_COOKIE",
+            "THREAD_OWNER",
+            "ROOT_AFFILIATION",
+            "COOKIE_CTL",
+            "OWNER_CTL",
+            "ROOT_CTL",
+            "TASK_COOKIE_B",
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "LOADER_GATE",
+            "LOADER_GATE_CTL",
+        ] {
+            assert!(
+                super::is_identity_map(name),
+                "{name} must route to identity"
+            );
+        }
+        for name in ["CONFIG", "PROC_EPOCH", "OTHER"] {
+            assert!(!super::is_identity_map(name), "{name} must route to policy");
+        }
     }
 
     #[test]
@@ -12365,17 +12380,13 @@ mod tests {
                 assert_eq!(actual.map_type(), expected.map_type as u32, "{name} type");
                 assert_eq!(actual.key_size(), expected.key_size, "{name} key");
                 assert_eq!(actual.value_size(), expected.value_size, "{name} value");
-                assert_eq!(
-                    actual.max_entries(),
-                    expected.max_entries,
-                    "{name} entries"
-                );
+                assert_eq!(actual.max_entries(), expected.max_entries, "{name} entries");
                 assert_eq!(actual.map_flags(), expected.flags, "{name} flags");
             }
         } else {
             for (name, _) in super::GATE_IDENTITY_MAPS {
                 assert!(
-                    detailed.maps.get(name).is_none(),
+                    !detailed.maps.contains_key(name),
                     "{name} must be absent from the gate-0 object"
                 );
             }
@@ -12392,7 +12403,7 @@ mod tests {
             let inventory = aya_obj::Object::parse(bytes).unwrap();
             for (name, _) in super::GATE_IDENTITY_MAPS {
                 assert!(
-                    inventory.maps.get(name).is_none(),
+                    !inventory.maps.contains_key(name),
                     "{name} must be absent from inventory objects"
                 );
             }
@@ -12412,7 +12423,7 @@ mod tests {
             let counter = aya_obj::Object::parse(bytes).unwrap();
             for (name, _) in super::GATE_IDENTITY_MAPS {
                 assert!(
-                    counter.maps.get(name).is_none(),
+                    !counter.maps.contains_key(name),
                     "{name} must be absent from counter objects"
                 );
             }
@@ -12426,7 +12437,7 @@ mod tests {
         let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
         assert_eq!(
             super::LOADER_GATE_BUILD,
-            detailed.maps.get("IMAGE_BANK_SELECT").is_some(),
+            detailed.maps.contains_key("IMAGE_BANK_SELECT"),
             "gate selection must match the embedded object"
         );
     }

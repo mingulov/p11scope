@@ -5,8 +5,10 @@
 The privileged capture core cannot run here; this suite covers what it
 can without privilege: the CLI surface (help, usage errors, parameter
 validation), the emitter build with the pinned warnings, provider
-probing, the verdict mapping (pass/fail/nonqualifying/expected), and
-the results.jsonl row shape. Library functions are reached by
+probing, the verdict mapping (pass plus the qualified,
+nonqualifying, expected-failure and failed qualifications), the
+event assembly and flow helpers, and the results.jsonl row shape.
+Library functions are reached by
 sourcing the script with JOINT_TP_SOURCED=1 (the file's own guard
 keeps main from running); live cell flows are exercised by the
 script's own runs, never by this suite.
@@ -156,6 +158,47 @@ class CellScriptLibrary(unittest.TestCase):
         self.assertGreater(float(load), -0.01)
         self.assertGreaterEqual(int(cpus), 1)
 
+    def test_loaded_host_compares_against_nproc(self):
+        for load, cpus, expected in (("12.5", "8", 0), ("8.0", "8", 1),
+                                    ("2.0", "8", 1), ("0.5", "1", 1)):
+            proc = run_sourced(f'loaded_host "{load}" "{cpus}"')
+            self.assertEqual(proc.returncode, expected, (load, cpus))
+
+    def test_event_args_lists_every_part_oldest_first(self):
+        with tempfile.TemporaryDirectory(prefix="jtp-ev-") as tmp:
+            workdir = Path(tmp) / "out.dir"
+            workdir.mkdir()
+            (workdir / "events.jsonl").write_text("{}\n", encoding="utf-8")
+            proc = run_sourced(f'event_args "{workdir}"')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.split(),
+                             ["--events", str(workdir / "events.jsonl")])
+            (workdir / "events.jsonl.1").write_text("{}\n", encoding="utf-8")
+            (workdir / "events.jsonl.2").write_text("{}\n", encoding="utf-8")
+            (workdir / "events.jsonl.10").write_text("{}\n", encoding="utf-8")
+            proc = run_sourced(f'event_args "{workdir}"')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                proc.stdout.split(),
+                ["--events", str(workdir / "events.jsonl.10"),
+                 "--events", str(workdir / "events.jsonl.2"),
+                 "--events", str(workdir / "events.jsonl.1"),
+                 "--events", str(workdir / "events.jsonl")])
+
+    def test_fail_flow_records_rc_and_reason(self):
+        with tempfile.TemporaryDirectory(prefix="jtp-flow-") as tmp:
+            proc = run_sourced(
+                f'ORACLE_RC=0; ORACLE_REASON=""; fail_flow "{tmp}" '
+                '"pass 0 never published"; '
+                'echo "rc=$ORACLE_RC reason=$ORACLE_REASON"')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("rc=2 reason=pass 0 never published",
+                          proc.stdout)
+            payload = json.loads(
+                (Path(tmp) / "oracle.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["verdict"], "fail")
+            self.assertEqual(payload["reason"], "pass 0 never published")
+
 
 class VerdictMapping(unittest.TestCase):
     def map_verdict(self, rc, reason, load="2.0", cpus="8"):
@@ -172,79 +215,147 @@ class VerdictMapping(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             return proc.stdout.strip()
 
-    def test_pass_maps(self):
+    def test_pass_maps_to_qualified(self):
         with tempfile.TemporaryDirectory(prefix="jtp-map-") as tmp:
             oracle = Path(tmp) / "oracle.json"
             oracle.write_text(json.dumps({"verdict": "pass"}),
                               encoding="utf-8")
             proc = run_sourced(f'map_verdict 0 "{oracle}" "99.0" "8"')
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertEqual(proc.stdout.strip(), "pass|")
+            self.assertEqual(proc.stdout.strip(), "true|qualified|")
 
     def test_rate_miss_on_a_loaded_host_is_nonqualifying(self):
         got = self.map_verdict(
             1, "window 0: 5 calls/s below minimum 10 [0, 1)", load="12.5",
             cpus="8")
-        self.assertEqual(got, "nonqualifying|")
+        self.assertEqual(got, "false|nonqualifying|")
 
     def test_rate_miss_on_a_quiet_host_is_failed(self):
         got = self.map_verdict(
             1, "window 0: 5 calls/s below minimum 10 [0, 1)", load="2.0",
             cpus="8")
-        self.assertEqual(got, "fail|")
+        self.assertEqual(got, "false|failed|")
 
     def test_unlinked_joint_marker_is_expected(self):
-        got = self.map_verdict(
-            1, "object_observations status unavailable reason "
-               "journal_unavailable, not the Joint marker populated/none")
-        self.assertEqual(got, "fail|Session-loop seal wire pending (WU-2)")
+        for reason in (
+                "object_observations status unavailable reason "
+                "journal_unavailable, not the Joint marker populated/none",
+                "unlinked lane disclosure present: "
+                "joint_journal_unavailable"):
+            with self.subTest(reason=reason):
+                got = self.map_verdict(1, reason)
+                self.assertEqual(
+                    got, "false|expected-failure|"
+                         "Session-loop seal wire pending (WU-2)")
 
-    def test_other_joint_reasons_stay_unexpected(self):
-        got = self.map_verdict(1, "per-key operations [5] != ledgered [6]")
-        self.assertEqual(got, "fail|")
+    def test_other_joint_reasons_stay_failed(self):
+        for reason in ("per-key operations [5] != ledgered [6]",
+                       "object_observations without key rows",
+                       "unknown-key operations persist: 2 rows"):
+            with self.subTest(reason=reason):
+                self.assertEqual(self.map_verdict(1, reason, load="99.0"),
+                                 "false|failed|")
 
     def test_conservation_miss_is_failed_at_any_load(self):
         got = self.map_verdict(1, "operations.calls 65 != issued 20006",
                                load="99.0", cpus="8")
-        self.assertEqual(got, "fail|")
+        self.assertEqual(got, "false|failed|")
+
+    def test_loss_miss_is_failed_at_any_load(self):
+        got = self.map_verdict(
+            1, "stop did not prove a full drain (final_drain=None, "
+               "stop_quiescence=not_requested)", load="99.0", cpus="8")
+        self.assertEqual(got, "false|failed|")
+
+    def test_shapeless_evidence_is_load_judged(self):
+        reasons = (
+            "unreadable events /tmp/x/events.jsonl.1",
+            "unreadable ledger /tmp/x/hot.jsonl",
+            "unreadable inventory /tmp/x/report.json",
+            "event stream incomplete: missing or duplicate sequence",
+            "event stream incomplete: started marker is not unique "
+            "and first",
+            "current parent is not the exact withheld semantic summary",
+            "physical entries are not complete observed counts",
+            "no ledgers emitted",
+            "pass 0 never published",
+            "MAPPED never printed",
+            "DONE never printed",
+            "generator never became ready",
+            "no admission pass after mapping",
+            "no binding pass after setup",
+            "target not held through drain",
+            "observer rc=1",
+            "generator rc=1",
+            "evidence chmod failed",
+        )
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    self.map_verdict(1, reason, load="12.5", cpus="8"),
+                    "false|nonqualifying|")
+                self.assertEqual(
+                    self.map_verdict(1, reason, load="2.0", cpus="8"),
+                    "false|failed|")
 
     def test_unparsable_oracle_output_is_failed(self):
-        self.assertEqual(self.map_verdict(1, None), "fail|")
+        self.assertEqual(self.map_verdict(1, None), "false|failed|")
+        self.assertEqual(self.map_verdict(1, "oracle output unparsable",
+                                           load="99.0"),
+                         "false|failed|")
         with tempfile.TemporaryDirectory(prefix="jtp-map-") as tmp:
             oracle = Path(tmp) / "oracle.json"
             oracle.write_text(json.dumps({"verdict": "pass"}),
                               encoding="utf-8")
             proc = run_sourced(f'map_verdict 2 "{oracle}" "1.0" "8"')
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertEqual(proc.stdout.strip(), "fail|")
+            self.assertEqual(proc.stdout.strip(), "false|failed|")
 
 
 class ResultsRows(unittest.TestCase):
-    def test_write_row_shape_and_expected(self):
+    def test_write_row_uses_the_contract_shape(self):
         with tempfile.TemporaryDirectory(prefix="jtp-row-") as tmp:
             results = Path(tmp) / "results.jsonl"
             env = {"RESULTS_JSONL": str(results)}
             first = run_sourced(
-                'RESULTS_JSONL="$RESULTS_JSONL"; '
-                'write_row joint-10k-single pass "host=h load1=1.0" ""',
+                'write_row joint-10k-single true qualified '
+                '"host=h load1=1.0"',
                 env=env)
             self.assertEqual(first.returncode, 0, first.stderr)
             second = run_sourced(
-                'RESULTS_JSONL="$RESULTS_JSONL"; write_row joint-10k-churn '
-                'fail "host=h load1=1.0" "Session-loop seal wire pending (WU-2)"',
+                'write_row joint-10k-churn false expected-failure '
+                '"host=h load1=1.0 expected-failure: '
+                'Session-loop seal wire pending (WU-2)"',
                 env=env)
             self.assertEqual(second.returncode, 0, second.stderr)
             rows = [json.loads(line) for line in
                     results.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[0],
-                             {"cell": "joint-10k-single", "result": "pass",
+                             {"cell": "joint-10k-single", "pass": True,
+                              "qualification": "qualified",
                               "detail": "host=h load1=1.0"})
-            self.assertNotIn("expected", rows[0])
+            self.assertIs(rows[0]["pass"], True)
             self.assertEqual(rows[1]["cell"], "joint-10k-churn")
-            self.assertEqual(rows[1]["result"], "fail")
-            self.assertEqual(rows[1]["expected"],
-                             "Session-loop seal wire pending (WU-2)")
+            self.assertIs(rows[1]["pass"], False)
+            self.assertEqual(rows[1]["qualification"], "expected-failure")
+            self.assertIn("Session-loop seal wire pending (WU-2)",
+                          rows[1]["detail"])
+
+    def test_skip_all_is_nonqualifying_with_the_prerequisite(self):
+        with tempfile.TemporaryDirectory(prefix="jtp-skip-") as tmp:
+            results = Path(tmp) / "results.jsonl"
+            env = {"RESULTS_JSONL": str(results),
+                   "CELLS": "joint-10k-single s1-10k-twin"}
+            proc = run_sourced('skip_all "no gcc"', env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            rows = [json.loads(line) for line in
+                    results.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 2)
+            for row in rows:
+                self.assertIs(row["pass"], False)
+                self.assertEqual(row["qualification"], "nonqualifying")
+                self.assertIn("no gcc", row["detail"])
 
 
 if __name__ == "__main__":

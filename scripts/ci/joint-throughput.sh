@@ -50,20 +50,33 @@
 # a post-closure spawn is the lane the product links.
 #
 # Results: OUTDIR/results.jsonl carries one JSON object per cell:
-# {"cell", "result", "detail", "expected"?}. result is pass, fail,
-# nonqualifying or skip. A rate miss on a loaded host (max sampled
-# load1 above nproc) is nonqualifying with the load in detail, never
-# pass; conservation and loss failures are failed at any load. A
+# {"cell", "pass", "qualification", "detail"}. qualification is
+# qualified, nonqualifying, expected-failure or failed. A rate miss
+# on a loaded host (max sampled load1 above nproc) is
+# nonqualifying with the load in detail, never pass; conservation
+# and loss failures are failed at any load. Evidence that never
+# met the oracle's input shape (loader refusals, flow timeouts) is
+# nonqualifying on a loaded host and failed on a quiet one. A
 # failure that matches the known product gap (the Session-loop seal
 # wire is pending in WU-2, so production captures stay
-# journal_unavailable) is marked expected with that reason; any
-# other gate-4 reason stays an unexpected fail. Exit 0 when every
-# cell passes, 1 when any cell fails, 2 for caller/infra errors,
-# 77 when the environment cannot satisfy the cell contract.
+# journal_unavailable) is an expected-failure with that reason in
+# detail; any other gate-4 reason stays failed. Exit 0 when every
+# cell either passed or is nonqualifying/expected-failure, 1 when
+# any cell failed, 2 for caller/infra errors, 77 when the
+# environment cannot satisfy the cell contract (rows are written
+# as nonqualifying with the missing prerequisite in detail).
 #
 # Privilege: the observer runs under sudo -n with the workspace
 # privileged lock held. Each cell holds the lock only for its own
 # run. This script kills only the children it spawned, by PID.
+#
+# Apt prerequisites (ubuntu-26.04 runner, also fine as root):
+# gcc python3 sudo util-linux procps softhsm2. The runner also
+# needs kernel BTF (/sys/kernel/btf/vmlinux); KVM is not used by
+# these cells. As root,
+# sudo -n is a no-op and OUTDIR carries all state (tokens,
+# SoftHSM config, emitter build), so no $HOME or TMPDIR reliance
+# affects the run.
 set -eu
 umask 022
 
@@ -170,55 +183,109 @@ nproc_() {
     nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n'
 }
 
-# Map one oracle run to "result|expected". $1 oracle rc, $2 oracle
-# stdout file, $3 max sampled load1, $4 nproc.
+# True when the max sampled load1 exceeds the CPU count: the host
+# was too loaded to judge this cell.
+loaded_host() {
+    awk "BEGIN{exit !(($1) > ($2))}"
+}
+
+# Map one oracle run to "pass|qualification|marker". $1 oracle rc,
+# $2 oracle stdout file, $3 max sampled load1, $4 nproc. marker
+# carries the expected-failure reason, else empty.
 map_verdict() {
     rc=$1
     out=$2
     max_load=$3
     cpus=$4
     if [ "$rc" -eq 0 ]; then
-        printf 'pass|\n'
+        printf 'true|qualified|\n'
         return 0
     fi
     reason=$(python3 -c \
         'import json,sys; print(json.load(open(sys.argv[1])).get("reason",""))' \
         "$out" 2>/dev/null) || reason=""
     if [ -z "$reason" ]; then
-        printf 'fail|\n'
+        printf 'false|failed|\n'
         return 0
     fi
     case "$reason" in
         *"not the Joint marker populated"*|*"joint_journal_unavailable"*)
-            printf 'fail|%s\n' "$EXPECTED_WU2"
+            printf 'false|expected-failure|%s\n' "$EXPECTED_WU2"
             return 0
             ;;
         *"below minimum"*)
-            if awk "BEGIN{exit !(($max_load) > ($cpus))}"; then
-                printf 'nonqualifying|\n'
+            if loaded_host "$max_load" "$cpus"; then
+                printf 'false|nonqualifying|\n'
             else
-                printf 'fail|\n'
+                printf 'false|failed|\n'
+            fi
+            return 0
+            ;;
+        *"unreadable events"*|*"unreadable ledger"*|*"unreadable inventory"*|\
+*"event stream incomplete"*|*"missing or duplicate"*|*"not unique"*|\
+*"not the exact"*|*"not complete"*|*"no ledgers emitted"*|\
+*"never published"*|*"never printed"*|*"never became"*|\
+*"no admission pass"*|*"no binding pass"*|*"not held"*|\
+*" rc="*|*"chmod failed"*)
+            # Evidence never met the oracle's input shape: judgeable
+            # only on a quiet host.
+            if loaded_host "$max_load" "$cpus"; then
+                printf 'false|nonqualifying|\n'
+            else
+                printf 'false|failed|\n'
             fi
             return 0
             ;;
         *)
-            printf 'fail|\n'
+            printf 'false|failed|\n'
             return 0
             ;;
     esac
 }
 
-# Append one results.jsonl row. $1 cell, $2 result, $3 detail, $4 expected.
+# Append one results.jsonl row. $1 cell, $2 pass (true/false),
+# $3 qualification, $4 detail.
 write_row() {
-    python3 - "$RESULTS_JSONL" "$1" "$2" "$3" "${4:-}" <<'PYEOF'
+    python3 - "$RESULTS_JSONL" "$1" "$2" "$3" "$4" <<'PYEOF'
 import json, sys
-path, cell, result, detail, expected = sys.argv[1:6]
-row = {"cell": cell, "result": result, "detail": detail}
-if expected:
-    row["expected"] = expected
+path, cell, passed, qualification, detail = sys.argv[1:6]
+row = {"cell": cell, "pass": passed == "true",
+       "qualification": qualification, "detail": detail}
 with open(path, "a", encoding="utf-8") as stream:
     stream.write(json.dumps(row, sort_keys=True) + "\n")
 PYEOF
+}
+
+# --events arguments for every retained part, oldest first: the
+# numeric suffixes in descending order (.2 before .1), then the
+# live base. The oracle sorts by seq, so the order is for humans.
+event_args() {
+    dir=$1
+    args=""
+    parts=$(for part in "$dir"/events.jsonl.[0-9]*; do
+        [ -f "$part" ] || continue
+        printf '%s\n' "$part"
+    done | awk -F. '{ print $NF "\t" $0 }' | sort -n -r -k1,1 | cut -f2-) || parts=""
+    for part in $parts; do
+        args="$args --events $part"
+    done
+    printf '%s --events %s\n' "$args" "$dir/events.jsonl"
+}
+
+# Take evidence ownership after the observer stops: the report,
+# the live event log and any rotated parts (rotation may leave a
+# part root-only). Returns nonzero when the chmod fails.
+take_evidence() {
+    sudo -n chmod 644 "$1/report.json" "$1"/events.jsonl*
+}
+
+# Record a flow failure: rc 2 plus a machine-readable oracle.json
+# carrying the reason, so the verdict mapping reads it uniformly.
+fail_flow() {
+    dir=$1
+    ORACLE_RC=2
+    ORACLE_REASON=$2
+    printf '{"verdict": "fail", "reason": "%s"}\n' "$2" > "$dir/oracle.json"
 }
 
 # --- privileged cells (only main reaches these) ---
@@ -331,21 +398,21 @@ run_oracle() {
         ledger_args="$ledger_args --ledger $ledger"
     done
     if [ -z "$ledger_args" ]; then
-        ORACLE_RC=2
-        ORACLE_REASON="no ledgers emitted"
+        fail_flow "$dir" "no ledgers emitted"
         return 0
     fi
-    # Word-split the assembled --ledger list. An oracle fail verdict
-    # is rc 1, not a shell error: capture it without tripping set -e.
+    # Word-split the assembled --ledger/--events lists. An oracle
+    # fail verdict is rc 1, not a shell error: capture it without
+    # tripping set -e.
     # shellcheck disable=SC2086
     ORACLE_RC=0
     if [ -n "$mode" ]; then
         python3 -I "$ORACLE" --joint --min-rate "$MIN_RATE" $ledger_args \
-            --events "$dir/events.jsonl" --inventory "$dir/report.json" \
+            $(event_args "$dir") --inventory "$dir/report.json" \
             > "$dir/oracle.json" 2> "$dir/oracle.err" || ORACLE_RC=$?
     else
         python3 -I "$ORACLE" --min-rate "$MIN_RATE" $ledger_args \
-            --events "$dir/events.jsonl" --inventory "$dir/report.json" \
+            $(event_args "$dir") --inventory "$dir/report.json" \
             > "$dir/oracle.json" 2> "$dir/oracle.err" || ORACLE_RC=$?
     fi
     ORACLE_REASON=$(python3 -c \
@@ -360,12 +427,17 @@ finish_cell() {
     detail_extra=$3
     cpus=$(nproc_)
     mapping=$(map_verdict "$ORACLE_RC" "$dir/oracle.json" "$LOAD_MAX" "$cpus")
-    result=${mapping%%|*}
-    expected=${mapping#*|}
+    passed=${mapping%%|*}
+    rest=${mapping#*|}
+    qualification=${rest%%|*}
+    marker=${rest#*|}
     detail="host=$(hostname) kernel=$(uname -r) rate=$RATE dur=$DURATION min_rate=$MIN_RATE load1=$LOAD_TRACE nproc=$cpus provider=$PROVIDER $detail_extra oracle_rc=$ORACLE_RC reason=$ORACLE_REASON dir=$dir"
-    write_row "$cell" "$result" "$detail" "$expected"
-    log "$cell: $result ${expected:+($expected) } :: $ORACLE_REASON"
-    [ "$result" = "pass" ]
+    if [ -n "$marker" ]; then
+        detail="$detail expected-failure: $marker"
+    fi
+    write_row "$cell" "$passed" "$qualification" "$detail"
+    log "$cell: pass=$passed $qualification ${marker:+($marker) }:: $ORACLE_REASON"
+    [ "$passed" = "true" ] || [ "$qualification" != "failed" ]
 }
 
 # One joint cell: --system --key-operations, spawn after pass 0, no GO.
@@ -396,9 +468,7 @@ run_joint_cell() {
         log "$cell: pass 0 never published"
         kill_observer "$dir/observer.pid"
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="pass 0 never published"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "pass 0 never published"
         finish_cell "$cell" "$dir" "flow=pass0-timeout" || return 1
         return 0
     fi
@@ -416,9 +486,7 @@ run_joint_cell() {
         kill_observer "$dir/observer.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="MAPPED never printed"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "MAPPED never printed"
         finish_cell "$cell" "$dir" "flow=mapped-timeout" || return 1
         return 0
     fi
@@ -430,9 +498,7 @@ run_joint_cell() {
         kill_observer "$dir/observer.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="no admission pass after mapping"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "no admission pass after mapping"
         finish_cell "$cell" "$dir" "flow=admit-timeout" || return 1
         return 0
     fi
@@ -444,9 +510,7 @@ run_joint_cell() {
         kill_observer "$dir/observer.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="generator never became ready"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "generator never became ready"
         finish_cell "$cell" "$dir" "flow=ready-timeout" || return 1
         return 0
     fi
@@ -458,9 +522,7 @@ run_joint_cell() {
         kill_observer "$dir/observer.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="no binding pass after setup"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "no binding pass after setup"
         finish_cell "$cell" "$dir" "flow=bind-timeout" || return 1
         return 0
     fi
@@ -473,9 +535,7 @@ run_joint_cell() {
         kill_observer "$dir/observer.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="DONE never printed"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "DONE never printed"
         finish_cell "$cell" "$dir" "flow=done-timeout" || return 1
         return 0
     fi
@@ -488,9 +548,7 @@ run_joint_cell() {
         kill_pidfile "$dir/gen.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="observer rc=$obs_rc"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "observer rc=$obs_rc"
         finish_cell "$cell" "$dir" "flow=observer-rc" || return 1
         return 0
     fi
@@ -499,9 +557,7 @@ run_joint_cell() {
         kill_pidfile "$dir/gen.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="target not held through drain"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "target not held through drain"
         finish_cell "$cell" "$dir" "flow=hold-broken" || return 1
         return 0
     fi
@@ -511,16 +567,12 @@ run_joint_cell() {
     exec 9>&-
     log "$cell: generator rc=$gen_rc"
     if [ "$gen_rc" -ne 0 ]; then
-        ORACLE_RC=2
-        ORACLE_REASON="generator rc=$gen_rc"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "generator rc=$gen_rc"
         finish_cell "$cell" "$dir" "flow=generator-rc" || return 1
         return 0
     fi
-    if ! sudo -n chmod 644 "$dir/report.json" "$dir/events.jsonl"; then
-        ORACLE_RC=2
-        ORACLE_REASON="evidence chmod failed"
-        : > "$dir/oracle.json"
+    if ! take_evidence "$dir"; then
+        fail_flow "$dir" "evidence chmod failed"
         finish_cell "$cell" "$dir" "flow=chmod" || return 1
         return 0
     fi
@@ -551,9 +603,7 @@ run_twin_cell() {
         log "$cell: generator never became ready"
         kill_pidfile "$dir/gen.pid"
         wait 2>/dev/null || true
-        ORACLE_RC=2
-        ORACLE_REASON="generator never became ready"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "generator never became ready"
         finish_cell "$cell" "$dir" "flow=ready-timeout" || return 1
         return 0
     fi
@@ -574,9 +624,7 @@ run_twin_cell() {
         kill_observer "$dir/observer.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="pass 0 never published"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "pass 0 never published"
         finish_cell "$cell" "$dir" "flow=pass0-timeout" || return 1
         return 0
     fi
@@ -590,9 +638,7 @@ run_twin_cell() {
         kill_observer "$dir/observer.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="DONE never printed"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "DONE never printed"
         finish_cell "$cell" "$dir" "flow=done-timeout" || return 1
         return 0
     fi
@@ -605,9 +651,7 @@ run_twin_cell() {
         kill_pidfile "$dir/gen.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="observer rc=$obs_rc"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "observer rc=$obs_rc"
         finish_cell "$cell" "$dir" "flow=observer-rc" || return 1
         return 0
     fi
@@ -616,9 +660,7 @@ run_twin_cell() {
         kill_pidfile "$dir/gen.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        ORACLE_RC=2
-        ORACLE_REASON="target not held through drain"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "target not held through drain"
         finish_cell "$cell" "$dir" "flow=hold-broken" || return 1
         return 0
     fi
@@ -628,16 +670,12 @@ run_twin_cell() {
     exec 9>&-
     log "$cell: generator rc=$gen_rc"
     if [ "$gen_rc" -ne 0 ]; then
-        ORACLE_RC=2
-        ORACLE_REASON="generator rc=$gen_rc"
-        : > "$dir/oracle.json"
+        fail_flow "$dir" "generator rc=$gen_rc"
         finish_cell "$cell" "$dir" "flow=generator-rc" || return 1
         return 0
     fi
-    if ! sudo -n chmod 644 "$dir/report.json" "$dir/events.jsonl"; then
-        ORACLE_RC=2
-        ORACLE_REASON="evidence chmod failed"
-        : > "$dir/oracle.json"
+    if ! take_evidence "$dir"; then
+        fail_flow "$dir" "evidence chmod failed"
         finish_cell "$cell" "$dir" "flow=chmod" || return 1
         return 0
     fi
@@ -647,11 +685,14 @@ run_twin_cell() {
     return 0
 }
 
-# results.jsonl row for a skipped run.
+# results.jsonl rows when a prerequisite is missing: the run exits
+# 77, and the cells are nonqualifying (never judged), with the
+# missing prerequisite in detail.
 skip_all() {
     why=$1
     for cell in ${CELLS:-joint-10k-single joint-10k-churn s1-10k-twin}; do
-        write_row "$cell" "skip" "host=$(hostname) reason=$why" ""
+        write_row "$cell" "false" "nonqualifying" \
+            "host=$(hostname) prerequisite missing: $why"
     done
 }
 

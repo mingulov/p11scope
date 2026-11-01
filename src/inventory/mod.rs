@@ -5917,11 +5917,12 @@ impl ClassicDriver<'_> {
         // private to the machine (`machine.rs`); this arm reads and
         // spends the shared fields directly. A fault or over-work
         // answer records `Unavailable` for the fallback stop reason
-        // but never latches the machine: it sets the capture's sticky
-        // discovery status, so the lane's coverage fails permanently
-        // at the next audit while publication proceeds with coverage
-        // failed. One-credit hooks skip the pump and advance the
-        // machine, as in the unlinked rule.
+        // and charges the share it was given, but never latches the
+        // machine: it sets the capture's sticky discovery status, so
+        // the lane's coverage fails permanently at the next audit
+        // while publication proceeds with coverage failed. One-credit
+        // hooks skip the pump and advance the machine, as in the
+        // unlinked rule.
         let mut pump_refusal = None;
         if budget.remaining_actions > 1 && Instant::now() < budget.deadline {
             let work = (budget.remaining_actions - 1)
@@ -5930,10 +5931,16 @@ impl ClassicDriver<'_> {
                 Ok(records) if records <= work => {
                     budget.remaining_actions = budget.remaining_actions.saturating_sub(records);
                 }
+                // A refused pump drained up to its share before failing,
+                // so both refusal arms charge the share: `work` never
+                // exceeds `remaining - 1`, so the machine keeps at least
+                // one action and the hook keeps the 1024-action bound.
                 Ok(_) => {
+                    budget.remaining_actions -= work;
                     pump_refusal = Some(crate::inventory_semantics::SemanticRefusal::Unavailable);
                 }
                 Err(reason) => {
+                    budget.remaining_actions -= work;
                     pump_refusal = Some(reason);
                 }
             }

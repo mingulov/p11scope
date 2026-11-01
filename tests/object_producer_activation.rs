@@ -3161,6 +3161,12 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// source change: `emit_lifecycle` acquires the ticket only when the
 /// scope flags lack the PID-filter bit, plus its comment lines): 143780 B,
 /// measured with this same lexer; the previous pin matches its parent.
+/// Re-baselined for the exec-witness stamp narrowing on top of that
+/// exclusion (the only BPF source change: `emit_lifecycle` compiles the
+/// ticket out of counter flavors and, in Detailed, stamps it only while
+/// short-lived tracking is armed outside aggregate captures, plus its
+/// comment lines and the counter-flavor cfg on the helper import):
+/// 144104 B, measured with this same lexer on the integrated source.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3170,8 +3176,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            143780,
-            "36d08e8ea491ecdd19e7253743a1b8c1cfeb32ed3f456eee649991b38b295c9f"
+            144104,
+            "2d26a4fbdc7dc004705ebcc0c3debbb9b18a10841432e86f47c98d2b7426ca89"
         ),
         "stripped BPF dump must stay byte-identical"
     );

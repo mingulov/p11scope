@@ -154,10 +154,11 @@ fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
 "#;
     if !comparison
         .lines()
-        // Pinned baseline 9a0b277a: the PID-scope EXEC ticket fix on top of
-        // the reviewed loader + bank + journal delta since ba92b4e2 and the
-        // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        .any(|line| line == "          BASELINE=9a0b277ad47401c19cca62ad146cabd98f42985d")
+        // Pinned baseline b3b75346: the exec-witness health-counter fix on top
+        // of the PID-scope EXEC ticket fix, the reviewed loader + bank + journal
+        // delta since ba92b4e2 and the loader-gate wiring since 90b8cf9f; all
+        // enumerated in the ci.yml comment.
+        .any(|line| line == "          BASELINE=b3b753469df76553bba7fb0e8dec48666f45569a")
         || !comparison.contains(repeat)
         || !comparison.contains(integration)
         || comparison.contains("--host-compiler-transition")
@@ -237,10 +238,11 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
         "a renamed comparison job must be rejected"
     );
     for marker in [
-        // Pinned baseline 9a0b277a: the PID-scope EXEC ticket fix on top of
-        // the reviewed loader + bank + journal delta since ba92b4e2 and the
-        // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=9a0b277ad47401c19cca62ad146cabd98f42985d",
+        // Pinned baseline b3b75346: the exec-witness health-counter fix on top
+        // of the PID-scope EXEC ticket fix, the reviewed loader + bank + journal
+        // delta since ba92b4e2 and the loader-gate wiring since 90b8cf9f; all
+        // enumerated in the ci.yml comment.
+        "BASELINE=b3b753469df76553bba7fb0e8dec48666f45569a",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"",

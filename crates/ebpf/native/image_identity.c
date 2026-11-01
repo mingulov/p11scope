@@ -334,8 +334,9 @@ __attribute__((noinline)) u32 p11_image_bank_cut(u64 target)
  * (fold-complete), healthy and roomy with a valid epoch; any other
  * quota refuses honestly. Returned tickets stay local; the issuing
  * (or retaining) bank and its observed incarnation travel alongside
- * for the identity entry to qualify. */
-static __always_inline struct cookie_result cookie_for(struct task_struct *task)
+ * for the identity entry to qualify. A witness pass clears
+ * count_failures so its misses never touch the shared health cells. */
+static __always_inline struct cookie_result cookie_for(struct task_struct *task, int count_failures)
 {
     struct cookie_result result = {
         .cookie = 0, .incarnation = 0,
@@ -375,7 +376,9 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
         return result;
     }
     if (!bank_control_valid(control)) {
-        identity_count(select, &control->unavailable);
+        if (count_failures) {
+            identity_count(select, &control->unavailable);
+        }
         result.status = COOKIE_STATUS_BAD_CONFIG;
         return result;
     }
@@ -406,14 +409,18 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
             return result;
         }
         if (!bank_control_valid(origin)) {
-            identity_count(select, &origin->unavailable);
+            if (count_failures) {
+                identity_count(select, &origin->unavailable);
+            }
             result.status = COOKIE_STATUS_BAD_CONFIG;
             return result;
         }
         /* Domain before row: an overflowed epoch refuses even a
          * stored cell, so no qualifier can wrap into an alias. */
         if (source_epoch >= IMAGE_IDENTITY_INCARNATION_LIMIT) {
-            identity_count(select, &origin->unavailable);
+            if (count_failures) {
+                identity_count(select, &origin->unavailable);
+            }
             result.status = COOKIE_STATUS_BAD_CONFIG;
             return result;
         }
@@ -423,7 +430,9 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
             result.incarnation = source_epoch;
             result.status = COOKIE_STATUS_OK;
         } else {
-            identity_count(select, &origin->unavailable);
+            if (count_failures) {
+                identity_count(select, &origin->unavailable);
+            }
             result.status = COOKIE_STATUS_ZERO_CELL;
         }
         return result;
@@ -443,7 +452,9 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
         epochs[1] = select->incarnation[1];
         epoch = (bank == 0) ? epochs[0] : epochs[1];
         if (epoch >= IMAGE_IDENTITY_INCARNATION_LIMIT) {
-            identity_count(select, &control->unavailable);
+            if (count_failures) {
+                identity_count(select, &control->unavailable);
+            }
             result.status = COOKIE_STATUS_BAD_CONFIG;
             return result;
         }
@@ -468,7 +479,9 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
                 control = target;
                 continue;
             }
-            identity_count(select, &control->unavailable);
+            if (count_failures) {
+                identity_count(select, &control->unavailable);
+            }
             bank_refuse(select);
             result.status = COOKIE_STATUS_QUOTA;
             return result;
@@ -489,7 +502,9 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
                 result.incarnation = epoch;
                 result.status = COOKIE_STATUS_OK;
             } else {
-                identity_count(select, &control->unavailable);
+                if (count_failures) {
+                    identity_count(select, &control->unavailable);
+                }
                 result.status = COOKIE_STATUS_ZERO_CELL;
             }
             return result;
@@ -504,19 +519,25 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
             return result;
         }
 
-        identity_count(select, &control->create_failures);
-        identity_count(select, &control->unavailable);
+        if (count_failures) {
+            identity_count(select, &control->create_failures);
+            identity_count(select, &control->unavailable);
+        }
         result.status = COOKIE_STATUS_CREATE_FAILED;
         return result;
     }
 
-    identity_count(select, &control->retry_exhausted);
-    identity_count(select, &control->unavailable);
+    if (count_failures) {
+        identity_count(select, &control->retry_exhausted);
+        identity_count(select, &control->unavailable);
+    }
     result.status = COOKIE_STATUS_RETRY_EXHAUSTED;
     return result;
 }
 #else
-static __always_inline struct cookie_result cookie_for(struct task_struct *task)
+/* A witness pass clears count_failures so its misses never touch the
+ * shared health cells. */
+static __always_inline struct cookie_result cookie_for(struct task_struct *task, int count_failures)
 {
     struct cookie_result result = {
         .cookie = 0, .incarnation = 0,
@@ -535,7 +556,9 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
     }
     if (control->limit != IMAGE_IDENTITY_TICKET_LIMIT ||
         control->next_ticket > IMAGE_IDENTITY_TICKET_LIMIT) {
-        finite_increment(&control->unavailable);
+        if (count_failures) {
+            finite_increment(&control->unavailable);
+        }
         result.status = COOKIE_STATUS_BAD_CONFIG;
         return result;
     }
@@ -546,7 +569,9 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
             result.cookie = *cell;
             result.status = COOKIE_STATUS_OK;
         } else {
-            finite_increment(&control->unavailable);
+            if (count_failures) {
+                finite_increment(&control->unavailable);
+            }
             result.status = COOKIE_STATUS_ZERO_CELL;
         }
         return result;
@@ -559,7 +584,9 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
         u64 proposed;
 
         if (ticket >= control->limit) {
-            finite_increment(&control->unavailable);
+            if (count_failures) {
+                finite_increment(&control->unavailable);
+            }
             result.status = COOKIE_STATUS_QUOTA;
             return result;
         }
@@ -577,7 +604,9 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
                 result.cookie = *cell;
                 result.status = COOKIE_STATUS_OK;
             } else {
-                finite_increment(&control->unavailable);
+                if (count_failures) {
+                    finite_increment(&control->unavailable);
+                }
                 result.status = COOKIE_STATUS_ZERO_CELL;
             }
             return result;
@@ -590,14 +619,18 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task)
             return result;
         }
 
-        finite_increment(&control->create_failures);
-        finite_increment(&control->unavailable);
+        if (count_failures) {
+            finite_increment(&control->create_failures);
+            finite_increment(&control->unavailable);
+        }
         result.status = COOKIE_STATUS_CREATE_FAILED;
         return result;
     }
 
-    finite_increment(&control->retry_exhausted);
-    finite_increment(&control->unavailable);
+    if (count_failures) {
+        finite_increment(&control->retry_exhausted);
+        finite_increment(&control->unavailable);
+    }
     result.status = COOKIE_STATUS_RETRY_EXHAUSTED;
     return result;
 }
@@ -613,7 +646,7 @@ static __always_inline u32 identity_for(struct task_struct *task,
         return COOKIE_STATUS_BAD_TASK;
     *(volatile u64 *)&out->task_cookie = 0;
     *(volatile u64 *)&out->exec_id = 0;
-    result = cookie_for(task);
+    result = cookie_for(task, 1);
     if (result.status != COOKIE_STATUS_OK)
         return result.status;
 #ifdef P11SCOPE_LOADER_GATE
@@ -650,7 +683,8 @@ __attribute__((noinline)) u32 p11_link_current_identity(struct image_identity *o
 }
 
 /* Private EXEC witness: task incarnation only. Reuse the same bounded
- * allocator without identity_for's self_exec_id read. Callers acquire this
+ * allocator without identity_for's self_exec_id read, and without
+ * touching the shared health cells on failure. Callers acquire this
  * only after scope admission and a successful lifecycle ring reservation. */
 __attribute__((noinline)) u64 p11_link_current_cookie(void)
 {
@@ -658,7 +692,7 @@ __attribute__((noinline)) u64 p11_link_current_cookie(void)
     struct cookie_result result;
     if (!current)
         return 0;
-    result = cookie_for(current->group_leader);
+    result = cookie_for(current->group_leader, 0);
     if (result.status != COOKIE_STATUS_OK || !result.cookie ||
         result.cookie > IMAGE_IDENTITY_TICKET_LIMIT)
         return 0;
@@ -678,7 +712,7 @@ __attribute__((noinline)) u32 p11_link_task_ticket(struct task_struct *task, u64
     *ticket_out = 0;
     if (!task)
         return COOKIE_STATUS_BAD_TASK;
-    result = cookie_for(task);
+    result = cookie_for(task, 1);
     if (result.status != COOKIE_STATUS_OK)
         return result.status;
     *ticket_out = result.cookie;

@@ -8,9 +8,23 @@ extern u32 p11_link_task_ticket(struct task_struct *task, u64 *ticket_out)
 extern u32 p11_image_identity_issued(u64 *watermark_out) __attribute__((weak));
 extern u32 p11_image_bank_select(void) __attribute__((weak));
 extern u32 p11_image_bank_cut(u64 target) __attribute__((weak));
+extern u64 p11_link_current_cookie(void) __attribute__((weak));
 /* Map presence is compile-enforced now: the stub routing below
  * references the bank maps, so an ifdefed-out bank fails the build. */
+/* Witness-neutrality CAS injection: while witness_lost_race_cell is set,
+ * every CAS on that cell fails so the retry-exhaustion twin can prove
+ * witness misses stay flat while ticket misses still count. Null by
+ * default, so all existing scenarios use the real CAS. */
+static u64 *witness_lost_race_cell = 0;
+static u64 witness_injected_cas(u64 *cell, u64 old, u64 replacement)
+{
+    if (cell == witness_lost_race_cell)
+        return old + 1;
+    return __sync_val_compare_and_swap(cell, old, replacement);
+}
+#define __sync_val_compare_and_swap witness_injected_cas
 #include "image_identity.c"
+#undef __sync_val_compare_and_swap
 #include <assert.h>
 #include <pthread.h>
 #include <stddef.h>
@@ -834,6 +848,149 @@ static void binding_stays_local(void)
     puts("ASSERT binding_a_stays_local");
 }
 
+/* Bank-variant witness neutrality: quota, zero-cell, create, retry and
+ * config failures through p11_link_current_cookie (count_failures=0)
+ * must leave the shared health counters (unavailable, create_failures,
+ * retry_exhausted) unchanged on both banks. The ticket path (count=1)
+ * keeps counting its own failures. */
+static void bank_witness_neutrality(void)
+{
+    u64 ticket = 0;
+
+    assert(&p11_link_current_cookie && "witness needs the cookie-only helper");
+    assert(&p11_link_task_ticket && "control needs the ticket query");
+    bpf_get_current_task_btf = stub_current_task;
+    stub_leader = 0;
+    /* Healthy: allocates ticket 1, counters flat. */
+    reset();
+    bpf_get_current_task_btf = stub_current_task;
+    stub_leader = 0;
+    ctl.unavailable = 11;
+    ctl.create_failures = 13;
+    ctl.retry_exhausted = 17;
+    ctl_b.unavailable = 21;
+    ctl_b.create_failures = 23;
+    ctl_b.retry_exhausted = 29;
+    assert(p11_link_current_cookie() == 1);
+    assert(ctl.next_ticket == 1);
+    assert(ctl.unavailable == 11 && ctl.create_failures == 13 && ctl.retry_exhausted == 17);
+    assert(ctl_b.unavailable == 21 && ctl_b.create_failures == 23 && ctl_b.retry_exhausted == 29);
+    puts("ASSERT witness_healthy_flat");
+    /* Quota: zero ticket, watermark held, flat. */
+    reset();
+    bpf_get_current_task_btf = stub_current_task;
+    stub_leader = 0;
+    ctl.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
+    ctl.unavailable = 11;
+    ctl.create_failures = 13;
+    ctl.retry_exhausted = 17;
+    ctl_b.unavailable = 21;
+    ctl_b.create_failures = 23;
+    ctl_b.retry_exhausted = 29;
+    assert(p11_link_current_cookie() == 0);
+    assert(ctl.next_ticket == IMAGE_IDENTITY_TICKET_LIMIT);
+    assert(ctl.unavailable == 11 && ctl.create_failures == 13 && ctl.retry_exhausted == 17);
+    assert(ctl_b.unavailable == 21 && ctl_b.create_failures == 23 && ctl_b.retry_exhausted == 29);
+    puts("ASSERT witness_quota_flat");
+    /* Zero cell: zero ticket, flat. */
+    reset();
+    bpf_get_current_task_btf = stub_current_task;
+    stub_leader = 0;
+    present[0] = 1;
+    stored[0] = 0;
+    ctl.unavailable = 11;
+    ctl.create_failures = 13;
+    ctl.retry_exhausted = 17;
+    ctl_b.unavailable = 21;
+    ctl_b.create_failures = 23;
+    ctl_b.retry_exhausted = 29;
+    assert(p11_link_current_cookie() == 0);
+    assert(ctl.unavailable == 11 && ctl.create_failures == 13 && ctl.retry_exhausted == 17);
+    assert(ctl_b.unavailable == 21 && ctl_b.create_failures == 23 && ctl_b.retry_exhausted == 29);
+    puts("ASSERT witness_zero_cell_flat");
+    /* Create failure: zero ticket, the CAS ticket is still spent, flat. */
+    reset();
+    bpf_get_current_task_btf = stub_current_task;
+    stub_leader = 0;
+    fail_create = 1;
+    ctl.next_ticket = 0;
+    ctl.unavailable = 11;
+    ctl.create_failures = 13;
+    ctl.retry_exhausted = 17;
+    ctl_b.unavailable = 21;
+    ctl_b.create_failures = 23;
+    ctl_b.retry_exhausted = 29;
+    assert(p11_link_current_cookie() == 0);
+    assert(ctl.next_ticket == 1);
+    assert(ctl.unavailable == 11 && ctl.create_failures == 13 && ctl.retry_exhausted == 17);
+    assert(ctl_b.unavailable == 21 && ctl_b.create_failures == 23 && ctl_b.retry_exhausted == 29);
+    fail_create = 0;
+    puts("ASSERT witness_create_flat");
+    /* Bad config: zero ticket, flat. */
+    reset();
+    bpf_get_current_task_btf = stub_current_task;
+    stub_leader = 0;
+    ctl.limit = 0;
+    ctl.unavailable = 11;
+    ctl.create_failures = 13;
+    ctl.retry_exhausted = 17;
+    ctl_b.unavailable = 21;
+    ctl_b.create_failures = 23;
+    ctl_b.retry_exhausted = 29;
+    assert(p11_link_current_cookie() == 0);
+    assert(ctl.unavailable == 11 && ctl.create_failures == 13 && ctl.retry_exhausted == 17);
+    assert(ctl_b.unavailable == 21 && ctl_b.create_failures == 23 && ctl_b.retry_exhausted == 29);
+    puts("ASSERT witness_bad_config_flat");
+    /* CAS exhaustion: zero ticket after the bounded tries, flat. */
+    reset();
+    bpf_get_current_task_btf = stub_current_task;
+    stub_leader = 0;
+    ctl.next_ticket = 0;
+    ctl.unavailable = 11;
+    ctl.create_failures = 13;
+    ctl.retry_exhausted = 17;
+    ctl_b.unavailable = 21;
+    ctl_b.create_failures = 23;
+    ctl_b.retry_exhausted = 29;
+    witness_lost_race_cell = &ctl.next_ticket;
+    assert(p11_link_current_cookie() == 0);
+    assert(ctl.next_ticket == 0);
+    assert(ctl.unavailable == 11 && ctl.create_failures == 13 && ctl.retry_exhausted == 17);
+    assert(ctl_b.unavailable == 21 && ctl_b.create_failures == 23 && ctl_b.retry_exhausted == 29);
+    witness_lost_race_cell = 0;
+    puts("ASSERT witness_retry_flat");
+    /* The ticket path keeps counting: quota still raises unavailable. */
+    reset();
+    ctl.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
+    ctl.unavailable = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_QUOTA);
+    assert(ticket == 0 && ctl.unavailable == 1);
+    puts("ASSERT ticket_quota_counts");
+    /* Create failures still raise create_failures and unavailable. */
+    reset();
+    fail_create = 1;
+    ctl.next_ticket = 0;
+    ctl.create_failures = 0;
+    ctl.unavailable = 0;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[2], &ticket) == COOKIE_STATUS_CREATE_FAILED);
+    assert(ticket == 0 && ctl.create_failures == 1 && ctl.unavailable == 1);
+    fail_create = 0;
+    puts("ASSERT ticket_create_counts");
+    /* Retry exhaustion still raises retry_exhausted and unavailable. */
+    reset();
+    ctl.next_ticket = 0;
+    ctl.retry_exhausted = 0;
+    ctl.unavailable = 0;
+    witness_lost_race_cell = &ctl.next_ticket;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[3], &ticket) == COOKIE_STATUS_RETRY_EXHAUSTED);
+    assert(ticket == 0 && ctl.retry_exhausted == 1 && ctl.unavailable == 1);
+    witness_lost_race_cell = 0;
+    puts("ASSERT ticket_retry_counts");
+}
+
 /* A healthy B admission folds the claimed bank: fold help is not
  * quota-gated. The pending-fold watermark excludes the retired bank
  * (its count already lives in folded_issued), the retired epoch still
@@ -1173,6 +1330,8 @@ int main(int argc, char **argv)
         hit_overflow_refuses();
     } else if (!strcmp(argv[1], "guard-before-zero-cell")) {
         guard_before_zero_cell();
+    } else if (!strcmp(argv[1], "bank-witness-neutrality")) {
+        bank_witness_neutrality();
 #ifdef IMAGE_HOST_CAS_HOOK
     } else if (!strcmp(argv[1], "identity-cas-exhaustion")) {
         identity_cas_exhaustion();

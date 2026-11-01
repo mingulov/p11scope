@@ -12300,7 +12300,10 @@ mod tests {
             "LOADER_GATE",
             "LOADER_GATE_CTL",
         ] {
-            assert!(super::is_identity_map(name), "{name} must route to identity");
+            assert!(
+                super::is_identity_map(name),
+                "{name} must route to identity"
+            );
         }
         for name in ["CONFIG", "PROC_EPOCH", "OTHER"] {
             assert!(!super::is_identity_map(name), "{name} must route to policy");

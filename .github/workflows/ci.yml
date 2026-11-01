@@ -502,7 +502,13 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin 9a0b277a, the reviewed PID-scope EXEC ticket fix: emit_lifecycle no
+      # Pin b3b75346, the reviewed exec-witness health-counter fix: the native
+      # witness no longer counts allocator misses, and emit_lifecycle stamps the
+      # EXEC ticket in Detailed only while short-lived tracking is armed outside
+      # aggregate captures (counter objects compile the ticket out), a code
+      # change in the Detailed and InventoryCallers objects. No other BPF input
+      # changed since 9a0b277a.
+      # Earlier pin 9a0b277a, the reviewed PID-scope EXEC ticket fix: emit_lifecycle no
       # longer takes the EXEC task ticket under PID scope, a code change in the
       # Detailed and InventoryCallers objects (the inventory object should differ
       # only in line info). No other BPF input changed since 30208b48.
@@ -537,7 +543,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=9a0b277ad47401c19cca62ad146cabd98f42985d
+          BASELINE=b3b753469df76553bba7fb0e8dec48666f45569a
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

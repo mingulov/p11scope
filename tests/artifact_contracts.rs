@@ -612,10 +612,11 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
         "- name: Install packaged bpftool",
         "set -euo pipefail",
-        // Pinned baseline 9a0b277a: the PID-scope EXEC ticket fix on top of
-        // the reviewed loader + bank + journal delta since ba92b4e2 and the
-        // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=9a0b277ad47401c19cca62ad146cabd98f42985d",
+        // Pinned baseline b3b75346: the exec-witness health-counter fix on top
+        // of the PID-scope EXEC ticket fix, the reviewed loader + bank + journal
+        // delta since ba92b4e2 and the loader-gate wiring since 90b8cf9f; all
+        // enumerated in the ci.yml comment.
+        "BASELINE=b3b753469df76553bba7fb0e8dec48666f45569a",
         "python3 -I scripts/check-bpf-noninterference.py \\",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
@@ -9673,10 +9674,11 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         "needs: [dedupe, tests]",
         "!cancelled() && needs.dedupe.outputs.run == 'true'",
         "fetch-depth: 0",
-        // Pinned baseline 9a0b277a: the PID-scope EXEC ticket fix on top of
-        // the reviewed loader + bank + journal delta since ba92b4e2 and the
-        // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=9a0b277ad47401c19cca62ad146cabd98f42985d",
+        // Pinned baseline b3b75346: the exec-witness health-counter fix on top
+        // of the PID-scope EXEC ticket fix, the reviewed loader + bank + journal
+        // delta since ba92b4e2 and the loader-gate wiring since 90b8cf9f; all
+        // enumerated in the ci.yml comment.
+        "BASELINE=b3b753469df76553bba7fb0e8dec48666f45569a",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"\n",

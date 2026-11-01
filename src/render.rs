@@ -2547,10 +2547,12 @@ pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
             }),
         );
     }
-    // B17 W2: present if and only if the capture disclosed a tainted
-    // identity. Per-identity entries plus the capture counts; the
-    // private image key never renders, and the key never feeds
-    // shares, verdicts, or completeness.
+    // B17 W2: present whenever the capture produced reload evidence:
+    // a disclosed tainted identity, or nonzero count snapshots with
+    // an empty identities list (mint exhaustion). Per-identity
+    // entries plus the capture counts; the private image key never
+    // renders, and the key never feeds shares, verdicts, or
+    // completeness.
     if let Some(reload) = ev.instance_reload_not_excluded.as_ref() {
         let identities: Vec<serde_json::Value> = reload
             .identities

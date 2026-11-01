@@ -81,11 +81,16 @@ continuation, the terminal profile-lane evidence also contains an
 optional additive `instance_reload_not_excluded` object. Captures
 without a disclosing producer omit it (absent, never zero or null);
 the metrics lane never carries it, and the terminal trace `EVIDENCE`
-object carries it under the same rule. Its keys are
+object carries it under the same rule. When the router counted tainted
+continuations but minted no identity to name (mint exhaustion), the key
+is still present with the exact snapshots and an empty `identities`
+list: the router is the producer then, so absent-never-zero does not
+apply. Its keys are
 `continued_across_global` and `joined_across_global` (the
 capture-monotonic router snapshots: tainted continuations observed and
 calls joined through a tainted entry) and `identities` (one entry per
-tainted identity, in `(file_slot, ids)` order). Each entry names the
+tainted identity, in `(file_slot, ids)` order; empty under mint
+exhaustion). Each entry names the
 watched `file_slot` and the continued capture-local instance `ids`.
 Entries carry no task cookie, exec id, epoch, range or address: the
 private image key groups the ledger but never renders. The key is

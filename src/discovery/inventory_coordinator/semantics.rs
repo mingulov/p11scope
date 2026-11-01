@@ -2326,18 +2326,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// B17 W2 terminal projection of the namespace reload disclosure
-    /// ledger: `None` without a disclosed identity (absent, never
-    /// zero), else the per-identity entries in `(file_slot, ids)`
-    /// order plus the latest count snapshots. The private image key
-    /// never leaves the ledger. Tests only until a lane-backed
-    /// producer feeds the capture render.
+    /// ledger: `None` only without a producer — an empty ledger with
+    /// zero count snapshots (absent, never zero). Nonzero snapshots
+    /// project even with an empty identities list: the router is the
+    /// producer then, and exact counts with no identities is the
+    /// honest mint-exhaustion shape. Else the per-identity entries
+    /// in `(file_slot, ids)` order plus the latest count snapshots.
+    /// The private image key never leaves the ledger. Tests only
+    /// until a lane-backed producer feeds the capture render.
     #[cfg(test)]
     pub(crate) fn reload_not_excluded_evidence(
         &self,
     ) -> Option<crate::semantic_capture::InstanceReloadNotExcluded> {
         use crate::semantic_capture::{InstanceReloadNotExcluded, ReloadNotExcludedIdentity};
         let state = self.semantic_finalizer.as_ref()?;
-        if state.reload_not_excluded.is_empty() {
+        if state.reload_not_excluded.is_empty()
+            && state.continued_across_global == 0
+            && state.joined_across_global == 0
+        {
             return None;
         }
         let mut identities: Vec<ReloadNotExcludedIdentity> = state

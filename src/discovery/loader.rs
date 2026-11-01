@@ -122,6 +122,8 @@ pub(crate) struct LoaderRegistry {
     allocated: usize,
     discovery_truncated: u64,
     context_failures: u64,
+    #[cfg(test)]
+    attempt_ledger: std::cell::RefCell<AttemptLedger>,
 }
 
 impl Default for LoaderRegistry {
@@ -138,6 +140,8 @@ impl Default for LoaderRegistry {
             allocated: 0,
             discovery_truncated: 0,
             context_failures: 0,
+            #[cfg(test)]
+            attempt_ledger: std::cell::RefCell::new(AttemptLedger::default()),
         }
     }
 }
@@ -148,6 +152,23 @@ impl LoaderRegistry {
         &self,
         spec: LoaderContextSpec,
     ) -> Result<PreparedLoaderContext, String> {
+        #[cfg(test)]
+        let pending = self.take_pending_attempt();
+        #[cfg(test)]
+        let view = spec.view;
+        let result = self.preflight_checked(spec);
+        #[cfg(test)]
+        self.push_attempt(
+            LoaderAttemptKind::Preflight,
+            pending,
+            Some(view),
+            result.as_ref().ok().map(|prepared| prepared.id),
+            result.as_ref().err().cloned(),
+        );
+        result
+    }
+
+    fn preflight_checked(&self, spec: LoaderContextSpec) -> Result<PreparedLoaderContext, String> {
         if self.allocated == MAX_LOADER_CONTEXTS {
             return Err("loader context capacity 256 is exhausted".into());
         }
@@ -178,6 +199,32 @@ impl LoaderRegistry {
     /// Commits a successfully preflighted context. In this single-threaded registry,
     /// any failure here is an internal lifecycle invariant, not an ordinary refusal.
     pub(crate) fn prepare(
+        &mut self,
+        prepared: PreparedLoaderContext,
+    ) -> Result<LoaderContextId, String> {
+        #[cfg(test)]
+        let pending = self.take_pending_attempt();
+        #[cfg(test)]
+        let view = prepared.context.spec.view;
+        let result = self.prepare_checked(prepared);
+        #[cfg(test)]
+        {
+            let (context_id, refusal) = match &result {
+                Ok(id) => (Some(*id), None),
+                Err(reason) => (None, Some(reason.clone())),
+            };
+            self.push_attempt(
+                LoaderAttemptKind::Prepare,
+                pending,
+                Some(view),
+                context_id,
+                refusal,
+            );
+        }
+        result
+    }
+
+    fn prepare_checked(
         &mut self,
         prepared: PreparedLoaderContext,
     ) -> Result<LoaderContextId, String> {
@@ -259,6 +306,29 @@ impl LoaderRegistry {
     }
 
     pub(crate) fn remove(&mut self, id: LoaderContextId) -> Result<(), String> {
+        #[cfg(test)]
+        let pending = self.take_pending_attempt();
+        #[cfg(test)]
+        let view = self.context(id).map(|context| context.spec.view);
+        let result = self.remove_checked(id);
+        #[cfg(test)]
+        {
+            let (context_id, refusal) = match &result {
+                Ok(()) => (Some(id), None),
+                Err(reason) => (None, Some(reason.clone())),
+            };
+            self.push_attempt(
+                LoaderAttemptKind::Remove,
+                pending,
+                view,
+                context_id,
+                refusal,
+            );
+        }
+        result
+    }
+
+    fn remove_checked(&mut self, id: LoaderContextId) -> Result<(), String> {
         let index = usize::from(id.get().saturating_sub(1));
         let context = self
             .contexts
@@ -436,51 +506,150 @@ pub(crate) enum LoaderPrepareReason {
     Readmit,
 }
 
-// Scaffold (RED): stubs that compile but record nothing; GREEN implements.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct PendingAttempt {
+    pid: u32,
+    owner: LoaderAttemptOwner,
+    truncated_delta: u64,
+    failures_delta: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct AttemptLedger {
+    entries: Vec<LoaderAttempt>,
+    pending: Option<PendingAttempt>,
+}
+
 #[cfg(test)]
 impl LoaderRegistry {
+    fn take_pending_attempt(&self) -> Option<PendingAttempt> {
+        self.attempt_ledger.borrow_mut().pending.take()
+    }
+
+    fn push_attempt(
+        &self,
+        kind: LoaderAttemptKind,
+        pending: Option<PendingAttempt>,
+        view: Option<ProcessViewId>,
+        context_id: Option<LoaderContextId>,
+        refusal: Option<String>,
+    ) {
+        let mut ledger = self.attempt_ledger.borrow_mut();
+        let ordinal = ledger.entries.len() + 1;
+        let (pid, owner, truncated_delta, failures_delta) = match pending {
+            Some(context) => (
+                Some(context.pid),
+                Some(context.owner),
+                context.truncated_delta,
+                context.failures_delta,
+            ),
+            None => (None, None, 0, 0),
+        };
+        ledger.entries.push(LoaderAttempt {
+            ordinal,
+            kind,
+            pid,
+            owner,
+            view,
+            context_id,
+            refusal,
+            truncated_delta,
+            failures_delta,
+        });
+    }
+
+    pub(crate) fn set_next_attempt(
+        &self,
+        pid: u32,
+        owned: bool,
+        truncated_delta: u64,
+        failures_delta: u64,
+    ) {
+        let owner = if owned {
+            LoaderAttemptOwner::Owned
+        } else {
+            LoaderAttemptOwner::Ambient
+        };
+        self.attempt_ledger.borrow_mut().pending = Some(PendingAttempt {
+            pid,
+            owner,
+            truncated_delta,
+            failures_delta,
+        });
+    }
+
     pub(crate) fn attempts(&self) -> Vec<LoaderAttempt> {
-        Vec::new()
+        self.attempt_ledger.borrow().entries.clone()
     }
 
     pub(crate) fn successful_prepare_count(&self) -> usize {
-        0
+        self.attempt_ledger
+            .borrow()
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == LoaderAttemptKind::Prepare && entry.refusal.is_none())
+            .count()
     }
 
     pub(crate) fn prepare_reasons(&self) -> Vec<(usize, u32, LoaderPrepareReason)> {
-        Vec::new()
+        let ledger = self.attempt_ledger.borrow();
+        let mut last_view: std::collections::HashMap<u32, ProcessViewId> =
+            std::collections::HashMap::new();
+        let mut reasons = Vec::new();
+        for entry in ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == LoaderAttemptKind::Prepare && entry.refusal.is_none())
+        {
+            let (Some(pid), Some(view)) = (entry.pid, entry.view) else {
+                continue;
+            };
+            let reason = match last_view.get(&pid) {
+                None => LoaderPrepareReason::Initial,
+                Some(previous) if *previous == view => LoaderPrepareReason::Rearm,
+                Some(_) => LoaderPrepareReason::Readmit,
+            };
+            last_view.insert(pid, view);
+            reasons.push((entry.ordinal, pid, reason));
+        }
+        reasons
     }
 
     pub(crate) fn preflight_recorded(
         &mut self,
         spec: LoaderContextSpec,
-        _pid: u32,
-        _owned: bool,
-        _truncated_delta: u64,
-        _failures_delta: u64,
+        pid: u32,
+        owned: bool,
+        truncated_delta: u64,
+        failures_delta: u64,
     ) -> Result<PreparedLoaderContext, String> {
+        self.set_next_attempt(pid, owned, truncated_delta, failures_delta);
         self.preflight(spec)
     }
 
     pub(crate) fn prepare_recorded(
         &mut self,
         prepared: PreparedLoaderContext,
-        _pid: u32,
-        _owned: bool,
-        _truncated_delta: u64,
-        _failures_delta: u64,
+        pid: u32,
+        owned: bool,
+        truncated_delta: u64,
+        failures_delta: u64,
     ) -> Result<LoaderContextId, String> {
+        self.set_next_attempt(pid, owned, truncated_delta, failures_delta);
         self.prepare(prepared)
     }
 
     pub(crate) fn remove_recorded(
         &mut self,
         id: LoaderContextId,
-        _pid: u32,
-        _owned: bool,
-        _truncated_delta: u64,
-        _failures_delta: u64,
+        pid: u32,
+        owned: bool,
+        truncated_delta: u64,
+        failures_delta: u64,
     ) -> Result<(), String> {
+        self.set_next_attempt(pid, owned, truncated_delta, failures_delta);
         self.remove(id)
     }
 }

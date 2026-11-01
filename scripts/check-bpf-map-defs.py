@@ -1011,8 +1011,12 @@ def bpf_call_graph(elf):
     return bodies, edges, calls
 
 
-def validate_object_capture_reachability(elf, *, full):
-    """FULL reaches scalar readers; P0 never reaches them. Neither publishes."""
+def validate_object_capture_reachability(elf, *, full, journal=False):
+    """FULL reaches scalar readers; P0 never reaches them. Neither publishes.
+
+    The journal ELF runs the same rule with journal roots: its entry and
+    return roots reach exactly the globals the Detailed roots reach.
+    """
     validate_object_capture_globals(elf)
     bodies, edges, _ = bpf_call_graph(elf)
 
@@ -1029,16 +1033,23 @@ def validate_object_capture_reachability(elf, *, full):
                        if symbol[0] in OBJECT_CAPTURE_GLOBAL_HELPERS}
     if globals_by_name.keys() != OBJECT_CAPTURE_GLOBAL_HELPERS:
         raise RuntimeError("missing compiled object capture globals")
+    if journal:
+        entry_prefix, return_name = "p11_entry_journal", "p11_return_journal"
+    else:
+        entry_prefix, return_name = "p11_entry", "p11_return"
     roots = {symbol[0]: key for key, symbol in bodies.items()
-             if symbol[0] == "p11_return" or symbol[0].startswith("p11_entry")}
-    if not {"p11_entry", "p11_return"} <= roots.keys():
+             if symbol[0] == return_name or symbol[0].startswith(entry_prefix)}
+    if journal:
+        if not {"p11_entry_journal", "p11_return_journal"} <= roots.keys():
+            raise RuntimeError("object capture globals require actual journal entry/return roots")
+    elif not {"p11_entry", "p11_return"} <= roots.keys():
         raise RuntimeError("object capture globals require actual entry/return roots")
     for name, root in roots.items():
         symbol = bodies[root]
-        section = "uretprobe" if name == "p11_return" else "uprobe"
+        section = "uretprobe" if name == return_name else "uprobe"
         if symbol[1] != 0x12 or symbol[2] != 0 or symbol[3] != elf.indices.get(section):
             raise RuntimeError(f"object capture requires {name} GLOBAL DEFAULT {section} root")
-        required = ({"p11_stable_cell", "p11_alias_capacity"} if name == "p11_return"
+        required = ({"p11_stable_cell", "p11_alias_capacity"} if name == return_name
                     else {"p11_stable_cell", "p11_alias_scan", "p11_request_cell"})
         found = {helper for helper, key in globals_by_name.items() if key in reachable(root)}
         # This diagnostic tail continuation walks the second template in an

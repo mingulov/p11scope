@@ -128,8 +128,9 @@ fn journal_proof_requested() -> bool {
 
 // The production journal stays behind P11SCOPE_JOURNAL. Unset selects it
 // exactly when the build can carry it (default capacities, no SMALL/WIDE,
-// no unsafe, no stub, no private proof or counter-artifact configuration);
-// other builds omit it silently, like the counter objects below. Explicit
+// no unsafe, no private proof or counter-artifact configuration); P0
+// carries it with attribute capture stubbed, like its Detailed object.
+// Other builds omit it silently, like the counter objects below. Explicit
 // =1 with an incompatible build keeps its refusal; =0 is off.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JournalRequest {
@@ -240,11 +241,8 @@ fn main() {
     // build cannot carry the production journal.
     assert!(
         journal_request != JournalRequest::Enabled
-            || !(small_build
-                || wide_detailed
-                || stub_object_attributes
-                || unsafe_unvalidated),
-        "production journal requires default FULL capacities without SMALL, WIDE, unsafe or P0"
+            || !(small_build || wide_detailed || unsafe_unvalidated),
+        "production journal requires default FULL capacities without SMALL, WIDE or unsafe"
     );
     assert!(
         !(journal_request == JournalRequest::Enabled && (image_bank_proof || counter_artifacts)),
@@ -256,7 +254,6 @@ fn main() {
         JournalRequest::Unset => {
             !(small_build
                 || wide_detailed
-                || stub_object_attributes
                 || unsafe_unvalidated
                 || journal_proof
                 || image_bank_proof
@@ -512,13 +509,15 @@ fn main() {
         );
     }
     if production_journal {
+        // The journal object takes the build's own attribute-capture
+        // selection: P0 stubs it exactly like its Detailed object.
         build_variant_with_proof(
             BpfFlavor::Detailed,
             false,
             false,
             false,
             false,
-            false,
+            stub_object_attributes,
             BankProof::Journal,
             true,
             birth_marker,

@@ -51,6 +51,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/attach.rs",
+      "path": "attach::tests::gate_session_binds_live_gate_and_bank_cells",
+      "reason": "loader-gate activation; privileged: live self-preflight session binds the gate and bank cells",
+      "cell": "privileged"
+    },
+    {
       "file": "src/attach/counter_banks.rs",
       "path": "attach::counter_banks::tests::counter_bank_mode_objects_load_lp64",
       "reason": "requires the default build with embedded counter objects; run as root in an authorized BPF lane with LP64 map/program load and uprobe_multi",

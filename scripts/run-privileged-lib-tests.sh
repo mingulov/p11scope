@@ -253,6 +253,9 @@ attach::tests::collected_retirement_stopped_session_q_closes_original_lp64
 # linkage, 6.06). Same owned fixture Session shape as the retirement
 # cells above.
 attach::tests::sealed_session_drain_linkage_is_behavioral
+# Loader-gate activation: a live self-preflight session binds the gate and
+# bank cells (gate-1 reads the published select word; gate-0 binds none).
+attach::tests::gate_session_binds_live_gate_and_bank_cells
 discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_serial_production_probe
 # Stamped-legacy surface cell: a legacy-only fixture whose 68-slot list is
 # stamped 3.0/3.1/3.2 (the Fedora SoftHSM 2.7 shape) decodes to a complete

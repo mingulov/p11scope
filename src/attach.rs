@@ -12374,6 +12374,84 @@ mod tests {
     }
 
     #[test]
+    fn loader_gate_build_matches_embedded_object() {
+        // The build-time gate selection and the embedded Detailed bytes
+        // agree: the select map exists exactly in gate-1 builds.
+        let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        assert_eq!(
+            super::LOADER_GATE_BUILD,
+            detailed.maps.get("IMAGE_BANK_SELECT").is_some(),
+            "gate selection must match the embedded object"
+        );
+    }
+
+    #[ignore = "privileged: gate session binds live gate and bank cells"]
+    #[test]
+    fn gate_session_binds_live_gate_and_bank_cells() -> anyhow::Result<()> {
+        // The doctor self-preflight session, kept alive to read the cells:
+        // gate-1 exposes the published select word and the real (still
+        // unpublished) gate/bank cells; gate-0 exposes none, and both
+        // snapshot mappings report their honest refusal.
+        let session = super::Session::start_inner(
+            &super::Scope::Pid(std::process::id()),
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::AttachBackend::Singles,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        if super::LOADER_GATE_BUILD {
+            let select = session
+                .image_bank_select()?
+                .expect("gate-1 binds IMAGE_BANK_SELECT");
+            assert_eq!(select.bank, 0);
+            assert_eq!(select.prepared, [1, 0]);
+            assert_eq!(select.cuts, 0);
+            let gate = session
+                .loader_gate_control()?
+                .expect("gate-1 binds LOADER_GATE_CTL");
+            assert_eq!(
+                gate.limit, 0,
+                "gate control is unpublished before the acknowledgement wiring"
+            );
+            let bank_b = session
+                .bank_b_control()?
+                .expect("gate-1 binds COOKIE_CTL_B");
+            assert_eq!(
+                bank_b.limit, 0,
+                "bank B is unpublished before its preparation"
+            );
+            assert!(session.loader_gate_rows().is_some());
+            assert!(
+                crate::metrics::loader_transitions(&session)?.is_none(),
+                "unpublished gate control refuses honestly"
+            );
+            assert!(
+                crate::metrics::image_transitions(&session)?.is_none(),
+                "unpublished bank B refuses honestly"
+            );
+        } else {
+            assert!(session.image_bank_select()?.is_none());
+            assert!(session.loader_gate_control()?.is_none());
+            assert!(session.bank_b_control()?.is_none());
+            assert!(session.loader_gate_rows().is_none());
+            assert!(
+                crate::metrics::loader_transitions(&session)?.is_none(),
+                "gate-0 snapshots refuse honestly"
+            );
+            assert!(
+                crate::metrics::image_transitions(&session)?.is_none(),
+                "gate-0 snapshots refuse honestly"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn identity_preparation_stops_at_every_write_readback_and_freeze_failure() {
         let mut expected = Vec::new();
         prepare_identity_with(true, false, |step| {

@@ -935,6 +935,12 @@ pub(crate) struct AttestedSemanticLane {
     /// exactly like a live machine past its finish.
     #[cfg(test)]
     test_joint_machine: bool,
+    /// Tests-only linked-journal answer for the linked live-discovery
+    /// pump: substituted lanes carry no live Session to derive linkage
+    /// from, so the seam marks linked lanes linked. Independent of the
+    /// machine: the pump requires both (§6.06).
+    #[cfg(test)]
+    test_joint_linked: bool,
     /// Tests-only scripted Joint-machine init outcome: when set,
     /// `initialize_joint` answers it without a live Session, so
     /// the driver's D5 wiring runs unprivileged. A scripted Ok
@@ -1567,6 +1573,8 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             test_joint_machine: false,
             #[cfg(test)]
+            test_joint_linked: false,
+            #[cfg(test)]
             scripted_joint_init: None,
             #[cfg(test)]
             joint_init_calls: 0,
@@ -1715,6 +1723,8 @@ impl AttestedSemanticLane {
             test_joint_frame: false,
             #[cfg(test)]
             test_joint_machine: false,
+            #[cfg(test)]
+            test_joint_linked: false,
             #[cfg(test)]
             scripted_joint_init: None,
             #[cfg(test)]
@@ -2154,6 +2164,13 @@ impl AttestedSemanticLane {
         self.test_joint_machine = on;
     }
 
+    /// Mark the lane linked through the test seam: substituted lanes
+    /// carry no live Session to derive linkage from (§6.06).
+    #[cfg(test)]
+    pub(crate) fn set_test_joint_linked(&mut self, on: bool) {
+        self.test_joint_linked = on;
+    }
+
     /// Script the Joint-machine init outcome (or clear it with
     /// `None`): a scripted Ok marks the lane Joint without a live
     /// machine, so the driver's D5 wiring runs unprivileged.
@@ -2503,6 +2520,23 @@ impl AttestedSemanticLane {
         {
             live.capture.service_live_discovery(&mut live.session);
         }
+    }
+
+    /// Service linked live DISCOVERY on a Joint lane (§6.06): the
+    /// driver pump's lane half. Linked-only, machine-required and
+    /// bounded: exit-retained, finished, machineless, unlinked or
+    /// budget-empty calls answer `Ok(0)` without touching the seam.
+    /// A transport fault answers `Err(Unavailable)` and never latches
+    /// the machine: linked publication completes without DD, and the
+    /// next hook services both again. Complements the machine-side
+    /// prohibition (linked Joint keeps its publication-bearing
+    /// DISCOVERY for its existing owner).
+    pub(crate) fn service_linked_live_discovery(
+        &mut self,
+        _work: usize,
+        _deadline: Instant,
+    ) -> Result<usize, SemanticRefusal> {
+        Ok(0)
     }
 
     /// One H0 collect→audit→route quantum over the bound callers' stable
@@ -4926,6 +4960,157 @@ mod joint_terminal_tests {
         assert!(lane.has_joint_frame());
         lane.set_test_joint_frame(false);
         assert!(!lane.has_joint_frame());
+    }
+
+    /// Discovery-service spy beneath the linked pump: counts owner-seam
+    /// services; every other method is inert.
+    struct DiscoverySpy {
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl LaneTestIo for DiscoverySpy {
+        fn service_live_discovery(&mut self) {
+            self.calls.set(self.calls.get() + 1);
+        }
+
+        fn validate_current(
+            &mut self,
+            _receipt: &CurrentPartitionReceipt,
+            _report: &mut TickReport,
+        ) -> Result<(), CurrentReceiptRefusal> {
+            Err(CurrentReceiptRefusal::Stopped)
+        }
+
+        fn tick(&mut self, _domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {
+            Err(SemanticRefusal::Unavailable)
+        }
+
+        fn refresh(
+            &mut self,
+            _pin: Arc<PidPin>,
+            _slot: u32,
+        ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
+            Err(SemanticRefusal::Unavailable)
+        }
+
+        fn has_pending_evidence(&self) -> bool {
+            false
+        }
+
+        fn finish(&mut self, domain: NativeDomainId) -> SemanticBatch {
+            SemanticBatch::scripted(domain, Vec::new(), 0)
+        }
+
+        fn quiescent(&mut self) -> bool {
+            true
+        }
+
+        fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+            None
+        }
+
+        fn drain_events_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
+            LaneDrainOutcome {
+                records: 0,
+                post_q: false,
+                backlog: false,
+                failed: false,
+            }
+        }
+
+        fn drain_discovery_to(
+            &mut self,
+            _stop: usize,
+            _quantum: usize,
+        ) -> LaneDrainOutcome {
+            LaneDrainOutcome {
+                records: 0,
+                post_q: false,
+                backlog: false,
+                failed: false,
+            }
+        }
+    }
+
+    /// A substituted linked Joint lane with a discovery spy: the pump's
+    /// test half. Each arm below flips one input from this healthy base.
+    fn linked_pump_lane_for_test() -> (AttestedSemanticLane, Rc<Cell<usize>>) {
+        let mut lane = shell_lane_for_test();
+        let calls = Rc::new(Cell::new(0));
+        lane.install_test_io(Box::new(DiscoverySpy {
+            calls: Rc::clone(&calls),
+        }));
+        lane.set_test_joint_machine(true);
+        lane.set_test_joint_linked(true);
+        (lane, calls)
+    }
+
+    fn pump_budget_for_test() -> (usize, std::time::Instant) {
+        (
+            8,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+    }
+
+    #[test]
+    fn linked_pump_services_substituted_owner_seam() {
+        // Positive: linked + machine + test I/O forwards to the owner
+        // seam once and reports zero drained records (the test arm
+        // counts, it never drains). Kills a missing test-arm forward.
+        let (mut lane, calls) = linked_pump_lane_for_test();
+        let (work, deadline) = pump_budget_for_test();
+        assert_eq!(lane.service_linked_live_discovery(work, deadline), Ok(0));
+        assert_eq!(calls.get(), 1, "the pump forwards to the owner seam");
+    }
+
+    #[test]
+    fn linked_pump_skips_unlinked_and_machineless_lanes() {
+        // Linked-only: the same lane unlinked never touches the seam.
+        // Kills a pump without the linked gate and the guard-relax
+        // variant (the classic lane service must not gain Joint lanes).
+        let (mut lane, calls) = linked_pump_lane_for_test();
+        lane.set_test_joint_linked(false);
+        let (work, deadline) = pump_budget_for_test();
+        assert_eq!(lane.service_linked_live_discovery(work, deadline), Ok(0));
+        assert_eq!(calls.get(), 0);
+        // Machine-required: linked but machineless never touches it.
+        let (mut lane, calls) = linked_pump_lane_for_test();
+        lane.set_test_joint_machine(false);
+        assert_eq!(lane.service_linked_live_discovery(work, deadline), Ok(0));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn linked_pump_skips_terminal_and_gated_lanes() {
+        // Terminal skips: finished, exit-retained and gated lanes
+        // answer Ok(0) without touching the seam.
+        let (work, deadline) = pump_budget_for_test();
+        let (mut lane, calls) = linked_pump_lane_for_test();
+        lane.test_finished = true;
+        assert_eq!(lane.service_linked_live_discovery(work, deadline), Ok(0));
+        assert_eq!(calls.get(), 0);
+        let (mut lane, calls) = linked_pump_lane_for_test();
+        lane.exit_retained = true;
+        assert_eq!(lane.service_linked_live_discovery(work, deadline), Ok(0));
+        assert_eq!(calls.get(), 0);
+        let (mut lane, calls) = linked_pump_lane_for_test();
+        lane.test_gated = true;
+        assert_eq!(lane.service_linked_live_discovery(work, deadline), Ok(0));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn linked_pump_skips_empty_and_expired_budgets() {
+        // Budget discipline: no work or an expired deadline never
+        // touches the seam. Kills an unbounded-seam variant.
+        let (mut lane, calls) = linked_pump_lane_for_test();
+        let (_, deadline) = pump_budget_for_test();
+        assert_eq!(lane.service_linked_live_discovery(0, deadline), Ok(0));
+        assert_eq!(calls.get(), 0);
+        let (mut lane, calls) = linked_pump_lane_for_test();
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(lane.service_linked_live_discovery(8, expired), Ok(0));
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]

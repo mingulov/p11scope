@@ -14233,6 +14233,133 @@ mod tests {
     }
 
     #[test]
+    fn joint_linked_hook_pumps_live_discovery_alongside_machine() {
+        // §6.06: one linked hook services the machine AND pumps live
+        // DISCOVERY through the lane's owner seam. The substituted lane
+        // refuses machine service (no live machine) yet the pump still
+        // runs: transport monitoring survives machine refusals.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let discovery = Rc::new(Cell::new(0));
+        let mut io = WindDownIo::completing();
+        io.discovery = Rc::clone(&discovery);
+        driver.semantic = Some(wind_down_lane(io));
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_scripted_joint_init_for_test(Some(Ok(())));
+        driver.initialize_joint_lane();
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_test_joint_linked(true);
+        assert!(
+            driver
+                .semantic
+                .as_ref()
+                .expect("lane stays seated")
+                .has_joint_machine(),
+            "a successful init marks the lane Joint"
+        );
+        driver.on_tick();
+        {
+            let lane = driver.semantic.as_ref().expect("lane stays seated");
+            assert_eq!(
+                lane.joint_service_calls_for_test(),
+                1,
+                "the hook attempts machine service"
+            );
+            assert_eq!(
+                discovery.get(),
+                1,
+                "the same hook pumps linked live discovery"
+            );
+        }
+        // No wedge, no latch: the second hook services both again.
+        driver.on_tick();
+        {
+            let lane = driver.semantic.as_ref().expect("lane stays seated");
+            assert_eq!(
+                lane.joint_service_calls_for_test(),
+                2,
+                "every hook services the machine"
+            );
+            assert_eq!(discovery.get(), 2, "every hook pumps linked discovery");
+        }
+    }
+
+    #[test]
+    fn joint_unlinked_hook_skips_linked_discovery_pump() {
+        // Negative control for the linked pump: the same fixture with
+        // the linked flag off services the machine but never the pump
+        // (unlinked DD stays with the machine's inline service).
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let discovery = Rc::new(Cell::new(0));
+        let mut io = WindDownIo::completing();
+        io.discovery = Rc::clone(&discovery);
+        driver.semantic = Some(wind_down_lane(io));
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_scripted_joint_init_for_test(Some(Ok(())));
+        driver.initialize_joint_lane();
+        driver.on_tick();
+        let lane = driver.semantic.as_ref().expect("lane stays seated");
+        assert_eq!(
+            lane.joint_service_calls_for_test(),
+            1,
+            "the hook attempts machine service"
+        );
+        assert_eq!(
+            discovery.get(),
+            0,
+            "an unlinked lane never runs the linked pump"
+        );
+    }
+
+    #[test]
+    fn linked_flag_without_machine_keeps_classic_discovery_service() {
+        // Preservation: the linked flag on a non-Joint lane changes
+        // nothing — the classic arm still services live discovery.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let discovery = Rc::new(Cell::new(0));
+        let mut io = WindDownIo::completing();
+        io.discovery = Rc::clone(&discovery);
+        driver.semantic = Some(wind_down_lane(io));
+        driver
+            .semantic
+            .as_mut()
+            .expect("lane stays seated")
+            .set_test_joint_linked(true);
+        driver.on_tick();
+        let lane = driver.semantic.as_ref().expect("lane stays seated");
+        assert_eq!(
+            lane.joint_service_calls_for_test(),
+            0,
+            "no machine service off the Joint path"
+        );
+        assert_eq!(
+            discovery.get(),
+            1,
+            "the classic arm still services live discovery"
+        );
+    }
+
+    #[test]
     fn joint_poll_commit_refused_poll_holds_lane_and_publishes() {
         // Structural contract (controller ruling E1: the semantic lane
         // must never end the broad inventory): a refused Joint commit
@@ -15539,6 +15666,9 @@ mod promotion_driver_tests {
         pub(crate) ticks: Rc<Cell<usize>>,
         threads: Rc<RefCell<Vec<std::thread::ThreadId>>>,
         pub(crate) drop_spy: Option<Rc<Cell<usize>>>,
+        /// Live-discovery services through the substituted lane: the
+        /// linked-DD pump twin counts them here.
+        pub(crate) discovery: Rc<Cell<usize>>,
         submitted: bool,
     }
 
@@ -15555,6 +15685,7 @@ mod promotion_driver_tests {
             Self {
                 cleanup: Box::new(|_| Ok(())),
                 nonempty_finish: false,
+                discovery: Rc::new(Cell::new(0)),
                 gate: None,
                 release_after_polls: None,
                 fail_poll: false,
@@ -15576,6 +15707,7 @@ mod promotion_driver_tests {
             Self {
                 cleanup: Box::new(|_| Ok(())),
                 nonempty_finish: true,
+                discovery: Rc::new(Cell::new(0)),
                 gate: None,
                 release_after_polls: None,
                 fail_poll: false,
@@ -15762,6 +15894,10 @@ mod promotion_driver_tests {
             _quantum: usize,
         ) -> crate::inventory_semantics::LaneDrainOutcome {
             crate::inventory_semantics::LaneDrainOutcome::default()
+        }
+
+        fn service_live_discovery(&mut self) {
+            self.discovery.set(self.discovery.get() + 1);
         }
     }
 

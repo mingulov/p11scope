@@ -172,6 +172,9 @@ class JournalGateTests(unittest.TestCase):
             "linked-unlatched": rows,
             "linked-idle": rows,
             "refused-noseal": [row for row in rows if row["btf_id"] == 48],
+            # The plain build exits before loading anything: the probe
+            # file holds only its summary.
+            "refused-hard": [],
             "missing-root": [row for row in rows
                              if row["root"] != "p11_return_journal"],
             "unlinked": [row for row in rows if row["btf_id"] == 48],
@@ -199,6 +202,10 @@ class JournalGateTests(unittest.TestCase):
                 "gap: key operations unavailable: "
                 "journal-pair-unavailable-in-build: this build omits the "
                 "production journal object; broad inventory continues\n"},
+            "refused-hard": {"rc": 1, "text":
+                "p11scope: inventory --system: "
+                "journal-pair-unavailable-in-build: this build omits the "
+                "production journal object\n"},
             "over-budget": {"rc": 0, "text": LINKED_TEXT},
             "timeout": {"rc": 124, "text": ""},
             "crash": {"rc": 1, "text": LINKED_TEXT + "thread 'main' panicked at src/x.rs:1\n"},
@@ -368,6 +375,17 @@ class JournalGateTests(unittest.TestCase):
         # Both lanes refused, so no seal line exists; the row still
         # names the finite refusal reason instead of just the seal.
         result, out = self.run_gate(KERNEL, mode="refused-noseal")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("journal-pair-unavailable-in-build", row["detail"])
+
+    def test_hard_refused_build_names_the_reason(self):
+        # The plain build rejects --key-operations up front with the
+        # bare finite reason (no gap subject, no seal, no loads): the
+        # row still names it.
+        result, out = self.run_gate(KERNEL, mode="refused-hard")
         self.assertEqual(result.returncode, 1, result.stdout)
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])

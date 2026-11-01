@@ -898,6 +898,7 @@ jobs:
       - run: scripts/bench-inventory-native.sh --self-test
       - run: scripts/measure-c5-campaign.sh --self-test
       - run: scripts/qualify-release-matrix.sh --self-test
+      - run: scripts/qualify-stop-races.sh --self-test
       - run: scripts/matrix/verify-fork-scope.sh --self-test
       - run: scripts/matrix/verify-ia32-compat.sh --self-test
       - run: scripts/matrix/verify-oracle.sh --self-test

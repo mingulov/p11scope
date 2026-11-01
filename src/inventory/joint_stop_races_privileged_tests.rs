@@ -466,6 +466,7 @@ fn start_joint_lane(
         convert_subset,
         &scope,
         crate::attach::BackendSelection::Auto,
+        None,
     )
     .map_err(|refusal| anyhow::anyhow!("live lane attaches: {refusal}"))?;
     ensure!(lane.is_live(), "the lane owns its live session");

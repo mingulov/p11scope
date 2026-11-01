@@ -1659,6 +1659,13 @@
       "path": "attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_ia32",
       "reason": "privileged: C_AsyncJoin carries the detached id with no flag and the op completes (ia32)",
       "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/joint_stop_races_privileged_tests.rs",
+      "path": "inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64",
+      "reason": "privileged: live Joint stop after the last waiter resolves; run by hand via scripts/ci/stop-races.sh (results.jsonl entry), unscheduled in CI",
+      "cell": "privileged",
+      "until": "0.7.0"
     }
   ]
 }

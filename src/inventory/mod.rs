@@ -5561,6 +5561,30 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 ) {
                     self.joint_tick_refusal.get_or_insert(reason);
                 }
+                // Linked-DD pump (§6.06): after machine service, on the
+                // shared per-hook budget, pump linked live DISCOVERY
+                // through the lane's owner seam. The machine keeps
+                // priority; the pump runs regardless of the machine
+                // outcome, and a fault only names the fallback stop
+                // reason — it never latches the machine. The pump is
+                // last in the hook, so the drained count needs no spend
+                // bookkeeping (re-add it if a later consumer follows
+                // the pump); an over-work answer still names the
+                // fallback reason, like the machine's distrust.
+                let work = budget
+                    .remaining_actions
+                    .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM);
+                match lane.service_linked_live_discovery(work, budget.deadline) {
+                    Ok(records) if records <= work => {}
+                    Ok(_) => {
+                        self.joint_tick_refusal.get_or_insert(
+                            crate::inventory_semantics::SemanticRefusal::Unavailable,
+                        );
+                    }
+                    Err(reason) => {
+                        self.joint_tick_refusal.get_or_insert(reason);
+                    }
+                }
             }
             return;
         }

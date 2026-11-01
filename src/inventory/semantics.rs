@@ -2533,10 +2533,58 @@ impl AttestedSemanticLane {
     /// DISCOVERY for its existing owner).
     pub(crate) fn service_linked_live_discovery(
         &mut self,
-        _work: usize,
-        _deadline: Instant,
+        work: usize,
+        deadline: Instant,
     ) -> Result<usize, SemanticRefusal> {
+        if self.exit_retained || self.is_finished() || !self.has_joint_machine() {
+            return Ok(0);
+        }
+        // Linkedness: substituted lanes read the test seam (no live
+        // Session to derive from); live lanes derive from the Session's
+        // retained sealed fact, the same source `initialize_joint`
+        // builds the machine from.
+        #[cfg(test)]
+        let linked = if self.test_io.is_some() {
+            self.test_joint_linked
+        } else {
+            self.live_linked()
+        };
+        #[cfg(not(test))]
+        let linked = self.live_linked();
+        if !linked {
+            return Ok(0);
+        }
+        if work == 0 || Instant::now() >= deadline {
+            return Ok(0);
+        }
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            if !self.test_gated {
+                test.service_live_discovery();
+            }
+            return Ok(0);
+        }
+        if let Some(live) = self.live.as_mut()
+            && !live.gated
+            && !live.finished
+        {
+            // A fault refuses without latching the machine: linked
+            // publication completes without DD, and the next hook
+            // services both again.
+            return live
+                .capture
+                .service_live_discovery_until(&mut live.session, work, deadline)
+                .map_err(|_| SemanticRefusal::Unavailable);
+        }
         Ok(0)
+    }
+
+    /// Whether the live Session retains a linked journal producer (§6.06).
+    fn live_linked(&self) -> bool {
+        self.live
+            .as_deref()
+            .and_then(|live| live.session.drain_producers())
+            .is_some_and(|producers| producers.journal_linked())
     }
 
     /// One H0 collect→audit→route quantum over the bound callers' stable
@@ -5018,11 +5066,7 @@ mod joint_terminal_tests {
             }
         }
 
-        fn drain_discovery_to(
-            &mut self,
-            _stop: usize,
-            _quantum: usize,
-        ) -> LaneDrainOutcome {
+        fn drain_discovery_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
             LaneDrainOutcome {
                 records: 0,
                 post_q: false,

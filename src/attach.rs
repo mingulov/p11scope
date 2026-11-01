@@ -12277,6 +12277,33 @@ mod tests {
     }
 
     #[test]
+    fn identity_map_routing_covers_both_tables() {
+        // freeze_map routes identity names to the identity validator and
+        // every other name to the policy validator. A gate name routed to
+        // the policy side refuses live bank task storage (Fedora root
+        // cell); a policy name routed to the identity side would skip its
+        // own contract.
+        for name in [
+            "TASK_COOKIE",
+            "THREAD_OWNER",
+            "ROOT_AFFILIATION",
+            "COOKIE_CTL",
+            "OWNER_CTL",
+            "ROOT_CTL",
+            "TASK_COOKIE_B",
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "LOADER_GATE",
+            "LOADER_GATE_CTL",
+        ] {
+            assert!(super::is_identity_map(name), "{name} must route to identity");
+        }
+        for name in ["CONFIG", "PROC_EPOCH", "OTHER"] {
+            assert!(!super::is_identity_map(name), "{name} must route to policy");
+        }
+    }
+
+    #[test]
     fn gate_identity_table_names_exactly_the_gate1_maps() {
         // The preflight pins every map a gate-1 Detailed object adds: no
         // more, no fewer. Membership only; prepare order is unconstrained.

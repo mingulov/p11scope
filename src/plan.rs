@@ -7193,10 +7193,7 @@ mod tests {
             AdmissionPolicy::Inventory(budget),
             AdmissionScope::Shared,
         );
-        assert_eq!(
-            plan.admission_policy(),
-            AdmissionPolicy::Inventory(budget)
-        );
+        assert_eq!(plan.admission_policy(), AdmissionPolicy::Inventory(budget));
         assert_eq!(plan.refused_modules().count(), 0);
         assert_eq!(plan.slots.len(), 1);
         assert_eq!(plan.slots[0].names, ["C_SignInit"]);

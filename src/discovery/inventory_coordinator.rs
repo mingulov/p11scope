@@ -842,15 +842,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
             .collect();
         let declared = crate::plan::operator_target_keys(&[], &pieces, &pins);
-        let plan =
-            crate::plan::build_from_sources_for_policy_scoped_with_prearm(
-                &[],
-                &[],
-                &pieces,
-                &pins,
-                crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget()),
-                crate::plan::AdmissionScope::Shared,
-            );
+        let plan = crate::plan::build_from_sources_for_policy_scoped_with_prearm(
+            &[],
+            &[],
+            &pieces,
+            &pins,
+            crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget()),
+            crate::plan::AdmissionScope::Shared,
+        );
         let absorbed = self.attach_set.absorb(&plan, &pins);
         // Declared-key → endpoint-id map, before the delta joins the pending
         // targets: match the fresh endpoints by (retained identity, offset),
@@ -1016,9 +1015,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let attached_at = object.and_then(|id| self.prearm_attached_at(id));
             let mapped = object.is_some_and(|id| self.prearm_object_mapped(&prearm.pins, id));
             let mut windows = Vec::new();
-            if mapped
-                && let (Some(start), Some(end)) = (self.prearm_scope_start_ns, attached_at)
-            {
+            if mapped && let (Some(start), Some(end)) = (self.prearm_scope_start_ns, attached_at) {
                 windows.push(crate::render::UnobservedWindow {
                     start_ns: start,
                     end_ns: end,
@@ -1154,9 +1151,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if !pins.object_matches_key(object, *dev_major, *dev_minor, *ino) {
                 return false;
             }
-            sha256.as_deref().is_none_or(|digest| {
-                !pin_sha.is_empty() && digest == pin_sha
-            })
+            sha256
+                .as_deref()
+                .is_none_or(|digest| !pin_sha.is_empty() && digest == pin_sha)
         })
     }
 
@@ -1203,9 +1200,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         id: crate::discovery::identity::PinnedObjectId,
     ) -> String {
         let summary = pins.pinned().find(|pin| pin.id == id);
-        let (path, major, minor, ino) = summary.map_or(("<unresolved pre-arm object>", 0, 0, 0), |pin| {
-            (pin.path, pin.key.device.major, pin.key.device.minor, pin.key.inode)
-        });
+        let (path, major, minor, ino) =
+            summary.map_or(("<unresolved pre-arm object>", 0, 0, 0), |pin| {
+                (
+                    pin.path,
+                    pin.key.device.major,
+                    pin.key.device.minor,
+                    pin.key.inode,
+                )
+            });
         format!(
             "{path} (device {major}:{minor}, inode {ino}) changed identity since its endpoints were \
              retained: its digest or (inode, size, ctime) pin differs, and the attach \
@@ -10284,7 +10287,11 @@ pub(crate) mod tests {
         );
         assert_eq!(delta.objects.len(), 1, "one retained object");
         assert_eq!(
-            delta.endpoints.iter().map(|endpoint| endpoint.file_offset).collect::<BTreeSet<_>>(),
+            delta
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.file_offset)
+                .collect::<BTreeSet<_>>(),
             proved_offsets,
         );
         for endpoint in &delta.endpoints {
@@ -10305,7 +10312,10 @@ pub(crate) mod tests {
         }
         let rows = coordinator.prearm_rows();
         assert_eq!(rows.len(), 1);
-        let watch = rows[0].watch.as_ref().expect("an absorbed input has a watch");
+        let watch = rows[0]
+            .watch
+            .as_ref()
+            .expect("an absorbed input has a watch");
         assert_eq!(watch.state, crate::render::PrearmWatchState::PinnedUnarmed);
         assert_eq!(watch.since_ns, None);
     }
@@ -10355,7 +10365,10 @@ pub(crate) mod tests {
         let rows = coordinator.prearm_rows();
         let watch = rows[0].watch.as_ref().unwrap();
         assert_eq!(watch.state, crate::render::PrearmWatchState::Ended);
-        assert_eq!(watch.ended_by, Some(crate::render::PrearmWatchEnd::ScopeEnd));
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::ScopeEnd)
+        );
         assert_eq!(watch.until_ns, Some(9_000));
         assert_eq!(watch.since_ns, None);
         coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(10_000));
@@ -10377,7 +10390,7 @@ pub(crate) mod tests {
         let provider = prearm_provider_with_proved_exports(dir.path(), "replaced");
         let old_bytes = std::fs::read(&provider).unwrap();
         let old_ino = std::fs::metadata(&provider).unwrap().ino();
-        let pinning = pin_prearm_for_test(&[provider.clone()]);
+        let pinning = pin_prearm_for_test(std::slice::from_ref(&provider));
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
         coordinator.absorb_prearm_plan(crate::attach::monotonic_ns().expect("monotonic clock"));
@@ -10408,7 +10421,11 @@ pub(crate) mod tests {
         // Per-object disclosure: the refresh attributes exactly this object,
         // once (sticky).
         let changed = coordinator.refresh_prearm_object_changes();
-        assert_eq!(changed.len(), 1, "the refresh attributes the replaced object");
+        assert_eq!(
+            changed.len(),
+            1,
+            "the refresh attributes the replaced object"
+        );
         assert!(
             coordinator.refresh_prearm_object_changes().is_empty(),
             "change evidence is sticky: the second refresh reports nothing new"
@@ -10425,7 +10442,10 @@ pub(crate) mod tests {
             watch.ended_by,
             Some(crate::render::PrearmWatchEnd::ObjectChanged)
         );
-        let bracket = watch.changed.as_ref().expect("a detected change publishes its bracket");
+        let bracket = watch
+            .changed
+            .as_ref()
+            .expect("a detected change publishes its bracket");
         assert_eq!(bracket.previous_ino, old_ino);
         assert!(bracket.last_ok_ns > 0);
         assert!(
@@ -10521,9 +10541,9 @@ pub(crate) mod tests {
             let delta = coordinator.take_target_delta();
             coordinator.registry_mut().publish();
             let gaps = coordinator.registry().gaps();
-            let refused = gaps.iter().find(|gap| {
-                gap.subject == crate::discovery::inventory_attach_set::REFUSED_SUBJECT
-            });
+            let refused = gaps
+                .iter()
+                .find(|gap| gap.subject == crate::discovery::inventory_attach_set::REFUSED_SUBJECT);
             let rows = coordinator.prearm_rows();
             assert_eq!(rows.len(), 1);
             let watch = rows[0].watch.as_ref().unwrap();
@@ -10539,7 +10559,10 @@ pub(crate) mod tests {
             );
             if admitted {
                 assert_eq!(delta.endpoints.len(), 2, "budget {budget_endpoints}");
-                assert!(refused.is_none(), "budget {budget_endpoints}: no refusal gap");
+                assert!(
+                    refused.is_none(),
+                    "budget {budget_endpoints}: no refusal gap"
+                );
             } else {
                 assert!(delta.endpoints.is_empty(), "budget {budget_endpoints}");
                 let Some(gap) = refused else {

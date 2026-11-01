@@ -63,11 +63,11 @@ static void exec_cookie_controls(void) {
     assert(ctl.next_ticket == IMAGE_IDENTITY_TICKET_LIMIT && create_calls == 2);
     ctl.next_ticket = 0; fail_create = 1;
     assert(p11_link_current_cookie() == 0);
-    assert(ctl.next_ticket == 1 && ctl.create_failures == 1 && create_calls == 3);
+    assert(ctl.next_ticket == 1 && ctl.create_failures == 0 && create_calls == 3);
     fail_create = 0; lost_race_cell = &ctl.next_ticket; cas_attempts = 0;
     assert(p11_link_current_cookie() == 0);
     assert(cas_attempts == COOKIE_CAS_TRIES && ctl.next_ticket == 1);
-    assert(ctl.retry_exhausted == 1 && create_calls == 3);
+    assert(ctl.retry_exhausted == 0 && create_calls == 3);
     lost_race_cell = 0; present = 1; stored = 0;
     assert(p11_link_current_cookie() == 0);
     stored = IMAGE_IDENTITY_TICKET_LIMIT + 1;
@@ -142,6 +142,9 @@ int main(void) {
     ctl.next_ticket = 0; ctl.create_failures = 0; fail_create = 1; lost_race_cell = &ctl.create_failures;
     assert(p11_link_current_identity(&out) == COOKIE_STATUS_CREATE_FAILED);
     assert(ctl.create_failures == 1 && ctl.unavailable == 2);
+    ctl.next_ticket = 0; ctl.retry_exhausted = 0; fail_create = 0; present = 0; lost_race_cell = &ctl.next_ticket; cas_attempts = 0;
+    assert(p11_link_current_identity(&out) == COOKIE_STATUS_RETRY_EXHAUSTED);
+    assert(cas_attempts == COOKIE_CAS_TRIES && ctl.next_ticket == 0 && ctl.retry_exhausted == 1 && ctl.unavailable == 3);
     exec_cookie_controls();
     puts("native control: malformed, near-limit exhaustion, stable cookie/exec, zero cell, creation failure, null refusal passed");
 }

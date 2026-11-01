@@ -4160,10 +4160,10 @@ mod tests {
         // The reference-free enumerator must see every watched
         // object while A is alive; otherwise the absence poll
         // below would pass vacuously.
-        let live_maps = live_ids(aya_obj::generated::bpf_cmd::BPF_MAP_GET_NEXT_ID)
-            .expect("live map ids");
-        let live_progs = live_ids(aya_obj::generated::bpf_cmd::BPF_PROG_GET_NEXT_ID)
-            .expect("live prog ids");
+        let live_maps =
+            live_ids(aya_obj::generated::bpf_cmd::BPF_MAP_GET_NEXT_ID).expect("live map ids");
+        let live_progs =
+            live_ids(aya_obj::generated::bpf_cmd::BPF_PROG_GET_NEXT_ID).expect("live prog ids");
         for (name, id) in &objects_a.maps {
             assert!(
                 live_maps.contains(id),
@@ -4183,10 +4183,10 @@ mod tests {
         // requirement stays exact: every A map and program must be gone.
         let started = Instant::now();
         let waited_ms = loop {
-            let live_maps = live_ids(aya_obj::generated::bpf_cmd::BPF_MAP_GET_NEXT_ID)
-                .expect("live map ids");
-            let live_progs = live_ids(aya_obj::generated::bpf_cmd::BPF_PROG_GET_NEXT_ID)
-                .expect("live prog ids");
+            let live_maps =
+                live_ids(aya_obj::generated::bpf_cmd::BPF_MAP_GET_NEXT_ID).expect("live map ids");
+            let live_progs =
+                live_ids(aya_obj::generated::bpf_cmd::BPF_PROG_GET_NEXT_ID).expect("live prog ids");
             let lingering_maps = lingering_ids(&objects_a.maps, &live_maps);
             let lingering_progs = lingering_ids(&objects_a.progs, &live_progs);
             if lingering_maps.is_empty() && lingering_progs.is_empty() {

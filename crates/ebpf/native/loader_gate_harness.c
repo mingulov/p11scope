@@ -18,6 +18,7 @@ extern long p11_loader_gate_cutover_latched(void) __attribute__((weak));
 
 #ifdef GATE_HOST_CAS_HOOK
 extern int gate_cas_fail_all;
+extern int gate_fallback_interleave_drop;
 #endif
 
 unsigned char LOADER_GATE, LOADER_GATE_CTL;
@@ -926,15 +927,44 @@ static int cas_exhaustion_counts(const char *scenario)
     CHECK(p11_loader_gate_hit(41, 1) == 41, "exhaust_admit_succeeds");
     CHECK(gate_ctl.retained == 2, "exhaust_gauge_counts");
     CHECK(gate_ctl.retained_peak == 1, "exhaust_peak_holds");
-    CHECK(gate_ctl.update_losses == 2, "peak_loss_reported");
+    CHECK(gate_ctl.update_losses == 3, "peak_loss_reported");
     CHECK(p11_loader_gate_note_producer_end(TOKEN(1, 40), 0) == 0,
           "exhaust_retire");
     gate_rows[40].acked = 1;
     CHECK(p11_loader_gate_ack(TOKEN(1, 40)) == 0, "exhaust_ack_empties");
     CHECK(gate_rows[40].state == LOADER_GATE_EMPTY, "exhaust_row_empty");
     CHECK(gate_ctl.retained == 2, "exhaust_drop_overcounts");
-    CHECK(gate_ctl.update_losses == 3, "drop_loss_reported");
+    CHECK(gate_ctl.update_losses == 4, "drop_loss_reported");
     CHECK(gate_ctl.reclaims == 1, "exhaust_reclaim_counted");
+    return 0;
+}
+
+/* Fallback interleave twin: with every counting-cell CAS forced to fail,
+ * the retained add takes the headroom fallback; a reclaim landing
+ * between the fallback add and the re-read lowers the peak passed on.
+ * The fallback must report a loss so zero losses still means exact. */
+static int retained_fallback_interleave(const char *scenario)
+{
+    gate_reset();
+    CHECK(p11_loader_gate_cutover() == 0, "cutover_zero");
+    CHECK(p11_loader_gate_admit(40, 1) == 0, "interleave_setup_admits");
+    CHECK(gate_ctl.retained == 1 && gate_ctl.retained_peak == 1,
+          "interleave_setup_gauge_one");
+    CHECK(p11_loader_gate_note_producer_end(TOKEN(1, 40), 0) == 0,
+          "interleave_setup_retires");
+    gate_rows[40].acked = 1;
+    gate_cas_fail_all = 1;
+    gate_fallback_interleave_drop = 1;
+    CHECK(p11_loader_gate_hit(41, 1) == 41, "interleave_admit_succeeds");
+    gate_fallback_interleave_drop = 0;
+    gate_cas_fail_all = 0;
+    CHECK(gate_ctl.retained == 1, "interleave_gauge_shows_drop");
+    CHECK(gate_ctl.retained_peak == 1, "interleave_peak_understates");
+    CHECK(gate_ctl.update_losses == 1, "interleave_fallback_reports_loss");
+    CHECK(p11_loader_gate_ack(TOKEN(1, 40)) == 0, "interleave_ack_empties");
+    CHECK(gate_ctl.retained == 0, "interleave_retained_drains");
+    CHECK(gate_ctl.retained_peak == 1, "interleave_peak_never_falls");
+    CHECK(gate_ctl.update_losses == 1, "interleave_no_further_loss");
     return 0;
 }
 #endif
@@ -970,6 +1000,7 @@ int main(int argc, char **argv)
         { "quarantine-retained", quarantine_retained },
 #ifdef GATE_HOST_CAS_HOOK
         { "cas-exhaustion-counts", cas_exhaustion_counts },
+        { "retained-fallback-interleave", retained_fallback_interleave },
 #endif
     };
     unsigned i;

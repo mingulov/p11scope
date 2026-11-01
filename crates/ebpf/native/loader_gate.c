@@ -19,6 +19,12 @@
  * cutover CAS stay real; only counting-cell CAS routes through this
  * wrapper. Never defined for BPF. */
 int gate_cas_fail_all = 0;
+/* Host-only interleave hook: while gate_fallback_interleave_drop is set,
+ * the retained-cell fallback simulates a reclaim landing between the
+ * add and the re-read, so the interleave twin proves the re-read can
+ * understate the peak. Single-threaded and deterministic; never defined
+ * for BPF. */
+int gate_fallback_interleave_drop = 0;
 static __always_inline u64 gate_sat_cas(u64 *ptr, u64 old, u64 desired)
 {
     if (gate_cas_fail_all)
@@ -94,6 +100,10 @@ static __always_inline int gate_sat_inc(struct loader_gate_control *ctl, u64 *ce
      * the link CPU) and the post-value is re-read instead. */
     if (seen < ~0ULL - GATE_SAT_HEADROOM) {
         __sync_fetch_and_add(cell, 1);
+#ifdef GATE_HOST_CAS_HOOK
+        if (gate_fallback_interleave_drop && cell == &ctl->retained)
+            __sync_fetch_and_sub(cell, 1);
+#endif
         *out = *(volatile u64 *)cell;
         return 1;
     }

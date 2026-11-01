@@ -183,6 +183,34 @@ fn refused_but_quiet_renders_both_states_not_one_merged_label() {
     );
 }
 
+/// The snapshot names a refused module with its admission reason in plain
+/// words, on the module's own detail line.
+#[test]
+fn snapshot_names_a_refused_module_with_its_admission_reason() {
+    let harness = varied_harness();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let snapshot = render_snapshot(&presentation);
+    let lines: Vec<&str> = snapshot.lines().collect();
+    let position = lines
+        .iter()
+        .position(|line| line.contains("/scale/refused0.so") && line.contains("(refused)"))
+        .expect("the refused module line");
+    assert!(
+        lines[position + 1].contains("fixture refusal"),
+        "{snapshot}"
+    );
+    // Admitted modules carry no admission detail line.
+    let admitted = lines
+        .iter()
+        .position(|line| line.contains("/scale/m0.so") && line.contains("(admitted)"))
+        .expect("an admitted module line");
+    assert!(
+        !lines[admitted + 1].trim_start().starts_with("admission:"),
+        "{snapshot}"
+    );
+}
+
 #[test]
 fn quiet_is_not_unloaded() {
     let mut harness = harness();

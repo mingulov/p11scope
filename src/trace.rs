@@ -878,6 +878,46 @@ mod tests {
         assert_eq!(value["raw_calls"], u64::MAX);
     }
 
+    /// The terminal EVIDENCE record names every refused or partially covered
+    /// module with its reason.
+    #[test]
+    fn evidence_line_names_refused_and_partially_covered_modules() {
+        let mut ev = empty_evidence();
+        ev.discovery.modules_skipped = vec![
+            render::SkippedOut {
+                name: "/opt/p11-kit-trust.so".into(),
+                reason: "module needs 68 more; only 512 attach slots are available".into(),
+            },
+            render::SkippedOut {
+                name: "/opt/libp11-kit.so".into(),
+                reason: "admitted module needs 6120 more; only 512 attach slots are available"
+                    .into(),
+            },
+        ];
+        let line = evidence_line(&ev, crate::attach::CapturePolicy::Allowlisted);
+        let value: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
+        assert_eq!(
+            value["modules_skipped"][0]["name"],
+            "/opt/p11-kit-trust.so"
+        );
+        assert!(
+            value["modules_skipped"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("module needs 68 more"),
+            "{value}"
+        );
+        assert_eq!(value["modules_skipped"][1]["name"], "/opt/libp11-kit.so");
+        assert!(
+            value["modules_skipped"][1]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("admitted module needs 6120 more"),
+            "{value}"
+        );
+    }
+
     fn empty_evidence() -> render::Evidence {
         render::Evidence {
             discovery: render::DiscoveryEvidence::default(),

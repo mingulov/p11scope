@@ -5875,6 +5875,122 @@ pub(crate) mod tests {
         );
     }
 
+    /// The terminal summary names a refused module with its reason in plain
+    /// words and the way to capture it alone.
+    #[test]
+    fn scope_summary_names_a_refused_module_with_its_hint() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/p11-kit-trust.so".into(),
+            reason: "module needs 68 more; only 512 attach slots are available; 480 are in use \
+                 (480 active, 0 retired; held by /opt/other.so 480) — refusing to attach a prefix"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 modules refused"), "{text}");
+        assert!(text.contains("Module gaps (showing 1 of 1):"), "{text}");
+        assert!(text.contains("/opt/p11-kit-trust.so: not attached — "), "{text}");
+        assert!(text.contains("module needs 68 more"), "{text}");
+        assert!(
+            text.contains("capture it alone with --module /opt/p11-kit-trust.so"),
+            "{text}"
+        );
+    }
+
+    /// The terminal summary names a partially covered module: kept endpoints
+    /// stay counted, and the omission says what did not fit.
+    #[test]
+    fn scope_summary_names_a_partially_covered_module() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/grown.so".into(),
+            reason: GROWTH_OMISSION_RECORD.into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 modules partially covered"), "{text}");
+        assert!(text.contains("/opt/grown.so: partially covered — "), "{text}");
+        assert!(text.contains("kept its 511 attached endpoints"), "{text}");
+        assert!(
+            text.contains("capture it alone with --module /opt/grown.so"),
+            "{text}"
+        );
+    }
+
+    /// The terminal summary names a refused proxy closure array with its
+    /// lookalike reason and where its forwarded calls are counted.
+    #[test]
+    fn scope_summary_names_a_refused_closure_array_with_its_counted_providers() {
+        let mut trust = discovered_fixture();
+        trust.id = ModuleId(1);
+        trust.ino = 21;
+        trust.path = "/opt/p11-kit-trust.so".into();
+        let mut row = report("C_FindObjects", 744, 0, false);
+        row.module = Some(ModuleId(1));
+        let mut ev = evidence();
+        ev.discovery.modules.push(trust);
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libp11-kit.so".into(),
+            reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
+                 (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a \
+                 prefix of its 64 lookalike function tables (a proxy closure array is admitted \
+                 whole or not at all)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[row], &ev);
+        assert!(text.contains("/opt/libp11-kit.so: not attached — "), "{text}");
+        assert!(text.contains("64 lookalike function tables"), "{text}");
+        assert!(
+            text.contains(
+                "calls it forwards are counted at the attached providers \
+                 (/opt/p11-kit-trust.so: 744 calls)"
+            ),
+            "{text}"
+        );
+    }
+
+    /// A refused closure array with nothing captured below it says so: its
+    /// calls are not counted anywhere.
+    #[test]
+    fn scope_summary_names_a_refused_closure_array_with_nothing_below_it() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libp11-kit.so".into(),
+            reason: "module needs 6530 more; only 512 attach slots are available; 0 are in use \
+                 (0 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
+                 tables (a proxy closure array is admitted whole or not at all)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[], &ev);
+        assert!(text.contains("/opt/libp11-kit.so: not attached — "), "{text}");
+        assert!(
+            text.contains("no provider below it was captured"),
+            "{text}"
+        );
+    }
+
+    /// The named gap list is bounded: at most five lines plus "and K more".
+    #[test]
+    fn scope_summary_bounds_the_named_gap_list() {
+        let mut ev = evidence();
+        for index in 0..7 {
+            ev.discovery.modules_skipped.push(SkippedOut {
+                name: format!("/opt/refused{index}.so"),
+                reason: "module needs 1 more".into(),
+            });
+        }
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("Module gaps (showing 5 of 7):"), "{text}");
+        assert!(text.contains("/opt/refused0.so: not attached — "), "{text}");
+        assert!(text.contains("/opt/refused4.so: not attached — "), "{text}");
+        assert!(!text.contains("/opt/refused5.so"), "{text}");
+        assert!(text.contains("and 2 more"), "{text}");
+    }
+
     #[test]
     fn provider_change_forces_partial_and_is_shown_live() {
         let mut ev = evidence();

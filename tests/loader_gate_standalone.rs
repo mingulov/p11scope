@@ -692,6 +692,27 @@ fn loader_ticket_harness_bank_binding_stays_local() {
     );
 }
 
+/// Bank-variant witness neutrality: failures through the EXEC witness
+/// (`p11_link_current_cookie`, count=0) leave the shared health cells
+/// flat in a bank build, while the ticket path still counts.
+#[test]
+fn loader_ticket_harness_bank_witness_neutrality() {
+    drive_tickets(
+        "bank-witness-neutrality",
+        &[
+            "ASSERT witness_healthy_flat",
+            "ASSERT witness_quota_flat",
+            "ASSERT witness_zero_cell_flat",
+            "ASSERT witness_create_flat",
+            "ASSERT witness_bad_config_flat",
+            "ASSERT witness_retry_flat",
+            "ASSERT ticket_quota_counts",
+            "ASSERT ticket_create_counts",
+            "ASSERT ticket_retry_counts",
+        ],
+    );
+}
+
 /// Pending-fold watermark: a healthy admission folds the claimed
 /// bank, the retired count is excluded while pending, the retired
 /// epoch still serves, and re-prepare completes without cutting.

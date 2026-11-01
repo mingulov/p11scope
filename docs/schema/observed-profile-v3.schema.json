@@ -933,6 +933,16 @@
                 "ordinal": {"type": "integer", "minimum": 0, "maximum": 103}
               }
             }
+          },
+          "initialization": {
+            "description": "Optional v3-additive Initialize claim, present only on rows that name C_Initialize with at least one positively counted return. The outcome class over the row's own completed calls; potential_provider is a true-only likelihood, never proof. Absent means Initialize was not observed on this row.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outcome"],
+            "properties": {
+              "outcome": {"enum": ["ok", "already_initialized", "error", "mixed"]},
+              "potential_provider": {"const": true}
+            }
           }
         }
       }

@@ -2029,9 +2029,13 @@ pub fn live_scoped(
         } else {
             [None; 3]
         };
+        let mut name = label(r);
+        if let Some(init) = initialization_out(&r.names, &r.rv_counts) {
+            name.push_str(init.text_suffix());
+        }
         s.push_str(&format!(
             "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
-            escape_controls(&label(r)),
+            escape_controls(&name),
             r.calls,
             r.errors,
             fmt_ns(percentiles[0]),
@@ -2344,6 +2348,10 @@ struct FunctionOut {
     in_flight: u64,
     latency_ns: Option<LatencyOut>,
     rv_counts: std::collections::BTreeMap<String, u64>,
+    /// The Initialize claim, present only on rows that name `C_Initialize`
+    /// with at least one positively counted return; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initialization: Option<InitializationOut>,
 }
 
 #[derive(Serialize)]
@@ -2389,6 +2397,82 @@ fn latency_out_for_mode(report: &SlotReport) -> Option<LatencyOut> {
     }
 }
 
+/// The per-row Initialize claim: the outcome class over the row's own
+/// completed calls plus the potential-provider likelihood. Render-time
+/// only, from `rv_counts` already on the row — no new read, no new
+/// retention. Absent (never null or false) unless the row names
+/// `C_Initialize` with at least one positively counted return.
+#[derive(Serialize)]
+struct InitializationOut {
+    /// `ok`, `already_initialized`, `error`, or `mixed` (more than one
+    /// class over the row's completed calls).
+    outcome: &'static str,
+    /// Present and true exactly when at least one completed call returned
+    /// CKR_OK or CKR_CRYPTOKI_ALREADY_INITIALIZED: a likelihood that the
+    /// row's module behaves as a Cryptoki provider, never proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    potential_provider: Option<bool>,
+}
+
+impl InitializationOut {
+    /// The live-table marker uses the same words as the JSON row.
+    fn text_suffix(&self) -> &'static str {
+        match self.outcome {
+            "ok" => " [init: ok, potential provider]",
+            "already_initialized" => " [init: already_initialized, potential provider]",
+            "mixed" => " [init: mixed, potential provider]",
+            _ => " [init: error]",
+        }
+    }
+}
+
+/// Derives the Initialize claim from the row's own `rv_counts` alone.
+/// Every positively counted return maps to exactly one class: CKR_OK is
+/// `ok`, CKR_CRYPTOKI_ALREADY_INITIALIZED is `already_initialized`, and
+/// anything else — including CKR_PENDING, for which the outcome
+/// vocabulary has no word — is `error`. Zero counts assert nothing and
+/// are ignored.
+fn initialization_out(
+    names: &[String],
+    rv_counts: &std::collections::BTreeMap<u64, u64>,
+) -> Option<InitializationOut> {
+    if !names.iter().any(|name| name == "C_Initialize") {
+        return None;
+    }
+    let mut ok = false;
+    let mut already = false;
+    let mut error = false;
+    for (&rv, &count) in rv_counts {
+        if count == 0 {
+            continue;
+        }
+        if rv == pkcs11_types::CkRv::OK.0 {
+            ok = true;
+        } else if rv == pkcs11_types::CkRv::CRYPTOKI_ALREADY_INITIALIZED.0 {
+            already = true;
+        } else {
+            error = true;
+        }
+    }
+    let classes = [ok, already, error].into_iter().filter(|&b| b).count();
+    if classes == 0 {
+        return None;
+    }
+    let outcome = if classes > 1 {
+        "mixed"
+    } else if ok {
+        "ok"
+    } else if already {
+        "already_initialized"
+    } else {
+        "error"
+    };
+    Some(InitializationOut {
+        outcome,
+        potential_provider: (ok || already).then_some(true),
+    })
+}
+
 /// Per-name call/error/latency counts from the **aggregate BPF maps** —
 /// the count authority in every mode (see module docs on `functions`
 /// sourcing in both renderers). `modules` is the current compact
@@ -2431,6 +2515,7 @@ fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<Fu
                 .iter()
                 .map(|(rv, n)| (format!("0x{rv:016x}"), *n))
                 .collect(),
+            initialization: initialization_out(&r.names, &r.rv_counts),
         })
         .collect()
 }
@@ -4258,11 +4343,7 @@ pub(crate) mod tests {
 
         let mut zeroed = report("C_Initialize", 0, 0, false);
         zeroed.rv_counts.insert(pkcs11_types::CkRv::OK.0, 0);
-        let metrics = json(
-            std::slice::from_ref(&zeroed),
-            &ev,
-            &capture_fixture(),
-        );
+        let metrics = json(std::slice::from_ref(&zeroed), &ev, &capture_fixture());
         assert!(
             metrics["functions"][0].get("initialization").is_none(),
             "zero-count RVs assert nothing observed: {}",
@@ -4318,14 +4399,20 @@ pub(crate) mod tests {
             row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 2);
             let wanted = serde_json::json!({"outcome": "ok", "potential_provider": true});
             let metrics = json(std::slice::from_ref(&row), &ev, &capture_fixture());
-            assert_eq!(metrics["functions"][0]["initialization"], wanted, "{mode:?}");
+            assert_eq!(
+                metrics["functions"][0]["initialization"], wanted,
+                "{mode:?}"
+            );
             let profile = profile_json(
                 std::slice::from_ref(&row),
                 VersionedEvidence::wrap(&ev),
                 &state,
                 &capture_fixture(),
             );
-            assert_eq!(profile["functions"][0]["initialization"], wanted, "{mode:?}");
+            assert_eq!(
+                profile["functions"][0]["initialization"], wanted,
+                "{mode:?}"
+            );
         }
     }
 
@@ -4360,7 +4447,9 @@ pub(crate) mod tests {
         let mut ok = report("C_Initialize", 2, 0, false);
         ok.rv_counts.insert(CkRv::OK.0, 2);
         let mut already = report("C_Initialize", 1, 0, false);
-        already.rv_counts.insert(CkRv::CRYPTOKI_ALREADY_INITIALIZED.0, 1);
+        already
+            .rv_counts
+            .insert(CkRv::CRYPTOKI_ALREADY_INITIALIZED.0, 1);
         let mut error = report("C_Initialize", 1, 0, false);
         error.rv_counts.insert(CkRv::GENERAL_ERROR.0, 1);
         let mut mixed = report("C_Initialize", 2, 0, false);

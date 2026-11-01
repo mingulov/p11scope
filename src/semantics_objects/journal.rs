@@ -15293,6 +15293,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_h3_clean_keeps_unpublished_floor() {
+        // The unpublished floor is a fail-safe guard no production
+        // path reaches today; pin it at the function level so dropping
+        // it fails here instead of surviving silently.
+        let genesis = H3DispositionEvidence::genesis();
+        let clean = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(5)],
+            None,
+            None,
+            Some(3),
+            false,
+            &genesis,
+            0,
+        );
+        assert!(
+            matches!(
+                clean,
+                H3DispositionEvidence::Clean {
+                    staged_max: 5,
+                    pending_floor: Some(3)
+                }
+            ),
+            "the unpublished floor survives below the staged maximum: {clean:?}"
+        );
+    }
+
+    #[test]
     fn object_journal_h3_loss_acknowledgement_gates_clean_transition() {
         // N1: loss at position 1, then a clean batch through 2. Without
         // the seal's acknowledgement the barrier persists (never a

@@ -3318,8 +3318,14 @@ impl ClassicDriver<'_> {
     ) -> String {
         // A recorded terminal graph refusal predates any later
         // verdict, so it wins as the abandon reason (§1.9, §6.4).
+        // Next the machine's latched disposition refusal, so the
+        // abandon gap and the run error name the trigger; only with
+        // no refusal code anywhere does the generic fallback stand.
         let reason = coordinator
             .collected_graph_refused()
+            .or(lane
+                .joint_disposition_reason()
+                .map(crate::inventory_semantics::SemanticRefusal::code))
             .unwrap_or("joint finish disposition required");
         let latched = lane.joint_finish_disposition_required();
         // Name a tripped no-progress wedge on stderr: the wedged
@@ -12739,6 +12745,87 @@ mod tests {
             1,
             "exactly one abandon gap: {:?}",
             gaps(&mut driver)
+        );
+    }
+
+    #[test]
+    fn dispose_retained_publication_abandon_names_latched_storage_refusal() {
+        use std::time::{Duration, Instant};
+
+        // Clear the posed reason even if an assertion panics: the
+        // override is thread-local and must not leak into the next
+        // test on this thread.
+        struct ClearPosedReason;
+        impl Drop for ClearPosedReason {
+            fn drop(&mut self) {
+                crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+                    None,
+                );
+            }
+        }
+        let _clear = ClearPosedReason;
+        // Substituted lanes carry no live machine to latch, so the
+        // storage refusal is posed (like the lane's `scripted_*` seams
+        // stage machine behavior); the hold still reads it through the
+        // production accessor. The lane's own Finish flag stays a
+        // different refusal, so the machine latch must win by name.
+        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+            Some(crate::inventory_semantics::SemanticRefusal::ProviderStorage),
+        );
+        let mut coord = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coord, headless.display);
+        let mut io = WindDownIo::completing();
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        io.drop_spy = Some(std::rc::Rc::clone(&drops));
+        let mut lane = joint_lane(io, false);
+        lane.note_joint_finish_failure(crate::inventory_semantics::SemanticRefusal::Unavailable);
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        let outcome = super::tests::retain_with_cause(
+            &mut driver,
+            crate::inventory_capture::ZeroPassCause::OperatorStop,
+            None,
+        );
+        let (mut run, _) = retained_run_of(outcome);
+        let mut budget = RetainedWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let disposition: Result<BlockDisposition, anyhow::Error> =
+            driver.dispose_retained(RetainedBlock::Publication, &mut run, &mut budget);
+        assert_eq!(
+            disposition.unwrap(),
+            BlockDisposition::Resolved,
+            "the abandoned lane leaves nothing pending"
+        );
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the I2 trigger abandons"
+        );
+        assert!(driver.semantic.is_none(), "the lane is held");
+        assert_eq!(drops.get(), 0, "held means never dropped");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("provider_storage_refused"),
+            "the first error names the latched refusal"
+        );
+        let abandons: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "joint finish abandoned for exit")
+            .collect();
+        assert_eq!(
+            abandons.as_slice(),
+            &[(
+                "joint finish abandoned for exit".to_string(),
+                "provider_storage_refused".to_string()
+            )],
+            "the abandon gap names the latched refusal: {:?}",
+            gaps(&mut driver)
+        );
+        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+            None,
         );
     }
 

@@ -463,12 +463,34 @@ int main(int argc, char **argv)
     query_tgid = 101; cookie = 1; cookie_present = 1; cookie_b_present = 0;
     task.self_exec_id = 5; request.cookie = 1; query();
     assert(writes == 2 && rows[0].status == IMG_ROW_READY && rows[0].sequence == 1);
+    /* A missing select word skips the query without failing coverage. */
+    reset();
+    query_tgid = 101; assert(p11_image_entry(101, 1, 5));
+    cookie = 1; cookie_present = 1; cookie_b_present = 0;
+    task.self_exec_id = 5; request.cookie = 1; select_present = 0; query();
+    assert(!writes && control.failed && coverage == IMG_ENABLED);
+    /* A corrupt incarnation skips the same way: the qualifier is checked
+     * before it can wrap into an aliasing legacy cookie. */
+    reset();
+    query_tgid = 101; assert(p11_image_entry(101, 1, 5));
+    cookie = 1; cookie_present = 1; cookie_b_present = 0;
+    task.self_exec_id = 5; request.cookie = 1;
+    select_word.incarnation[0] = IMAGE_IDENTITY_INCARNATION_LIMIT; query();
+    assert(!writes && control.failed && coverage == IMG_ENABLED);
     reset();
     query_tgid = 103;
     assert(!p11_image_entry(103, IMG_LIMIT + 1, 9) && coverage == IMG_FAILED);
     reset();
     query_tgid = 104;
     assert(!p11_image_entry(104, image_identity_qualify(1, 1, 1), 9));
+    assert(coverage == IMG_FAILED);
+    /* In-range but malformed B shapes fail: ticket zero and over-ticket. */
+    reset();
+    query_tgid = 105;
+    assert(!p11_image_entry(105, 1ULL << 15, 9) && coverage == IMG_FAILED);
+    reset();
+    query_tgid = 106;
+    assert(!p11_image_entry(106, (1ULL << 15) + IMG_LIMIT + 1, 9));
     assert(coverage == IMG_FAILED);
     puts("image continuity: qualified bank-B cookies seed, query and invalidate");
 #endif

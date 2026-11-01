@@ -436,13 +436,13 @@ discarded; none of these values is emitted.
 include the journal and birth marker (owner B2, 2026-11-01), and the linked
 birth seals activate only when the user opts in to per-key tracking (owner
 B1, 2026-11-01), with no new read. No formal privacy sign-off before about
-v0.9 (OD25).** [FLAG-NAME-TBD: the WU-2 selection ruling names the
-per-key-tracking opt-in flag; the WU-2 packet fills the flag name into this
-sentence.] At this revision the kernel publish/dirty hooks are implemented
+v0.9 (OD25).** The opt-in is `p11scope inventory --key-operations` (default
+off). At this revision the kernel publish/dirty hooks are implemented
 and the Session-loop seal wire is pending (WU-2); until it lands, no production
 caller mints births from marker state.
 This adds state only in a Detailed lane Session that has published an attach generation (closure).
-Metrics, profile and trace Sessions load the same Detailed object, so the control map exists there,
+Non-counter metrics, profile and trace Sessions load the same Detailed object (counter-mode Sessions load
+counter objects), so the control map exists there,
 zeroed and frozen, and the hooks do one gated read. The marker adds no state to them. Inventory and counter
 objects do not contain the map. v1 and v2 are unchanged.
 
@@ -481,7 +481,9 @@ Scope note: under `--cgroup`, a process outside the selected scope that calls a 
 record holding DIRTY (a record the gap creates holds only DIRTY and zero fields; a record Stage A created
 first keeps its Stage A fields and gains DIRTY). Under `--pid` an outside process never reaches BPF, so it
 gets no record from the marker, except a CLONE_VM sharer of the target (a vfork or posix_spawn child before it
-execs) that calls a watched function: it is marked DIRTY and spends one admission. (The CLONE_VM fork hook
+execs) that calls a watched function: it is left not covered. Where its call reaches BPF it is marked DIRTY
+and spends one admission; whether either attach backend delivers such a call under `--pid` is not yet
+verified live. (The CLONE_VM fork hook
 already creates a shared-mm `PROC_EPOCH` row for such a child regardless of scope.) Stage A already keeps unscoped `PROC_EPOCH` records for processes that map a watched
 provider file (see above), so this is not new in kind. It is never emitted, and it dies with the task.
 
@@ -501,8 +503,8 @@ capture-lifetime userspace copies, `SessionBirthEvidence` and `SessionBirthGrant
 `Debug` output must be redacted before activation. The Session-loop seal wire lands in the WU-2 packet.
 
 Output: nothing new is emitted. The marker only decides whether a process's key operations are reported as
-complete or withheld with a finite `joint_birth_native_<reason>`. No argv, environment, PIN, key, payload,
-raw buffer or pointer is read or kept.
+complete or withheld with a finite `joint_birth_native_<reason>`. No argv, environment, PIN, key, payload or
+raw buffer is read or kept, and no pointer is retained or emitted.
 
 Wire: each EVENTS record carries a private 40-byte tail `{entry_ip,
 entry_stamp, return_stamp}` after the unchanged 328-byte `Event`.

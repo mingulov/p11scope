@@ -29,13 +29,17 @@
 #
 # A load kernel passes only when the probe rows carry both journal roots
 # loaded with verifier stats, the per-program report passes, and the
-# observer text reports the linked lane started (`key operations:
-# unavailable (bootstrap_unavailable)`, or a populated `key operations:
-# rev ...` line when births occur). Zero journal rows, a refused journal
-# start, a timeout, a crash or a missing count is FAIL. The finite
-# refusal reasons (`journal-pair-unavailable-in-build` on a build that
-# omits the object, `uprobe-multi-required` on pre-Multi kernels) are
-# named in the row detail, never mistaken for a pass.
+# observer text proves the linked lane sealed and live: the `semantic
+# lane ready` line, no `key operations unavailable` refusal gap (the
+# refused-linked arm records exactly that before its ordinary retry),
+# and joined semantic calls from an admitted binding. Zero journal
+# rows, a refused journal start, an idle lane, a timeout, a crash or a
+# missing count is FAIL. The finite refusal reasons
+# (`journal-pair-unavailable-in-build` on a build that omits the
+# object, `uprobe-multi-required` on pre-Multi kernels) are named in
+# the row detail, never mistaken for a pass. The key-operations display
+# latch does not complete in production runs at this base, so the
+# display state is recorded in the row, never gated.
 #
 # Pre-Multi kernels (v5.15.*, v6.1.*) are a refusal control, not a
 # load: the finite `uprobe-multi-required` refusal with no loaded
@@ -461,18 +465,31 @@ PY
     elif grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$J_TXT"; then
         add_reason "observer crashed"
     fi
-    LINKED_HOW=""
-    if [ -f "$J_TXT" ] && grep -q 'key operations: unavailable (bootstrap_unavailable)' "$J_TXT"; then
-        LINKED_HOW="linked bootstrap_unavailable"
-    elif [ -f "$J_TXT" ] && grep -q 'key operations: rev ' "$J_TXT"; then
-        LINKED_HOW="linked populated"
-    elif [ -f "$J_TXT" ] && grep -q 'key operations unavailable' "$J_TXT"; then
+    # Linked proof: the seal line plus no journal-start refusal gap
+    # means the linked start succeeded (start_semantic_lane records
+    # "key operations unavailable" on exactly the refused-linked arm
+    # before its ordinary retry, and prints the seal line only for a
+    # sealed lane), and joined calls prove the lane is live. The
+    # key-operations display latch (bootstrap_unavailable) does not
+    # complete in production runs at this base, so the display state
+    # is recorded in the row, never gated.
+    if [ ! -f "$J_TXT" ] || ! grep -q 'p11scope: semantic lane ready' "$J_TXT"; then
+        add_reason "semantic lane never sealed"
+    elif grep -q 'key operations unavailable' "$J_TXT"; then
         REFUSAL=$(grep 'key operations unavailable' "$J_TXT" | head -1 | cut -c1-160)
         add_reason "linked lane refused: $REFUSAL"
-    elif [ -f "$J_TXT" ] && grep -Eq 'not reported by this version|journal_unavailable' "$J_TXT"; then
-        add_reason "linked lane not reported (unlinked lane sealed)"
-    else
-        add_reason "linked lane not reported"
+    elif ! grep -Eq 'semantic calls: collected [0-9]+, joined [1-9][0-9]*, shed [0-9]+, bindings [1-9][0-9]*' "$J_TXT"; then
+        add_reason "linked lane idle (no joined calls)"
+    fi
+    OBSERVED="unknown"
+    if [ -f "$J_TXT" ]; then
+        if grep -q 'key operations: unavailable (bootstrap_unavailable)' "$J_TXT"; then
+            OBSERVED="bootstrap_unavailable"
+        elif grep -q 'key operations: rev ' "$J_TXT"; then
+            OBSERVED="populated"
+        elif grep -Eq 'not reported by this version|journal_unavailable' "$J_TXT"; then
+            OBSERVED="journal_unavailable"
+        fi
     fi
     if [ "$PAIR_OK" != 1 ]; then
         if [ ! -f "$J_PROBE" ]; then
@@ -555,7 +572,7 @@ PY
         fi
     fi
     if [ -z "$REASONS" ]; then
-        DETAIL="$LINKED_HOW; $BITS_COUNT journal rows; max $BITS_PROC $BITS_ROOT; min headroom $BITS_HEAD%; $LEDGERS workload LEDGERs; $BUDGETED"
+        DETAIL="linked sealed live; observations=$OBSERVED; $BITS_COUNT journal rows; max $BITS_PROC $BITS_ROOT; min headroom $BITS_HEAD%; $LEDGERS workload LEDGERs; $BUDGETED"
         echo "# load $KERNEL: PASS ($DETAIL)"
         emit_row "journal-load-$KERNEL" 1 qualified "$DETAIL"
     else

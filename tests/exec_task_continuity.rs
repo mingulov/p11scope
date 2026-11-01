@@ -454,6 +454,105 @@ assert emit[0] not in m.reachable(root_graph, [refused]), 'refused scope emitted
     }
 }
 
+/// PID scope admits a lifecycle record on the tgid number alone, which a
+/// process that later reuses the target's PID also passes; only the
+/// entries' kernel pid filter keeps that process out. The EXEC ticket must
+/// therefore never be acquired under PID scope (its record carries zero,
+/// unavailable), or the reused PID gets TASK_COOKIE state and an allocator
+/// charge in a capture that never selected it. Every path from the emitter
+/// entry to the only ticket call passes a mask of the scope flags'
+/// PID-filter bit (the flags scalar or the first word of the ScopeAuth the
+/// third argument points to); the set arm cannot reach the call and the
+/// clear arm (cgroup/system) still does.
+#[test]
+fn exec_generation_ticket_is_never_acquired_under_pid_scope() {
+    let mut variants = vec![
+        ("detailed", p11scope::EBPF_OBJECT),
+        ("callers", p11scope::EBPF_INVENTORY_CALLERS_OBJECT),
+    ];
+    for (name, bytes) in [
+        ("counts", p11scope::EBPF_COUNTER_COUNTS_OBJECT),
+        ("timestamps", p11scope::EBPF_COUNTER_TIMESTAMPS_OBJECT),
+        ("latency", p11scope::EBPF_COUNTER_LATENCY_OBJECT),
+    ] {
+        if !bytes.is_empty() {
+            variants.push((name, bytes));
+        }
+    }
+    let script = r#"
+import re, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+from _loader import load_path
+m = load_path(Path('scripts/check-live-discovery-object.py'), 'exec_ticket_pid_gate')
+dump = subprocess.check_output(['llvm-objdump-18', '-dr', sys.argv[1]], text=True)
+blocks = m.function_blocks(dump)
+owners = [(name, lines) for name, lines in blocks.items()
+          if any(re.search(r'R_BPF_64_32\s+p11_link_current_cookie\s*$', line) for line in lines)]
+assert len(owners) == 1 and owners[0][0].endswith('emit_lifecycle'), owners
+lines = owners[0][1]
+ticket_row = next(i for i, line in enumerate(lines) if re.search(r'R_BPF_64_32\s+p11_link_current_cookie\s*$', line))
+ticket = next(m.line_pc(line) for line in reversed(lines[:ticket_row]) if m.line_pc(line) is not None)
+insns, graph = m.instruction_graph(lines)
+entry = insns[0][0]
+assert ticket in m.reachable(graph, [entry]), 'the EXEC ticket call is unreachable'
+
+def names_scope_flags(index, register):
+    # Straight-line definitions back to the third argument: the flags
+    # scalar itself, or one u64 load of the ScopeAuth word at offset 0.
+    loaded = False
+    for _, text in reversed(insns[:index]):
+        if text.startswith('call') and register in {'r0', 'r1', 'r2', 'r3', 'r4', 'r5'}:
+            return False
+        if not re.match(register + r' [^ ]*= ', text):
+            continue
+        copy = re.fullmatch(register + r' = (r\d+)', text)
+        if copy:
+            register = copy.group(1)
+            continue
+        load = re.fullmatch(register + r' = \*\(u64 \*\)\((r\d+) \+ 0x0\)', text)
+        if load and not loaded:
+            register, loaded = load.group(1), True
+            continue
+        return False
+    return register == 'r3'
+
+gates = []
+for index, (pc, text) in enumerate(insns[:-2]):
+    mask = re.fullmatch(r'(r\d+) &= 0x1', text)
+    if not mask or not names_scope_flags(index, mask.group(1)):
+        continue
+    branch_pc, branch = insns[index + 1]
+    test = re.fullmatch(mask.group(1) + r' (==|!=) 0x0 goto [+-]0x[0-9a-f]+', branch.removeprefix('if '))
+    if not test:
+        continue
+    target = m.relative_target(branch_pc, branch)
+    following = insns[index + 2][0]
+    pid_set, pid_clear = (target, following) if test.group(1) == '!=' else (following, target)
+    gates.append((pc, pid_set, pid_clear))
+assert gates, 'no PID-filter scope gate guards the EXEC ticket'
+for pc, pid_set, pid_clear in gates:
+    assert ticket not in m.reachable(graph, [pid_set]), f'PID scope reaches the EXEC ticket (gate {pc})'
+    assert ticket in m.reachable(graph, [pid_clear]), f'cgroup/system scope lost the EXEC ticket (gate {pc})'
+assert ticket not in m.reachable(graph, [entry], {pc for pc, _, _ in gates}), 'the EXEC ticket bypasses the PID-filter gate'
+"#;
+    for (name, bytes) in variants {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("exec-ticket-pid.o");
+        fs::write(&path, bytes).unwrap();
+        let check = Command::new("python3")
+            .args(["-I", "-c", script])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+}
+
 #[test]
 fn exec_task_singles_perf_attributes_preserve_healthy_leader_exec() {
     // Characterize the exact patched Aya constructor our Singles path uses.

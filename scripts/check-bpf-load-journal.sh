@@ -14,7 +14,9 @@
 # --budgets defaults to the checked-in tests/bpf-verifier-budgets.json when
 # that file exists. The journal rows are scored against it only when it
 # carries journal/ keys for the kernel; otherwise the gate is loaded +
-# stats + 5% headroom and the row says unbudgeted.
+# stats + 5% headroom and the row says unbudgeted. A corrupt or
+# unreadable budgets file is a harness error (exit 2), never a silent
+# unbudgeted pass.
 #
 # Per kernel one throwaway guest runs a bounded linked inventory,
 # `inventory --system --capture native --key-operations --manifest
@@ -128,7 +130,7 @@ esac
 case "$OUTDIR" in
     /var/tmp/*) echo "output dir under /var/tmp is hidden from vng guests: $OUTDIR" >&2; exit 2 ;;
 esac
-command -v vng >/dev/null || { echo "vng not on PATH" >&2; exit 2; }
+command -v vng >/dev/null || { echo "vng not on PATH" >&2; exit 77; }
 command -v cc >/dev/null || { echo "cc not on PATH" >&2; exit 77; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util not on PATH" >&2; exit 77; }
 MODULE=""
@@ -137,6 +139,44 @@ if ! MODULE=$(python3 -I "$SELECTOR" --select-module 2>/dev/null); then
     exit 77
 fi
 [ -f "$MODULE" ] || { echo "provider module not found: $MODULE" >&2; exit 77; }
+if [ -n "$BUDGETS" ]; then
+    # A corrupt or unreadable budgets file is a harness error, never
+    # a silent unbudgeted pass: require the same shape the report
+    # requires before any guest runs. This sits past the
+    # prerequisite checks so a missing tool still reports 77 first.
+    if ! BUDGETS_ERROR=$(python3 - "$BUDGETS" 2>&1 <<'PY'
+import json,sys
+path = sys.argv[1]
+try:
+    document = json.loads(open(path, encoding="ascii").read())
+except (OSError, UnicodeError, ValueError) as error:
+    print(f"cannot read budgets ({error})")
+    sys.exit(1)
+if type(document) is not dict or type(document.get("programs")) is not dict:
+    print("budgets need a programs mapping")
+    sys.exit(1)
+limit = document.get("limit", 1000000)
+headroom = document.get("min_headroom_percent", 5.0)
+if type(limit) is not int or limit <= 0:
+    print(f"bad budgets limit {limit!r}")
+    sys.exit(1)
+if type(headroom) not in (int, float) or not 0 < headroom < 100:
+    print(f"bad min_headroom_percent {headroom!r}")
+    sys.exit(1)
+for root, per_kernel in document["programs"].items():
+    if type(per_kernel) is not dict:
+        print(f"bad budgets entry for {root!r}")
+        sys.exit(1)
+    for kernel, budget in per_kernel.items():
+        if type(budget) is not int or budget <= 0:
+            print(f"bad budget for {root} on {kernel}")
+            sys.exit(1)
+PY
+); then
+        echo "budgets invalid: $BUDGETS: $BUDGETS_ERROR" >&2
+        exit 2
+    fi
+fi
 
 OBSERVER_SHA=$(sha256sum "$OBSERVER" | cut -d' ' -f1)
 echo "# observer: $OBSERVER"
@@ -269,7 +309,7 @@ else
     exit 3
 fi
 # One persistent caller with spread key-operation iterations: it maps
-# the provider once, sets up a session, prints READY, then paces forty
+# the provider once, sets up a session, prints READY, then paces eighty
 # mech iterations a second apart and holds until killed. Short-lived
 # burst callers exit before admission and shed every call as
 # use-before-admission, so the leg waits for READY before the observer
@@ -478,8 +518,11 @@ PY
     # key-operations display latch (bootstrap_unavailable) does not
     # complete in production runs at this base, so the display state
     # is recorded in the row, never gated.
-    if [ -f "$J_TXT" ] && grep -q 'key operations unavailable' "$J_TXT"; then
-        REFUSAL=$(grep 'key operations unavailable' "$J_TXT" | head -1 | cut -c1-160)
+    # Both refusal shapes: the gap subject from a runtime journal
+    # refusal (with an ordinary retry behind it), and the bare finite
+    # reason from a build that rejects --key-operations up front.
+    if [ -f "$J_TXT" ] && grep -Eq 'key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT"; then
+        REFUSAL=$(grep -E 'key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT" | head -1 | cut -c1-160)
         add_reason "linked lane refused: $REFUSAL"
     elif [ ! -f "$J_TXT" ] || ! grep -q 'p11scope: semantic lane ready' "$J_TXT"; then
         add_reason "semantic lane never sealed"

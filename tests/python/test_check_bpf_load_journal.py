@@ -172,6 +172,12 @@ class JournalGateTests(unittest.TestCase):
             "linked-unlatched": rows,
             "linked-idle": rows,
             "refused-noseal": [row for row in rows if row["btf_id"] == 48],
+            # The plain build exits before loading anything: the probe
+            # file holds only its summary.
+            "refused-hard": [],
+            # The observed 7.3.1 shape: the pair loads, but the
+            # link is refused (no seal, no joined calls).
+            "refused-loaded": rows,
             "missing-root": [row for row in rows
                              if row["root"] != "p11_return_journal"],
             "unlinked": [row for row in rows if row["btf_id"] == 48],
@@ -192,13 +198,23 @@ class JournalGateTests(unittest.TestCase):
             "refused-build": {"rc": 0, "text":
                 "p11scope: semantic lane ready; mechanisms and API results "
                 "are recorded from now on (key operations: planned for 0.6.0)\n"
-                "gap: key operations unavailable: "
+                "gap [key operations unavailable] "
                 "journal-pair-unavailable-in-build: this build omits the "
-                "production journal object; broad inventory continues\n"},
+                "production journal object; broad inventory continues "
+                "with S1 mechanisms and API results\n"},
             "refused-noseal": {"rc": 0, "text":
-                "gap: key operations unavailable: "
+                "gap [key operations unavailable] "
                 "journal-pair-unavailable-in-build: this build omits the "
-                "production journal object; broad inventory continues\n"},
+                "production journal object; broad inventory continues "
+                "with S1 mechanisms and API results\n"},
+            "refused-hard": {"rc": 1, "text":
+                "p11scope: inventory --system: "
+                "journal-pair-unavailable-in-build: this build omits the "
+                "production journal object\n"},
+            "refused-loaded": {"rc": 0, "text":
+                "gap [key operations unavailable] "
+                "semantic_attachment_refused; broad inventory continues "
+                "with S1 mechanisms and API results\n"},
             "over-budget": {"rc": 0, "text": LINKED_TEXT},
             "timeout": {"rc": 124, "text": ""},
             "crash": {"rc": 1, "text": LINKED_TEXT + "thread 'main' panicked at src/x.rs:1\n"},
@@ -374,6 +390,29 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(row["qualification"], "failed")
         self.assertIn("journal-pair-unavailable-in-build", row["detail"])
 
+    def test_hard_refused_build_names_the_reason(self):
+        # The plain build rejects --key-operations up front with the
+        # bare finite reason (no gap subject, no seal, no loads): the
+        # row still names it.
+        result, out = self.run_gate(KERNEL, mode="refused-hard")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("journal-pair-unavailable-in-build", row["detail"])
+
+    def test_loaded_pair_with_refusal_gap_fails(self):
+        # The observed 7.3.1 shape: the pair loads, but the link
+        # is refused. Refusal wins over the loaded pair: the cell
+        # fails naming the refusal, not the missing seal.
+        result, out = self.run_gate(KERNEL, mode="refused-loaded")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("linked lane refused", row["detail"])
+        self.assertIn("semantic_attachment_refused", row["detail"])
+
     def test_over_budget_row_fails(self):
         # Non-vacuity: a planted over-budget journal row fails the
         # budgeted cell with both numbers.
@@ -396,6 +435,24 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(row["qualification"], "qualified")
         self.assertIn("budgeted", row["detail"])
         self.assertNotIn("unbudgeted", row["detail"])
+
+    def test_corrupt_budgets_is_a_harness_error(self):
+        # An explicitly-passed corrupt or unreadable budgets file
+        # is a harness error (exit 2 naming budgets), never a
+        # silent unbudgeted pass: no kernel leg runs.
+        cases = {
+            "corrupt.json": b'{"programs": "CORRUPT"\n',
+            "binary.json": b'\xff\xfe\x00bad\n',
+            "unmapped.json": b'{"programs": "CORRUPT"}\n',
+        }
+        for name, payload in cases.items():
+            path = self.work / name
+            path.write_bytes(payload)
+            result, _ = self.run_gate(KERNEL, budgets=path)
+            self.assertEqual(result.returncode, 2, (name, result.stdout))
+            self.assertIn("budgets", result.stderr, name)
+            self.assertNotIn("## kernel", result.stdout, name)
+            shutil.rmtree(self.work / "out")
 
     def test_refusal_control_passes(self):
         # 5.15 is a refusal control: the finite pre-Multi refusal with
@@ -574,6 +631,24 @@ class JournalGateTests(unittest.TestCase):
             capture_output=True, text=True, timeout=60, env=env)
         self.assertEqual(result.returncode, 77, result.stdout)
         self.assertIn("cc not on PATH", result.stderr)
+
+    def test_missing_vng_exits_77(self):
+        # vng is a prerequisite like cc: only dirname is on PATH,
+        # so the gate reaches the vng check first and exits 77.
+        out = self.work / "out"
+        out.mkdir()
+        minbin = self.work / "minbin"
+        minbin.mkdir()
+        real_dirname = shutil.which("dirname")
+        self.assertIsNotNone(real_dirname)
+        (minbin / "dirname").symlink_to(real_dirname)
+        env = {**os.environ, "PATH": str(minbin)}
+        result = subprocess.run(
+            [str(SCRIPT), str(self.bin / "observer"), str(self.probe),
+             str(self.manifest), str(out), KERNEL],
+            capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(result.returncode, 77, result.stdout)
+        self.assertIn("vng not on PATH", result.stderr)
 
 
 class ScriptContractTests(unittest.TestCase):

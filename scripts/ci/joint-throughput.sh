@@ -21,8 +21,8 @@
 #             provider path override (default: probe the release
 #             matrix selector, then the Debian/Fedora paths)
 #   OBS_MARGIN
-#             observer seconds beyond DURATION for startup, pass
-#             attribution and drain (default 60)
+#             observer seconds beyond DURATION for startup, the two
+#             admission passes and drain (default 90)
 #
 # Cells:
 #   joint-10k-single  --system --key-operations over keyed RATE/DURATION
@@ -33,11 +33,16 @@
 #
 # The joint cells spawn the generator after the observer's pass 0, so
 # its exec lands after the linked lane seals and its key is created
-# inside the observed window; there is no GO gate (the hot loop
-# starts immediately after setup, so the paced span has no gap).
-# Every cell holds its target through the observer drain with the
-# FINISH gate and proves the hold (live PID plus provider mapping)
-# before releasing it. The oracle judges every emitted ledger.
+# inside the observed window. The generator prints MAPPED once the
+# provider is mapped but before its first call; the cell waits for an
+# admission pass, opens the setup gate, waits for READY, waits for a
+# second pass so bindings install, then opens GO. First use after
+# admission keeps the usage edge counted (use before admission voids
+# it for good), and the unpaced setup prologue stays outside the
+# paced rate windows by oracle design. Every cell holds its target
+# through the observer drain with the FINISH gate and proves the hold
+# (live PID plus provider mapping) before releasing it. The oracle
+# judges every emitted ledger.
 #
 # Scope note: the joint cells use --system, not --pid. A --pid target
 # that execs after closure loses capture custody at HEAD (the
@@ -244,6 +249,25 @@ wait_for_line() {
     return 0
 }
 
+# Count observer pass lines in $1.
+pass_count() {
+    grep -c "p11scope: pass " "$1" 2>/dev/null || true
+}
+
+# Wait until $1 gains a pass line beyond $2, or $3 seconds pass.
+wait_for_pass() {
+    file=$1
+    before=$2
+    deadline=$(($(date +%s) + $3))
+    while [ "$(pass_count "$file")" -le "$before" ]; do
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            return 1
+        fi
+        sleep 0.5
+    done
+    return 0
+}
+
 # Kill the PIDs in $1 (a pidfile) when still alive; ours only.
 kill_pidfile() {
     [ -f "$1" ] || return 0
@@ -379,13 +403,41 @@ run_joint_cell() {
         return 0
     fi
     log "$cell: pass 0 published; spawning the keyed generator"
-    touch "$dir/go"
-    SOFTHSM2_CONF="$SOFT_CONF" "$GEN" "$PROVIDER" "$mode" "$RATE" "$DURATION" \
+    GEN_CALLS_SETUP_GATE="$dir/setup_go" SOFTHSM2_CONF="$SOFT_CONF" \
+        "$GEN" "$PROVIDER" "$mode" "$RATE" "$DURATION" \
         "$dir/hot.jsonl" "$dir/go" "$dir/finish" \
         > "$dir/gen.out" 2> "$dir/gen.err" &
     gen_pid=$!
     echo "$gen_pid" > "$dir/gen.pid"
     sample_load
+    if ! wait_for_line "MAPPED pid=" "$dir/gen.out" 120; then
+        log "$cell: generator never mapped the provider"
+        kill_pidfile "$dir/gen.pid"
+        kill_observer "$dir/observer.pid"
+        wait 2>/dev/null || true
+        exec 9>&-
+        ORACLE_RC=2
+        ORACLE_REASON="MAPPED never printed"
+        : > "$dir/oracle.json"
+        finish_cell "$cell" "$dir" "flow=mapped-timeout" || return 1
+        return 0
+    fi
+    log "$cell: provider mapped; waiting for an admission pass"
+    passes_before=$(pass_count "$dir/observer.out")
+    if ! wait_for_pass "$dir/observer.out" "$passes_before" 180; then
+        log "$cell: no admission pass after mapping"
+        kill_pidfile "$dir/gen.pid"
+        kill_observer "$dir/observer.pid"
+        wait 2>/dev/null || true
+        exec 9>&-
+        ORACLE_RC=2
+        ORACLE_REASON="no admission pass after mapping"
+        : > "$dir/oracle.json"
+        finish_cell "$cell" "$dir" "flow=admit-timeout" || return 1
+        return 0
+    fi
+    log "$cell: opening the setup gate"
+    touch "$dir/setup_go"
     if ! wait_for_line "READY pid=" "$dir/gen.out" 120; then
         log "$cell: generator never became ready"
         kill_pidfile "$dir/gen.pid"
@@ -398,7 +450,23 @@ run_joint_cell() {
         finish_cell "$cell" "$dir" "flow=ready-timeout" || return 1
         return 0
     fi
-    log "$cell: generator ready; waiting for DONE"
+    log "$cell: setup done; waiting for a binding pass before GO"
+    passes_before=$(pass_count "$dir/observer.out")
+    if ! wait_for_pass "$dir/observer.out" "$passes_before" 180; then
+        log "$cell: no binding pass after setup"
+        kill_pidfile "$dir/gen.pid"
+        kill_observer "$dir/observer.pid"
+        wait 2>/dev/null || true
+        exec 9>&-
+        ORACLE_RC=2
+        ORACLE_REASON="no binding pass after setup"
+        : > "$dir/oracle.json"
+        finish_cell "$cell" "$dir" "flow=bind-timeout" || return 1
+        return 0
+    fi
+    log "$cell: opening GO"
+    touch "$dir/go"
+    log "$cell: generator running; waiting for DONE"
     if ! wait_for_line "DONE" "$dir/gen.out" $((DURATION + 240)); then
         log "$cell: DONE never printed"
         kill_pidfile "$dir/gen.pid"
@@ -594,7 +662,7 @@ usage: joint-throughput.sh P11SCOPE OUTDIR
   OUTDIR    fresh results directory
   env RATE (1k/10k/100k, default 10k), DURATION seconds (default 20),
       MIN_RATE calls/s (default 10000), CELLS subset, SOFTHSM_LIB
-      override, OBS_MARGIN observer seconds beyond DURATION (default 60)
+      override, OBS_MARGIN observer seconds beyond DURATION (default 90)
 USAGE
 }
 
@@ -612,7 +680,7 @@ main() {
     RATE=${RATE:-10k}
     DURATION=${DURATION:-20}
     MIN_RATE=${MIN_RATE:-10000}
-    OBS_MARGIN=${OBS_MARGIN:-60}
+    OBS_MARGIN=${OBS_MARGIN:-90}
     CELLS=${CELLS:-joint-10k-single joint-10k-churn s1-10k-twin}
     if [ ! -x "$P11SCOPE" ]; then
         log "observer binary $P11SCOPE is not executable"

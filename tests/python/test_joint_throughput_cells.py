@@ -139,6 +139,16 @@ class CellScriptLibrary(unittest.TestCase):
             self.assertEqual(glfw.returncode, 0)
             self.assertIn("keyed / keyed-churn", glfw.stdout)
 
+    def test_pass_wait_counts_observer_passes(self):
+        with tempfile.TemporaryDirectory(prefix="jtp-pass-") as tmp:
+            log = Path(tmp) / "observer.out"
+            log.write_text("p11scope: pass 0: 1 scanned\n"
+                           "p11scope: pass 1: 2 scanned\n", encoding="utf-8")
+            first = run_sourced(f'wait_for_pass "{log}" 1 5')
+            self.assertEqual(first.returncode, 0, first.stderr)
+            second = run_sourced(f'wait_for_pass "{log}" 5 1')
+            self.assertEqual(second.returncode, 1)
+
     def test_load_and_nproc_are_sane(self):
         proc = run_sourced('load1; nproc_')
         self.assertEqual(proc.returncode, 0, proc.stderr)

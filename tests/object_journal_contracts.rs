@@ -2223,6 +2223,76 @@ fn object_journal_marker_wired_detailed_only() {
     }
 }
 
+/// P0 journal attribute capture: the journal ELF carries attribute-read
+/// paths exactly when the Detailed object does (FULL wires both, P0 stubs
+/// both). The journal half runs the same object-capture reachability rule
+/// with journal roots; the flipped flag must fail on the same ELF, proving
+/// the check is live rather than vacuous.
+#[test]
+fn object_journal_elf_matches_detailed_attribute_capture() {
+    fn small_requested() -> bool {
+        option_env!("P11SCOPE_SMALL_RING").is_some_and(|value| value == "1" || value == "true")
+            || option_env!("P11SCOPE_SMALL_STATE_MAPS")
+                .is_some_and(|value| value == "1" || value == "true")
+            || option_env!("P11SCOPE_SMALL_DISCOVERY_RING")
+                .is_some_and(|value| value == "1" || value == "true")
+    }
+    // Independent expectation from the request and the build inputs: FULL
+    // and P0 carriable builds select the journal; SMALL, WIDE, unsafe,
+    // private proof, counter-artifact and =0 builds omit it.
+    let carriable = !cfg!(feature = "wide-detailed-2112")
+        && !cfg!(feature = "unsafe-unvalidated-metadata")
+        && !small_requested()
+        && option_env!("P11SCOPE_JOURNAL_PROOF") != Some("1")
+        && option_env!("P11SCOPE_IMAGE_BANK_PROOF") != Some("1")
+        && option_env!("P11SCOPE_COUNTER_ARTIFACTS") != Some("1");
+    let expected = match option_env!("P11SCOPE_JOURNAL") {
+        None => carriable,
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => panic!("malformed P11SCOPE_JOURNAL request {other:?}"),
+    };
+    if !expected {
+        return;
+    }
+    let journal =
+        std::path::Path::new(env!("OUT_DIR")).join("journal-v1/p11scope-ebpf-journal-v1");
+    assert!(
+        journal.is_file(),
+        "expected production journal ELF is absent: build-selection interface gap: {}",
+        journal.display()
+    );
+    let output = std::process::Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("P11SCOPE_OBJECT_CAPTURE_JOURNAL_OBJECT", &journal)
+        .env(
+            "P11SCOPE_OBJECT_CAPTURE_FULL",
+            if cfg!(feature = "stub-object-attributes") {
+                "0"
+            } else {
+                "1"
+            },
+        )
+        .args([
+            "-I",
+            "tests/python/test_bpf_map_defs.py",
+            "ObjectCaptureGlobalsTests.test_object_capture_journal_elf_matches_detailed_capture",
+        ])
+        .output()
+        .expect("run actual journal capture reachability proof");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "journal capture globals: {report}");
+    assert!(report.contains("Ran 1 test"), "zero selection: {report}");
+    assert!(
+        !report.contains("skipped"),
+        "skipped journal proof: {report}"
+    );
+}
+
 /// Every finite ABANDON reason is either emitted by a named producer
 /// site or explicitly reserved in the shared contract. A reason with
 /// neither would let the fixture's wire coverage (removal reasons

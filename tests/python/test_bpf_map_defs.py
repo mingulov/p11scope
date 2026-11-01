@@ -1571,6 +1571,24 @@ class ObjectCaptureGlobalsTests(unittest.TestCase):
                 checker.validate_object_capture_reachability(
                     self.mutated([(row[4] + map_at, "Q", symbol[4])]), full=full == "1")
 
+    def test_object_capture_journal_roots_require_journal_programs(self):
+        elf = checker.Elf(self.object.read_bytes())
+        with self.assertRaisesRegex(RuntimeError, "journal entry/return roots"):
+            checker.validate_object_capture_reachability(elf, full=True, journal=True)
+
+    def test_object_capture_journal_elf_matches_detailed_capture(self):
+        journal = Path(os.environ["P11SCOPE_OBJECT_CAPTURE_JOURNAL_OBJECT"])
+        self.assertTrue(journal.is_file(), "a real compiled journal object is required")
+        elf = checker.Elf(journal.read_bytes())
+        expected = {"p11_stable_cell", "p11_alias_scan", "p11_alias_capacity", "p11_request_cell"}
+        self.assertTrue(expected <= {symbol[0] for symbol in elf.symbols},
+                        "the actual journal object must retain all four scalar globals")
+        full = os.environ.get("P11SCOPE_OBJECT_CAPTURE_FULL", "1")
+        self.assertIn(full, ("0", "1"))
+        checker.validate_object_capture_reachability(elf, full=full == "1", journal=True)
+        with self.assertRaisesRegex(RuntimeError, "reachable"):
+            checker.validate_object_capture_reachability(elf, full=full != "1", journal=True)
+
 
 def run_suite(suite, stream=None):
     result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)

@@ -471,6 +471,27 @@ pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {
     })
 }
 
+/// L4b loader snapshot from a live session: the gate control cell mapped
+/// through the approved counter contract. `None` when this build carries
+/// no gate, the map is absent, or the cell is unpublished or malformed.
+/// Staged read path; no evidence linkage.
+pub fn loader_transitions(session: &Session) -> Result<Option<LoaderTransitions>> {
+    Ok(LoaderTransitions::from_control(
+        session.loader_gate_control()?,
+    ))
+}
+
+/// L4b image snapshot from a live session: the bank-select word plus both
+/// bank watermarks, derived without spending a ticket. `None` unless the
+/// producer and both controls are present and valid. Staged read path; no
+/// evidence linkage.
+pub fn image_transitions(session: &Session) -> Result<Option<ImageTransitions>> {
+    let select = session.image_bank_select()?;
+    let bank_a = control_cell::<ImageIdentityControl>(session, "COOKIE_CTL")?;
+    let bank_b = session.bank_b_control()?;
+    Ok(ImageTransitions::from_cells(select, bank_a, bank_b))
+}
+
 /// Sum of counter cells (per-CPU values, histogram buckets), saturating at
 /// `u64::MAX` like every other aggregate here instead of wrapping (F-58-T7).
 fn saturating_total(values: impl IntoIterator<Item = u64>) -> u64 {

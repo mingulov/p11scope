@@ -25,8 +25,8 @@ use p11scope_ebpf_common::{
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
     EVIDENCE_ABI_REFUSALS, EVIDENCE_RING_LOSS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
-    IMAGE_IDENTITY_TICKET_LIMIT, ImageBankSelect, ImageIdentityControl, MAX_DESCRIPTORS,
-    PAIR_CALLS_SECOND_SLOT,
+    IMAGE_IDENTITY_TICKET_LIMIT, ImageBankSelect, ImageIdentityControl, LoaderGateControl,
+    MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT,
     PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE, RootAffiliationControl, SlotSemantics,
     TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT,
     ThreadOwnerControl, attach_cookie,
@@ -7563,6 +7563,52 @@ impl Session {
             .copied()
             .fold(0u64, u64::saturating_add);
         counter_snapshot_with(read, abi_refusals)
+    }
+
+    /// One gate-1 `Array` cell, when this build carries the gate and the
+    /// loaded object carries the map. A gate-0 session binds nothing; a
+    /// malformed map errors like every other control read.
+    fn gate_cell<T: aya::Pod>(&self, name: &str) -> Result<Option<T>> {
+        if !LOADER_GATE_BUILD {
+            return Ok(None);
+        }
+        let Some(map) = self.ebpf.map(name) else {
+            return Ok(None);
+        };
+        let cell: Array<_, T> =
+            Array::try_from(map).with_context(|| format!("{name} gate map"))?;
+        Ok(Some(
+            cell.get(&0, 0)
+                .with_context(|| format!("{name} gate cell"))?,
+        ))
+    }
+
+    /// The loader-gate control cell for the snapshot read path. Unpublished
+    /// (zero) cells read back as real zero bytes; the snapshot mapping
+    /// refuses them honestly.
+    pub(crate) fn loader_gate_control(&self) -> Result<Option<LoaderGateControl>> {
+        self.gate_cell("LOADER_GATE_CTL")
+    }
+
+    /// The published bank-select word for the snapshot read path.
+    pub(crate) fn image_bank_select(&self) -> Result<Option<ImageBankSelect>> {
+        self.gate_cell("IMAGE_BANK_SELECT")
+    }
+
+    /// The bank-B control cell for the snapshot read path. Unpublished
+    /// until bank-B preparation lands.
+    pub(crate) fn bank_b_control(&self) -> Result<Option<ImageIdentityControl>> {
+        self.gate_cell("COOKIE_CTL_B")
+    }
+
+    /// The gate rows map for the native acknowledgement: the acknowledgement
+    /// wiring arms per-row reuse through it. Borrowed from the session;
+    /// `None` wherever the gate is not built in.
+    pub(crate) fn loader_gate_rows(&self) -> Option<&Map> {
+        if !LOADER_GATE_BUILD {
+            return None;
+        }
+        self.ebpf.map("LOADER_GATE")
     }
 
     fn read_pid_health(&mut self) -> std::result::Result<u64, PidContinuityRefusal> {

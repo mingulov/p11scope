@@ -152,12 +152,18 @@ is_positive_int() {
 
 # check_counted DIR OPS THREADS: the on-arm exactness gate. inventory.json
 # must hold exactly one SoftHSM2 edge reading counted with exactly
-# OPS+2*THREADS+1, explicitly non-lossy and unsaturated. Prints
-# "<count> counted".
+# OPS+2*THREADS+1, explicitly non-lossy and unsaturated — either exactly
+# on the edge (case a), or as the edge plus one honestly disclosed
+# exit-time demoted tail (case b: exactly one rejected demoted count gap
+# for the sample caller with base == edge and absolute == want, plus
+# exit-time evidence and no placed, budget or sharing gaps; controller
+# ruling 2026-11-01). Prints "<want> counted" and records the case
+# letter in DIR/gate_case.
 check_counted() {
     python3 -I - "$1/inventory.json" "$2" "$3" <<'EOF'
-import json, sys
-doc = json.load(open(sys.argv[1]))
+import json, os, re, sys
+path = sys.argv[1]
+doc = json.load(open(path))
 ops, threads = int(sys.argv[2]), int(sys.argv[3])
 lanes = doc.get("observation", {}).get("lane", None)
 if lanes != "native":
@@ -178,11 +184,70 @@ if state != "counted":
     sys.exit(f"edge state is {state!r}, want counted")
 if coverage.get("lossy") is not False:
     sys.exit(f"edge lossy is {coverage.get('lossy')!r}, want false")
-if entries.get("count") != want:
-    sys.exit(f"edge count {entries.get('count')} != {want} (ops={ops} threads={threads})")
 if entries.get("saturated"):
     sys.exit("edge saturated")
-print(f"{want} counted")
+edge = entries.get("count")
+sample_caller = edges[0].get("caller")
+sample_module = edges[0].get("module")
+gaps = doc.get("gaps") or []
+if doc.get("gaps_suppressed"):
+    sys.exit(f"gaps_suppressed is {doc.get('gaps_suppressed')}, gap counts are incomplete")
+for gap in gaps:
+    if gap.get("caller") == sample_caller and gap.get("budget") is not None:
+        sys.exit(f"budget-bearing gap for the sample caller: {gap.get('subject')!r}")
+placed = [g for g in gaps
+          if g.get("subject") == "demoted count placed" and g.get("caller") == sample_caller]
+if placed:
+    sys.exit(f"{len(placed)} demoted count placed gaps for the sample caller")
+rejected = [g for g in gaps
+            if g.get("subject") == "rejected demoted count" and g.get("caller") == sample_caller]
+
+
+def record(case):
+    with open(os.path.join(os.path.dirname(path), "gate_case"), "w") as handle:
+        handle.write(case + "\n")
+
+
+if edge == want:
+    if rejected:
+        sys.exit(f"edge is exact but {len(rejected)} rejected demoted count gaps name the sample caller")
+    record("a")
+    print(f"{want} counted")
+    sys.exit(0)
+if len(rejected) != 1:
+    sys.exit(f"want exactly 1 rejected demoted count gap for the sample caller, have {len(rejected)}")
+reason = rejected[0].get("reason", "")
+match = re.search(r"absolute count range \((\d+), (\d+)\] \((\d+) unattributed calls\)", reason)
+if match is None:
+    sys.exit("demoted gap reason lacks an absolute count range")
+base, absolute, unattributed = int(match.group(1)), int(match.group(2)), int(match.group(3))
+if unattributed != absolute - base:
+    sys.exit(f"demoted gap unattributed {unattributed} != absolute-base {absolute - base}")
+if base != edge:
+    sys.exit(f"demoted base {base} != edge {edge}")
+if absolute != want:
+    sys.exit(f"demoted absolute {absolute} != {want} (ops={ops} threads={threads})")
+if "budget" in reason or "limit" in reason:
+    sys.exit("demoted gap line mentions budget/limit")
+leader = [g for g in gaps
+          if g.get("subject") == "leader exit status unresolved at stop"
+          and g.get("caller") == sample_caller]
+custody = [g for g in gaps
+           if g.get("subject") == "native capture scope custody unproven"
+           and "PID custody lost: the PID target exited" in g.get("reason", "")
+           and g.get("caller") in (None, sample_caller)]
+if not leader and not custody:
+    sys.exit("demoted tail lacks exit-time evidence (no leader-exit or PID-custody gap)")
+for gap in gaps:
+    rides = ((gap.get("caller") is None or gap.get("caller") == sample_caller)
+             and (gap.get("module") is None or gap.get("module") == sample_module))
+    if rides and (gap.get("subject") == "ambiguous shared endpoint"
+                  or "sharing appeared" in gap.get("reason", "")):
+        sys.exit(f"mid-life sharing gap rides the sample edge: {gap.get('subject')!r}")
+record("b")
+print(f"{want} counted", file=sys.stdout)
+print(f"check_counted: case b exit-time demoted tail base={base} absolute={absolute} want={want}",
+      file=sys.stderr)
 EOF
 }
 

@@ -2156,7 +2156,9 @@ impl BankProofDriver {
     /// rollover reclaim watch: every map in the load except the
     /// shared pins (which legitimately survive a reclaim), plus the
     /// slot's two bank programs. A reclaimed load must leave none
-    /// of these behind.
+    /// of these behind. The program census enumerates every loaded
+    /// program and pins the set to exactly those two, so a third
+    /// loaded program fails loudly instead of going unwatched.
     pub fn bank_load_objects(&self, slot: u32) -> anyhow::Result<BankLoadObjects> {
         let key = self.bank_load_key(slot);
         let load = self.loads.get(key).expect("bank load present");
@@ -2170,14 +2172,41 @@ impl BankProofDriver {
         }
         maps.sort();
         let mut progs = Vec::new();
-        for name in [Self::entry_prog(slot), Self::birth_prog(slot)] {
-            let program = load
-                .bpf
-                .program(name)
-                .ok_or_else(|| anyhow::anyhow!("no such program"))?;
-            progs.push((name.to_string(), program.info()?.id()));
+        for (name, program) in load.bpf.programs() {
+            match program.info() {
+                Ok(info) => progs.push((name.to_string(), info.id())),
+                Err(aya::programs::ProgramError::NotLoaded) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
+        progs.sort();
+        Self::check_bank_program_set(
+            slot,
+            &progs
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+        )?;
         Ok(BankLoadObjects { maps, progs })
+    }
+
+    /// The loaded-program contract for one bank load's reclaim watch:
+    /// exactly the slot's entry and birth programs, nothing else. A
+    /// third loaded program (e.g. a query cover loaded into the slot
+    /// before the census) fails loudly instead of going unwatched.
+    fn check_bank_program_set(slot: u32, loaded: &[String]) -> anyhow::Result<()> {
+        let mut got = loaded.to_vec();
+        got.sort();
+        let mut expected = vec![
+            Self::entry_prog(slot).to_string(),
+            Self::birth_prog(slot).to_string(),
+        ];
+        expected.sort();
+        anyhow::ensure!(
+            got == expected,
+            "bank load {slot} holds programs {got:?}, want exactly {expected:?}"
+        );
+        Ok(())
     }
 
     /// Memlock bytes for the shared proof maps (select/gate/arrays/account).
@@ -6513,6 +6542,43 @@ mod tests {
         assert!(
             body.contains("entry_prog(slot)") && body.contains("birth_prog(slot)"),
             "the program census still pins the slot's two bank programs"
+        );
+    }
+
+    #[test]
+    fn bank_program_set_pins_exactly_entry_and_birth() {
+        let entry_a = "p11_bank_entry_a".to_string();
+        let birth_a = "p11_bank_birth_a".to_string();
+        BankProofDriver::check_bank_program_set(0, &[entry_a.clone(), birth_a.clone()])
+            .expect("exactly entry+birth passes");
+        BankProofDriver::check_bank_program_set(0, &[birth_a.clone(), entry_a.clone()])
+            .expect("program order is irrelevant");
+        assert!(
+            BankProofDriver::check_bank_program_set(
+                0,
+                &[
+                    entry_a.clone(),
+                    birth_a.clone(),
+                    "p11_bank_query_cover".to_string()
+                ]
+            )
+            .is_err(),
+            "a third loaded program fails the census"
+        );
+        assert!(
+            BankProofDriver::check_bank_program_set(0, std::slice::from_ref(&entry_a)).is_err(),
+            "a missing birth program fails the census"
+        );
+        assert!(
+            BankProofDriver::check_bank_program_set(
+                0,
+                &[
+                    "p11_bank_entry_b".to_string(),
+                    "p11_bank_birth_b".to_string()
+                ]
+            )
+            .is_err(),
+            "the wrong slot's programs fail the census"
         );
     }
 

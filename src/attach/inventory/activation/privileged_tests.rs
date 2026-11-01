@@ -7910,6 +7910,14 @@ fn same_cpu_preemption_lane(selection: crate::attach::BackendSelection, label: &
 /// halts every probe at its scope gate, userspace reads OWNER_CTL, and the
 /// published evidence names the halt and is a concrete-gap PARTIAL, instead
 /// of a quiet zero-call capture.
+///
+/// PID scope reads the owner through its continuity baseline before the
+/// first static link, and terminal poison refuses static attachment there
+/// (12a6c3568: explicit stop, terminal or detach state never permits
+/// attachment), so a PID-scoped start with the seeded poison must refuse
+/// before it returns a session. The disclosure body runs under an owned
+/// cgroup scope: its probes are process-wide and gated in BPF only, so the
+/// session starts and the halt reaches the read path.
 #[test]
 #[ignore = "root-owned BPF lane; a poisoned native owner halts capture and is disclosed"]
 fn privileged_detailed_owner_poison_is_disclosed() -> Result<()> {
@@ -7918,21 +7926,37 @@ fn privileged_detailed_owner_poison_is_disclosed() -> Result<()> {
     let plan =
         AttachPlan::from_slots_with_policy(fixture.plan.slots.clone(), AdmissionPolicy::Detailed)
             .map_err(anyhow::Error::msg)?;
+    // Created before the caller, so an early failure drops (kills) the
+    // caller first and the cgroup can still be removed.
+    let group = OwnedCgroup::create()?;
     let mut caller = fixture.spawn_gated()?;
-    crate::attach::TEST_OWNER_POISON
-        .with(|seed| seed.set(p11scope_ebpf_common::OWNER_CLASSIFIER_FAILED));
-    let started = crate::attach::Session::start(
-        &plan,
-        &Scope::Pid(caller.child.id()),
-        &fixture.pins,
-        crate::attach::CapturePolicy::AggregateOnly,
-        None,
-        None,
-        None,
-        crate::attach::BackendSelection::Singles,
+    let poisoned_start = |scope: &Scope| {
+        crate::attach::TEST_OWNER_POISON
+            .with(|seed| seed.set(p11scope_ebpf_common::OWNER_CLASSIFIER_FAILED));
+        let started = crate::attach::Session::start(
+            &plan,
+            scope,
+            &fixture.pins,
+            crate::attach::CapturePolicy::AggregateOnly,
+            None,
+            None,
+            None,
+            crate::attach::BackendSelection::Singles,
+        );
+        crate::attach::TEST_OWNER_POISON.with(|seed| seed.set(0));
+        started
+    };
+    let refused = match poisoned_start(&Scope::Pid(caller.child.id())) {
+        Ok(_) => bail!("a PID-scoped start attached static probes under terminal owner poison"),
+        Err(error) => format!("{error:#}"),
+    };
+    ensure!(
+        refused.contains("static attachment refused while Session is stopping or detached"),
+        "the poisoned PID-scoped start failed for another reason: {refused}"
     );
-    crate::attach::TEST_OWNER_POISON.with(|seed| seed.set(0));
-    let mut session = started?;
+    eprintln!("OWNER_POISON_PID_START refused={refused:?}");
+    group.move_in(&caller)?;
+    let mut session = poisoned_start(&crate::scope::cgroup(&group.path)?)?;
     let ids = OwnedIds::detailed(&session)?;
     caller.go()?;
     caller.calls(0, CALLS)?;
@@ -7965,6 +7989,7 @@ fn privileged_detailed_owner_poison_is_disclosed() -> Result<()> {
     caller.finish()?;
     detached?;
     ensure!(clean_detach, "poisoned Detailed detach retained failures");
+    std::fs::remove_dir(&group.path).context("owner poison cgroup cleanup")?;
     Ok(())
 }
 

@@ -2942,6 +2942,53 @@ mod tests {
     }
 
     #[test]
+    fn same_origin_position_truth_table() {
+        // Same origin means equal carried positions; an unknown
+        // (S1Only) side never confirms.
+        assert!(same_origin_position(Some(900), Some(900)));
+        assert!(!same_origin_position(Some(900), Some(901)));
+        assert!(!same_origin_position(Some(900), None));
+        assert!(!same_origin_position(None, Some(900)));
+        assert!(!same_origin_position(None, None));
+    }
+
+    #[test]
+    fn queued_pending_carries_no_origin_position() {
+        // S1Only queueing stores no origin position; Joint replay
+        // will supply it (Activation wires the channel).
+        let mut edge = EdgeSemantics::default();
+        let sign_id = crate::kinds::function_id("C_Sign").unwrap();
+        let mut pending = op("C_Sign", 7, 110);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        assert_eq!(edge.pending[&(7, sign_id)].origin_pos, None);
+    }
+
+    #[test]
+    fn get_id_carries_origin_position_to_detached() {
+        // A Joint-replayed original's H0 position rides with its
+        // record across the GetID mint, never re-snapshotted.
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&call("C_OpenSession", 7, CkRv::OK.0, 90));
+        let sign_id = crate::kinds::function_id("C_Sign").unwrap();
+        let mut pending = op("C_Sign", 7, 110);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        edge.pending
+            .get_mut(&(7, sign_id))
+            .expect("queued")
+            .origin_pos = Some(900);
+        let mut get_id = call("C_AsyncGetID", 7, CkRv::OK.0, 120);
+        get_id.target_function = sign_id;
+        get_id.async_value = 42;
+        edge.observe(&get_id);
+        assert_eq!(edge.detached.len(), 1);
+        let id = edge.detached.values().next().expect("detached");
+        assert_eq!(id.owner, Some(7));
+        assert_eq!(id.origin_pos, Some(900));
+    }
+
+    #[test]
     fn completion_after_replacement_init_orphans_rather_than_joining() {
         // F2: Init(M1) → Sign(PENDING) → competing Init(M2) →
         // AsyncComplete(Sign, OK). The stale completion must not

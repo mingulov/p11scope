@@ -12,6 +12,8 @@
 use crate::attach::{CapturePolicy, Scope, Session};
 use crate::cli::{self, CaptureArgs, Kind, RunArgs, ScopeArg};
 use crate::discovery::attribution;
+use crate::discovery::caller_registry::OsProcessSource;
+use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
 use crate::discovery::engine::{Engine, EngineSession};
 use crate::discovery::pause::{
     ArmResult, PauseCoordinator, PauseError, PauseIo, PauseStatus, SessionPauseIo,
@@ -5731,6 +5733,7 @@ fn capture_profile(
                 owned
                     .as_deref()
                     .and_then(|owned| owned.still_running.then_some(owned.pid)),
+                None,
             );
             render::apply_counter_snapshot(&mut ev, &snapshot);
             let frame = render::live_snapshot_scoped(
@@ -6429,6 +6432,7 @@ fn capture_profile(
                 .2
                 .as_deref()
                 .and_then(|owned| owned.still_running.then_some(owned.pid)),
+            None,
         );
         ev.apply_stop_quiescence(consumers.stop_quiescence);
         ev.settle_terminal(profile);
@@ -7297,6 +7301,7 @@ fn capture_trace(
                             .2
                             .as_deref()
                             .and_then(|owned| owned.still_running.then_some(owned.pid)),
+                        None,
                     );
                     // Trace without `-o` writes its data to stdout, so only
                     // there are slow-sink drops lost data (review F-4).
@@ -8720,9 +8725,12 @@ fn report_trace_loss<W: Write>(
 /// session (attach failures, object-capture status), the current reports
 /// (in-flight count), and (profile mode only — always 0 in metrics mode)
 /// the ring-buffer/semantic gap counters. Calls `.verdict()` itself before
-/// returning, so callers must not call it again.
+/// returning, so callers must not call it again. `reload_ledger` hands over
+/// the capture's staged disclosure ledger for the B17 projection (`None`
+/// without a producer — the profile loops stage no semantic lane, so the
+/// key stays absent there).
 #[allow(clippy::too_many_arguments)]
-fn evidence_for(
+pub(crate) fn evidence_for(
     engine: &Engine,
     facts: render::CaptureFacts,
     attached_probes: usize,
@@ -8744,6 +8752,7 @@ fn evidence_for(
     scheduling: render::SchedulingEvidence,
     uretprobe_override: Option<render::UretprobeOverride>,
     handoff_child_pid: Option<u32>,
+    reload_ledger: Option<&InventoryCoordinator<OsProcessSource>>,
 ) -> render::Evidence {
     let semantic = state.semantic_evidence();
     // The frozen consumer map (plan Task 8 Step 2), in one place:
@@ -8876,9 +8885,8 @@ fn evidence_for(
         // 6.14 Option B: `None` unless extensive mode armed; the JSON
         // key is then omitted, never null.
         gap_exe_hints: engine.gap_exe_hints().copied(),
-        // B17 W2: the capture path stages no semantic lane, so no
-        // producer feeds this yet; the key stays absent. A future
-        // lane-backed producer sets it post-hoc before the render.
+        // B17: the staged disclosure ledger projects post-hoc below;
+        // captures without one keep the key absent, never zero.
         instance_reload_not_excluded: None,
         // Design §5.7: a live-learned attach key is protected only inside a
         // confirmed pause owner's window. A nonzero debug-state hit counter is
@@ -8905,6 +8913,12 @@ fn evidence_for(
         p11scope_env: render::snapshot_process_env(),
         completeness: "UNKNOWN",
     };
+    // B17 lane-backed producer: project the staged disclosure ledger
+    // the capture handed over (`None` without a producer — the
+    // profile loops stage no semantic lane, so the key stays absent
+    // there). Profile-lane only: shares and verdicts never read it.
+    ev.instance_reload_not_excluded =
+        reload_ledger.and_then(|ledger| ledger.reload_not_excluded_evidence());
     ev.verdict_with_selection(include_selection);
     ev
 }
@@ -8934,6 +8948,7 @@ pub(crate) fn physical_gap_public_evidence_for_test(engine: &Engine) -> [serde_j
         None,
         false,
         render::SchedulingEvidence::default(),
+        None,
         None,
         None,
     );
@@ -9761,6 +9776,7 @@ mod tests {
             None,
             false,
             scheduling,
+            None,
             None,
             None,
         );
@@ -16828,6 +16844,7 @@ mod tests {
             scheduling,
             None,
             None,
+            None,
         );
         evidence.mark_terminal_drain_unproven();
         evidence
@@ -18849,6 +18866,7 @@ mod tests {
                 render::SchedulingEvidence::default(),
                 None,
                 None,
+                None,
             )
         };
 
@@ -18949,6 +18967,7 @@ mod tests {
                     render::SchedulingEvidence::default(),
                     None,
                     None,
+                    None,
                 );
                 assert_eq!(evidence.pause, status);
                 assert_eq!(evidence.unprotected_live_windows, unprotected);
@@ -19022,6 +19041,7 @@ mod tests {
             render::SchedulingEvidence::default(),
             None,
             None,
+            None,
         );
         let capture = render::CaptureMeta {
             started: "t0",
@@ -19074,6 +19094,7 @@ mod tests {
             None,
             true,
             render::SchedulingEvidence::default(),
+            None,
             None,
             None,
         );

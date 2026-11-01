@@ -2365,16 +2365,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         });
     }
 
-    /// B17 W2 terminal projection of the namespace reload disclosure
-    /// ledger: `None` only without a producer — an empty ledger with
-    /// zero count snapshots (absent, never zero). Nonzero snapshots
-    /// project even with an empty identities list: the router is the
-    /// producer then, and exact counts with no identities is the
-    /// honest mint-exhaustion shape. Else the per-identity entries
-    /// in `(file_slot, ids)` order plus the latest count snapshots.
-    /// The private image key never leaves the ledger. Tests only
-    /// until a lane-backed producer feeds the capture render.
-    #[cfg(test)]
+    /// B17 terminal projection of the namespace reload disclosure
+    /// ledger into the profile-lane evidence: `None` only without a
+    /// producer — an empty ledger with zero count snapshots (absent,
+    /// never zero). Nonzero snapshots project even with an empty
+    /// identities list: the router is the producer then, and exact
+    /// counts with no identities is the honest mint-exhaustion shape.
+    /// Else the per-identity entries in `(file_slot, ids)` order plus
+    /// the latest count snapshots. The private image key never leaves
+    /// the ledger. `evidence_for` calls this for the staged ledger
+    /// its capture hands over; captures without one pass `None`.
     pub(crate) fn reload_not_excluded_evidence(
         &self,
     ) -> Option<crate::semantic_capture::InstanceReloadNotExcluded> {

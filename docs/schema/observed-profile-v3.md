@@ -84,9 +84,12 @@ buckets) and never a combined total.
 When a Detailed capture's semantic lane discloses a global-only instance
 continuation, the terminal profile-lane evidence also contains an
 optional additive `instance_reload_not_excluded` object. Captures
-without a disclosing producer omit it (absent, never zero or null);
-the metrics lane never carries it, and the terminal trace `EVIDENCE`
-object carries it under the same rule. When the router counted tainted
+without a disclosing producer omit it (absent, never zero or null).
+The key projects the capture's staged coordinator ledger at the
+terminal evidence; a capture whose path stages no semantic lane (the
+profile loops stage none) omits it. The metrics lane never carries
+it, and the terminal trace `EVIDENCE` object carries it under the
+same rule. When the router counted tainted
 continuations but minted no identity to name (mint exhaustion), the key
 is still present with the exact snapshots and an empty `identities`
 list: the router is the producer then, so absent-never-zero does not

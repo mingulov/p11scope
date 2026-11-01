@@ -127,7 +127,12 @@ fn journal_requested() -> bool {
 // Staged loader-gate activation: unset/0 compiles the gate out (every
 // object byte-identical to before this flag existed), 1 compiles the
 // gate unit, production define and Rust maps into Detailed flavors.
-// Wiring only: the runtime cutover latch still gates enabling.
+// Wiring only: the runtime cutover latch gates the loader hit path
+// alone (old decode before the flip, tokens after). Image-identity
+// bank selection is not latch-gated: the flavor-wide define always
+// compiles the bank-aware allocator, which refuses until the
+// bank-select map is prepared, and nothing publishes it yet. P3 entry
+// precondition: publish the bank select before any =1 load.
 fn loader_gate_requested() -> bool {
     match env::var("P11SCOPE_LOADER_GATE").as_deref() {
         Err(env::VarError::NotPresent) | Ok("0") => false,

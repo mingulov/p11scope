@@ -502,7 +502,13 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin the reviewed post-loader tree 90b8cf9f: the BPF input changes
+      # Pin the post-loader-gate-wiring tree 30208b48. Since 90b8cf9f the BPF
+      # inputs changed in 76098298, a785b4a3 and d63208ac (objects still
+      # matched 90b8cf9f at d63208ac), then 5f67b34f, 32e7dd9a and 523323e0:
+      # at 30208b48 only .debug_* and .BTF.ext line info differ in all three
+      # objects (switched-off loader-gate cfg lines shift source lines);
+      # code, map and BTF type sections are byte-identical.
+      # Earlier pin 90b8cf9f: the BPF input changes
       # since ba92b4e2 are exactly these 12 reviewed commits (loader
       # hit-transaction series, bank identity/fold lifecycle, journal
       # caller/header parity, staged kind-7 notes, birth-marker build
@@ -527,7 +533,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=90b8cf9f6569ad3bf465c143db2cf170c80a617b
+          BASELINE=30208b48bfaa494420cd05f28ba950be41279470
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

@@ -3152,6 +3152,11 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// serialized admission) and the object_return journal Option-reason
 /// migration (c4d87451, 81fef0a2, 4f48d083, f2432aa2): 143211 B,
 /// sha256 below, measured with the unchanged executable lexer.
+/// Re-baselined for the loader-gate map wiring behind the inactive
+/// `p11scope_loader_gate` cfg (32e7dd9a: the gate row/control import
+/// and the `LOADER_GATE`/`LOADER_GATE_CTL` maps, its only BPF source
+/// change): 143722 B. The old pin still matches the source at
+/// 32e7dd9a^ with this same lexer.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3161,8 +3166,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            143211,
-            "84cfd3487db717f0e91eda53d408101cba451232ebd063442fc7da39dfe2ac7e"
+            143722,
+            "3cb6f6624ca0f58ae9e07073b80e57d90cd1fb004e80a9d28712a789cfaeec5d"
         ),
         "stripped BPF dump must stay byte-identical"
     );

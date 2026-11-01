@@ -7,6 +7,7 @@
 # file. The guest shares the host rootfs read-only and hides /tmp and
 # /var/tmp, so the binary and OUTDIR must live under /home; the cells run on
 # a guest-local root-owned tmpfs base. Take the privileged lock around this.
+# MODULE, when set, is forwarded to the guest (a provider path under /home or /usr).
 set -u
 K=$1; BIN=$(realpath -e "$2"); OUT=$3; CELLS=${4:-"overlay cap"}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -20,7 +21,7 @@ cat > "$OUT/inner.sh" <<INNER
 uname -r > $OUT/uname.txt
 modprobe overlay 2>/dev/null || { [ -n "$OVL_KO" ] && insmod "$OVL_KO"; }
 mkdir -p /tmp/c1b && mount -t tmpfs -o mode=0711 tmpfs /tmp/c1b
-$REPO/scripts/qualify-inventory-c1b.sh $BIN --base /tmp/c1b --cells "$CELLS" > $OUT/cells.log 2>&1
+${MODULE:+MODULE=$MODULE }$REPO/scripts/qualify-inventory-c1b.sh $BIN --base /tmp/c1b --cells "$CELLS" > $OUT/cells.log 2>&1
 echo "cells_exit=\$?" >> $OUT/cells.log
 INNER
 s=$(date +%s)

@@ -12029,6 +12029,28 @@ mod tests {
     }
 
     #[test]
+    fn gate1_task_storage_inventory_is_accepted() {
+        // A gate-1 Detailed object carries TASK_COOKIE_B beside the three
+        // base task-storage maps; the preflight must accept that inventory.
+        // Today it refuses with `unexpected Unsupported map TASK_COOKIE_B`,
+        // which blocks every gate-1 load at doctor preflight.
+        let gate1 = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("TASK_COOKIE_B", true),
+            ("COOKIE_CTL", false),
+            ("COOKIE_CTL_B", false),
+            ("IMAGE_BANK_SELECT", false),
+            ("LOADER_GATE", false),
+            ("LOADER_GATE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        validate_identity_inventory(gate1.into_iter()).unwrap();
+    }
+
+    #[test]
     fn identity_preparation_stops_at_every_write_readback_and_freeze_failure() {
         let mut expected = Vec::new();
         prepare_identity_with(true, |step| {

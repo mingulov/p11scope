@@ -744,7 +744,13 @@ fn native_semantic_resource_final_types_pinned() {
     // before SYSTEM activation. Measured on Rust 1.98.1 x86-64 Linux.
     // SemanticBatch carries the H3 disposition inputs C5 requires
     // (awaiting/shed floors plus exhaustion: +40 B over the 88 B base).
-    pin!(crate::inventory_semantics::SemanticBatch, 128);
+    // B17 W2 adds the ruled disclosure quadrant beside it: one drained
+    // disclosures Vec (24 B) plus the two capture-monotonic router
+    // count snapshots (2 x 8 B), +40 B over 128 B = 168 B. Same
+    // justified shape as the previous +40; the terminal stage still
+    // sheds at TERMINAL_STAGED_BATCH_CAP (33), so staged inline
+    // worst case is 33 x 168 B = 5,544 B.
+    pin!(crate::inventory_semantics::SemanticBatch, 168);
     pin!(crate::inventory_semantics::LaneNegative, 16);
     pin!(crate::inventory_semantics::LaneCollectionRefusal, 1);
     pin!(crate::inventory_semantics::LaneCoverage, 64);

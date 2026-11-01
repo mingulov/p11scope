@@ -6752,6 +6752,18 @@ mod b17_wire_projection {
         local: u64,
         global: u64,
     ) -> TickReport {
+        scan_ranges(capture, io, endpoint, image, local, global, ranges())
+    }
+
+    fn scan_ranges(
+        capture: &mut SemanticCapture,
+        io: &mut ScriptIo,
+        endpoint: Endpoint,
+        image: ImageIdentity,
+        local: u64,
+        global: u64,
+        scan_ranges: Vec<MapRange>,
+    ) -> TickReport {
         let fence = capture.router.fence();
         let proof = acquire_test_scan(
             io.domain,
@@ -6764,7 +6776,7 @@ mod b17_wire_projection {
                 sticky: 0,
                 record_flags: 0,
             },
-            ranges(),
+            scan_ranges,
             fence,
         )
         .expect("stable acquisition");
@@ -6973,6 +6985,91 @@ mod b17_wire_projection {
                 .map(String::as_str)
                 .collect::<BTreeSet<_>>(),
             ["file_slot", "ids"].into_iter().collect::<BTreeSet<_>>(),
+        );
+    }
+
+    // Counts without identity still render: mint exhaustion is the
+    // honest empty-ledger shape. The filler scan mints the whole
+    // router budget through the real scan seam, so the churned
+    // identity mints nothing; its global-only continuation still
+    // counts (continued = 1) without queueing a disclosure, and the
+    // capture projects the ruled key with exact counts and an empty
+    // identities list. The router is the producer here, so the key
+    // must be present: absent-never-zero applies only without one.
+    #[test]
+    fn b17_wire_mint_exhaustion_projects_counts_with_empty_identities() {
+        use crate::discovery::instances::MAX_INSTANCES;
+
+        const FILLER: ImageIdentity = ImageIdentity {
+            task_cookie: 0x53,
+            exec_id: 11,
+        };
+        const FILL_BASE: u64 = 0x7000_0000_0000;
+        const FILL_STEP: u64 = 0x1_0000;
+
+        let (mut capture, mut io, endpoint) = fixture();
+        // Exhaust the mint budget in one fat New: every filler range
+        // sits at file offset 0, so each mints one instance ID.
+        let fat: Vec<MapRange> = (0..MAX_INSTANCES as u64)
+            .map(|i| {
+                MapRange::new(
+                    FILL_BASE + i * FILL_STEP,
+                    FILL_BASE + i * FILL_STEP + 0x1000,
+                    0,
+                    false,
+                )
+            })
+            .collect();
+        let filler = scan_ranges(&mut capture, &mut io, endpoint, FILLER, 2, 0, fat);
+        assert_eq!(filler.observations, vec![ObserveOutcome::New]);
+        assert_eq!(
+            capture.router.instances_minted(),
+            MAX_INSTANCES,
+            "the filler must exhaust the mint budget"
+        );
+        // The churned identity mints nothing now; its global-only
+        // continuation counts without disclosing.
+        let churned_new = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 0);
+        assert_eq!(churned_new.observations, vec![ObserveOutcome::New]);
+        assert!(churned_new.reload_not_excluded.is_empty());
+        let churned_tainted = scan(&mut capture, &mut io, endpoint, CHURNED, 2, 1);
+        assert_eq!(
+            churned_tainted.observations,
+            vec![ObserveOutcome::Continued]
+        );
+        assert!(
+            churned_tainted.reload_not_excluded.is_empty(),
+            "exhausted mints disclose no identity"
+        );
+        assert_eq!(churned_tainted.continued_across_global, 1);
+        assert_eq!(churned_tainted.joined_across_global, 0);
+
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        for report in [filler, churned_new, churned_tainted] {
+            commit(&mut coordinator, &mut lane, report);
+        }
+        let projected = coordinator
+            .reload_not_excluded_evidence()
+            .expect("nonzero snapshots must project even with no identities");
+        assert_eq!(projected.continued_across_global, 1);
+        assert_eq!(projected.joined_across_global, 0);
+        assert!(
+            projected.identities.is_empty(),
+            "mint exhaustion names no identity"
+        );
+
+        // The ruled key renders with exact counts and an empty list.
+        let mut evidence = crate::render::tests::evidence();
+        evidence.instance_reload_not_excluded = Some(projected);
+        let value = crate::render::versioned_evidence(&evidence);
+        assert_eq!(
+            value["instance_reload_not_excluded"],
+            serde_json::json!({
+                "continued_across_global": 1,
+                "joined_across_global": 0,
+                "identities": [],
+            }),
         );
     }
 

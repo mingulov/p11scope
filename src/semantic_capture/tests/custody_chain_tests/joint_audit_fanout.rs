@@ -20893,7 +20893,14 @@ fn joint_machine_receipt_model_sizes_and_collect_growth() {
     );
     assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 784);
     assert_eq!(size_of::<crate::inventory_semantics::LaneNegative>(), 16);
-    assert_eq!(size_of::<crate::inventory_semantics::SemanticBatch>(), 128);
+    // 128 + 40 (B17 W2 ruled disclosure quadrant: one drained
+    // disclosures Vec, 24 B, plus the two capture-monotonic router
+    // count snapshots, 2 x 8 B). Same justified shape as the
+    // previous +40 (awaiting/shed floors + exhaustion over the 88 B
+    // base). Re-audited: terminal staging still sheds at
+    // TERMINAL_STAGED_BATCH_CAP (33), so the staged inline worst
+    // case is 33 x 168 B = 5,544 B and the reservation holds.
+    assert_eq!(size_of::<crate::inventory_semantics::SemanticBatch>(), 168);
     assert_eq!(size_of::<crate::semantic_capture::Endpoint>(), 16);
     assert_eq!(
         size_of::<crate::semantics_edge::resources::ResourceLease>(),

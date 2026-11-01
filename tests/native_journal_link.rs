@@ -24,6 +24,40 @@ fn selected() -> bool {
     }
 }
 
+/// Independent build-selection expectations from the switch requests and
+/// the build inputs, never from the build's own output.
+fn small_build_requested() -> bool {
+    option_env!("P11SCOPE_SMALL_RING").is_some_and(|value| value == "1" || value == "true")
+        || option_env!("P11SCOPE_SMALL_STATE_MAPS")
+            .is_some_and(|value| value == "1" || value == "true")
+        || option_env!("P11SCOPE_SMALL_DISCOVERY_RING")
+            .is_some_and(|value| value == "1" || value == "true")
+}
+
+fn expected_journal_selected() -> bool {
+    let carriable = !cfg!(feature = "wide-detailed-2112")
+        && !cfg!(feature = "unsafe-unvalidated-metadata")
+        && !small_build_requested()
+        && option_env!("P11SCOPE_JOURNAL_PROOF") != Some("1")
+        && option_env!("P11SCOPE_IMAGE_BANK_PROOF") != Some("1")
+        && option_env!("P11SCOPE_COUNTER_ARTIFACTS") != Some("1");
+    match option_env!("P11SCOPE_JOURNAL") {
+        None => carriable,
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => panic!("malformed P11SCOPE_JOURNAL request {other:?}"),
+    }
+}
+
+fn expected_marker_enabled() -> bool {
+    match option_env!("P11SCOPE_BIRTH_MARKER") {
+        None => expected_journal_selected(),
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => panic!("malformed P11SCOPE_BIRTH_MARKER request {other:?}"),
+    }
+}
+
 #[test]
 fn journal_proof_output_matches_this_build_selection() {
     let requested = option_env!("P11SCOPE_JOURNAL_PROOF") == Some("1");
@@ -40,11 +74,11 @@ fn journal_proof_output_matches_this_build_selection() {
         option_env!("P11SCOPE_JOURNAL_PROOF_OUTPUTS"),
         Some(if requested { "journal-proof-v1" } else { "" })
     );
-    let marker_requested = option_env!("P11SCOPE_BIRTH_MARKER") == Some("1");
+    let marker_expected = expected_marker_enabled();
     assert_eq!(
         env!("P11SCOPE_BIRTH_MARKER_ENABLED"),
-        if marker_requested { "1" } else { "0" },
-        "birth-marker build selection must track P11SCOPE_BIRTH_MARKER"
+        if marker_expected { "1" } else { "0" },
+        "birth-marker build selection must track the request and the build inputs"
     );
     if requested {
         assert!(
@@ -732,9 +766,9 @@ fn journal_unset_selects_exactly_carriable_builds() {
 
 #[test]
 fn journal_output_matches_this_build_selection() {
-    let requested = option_env!("P11SCOPE_JOURNAL") == Some("1");
+    let expected = expected_journal_selected();
     let path = Path::new(env!("OUT_DIR")).join(JOURNAL_OUTPUT);
-    if requested {
+    if expected {
         assert!(
             path.is_file(),
             "requested production journal ELF is absent: build-selection interface gap: {}",
@@ -745,10 +779,10 @@ fn journal_output_matches_this_build_selection() {
             "production journal ELF aliases ordinary Detailed bytes"
         );
     }
-    assert_eq!(journal_selected(), requested);
+    assert_eq!(journal_selected(), expected);
     assert_eq!(
         option_env!("P11SCOPE_JOURNAL_OUTPUTS"),
-        Some(if requested { "journal-v1" } else { "" })
+        Some(if expected { "journal-v1" } else { "" })
     );
 }
 

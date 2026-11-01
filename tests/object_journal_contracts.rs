@@ -1379,11 +1379,45 @@ fn object_journal_cleanup_abandoned_code_matches_native() {
     assert_eq!(bound, 2, "the abandoned-start code is 2 (only 1 fails)");
 }
 
-/// H8-D marker build gate: `P11SCOPE_BIRTH_MARKER` (unset/0 = off, 1 =
-/// on) derives one decision; the native unit, the instance-epoch define,
-/// the Rust cfg and the two global exports share one predicate, so a
-/// future Detailed bank object cannot half-link the marker (unit without
-/// exports, or the reverse).
+/// Independent build-selection expectations from the switch requests and
+/// the build inputs, never from the build's own output.
+fn small_build_requested() -> bool {
+    option_env!("P11SCOPE_SMALL_RING").is_some_and(|value| value == "1" || value == "true")
+        || option_env!("P11SCOPE_SMALL_STATE_MAPS")
+            .is_some_and(|value| value == "1" || value == "true")
+        || option_env!("P11SCOPE_SMALL_DISCOVERY_RING")
+            .is_some_and(|value| value == "1" || value == "true")
+}
+
+fn expected_journal_selected() -> bool {
+    let carriable = !cfg!(feature = "wide-detailed-2112")
+        && !cfg!(feature = "unsafe-unvalidated-metadata")
+        && !small_build_requested()
+        && option_env!("P11SCOPE_JOURNAL_PROOF") != Some("1")
+        && option_env!("P11SCOPE_IMAGE_BANK_PROOF") != Some("1")
+        && option_env!("P11SCOPE_COUNTER_ARTIFACTS") != Some("1");
+    match option_env!("P11SCOPE_JOURNAL") {
+        None => carriable,
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => panic!("malformed P11SCOPE_JOURNAL request {other:?}"),
+    }
+}
+
+fn expected_marker_enabled() -> bool {
+    match option_env!("P11SCOPE_BIRTH_MARKER") {
+        None => expected_journal_selected(),
+        Some("1") => true,
+        Some("0") => false,
+        Some(other) => panic!("malformed P11SCOPE_BIRTH_MARKER request {other:?}"),
+    }
+}
+
+/// H8-D marker build gate: `P11SCOPE_BIRTH_MARKER` (unset follows the
+/// journal decision, 0 = off, 1 = on) derives one decision; the native
+/// unit, the instance-epoch define, the Rust cfg and the two global
+/// exports share one predicate, so a future Detailed bank object cannot
+/// half-link the marker (unit without exports, or the reverse).
 #[test]
 fn object_journal_marker_build_uses_one_gate() {
     let build = std::fs::read_to_string("build.rs").expect("read build script");
@@ -1404,20 +1438,25 @@ fn object_journal_marker_build_uses_one_gate() {
     );
     let at = lines
         .iter()
-        .position(|line| line.contains("fn birth_marker_requested() -> bool"))
+        .position(|line| line.contains("fn birth_marker_requested() -> BirthMarkerRequest"))
         .expect("marker derivation");
     let derivation = lines[at..at + 8].join("\n");
     for arm in [
         "P11SCOPE_BIRTH_MARKER",
-        "| Ok(\"0\") => false",
-        "Ok(\"1\") => true",
+        "NotPresent) => BirthMarkerRequest::Unset",
+        "Ok(\"1\") => BirthMarkerRequest::Enabled",
+        "Ok(\"0\") => BirthMarkerRequest::Disabled",
         "P11SCOPE_BIRTH_MARKER must be unset, 0 or 1",
     ] {
         assert!(
             derivation.contains(arm),
-            "the marker derivation must map unset/0 to off and 1 to on: {arm}"
+            "the marker derivation must map unset/1/0 to Unset/Enabled/Disabled: {arm}"
         );
     }
+    assert!(
+        build.contains("BirthMarkerRequest::Unset => production_journal"),
+        "an unset marker must follow the journal decision"
+    );
     assert!(
         build.contains("cargo:rerun-if-env-changed=P11SCOPE_BIRTH_MARKER"),
         "the marker derivation must declare its environment input"
@@ -1471,20 +1510,21 @@ fn object_journal_marker_build_uses_one_gate() {
 }
 
 /// H8-D marker host selection: this compilation's cfg and build receipt
-/// track the `P11SCOPE_BIRTH_MARKER` request exactly, so the default
-/// (unset) build stays marker-off and the opt-in build flips on.
+/// track the marker request and the build inputs exactly, so the default
+/// carriable build stays marker-on, incompatible and `=0` builds stay
+/// marker-off, and the opt-in build flips on.
 #[test]
 fn object_journal_birth_marker_host_selection_tracks_request() {
-    let requested = option_env!("P11SCOPE_BIRTH_MARKER") == Some("1");
+    let expected = expected_marker_enabled();
     assert_eq!(
         cfg!(p11scope_birth_marker),
-        requested,
-        "host cfg must track P11SCOPE_BIRTH_MARKER"
+        expected,
+        "host cfg must track the request and the build inputs"
     );
     assert_eq!(
         env!("P11SCOPE_BIRTH_MARKER_ENABLED"),
-        if requested { "1" } else { "0" },
-        "host receipt must track P11SCOPE_BIRTH_MARKER"
+        if expected { "1" } else { "0" },
+        "host receipt must track the request and the build inputs"
     );
 }
 
@@ -1494,11 +1534,11 @@ fn object_journal_birth_marker_host_selection_tracks_request() {
 #[test]
 fn object_journal_birth_marker_detailed_flags_tracks_request() {
     const FLAG: &str = "--cfg=p11scope_birth_marker";
-    let requested = option_env!("P11SCOPE_BIRTH_MARKER") == Some("1");
+    let expected = expected_marker_enabled();
     assert_eq!(
         env!("P11SCOPE_BPF_RUSTFLAGS_DETAILED").contains(FLAG),
-        requested,
-        "Detailed BPF flags must track P11SCOPE_BIRTH_MARKER"
+        expected,
+        "Detailed BPF flags must track the request and the build inputs"
     );
     let mut plain = vec![
         ("inventory", env!("P11SCOPE_BPF_RUSTFLAGS_INVENTORY")),
@@ -1552,12 +1592,12 @@ fn object_journal_birth_marker_detailed_flags_tracks_request() {
 fn object_journal_birth_marker_detailed_object_tracks_request() {
     const MAP: &str = "JOURNAL_MARKER_CTL";
     const GLOBALS: [&str; 2] = ["p11_instance_exec_birth", "p11_instance_scope_gap"];
-    let requested = option_env!("P11SCOPE_BIRTH_MARKER") == Some("1");
+    let expected = expected_marker_enabled();
     let object = aya_obj::Object::parse(p11scope::EBPF_OBJECT).expect("parse Detailed object");
     assert_eq!(
         object.maps.contains_key(MAP),
-        requested,
-        "Detailed marker map must track P11SCOPE_BIRTH_MARKER"
+        expected,
+        "Detailed marker map must track the request and the build inputs"
     );
     for global in GLOBALS {
         assert_eq!(
@@ -1565,8 +1605,8 @@ fn object_journal_birth_marker_detailed_object_tracks_request() {
                 .functions
                 .values()
                 .any(|function| function.name == global),
-            requested,
-            "Detailed {global} must track P11SCOPE_BIRTH_MARKER"
+            expected,
+            "Detailed {global} must track the request and the build inputs"
         );
     }
     for (name, bytes) in [
@@ -2084,33 +2124,99 @@ fn object_journal_object_ring_loss_gap_requires_settled_guard() {
     }
 }
 
-/// H8-D birth marker wiring: only the Detailed object carries the
-/// control map and the two marker globals; inventory and counter
-/// objects carry neither; no built object carries a transaction
-/// symbol (a linked transaction leaf would add its map or a
-/// `p11_journal_*` function). Counter objects are checked when this
-/// build produced them; every class present checks a nonzero
-/// object count, so the test cannot pass with an empty selection.
+/// H8-D birth marker wiring in release objects: a default FULL or P0
+/// build's Detailed object carries the control map and both marker
+/// bodies; a `=0` build carries none; inventory and counter objects
+/// never carry them. Counter objects are checked when this build
+/// produced them; every class present checks a nonzero object count,
+/// so the test cannot pass with an empty selection.
 #[test]
-fn object_journal_release_has_no_birth_marker_paths() {
-    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") == "1" {
-        eprintln!("release-config pin; run in the default-mode matrix");
-        return;
-    }
+fn object_journal_release_birth_marker_wiring_matches_build() {
+    const MAP: &str = "JOURNAL_MARKER_CTL";
+    const GLOBALS: [&str; 2] = ["p11_instance_exec_birth", "p11_instance_scope_gap"];
+    let wired = expected_marker_enabled();
     let object =
         aya_obj::Object::parse(p11scope::EBPF_OBJECT).expect("parse release Detailed object");
-    assert!(
-        !object.maps.contains_key("JOURNAL_MARKER_CTL"),
-        "the release must not allocate the deferred birth-marker control map"
+    assert_eq!(
+        object.maps.contains_key(MAP),
+        wired,
+        "the release Detailed object must carry the marker map exactly when the build selects it"
     );
-    for name in ["p11_instance_exec_birth", "p11_instance_scope_gap"] {
-        assert!(
-            !object
+    for name in GLOBALS {
+        assert_eq!(
+            object
                 .functions
                 .values()
                 .any(|function| function.name == name),
-            "the release must not retain a marker body, including a no-op stub: {name}"
+            wired,
+            "the release Detailed object must carry {name} exactly when the build selects it"
         );
+    }
+    let mut others: Vec<(&str, &[u8])> = vec![
+        ("inventory", p11scope::EBPF_INVENTORY_OBJECT),
+        (
+            "inventory-callers",
+            p11scope::EBPF_INVENTORY_CALLERS_OBJECT,
+        ),
+    ];
+    for (name, bytes) in [
+        ("counter-counts", p11scope::EBPF_COUNTER_COUNTS_OBJECT),
+        (
+            "counter-timestamps",
+            p11scope::EBPF_COUNTER_TIMESTAMPS_OBJECT,
+        ),
+        ("counter-latency", p11scope::EBPF_COUNTER_LATENCY_OBJECT),
+    ] {
+        if !bytes.is_empty() {
+            others.push((name, bytes));
+        }
+    }
+    let mut artifact_bodies: Vec<Vec<u8>> = Vec::new();
+    if option_env!("P11SCOPE_COUNTER_ARTIFACTS") == Some("1") {
+        for name in [
+            "p11scope-ebpf-counter-counts",
+            "p11scope-ebpf-counter-timestamps",
+            "p11scope-ebpf-counter-latency",
+        ] {
+            let path = std::path::Path::new(env!("OUT_DIR"))
+                .join("counter-artifacts")
+                .join(name);
+            artifact_bodies.push(std::fs::read(&path).unwrap_or_else(|_| {
+                panic!("requested counter artifact is absent: {}", path.display())
+            }));
+        }
+    }
+    for (index, bytes) in artifact_bodies.iter().enumerate() {
+        others.push(
+            (
+                [
+                    "counter-counts-artifact",
+                    "counter-timestamps-artifact",
+                    "counter-latency-artifact",
+                ][index],
+                bytes.as_slice(),
+            ),
+        );
+    }
+    assert!(
+        others.len() >= 2,
+        "the inventory class checks two objects, so the test cannot pass with an empty selection"
+    );
+    for (name, bytes) in others {
+        let object = aya_obj::Object::parse(bytes).expect("parse release object");
+        assert!(
+            !object.maps.contains_key(MAP),
+            "{name} must not allocate the marker control map"
+        );
+        for global in GLOBALS {
+            assert!(
+                !object
+                    .functions
+                    .values()
+                    .any(|function| function.name == global),
+                "{name} must not retain {global}"
+            );
+        }
     }
 }
 
@@ -2230,29 +2336,7 @@ fn object_journal_marker_wired_detailed_only() {
 /// the check is live rather than vacuous.
 #[test]
 fn object_journal_elf_matches_detailed_attribute_capture() {
-    fn small_requested() -> bool {
-        option_env!("P11SCOPE_SMALL_RING").is_some_and(|value| value == "1" || value == "true")
-            || option_env!("P11SCOPE_SMALL_STATE_MAPS")
-                .is_some_and(|value| value == "1" || value == "true")
-            || option_env!("P11SCOPE_SMALL_DISCOVERY_RING")
-                .is_some_and(|value| value == "1" || value == "true")
-    }
-    // Independent expectation from the request and the build inputs: FULL
-    // and P0 carriable builds select the journal; SMALL, WIDE, unsafe,
-    // private proof, counter-artifact and =0 builds omit it.
-    let carriable = !cfg!(feature = "wide-detailed-2112")
-        && !cfg!(feature = "unsafe-unvalidated-metadata")
-        && !small_requested()
-        && option_env!("P11SCOPE_JOURNAL_PROOF") != Some("1")
-        && option_env!("P11SCOPE_IMAGE_BANK_PROOF") != Some("1")
-        && option_env!("P11SCOPE_COUNTER_ARTIFACTS") != Some("1");
-    let expected = match option_env!("P11SCOPE_JOURNAL") {
-        None => carriable,
-        Some("1") => true,
-        Some("0") => false,
-        Some(other) => panic!("malformed P11SCOPE_JOURNAL request {other:?}"),
-    };
-    if !expected {
+    if !expected_journal_selected() {
         return;
     }
     let journal =

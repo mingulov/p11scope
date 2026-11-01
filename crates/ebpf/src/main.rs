@@ -2081,8 +2081,12 @@ fn emit_lifecycle(kind: u8, case_id: u8, scope: ScopeAuth, pause_eligible: bool)
     // ScopeAuth was admitted by the lifecycle root and this reservation
     // succeeded. Only EXEC owns this private word; all other kinds retain
     // the initializer's zero. InventoryGlobal carries no identity allocator.
+    // PID scope admits a lifecycle record on the tgid number alone, which a
+    // process that later reuses the target's PID also passes (only the
+    // entries' kernel pid filter holds the original task), so PID scope
+    // never acquires a ticket: its EXEC carries zero, unavailable.
     #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
-    if kind == DISCOVERY_KIND_EXEC {
+    if kind == DISCOVERY_KIND_EXEC && scope.flags & FLAG_PID_FILTER == 0 {
         let ticket = unsafe { p11_link_current_cookie() };
         unsafe {
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), ticket);

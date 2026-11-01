@@ -6217,6 +6217,249 @@ pub(crate) mod tests {
         assert!(!out.contains("unsupported function-table"), "{out}");
     }
 
+    fn fedora_fixture_maps() -> Vec<p11scope_manifest::maps::MapEntry> {
+        p11scope_manifest::maps::parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n\
+              4000-5000 rw-p 00001000 08:01 7 /lib/provider.so\n\
+              7000-9000 r--p 00002000 08:01 7 /lib/provider.so\n",
+        )
+        .unwrap()
+    }
+
+    fn fedora_shaped_snapshot() -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 0..69 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for slot in 69..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        snapshot
+    }
+
+    fn observation_for_decoded_table(
+        snapshot: &[u8],
+        exports: std::sync::Arc<[(String, u64)]>,
+        hook_exports: Vec<String>,
+    ) -> GapClasses {
+        use crate::discovery::identity::{PinnedObjectId, ReconciledModule};
+        use crate::discovery::scan::{CaptureWorkBudget, ScannedModule, decode_exact_table};
+        use crate::plan::build_from_reconciled_modules;
+        use crate::process::{MountNamespaceId, ProcessViewId};
+        use p11scope_manifest::elf::ElfAbi;
+        use p11scope_manifest::maps::MapIndex;
+
+        let maps = fedora_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let table = decode_exact_table(
+            snapshot,
+            0x7000,
+            pkcs11_module::LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .expect("budget must admit the table")
+        .expect("the fixture table must decode");
+        assert_eq!(table.decoded_slot_count(), 68);
+        let key = table.entries[0].object;
+        let object = PinnedObjectId(0);
+        let entry_count = table.entries.len();
+        let scanned = ScannedModule {
+            mapped_identity: None,
+            view: ProcessViewId(0),
+            mount_namespace: MountNamespaceId { device: 1, inode: 1 },
+            key,
+            double_loaded: false,
+            path: "/lib/provider.so".into(),
+            decoder_abi: Some(ElfAbi::Lp64),
+            exports: hook_exports,
+            tables: vec![table],
+            interfaces: vec![],
+        };
+        let reconciled = ReconciledModule {
+            scanned,
+            object,
+            entry_objects: vec![vec![object; entry_count]],
+            exports,
+        };
+        let plan = build_from_reconciled_modules(std::slice::from_ref(&reconciled));
+        assert_eq!(plan.surfaces.len(), 1);
+        assert_eq!(plan.surfaces[0].walk, "known_prefix");
+        assert_eq!(plan.surfaces[0].acquisition, "ok");
+        assert_eq!(plan.surfaces[0].functions, 68);
+        let mut ev = evidence();
+        ev.surfaces = plan.surfaces.clone();
+        ev.gap_classes(true)
+    }
+
+    fn fedora_exports_without_interface_getters() -> std::sync::Arc<[(String, u64)]> {
+        (0..68)
+            .map(|ordinal| {
+                (
+                    pkcs11_module::function_name(ordinal).unwrap().to_string(),
+                    0x500,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fedora_shaped_68_slot_prefix_under_32_label_is_exact() {
+        let exports = fedora_exports_without_interface_getters();
+        assert!(
+            !exports
+                .iter()
+                .any(|(name, _)| name == "C_GetInterface" || name == "C_GetInterfaceList"),
+            "the Fedora shape exports no 3.x interface getter"
+        );
+        let classes = observation_for_decoded_table(
+            &fedora_shaped_snapshot(),
+            exports,
+            vec!["C_GetFunctionList".into()],
+        );
+        assert_eq!(
+            classes.observation.status, "exact",
+            "a complete 68-slot prefix with an impossible extension and no \
+             interface getters is the full reachable surface: {:?}",
+            classes.observation.causes
+        );
+        assert!(
+            classes.observation.causes.is_empty(),
+            "no observation gap: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_an_interface_getter_export_stays_lossy() {
+        let mut names: Vec<(String, u64)> =
+            fedora_exports_without_interface_getters().to_vec();
+        names.push(("C_GetInterface".into(), 0x600));
+        let classes = observation_for_decoded_table(
+            &fedora_shaped_snapshot(),
+            names.into(),
+            vec!["C_GetFunctionList".into(), "C_GetInterface".into()],
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an exported 3.x getter keeps a 3.x route reachable: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_a_truncated_extension_stays_lossy() {
+        let mut truncated = fedora_shaped_snapshot();
+        truncated.truncate(8 + 68 * 8);
+        let classes = observation_for_decoded_table(
+            &truncated,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an unreadable extension cannot prove completeness: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_incomplete_export_evidence_stays_lossy() {
+        let mut names: Vec<(String, u64)> =
+            fedora_exports_without_interface_getters().to_vec();
+        names.pop();
+        assert_eq!(names.len(), 67);
+        let classes = observation_for_decoded_table(
+            &fedora_shaped_snapshot(),
+            names.into(),
+            vec!["C_GetFunctionList".into()],
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "export agreement must cover every decoded slot: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn genuine_104_slot_32_table_stays_full() {
+        use crate::discovery::identity::{PinnedObjectId, ReconciledModule};
+        use crate::discovery::scan::{CaptureWorkBudget, ScannedModule, decode_exact_table};
+        use crate::plan::build_from_reconciled_modules;
+        use crate::process::{MountNamespaceId, ProcessViewId};
+        use p11scope_manifest::elf::ElfAbi;
+        use p11scope_manifest::maps::MapIndex;
+
+        let maps = fedora_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 0..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        let table = decode_exact_table(
+            &snapshot,
+            0x7000,
+            pkcs11_module::LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .expect("budget")
+        .expect("a genuine 104-slot table must decode");
+        assert_eq!(table.version, (3, 2));
+        assert_eq!(table.walk, "full");
+        assert_eq!(table.decoded_slot_count(), 104);
+        let key = table.entries[0].object;
+        let object = PinnedObjectId(0);
+        let exports: std::sync::Arc<[(String, u64)]> = (0..104)
+            .map(|ordinal| {
+                (
+                    pkcs11_module::function_name(ordinal).unwrap().to_string(),
+                    0x500,
+                )
+            })
+            .collect();
+        let scanned = ScannedModule {
+            mapped_identity: None,
+            view: ProcessViewId(0),
+            mount_namespace: MountNamespaceId { device: 1, inode: 1 },
+            key,
+            double_loaded: false,
+            path: "/lib/provider.so".into(),
+            decoder_abi: Some(ElfAbi::Lp64),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![table],
+            interfaces: vec![],
+        };
+        let reconciled = ReconciledModule {
+            scanned,
+            object,
+            entry_objects: vec![vec![object; 104]],
+            exports,
+        };
+        let plan = build_from_reconciled_modules(std::slice::from_ref(&reconciled));
+        assert_eq!(plan.surfaces.len(), 1);
+        assert_eq!(plan.surfaces[0].walk, "full");
+        let mut ev = evidence();
+        ev.surfaces = plan.surfaces.clone();
+        let classes = ev.gap_classes(true);
+        assert_eq!(classes.observation.status, "exact");
+        assert!(
+            !classes.observation.causes.contains(&"surfaces"),
+            "a full walk is unchanged: {:?}",
+            classes.observation.causes
+        );
+    }
+
     #[test]
     fn json_marks_latency_approximate_and_hex_rvs() {
         let mut ev = evidence();

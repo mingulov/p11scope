@@ -46,7 +46,9 @@ use crate::inventory_promotion::{
 use crate::plan::{AdmissionPolicy, AttachKey, AttachPlan, Slot};
 use crate::process::PidPin;
 use crate::semantics_edge::resources::{SemanticResourcePool, SemanticResourceReserver};
-use p11scope_ebpf_common::{CounterMode, DiscoveryRecord};
+use p11scope_ebpf_common::{
+    CounterMode, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_LEADER_EXIT, DiscoveryRecord,
+};
 use std::sync::Arc;
 
 /// One resolved CLI selection: the unique broad slot plus the pinned
@@ -1028,6 +1030,7 @@ pub(super) fn open_k0_window(
 /// `detail` stay absent and the main report's aggregate alone
 /// carries the capture. Metrics-internal like the reads it observes:
 /// production enters through [`close_k0_production`].
+#[cfg_attr(not(test), allow(dead_code))] // No-tail close for twins; production closes with its tail.
 pub(super) fn close_k0_window(
     window: K0Window,
     close_plan: &AttachPlan,
@@ -1050,14 +1053,40 @@ pub(super) fn close_k0_window(
 
 /// Scan the shutdown-tail discovery records for a lifecycle hit on
 /// the selected caller: an EXEC, a leader exit, or a tap fault
-/// (malformed tail). STUB: the tail scan lands with the shutdown-tail
-/// fix; until then the tail is ignored and the window succeeds.
+/// (malformed tail). PID-matched like the tap: other PIDs never hit.
+/// An EXEC voids as caller-changed whatever its case (a faulting case
+/// fails closed the same way); a leader exit voids as caller-retired
+/// unless its timestamp is zero, which fails closed as caller-changed
+/// like the tap's zero-timestamp fault. A malformed tail fails closed
+/// as caller-changed: the witness would have faulted on it.
 fn scan_k0_tail(
-    _pid: u32,
-    _records: &[DiscoveryRecord],
-    _malformed: u64,
+    pid: u32,
+    records: &[DiscoveryRecord],
+    malformed: u64,
 ) -> Option<SelectedDriverRefusal> {
-    None
+    use SelectedDriverRefusal::Promotion;
+    if malformed > 0 {
+        return Some(Promotion(PromotionRefusal::CallerChanged));
+    }
+    let mut saw_exit = false;
+    for record in records {
+        if (record.pid_tgid >> 32) as u32 != pid {
+            continue;
+        }
+        match record.kind {
+            DISCOVERY_KIND_EXEC => {
+                return Some(Promotion(PromotionRefusal::CallerChanged));
+            }
+            DISCOVERY_KIND_LEADER_EXIT => {
+                if record.hook_ts_ns == 0 {
+                    return Some(Promotion(PromotionRefusal::CallerChanged));
+                }
+                saw_exit = true;
+            }
+            _ => {}
+        }
+    }
+    saw_exit.then_some(Promotion(PromotionRefusal::CallerRetired))
 }
 
 /// Close the K0 window with its shutdown-tail records: the shared
@@ -1068,6 +1097,7 @@ fn scan_k0_tail(
 /// caller-retired, in the witness step's contract position (after
 /// retirement, before loss). Twins stage the tail directly;
 /// production collects it from the terminal drains.
+#[allow(clippy::too_many_arguments)] // One close over all retained inputs; twins drive it directly.
 pub(super) fn close_k0_window_with_tail(
     window: K0Window,
     close_plan: &AttachPlan,
@@ -1201,18 +1231,21 @@ pub(crate) fn open_k0_production(
 }
 
 /// Everything `run_terminal` needs to close an opened K0 window: the
-/// window, the close witness facts snapshotted before the terminal
-/// discovery drain, and whether the close boundary is proven clean.
+/// window, the close witness facts snapshotted before quiescence, the
+/// shutdown-tail discovery records drained after that snapshot, and
+/// whether the close boundary is proven clean.
 pub(crate) struct K0Close {
     pub(crate) window: K0Window,
     pub(crate) facts: K0Facts,
     pub(crate) clean: bool,
+    pub(crate) tail_records: Vec<DiscoveryRecord>,
+    pub(crate) tail_malformed: u64,
 }
 
 /// Production K0 close inside `run_terminal`: the close read off the
-/// broad banks, then the shared close body. The close read runs even
-/// when the boundary is unclean; the close body discards it before
-/// observing and voids as broad-stopping.
+/// broad banks, then the shared close body with the tail. The close
+/// read runs even when the boundary is unclean; the close body
+/// discards it before observing and voids as broad-stopping.
 pub(crate) fn close_k0_production(
     close: K0Close,
     session: &Session,
@@ -1224,6 +1257,8 @@ pub(crate) fn close_k0_production(
         window,
         facts,
         clean,
+        tail_records,
+        tail_malformed,
     } = close;
     let after = k0_broad_read(
         session,
@@ -1232,7 +1267,16 @@ pub(crate) fn close_k0_production(
         window.limits,
         window.collector.reserver(),
     );
-    close_k0_window(window, plan, after, facts, clean, ledger);
+    close_k0_window_with_tail(
+        window,
+        plan,
+        after,
+        facts,
+        clean,
+        &tail_records,
+        tail_malformed,
+        ledger,
+    );
 }
 
 /// Compose the additive `selected_detail` evidence object (M2

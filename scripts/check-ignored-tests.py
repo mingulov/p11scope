@@ -15,7 +15,11 @@ compares them both ways against tests/ignored-tests.json:
   entry missing from its owner's list fails, and a list member that
   resolves to no owned entry fails;
 - a `privileged` or `live-kernel` entry outside tests/ whose test is
-  not curated in scripts/run-privileged-lib-tests.sh fails. Macro-defined
+  not curated in scripts/run-privileged-lib-tests.sh fails. A
+  `performance`/`helper` lib entry whose source #[ignore] reason carries
+  a `privileged:`/`root:` marker fails too: the marker declares a
+  privileged test, so the row must be curated as privileged instead of
+  hiding in a curation-free cell. Macro-defined
   sites (path ending in `!`) expand to their `name!(test, ...)`
   invocations in the same file; every default-build expansion must be
   curated in the default lists, while expansions gated on a cargo
@@ -75,6 +79,7 @@ COUNT_LISTS = (
     INTEGRATION_LIST,
 )
 LIB_CELLS = ("privileged", "live-kernel")
+PRIVILEGED_REASON_MARKERS = ("privileged:", "root:")
 
 MOD_RE = re.compile(
     r"((?:#\s*\[[^\]]*\]\s*)*)"
@@ -519,8 +524,8 @@ def check(root=ROOT, inventory=None, runner=None):
 
     indexed = {}
     for rel, items in sites.items():
-        for line, full, macro, _reason in items:
-            indexed.setdefault((rel, full), []).append((line, macro))
+        for line, full, macro, reason in items:
+            indexed.setdefault((rel, full), []).append((line, macro, reason))
 
     seen = set()
     for pos, entry in enumerate(entries):
@@ -581,8 +586,16 @@ def check(root=ROOT, inventory=None, runner=None):
                         f"{INTEGRATION_LIST}")
             continue
         if entry["cell"] not in LIB_CELLS:
+            _line, _macro, reason = matches[0]
+            marker = next((mark for mark in PRIVILEGED_REASON_MARKERS
+                           if reason.startswith(mark)), None)
+            if marker is not None:
+                failures.append(
+                    f"FAIL {where}: {entry['cell']} {entry['path']} carries "
+                    f"a {marker} source marker in its #[ignore] reason but "
+                    "is not filed as privileged/live-kernel")
             continue
-        _line, macro = matches[0]
+        _line, macro, _reason = matches[0]
         if macro is None:
             if entry["path"] not in registered:
                 failures.append(
@@ -616,7 +629,7 @@ def check(root=ROOT, inventory=None, runner=None):
 
     for (rel, full), matches in sorted(indexed.items()):
         if (rel, full) not in seen:
-            lines = ",".join(str(line) for line, _ in matches)
+            lines = ",".join(str(line) for line, _, _ in matches)
             failures.append(f"FAIL {rel}:{lines}: #[ignore] site {full} "
                             "has no inventory entry")
 

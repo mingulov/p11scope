@@ -667,6 +667,26 @@ class L4ReceiptTests(unittest.TestCase):
             self.judge_report("g16", 300, l4)
         self.assertIn("reclaims", str(raised.exception))
 
+    def test_l4_loader_update_losses_nonzero_is_fail(self):
+        # Any settled-update loss voids the exact-peak proof: the gauges
+        # are bounds, never exact facts, so the capture cannot qualify.
+        l4 = self.with_receipt(
+            "g16", 300, "loader_transitions.update_losses", 1)
+        with self.assertRaises(ORACLE.JudgeFail) as raised:
+            self.judge_report("g16", 300, l4)
+        self.assertIn("update", str(raised.exception))
+        code, verdict = self.judge_cli_verdict("g16", 300, l4)
+        self.assertEqual((code, verdict["pass"], verdict["qualification"]),
+                         (1, False, "failed"))
+
+    def test_l4_loader_update_losses_zero_passes(self):
+        # Zero losses keep the exact-gauge proof: zero-loss evidence
+        # qualifies exactly like the pre-counter receipts.
+        l4 = self.with_receipt(
+            "g16", 300, "loader_transitions.update_losses", 0)
+        self.assertIn("installed positive",
+                      self.judge_report("g16", 300, l4))
+
     def test_l4_tickets_never_crossed_is_fail(self):
         l4 = self.with_receipt(
             "g17", 16385, "image_transitions.tickets_issued", 16384)

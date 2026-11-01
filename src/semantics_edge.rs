@@ -445,7 +445,7 @@ enum CompleteEligible {
     /// The unique pending (session, target) record.
     Pending((u64, u32)),
     /// The unique detached (slot, target, value) record.
-    Detached((u64, u32, u64)),
+    Detached((u64, u32, crate::semantics_objects::AsyncValue)),
 }
 
 /// One mechanism id's per-edge aggregates. The id stays verbatim
@@ -503,7 +503,7 @@ pub(crate) struct EdgeSemantics {
     /// and one module instance, so a second independent claimant
     /// cannot exist inside this map (successive incarnations live on
     /// different edges).
-    detached: BTreeMap<(u64, u32, u64), AsyncId>,
+    detached: BTreeMap<(u64, u32, crate::semantics_objects::AsyncValue), AsyncId>,
     sequence: u64,
     /// Next operation-machine generation (F2/H9): every machine and
     /// every direct operation takes a fresh value via checked
@@ -2021,7 +2021,11 @@ impl EdgeSemantics {
                 // refuses/orphans the second mint and counts
                 // ambiguity — it never overwrites the first origin,
                 // and the refused mint's pending stays intact.
-                let detached_key = (slot, call.target_function, call.async_value);
+                let detached_key = (
+                    slot,
+                    call.target_function,
+                    crate::semantics_objects::AsyncValue::from(call.async_value),
+                );
                 if self.detached.contains_key(&detached_key) {
                     self.orphans = self.orphans.saturating_add(1);
                     self.evidence.async_duplicates =
@@ -2052,10 +2056,11 @@ impl EdgeSemantics {
                     self.orphans = self.orphans.saturating_add(1);
                     return;
                 };
-                match self
-                    .detached
-                    .get_mut(&(slot, call.target_function, call.async_value))
-                {
+                match self.detached.get_mut(&(
+                    slot,
+                    call.target_function,
+                    crate::semantics_objects::AsyncValue::from(call.async_value),
+                )) {
                     Some(id) => {
                         // A successful join assigns custody whole to
                         // the joining session.

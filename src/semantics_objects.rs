@@ -90,6 +90,19 @@ impl SessionHandle {
     }
 }
 
+/// A PKCS#11 3.2 async id word: the `C_AsyncJoin` argument scalar or
+/// the `C_AsyncGetID` output scalar. Internal correlation key only;
+/// never rendered, never serialized.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct AsyncValue(u64);
+redacted_debug!(AsyncValue);
+
+impl From<u64> for AsyncValue {
+    fn from(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 /// Exact outer semantic domain: caller incarnation, process image, native
 /// source (image-domain tag), proven load instance and initialization era.
 ///

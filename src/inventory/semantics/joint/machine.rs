@@ -25,7 +25,7 @@ use crate::inventory_semantics::{
 };
 use crate::semantic_capture::{
     CommittedAbsenceBirth, CurrentPartitionReceipt, H0BirthCandidate, InvalidationScope,
-    RetainedBirthWitness, TickOutcome, TickReport,
+    ReloadNotExcludedReport, RetainedBirthWitness, TickOutcome, TickReport,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
@@ -652,10 +652,25 @@ fn collected_budgets(
             .checked_mul(size_of::<InstanceId>())?
             .checked_add(MAX_INSTANCES.checked_mul(OWNED_ALLOCATION_PADDING)?)
     })()?;
+    // Disclosure-owned instance id lists merge into the accumulator
+    // with the stop union's disclosures: same shape as the outcome
+    // lists (at most one list per disclosure, the union bound caps the
+    // lists at MAX_INSTANCES, the lists together name minted-pool ids,
+    // each collected with the pinned growth law). Covered
+    // unconditionally: the union moves the lists without growth, so no
+    // merge-time charge applies.
+    let disclosure_nested = (|| {
+        MAX_INSTANCES
+            .checked_mul(2)?
+            .checked_add(MAX_INSTANCES.checked_mul(4)?)?
+            .checked_mul(size_of::<InstanceId>())?
+            .checked_add(MAX_INSTANCES.checked_mul(OWNED_ALLOCATION_PADDING)?)
+    })()?;
     let nested_limit = tick_nested
         .checked_add(stashed_nested)?
         .checked_add(binder_margin)?
-        .checked_add(outcome_nested)?;
+        .checked_add(outcome_nested)?
+        .checked_add(disclosure_nested)?;
     // Both the accumulator and the current callback's original buffers
     // coexist. Each Current keeps its actual IDs/watched-file allocation.
     // Empty-input retries resolve those same jobs, never add interests.
@@ -664,6 +679,7 @@ fn collected_budgets(
             .checked_add(array_bytes::<TickOutcome>(MAX_INSTANCES)?.checked_mul(2)?)?
             .checked_add(array_bytes::<CurrentPartitionReceipt>(allocation_limit)?.checked_mul(2)?)?
             .checked_add(array_bytes::<LaneNegative>(MAX_LANE_NEGATIVES)?.checked_mul(2)?)?
+            .checked_add(array_bytes::<ReloadNotExcludedReport>(MAX_INSTANCES)?.checked_mul(2)?)?
             .checked_add(nested_limit.checked_mul(2)?)
     })()?;
     Some(CollectedBudgets {
@@ -746,6 +762,7 @@ impl CollectedReports {
         let mut outcomes = Vec::new();
         let mut current = Vec::new();
         let mut negatives = Vec::new();
+        let mut reload_not_excluded = Vec::new();
         outcomes
             .try_reserve_exact(MAX_INSTANCES)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
@@ -755,9 +772,13 @@ impl CollectedReports {
         negatives
             .try_reserve_exact(MAX_LANE_NEGATIVES)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        reload_not_excluded
+            .try_reserve_exact(MAX_INSTANCES)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
         if outcomes.capacity() != MAX_INSTANCES
             || current.capacity() != budgets.receipt_limit
             || negatives.capacity() != MAX_LANE_NEGATIVES
+            || reload_not_excluded.capacity() != MAX_INSTANCES
         {
             return Err(SemanticRefusal::ProviderStorage);
         }
@@ -774,7 +795,7 @@ impl CollectedReports {
                 has_pending_scans: false,
                 awaited_jobs_pending: false,
                 awaited_hold_pending: false,
-                reload_not_excluded: Vec::new(),
+                reload_not_excluded,
                 continued_across_global: 0,
                 joined_across_global: 0,
             }),
@@ -796,6 +817,7 @@ impl CollectedReports {
         let mut outcomes = Vec::new();
         let mut current = Vec::new();
         let mut negatives = Vec::new();
+        let mut reload_not_excluded = Vec::new();
         outcomes
             .try_reserve_exact(MAX_INSTANCES)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
@@ -805,9 +827,13 @@ impl CollectedReports {
         negatives
             .try_reserve_exact(MAX_LANE_NEGATIVES)
             .map_err(|_| SemanticRefusal::ProviderStorage)?;
+        reload_not_excluded
+            .try_reserve_exact(MAX_INSTANCES)
+            .map_err(|_| SemanticRefusal::ProviderStorage)?;
         if outcomes.capacity() != MAX_INSTANCES
             || current.capacity() != budgets.receipt_limit
             || negatives.capacity() != MAX_LANE_NEGATIVES
+            || reload_not_excluded.capacity() != MAX_INSTANCES
         {
             return Err(SemanticRefusal::ProviderStorage);
         }
@@ -824,7 +850,7 @@ impl CollectedReports {
                 has_pending_scans: false,
                 awaited_jobs_pending: false,
                 awaited_hold_pending: false,
-                reload_not_excluded: Vec::new(),
+                reload_not_excluded,
                 continued_across_global: 0,
                 joined_across_global: 0,
             }),

@@ -2281,11 +2281,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // backpressure drops keep their disclosures (the router drained
         // each identity once); the refused and foreign returns above
         // drop theirs with the batch at the namespace boundary.
+        // Identities shed past the ledger cap are counted and named
+        // here, never silent.
         let (disclosures, continued, joined) = batch.take_reload_disclosures();
-        self.semantic_finalizer
+        let namespace = self
+            .semantic_finalizer
             .as_mut()
-            .expect("the matching Session state is retained")
-            .accumulate_reload_disclosures(disclosures, continued, joined);
+            .expect("the matching Session state is retained");
+        let shed = namespace.accumulate_reload_disclosures(disclosures, continued, joined);
+        if shed > 0 {
+            let cumulative = namespace.reload_shed;
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "reload disclosure identities shed".into(),
+                reason: format!(
+                    "{shed} disclosed identities shed past the ledger cap of {} \
+                     ({cumulative} shed this capture); the count snapshots stay exact",
+                    crate::discovery::instances::MAX_INSTANCES,
+                ),
+                budget: None,
+            });
+        }
         if backpressure {
             self.registry.record_gap(RegistryGap {
                 caller: None,

@@ -7012,7 +7012,7 @@ mod b17_wire_projection {
         use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
 
         let mut coordinator = coordinator();
-        let mut lane = shell_lane();
+        let lane = shell_lane();
         let report = |cookie: u64, id: u64, continued: u64, joined: u64| {
             let mut report = TickReport::default();
             report.reload_not_excluded.push(ReloadNotExcludedReport {
@@ -7059,15 +7059,19 @@ mod b17_wire_projection {
             file_slot: 3,
             ids: vec![InstanceId::from_raw(cookie + 1)],
         };
-        let mut full = TickReport::default();
-        full.reload_not_excluded = (0..MAX_INSTANCES as u64).map(disclosure).collect();
-        full.continued_across_global = 4;
-        full.joined_across_global = 2;
+        let full = TickReport {
+            reload_not_excluded: (0..MAX_INSTANCES as u64).map(disclosure).collect(),
+            continued_across_global: 4,
+            joined_across_global: 2,
+            ..Default::default()
+        };
         commit(&mut coordinator, &mut lane, full);
-        let mut overflow = TickReport::default();
-        overflow.reload_not_excluded = vec![disclosure(10_000)];
-        overflow.continued_across_global = 9;
-        overflow.joined_across_global = 3;
+        let overflow = TickReport {
+            reload_not_excluded: vec![disclosure(10_000)],
+            continued_across_global: 9,
+            joined_across_global: 3,
+            ..Default::default()
+        };
         let batch =
             SemanticBatch::from_tick_report(lane.domain(), overflow, Vec::new(), 130).unwrap();
         coordinator.stage_semantic_batch(batch);

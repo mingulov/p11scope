@@ -1044,6 +1044,27 @@ impl TickReport {
         shed
     }
 
+    /// Merge lane-stashed reload disclosures behind this tick's own,
+    /// truncated to batch capacity like the receipts, with max-merged
+    /// count snapshots. Returns shed disclosures. Fresh disclosures
+    /// stay ahead of stashed ones; the snapshots are
+    /// capture-monotonic router totals, so the maximum wins and totals
+    /// survive even when identities shed.
+    pub(crate) fn merge_stashed_disclosures(
+        &mut self,
+        stashed: Vec<ReloadNotExcludedReport>,
+        continued_across_global: u64,
+        joined_across_global: u64,
+    ) -> u64 {
+        self.reload_not_excluded.extend(stashed);
+        let shed = self.reload_not_excluded.len().saturating_sub(MAX_INSTANCES);
+        self.reload_not_excluded.truncate(MAX_INSTANCES);
+        debug_assert!(self.reload_not_excluded.len() <= MAX_INSTANCES);
+        self.continued_across_global = self.continued_across_global.max(continued_across_global);
+        self.joined_across_global = self.joined_across_global.max(joined_across_global);
+        shed as u64
+    }
+
     /// H3 disposition inputs for the finalizer: the allocation
     /// watermark, route-waiting floor, shed floor, and exhaustion.
     pub(crate) fn allocated_below(&self) -> u64 {

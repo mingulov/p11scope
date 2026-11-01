@@ -368,10 +368,18 @@ impl SemanticBatch {
         &mut self,
         report: &mut TickReport,
     ) -> Result<(), SemanticRefusal> {
+        // The disclosure union shares the batch constructor's bound:
+        // two individually bounded sides must not stage an over-bound
+        // batch. Refusal leaves both sides untouched.
+        let disclosed = self
+            .reload_not_excluded
+            .len()
+            .saturating_add(report.reload_not_excluded.len());
         if !self.permits_collected_stop()
             || !report.current().is_empty()
             || report.outcomes().len() != 1
             || self.outcomes.len() == self.outcomes.capacity()
+            || disclosed > crate::discovery::instances::MAX_INSTANCES
         {
             return Err(SemanticRefusal::ProviderStorage);
         }
@@ -1008,11 +1016,22 @@ pub(crate) const MAX_STASHED_REFRESH_RECEIPTS: usize = crate::discovery::instanc
 /// accompanying outcomes (invalidations from superseded proof) stash
 /// beside the receipts, never discarded. Beyond
 /// [`MAX_STASHED_REFRESH_RECEIPTS`] the oldest of each shed (counted);
-/// a later scan re-mints superseded proof.
+/// a later scan re-mints superseded proof. A disclosing refresh parks
+/// its disclosure quadrant beside the receipts for the same merge.
 #[derive(Debug, Default)]
 pub(crate) struct RefreshReceiptStash {
     stashed: std::collections::VecDeque<CurrentPartitionReceipt>,
     outcomes: std::collections::VecDeque<TickOutcome>,
+    /// Stashed reload disclosures in drain order: router identities
+    /// drain once, so a disclosing refresh parks its quadrant here for
+    /// the next tick merge instead of dropping it. Bounded at the batch
+    /// constructor's `MAX_INSTANCES`; past the cap the oldest shed
+    /// (counted).
+    disclosures: std::collections::VecDeque<ReloadNotExcludedReport>,
+    /// Stashed router count snapshots: capture-monotonic, so the
+    /// maximum wins at merge time.
+    continued_across_global: u64,
+    joined_across_global: u64,
     shed: u64,
     /// Minimum shed outcome position: stash overflow drops positioned
     /// history, so the next merge carries it as a loss barrier. Taken
@@ -1142,7 +1161,11 @@ impl RefreshReceiptStash {
 
     /// Whether the stash holds nothing to merge.
     pub(crate) fn is_empty(&self) -> bool {
-        self.stashed.is_empty() && self.outcomes.is_empty()
+        self.stashed.is_empty()
+            && self.outcomes.is_empty()
+            && self.disclosures.is_empty()
+            && self.continued_across_global == 0
+            && self.joined_across_global == 0
     }
 
     /// Tests-only shed count: production discloses `push_all`'s return
@@ -1162,6 +1185,41 @@ impl RefreshReceiptStash {
         std::mem::take(&mut self.outcomes).into_iter().collect()
     }
 
+    /// Stash one refresh's disclosure quadrant beside its receipts:
+    /// disclosures append in drain order while the count snapshots
+    /// max-merge (router counters are capture-monotonic, so totals
+    /// survive even when identities shed). Past `MAX_INSTANCES` the
+    /// oldest identities shed, counted like receipt/outcome overflow;
+    /// the caller discloses the count as refused endpoints.
+    pub(crate) fn push_disclosures(
+        &mut self,
+        disclosures: Vec<ReloadNotExcludedReport>,
+        continued_across_global: u64,
+        joined_across_global: u64,
+    ) -> u64 {
+        const MAX: usize = crate::discovery::instances::MAX_INSTANCES;
+        self.continued_across_global = self.continued_across_global.max(continued_across_global);
+        self.joined_across_global = self.joined_across_global.max(joined_across_global);
+        let mut shed = 0;
+        self.disclosures.extend(disclosures);
+        while self.disclosures.len() > MAX {
+            self.disclosures.pop_front();
+            shed += 1;
+        }
+        self.shed = self.shed.saturating_add(shed);
+        shed
+    }
+
+    /// Drain the stashed disclosures in order plus the merged count
+    /// snapshots into the next tick batch, resetting the snapshots.
+    pub(crate) fn take_disclosures(&mut self) -> (Vec<ReloadNotExcludedReport>, u64, u64) {
+        (
+            std::mem::take(&mut self.disclosures).into_iter().collect(),
+            std::mem::take(&mut self.continued_across_global),
+            std::mem::take(&mut self.joined_across_global),
+        )
+    }
+
     pub(crate) fn take_for_admission(
         &mut self,
         pin: &Arc<PidPin>,
@@ -1174,9 +1232,10 @@ impl RefreshReceiptStash {
     }
 }
 
-/// Stash one refresh report's receipts and outcomes for the next tick
-/// batch, returning the binding-hint images and the shed count. Shared
-/// by the live refresh path; tests drive it with real H0 reports.
+/// Stash one refresh report's receipts, outcomes and disclosure
+/// quadrant for the next tick batch, returning the binding-hint images
+/// and the shed count. Shared by the live refresh path; tests drive it
+/// with real H0 reports.
 pub(crate) fn stash_refresh_report(
     stash: &mut RefreshReceiptStash,
     report: &mut TickReport,
@@ -1187,6 +1246,10 @@ pub(crate) fn stash_refresh_report(
         .map(|receipt| receipt.image())
         .collect();
     let shed = stash.push_all(report.take_current(), report.take_outcomes());
+    let disclosures = std::mem::take(&mut report.reload_not_excluded);
+    let continued = std::mem::take(&mut report.continued_across_global);
+    let joined = std::mem::take(&mut report.joined_across_global);
+    let shed = shed.saturating_add(stash.push_disclosures(disclosures, continued, joined));
     (images, shed)
 }
 
@@ -1199,6 +1262,9 @@ pub(crate) fn merge_stash_into_report(
 ) -> u64 {
     let shed = report.merge_stashed_current(stash.take());
     let shed = shed.saturating_add(report.merge_stashed_outcomes(stash.take_outcomes()));
+    let (disclosures, continued, joined) = stash.take_disclosures();
+    let shed =
+        shed.saturating_add(report.merge_stashed_disclosures(disclosures, continued, joined));
     report.absorb_shed_floor(stash.take_shed_floor());
     shed
 }

@@ -1275,6 +1275,41 @@ mod tests {
         }
     }
 
+    /// The self-probe must not re-verify the capture's most expensive
+    /// program: `p11_return` (4,960 instructions) is verified again by the
+    /// session seconds later, so the probe loads a cheap production return
+    /// probe through the same shared loader instead. Both the load site
+    /// and the attach site name that one program through
+    /// `SELF_PROBE_PROGRAM`: a mismatch would attach a program the probe
+    /// never loaded. Fails while either site names `p11_return`.
+    #[test]
+    fn the_self_probe_verifies_a_cheap_return_probe_not_p11_return() {
+        let source = include_str!("uretprobe_hazard.rs");
+        for (signature, role) in [
+            (
+                "#[cfg(target_arch = \"x86_64\")]\nfn probe_kernel_inner()",
+                "load site",
+            ),
+            ("fn probe_parent(", "attach site"),
+        ] {
+            let body = source
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("{signature} not found"))
+                .1
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("{signature} body end not found"))
+                .0;
+            assert!(
+                !body.contains("\"p11_return\""),
+                "the self-probe {role} must not name p11_return"
+            );
+            assert!(
+                body.contains("SELF_PROBE_PROGRAM"),
+                "the self-probe {role} must name SELF_PROBE_PROGRAM"
+            );
+        }
+    }
+
     /// S4: the self-probe attaches, so it holds the embedded-flavor gate
     /// itself instead of trusting every caller to check first. A planted
     /// mismatch refuses with the same message capture setup refuses with,

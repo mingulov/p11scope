@@ -236,6 +236,36 @@ struct PendingExecSuccessor<Pin> {
     transition: ExecTransition,
 }
 
+/// One `--prearm-module` input's assembled report row: operator spelling
+/// plus file identity, whether any scope member maps it, and the 6.13
+/// interval keys (`watch`, `attached_at_ns`, `unobserved_windows`) merged
+/// from this lane's own attach stamps. The presentation builder renders one
+/// JSON row per input from these, in flag order.
+#[cfg_attr(not(test), allow(dead_code))] // STAGED: constructed only for the presentation builder.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PrearmReportRow {
+    /// Normalized operator spelling: messages and the module path only,
+    /// never identity.
+    pub path: String,
+    pub dev: (u64, u64),
+    pub ino: u64,
+    /// Whole-file digest of the retained pin, `None` when unproven.
+    pub sha256: Option<String>,
+    /// Whether any registry module record names this object now.
+    pub mapped: bool,
+    /// The watch interval; `None` only when the input resolved to no
+    /// retained object (defensive: retained pins always resolve).
+    pub watch: Option<crate::render::PrearmWatch>,
+    /// Declared-set attach instant (`None` renders null): the max over the
+    /// declared set's real stamps, only when every member carries one.
+    pub attached_at_ns: Option<u64>,
+    /// Explicit unobserved intervals; absent when undisclosed (never-mapped
+    /// pre-arm, unattached modules). An explicitly empty list reads as
+    /// exact only with an R2-D1-6 proof (no producer in this packet, so
+    /// attached modules always disclose their window).
+    pub unobserved_windows: Option<Vec<crate::render::UnobservedWindow>>,
+}
+
 /// The coordinator: an Inventory-policy engine, the caller adapter, and
 /// the caller registry behind one batch boundary, plus the attach set the
 /// catalog's Inventory lowering feeds every pass.
@@ -259,14 +289,27 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     count_manifests: Vec<PathBuf>,
     /// Retained `--prearm-module` pins (packet 6.13 round-2, F5): startup
     /// validation, pin and held-FD custody for supported auto/native
-    /// Inventory capture. Detailed-subset offset activation stays pending
-    /// (disclosed gap); the pins themselves are real and live for the run.
+    /// Inventory capture. Proved offsets lower into the run's attach set
+    /// through [`Self::absorb_prearm_plan`].
     prearm: Option<crate::discovery::identity::PrearmPinning>,
     /// The retained pre-arm pins' object/byte usage (packet 6.13 round-3,
     /// finding 3): manifests pin after pre-arm in inventory, so both the
     /// semantic and the count readers charge this usage against the one
     /// shared capture-level manifest+pre-arm budget.
     prearm_prior: (usize, u64),
+    /// Pre-arm watch state: one watch per pre-armed object over its frozen
+    /// declared proved set, armed from the lane's own attach receipts.
+    /// Reuses `PrearmState`, never a forked machine.
+    prearm_state: crate::prearm_module::PrearmState,
+    /// The capture's scope start for pre-arm window bounds: the run start,
+    /// never absorb time (which would understate the unobserved outer
+    /// bound). Set by [`Self::absorb_prearm_plan`].
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED: read only by prearm_rows.
+    prearm_scope_start_ns: Option<u64>,
+    /// Declared pre-arm keys (prearm-pin id space) to the attach-set
+    /// endpoint ids their absorb minted: how receipt stamps address
+    /// watches. Populated by [`Self::absorb_prearm_plan`].
+    prearm_endpoints: BTreeMap<crate::plan::AttachKey, EndpointId>,
     adapter: CallerAdapter<Source>,
     registry: CallerRegistry,
     attach_set: InventoryAttachSet,
@@ -677,6 +720,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             count_manifests: Vec::new(),
             prearm: None,
             prearm_prior: (0, 0),
+            prearm_state: crate::prearm_module::PrearmState::empty(),
+            prearm_scope_start_ns: None,
+            prearm_endpoints: BTreeMap::new(),
             adapter,
             registry,
             attach_set: InventoryAttachSet::new(endpoint_budget),
@@ -763,6 +809,418 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.prearm_prior = usage;
         self.semantic_inputs.set_prearm_prior(usage.0, usage.1);
         self.prearm = Some(pinning);
+    }
+
+    /// Lowers the retained `--prearm-module` pinning into the run's attach
+    /// set: resolves proved-offset pieces fresh against the
+    /// retained pins (never a stale id), builds a prearm-only plan under
+    /// the run's own Inventory budget through the shared merge, and absorbs
+    /// it. Called before passes, so operator intent wins budget ties; the
+    /// budget itself is unchanged and refusals name it as today. Creates
+    /// one watch per pre-armed object over its frozen declared set and
+    /// records the scope start for window bounds. No-op without retained
+    /// pinning. Entry-only, retained-FD, count-only: capture attaches the
+    /// absorbed delta through the existing facade like every other delta.
+    pub(crate) fn absorb_prearm_plan(&mut self, scope_start_ns: u64) {
+        let Some(prearm) = self.prearm.as_ref() else {
+            return;
+        };
+        let pins = prearm.pins.clone();
+        let pieces: Vec<crate::plan::PrearmPlanPiece> = prearm
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                pins.id_for_prearm(input.key, &input.path).map(|object| {
+                    crate::plan::PrearmPlanPiece {
+                        object,
+                        key: input.key,
+                        path: input.path.clone(),
+                        proved: input.proved.clone(),
+                        non_executable: input.non_executable.clone(),
+                    }
+                })
+            })
+            .collect();
+        let declared = crate::plan::operator_target_keys(&[], &pieces, &pins);
+        let plan =
+            crate::plan::build_from_sources_for_policy_scoped_with_prearm(
+                &[],
+                &[],
+                &pieces,
+                &pins,
+                crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget()),
+                crate::plan::AdmissionScope::Shared,
+            );
+        let absorbed = self.attach_set.absorb(&plan, &pins);
+        // Declared-key → endpoint-id map, before the delta joins the pending
+        // targets: match the fresh endpoints by (retained identity, offset),
+        // indexed by offset so the per-endpoint scan stays small.
+        let mut by_offset: BTreeMap<u64, Vec<crate::plan::AttachKey>> = BTreeMap::new();
+        for key in declared.values().flatten() {
+            by_offset.entry(key.file_offset).or_default().push(*key);
+        }
+        for endpoint in &absorbed.delta.endpoints {
+            let (Some(target), Some(keys)) = (
+                self.attach_set.target(endpoint.object),
+                by_offset.get(&endpoint.file_offset),
+            ) else {
+                continue;
+            };
+            for key in keys {
+                if target.same_object_as(&pins, key.object) {
+                    self.prearm_endpoints.insert(*key, endpoint.id);
+                }
+            }
+        }
+        self.record_absorbed(absorbed);
+        self.prearm_scope_start_ns = Some(scope_start_ns);
+        // Plan-level refusals never reach the attach set as modules (the
+        // set still verdicts them refused), but the operator declaration
+        // stands: disclose each by name with the run's refusal vocabulary
+        // and keep its declared watch over zero linked endpoints. The
+        // synthetic summaries below carry only the refused objects through
+        // `create_watches`, which reads just `.object`; the sentinel id is
+        // never rendered.
+        let mut refused_watches: Vec<crate::plan::ModuleSummary> = Vec::new();
+        for (object, skipped) in plan.refused_modules() {
+            let piece = pieces.iter().find(|piece| piece.object == object);
+            let path = piece.map_or("<unresolved pre-arm object>", |piece| piece.path.as_str());
+            let proved = piece.map_or(0, |piece| piece.proved.len());
+            self.note_scope_gap(
+                crate::discovery::inventory_attach_set::REFUSED_SUBJECT.to_string(),
+                format!(
+                    "{path}: the inventory plan refused {proved} proved offsets ({})",
+                    skipped.reason
+                ),
+            );
+            if let Some(piece) = piece {
+                refused_watches.push(crate::plan::ModuleSummary {
+                    id: crate::plan::ModuleId(u32::MAX),
+                    object,
+                    key: piece.key,
+                    path: piece.path.clone(),
+                    tables: Vec::new(),
+                    interfaces: 0,
+                    source: "prearm",
+                    corroborated: false,
+                    skipped: Vec::new(),
+                });
+            }
+        }
+        let mut watched = plan.modules.clone();
+        watched.extend(refused_watches);
+        self.prearm_state.create_watches(&watched, &declared, &pins);
+    }
+
+    /// Re-runs per-object held-fd checks on pre-arm watched objects and
+    /// publishes fresh `pinned_object_changed` brackets (R2-D1-8). Returns
+    /// the newly changed object ids (sticky: already-reported objects are
+    /// not returned again). A newly detected change also stages the run's
+    /// changed-identity gap: the global disclosure beside the per-module
+    /// bracket. An `fstat` failure records nothing here — the attach path's
+    /// global check is the backstop that surfaces it.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED: the terminal hook calls this.
+    pub(crate) fn refresh_prearm_object_changes(
+        &mut self,
+    ) -> Vec<crate::discovery::identity::PinnedObjectId> {
+        let Some(prearm) = self.prearm.as_ref() else {
+            return Vec::new();
+        };
+        let ids: Vec<crate::discovery::identity::PinnedObjectId> =
+            self.prearm_state.watches().keys().copied().collect();
+        let mut newly = Vec::new();
+        let mut gap_reasons = Vec::new();
+        for id in ids {
+            match prearm.pins.check_object_unchanged(id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let bracket = prearm.pins.change_bracket(id);
+                    if let Some(watch) = self.prearm_state.get_mut(id) {
+                        let was_ended = watch.is_ended();
+                        match bracket {
+                            Some(bracket) => watch.note_object_changed(bracket),
+                            // Detected but the clock never yielded the
+                            // bounds: the end is still disclosed, only its
+                            // instants are not.
+                            None => watch.end(
+                                crate::render::PrearmWatchEnd::ObjectChanged,
+                                crate::attach::monotonic_ns(),
+                            ),
+                        }
+                        if !was_ended {
+                            newly.push(id);
+                            gap_reasons.push(Self::changed_prearm_gap_reason(&prearm.pins, id));
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        for reason in gap_reasons {
+            self.note_scope_gap(
+                crate::discovery::inventory_attach_set::CHANGED_SUBJECT.to_string(),
+                reason,
+            );
+        }
+        newly
+    }
+
+    /// Terminal pre-arm close: a last held-fd refresh (a change detected
+    /// here ends its watch with the exact bracket), then every watch ends
+    /// for `cause` exactly once, clamped to the first stop. The run loop
+    /// calls this after the capture stops, before the final view.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED: the terminal hook calls this.
+    pub(crate) fn finish_prearm_watches(
+        &mut self,
+        cause: crate::render::PrearmWatchEnd,
+        now: Option<u64>,
+    ) {
+        if self.prearm_state.is_empty() {
+            return;
+        }
+        let _ = self.refresh_prearm_object_changes();
+        self.prearm_state.end_all(cause, now);
+        self.prearm_state.clamp_all_to_stop(now);
+    }
+
+    /// Assembled pre-arm report rows: one row per retained input
+    /// in flag order, merging the watch interval with the lane's real attach
+    /// stamps (R2-D1-5 inventory assembly). Pure over coordinator state; the
+    /// presentation builder reads it for pass and final views.
+    ///
+    /// * `attached_at_ns` is the declared set's maximum over the lane's
+    ///   per-endpoint stamps, only when every member carries one (any
+    ///   missing stamp leaves the instant unknown); `None` renders null.
+    /// * The base `[scope_start_ns, attached_at_ns]` window emits for every
+    ///   attached mapped module without an R2-D1-6 proof (no producer in
+    ///   this packet, so attached modules always disclose); never-mapped
+    ///   pre-arm carries no window (its watch speaks). The reason reads
+    ///   `pre_attach`: a conservative outer bound whatever the mapping
+    ///   instant was (late-discovery precision is deferred to a later
+    ///   packet with initial-membership tracking).
+    /// * Attached endpoints of the object outside the declared set disclose
+    ///   one `mapped_unattached` window to their max attach instant.
+    /// * Anything unboundable (no stamps, no scope start) stays undisclosed:
+    ///   absence claims nothing.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED: the presentation builder reads this.
+    pub(crate) fn prearm_rows(&self) -> Vec<PrearmReportRow> {
+        let Some(prearm) = self.prearm.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::with_capacity(prearm.inputs.len());
+        for input in &prearm.inputs {
+            let object = prearm.pins.id_for_prearm(input.key, &input.path);
+            let watch = object
+                .and_then(|id| self.prearm_state.get(id))
+                .map(|watch| watch.render());
+            let attached_at = object.and_then(|id| self.prearm_attached_at(id));
+            let mapped = object.is_some_and(|id| self.prearm_object_mapped(&prearm.pins, id));
+            let mut windows = Vec::new();
+            if mapped
+                && let (Some(start), Some(end)) = (self.prearm_scope_start_ns, attached_at)
+            {
+                windows.push(crate::render::UnobservedWindow {
+                    start_ns: start,
+                    end_ns: end,
+                    reason: crate::render::UnobservedReason::PreAttach,
+                });
+                if let Some(end) = object.and_then(|id| self.prearm_undeclared_max(id)) {
+                    windows.push(crate::render::UnobservedWindow {
+                        start_ns: start,
+                        end_ns: end,
+                        reason: crate::render::UnobservedReason::MappedUnattached,
+                    });
+                }
+            }
+            let summary = object.and_then(|id| {
+                prearm
+                    .pins
+                    .pinned()
+                    .find(|pin| pin.id == id)
+                    .map(|pin| (pin.key, pin.sha256.to_string()))
+            });
+            let (dev, ino, sha256) = match summary {
+                Some((key, sha)) => (
+                    (key.device.major, key.device.minor),
+                    key.inode,
+                    (!sha.is_empty()).then_some(sha),
+                ),
+                None => (
+                    (input.key.device.major, input.key.device.minor),
+                    input.key.inode,
+                    None,
+                ),
+            };
+            rows.push(PrearmReportRow {
+                path: input.path.clone(),
+                dev,
+                ino,
+                sha256,
+                mapped,
+                watch,
+                attached_at_ns: attached_at,
+                unobserved_windows: (!windows.is_empty()).then_some(windows),
+            });
+        }
+        rows
+    }
+
+    /// The declared set's attach instant: the max over its members' real
+    /// stamps — only when every member carries one. A subset maximum is not
+    /// declared-set readiness.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED: read by prearm_rows.
+    fn prearm_attached_at(
+        &self,
+        object: crate::discovery::identity::PinnedObjectId,
+    ) -> Option<u64> {
+        let watch = self.prearm_state.get(object)?;
+        let capture = self.capture.as_ref()?;
+        let mut latest: Option<u64> = None;
+        for key in watch.declared().iter() {
+            let stamped = self
+                .prearm_endpoints
+                .get(key)
+                .and_then(|id| capture.attached_at.get(id).copied())?;
+            latest = Some(latest.map_or(stamped, |known| known.max(stamped)));
+        }
+        latest
+    }
+
+    /// Max attach stamp over this object's attached endpoints outside its
+    /// declared set (scan-corroborated unproved offsets), if any: same-object
+    /// endpoints matched by retained identity over the dense id range,
+    /// skipping keys the declared set already owns.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED: read by prearm_rows.
+    fn prearm_undeclared_max(
+        &self,
+        object: crate::discovery::identity::PinnedObjectId,
+    ) -> Option<u64> {
+        let capture = self.capture.as_ref()?;
+        let watch = self.prearm_state.get(object)?;
+        let declared = watch.declared();
+        let pins = &self.prearm.as_ref()?.pins;
+        let mut latest: Option<u64> = None;
+        for raw in 0..self.attach_set.len() {
+            let id = EndpointId(raw as u32);
+            let Some(endpoint) = self.attach_set.endpoint(id) else {
+                continue;
+            };
+            let Some(target) = self.attach_set.target(endpoint.object) else {
+                continue;
+            };
+            if !target.same_object_as(pins, object) {
+                continue;
+            }
+            let key = crate::plan::AttachKey {
+                object,
+                file_offset: endpoint.file_offset,
+            };
+            if declared.contains(&key) || self.prearm_endpoints.contains_key(&key) {
+                continue;
+            }
+            if let Some(stamped) = capture.attached_at.get(&id).copied() {
+                latest = Some(latest.map_or(stamped, |known| known.max(stamped)));
+            }
+        }
+        latest
+    }
+
+    /// Whether any registry module record names this retained object: the
+    /// physical-key join through the single `object_matches_key` predicate
+    /// (including the entry-carried maps rendering on a pre-6.8 overlay
+    /// split), plus the retained whole-file digest when the record carries
+    /// one.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED: read by prearm_rows.
+    fn prearm_object_mapped(
+        &self,
+        pins: &crate::discovery::identity::PinnedObjects,
+        object: crate::discovery::identity::PinnedObjectId,
+    ) -> bool {
+        let pin_sha = pins
+            .pinned()
+            .find(|pin| pin.id == object)
+            .map(|pin| pin.sha256.to_string())
+            .unwrap_or_default();
+        self.registry.modules().any(|module| {
+            let crate::discovery::caller_registry::ModuleKey::Physical {
+                dev_major,
+                dev_minor,
+                ino,
+                sha256,
+            } = &module.key
+            else {
+                return false;
+            };
+            if !pins.object_matches_key(object, *dev_major, *dev_minor, *ino) {
+                return false;
+            }
+            sha256.as_deref().is_none_or(|digest| {
+                !pin_sha.is_empty() && digest == pin_sha
+            })
+        })
+    }
+
+    /// Evaluates pre-arm arming from the lane's current attach stamps:
+    /// every declared key with a live link and a real stamp feeds its watch;
+    /// partial attachment stays unarmed for the declared set. Called after
+    /// each receipt's stamps land. In this lane attach always carries its
+    /// stamp (the facade stamps every attach), so a fully attached declared
+    /// set always arms with a known instant.
+    fn note_prearm_receipt(&mut self) {
+        if self.prearm_state.is_empty() {
+            return;
+        }
+        let Some(capture) = self.capture.as_ref() else {
+            return;
+        };
+        let mut links_by_object: BTreeMap<
+            crate::discovery::identity::PinnedObjectId,
+            Vec<crate::prearm_module::DeclaredLink>,
+        > = BTreeMap::new();
+        for (key, id) in &self.prearm_endpoints {
+            let stamped = capture.attached_at.get(id).copied();
+            links_by_object.entry(key.object).or_default().push(
+                crate::prearm_module::DeclaredLink {
+                    key: *key,
+                    linked: stamped.is_some(),
+                    stamped_at: stamped,
+                },
+            );
+        }
+        for (object, links) in &links_by_object {
+            if let Some(watch) = self.prearm_state.get_mut(*object) {
+                watch.evaluate_arm(links);
+            }
+        }
+    }
+
+    /// Changed-identity gap reason for a pre-armed object, mirroring the
+    /// attach set's own vocabulary: same subject, same sentence. The facade
+    /// refuses to (re-)extend a changed object through its per-entry
+    /// unchanged checks, so the sentence holds here too.
+    fn changed_prearm_gap_reason(
+        pins: &crate::discovery::identity::PinnedObjects,
+        id: crate::discovery::identity::PinnedObjectId,
+    ) -> String {
+        let summary = pins.pinned().find(|pin| pin.id == id);
+        let (path, major, minor, ino) = summary.map_or(("<unresolved pre-arm object>", 0, 0, 0), |pin| {
+            (pin.path, pin.key.device.major, pin.key.device.minor, pin.key.inode)
+        });
+        format!(
+            "{path} (device {major}:{minor}, inode {ino}) changed identity since its endpoints were \
+             retained: its digest or (inode, size, ctime) pin differs, and the attach \
+             set never extends a changed object"
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prearm_declared_endpoints(
+        &self,
+        object: crate::discovery::identity::PinnedObjectId,
+    ) -> Option<BTreeSet<crate::plan::AttachKey>> {
+        self.prearm_state
+            .get(object)
+            .map(|watch| watch.declared().clone())
     }
 
     #[cfg(test)]
@@ -1917,6 +2375,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             capture.attached_at.remove(&failed.id);
             capture.failed.insert(failed.id);
         }
+        // The receipt's stamps just landed; feed the pre-arm watches.
+        self.note_prearm_receipt();
         self.note_partial_attach(receipt);
         if let Some(custody) = &receipt.custody {
             self.note_capture_custody(custody);
@@ -9743,16 +10203,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// WU-13 P-A fixture: a real provider .so exporting two standard-name
-    /// functions (proved) and defining one standard-name data word (not
-    /// executable: disclosed, never attached pre-mapping).
+    /// Pre-arm activation fixture: a real provider .so exporting two
+    /// standard-name functions (proved) and defining one standard-name data
+    /// word (not executable: disclosed, never attached pre-mapping).
     fn prearm_provider_with_proved_exports(dir: &std::path::Path, name: &str) -> PathBuf {
         let src = dir.join(format!("{name}.c"));
         std::fs::write(
             &src,
             "unsigned long C_Initialize(void *p){(void)p;return 0;}\n\
              unsigned long C_GetFunctionList(void *l){(void)l;return 0;}\n\
-             unsigned long C_Finalize = 0;\n",
+             unsigned long C_Finalize = 1;\n",
         )
         .unwrap();
         let so = dir.join(format!("{name}.so"));
@@ -9782,8 +10242,8 @@ pub(crate) mod tests {
 
     #[test]
     fn prearm_proved_offsets_enter_the_inventory_attach_set() {
-        // Twin-1 (absorb half): proved offsets appear in the inventory
-        // attach set with retained-FD custody (the from_plan preconditions:
+        // Absorb half: proved offsets appear in the inventory attach set
+        // with retained-FD custody (the from_plan preconditions:
         // valid Inventory plan, retained pins, held-fd bytes, unchanged);
         // the watch opens unarmed over the declared proved set.
         let dir = tempfile::tempdir().unwrap();
@@ -9852,8 +10312,9 @@ pub(crate) mod tests {
 
     #[test]
     fn prearm_never_mapped_watch_bounds_and_cancels() {
-        // Twin-2: a never-mapped pre-arm input renders a bounded watch and
-        // never attaches by guess; scope end closes the watch exactly once.
+        // Never-mapped half: a never-mapped pre-arm input renders a bounded
+        // watch and never attaches by guess; scope end closes the watch
+        // exactly once.
         let dir = tempfile::tempdir().unwrap();
         let provider = prearm_provider_with_proved_exports(dir.path(), "never-mapped");
         let bytes = std::fs::read(&provider).unwrap();
@@ -9908,7 +10369,7 @@ pub(crate) mod tests {
 
     #[test]
     fn prearm_same_path_replacement_keeps_pinned_inode_and_reports_change() {
-        // Twin-3 (mirrors RED-4 through the same retained owner):
+        // Replacement half (mirrors RED-4 through the same retained owner):
         // rename-over keeps the old inode behind /proc/self/fd and discloses
         // the change as a bracket + ended watch + changed-identity gap.
         use std::os::unix::fs::MetadataExt as _;
@@ -9919,7 +10380,7 @@ pub(crate) mod tests {
         let pinning = pin_prearm_for_test(&[provider.clone()]);
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(pinning);
-        coordinator.absorb_prearm_plan(crate::attach::monotonic_ns());
+        coordinator.absorb_prearm_plan(crate::attach::monotonic_ns().expect("monotonic clock"));
 
         std::thread::sleep(std::time::Duration::from_millis(20)); // ctime granularity margin
         let other_src = dir.path().join("other.c");
@@ -9955,7 +10416,7 @@ pub(crate) mod tests {
 
         // The watch ends with the bracket; the first end wins over the later
         // scope end.
-        let stop = crate::attach::monotonic_ns();
+        let stop = crate::attach::monotonic_ns().expect("monotonic clock");
         coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(stop));
         let rows = coordinator.prearm_rows();
         let watch = rows[0].watch.as_ref().unwrap();
@@ -10032,10 +10493,13 @@ pub(crate) mod tests {
     #[test]
     fn prearm_beyond_run_budget_is_refused_whole_with_declared_watch() {
         // No admission-cap change: past the run budget the pre-arm module is
-        // refused whole by name (existing attach-set gap); the watch keeps
-        // its declared set (R9) with zero linked endpoints. Positive half:
-        // an exactly-fitting budget admits every proved offset.
-        for (budget_endpoints, admitted) in [(1u64, false), (2u64, true)] {
+        // refused whole by name (a plan-level refusal the attach set
+        // verdicts refused and this absorb discloses as a run gap); the
+        // watch keeps its declared set with zero linked endpoints (the
+        // operator declaration stands). Positive half: a fitting budget
+        // admits every proved offset. (The exact admit threshold is the
+        // merge's inherited reserve rule, not this packet's to dictate.)
+        for (budget_endpoints, admitted) in [(1u64, false), (4096u64, true)] {
             let dir = tempfile::tempdir().unwrap();
             let provider = prearm_provider_with_proved_exports(
                 dir.path(),
@@ -10057,7 +10521,7 @@ pub(crate) mod tests {
             let delta = coordinator.take_target_delta();
             coordinator.registry_mut().publish();
             let gaps = coordinator.registry().gaps();
-            let refused = gaps.iter().any(|gap| {
+            let refused = gaps.iter().find(|gap| {
                 gap.subject == crate::discovery::inventory_attach_set::REFUSED_SUBJECT
             });
             let rows = coordinator.prearm_rows();
@@ -10075,10 +10539,17 @@ pub(crate) mod tests {
             );
             if admitted {
                 assert_eq!(delta.endpoints.len(), 2, "budget {budget_endpoints}");
-                assert!(!refused, "budget {budget_endpoints}: no refusal gap");
+                assert!(refused.is_none(), "budget {budget_endpoints}: no refusal gap");
             } else {
                 assert!(delta.endpoints.is_empty(), "budget {budget_endpoints}");
-                assert!(refused, "budget {budget_endpoints}: the refusal gap names it");
+                let Some(gap) = refused else {
+                    panic!("budget {budget_endpoints}: the refusal gap names it");
+                };
+                assert!(
+                    gap.reason.contains("refused 2 proved offsets"),
+                    "budget {budget_endpoints}: the gap names the plan refusal: {}",
+                    gap.reason
+                );
             }
         }
     }
@@ -10090,7 +10561,7 @@ pub(crate) mod tests {
         // never-mapped input carries no window (its watch speaks) and no
         // exactness is claimed without proof. Partial attachment stays
         // unarmed (R2-D1-4); without a use/health feed the watch stays
-        // armed, never armed_idle (R8).
+        // armed, never armed_idle (no quiet claim without the feed).
         use crate::attach::capture::AttachedEndpoint;
         let dir = tempfile::tempdir().unwrap();
         let provider = prearm_provider_with_proved_exports(dir.path(), "armed");

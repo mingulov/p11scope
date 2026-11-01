@@ -1371,6 +1371,9 @@ fn run_with_terminal_budget(
     if let Some(pinning) = prearm_pinning {
         let retained = pinning.inputs.len();
         coordinator.set_prearm_pinning(pinning);
+        // Lower the proved offsets into the run's attach set before passes,
+        // so the capture attaches them through the existing native lane.
+        coordinator.absorb_prearm_plan(started_ns);
         coordinator.note_scope_gap(
             "pre-arm subset pending".into(),
             format!(
@@ -8592,8 +8595,8 @@ mod tests {
         );
     }
 
-    /// WU-13 P-A fixture: a real provider .so exporting two standard-name
-    /// functions (proved).
+    /// Pre-arm activation fixture: a real provider .so exporting two
+    /// standard-name functions (proved).
     fn prearm_provider_with_proved_exports_for_test(dir: &std::path::Path) -> PathBuf {
         let src = dir.join("prearm-proved.c");
         std::fs::write(
@@ -8617,8 +8620,8 @@ mod tests {
 
     #[test]
     fn inventory_run_with_prearm_holds_proved_endpoints_in_the_attach_set() {
-        // WU-13 P-A twin-1 (production-wiring half): a full inventory run
-        // with --prearm-module holds the proved offsets in the run's attach
+        // Production-wiring half: a full inventory run with --prearm-module
+        // holds the proved offsets in the run's attach
         // set (budgets.inventory_endpoints.occupied), even when the --module
         // filter matches nothing (R2-D1-1: filtering never drops pre-arm).
         let dir = tempfile::tempdir().unwrap();

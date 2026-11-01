@@ -3418,6 +3418,30 @@ pub fn build_from_sources_for_policy_scoped(
     )
 }
 
+/// [`build_from_sources_for_policy_scoped`] plus resolved `--prearm-module`
+/// pieces: the inventory lane lowers proved pre-arm offsets under its own
+/// policy through the same merge, so admission caps and the
+/// count-only-unless-manifest-authorized rule are unchanged. An empty slice
+/// builds exactly the old plan.
+pub fn build_from_sources_for_policy_scoped_with_prearm(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    prearm: &[PrearmPlanPiece],
+    pinned: &PinnedObjects,
+    admission_policy: AdmissionPolicy,
+    admission_scope: AdmissionScope,
+) -> AttachPlan {
+    build_from_sources_with_policy(
+        scanned,
+        manifests,
+        prearm,
+        pinned,
+        false,
+        admission_policy,
+        admission_scope,
+    )
+}
+
 /// Complete target requirements before table/slot admission. These are negative
 /// completeness and ambiguity facts, never permission to read arguments.
 pub(crate) struct SemanticSourceClaims {
@@ -7156,8 +7180,8 @@ mod tests {
 
     #[test]
     fn inventory_policy_with_prearm_plans_proved_offsets_count_only() {
-        // WU-13 P-A: proved pre-arm offsets lower into an Inventory-policy
-        // plan like manifest-side operator input: count-only without
+        // Proved pre-arm offsets lower into an Inventory-policy plan like
+        // manifest-side operator input: count-only without
         // independent manifest authority, carrying the Inventory admission
         // policy the inventory attach set requires.
         let budget = inventory_budget_for_prearm_test(4096);

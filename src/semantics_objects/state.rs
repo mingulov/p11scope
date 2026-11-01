@@ -1729,8 +1729,8 @@ impl ModelState {
             // runs, so an invalid acting session stays conservative.
             CallKind::Neutral => {}
         }
-        // Close, close-all, creation-overflow and open-reuse arms
-        // above may dispose sessions; flush their queued releases
+        // Close, close-all, creation-overflow, open-reuse and session-cancel
+        // arms above may dispose sessions; flush their queued releases
         // before returning.
         self.flush_deferred_releases(ledger);
     }

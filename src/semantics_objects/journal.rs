@@ -1811,13 +1811,39 @@ fn is_pending_rv(rv: u64) -> bool {
     pkcs11_types::CkRv(rv) == pkcs11_types::CkRv::PENDING
 }
 
+/// The P1 async producer rewrite, shared by END-vs-BEGIN agreement
+/// (`returned_fields_agree`) and ordinary-CALL corroboration (both
+/// matchers below): an OK `C_AsyncGetID` return may gain ONLY the
+/// value-unreadable bit (null output pointer or unreadable id), never
+/// clearing it and never beside another capture change. Callers keep the
+/// mechanism word exact. Unreachable in production today — async controls
+/// are negative-only, never admitted to the open/refused tables — so
+/// output-neutral; once tracked, a GetID whose END was lost carries bit 6
+/// only on its preserved CALL and corroborates its BEGIN here. This alone
+/// does not stop the seal hold: the admission-side claim fingerprint
+/// (`fingerprint_matches_event`) still compares the capture word exactly,
+/// so a tracked OK GetID with a null or unreadable id would leave its
+/// BEGIN unclaimed and hold the seal on `BoundNotReady` until that check
+/// shares this rule.
+fn async_get_id_capture_gain(descriptor: u32, rv: u64, before: u32, after: u32) -> bool {
+    let lifecycle = crate::kinds::DESCRIPTORS
+        .get(descriptor as usize)
+        .map(|semantics| semantics.lifecycle);
+    lifecycle == Some(p11scope_ebpf_common::lifecycle::ASYNC_GET_ID)
+        && rv == 0
+        && (before ^ after) == capture::ASYNC_VALUE_UNREADABLE
+        && after & capture::ASYNC_VALUE_UNREADABLE != 0
+}
+
 /// Whether one ordinary CALL record corroborates one open BEGIN: the
 /// exact retained invocation — same image, same process, exact
 /// entry-time agreement plus the seven-word call identity — observed
 /// strictly after the BEGIN with a completed (non-pending) return
 /// value. Entry agreement is exact (`ts - duration`, the return path's
 /// own entry reconstruction): a merely later timestamp from another
-/// invocation never qualifies.
+/// invocation never qualifies. Capture agreement is exact except for
+/// the one P1 producer rewrite: an OK `C_AsyncGetID` return may gain
+/// ONLY the value-unreadable bit (`async_get_id_capture_gain`).
 fn ordinary_matches_begin(
     event: &p11scope_ebpf_common::Event,
     ordinal: u64,
@@ -1834,12 +1860,20 @@ fn ordinary_matches_begin(
         && event.mechanism == begin.entry_mechanism()
         && event.slot_id == begin.slot_id()
         && event.user_type == begin.user_type()
-        && event.capture == begin.capture()
+        && (event.capture == begin.capture()
+            || async_get_id_capture_gain(
+                begin.descriptor(),
+                event.rv,
+                begin.capture(),
+                event.capture,
+            ))
         && event.flags == begin.call_flags()
 }
 
 /// Whether one ordinary CALL record corroborates one refused BEGIN:
-/// the same exact-invocation binding as an open BEGIN.
+/// the same exact-invocation binding as an open BEGIN, including the
+/// one P1 producer rewrite for an OK `C_AsyncGetID` return gaining ONLY
+/// the value-unreadable bit (`async_get_id_capture_gain`).
 fn ordinary_matches_refused(
     event: &p11scope_ebpf_common::Event,
     ordinal: u64,
@@ -1855,7 +1889,13 @@ fn ordinary_matches_refused(
         && event.mechanism == refused.mechanism
         && event.slot_id == refused.slot_id
         && event.user_type == refused.user_type
-        && event.capture == refused.capture
+        && (event.capture == refused.capture
+            || async_get_id_capture_gain(
+                refused.function + 1,
+                event.rv,
+                refused.capture,
+                event.capture,
+            ))
         && event.flags == refused.flags
 }
 
@@ -1875,8 +1915,10 @@ fn returned_word_fits_layout(word: u64, layout: u8) -> bool {
 /// Match the session/mechanism rewrites made by capture_return_facts.
 /// Unreadable entry evidence is never an absent session; capture states are
 /// enums, and a captured VALUE (including zero or MECH_NONE's numeric value)
-/// stays exact. Other capture bits, ordinary corroboration and ingress are
-/// unchanged; asynchronous capture-state rewriting is a separate packet.
+/// stays exact. Other capture bits and ingress are unchanged; an OK
+/// `C_AsyncGetID` return may gain the value-unreadable bit for a null output
+/// pointer or unreadable id, here and in ordinary-CALL corroboration alike
+/// (`async_get_id_capture_gain`).
 fn returned_fields_agree(
     begin: &ValidatedJournalBegin,
     event: &p11scope_ebpf_common::Event,
@@ -1906,6 +1948,19 @@ fn returned_fields_agree(
     }
     let before = begin.capture();
     let after = event.capture;
+    // Wire-contract rule: an OK `C_AsyncGetID` return may gain ONLY
+    // the value-unreadable bit (null output pointer or unreadable
+    // id), with the mechanism word unchanged — the shared
+    // `async_get_id_capture_gain` predicate, also used by
+    // ordinary-CALL corroboration. Every other function, return code
+    // or bit change falls through to the strict rule below — in
+    // particular the bit never clears and never appears beside
+    // another change.
+    if event.mechanism == begin.entry_mechanism()
+        && async_get_id_capture_gain(begin.descriptor(), event.rv, before, after)
+    {
+        return true;
+    }
     let entry_state = before & capture::MECHANISM_MASK;
     let return_state = after & capture::MECHANISM_MASK;
     let entry_failed = before & capture::ARG_READ_FAILURE != 0;
@@ -6559,6 +6614,7 @@ pub(crate) mod tests {
                 | "C_CloseAllSessions"
                 | "C_CreateObject"
                 | "C_GetSessionInfo"
+                | "C_AsyncGetID"
         ));
         let function = function_id(name);
         let semantics = crate::kinds::DESCRIPTORS[function as usize + 1];
@@ -6851,6 +6907,111 @@ pub(crate) mod tests {
         }
     }
 
+    /// Test-only refused-BEGIN mirror of the production capacity-refusal
+    /// path: the same cut and identity the adapter would retain.
+    fn refused_of_begin(begin: &ValidatedJournalBegin, cut: u64) -> RefusedBegin {
+        RefusedBegin {
+            cut,
+            image: (begin.image_cookie(), begin.image_exec()),
+            pid_tgid: begin.pid_tgid(),
+            function: begin.descriptor() - 1,
+            slot: begin.slot(),
+            session: begin.session_word(),
+            mechanism: begin.entry_mechanism(),
+            slot_id: begin.slot_id(),
+            user_type: begin.user_type(),
+            capture: begin.capture(),
+            flags: begin.call_flags(),
+            entry_ns: begin.entry_ns(),
+            corroborated_return: None,
+        }
+    }
+
+    /// Decode one producer pair into its BEGIN plus the preserved CALL
+    /// (the END's embedded ordinary return event) for the ordinary
+    /// corroboration twins.
+    fn ordinary_match_pair(
+        name: &str,
+        rewrite: impl FnOnce(
+            &mut p11scope_ebpf_common::CallStart,
+            &mut p11scope_ebpf_common::object_flow::ReturnEventFacts,
+        ),
+    ) -> (ValidatedJournalBegin, Event) {
+        let (begin_bytes, end_bytes) = producer_agreement_pair(name, rewrite);
+        let rows = publish_object_descriptors();
+        let JournalRecord::Begin(begin) = decode_journal_record(&begin_bytes, &rows).unwrap()
+        else {
+            panic!("BEGIN")
+        };
+        let JournalRecord::End(end) = decode_journal_record(&end_bytes, &rows).unwrap() else {
+            panic!("END")
+        };
+        (begin, end.payload_base().event)
+    }
+
+    #[test]
+    fn object_journal_ordinary_matching_accepts_get_id_value_unreadable_on_ok() {
+        // A GetID whose END was lost carries bit 6 only on its preserved
+        // CALL; it must still corroborate its BEGIN (open or refused).
+        // The claim fingerprint is a separate exact check, so this alone
+        // does not release a seal hold. Unreachable in production today:
+        // async controls are negative-only, never admitted to the
+        // open/refused tables.
+        assert_eq!(
+            endpoint_class(function_id("C_AsyncGetID")),
+            Some(EndpointClass::NegativeOnlyAffecting),
+            "the exemption is a no-op until async controls are tracked"
+        );
+        let (begin, event) = ordinary_match_pair("C_AsyncGetID", |_, facts| {
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+        });
+        assert!(ordinary_matches_begin(&event, 2, &begin, 1));
+        assert!(ordinary_matches_refused(
+            &event,
+            2,
+            &refused_of_begin(&begin, 1)
+        ));
+    }
+
+    #[test]
+    fn object_journal_ordinary_matching_refuses_value_unreadable_elsewhere() {
+        // The bit-6 allowance is GetID+OK with the mechanism word
+        // unchanged: any other function, a failed return, bit 6 beside
+        // another change, or a changed mechanism still refuses on both
+        // ordinary matchers.
+        for shape in [
+            "other-function",
+            "failed-get-id",
+            "bit-beside-another-change",
+            "changed-mechanism",
+        ] {
+            let name = if shape == "other-function" {
+                "C_GetSessionInfo"
+            } else {
+                "C_AsyncGetID"
+            };
+            let (begin, event) = ordinary_match_pair(name, |_, facts| {
+                facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+                match shape {
+                    "failed-get-id" => facts.rv = 5,
+                    "bit-beside-another-change" => {
+                        facts.capture_flags |= capture::ARG_READ_FAILURE;
+                    }
+                    "changed-mechanism" => facts.mechanism ^= 1,
+                    _ => {}
+                }
+            });
+            assert!(
+                !ordinary_matches_begin(&event, 2, &begin, 1),
+                "open BEGIN: {shape}"
+            );
+            assert!(
+                !ordinary_matches_refused(&event, 2, &refused_of_begin(&begin, 1)),
+                "refused BEGIN: {shape}"
+            );
+        }
+    }
+
     #[test]
     fn object_journal_agreement_refuses_unrelated_return_capture_changes() {
         let (begin, end) = producer_agreement_pair("C_CreateObject", |_, facts| {
@@ -7005,6 +7166,52 @@ pub(crate) mod tests {
             facts.capture_flags = capture::MECHANISM_VALUE;
         });
         assert!(!producer_pair_agrees(&begin, &end), "no mechanism argument");
+    }
+
+    #[test]
+    fn object_journal_agreement_accepts_get_id_value_unreadable_on_ok() {
+        // Null-output / unreadable-id GetID: an OK return may gain
+        // ONLY the value-unreadable bit, with the mechanism word
+        // unchanged.
+        let (begin, end) = producer_agreement_pair("C_AsyncGetID", |_, facts| {
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+        });
+        assert!(producer_pair_agrees(&begin, &end));
+    }
+
+    #[test]
+    fn object_journal_agreement_refuses_value_unreadable_elsewhere() {
+        // The bit-6 allowance is GetID+OK only: a failed GetID, any
+        // other function, or a cleared bit still refuses — as does bit 6
+        // beside any other change.
+        let (begin, end) = producer_agreement_pair("C_AsyncGetID", |_, facts| {
+            facts.rv = 5;
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+        });
+        assert!(!producer_pair_agrees(&begin, &end), "failed GetID");
+        let (begin, end) = producer_agreement_pair("C_GetSessionInfo", |_, facts| {
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+        });
+        assert!(!producer_pair_agrees(&begin, &end), "other function");
+        let (begin, end) = producer_agreement_pair("C_AsyncGetID", |start, _| {
+            start.capture |= capture::ASYNC_VALUE_UNREADABLE;
+        });
+        assert!(!producer_pair_agrees(&begin, &end), "cleared bit");
+        let (begin, end) = producer_agreement_pair("C_AsyncGetID", |_, facts| {
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE | capture::ARG_READ_FAILURE;
+        });
+        assert!(
+            !producer_pair_agrees(&begin, &end),
+            "bit beside another change"
+        );
+        let (begin, end) = producer_agreement_pair("C_AsyncGetID", |_, facts| {
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+            facts.mechanism ^= 1;
+        });
+        assert!(
+            !producer_pair_agrees(&begin, &end),
+            "bit with changed mechanism"
+        );
     }
 
     #[test]

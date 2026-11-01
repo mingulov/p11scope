@@ -3318,8 +3318,14 @@ impl ClassicDriver<'_> {
     ) -> String {
         // A recorded terminal graph refusal predates any later
         // verdict, so it wins as the abandon reason (§1.9, §6.4).
+        // Next the machine's latched disposition refusal, so the
+        // abandon gap and the run error name the trigger; only with
+        // no refusal code anywhere does the generic fallback stand.
         let reason = coordinator
             .collected_graph_refused()
+            .or(lane
+                .joint_disposition_reason()
+                .map(crate::inventory_semantics::SemanticRefusal::code))
             .unwrap_or("joint finish disposition required");
         let latched = lane.joint_finish_disposition_required();
         // Name a tripped no-progress wedge on stderr: the wedged

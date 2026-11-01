@@ -399,6 +399,92 @@ impl LoaderRegistry {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoaderAttemptOwner {
+    Owned,
+    Ambient,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoaderAttemptKind {
+    Preflight,
+    Prepare,
+    Remove,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoaderAttempt {
+    pub(crate) ordinal: usize,
+    pub(crate) kind: LoaderAttemptKind,
+    pub(crate) pid: Option<u32>,
+    pub(crate) owner: Option<LoaderAttemptOwner>,
+    pub(crate) view: Option<ProcessViewId>,
+    pub(crate) context_id: Option<LoaderContextId>,
+    pub(crate) refusal: Option<String>,
+    pub(crate) truncated_delta: u64,
+    pub(crate) failures_delta: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoaderPrepareReason {
+    Initial,
+    Rearm,
+    Readmit,
+}
+
+// Scaffold (RED): stubs that compile but record nothing; GREEN implements.
+#[cfg(test)]
+impl LoaderRegistry {
+    pub(crate) fn attempts(&self) -> Vec<LoaderAttempt> {
+        Vec::new()
+    }
+
+    pub(crate) fn successful_prepare_count(&self) -> usize {
+        0
+    }
+
+    pub(crate) fn prepare_reasons(&self) -> Vec<(usize, u32, LoaderPrepareReason)> {
+        Vec::new()
+    }
+
+    pub(crate) fn preflight_recorded(
+        &mut self,
+        spec: LoaderContextSpec,
+        _pid: u32,
+        _owned: bool,
+        _truncated_delta: u64,
+        _failures_delta: u64,
+    ) -> Result<PreparedLoaderContext, String> {
+        self.preflight(spec)
+    }
+
+    pub(crate) fn prepare_recorded(
+        &mut self,
+        prepared: PreparedLoaderContext,
+        _pid: u32,
+        _owned: bool,
+        _truncated_delta: u64,
+        _failures_delta: u64,
+    ) -> Result<LoaderContextId, String> {
+        self.prepare(prepared)
+    }
+
+    pub(crate) fn remove_recorded(
+        &mut self,
+        id: LoaderContextId,
+        _pid: u32,
+        _owned: bool,
+        _truncated_delta: u64,
+        _failures_delta: u64,
+    ) -> Result<(), String> {
+        self.remove(id)
+    }
+}
+
 // Staged pre-reuse token adapter: converts identities only, never delegates
 // to the generation registry. Reuse activation wires it; until then only
 // tests resolve through it.
@@ -476,6 +562,7 @@ fn signed_delta(address: u64, base: u64) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::loader_lifetime::{LifetimeDomain, LifetimeRegistry};
     use p11scope_manifest::maps::Device;
 
     fn mapping() -> MapEntry {
@@ -506,6 +593,19 @@ mod tests {
     fn prepare(registry: &mut LoaderRegistry, spec: LoaderContextSpec) -> LoaderContextId {
         let prepared = registry.preflight(spec).unwrap();
         registry.prepare(prepared).unwrap()
+    }
+
+    fn spec_with_view(view: ProcessViewId) -> LoaderContextSpec {
+        LoaderContextSpec {
+            view,
+            loader: PinnedObjectId(9),
+            mapping: Some(mapping()),
+            hook: SymbolFact {
+                virtual_address: 0x2100,
+                file_offset: 0x2100,
+            },
+            state_address: None,
+        }
     }
 
     #[test]
@@ -817,5 +917,178 @@ mod tests {
         // While the twin slot is allocated, the old-format cookie resolves
         // through the token path: the gate cannot tell them apart.
         assert_eq!(registry.id_for_attach_cookie(0x100), Some(id));
+    }
+
+    #[test]
+    fn loader_lifetime_fresh_prepare_new_mints_generation_one_for_slot_zero() {
+        // Generation-one premise, adapted to the crate-visible lifetime
+        // API: the loader-gate work stages identity through the token
+        // adapter, but the generation registry still burns from zero, so
+        // a fresh prepare mints generation 1 for slot 0.
+        let domain = LifetimeDomain::mint();
+        let mut registry = LifetimeRegistry::new(domain, 4096).unwrap();
+        let token = registry.prepare_new(domain).unwrap();
+        assert_eq!(token.generation(), 1);
+        assert_eq!(token.slot(), 0);
+        assert_eq!(token.bits(), 0x100);
+    }
+
+    #[test]
+    fn loader_attempt_ledger_counts_match_allocation_across_allocate_refuse_remove() {
+        let mut registry = LoaderRegistry::default();
+        for pid in [100u32, 101] {
+            let prepared = registry
+                .preflight_recorded(spec(None), pid, true, 0, 0)
+                .unwrap();
+            registry
+                .prepare_recorded(prepared, pid, true, 0, 0)
+                .unwrap();
+        }
+        assert_eq!(registry.successful_prepare_count(), 2);
+        assert_eq!(registry.allocated, 2);
+        assert_eq!(registry.attempts().len(), 4);
+
+        let first = registry
+            .preflight_recorded(spec(None), 102, true, 1, 2)
+            .unwrap();
+        let stale = registry
+            .preflight_recorded(spec(None), 102, true, 3, 4)
+            .unwrap();
+        registry.prepare_recorded(first, 102, true, 5, 6).unwrap();
+        let refusal = registry
+            .prepare_recorded(stale, 102, true, 7, 8)
+            .unwrap_err();
+        assert_eq!(
+            refusal,
+            "preflighted loader context no longer matches registry state"
+        );
+        assert_eq!(registry.successful_prepare_count(), 3);
+        assert_eq!(registry.allocated, 3);
+        assert_eq!(registry.attempts().len(), 8);
+        let refused = registry.attempts().last().unwrap().clone();
+        assert_eq!(refused.kind, LoaderAttemptKind::Prepare);
+        assert_eq!(refused.refusal.as_deref(), Some(refusal.as_str()));
+        assert_eq!(refused.pid, Some(102));
+        assert_eq!(refused.owner, Some(LoaderAttemptOwner::Owned));
+        assert_eq!(refused.truncated_delta, 7);
+        assert_eq!(refused.failures_delta, 8);
+
+        let id = LoaderContextId::from_case_id(0);
+        let remove_refusal = registry.remove_recorded(id, 100, true, 9, 10).unwrap_err();
+        assert!(
+            remove_refusal.contains("not tombstoned"),
+            "{remove_refusal}"
+        );
+        assert_eq!(registry.attempts().len(), 9);
+        registry.mark_attached(id).unwrap();
+        registry.tombstone(id).unwrap();
+        registry.remove_recorded(id, 100, true, 11, 12).unwrap();
+        assert_eq!(registry.attempts().len(), 10);
+        assert_eq!(registry.successful_prepare_count(), 3);
+        assert_eq!(registry.allocated, 3);
+        let removed = registry.attempts().last().unwrap().clone();
+        assert_eq!(removed.kind, LoaderAttemptKind::Remove);
+        assert_eq!(removed.refusal, None);
+        assert_eq!(removed.context_id, Some(id));
+    }
+
+    #[test]
+    fn loader_attempt_ledger_ordinals_are_gapless_from_one() {
+        let mut registry = LoaderRegistry::default();
+        let prepared = registry
+            .preflight_recorded(spec(None), 200, true, 0, 0)
+            .unwrap();
+        let id = registry
+            .prepare_recorded(prepared, 200, true, 0, 0)
+            .unwrap();
+        registry.mark_attached(id).unwrap();
+        registry.tombstone(id).unwrap();
+        registry.remove_recorded(id, 200, true, 0, 0).unwrap();
+        let _ = registry.remove_recorded(id, 200, true, 0, 0).unwrap_err();
+        let ordinals: Vec<usize> = registry
+            .attempts()
+            .iter()
+            .map(|entry| entry.ordinal)
+            .collect();
+        assert_eq!(ordinals, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn loader_attempt_ledger_refuses_257th_owned_prepare_with_capacity_reason() {
+        let mut registry = LoaderRegistry::default();
+        for ordinal in 0..MAX_LOADER_CONTEXTS {
+            let pid = 1000 + ordinal as u32;
+            let prepared = registry
+                .preflight_recorded(spec(None), pid, true, 0, 0)
+                .expect("envelope fill must preflight below capacity");
+            registry
+                .prepare_recorded(prepared, pid, true, 0, 0)
+                .expect("envelope fill must prepare");
+        }
+        assert_eq!(registry.successful_prepare_count(), 256);
+        assert_eq!(registry.allocated, 256);
+        assert_eq!(registry.attempts().len(), 512);
+        let refusal = registry
+            .preflight_recorded(spec(None), 2000, true, 13, 17)
+            .unwrap_err();
+        assert_eq!(refusal, "loader context capacity 256 is exhausted");
+        assert_eq!(registry.successful_prepare_count(), 256);
+        assert_eq!(registry.allocated, 256);
+        assert_eq!(registry.attempts().len(), 513);
+        let refused = registry.attempts().last().unwrap().clone();
+        assert_eq!(refused.ordinal, 513);
+        assert_eq!(refused.kind, LoaderAttemptKind::Preflight);
+        assert_eq!(refused.refusal.as_deref(), Some(refusal.as_str()));
+        assert_eq!(refused.pid, Some(2000));
+        assert_eq!(refused.owner, Some(LoaderAttemptOwner::Owned));
+        assert_eq!(refused.truncated_delta, 13);
+        assert_eq!(refused.failures_delta, 17);
+    }
+
+    #[test]
+    fn loader_attempt_ledger_derives_initial_rearm_readmit_per_pid() {
+        let mut registry = LoaderRegistry::default();
+        let view_a = ProcessViewId(7);
+        let view_b = ProcessViewId(8);
+        let view_c = ProcessViewId(9);
+        let cases = [
+            (100u32, view_a, true),
+            (100, view_a, true),
+            (100, view_b, true),
+            (200, view_c, false),
+        ];
+        for (index, (pid, view, owned)) in cases.iter().enumerate() {
+            let prepared = registry
+                .preflight_recorded(
+                    spec_with_view(*view),
+                    *pid,
+                    *owned,
+                    index as u64,
+                    index as u64 + 100,
+                )
+                .unwrap();
+            registry
+                .prepare_recorded(prepared, *pid, *owned, index as u64 + 1, index as u64 + 101)
+                .unwrap();
+        }
+        assert_eq!(
+            registry.prepare_reasons(),
+            vec![
+                (2, 100, LoaderPrepareReason::Initial),
+                (4, 100, LoaderPrepareReason::Rearm),
+                (6, 100, LoaderPrepareReason::Readmit),
+                (8, 200, LoaderPrepareReason::Initial),
+            ]
+        );
+        let attempts = registry.attempts();
+        assert_eq!(attempts.len(), 8);
+        assert_eq!(attempts[1].pid, Some(100));
+        assert_eq!(attempts[1].owner, Some(LoaderAttemptOwner::Owned));
+        assert_eq!(attempts[1].view, Some(view_a));
+        assert_eq!(attempts[1].truncated_delta, 1);
+        assert_eq!(attempts[1].failures_delta, 101);
+        assert_eq!(attempts[7].pid, Some(200));
+        assert_eq!(attempts[7].owner, Some(LoaderAttemptOwner::Ambient));
+        assert_eq!(attempts[7].view, Some(view_c));
     }
 }

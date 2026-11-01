@@ -6939,6 +6939,95 @@ mod tests {
         assert_eq!(len, 8 + 68 * 8);
     }
 
+    /// A full-extent 3.2-labelled image: valid executable entries at
+    /// `entries`, NULL holes elsewhere in the legacy prefix, file-backed
+    /// data words across the whole extension. The sweep must refuse the
+    /// single-entry shape (a BSS lookalike); the getter path decodes it
+    /// (the provider's own address rules out a lookalike).
+    fn sparse_3x_snapshot(entries: &[usize]) -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for &ordinal in entries {
+            let at = 8 + ordinal * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for ordinal in 68..104 {
+            let at = 8 + ordinal * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        snapshot
+    }
+
+    #[test]
+    fn sweep_refuses_single_entry_and_zero_entry_3x_lookalikes() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for entries in [&[0][..], &[][..]] {
+            let snapshot = sparse_3x_snapshot(entries);
+            let (tables, skipped) = detect_tables(
+                &snapshot,
+                0x7000,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+            );
+            assert!(skipped.is_empty(), "{entries:?}: {skipped:?}");
+            assert!(
+                tables.is_empty(),
+                "{entries:?}: the sweep must refuse a lookalike with fewer than two prefix entries"
+            );
+        }
+        // Positive control: the same tail behind a complete 68-entry
+        // prefix still decodes on the sweep, so the refusal above pins
+        // the entry count, not the tail shape.
+        let full = mislabelled_snapshot(0x0203, 68, 36);
+        let (tables, skipped) = detect_tables(
+            &full,
+            0x7000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(tables.len(), 1, "the full prefix still decodes");
+        assert_eq!(tables[0].entries.len(), 68);
+    }
+
+    #[test]
+    fn exact_decode_accepts_a_getter_returned_single_entry_3x_table() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let snapshot = sparse_3x_snapshot(&[0]);
+        let table = decode_exact_table(
+            &snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .expect("budget must admit the attempt")
+        .expect("one validated entry at a provider-returned address decodes");
+        assert_eq!(table.version, (3, 2));
+        assert_eq!(table.walk, "known_prefix");
+        assert_eq!(table.entries.len(), 1);
+        assert_eq!(table.decoded_slot_count(), 68);
+        // Zero entries stay refused on the getter path too: no validated
+        // slot, no table.
+        let empty = sparse_3x_snapshot(&[]);
+        assert!(
+            decode_exact_table(
+                &empty,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .expect("budget must admit the attempt")
+            .is_none(),
+            "an all-NULL prefix is not a table on any path"
+        );
+    }
+
     /// A decoded mislabelled table: version {3,2}, walk `known_prefix`,
     /// 68 entries at the fixture snapshot base.
     fn short_prefix_table() -> ScannedTable {

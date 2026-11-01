@@ -1520,11 +1520,13 @@ pub const LOADER_GATE_SLOTS: u32 = 256;
 /// BPF owns every field; userspace sets `acked` once per retired
 /// generation after its T-L3 acknowledgement completes. Userspace never
 /// reads rows into output (privacy); the BPF map needs the value type.
+/// `state` is 64 bits: the BPF backend selects compare-and-swap only
+/// at 64 bits, and claim/retire each need exactly one CAS winner.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoaderGateRow {
     pub generation: u64,
-    pub state: u32,
+    pub state: u64,
     pub disposition: u32,
     pub acked: u32,
     pub last_gen: u32,
@@ -2335,6 +2337,38 @@ mod tests {
         assert_eq!(offset_of!(Event, image), 288);
         assert_eq!(offset_of!(Event, child_image), 304);
         assert_eq!(offset_of!(Event, root_affiliation), 320);
+    }
+
+    #[test]
+    fn loader_gate_and_bank_select_have_exact_native_layouts() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(LOADER_GATE_SLOTS, 256);
+        assert_eq!(size_of::<LoaderGateRow>(), 32);
+        assert_eq!(offset_of!(LoaderGateRow, generation), 0);
+        assert_eq!(offset_of!(LoaderGateRow, state), 8);
+        assert_eq!(offset_of!(LoaderGateRow, disposition), 16);
+        assert_eq!(offset_of!(LoaderGateRow, acked), 20);
+        assert_eq!(offset_of!(LoaderGateRow, last_gen), 24);
+        assert_eq!(size_of::<LoaderGateControl>(), 72);
+        assert_eq!(offset_of!(LoaderGateControl, limit), 0);
+        assert_eq!(offset_of!(LoaderGateControl, cutover), 8);
+        assert_eq!(offset_of!(LoaderGateControl, admitted), 16);
+        assert_eq!(offset_of!(LoaderGateControl, refusals), 24);
+        assert_eq!(offset_of!(LoaderGateControl, retired), 32);
+        assert_eq!(offset_of!(LoaderGateControl, reclaims), 40);
+        assert_eq!(offset_of!(LoaderGateControl, retained), 48);
+        assert_eq!(offset_of!(LoaderGateControl, retained_peak), 56);
+        assert_eq!(offset_of!(LoaderGateControl, update_losses), 64);
+        assert_eq!(size_of::<ImageBankSelect>(), 96);
+        assert_eq!(offset_of!(ImageBankSelect, bank), 0);
+        assert_eq!(offset_of!(ImageBankSelect, prepared), 8);
+        assert_eq!(offset_of!(ImageBankSelect, cuts), 24);
+        assert_eq!(offset_of!(ImageBankSelect, refusals), 32);
+        assert_eq!(offset_of!(ImageBankSelect, incarnation), 40);
+        assert_eq!(offset_of!(ImageBankSelect, folded), 56);
+        assert_eq!(offset_of!(ImageBankSelect, folds), 72);
+        assert_eq!(offset_of!(ImageBankSelect, folded_issued), 80);
+        assert_eq!(offset_of!(ImageBankSelect, update_losses), 88);
     }
 
     #[test]

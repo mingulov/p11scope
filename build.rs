@@ -124,6 +124,18 @@ fn journal_requested() -> bool {
     }
 }
 
+// Staged loader-gate activation: unset/0 compiles the gate out (every
+// object byte-identical to before this flag existed), 1 compiles the
+// gate unit, production define and Rust maps into Detailed flavors.
+// Wiring only: the runtime cutover latch still gates enabling.
+fn loader_gate_requested() -> bool {
+    match env::var("P11SCOPE_LOADER_GATE").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => panic!("P11SCOPE_LOADER_GATE must be unset, 0 or 1"),
+    }
+}
+
 /// Drops host-only coverage instrumentation from rustflags before they are
 /// forwarded to the freestanding BPF target: `-C instrument-coverage`
 /// pairs, `--cfg=coverage`, and `--cfg coverage` pairs. Everything else
@@ -176,6 +188,7 @@ fn main() {
     let journal_proof = journal_proof_requested();
     let production_journal = journal_requested();
     let birth_marker = birth_marker_requested();
+    let loader_gate_env = loader_gate_requested();
     println!("cargo:rustc-check-cfg=cfg(p11scope_journal_roots)");
     if journal_proof {
         println!("cargo:rustc-cfg=p11scope_journal_roots");
@@ -205,6 +218,8 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/native/stop_gate.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/loader_gate.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/loader_gate.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/object_journal.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/object_journal.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/journal_marker.c");
@@ -236,6 +251,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=P11SCOPE_IMAGE_BANK_PROOF");
     println!("cargo:rerun-if-env-changed=P11SCOPE_JOURNAL_PROOF");
     println!("cargo:rerun-if-env-changed=P11SCOPE_JOURNAL");
+    println!("cargo:rerun-if-env-changed=P11SCOPE_LOADER_GATE");
     println!("cargo:rerun-if-env-changed=P11SCOPE_BIRTH_MARKER");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WIDE_DETAILED_2112");
@@ -354,6 +370,7 @@ fn main() {
             wide_detailed,
             stub_object_attributes,
             birth_marker,
+            loader_gate_env,
         );
     }
     // The identity flavor is a standalone clang invocation, not a fourth
@@ -367,7 +384,16 @@ fn main() {
             BpfFlavor::CounterTimestamps,
             BpfFlavor::CounterLatency,
         ] {
-            build_variant(flavor, false, false, false, false, false, birth_marker);
+            build_variant(
+                flavor,
+                false,
+                false,
+                false,
+                false,
+                false,
+                birth_marker,
+                loader_gate_env,
+            );
         }
     }
     println!("cargo:rustc-check-cfg=cfg(p11scope_counter_objects)");
@@ -390,6 +416,7 @@ fn main() {
                 BankProof::Counter,
                 false,
                 birth_marker,
+                loader_gate_env,
             );
         }
     }
@@ -405,6 +432,7 @@ fn main() {
             BankProof::Image,
             false,
             birth_marker,
+            loader_gate_env,
         );
     }
     if journal_proof {
@@ -418,6 +446,7 @@ fn main() {
             BankProof::Journal,
             false,
             birth_marker,
+            loader_gate_env,
         );
     }
     if production_journal {
@@ -431,8 +460,13 @@ fn main() {
             BankProof::Journal,
             true,
             birth_marker,
+            loader_gate_env,
         );
     }
+    println!(
+        "cargo:rustc-env=P11SCOPE_LOADER_GATE_ENABLED={}",
+        u8::from(loader_gate_env)
+    );
     println!(
         "cargo:rustc-env=P11SCOPE_JOURNAL_PROOF_ENABLED={}",
         u8::from(journal_proof)
@@ -510,6 +544,7 @@ fn main() {
     );
 }
 
+#[allow(clippy::too_many_arguments)] // The staged gate switch joins the existing explicit flavor seam; bundling would churn both ends for no gain.
 fn build_variant(
     flavor: BpfFlavor,
     small_ring: bool,
@@ -518,6 +553,7 @@ fn build_variant(
     wide_detailed: bool,
     stub_object_attributes: bool,
     birth_marker: bool,
+    loader_gate_env: bool,
 ) {
     build_variant_with_proof(
         flavor,
@@ -529,6 +565,7 @@ fn build_variant(
         BankProof::None,
         false,
         birth_marker,
+        loader_gate_env,
     );
 }
 
@@ -545,10 +582,14 @@ fn build_variant_with_proof(
     bank_proof: BankProof,
     production_journal: bool,
     birth_marker: bool,
+    loader_gate_env: bool,
 ) {
     let counter_bank_proof = matches!(bank_proof, BankProof::Counter);
     let image_bank_proof = matches!(bank_proof, BankProof::Image);
     let journal_roots = matches!(bank_proof, BankProof::Journal);
+    // The gate wires the loader producer, which only Detailed flavors
+    // run. Inventory and counter objects stay byte-identical either way.
+    let loader_gate = loader_gate_env && matches!(flavor, BpfFlavor::Detailed);
     let inventory = matches!(
         flavor,
         BpfFlavor::InventoryGlobal | BpfFlavor::InventoryCallers
@@ -635,6 +676,9 @@ fn build_variant_with_proof(
     }
     if journal_roots {
         selected_native_units.extend(["object_journal", "journal_marker"]);
+    }
+    if loader_gate {
+        selected_native_units.push("loader_gate");
     }
     let mut native_bitcodes = Vec::new();
     for unit in &selected_native_units {
@@ -731,6 +775,12 @@ fn build_variant_with_proof(
             if *unit == "instance_epoch" {
                 compile.arg("-DP11SCOPE_JOURNAL_GAP");
             }
+        }
+        // Flavor-wide, like INVENTORY_ONLY: every unit in a gated
+        // Detailed build sees the same gate selection, so guarded map
+        // definitions and their externs can never disagree.
+        if loader_gate {
+            compile.arg("-DP11SCOPE_LOADER_GATE");
         }
         if counter_bank_proof && *unit == "counter_bank_timing" {
             compile.arg("-DP11SCOPE_COUNTER_BANK_PROOF");
@@ -860,6 +910,10 @@ fn build_variant_with_proof(
     if journal_marker {
         append_flag("--cfg=p11scope_birth_marker");
     }
+    append_flag("--check-cfg=cfg(p11scope_loader_gate)");
+    if loader_gate {
+        append_flag("--cfg=p11scope_loader_gate");
+    }
     // Native task storage and typed tracepoint require BTF/CO-RE in every build.
     for flag in [
         "-C",
@@ -979,6 +1033,12 @@ fn build_variant_with_proof(
         }
         append_flag("-C");
         append_flag("link-arg=--export=START");
+        if loader_gate {
+            append_flag("-C");
+            append_flag("link-arg=--export=LOADER_GATE");
+            append_flag("-C");
+            append_flag("link-arg=--export=LOADER_GATE_CTL");
+        }
         append_flag("-C");
         append_flag("link-arg=--export=STOP_GATE");
         // H7 slice B subordinate custody: the native owner resolves these.

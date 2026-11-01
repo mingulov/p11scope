@@ -11751,6 +11751,152 @@ mod tests {
         }
     }
 
+    /// Named scope defers a proxy closure array behind real providers: the
+    /// family is decided last and refused whole with its named reason, and a
+    /// heuristic backend it used to crowd out is admitted, in every discovery
+    /// order. Named scope keeps no reserve, so the refusal names none.
+    #[test]
+    fn named_scope_admits_a_heuristic_provider_ahead_of_a_proxy_closure_array() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        for modules in [&[p11_kit.clone(), trust.clone()], &[trust, p11_kit]] {
+            let named = scoped_plan(modules, AdmissionScope::Named);
+            let label: Vec<_> = modules.iter().map(|module| module.object.0).collect();
+
+            assert_eq!(named.admission_scope(), AdmissionScope::Named);
+            assert_eq!(
+                slots_of(&named, 32),
+                68,
+                "the backend is admitted: {label:?}"
+            );
+            assert_eq!(slots_of(&named, 31), 0, "no closure prefix: {label:?}");
+            let refusal = refusal_of(&named, P11_KIT).expect("closure refused whole");
+            assert!(
+                refusal.reason.starts_with(&format!(
+                    "module needs {} more; only {MAX_SLOTS} attach slots are available; ",
+                    64 * 103
+                )),
+                "{}",
+                refusal.reason
+            );
+            assert!(
+                refusal.reason.contains(
+                    "refusing to attach a prefix of its 64 lookalike function tables \
+                     (a proxy closure array is admitted whole or not at all)"
+                ),
+                "{}",
+                refusal.reason
+            );
+            assert!(
+                !refusal.reason.contains("are reserved"),
+                "named scope keeps no reserve: {}",
+                refusal.reason
+            );
+            assert_eq!(
+                named.uncorroborated_candidates, 0,
+                "a whole refusal spills nothing: {label:?}"
+            );
+        }
+    }
+
+    /// The corroborated twin: a backend with publication evidence is admitted
+    /// ahead of the closure array too, in every discovery order.
+    #[test]
+    fn named_scope_admits_a_corroborated_provider_ahead_of_a_proxy_closure_array() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, true);
+        for modules in [&[p11_kit.clone(), trust.clone()], &[trust, p11_kit]] {
+            let named = scoped_plan(modules, AdmissionScope::Named);
+            let label: Vec<_> = modules.iter().map(|module| module.object.0).collect();
+
+            assert_eq!(slots_of(&named, 32), 68, "corroborated backend: {label:?}");
+            assert_eq!(slots_of(&named, 31), 0, "no closure prefix: {label:?}");
+            assert!(
+                refusal_of(&named, P11_KIT).is_some(),
+                "closure refused whole: {label:?}"
+            );
+        }
+    }
+
+    /// The live `trust list` shape: the closure family, p11-kit-trust and
+    /// SoftHSM, all heuristic. Both backends are admitted and the family is
+    /// refused whole, in every discovery order.
+    #[test]
+    fn named_scope_admits_both_backends_ahead_of_a_proxy_closure_array() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let orders = [
+            [&p11_kit, &trust, &softhsm],
+            [&p11_kit, &softhsm, &trust],
+            [&trust, &p11_kit, &softhsm],
+            [&trust, &softhsm, &p11_kit],
+            [&softhsm, &p11_kit, &trust],
+            [&softhsm, &trust, &p11_kit],
+        ];
+        for order in orders {
+            let modules: Vec<_> = order.into_iter().cloned().collect();
+            let named = scoped_plan(&modules, AdmissionScope::Named);
+            let label: Vec<_> = modules.iter().map(|module| module.object.0).collect();
+
+            assert_eq!(slots_of(&named, 32), 68, "p11-kit-trust: {label:?}");
+            assert_eq!(slots_of(&named, 33), 68, "SoftHSM: {label:?}");
+            assert_eq!(slots_of(&named, 31), 0, "no closure prefix: {label:?}");
+            assert_eq!(named.modules_skipped.len(), 1, "{label:?}");
+            assert!(
+                refusal_of(&named, P11_KIT).is_some(),
+                "closure refused whole: {label:?}"
+            );
+        }
+    }
+
+    /// A closure family that fits whole when nothing else competes is
+    /// admitted whole: five lookalike tables are still a closure array, so
+    /// they never take a strongest-four prefix.
+    #[test]
+    fn named_scope_admits_a_small_closure_array_whole_when_nothing_competes() {
+        let family = provider_with_tables(41, "/opt/small-closure.so", 5, 3, false);
+        let named = scoped_plan(std::slice::from_ref(&family), AdmissionScope::Named);
+
+        assert_eq!(slots_of(&named, 41), 15, "admitted whole, not a K4 prefix");
+        assert_eq!(named.uncorroborated_candidates, 0);
+        assert!(named.modules_skipped.is_empty());
+    }
+
+    /// A closure family that fits no budget when nothing else competes is
+    /// refused whole with its named reason: the p11-kit proxy layer needs
+    /// thousands of slots, so a 512-slot capture reports the named gap
+    /// instead of a strongest-four prefix.
+    #[test]
+    fn named_scope_refuses_an_unfitting_closure_array_whole_when_nothing_competes() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let named = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+
+        assert!(named.slots.is_empty(), "no prefix without competition");
+        assert_eq!(named.modules_skipped.len(), 1);
+        let refusal = refusal_of(&named, P11_KIT).expect("closure refused whole");
+        assert!(
+            refusal.reason.contains(
+                "refusing to attach a prefix of its 64 lookalike function tables \
+                 (a proxy closure array is admitted whole or not at all)"
+            ),
+            "{}",
+            refusal.reason
+        );
+    }
+
+    /// Healthy control: a named-scope single provider with no closure family
+    /// is admitted exactly as before.
+    #[test]
+    fn named_scope_single_provider_without_a_closure_family_is_unchanged() {
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let named = scoped_plan(std::slice::from_ref(&trust), AdmissionScope::Named);
+
+        assert_eq!(slots_of(&named, 32), 68);
+        assert_eq!(named.uncorroborated_candidates, 0);
+        assert!(named.modules_skipped.is_empty());
+    }
+
     /// No module is admitted as a prefix in a shared scope. A corroborated
     /// provider that also decodes two heuristic lookalikes gets a prefix
     /// under named-scope K4 (its published table plus one heuristic table,

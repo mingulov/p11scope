@@ -2281,29 +2281,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // backpressure drops keep their disclosures (the router drained
         // each identity once); the refused and foreign returns above
         // drop theirs with the batch at the namespace boundary.
-        // Identities shed past the ledger cap are counted and named
-        // here, never silent.
-        let (disclosures, continued, joined) = batch.take_reload_disclosures();
-        let namespace = self
-            .semantic_finalizer
-            .as_mut()
-            .expect("the matching Session state is retained");
-        let shed = namespace.accumulate_reload_disclosures(disclosures, continued, joined);
-        if shed > 0 {
-            let cumulative = namespace.reload_shed;
-            self.registry.record_gap(RegistryGap {
-                caller: None,
-                module: None,
-                pid: None,
-                subject: "reload disclosure identities shed".into(),
-                reason: format!(
-                    "{shed} disclosed identities shed past the ledger cap of {} \
-                     ({cumulative} shed this capture); the count snapshots stay exact",
-                    crate::discovery::instances::MAX_INSTANCES,
-                ),
-                budget: None,
-            });
-        }
+        // Identities shed past a cap are counted and named here, never
+        // silent.
+        let (disclosures, continued, joined, carried) = batch.take_reload_disclosures();
+        self.drain_reload_disclosures_into_ledger(domain, disclosures, continued, joined, carried);
         if backpressure {
             self.registry.record_gap(RegistryGap {
                 caller: None,
@@ -2323,6 +2304,65 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .as_mut()
             .expect("the matching Session state is retained")
             .pending_semantic = Some(PendingSemanticBatch::Collected(batch));
+    }
+
+    /// Drain one batch's disclosure quadrant into the live namespace
+    /// ledger, disclosing shed under the one vocabulary. Shared by
+    /// staging (every same-domain batch, including backpressure
+    /// drops) and the collected stop union (appended after staging):
+    /// the ledger keeps the one cumulative disclosure-shed counter
+    /// for the capture, and every drop lands under the same named
+    /// gap with its cumulative total. Count snapshots stay exact.
+    pub(crate) fn drain_reload_disclosures_into_ledger(
+        &mut self,
+        domain: NativeDomainId,
+        disclosures: Vec<crate::semantic_capture::ReloadNotExcludedReport>,
+        continued_across_global: u64,
+        joined_across_global: u64,
+        carried_shed: u32,
+    ) {
+        let namespace = self
+            .semantic_finalizer
+            .get_or_insert_with(|| SessionFinalizerState::new(domain));
+        debug_assert_eq!(namespace.domain, domain);
+        let shed = namespace.accumulate_reload_disclosures(
+            disclosures,
+            continued_across_global,
+            joined_across_global,
+            carried_shed,
+        );
+        if shed == 0 {
+            return;
+        }
+        let cumulative = namespace.reload_shed;
+        let reason = if carried_shed > 0 && shed == u64::from(carried_shed) {
+            format!(
+                "{shed} disclosed identities shed past accumulator caps upstream \
+                 ({cumulative} shed this capture); the count snapshots stay exact"
+            )
+        } else if carried_shed > 0 {
+            format!(
+                "{shed} disclosed identities shed ({} past the ledger cap of {}, {} upstream) \
+                 ({cumulative} shed this capture); the count snapshots stay exact",
+                shed - u64::from(carried_shed),
+                crate::discovery::instances::MAX_INSTANCES,
+                carried_shed,
+            )
+        } else {
+            format!(
+                "{shed} disclosed identities shed past the ledger cap of {} \
+                 ({cumulative} shed this capture); the count snapshots stay exact",
+                crate::discovery::instances::MAX_INSTANCES,
+            )
+        };
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "reload disclosure identities shed".into(),
+            reason,
+            budget: None,
+        });
     }
 
     /// B17 W2 terminal projection of the namespace reload disclosure

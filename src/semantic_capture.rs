@@ -856,12 +856,24 @@ impl TickOutcome {
 /// One B17 reload-not-excluded disclosure in the semantic-capture report:
 /// the finite label plus the affected identity, pushed once per identity
 /// on its first tainted continuation. No epochs, ranges or addresses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Redacted Debug: the private image never prints.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ReloadNotExcludedReport {
     pub(crate) label: &'static str,
     pub(crate) image: ImageIdentity,
     pub(crate) file_slot: u32,
     pub(crate) ids: Vec<InstanceId>,
+}
+
+impl std::fmt::Debug for ReloadNotExcludedReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReloadNotExcludedReport")
+            .field("label", &self.label)
+            .field("image", &"<private>")
+            .field("file_slot", &self.file_slot)
+            .field("ids", &self.ids.len())
+            .finish()
+    }
 }
 
 /// B17 W2 terminal projection of the per-capture reload disclosure
@@ -903,6 +915,12 @@ pub(crate) struct TickReport {
     /// router counters they snapshot.
     pub(crate) continued_across_global: u64,
     pub(crate) joined_across_global: u64,
+    /// B17 carried disclosure-identity shed: identities shed past an
+    /// accumulator cap upstream (stash, collected union, stop union).
+    /// Saturating u32, so the pinned report size holds; the ledger
+    /// folds it into its cumulative counter at stage time. Never a
+    /// refused endpoint.
+    pub(crate) reload_shed: u32,
     /// Guard signals for the Joint no-progress tripwire: scans attempted
     /// for awaited keys this tick (joined-refresh scans excluded), whether
     /// any job for an awaited key still has a future deadline, and whether
@@ -970,6 +988,33 @@ impl CollectedH0Disposition {
             self.pending,
         ))
     }
+}
+
+/// One shared reload-disclosure union for every accumulator merge
+/// (collected union, pending-Q union, collected stop union, stashed
+/// merge): the incoming identities append behind the kept side under
+/// one cumulative `MAX_INSTANCES` cap while the count snapshots
+/// max-merge. Past the cap the incoming tail sheds (counted) and
+/// the merge still succeeds: disclosures never refuse a semantic
+/// merge. The union never exceeds the cap: the incoming side
+/// truncates to the remaining room first, so a prepaid accumulator
+/// absorbs it without reallocating. Returns shed identities.
+pub(crate) fn union_reload_disclosures(
+    kept: &mut Vec<ReloadNotExcludedReport>,
+    kept_continued: &mut u64,
+    kept_joined: &mut u64,
+    mut incoming: Vec<ReloadNotExcludedReport>,
+    incoming_continued: u64,
+    incoming_joined: u64,
+) -> u32 {
+    let room = MAX_INSTANCES.saturating_sub(kept.len());
+    let shed = incoming.len().saturating_sub(room);
+    incoming.truncate(room);
+    kept.append(&mut incoming);
+    *kept_continued = (*kept_continued).max(incoming_continued);
+    *kept_joined = (*kept_joined).max(incoming_joined);
+    debug_assert!(kept.len() <= MAX_INSTANCES);
+    u32::try_from(shed).unwrap_or(u32::MAX)
 }
 
 impl TickReport {
@@ -1044,25 +1089,43 @@ impl TickReport {
         shed
     }
 
-    /// Merge lane-stashed reload disclosures behind this tick's own,
-    /// truncated to batch capacity like the receipts, with max-merged
-    /// count snapshots. Returns shed disclosures. Fresh disclosures
-    /// stay ahead of stashed ones; the snapshots are
-    /// capture-monotonic router totals, so the maximum wins and totals
-    /// survive even when identities shed.
+    /// Merge lane-stashed reload disclosures behind this tick's own
+    /// through the shared disclosure union: one cumulative batch
+    /// cap, max-merged count snapshots, counted shed. Returns shed
+    /// disclosures as u32 (the disclosure-shed vocabulary; receipt
+    /// and outcome shed stays u64 beside the refused-endpoint
+    /// total). Fresh disclosures stay ahead of stashed ones; the
+    /// snapshots are capture-monotonic router totals, so the maximum
+    /// wins and totals survive even when identities shed.
     pub(crate) fn merge_stashed_disclosures(
         &mut self,
         stashed: Vec<ReloadNotExcludedReport>,
         continued_across_global: u64,
         joined_across_global: u64,
-    ) -> u64 {
-        self.reload_not_excluded.extend(stashed);
-        let shed = self.reload_not_excluded.len().saturating_sub(MAX_INSTANCES);
-        self.reload_not_excluded.truncate(MAX_INSTANCES);
-        debug_assert!(self.reload_not_excluded.len() <= MAX_INSTANCES);
-        self.continued_across_global = self.continued_across_global.max(continued_across_global);
-        self.joined_across_global = self.joined_across_global.max(joined_across_global);
-        shed as u64
+    ) -> u32 {
+        union_reload_disclosures(
+            &mut self.reload_not_excluded,
+            &mut self.continued_across_global,
+            &mut self.joined_across_global,
+            stashed,
+            continued_across_global,
+            joined_across_global,
+        )
+    }
+
+    /// Whether the report carries nothing a batch must preserve:
+    /// no outcomes, receipts, disclosures, count snapshots or
+    /// carried shed. A disclosure, a nonzero snapshot or a nonzero
+    /// carried shed is evidence, never quiet: dropping a
+    /// counts-only report would lose the router totals, and dropping
+    /// a shed-only report would lose the loss itself.
+    pub(crate) fn is_quiet(&self) -> bool {
+        self.outcomes.is_empty()
+            && self.current.is_empty()
+            && self.reload_not_excluded.is_empty()
+            && self.continued_across_global == 0
+            && self.joined_across_global == 0
+            && self.reload_shed == 0
     }
 
     /// H3 disposition inputs for the finalizer: the allocation

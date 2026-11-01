@@ -40,7 +40,7 @@ use crate::run::{STOP_QUIESCE_BUDGET, StopState, TerminalQuiescence};
 use crate::semantic_capture::{
     CurrentPartitionReceipt, CurrentReceiptRefusal, Endpoint, InvalidationScope,
     PhysicalSemanticGap, ReloadNotExcludedReport, SemanticCapture, TickLimits, TickOutcome,
-    TickReport, unjoined_shed_counts,
+    TickReport, union_reload_disclosures, unjoined_shed_counts,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal,
@@ -320,6 +320,11 @@ pub(crate) struct SemanticBatch {
     reload_not_excluded: Vec<ReloadNotExcludedReport>,
     continued_across_global: u64,
     joined_across_global: u64,
+    /// B17 carried disclosure-identity shed: identities shed past an
+    /// accumulator cap upstream. Saturating u32, so the pinned batch
+    /// size holds; the ledger folds it into its cumulative counter
+    /// at stage time. Never a refused endpoint.
+    reload_shed: u32,
 }
 
 /// Lane negatives per batch: one cut barrier plus bounded collection
@@ -364,22 +369,19 @@ impl SemanticBatch {
 
     /// The machine holds both incoming/union capacities before actual Stop.
     /// Every refusal leaves the incoming report and this original untouched.
+    /// The disclosure quadrant unions through the shared helper: past
+    /// the cumulative cap the incoming tail sheds (counted on the
+    /// carried shed) and the merge still succeeds — disclosures never
+    /// refuse the semantic merge. Only the structural shape (stop
+    /// permission, empty current, single outcome, outcome room) refuses.
     pub(crate) fn merge_collected_stop(
         &mut self,
         report: &mut TickReport,
     ) -> Result<(), SemanticRefusal> {
-        // The disclosure union shares the batch constructor's bound:
-        // two individually bounded sides must not stage an over-bound
-        // batch. Refusal leaves both sides untouched.
-        let disclosed = self
-            .reload_not_excluded
-            .len()
-            .saturating_add(report.reload_not_excluded.len());
         if !self.permits_collected_stop()
             || !report.current().is_empty()
             || report.outcomes().len() != 1
             || self.outcomes.len() == self.outcomes.capacity()
-            || disclosed > crate::discovery::instances::MAX_INSTANCES
         {
             return Err(SemanticRefusal::ProviderStorage);
         }
@@ -389,13 +391,19 @@ impl SemanticBatch {
             (a, b) => a.or(b),
         };
         self.exhausted |= report.exhausted();
-        let mut report = std::mem::take(report);
-        self.reload_not_excluded
-            .append(&mut report.reload_not_excluded);
-        self.continued_across_global = self
-            .continued_across_global
-            .max(report.continued_across_global);
-        self.joined_across_global = self.joined_across_global.max(report.joined_across_global);
+        let shed = union_reload_disclosures(
+            &mut self.reload_not_excluded,
+            &mut self.continued_across_global,
+            &mut self.joined_across_global,
+            std::mem::take(&mut report.reload_not_excluded),
+            report.continued_across_global,
+            report.joined_across_global,
+        );
+        self.reload_shed = self
+            .reload_shed
+            .saturating_add(shed)
+            .saturating_add(std::mem::take(&mut report.reload_shed));
+        let report = std::mem::take(report);
         let (mut outcomes, current) = report.into_parts();
         self.outcomes.append(&mut outcomes);
         drop(outcomes);
@@ -421,6 +429,7 @@ impl SemanticBatch {
         let reload_not_excluded = std::mem::take(&mut report.reload_not_excluded);
         let continued_across_global = report.continued_across_global;
         let joined_across_global = report.joined_across_global;
+        let reload_shed = std::mem::take(&mut report.reload_shed);
         let (outcomes, current) = report.into_parts();
         if outcomes.len() > crate::discovery::instances::MAX_INSTANCES
             || current.len() > crate::discovery::instances::MAX_INSTANCES
@@ -444,6 +453,7 @@ impl SemanticBatch {
             reload_not_excluded,
             continued_across_global,
             joined_across_global,
+            reload_shed,
         })
     }
 
@@ -542,28 +552,43 @@ impl SemanticBatch {
         self.joined_across_global
     }
 
+    /// The carried upstream disclosure-identity shed. Tests only
+    /// until a production reader joins the take path.
+    #[cfg(test)]
+    pub(crate) fn reload_shed(&self) -> u32 {
+        self.reload_shed
+    }
+
     /// Move the disclosure quadrant into the coordinator ledger. The
     /// router drains each identity once, so the batch takes its copy
-    /// out exactly once at staging; later drop paths see nothing left
+    /// out exactly once at staging (plus once more for a stop union
+    /// appended after staging); later drop paths see nothing left
     /// to lose.
-    pub(crate) fn take_reload_disclosures(&mut self) -> (Vec<ReloadNotExcludedReport>, u64, u64) {
+    pub(crate) fn take_reload_disclosures(
+        &mut self,
+    ) -> (Vec<ReloadNotExcludedReport>, u64, u64, u32) {
         (
             std::mem::take(&mut self.reload_not_excluded),
             std::mem::take(&mut self.continued_across_global),
             std::mem::take(&mut self.joined_across_global),
+            std::mem::take(&mut self.reload_shed),
         )
     }
 
-    /// Whether the batch carries no outcomes, receipts, negatives or
-    /// disclosures: tests assert quiet ticks stage or commit nothing.
-    /// A disclosure is evidence, so a disclosure-only batch is not
-    /// empty.
+    /// Whether the batch carries no outcomes, receipts, negatives,
+    /// disclosures, count snapshots or carried shed: tests assert
+    /// quiet ticks stage or commit nothing. A disclosure, a nonzero
+    /// snapshot or a nonzero carried shed is evidence, so a
+    /// disclosure-only batch is not empty.
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.outcomes.is_empty()
             && self.current.is_empty()
             && self.negatives.is_empty()
             && self.reload_not_excluded.is_empty()
+            && self.continued_across_global == 0
+            && self.joined_across_global == 0
+            && self.reload_shed == 0
     }
 
     /// The batch's own cut fence, if any: the maximum cut-barrier
@@ -1032,6 +1057,10 @@ pub(crate) struct RefreshReceiptStash {
     /// maximum wins at merge time.
     continued_across_global: u64,
     joined_across_global: u64,
+    /// Stashed disclosure-identity shed past the cap: carried into
+    /// the next tick report's own shed, never a refused endpoint.
+    /// Saturating u32, matching the carried-shed vocabulary.
+    disclosure_shed: u32,
     shed: u64,
     /// Minimum shed outcome position: stash overflow drops positioned
     /// history, so the next merge carries it as a loss barrier. Taken
@@ -1159,13 +1188,16 @@ impl RefreshReceiptStash {
         )
     }
 
-    /// Whether the stash holds nothing to merge.
+    /// Whether the stash holds nothing to merge. A carried
+    /// disclosure shed is evidence too: a shed-only stash must still
+    /// merge, so its count reaches the ledger instead of stranding.
     pub(crate) fn is_empty(&self) -> bool {
         self.stashed.is_empty()
             && self.outcomes.is_empty()
             && self.disclosures.is_empty()
             && self.continued_across_global == 0
             && self.joined_across_global == 0
+            && self.disclosure_shed == 0
     }
 
     /// Tests-only shed count: production discloses `push_all`'s return
@@ -1173,6 +1205,13 @@ impl RefreshReceiptStash {
     #[cfg(test)]
     pub(crate) fn shed(&self) -> u64 {
         self.shed
+    }
+
+    /// Tests-only carried disclosure-identity shed: production
+    /// carries it into the next tick report instead.
+    #[cfg(test)]
+    pub(crate) fn disclosure_shed(&self) -> u32 {
+        self.disclosure_shed
     }
 
     /// Drain the stashed receipts in order into the next tick batch.
@@ -1189,34 +1228,37 @@ impl RefreshReceiptStash {
     /// disclosures append in drain order while the count snapshots
     /// max-merge (router counters are capture-monotonic, so totals
     /// survive even when identities shed). Past `MAX_INSTANCES` the
-    /// oldest identities shed, counted like receipt/outcome overflow;
-    /// the caller discloses the count as refused endpoints.
+    /// oldest identities shed, counted on the carried disclosure
+    /// shed (never refused endpoints); the merge carries that count
+    /// into the next tick report. Returns this call's shed.
     pub(crate) fn push_disclosures(
         &mut self,
         disclosures: Vec<ReloadNotExcludedReport>,
         continued_across_global: u64,
         joined_across_global: u64,
-    ) -> u64 {
+    ) -> u32 {
         const MAX: usize = crate::discovery::instances::MAX_INSTANCES;
         self.continued_across_global = self.continued_across_global.max(continued_across_global);
         self.joined_across_global = self.joined_across_global.max(joined_across_global);
-        let mut shed = 0;
+        let mut shed = 0u32;
         self.disclosures.extend(disclosures);
         while self.disclosures.len() > MAX {
             self.disclosures.pop_front();
-            shed += 1;
+            shed = shed.saturating_add(1);
         }
-        self.shed = self.shed.saturating_add(shed);
+        self.disclosure_shed = self.disclosure_shed.saturating_add(shed);
         shed
     }
 
     /// Drain the stashed disclosures in order plus the merged count
-    /// snapshots into the next tick batch, resetting the snapshots.
-    pub(crate) fn take_disclosures(&mut self) -> (Vec<ReloadNotExcludedReport>, u64, u64) {
+    /// snapshots and the carried disclosure shed into the next tick
+    /// batch, resetting the snapshots and the shed.
+    pub(crate) fn take_disclosures(&mut self) -> (Vec<ReloadNotExcludedReport>, u64, u64, u32) {
         (
             std::mem::take(&mut self.disclosures).into_iter().collect(),
             std::mem::take(&mut self.continued_across_global),
             std::mem::take(&mut self.joined_across_global),
+            std::mem::take(&mut self.disclosure_shed),
         )
     }
 
@@ -1234,8 +1276,10 @@ impl RefreshReceiptStash {
 
 /// Stash one refresh report's receipts, outcomes and disclosure
 /// quadrant for the next tick batch, returning the binding-hint images
-/// and the shed count. Shared by the live refresh path; tests drive it
-/// with real H0 reports.
+/// and the receipt/outcome shed count (the refused-endpoints share).
+/// Disclosure-identity shed counts on the stash's carried disclosure
+/// shed instead, never in this total. Shared by the live refresh
+/// path; tests drive it with real H0 reports.
 pub(crate) fn stash_refresh_report(
     stash: &mut RefreshReceiptStash,
     report: &mut TickReport,
@@ -1249,22 +1293,36 @@ pub(crate) fn stash_refresh_report(
     let disclosures = std::mem::take(&mut report.reload_not_excluded);
     let continued = std::mem::take(&mut report.continued_across_global);
     let joined = std::mem::take(&mut report.joined_across_global);
-    let shed = shed.saturating_add(stash.push_disclosures(disclosures, continued, joined));
+    // The disclosure shed is already counted on the stash's carried
+    // counter by the push; it rides the next merge, not this total.
+    let _ = stash.push_disclosures(disclosures, continued, joined);
+    // A stashed report never carries shed today (H0 refresh reports
+    // are fresh), but taking it keeps a future carrier honest: shed
+    // joins the stash instead of dropping with the report.
+    stash.disclosure_shed = stash
+        .disclosure_shed
+        .saturating_add(std::mem::take(&mut report.reload_shed));
     (images, shed)
 }
 
 /// Merge the lane's stashed refresh evidence behind a tick report's
-/// own, returning the merge shed count. Shared by regular ticks and
-/// terminal quanta so quiet proofs register on every path.
+/// own, returning the receipt/outcome merge shed count (the
+/// refused-endpoints share). The stashed and merged disclosure
+/// shed joins the report's carried disclosure shed instead, never
+/// this total. Shared by regular ticks and terminal quanta so quiet
+/// proofs register on every path.
 pub(crate) fn merge_stash_into_report(
     stash: &mut RefreshReceiptStash,
     report: &mut TickReport,
 ) -> u64 {
     let shed = report.merge_stashed_current(stash.take());
     let shed = shed.saturating_add(report.merge_stashed_outcomes(stash.take_outcomes()));
-    let (disclosures, continued, joined) = stash.take_disclosures();
-    let shed =
-        shed.saturating_add(report.merge_stashed_disclosures(disclosures, continued, joined));
+    let (disclosures, continued, joined, stashed_shed) = stash.take_disclosures();
+    let merged_shed = report.merge_stashed_disclosures(disclosures, continued, joined);
+    report.reload_shed = report
+        .reload_shed
+        .saturating_add(stashed_shed)
+        .saturating_add(merged_shed);
     report.absorb_shed_floor(stash.take_shed_floor());
     shed
 }
@@ -3458,8 +3516,9 @@ pub(crate) fn run_semantic_stop(
 
 /// The terminal stash drain: quiet refresh evidence stashed since
 /// the last tick merges into terminal quanta (a stop before the next
-/// tick must not strand it), with merge shed disclosed through the
-/// lane's refusal counter.
+/// tick must not strand it), with receipt/outcome merge shed
+/// disclosed through the lane's refusal counter. Disclosure shed
+/// rides the report's carried counter to the ledger instead.
 struct LiveStashDrain<'a> {
     stash: &'a mut RefreshReceiptStash,
     shed: &'a mut u64,
@@ -3502,10 +3561,7 @@ impl SemanticStopIo for LiveStopIo<'_> {
             let shed = merge_stash_into_report(drain.stash, &mut report);
             *drain.shed = drain.shed.saturating_add(shed);
         }
-        if report.outcomes().is_empty()
-            && report.current().is_empty()
-            && report.reload_not_excluded.is_empty()
-        {
+        if report.is_quiet() {
             return Ok(None);
         }
         SemanticBatch::from_tick_report(self.domain, report, Vec::new(), now_ns()).map(Some)

@@ -85,7 +85,10 @@ object carries it under the same rule. When the router counted tainted
 continuations but minted no identity to name (mint exhaustion), the key
 is still present with the exact snapshots and an empty `identities`
 list: the router is the producer then, so absent-never-zero does not
-apply. Its keys are
+apply. The `identities` entries may also be incomplete while the
+snapshots stay exact when the capture discloses a "reload disclosure
+identities shed" gap: past an accumulator cap, identities shed
+(counted) but the router totals still merge. Its keys are
 `continued_across_global` and `joined_across_global` (the
 capture-monotonic router snapshots: tainted continuations observed and
 calls joined through a tainted entry) and `identities` (one entry per

@@ -26,6 +26,7 @@ use crate::inventory_semantics::{
 use crate::semantic_capture::{
     CommittedAbsenceBirth, CurrentPartitionReceipt, H0BirthCandidate, InvalidationScope,
     ReloadNotExcludedReport, RetainedBirthWitness, TickOutcome, TickReport,
+    union_reload_disclosures,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceReserver,
@@ -653,12 +654,13 @@ fn collected_budgets(
             .checked_add(MAX_INSTANCES.checked_mul(OWNED_ALLOCATION_PADDING)?)
     })()?;
     // Disclosure-owned instance id lists merge into the accumulator
-    // with the stop union's disclosures: same shape as the outcome
-    // lists (at most one list per disclosure, the union bound caps the
-    // lists at MAX_INSTANCES, the lists together name minted-pool ids,
-    // each collected with the pinned growth law). Covered
-    // unconditionally: the union moves the lists without growth, so no
-    // merge-time charge applies.
+    // with the collected unions' disclosures: same shape as the
+    // outcome lists (at most one list per disclosure, the union bound
+    // caps the lists at MAX_INSTANCES, the lists together name
+    // minted-pool ids, each collected with the pinned growth law).
+    // Covered unconditionally: the shared union truncates the
+    // incoming tail to the remaining room before appending, moving
+    // the lists without growth, so no merge-time charge applies.
     let disclosure_nested = (|| {
         MAX_INSTANCES
             .checked_mul(2)?
@@ -798,6 +800,7 @@ impl CollectedReports {
                 reload_not_excluded,
                 continued_across_global: 0,
                 joined_across_global: 0,
+                reload_shed: 0,
             }),
             refused: None,
             receipt_limit: budgets.receipt_limit,
@@ -853,6 +856,7 @@ impl CollectedReports {
                 reload_not_excluded,
                 continued_across_global: 0,
                 joined_across_global: 0,
+                reload_shed: 0,
             }),
             refused: None,
             receipt_limit: budgets.receipt_limit,
@@ -932,6 +936,23 @@ impl CollectedReports {
         batch.outcomes.append(&mut incoming.outcomes);
         batch.current.append(&mut incoming.current);
         batch.negatives.append(&mut incoming.negatives);
+        // The disclosure quadrant unions through the shared helper
+        // under the same cumulative cap: past the cap the incoming
+        // tail sheds (counted on the carried shed) and the merge
+        // still succeeds — disclosures never refuse the merge. The
+        // incoming batch is consumed, so its carried shed moves too.
+        let shed = union_reload_disclosures(
+            &mut batch.reload_not_excluded,
+            &mut batch.continued_across_global,
+            &mut batch.joined_across_global,
+            std::mem::take(&mut incoming.reload_not_excluded),
+            incoming.continued_across_global,
+            incoming.joined_across_global,
+        );
+        batch.reload_shed = batch
+            .reload_shed
+            .saturating_add(shed)
+            .saturating_add(std::mem::take(&mut incoming.reload_shed));
         batch.observed_ns = batch.observed_ns.max(incoming.observed_ns);
         // A resolved old floor must not strand its own collection forever.
         batch.awaiting_floor = incoming.awaiting_floor;
@@ -993,6 +1014,24 @@ impl CollectedReports {
         batch.observed_ns = batch
             .observed_ns
             .max(crate::discovery::caller_registry::now_ns());
+        // The pending report's disclosure quadrant joins the
+        // accumulator through the shared helper, like `merge`: shed
+        // instead of refuse past the cumulative cap, counts always
+        // max-merged, and the report's carried shed moves too.
+        let shed = union_reload_disclosures(
+            &mut batch.reload_not_excluded,
+            &mut batch.continued_across_global,
+            &mut batch.joined_across_global,
+            std::mem::take(&mut incoming.reload_not_excluded),
+            incoming.continued_across_global,
+            incoming.joined_across_global,
+        );
+        batch.reload_shed = batch
+            .reload_shed
+            .saturating_add(shed)
+            .saturating_add(std::mem::take(&mut incoming.reload_shed));
+        incoming.continued_across_global = 0;
+        incoming.joined_across_global = 0;
         let mut outcomes = incoming.take_outcomes();
         let mut current = incoming.take_current();
         batch.outcomes.append(&mut outcomes);
@@ -4798,6 +4837,14 @@ mod binding_reservation_tests {
         assert!(
             pending.reload_not_excluded.is_empty(),
             "the union takes the pending quadrant"
+        );
+        assert_eq!(
+            pending.continued_across_global, 0,
+            "the union takes the pending snapshots"
+        );
+        assert_eq!(
+            pending.joined_across_global, 0,
+            "the union takes the pending snapshots"
         );
         let kept = reports.batch.as_ref().expect("the accumulator is retained");
         assert_eq!(

@@ -91,20 +91,23 @@ impl SessionFinalizerState {
 
     /// Stage one batch's disclosure quadrant into the namespace
     /// ledger: the first disclosure per identity wins, and the count
-    /// snapshots take the maximum. Called for every same-domain
-    /// staged batch, including backpressure drops, so a drained-once
-    /// disclosure is never silently lost: ledgered, or shed past the
-    /// cap with a counted return the stager discloses as a named gap.
-    /// Refused and foreign batches drop theirs with the batch at the
-    /// namespace boundary. Returns shed identities.
+    /// snapshots take the maximum. The batch's carried upstream shed
+    /// joins the same cumulative counter, so every disclosure drop
+    /// in the capture lands under one counter. Called for every
+    /// same-domain staged batch, including backpressure drops, so a
+    /// drained-once disclosure is never silently lost: ledgered, or
+    /// shed past a cap with a counted return the stager discloses as
+    /// a named gap. Refused and foreign batches drop theirs with the
+    /// batch at the namespace boundary. Returns shed identities.
     pub(super) fn accumulate_reload_disclosures(
         &mut self,
         disclosures: Vec<crate::semantic_capture::ReloadNotExcludedReport>,
         continued_across_global: u64,
         joined_across_global: u64,
+        carried_shed: u32,
     ) -> u64 {
         const MAX: usize = crate::discovery::instances::MAX_INSTANCES;
-        let mut shed = 0u64;
+        let mut shed = u64::from(carried_shed);
         for disclosure in disclosures {
             let key = (
                 disclosure.image.task_cookie,

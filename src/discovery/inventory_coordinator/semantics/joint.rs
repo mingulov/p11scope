@@ -302,6 +302,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return Err(SemanticRefusal::Unavailable);
         };
         batch.merge_collected_stop(report)?;
+        // The stop union lands after staging already drained this
+        // batch's quadrant: drain the appended quadrant into the
+        // ledger now, or the stop disclosures strand in the staged
+        // batch and the union shed never reaches the one cumulative
+        // counter.
+        let (disclosures, continued, joined, carried) = batch.take_reload_disclosures();
+        let domain = batch.domain();
+        self.drain_reload_disclosures_into_ledger(domain, disclosures, continued, joined, carried);
         // The checked private Raw stamp is moved only after the original union
         // accepted all output. It cannot be supplied from receipt scalars.
         // The unchanged private stamp was checked above. Moving its Option

@@ -8631,6 +8631,11 @@ fn stop_merge_sheds_overbound_reload_disclosures() {
     );
     assert_eq!(batch.continued_across_global(), 9);
     assert_eq!(batch.joined_across_global(), 2);
+    assert_eq!(
+        batch.reload_shed(),
+        1,
+        "the shed tail counts on the carried shed"
+    );
     assert!(
         stop.reload_not_excluded.is_empty(),
         "the union takes the stop quadrant"

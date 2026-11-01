@@ -540,6 +540,56 @@ mod current_receipts_tests {
                 "disclosure-identity shed is not a refused endpoint (push {cookie})"
             );
         }
+        assert_eq!(
+            stash.disclosure_shed(),
+            1,
+            "the shed identity counts on the carried disclosure shed"
+        );
+    }
+
+    #[test]
+    fn quiet_report_treats_snapshots_and_shed_as_content() {
+        use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+
+        assert!(TickReport::default().is_quiet(), "empty is quiet");
+        let continued = TickReport {
+            continued_across_global: 4,
+            ..Default::default()
+        };
+        assert!(
+            !continued.is_quiet(),
+            "a nonzero continued snapshot is evidence, never quiet"
+        );
+        let joined = TickReport {
+            joined_across_global: 2,
+            ..Default::default()
+        };
+        assert!(
+            !joined.is_quiet(),
+            "a nonzero joined snapshot is evidence, never quiet"
+        );
+        let shed = TickReport {
+            reload_shed: 1,
+            ..Default::default()
+        };
+        assert!(
+            !shed.is_quiet(),
+            "a nonzero carried shed is evidence, never quiet"
+        );
+        let mut disclosed = TickReport::default();
+        disclosed.reload_not_excluded.push(ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: 0x51,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(1)],
+        });
+        assert!(
+            !disclosed.is_quiet(),
+            "a disclosure is evidence, never quiet"
+        );
     }
 
     #[test]
@@ -7291,7 +7341,7 @@ mod b17_wire_projection {
     #[test]
     fn staged_quiet_batch_records_no_disclosure_shed_gap() {
         let mut coordinator = coordinator();
-        let mut lane = shell_lane();
+        let lane = shell_lane();
         let batch =
             SemanticBatch::from_tick_report(lane.domain(), TickReport::default(), Vec::new(), 130)
                 .unwrap();
@@ -7302,6 +7352,36 @@ mod b17_wire_projection {
                 .iter()
                 .any(|(subject, _)| subject == "reload disclosure identities shed"),
             "no shed, no gap: {gaps:?}"
+        );
+    }
+
+    // Carried upstream shed reaches the one cumulative ledger counter
+    // and the named gap: a batch whose unions shed upstream still
+    // discloses the loss at stage time, with a running total.
+    #[test]
+    fn staged_carried_shed_reaches_ledger_counter_and_gap() {
+        let mut coordinator = coordinator();
+        let lane = shell_lane();
+        for carried in [3u32, 2u32] {
+            let report = TickReport {
+                reload_shed: carried,
+                ..Default::default()
+            };
+            let batch =
+                SemanticBatch::from_tick_report(lane.domain(), report, Vec::new(), 130).unwrap();
+            assert_eq!(batch.reload_shed(), carried);
+            coordinator.stage_semantic_batch(batch);
+        }
+        let gaps = coordinator.registry().staged_scope_gaps_for_test();
+        let shed_gaps: Vec<_> = gaps
+            .iter()
+            .filter(|(subject, _)| subject == "reload disclosure identities shed")
+            .collect();
+        assert_eq!(shed_gaps.len(), 2, "each shed stage names a gap: {gaps:?}");
+        assert!(
+            shed_gaps[1].1.contains("(5 shed this capture)"),
+            "the counter is cumulative: {:?}",
+            shed_gaps[1].1
         );
     }
 }

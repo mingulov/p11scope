@@ -1038,5 +1038,41 @@ class PrearmOracleAgreement(unittest.TestCase):
             CHECKER["exact_discovery_semantics"](evidence)
 
 
+class InitializationRowAgreement(unittest.TestCase):
+    """functions[].initialization: the optional v3-additive Initialize claim.
+
+    The release oracle does not close functions[] row keys (subset checks
+    only), so there is no oracle vocabulary to agree with here: these pins
+    lock the machine schema's additive shape instead — optional, closed
+    sub-object, finite outcome words, likelihood true-only.
+    """
+
+    def row_schema(self):
+        return SCHEMA["properties"]["functions"]["items"]
+
+    def test_initialization_is_optional_with_finite_outcome(self):
+        row = self.row_schema()
+        self.assertIn("initialization", row["properties"])
+        self.assertNotIn("initialization", row["required"])
+        init = row["properties"]["initialization"]
+        self.assertFalse(init["additionalProperties"])
+        self.assertEqual(set(init["required"]), {"outcome"})
+        self.assertEqual(
+            set(init["properties"]["outcome"]["enum"]),
+            {"ok", "already_initialized", "error", "mixed"},
+        )
+
+    def test_initialization_potential_provider_is_true_only(self):
+        row = self.row_schema()
+        self.assertIn("initialization", row["properties"])
+        init = row["properties"]["initialization"]
+        self.assertEqual(
+            set(init["properties"]), {"outcome", "potential_provider"}
+        )
+        self.assertEqual(
+            init["properties"]["potential_provider"], {"const": True}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

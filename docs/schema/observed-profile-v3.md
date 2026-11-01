@@ -459,6 +459,40 @@ positions share one target. `discovery[].tables[]` adds the linkage value
 and `functions[]` rows). Export linkage presents standard names only: scan-found
 slots stay semantics-unverified and count-only whatever their linkage.
 
+## Initialize claim on `functions[]` rows
+
+Every `functions[]` row that names `C_Initialize` and has at least one
+positively counted return carries an optional `initialization` object,
+rendered in both the profile and metrics lanes under every counter mode
+from the row's own `rv_counts` at render time — no new read, no new
+retention:
+
+- `outcome` is the outcome class over that row's completed calls: `ok`
+  (every counted return was `CKR_OK`), `already_initialized` (every
+  counted return was `CKR_CRYPTOKI_ALREADY_INITIALIZED`), `error` (every
+  counted return was anything else, `CKR_PENDING` included — the outcome
+  vocabulary has no pending word), or `mixed` (more than one class
+  occurred). Zero counts assert nothing observed and are ignored.
+- `potential_provider` is present and `true` exactly when at least one
+  completed call returned `CKR_OK` or
+  `CKR_CRYPTOKI_ALREADY_INITIALIZED`: the row's module answered as an
+  initialized Cryptoki at least once. It is a likelihood, never proof of
+  provider identity — a stub that returns `CKR_OK` qualifies — and it
+  carries no operator attestation.
+
+The claim is row-scoped: an aliased row that names `C_Initialize` among
+its names reports the row's own outcomes without splitting counts into
+guessed per-name shares. Rows that do not name exactly `C_Initialize`,
+and Initialize rows without positively counted returns, omit the key
+(absent, never null or false): absence means Initialize was not
+observed on that row (unknown, per OD35). The live function table marks
+qualifying rows with the same words (`[init: <outcome>]`, plus
+`, potential provider` when the likelihood holds).
+
+Like `selected_detail` and `instance_reload_not_excluded`, this is a
+v3-additive disclosure that introduces no new schema revision: the
+`functions[]` item shape stays open and the key stays optional.
+
 ## Kernel control evidence
 
 `kernel_control` is always present in every v3 profile, v3-metrics, and

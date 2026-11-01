@@ -1614,6 +1614,35 @@ impl MachineScene {
         );
     }
 
+    /// Unlinked one-call prefix: only a linked lane installs Joint
+    /// feeds, so this pins the revision advance instead of `prime`'s
+    /// joint_feeds count. The S1Only-routed call still reduces.
+    fn prime_unlinked(&mut self) {
+        let revision = self
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision();
+        self.scene.push(std::process::id(), 0, "C_CreateObject", 1);
+        self.published_labeled("unlinked-prefix", None);
+        assert_eq!(
+            self.scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .published_revision(),
+            revision + 1
+        );
+        assert_eq!(
+            self.scene.real.scene.coordinator.registry().joint_feeds(),
+            0,
+            "an unlinked lane routes its calls through S1Only, installing no Joint feed"
+        );
+    }
+
     fn reduced_for(&self, file: usize) -> u64 {
         let registry = self.scene.real.scene.coordinator.registry();
         let module = registry
@@ -7652,6 +7681,320 @@ fn joint_machine_negative_dispositions_are_finite() {
         assert!(coordinator.joint_capture().adapter().consumed_frontier() == frontier);
         assert!(!coordinator.publication_pending());
     }
+}
+
+/// Post-re-sync publication completes on an unlinked lane: a
+/// malformed quantum breaks the stream, the next collect re-syncs on
+/// a fresh stream, and the follow-up publication stages its call and
+/// completes within its finite work bound, tripping no bound. The
+/// break quantum's own handed-out positions ride invalidation
+/// outcomes, so no H0 position is left unstaged to wedge the seal.
+#[test]
+fn joint_machine_unlinked_resync_followup_publishes() {
+    let mut fixture = MachineScene::unlinked(1);
+    assert!(
+        !fixture.scene.producers.journal_linked(),
+        "only an unlinked lane re-syncs after a break"
+    );
+    fixture.prime_unlinked();
+    // Break the stream exactly like the linked negative twin.
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    fixture.published_labeled("resync-break", None);
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        assert!(
+            adapter.stream_broken_for_test() || adapter.invalidated_for_test(),
+            "the malformed quantum breaks the stream before the re-sync"
+        );
+    }
+    let api_returns = |fixture: &MachineScene| -> u64 {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum()
+    };
+    let before = api_returns(&fixture);
+    // Healthy follow-up on the re-synced stream.
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("resync-followup", None);
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        assert!(
+            !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()),
+            "the follow-up collect re-syncs the broken unlinked stream"
+        );
+    }
+    assert_eq!(
+        api_returns(&fixture),
+        before + 1,
+        "the re-synced follow-up joins its one call"
+    );
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.finish_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    assert!(audit_no_progress_gaps(&fixture).is_empty());
+    assert!(no_progress_gaps(&fixture).is_empty());
+}
+
+/// Healthy twin of the post-re-sync publication positive: the same
+/// unlinked follow-up without the malformed break publishes, stages
+/// its call, breaks no stream and trips no bound.
+#[test]
+fn joint_machine_unlinked_followup_publishes_without_break() {
+    let mut fixture = MachineScene::unlinked(1);
+    assert!(
+        !fixture.scene.producers.journal_linked(),
+        "the twin runs on the same unlinked lane as the re-sync positive"
+    );
+    fixture.prime_unlinked();
+    // S1Only feeds never replay, so `reduced` stays 0 here; the
+    // staged S1 facts (`api_returns`, as in the H8-absent batch
+    // test) count the joined calls on this lane.
+    let api_returns = |fixture: &MachineScene| -> u64 {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum()
+    };
+    let before = api_returns(&fixture);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("healthy-followup", None);
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        assert!(
+            !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()),
+            "no break, hence no re-sync, on the healthy path"
+        );
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .count(),
+        1
+    );
+    assert_eq!(
+        api_returns(&fixture),
+        before + 1,
+        "the healthy follow-up joins its one call"
+    );
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.finish_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    assert!(audit_no_progress_gaps(&fixture).is_empty());
+    assert!(no_progress_gaps(&fixture).is_empty());
+}
+
+/// A linked lane never re-syncs: the malformed quantum publishes
+/// its counted negative, and every follow-up collect refuses the
+/// fail-closed Gap finitely in Idle, publishing nothing past it.
+/// (The 6 s cut-off itself stays pinned by the posed bound tests.)
+#[test]
+fn joint_machine_linked_break_refuses_gap_without_resync() {
+    use crate::inventory_semantics::JointServiceProgress;
+    let mut fixture = MachineScene::new(1);
+    assert!(
+        fixture.scene.producers.journal_linked(),
+        "only a linked lane keeps the fail-closed Gap"
+    );
+    fixture.prime(1);
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    fixture.published_labeled("linked-break", None);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        revision + 1,
+        "the break quantum publishes its counted negative"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "the break's void drops the Joint feed back to S1Only"
+    );
+    let edges: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .collect();
+    assert_eq!(edges.len(), 1, "the edge is retained through the fallback");
+    assert_eq!(
+        edges[0].feed.mode(),
+        crate::semantics_key_use::FeedMode::S1Only
+    );
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        assert!(
+            adapter.stream_broken_for_test() || adapter.invalidated_for_test(),
+            "the malformed quantum breaks the stream"
+        );
+    }
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let mut refused = false;
+    for n in 0..8 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                panic!("nothing publishes past the linked Gap (service {n})")
+            }
+            Ok(JointServiceProgress::Pending) => {}
+            Err(SemanticRefusal::Unavailable) => {
+                refused = true;
+                break;
+            }
+            Err(reason) => panic!("the Gap refuses Unavailable, not {reason:?}"),
+        }
+    }
+    assert!(refused, "the follow-up collect refuses the Gap finitely");
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Idle",
+        "the Gap refuses before any frame is retained"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        revision + 1,
+        "the refused follow-up publishes nothing"
+    );
+    // The Gap is not consumed by one refusal: the lane stays
+    // fail-closed, refusing again instead of re-syncing.
+    assert_eq!(fixture.service(1), Err(SemanticRefusal::Unavailable));
+    assert_eq!(fixture.service(1), Err(SemanticRefusal::Unavailable));
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        assert!(
+            adapter.stream_broken_for_test() || adapter.invalidated_for_test(),
+            "a linked lane never clears the break"
+        );
+    }
+}
+
+/// A mid-call call straddling an unlinked break still completes:
+/// the BEGIN-only quantum publishes, the malformed quantum breaks
+/// the stream (voiding the retained START), the next collect
+/// re-syncs, and the real END publishes on the fresh stream,
+/// tripping no bound.
+#[test]
+fn joint_machine_unlinked_midcall_break_end_publishes() {
+    let mut fixture = MachineScene::unlinked(1);
+    assert!(
+        !fixture.scene.producers.journal_linked(),
+        "only an unlinked lane re-syncs after a break"
+    );
+    fixture.prime_unlinked();
+    let (begin_a, end_a) = fixture
+        .scene
+        .encoded(std::process::id(), 0, "C_SignInit", 3);
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(begin_a.to_vec());
+    fixture.published_labeled("midcall-q1", None);
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    fixture.published_labeled("midcall-break", None);
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        assert!(
+            adapter.stream_broken_for_test() || adapter.invalidated_for_test(),
+            "the malformed quantum breaks the stream before the re-sync"
+        );
+    }
+    fixture.scene.drain.source_mut().push_record(end_a.to_vec());
+    fixture.published_labeled("midcall-q2", None);
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        assert!(
+            !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()),
+            "the END collect re-syncs the broken unlinked stream"
+        );
+    }
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.finish_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    assert!(audit_no_progress_gaps(&fixture).is_empty());
+    assert!(no_progress_gaps(&fixture).is_empty());
 }
 
 #[test]

@@ -7986,7 +7986,9 @@ fn same_cpu_preemption_lane(selection: crate::attach::BackendSelection, label: &
 /// first static link, and terminal poison refuses static attachment there
 /// (12a6c3568: explicit stop, terminal or detach state never permits
 /// attachment), so a PID-scoped start with the seeded poison must refuse
-/// before it returns a session. The disclosure body runs under an owned
+/// before it returns a session. A healthy twin without the seed starts
+/// first, pinning the refusal to the poison latch rather than the shared
+/// message alone. The disclosure body runs under an owned
 /// cgroup scope: its probes are process-wide and gated in BPF only, so the
 /// session starts and the halt reaches the read path.
 #[test]
@@ -8017,6 +8019,29 @@ fn privileged_detailed_owner_poison_is_disclosed() -> Result<()> {
         crate::attach::TEST_OWNER_POISON.with(|seed| seed.set(0));
         started
     };
+    // Healthy twin: without the seeded poison the same PID-scoped start
+    // attaches, proving the refusal below tracks the poison latch and not
+    // the scope or the fixture (the refusal message is shared by the stop,
+    // poison and detach causes of a terminal baseline).
+    crate::attach::TEST_OWNER_POISON.with(|seed| seed.set(0));
+    {
+        let mut healthy = crate::attach::Session::start(
+            &plan,
+            &Scope::Pid(caller.child.id()),
+            &fixture.pins,
+            crate::attach::CapturePolicy::AggregateOnly,
+            None,
+            None,
+            None,
+            crate::attach::BackendSelection::Singles,
+        )?;
+        let detached = healthy.detach_producers();
+        let clean = healthy.detach_failures().is_empty();
+        drop(healthy);
+        detached?;
+        ensure!(clean, "healthy PID-scoped twin detach retained failures");
+    }
+    eprintln!("OWNER_POISON_PID_TWIN started without poison");
     let refused = match poisoned_start(&Scope::Pid(caller.child.id())) {
         Ok(_) => bail!("a PID-scoped start attached static probes under terminal owner poison"),
         Err(error) => format!("{error:#}"),

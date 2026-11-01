@@ -786,8 +786,9 @@ def check_trace_output(text, *, expected):
 # final public field names; when they land, ONLY the map below changes:
 # every L4 read goes through _l4_receipt. ---
 # Activation target (frozen before production wiring): G16 judges
-# `loader_transitions{arms, reclaims, retained_peak, refusals}` (300
-# arms, retained peak <= 8, zero refusals); G17 judges
+# `loader_transitions{arms, reclaims, retained_peak, refusals,
+# update_losses}` (300 arms, retained peak <= 8, zero refusals, zero
+# update losses); G17 judges
 # `image_transitions{tickets_issued, bank_cuts, bank_refusals}`
 # (issuance crosses 16,384, exactly one bank cut, zero refusals) plus
 # one `invocation_receipt{id}`. No D2/T-L4b rename has landed; if those
@@ -801,6 +802,7 @@ L4_RECEIPT_FIELD_MAP = {
     "loader_reclaims": ("loader_transitions", "reclaims"),
     "loader_retained_peak": ("loader_transitions", "retained_peak"),
     "loader_refusals": ("loader_transitions", "refusals"),
+    "loader_update_losses": ("loader_transitions", "update_losses"),
     "image_tickets_issued": ("image_transitions", "tickets_issued"),
     "image_bank_cuts": ("image_transitions", "bank_cuts"),
     "image_bank_refusals": ("image_transitions", "bank_refusals"),
@@ -843,6 +845,7 @@ def check_g16_l4_receipts(evidence, expected):
     reclaims = _l4_counter(evidence, "loader_reclaims")
     peak = _l4_counter(evidence, "loader_retained_peak")
     refusals = _l4_counter(evidence, "loader_refusals")
+    losses = _l4_counter(evidence, "loader_update_losses")
     # Known contradictions are failures even when another receipt is
     # unavailable. Evaluate relations only with their operands present.
     if arms is not _MISSING and arms != expected:
@@ -851,6 +854,8 @@ def check_g16_l4_receipts(evidence, expected):
         _fail("L4 retained peak exceeds 8")
     if refusals is not _MISSING and refusals != 0:
         _fail("L4 loader refusals are unexplained loss")
+    if losses is not _MISSING and losses != 0:
+        _fail("L4 loader update losses break the exact-peak proof")
     if arms is not _MISSING and reclaims is not _MISSING:
         if reclaims > arms or (peak is not _MISSING and reclaims < arms - peak):
             _fail("L4 loader reclaims disagree with arms and retained peak")

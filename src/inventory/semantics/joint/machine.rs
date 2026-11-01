@@ -1566,7 +1566,9 @@ impl LiveJointMachine {
             // When the Capture validates that no call of the original waits
             // at Q any more (a pass refresh between hooks resolved it into
             // the lane stash), nothing is reserved or expired and the
-            // ordinary at-Q tick below collects the original instead.
+            // ordinary at-Q tick below collects the original instead. An
+            // at-Q merge that completes nothing likewise refuses nothing:
+            // the incomplete PendingQ merge branch yields back to AwaitH0.
             if matches!(self.phase.as_ref(), Some(Phase::AwaitH0(original)) if original.raw.h0_waiting())
                 && self
                     .resolve_checked_pending_h0_at_q(lane, coordinator, io, q, &discovery, budget)?

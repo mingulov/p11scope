@@ -2561,9 +2561,9 @@ impl SemanticCapture {
     /// Expire every remaining collected waiter for the no-progress guard's
     /// true stall (no job, no hold, no deadline, no scan): the same disclosed
     /// `unobserved` shed as the deadline expiry, keeping already-joined
-    /// outcomes. Only the owning capture's waiters for this quantum expire;
-    /// the quantum's disposition advances to not-pending. No ring poll, scan,
-    /// fault or Stop occurs.
+    /// outcomes. Every waiter the owning capture still holds expires,
+    /// whatever quantum minted it; the quantum's disposition advances to
+    /// not-pending. No ring poll, scan, fault or Stop occurs.
     pub(crate) fn expire_collected_remaining_for_guard(
         &mut self,
         quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,

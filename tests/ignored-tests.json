@@ -48,7 +48,7 @@
       "file": "src/attach.rs",
       "path": "attach::tests::sealed_session_drain_linkage_is_behavioral",
       "reason": "privileged: real Session seal-to-drain linkage (installed linked control); standalone hand-run cell, fail-loud-unprivileged by design",
-      "cell": "performance"
+      "cell": "privileged"
     },
     {
       "file": "src/attach/counter_banks.rs",
@@ -114,13 +114,13 @@
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_instance_b17_counters_observe_sharer_churn",
       "reason": "privileged: loads BPF, attaches fentry hooks and uprobes; live marker twin, fail-loud-unprivileged by design, run by hand",
-      "cell": "performance"
+      "cell": "privileged"
     },
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_instance_b17_drain_yields_identity_once_live",
       "reason": "privileged: loads BPF, attaches fentry hooks and uprobes; live drain twin, fail-loud-unprivileged by design, run by hand",
-      "cell": "performance"
+      "cell": "privileged"
     },
     {
       "file": "src/attach/instance_tests.rs",
@@ -694,13 +694,13 @@
       "file": "src/discovery/d4_overlay_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_fresh_upper_joins",
       "reason": "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only); fresh-positive twin, fail-loud-unprivileged by design, run by hand",
-      "cell": "performance"
+      "cell": "privileged"
     },
     {
       "file": "src/discovery/d4_overlay_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_stale_lower_refuses",
       "reason": "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only); stale-negative twin, fail-loud-unprivileged by design, run by hand",
-      "cell": "performance"
+      "cell": "privileged"
     },
     {
       "file": "src/discovery/d4_population_cells.rs",

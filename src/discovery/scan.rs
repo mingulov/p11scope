@@ -2387,11 +2387,24 @@ pub(crate) fn exact_table_addresses_n(
 /// Whether a slot-validation failure at `ordinal` still leaves a complete
 /// validated 68-slot legacy prefix: the mislabelled-table shape (a 3.x
 /// version word over a 2.x table), accepted as its prefix instead of
-/// rejected. `prefix_non_null` counts validated non-NULL slots below 68;
-/// at least two are required so a single-entry BSS lookalike cannot admit
-/// a second table and churn the attach set pass to pass.
-fn mislabelled_tail_ordinal(version: (u8, u8), ordinal: usize, prefix_non_null: usize) -> bool {
-    version.0 == 3 && ordinal >= LEGACY_PREFIX_SLOTS && prefix_non_null > 1
+/// rejected. `prefix_non_null` counts validated non-NULL slots below 68.
+/// On the sweep (`strict_tail`) at least two are required so a
+/// single-entry BSS lookalike cannot admit a second table and churn the
+/// attach set pass to pass. Exact-address callers pass `false`: the
+/// provider's own address rules out a BSS lookalike, so one validated
+/// entry keeps the previous accept.
+fn mislabelled_tail_ordinal(
+    version: (u8, u8),
+    ordinal: usize,
+    prefix_non_null: usize,
+    strict_tail: bool,
+) -> bool {
+    let admitted = if strict_tail {
+        prefix_non_null > 1
+    } else {
+        prefix_non_null > 0
+    };
+    version.0 == 3 && ordinal >= LEGACY_PREFIX_SLOTS && admitted
 }
 
 /// Decodes one candidate at `offset` inside `snapshot` (whose first byte is at
@@ -2402,9 +2415,19 @@ fn mislabelled_tail_ordinal(version: (u8, u8), ordinal: usize, prefix_non_null: 
 /// complete validated 68-slot prefix decodes as that prefix, labelled with
 /// its declared version and a `known_prefix` walk. An incomplete or invalid
 /// legacy prefix is still rejected.
-/// `runtime_view` scopes the cardinality identity for tables without a stable
-/// file owner (heap/anonymous exact reads): `None` keeps the memory sweep's
-/// file-identity-only charging bit for bit.
+/// `ctx` carries the caller's runtime view and mislabelled-tail bar.
+#[derive(Debug, Clone, Copy)]
+struct DecodeContext {
+    /// Scopes the cardinality identity for tables without a stable file
+    /// owner (heap/anonymous exact reads): `None` keeps the memory
+    /// sweep's file-identity-only charging bit for bit.
+    runtime_view: Option<ProcessViewId>,
+    /// Applies the sweep's mislabelled-tail bar (at least two validated
+    /// prefix entries); exact-address callers pass `false` for the
+    /// provider-provenanced accept.
+    strict_tail: bool,
+}
+
 fn decode_candidate(
     layout: LinuxLayout,
     snapshot: &[u8],
@@ -2412,7 +2435,7 @@ fn decode_candidate(
     base_address: u64,
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
-    runtime_view: Option<ProcessViewId>,
+    ctx: DecodeContext,
 ) -> Result<Option<(ScannedTable, usize)>, ()> {
     let width = layout.word_bytes();
     let Some(raw_word) = offset
@@ -2503,7 +2526,7 @@ fn decode_candidate(
         else {
             // Anonymous or unmapped ⇒ not a function table, unless the
             // failure is a mislabelled tail past a complete legacy prefix.
-            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null) {
+            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
             short_prefix = true;
@@ -2512,7 +2535,7 @@ fn decode_candidate(
         if permissions[2] != b'x' {
             // A pointer into data ⇒ not a function table, unless the
             // failure is a mislabelled tail past a complete legacy prefix.
-            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null) {
+            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
             short_prefix = true;
@@ -2522,7 +2545,7 @@ fn decode_candidate(
             // Deleted/ambiguous pathname ⇒ cannot become an attach target,
             // unless the failure is a mislabelled tail past a complete
             // legacy prefix.
-            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null) {
+            if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
             short_prefix = true;
@@ -2573,7 +2596,7 @@ fn decode_candidate(
                 usable: decoded_entries,
             });
     let runtime_identity = if identity.is_none() {
-        runtime_view.map(|view| RuntimeTableIdentity {
+        ctx.runtime_view.map(|view| RuntimeTableIdentity {
             view,
             address,
             version_word: word,
@@ -2665,7 +2688,10 @@ fn decode_candidate(
 /// `/proc/<pid>/mem` read; this helper only accepts a complete table snapshot.
 /// `runtime_view` scopes the cardinality identity for tables without a stable
 /// file owner; pass the reading view for exact-address validation, `None`
-/// only where no view exists (unit fixtures).
+/// only where no view exists (unit fixtures). The mislabelled-tail bar
+/// stays at the previous single-entry accept: the caller's address (the
+/// provider's own getter result or an exact pool address) rules out the
+/// BSS lookalike the sweep bar exists for.
 pub(crate) fn decode_exact_table(
     snapshot: &[u8],
     address: u64,
@@ -2674,8 +2700,19 @@ pub(crate) fn decode_exact_table(
     budget: &mut CaptureWorkBudget,
     runtime_view: Option<ProcessViewId>,
 ) -> Result<Option<ScannedTable>, ()> {
-    decode_candidate(layout, snapshot, 0, address, maps, budget, runtime_view)
-        .map(|decoded| decoded.map(|(table, _)| table))
+    decode_candidate(
+        layout,
+        snapshot,
+        0,
+        address,
+        maps,
+        budget,
+        DecodeContext {
+            runtime_view,
+            strict_tail: false,
+        },
+    )
+    .map(|decoded| decoded.map(|(table, _)| table))
 }
 
 /// Decode words acquired through a typed getter or independently corroborated
@@ -2971,7 +3008,22 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
         let decoded = if metadata_header {
             Ok(None)
         } else {
-            decode_candidate(layout, snapshot, offset, base_address, maps, budget, None)
+            // Sweep decodes keep the strict mislabelled-tail bar: an
+            // unprovenanced version-like word needs two validated prefix
+            // entries before its tail can be accepted as a mislabelled
+            // prefix.
+            decode_candidate(
+                layout,
+                snapshot,
+                offset,
+                base_address,
+                maps,
+                budget,
+                DecodeContext {
+                    runtime_view: None,
+                    strict_tail: true,
+                },
+            )
         };
         match decoded {
             Ok(Some((table, len))) => {
@@ -6672,7 +6724,10 @@ mod tests {
                     0x7000,
                     &map_index,
                     &mut CaptureWorkBudget::default(),
-                    None,
+                    DecodeContext {
+                        runtime_view: None,
+                        strict_tail: true,
+                    },
                 )
                 .expect("the prefix fits the budget")
                 .expect("a complete legacy prefix does not need extended bytes");
@@ -6932,11 +6987,99 @@ mod tests {
             0x7000,
             &map_index,
             &mut CaptureWorkBudget::default(),
-            None,
+            DecodeContext {
+                runtime_view: None,
+                strict_tail: true,
+            },
         )
         .expect("budget must admit the table")
         .expect("offset 0 must decode");
         assert_eq!(len, 8 + 68 * 8);
+    }
+
+    /// A full-extent 3.2-labelled image: valid executable entries at
+    /// `entries`, NULL holes elsewhere in the legacy prefix, file-backed
+    /// data words across the whole extension. The sweep must refuse the
+    /// single-entry shape (a BSS lookalike); the getter path decodes it
+    /// (the provider's own address rules out a lookalike).
+    fn sparse_3x_snapshot(entries: &[usize]) -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for &ordinal in entries {
+            let at = 8 + ordinal * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for ordinal in 68..104 {
+            let at = 8 + ordinal * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        snapshot
+    }
+
+    #[test]
+    fn sweep_refuses_single_entry_and_zero_entry_3x_lookalikes() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        for entries in [&[0][..], &[][..]] {
+            let snapshot = sparse_3x_snapshot(entries);
+            let (tables, skipped) = detect_tables(
+                &snapshot,
+                0x7000,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+            );
+            assert!(skipped.is_empty(), "{entries:?}: {skipped:?}");
+            assert!(
+                tables.is_empty(),
+                "{entries:?}: the sweep must refuse a lookalike with fewer than two prefix entries"
+            );
+        }
+        // Positive control: the same tail behind a complete 68-entry
+        // prefix still decodes on the sweep, so the refusal above pins
+        // the entry count, not the tail shape.
+        let full = mislabelled_snapshot(0x0203, 68, 36);
+        let (tables, skipped) =
+            detect_tables(&full, 0x7000, &map_index, &mut CaptureWorkBudget::default());
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(tables.len(), 1, "the full prefix still decodes");
+        assert_eq!(tables[0].entries.len(), 68);
+    }
+
+    #[test]
+    fn exact_decode_accepts_a_getter_returned_single_entry_3x_table() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        let snapshot = sparse_3x_snapshot(&[0]);
+        let table = decode_exact_table(
+            &snapshot,
+            0x7000,
+            LinuxLayout::Lp64,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+            None,
+        )
+        .expect("budget must admit the attempt")
+        .expect("one validated entry at a provider-returned address decodes");
+        assert_eq!(table.version, (3, 2));
+        assert_eq!(table.walk, "known_prefix");
+        assert_eq!(table.entries.len(), 1);
+        assert_eq!(table.decoded_slot_count(), 68);
+        // Zero entries stay refused on the getter path too: no validated
+        // slot, no table.
+        let empty = sparse_3x_snapshot(&[]);
+        assert!(
+            decode_exact_table(
+                &empty,
+                0x7000,
+                LinuxLayout::Lp64,
+                &map_index,
+                &mut CaptureWorkBudget::default(),
+                None,
+            )
+            .expect("budget must admit the attempt")
+            .is_none(),
+            "an all-NULL prefix is not a table on any path"
+        );
     }
 
     /// A decoded mislabelled table: version {3,2}, walk `known_prefix`,

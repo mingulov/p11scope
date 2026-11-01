@@ -117,6 +117,12 @@ attach::instance_tests::privileged_instance_attach_during_reload_loop_has_zero_f
 attach::instance_tests::privileged_instance_exec_renews_the_instance
 attach::instance_tests::privileged_instance_fork_without_exec_stays_consistent
 attach::instance_tests::privileged_instance_hooks_attach_for_profile_but_not_metrics
+# B17 live twins: global-only sharer churn taints the router end to end
+# (marker counters) and discloses the tainted identity exactly once
+# through the capture report (drain). Same owned gcc fixtures and Singles
+# Session as the neighboring instance cells.
+attach::instance_tests::privileged_instance_b17_counters_observe_sharer_churn
+attach::instance_tests::privileged_instance_b17_drain_yields_identity_once_live
 attach::instance_tests::privileged_instance_mapping_controls_never_join_old_state
 attach::instance_tests::privileged_instance_mremap_dontunmap_keeps_both_and_renews
 attach::instance_tests::privileged_instance_nonleader_exec_detaches_without_misrouting
@@ -217,6 +223,11 @@ attach::object_stop::tests::object_stop_reports_real_scrub_failure
 attach::tests::collected_partial_group_real_session_guards_refuse_until_terminal_lp64
 attach::tests::collected_retirement_singles_session_defers_close_to_terminal_detach_lp64
 attach::tests::collected_retirement_stopped_session_q_closes_original_lp64
+# Installed linked control: a real Session sealed over the loaded journal
+# pair drains linked through the live wiring (behavioral seal-to-drain
+# linkage, 6.06). Same owned fixture Session shape as the retirement
+# cells above.
+attach::tests::sealed_session_drain_linkage_is_behavioral
 discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_serial_production_probe
 # T8 twin fullness control: the identical phase-1 arming with an empty
 # request map admits the same head with zero loss, proving the twin's
@@ -442,6 +453,11 @@ discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper
 # D4 copy-up RED reproducer: fails by design (the post-copy-up D-C7-3
 # re-edge stands), investigation target, never qualifies.
 discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
+# K1 deep-scan overlay twins (lanes B only): the stale-lower row must
+# refuse and the fresh-upper row must join, per xino mode. Each fails
+# loud off lane B, so both stay hand-run skips with reasons.
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_fresh_upper_joins
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_stale_lower_refuses
 # TID-scoped nonleader anchor run (installs nothing live; strict BPF
 # load): needs root with a live nonleader thread, run by hand.
 attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing
@@ -487,6 +503,11 @@ metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64
 # Unprivileged system-population graph sizing: memory, drain and release
 # are hard gates, the stop time is measured and disclosed (R-40).
 discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale
+# R57 future positive (expected RED, unprivileged): a balanced benign
+# exit-time transaction needs no terminal truncation once a provider-free
+# settlement receipt lands. No BPF or root; stays a hand-run skip until
+# then, so the exact-cover check matches the binary.
+discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation
 )
 SKIP_REASONS=(
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
@@ -555,6 +576,8 @@ SKIP_REASONS=(
 "needs root x86-64 LP64 Btrfs disk TMPDIR and eligible BTF/task_vma; required single-survivor zombie-leader positive baseline currently exposes an unqualified production path; run exact ignored test in a separately admitted native lane"
 "private re-exec entrypoint for the owned single-survivor zombie fixture; missing owning socket/source fails and this helper never qualifies independently"
 "RED by design (post-copy-up D-C7-3 re-edge stands; investigation target, never qualifies): run by hand as root to reproduce: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
+"needs root loop overlay mounts plus eligible BTF/task_vma identity on an overlay lane-B host (fails loud on other lanes); K1 deep-scan fresh-positive twin; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
+"needs root loop overlay mounts plus eligible BTF/task_vma identity on an overlay lane-B host (fails loud on other lanes); K1 deep-scan stale-negative twin; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "needs root with a live nonleader thread for the TID-scoped anchor run (strict BPF load, installs nothing live); run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; zombie survivor collision parity; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; cold zombie admission parity; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
@@ -582,6 +605,7 @@ SKIP_REASONS=(
 "needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
 "needs root with no fixture (the owned child maps no provider); run the exact ignored test by hand as root with TMPDIR and CARGO_TARGET_TMPDIR as in the evidence run"
 "unprivileged system-population graph sizing (4096 pin files plus 16384 native links; memory, drain and release asserts gate, the stop time is measured, not gated); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture on a host whose hard RLIMIT_NOFILE fits the population"
+"RED by design (R57 future positive: expected RED until a provider-free transaction receipt lands; un-ignore when a settlement receipt lands); unprivileged gcc fixture, no BPF or root needed; run by hand to confirm the boundary: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
 )
 
 # Wide-Detailed campaign: the ignored tests that exist only in a

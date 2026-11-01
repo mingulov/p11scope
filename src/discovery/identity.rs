@@ -7801,6 +7801,7 @@ pub(crate) mod test_fixture {
                 file_offset: Some(0),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             }],
             interfaces: vec![],
         }

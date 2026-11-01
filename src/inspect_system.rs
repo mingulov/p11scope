@@ -5649,6 +5649,7 @@ mod tests {
             file_offset: Some(0x1000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         }
     }
 

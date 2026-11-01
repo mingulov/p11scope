@@ -875,7 +875,8 @@ pub struct Evidence {
     /// Per-surface discovery provenance (walk outcome, acquisition status).
     /// A surface that was not fully walked or failed to acquire means
     /// functions the manifest declares may never have been probed, even
-    /// when `skipped`/`aliased` are empty.
+    /// when `skipped`/`aliased` are empty. A 68-slot prefix proven to be
+    /// the complete reachable surface is exempt.
     pub surfaces: Vec<crate::plan::SurfaceSummary>,
     /// Present-but-undecoded vendor interfaces (never walked).
     pub vendor_interfaces: usize,
@@ -1532,11 +1533,13 @@ fn physical_gap_category_requires_exact_internal_subject_and_description() {
 impl Evidence {
     /// COMPLETE only when nothing was lost: every planned probe attached,
     /// nothing was skipped, no aliasing ambiguity, no call left in flight,
-    /// every surface was fully walked with a successful acquisition, no
-    /// vendor interfaces were left undecoded, (profile mode) the ring
-    /// buffer neither dropped nor emitted a malformed record, no template
-    /// was truncated, no mechanism's parameter decode failed on every
-    /// single observed call, and no pinned provider object changed.
+    /// every surface was fully walked with a successful acquisition (a
+    /// 68-slot prefix proven to be the complete reachable surface counts
+    /// as fully walked), no vendor interfaces were left undecoded,
+    /// (profile mode) the ring buffer neither dropped nor emitted a
+    /// malformed record, no template was truncated, no mechanism's
+    /// parameter decode failed on every single observed call, and no
+    /// pinned provider object changed.
     ///
     /// Discovery gates it too, and three of those conditions are the ones a
     /// gap-counting verdict gets wrong on its own: a capture that discovered no
@@ -1615,7 +1618,7 @@ impl Evidence {
             "surfaces",
             self.surfaces
                 .iter()
-                .any(|s| s.walk != "full" || s.acquisition != "ok"),
+                .any(|s| !s.proven_complete_prefix && (s.walk != "full" || s.acquisition != "ok")),
         );
         cause(o, "vendor_interfaces", self.vendor_interfaces > 0);
         cause(
@@ -2215,7 +2218,9 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
             "surfaces" => count(
                 ev.surfaces
                     .iter()
-                    .filter(|s| s.walk != "full" || s.acquisition != "ok")
+                    .filter(|s| {
+                        !s.proven_complete_prefix && (s.walk != "full" || s.acquisition != "ok")
+                    })
                     .count() as u64,
                 "surface gaps",
             ),
@@ -3400,6 +3405,7 @@ pub(crate) mod tests {
             walk: "full".into(),
             acquisition: "ok".into(),
             functions: 68,
+            proven_complete_prefix: false,
         }
     }
 
@@ -4885,6 +4891,7 @@ pub(crate) mod tests {
                         file_offset: Some(0x100),
                         live_return: false,
                         manifest_supported: false,
+                        extension_impossible: false,
                     },
                     ScannedTable {
                         version: (2, 40),
@@ -4896,6 +4903,7 @@ pub(crate) mod tests {
                         file_offset: Some(0x200),
                         live_return: false,
                         manifest_supported: false,
+                        extension_impossible: false,
                     },
                 ],
                 interfaces: vec![ScannedInterface {
@@ -4995,6 +5003,7 @@ pub(crate) mod tests {
                     file_offset: Some(0),
                     live_return: false,
                     manifest_supported: false,
+                    extension_impossible: false,
                 }],
                 interfaces: vec![],
             },
@@ -5465,6 +5474,7 @@ pub(crate) mod tests {
             walk: "full".into(),
             acquisition: "ok".into(),
             functions: 92,
+            proven_complete_prefix: false,
         });
         ev.verdict();
         let v = profile_json(
@@ -6196,6 +6206,7 @@ pub(crate) mod tests {
             walk: walk.into(),
             acquisition: "ok".into(),
             functions: spans.iter().map(|span| span.fields().len()).sum(),
+            proven_complete_prefix: false,
         }];
         assert_eq!(ev.surfaces[0].functions, 104);
         assert!(
@@ -6271,7 +6282,10 @@ pub(crate) mod tests {
         let scanned = ScannedModule {
             mapped_identity: None,
             view: ProcessViewId(0),
-            mount_namespace: MountNamespaceId { device: 1, inode: 1 },
+            mount_namespace: MountNamespaceId {
+                device: 1,
+                inode: 1,
+            },
             key,
             double_loaded: false,
             path: "/lib/provider.so".into(),
@@ -6336,8 +6350,7 @@ pub(crate) mod tests {
 
     #[test]
     fn fedora_shape_with_an_interface_getter_export_stays_lossy() {
-        let mut names: Vec<(String, u64)> =
-            fedora_exports_without_interface_getters().to_vec();
+        let mut names: Vec<(String, u64)> = fedora_exports_without_interface_getters().to_vec();
         names.push(("C_GetInterface".into(), 0x600));
         let classes = observation_for_decoded_table(
             &fedora_shaped_snapshot(),
@@ -6371,8 +6384,7 @@ pub(crate) mod tests {
 
     #[test]
     fn fedora_shape_with_incomplete_export_evidence_stays_lossy() {
-        let mut names: Vec<(String, u64)> =
-            fedora_exports_without_interface_getters().to_vec();
+        let mut names: Vec<(String, u64)> = fedora_exports_without_interface_getters().to_vec();
         names.pop();
         assert_eq!(names.len(), 67);
         let classes = observation_for_decoded_table(
@@ -6431,7 +6443,10 @@ pub(crate) mod tests {
         let scanned = ScannedModule {
             mapped_identity: None,
             view: ProcessViewId(0),
-            mount_namespace: MountNamespaceId { device: 1, inode: 1 },
+            mount_namespace: MountNamespaceId {
+                device: 1,
+                inode: 1,
+            },
             key,
             double_loaded: false,
             path: "/lib/provider.so".into(),

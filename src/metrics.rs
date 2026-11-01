@@ -848,6 +848,7 @@ mod tests {
                     file_offset: Some(0x100),
                     live_return: false,
                     manifest_supported: false,
+                    extension_impossible: false,
                 }],
                 interfaces: vec![],
             },

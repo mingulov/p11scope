@@ -148,6 +148,7 @@ impl ProviderFixture {
                     file_offset: Some(0x40),
                     live_return: true,
                     manifest_supported: false,
+                    extension_impossible: false,
                 }],
             },
             object,
@@ -310,6 +311,7 @@ impl ProviderFixture {
                 file_offset: Some(0x80 + index as u64 * 0x400),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             });
         }
         // A published affecting endpoint without an operator claim is required
@@ -331,6 +333,7 @@ impl ProviderFixture {
             file_offset: Some(0x2400),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         });
         (
             engine_for_test(Vec::new(), vec![source], self.pins.clone()),

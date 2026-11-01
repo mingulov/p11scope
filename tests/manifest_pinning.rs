@@ -1198,6 +1198,7 @@ fn retiring_one_shared_namespace_view_keeps_only_the_stable_views_claims() {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         }],
         interfaces: vec![],
     };
@@ -1289,6 +1290,7 @@ fn retiring_a_rejected_provider_view_removes_its_unplanned_pins_and_raw_aliases(
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         }],
         interfaces: vec![],
     };

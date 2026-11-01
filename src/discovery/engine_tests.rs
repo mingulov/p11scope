@@ -9689,6 +9689,7 @@ fn provider_module(
         file_offset: Some(0),
         live_return: false,
         manifest_supported: false,
+        extension_impossible: false,
     }];
     module
 }
@@ -10132,6 +10133,7 @@ fn selection_only_table(
         file_offset: Some(table_file_offset),
         live_return: false,
         manifest_supported: false,
+        extension_impossible: false,
     }
 }
 
@@ -10458,6 +10460,7 @@ fn manifest_selection_tables_enter_the_attach_transaction() {
         file_offset: Some(base),
         live_return: false,
         manifest_supported: false,
+        extension_impossible: false,
     });
 
     let mut manifest = valid_manifest_for(&[PathBuf::from(&path)], &[0; 67]);
@@ -15016,6 +15019,7 @@ fn optional_export_absence_is_complete_independently_of_table_version() {
                 file_offset: None,
                 live_return: true,
                 manifest_supported: false,
+                extension_impossible: false,
             }];
             module.entry_objects = vec![Vec::new()];
         }
@@ -15279,6 +15283,7 @@ fn c_get_interface_selection_exact_match_keeps_inventory_aliases() {
         file_offset: Some(table_file_offset),
         live_return: false,
         manifest_supported: false,
+        extension_impossible: false,
     });
     engine.modules[0].entry_objects.push(Vec::new());
     engine.modules[0].scanned.interfaces.extend([
@@ -15598,6 +15603,7 @@ fn selection_occurrences_keep_canonical_null_and_alias_ordinals() {
         file_offset: Some(0x20),
         live_return: false,
         manifest_supported: false,
+        extension_impossible: false,
     };
 
     engine.record_selection_occurrences(plan::ModuleId(7), provider, &table);
@@ -21853,6 +21859,7 @@ fn loader_collision_candidate_keeps_provider_retirement_without_loader_id() {
         file_offset: Some(0),
         live_return: false,
         manifest_supported: false,
+        extension_impossible: false,
     });
     let mut provider_pins = pin_test_module(&view, &provider);
     let provider_modules = reconcile_for_test(std::slice::from_ref(&provider), &mut provider_pins);
@@ -22632,6 +22639,7 @@ fn merge_scanned_modules_retains_names_and_exact_decoder_provenance() {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         }],
         interfaces: vec![ScannedInterface {
             index: 0,
@@ -25567,6 +25575,7 @@ fn same_object_scan_and_manifest(
         file_offset: Some(0),
         live_return: false,
         manifest_supported: false,
+        extension_impossible: false,
     });
     let manifest = manifest_naming(&path, Some(sha256));
     let input = ManifestInput {
@@ -25721,6 +25730,7 @@ fn scanned_manifest_replacement(paths: &[PathBuf], targets: &[u32]) -> ScannedMo
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         }],
         interfaces: vec![],
     }
@@ -26668,6 +26678,7 @@ fn stale_only_identity_mismatch_becomes_manifest_fallback_for_stable_scope() {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         }],
         interfaces: vec![],
     };
@@ -26899,6 +26910,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
                 file_offset: Some(offset),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             }],
             interfaces: vec![],
         },
@@ -26988,6 +27000,7 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
                 file_offset: Some(0),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             }],
             interfaces: vec![],
         },
@@ -27056,6 +27069,7 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
                 file_offset: Some(0),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             }],
             interfaces: vec![],
         },
@@ -27324,6 +27338,7 @@ fn a_table_entry_whose_object_was_not_pinned_never_becomes_a_slot() {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         });
     modules[0].tables.last_mut().unwrap().entries[0].object_path = modules[0].path.clone();
 
@@ -27385,6 +27400,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         });
     let reconciled = reconcile_for_test(&modules, &mut pinned);
     let plan = plan::build_from_reconciled_modules(&reconciled);
@@ -28219,6 +28235,7 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         }],
         interfaces: vec![],
     };
@@ -29777,6 +29794,7 @@ fn linked_candidate_table_sorts_before_unlinked_lookalike() {
             file_offset: Some(0x1000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         },
         ScannedTable {
             version: (2, 40),
@@ -29788,6 +29806,7 @@ fn linked_candidate_table_sorts_before_unlinked_lookalike() {
             file_offset: Some(0x1800),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         },
     ];
     let interfaces = [ScannedInterface {
@@ -29859,6 +29878,7 @@ fn p11kit_like_64_table_module() -> ScannedModule {
             file_offset: Some(0x1caf20 + table * 840),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         })
         .collect();
     raw.interfaces = vec![ScannedInterface {
@@ -30061,6 +30081,7 @@ fn live_return_tables_keep_names_and_bypass_the_heuristic_cap() {
             file_offset: Some(0x90000 + table as u64 * 0x1000),
             live_return: table == 5,
             manifest_supported: false,
+            extension_impossible: false,
         })
         .collect();
     raw.interfaces = vec![];
@@ -30138,6 +30159,7 @@ fn published_tables_bypass_heuristic_cap_with_sufficient_budget() {
             file_offset: Some(0x20000 + table * 0x1000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         })
         .collect();
     raw.interfaces = (0..TABLES as usize)
@@ -30231,6 +30253,7 @@ fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_modu
                 file_offset: Some(0x50000 + minor * 0x10000 + table as u64 * 0x1000),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             })
             .collect();
         raw.interfaces = vec![];
@@ -30356,6 +30379,7 @@ fn two_views_share_one_per_object_cap_preserving_pins_and_interfaces() {
             file_offset: Some(0x1caf20 + table * 840),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         })
         .collect();
     view1.interfaces = vec![ScannedInterface {
@@ -30390,6 +30414,7 @@ fn two_views_share_one_per_object_cap_preserving_pins_and_interfaces() {
             file_offset: Some(0x1caf20 + table * 840),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         })
         .collect();
     view2.interfaces = vec![];
@@ -46974,6 +46999,7 @@ fn midfinal_res3_provider_module(view: ProcessViewId, offsets: &[u64]) -> Reconc
                 file_offset: Some(0),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             }],
             interfaces: vec![],
         },
@@ -50627,6 +50653,7 @@ fn scanned_module_copy_is_exact() {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         });
     }
     let mut wide = source.tables[0].clone();

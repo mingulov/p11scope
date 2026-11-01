@@ -30,8 +30,8 @@ use crate::discovery::identity::{
 pub use crate::discovery::scan::Skipped;
 use crate::discovery::scan::{
     ObjectExports, ScannedEntry, ScannedInterface, ScannedTable, TableEvidenceScore,
-    export_agreement, order_tables_by_evidence, standard_ordinal, table_evidence_score,
-    table_linkage, table_name_authorized, table_observation_authorized,
+    export_agreement, order_tables_by_evidence, proven_complete_legacy_prefix, standard_ordinal,
+    table_evidence_score, table_linkage, table_name_authorized, table_observation_authorized,
 };
 use crate::inventory_semantics::SemanticRefusal;
 use crate::kinds::AliasAgreement;
@@ -653,13 +653,31 @@ pub struct ModuleSummary {
 /// manifest that never finished walking a surface can't be reported as a
 /// complete capture just because its (empty) function list produced no
 /// skips or aliases.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SurfaceSummary {
     /// Short human label for the surface (legacy table or interface name).
     pub source: String,
     pub walk: String,
     pub acquisition: String,
     pub functions: usize,
+    /// True when a 3.x-labelled 68-slot prefix is proven to be the
+    /// module's complete reachable surface (scan `extension_impossible`
+    /// plus no interface-getter exports plus full export agreement).
+    /// Internal only, never serialized: the JSON schema keeps exactly
+    /// `source`, `walk`, `acquisition`, `functions`. Ignored by
+    /// `PartialEq` (identity is the four serialized fields); merges
+    /// union it via `|=` so a proven reading upgrades a truncated one.
+    #[serde(skip)]
+    pub proven_complete_prefix: bool,
+}
+
+impl PartialEq for SurfaceSummary {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.walk == other.walk
+            && self.acquisition == other.acquisition
+            && self.functions == other.functions
+    }
 }
 
 /// A surface label for capture output. Never the interface's recorded name:
@@ -3044,7 +3062,7 @@ fn merge(
         let mut seen_skips = BTreeSet::new();
         let mut seen_tables = Vec::new();
         let mut seen_surfaces = Vec::new();
-        let mut group_surfaces = Vec::new();
+        let mut group_surfaces: Vec<SurfaceSummary> = Vec::new();
         let mut group_skips = Vec::new();
         // A refused growth's endpoints no other module attaches, and the kept
         // endpoints this module stays attached through.
@@ -3153,14 +3171,16 @@ fn merge(
                     .filter(|known| *known == &surface)
                     .count();
                 module_surfaces.push(surface.clone());
-                if !seen_surfaces
+                let known = seen_surfaces
                     .iter()
-                    .any(|(source, known, known_occurrence)| {
+                    .position(|(source, known, known_occurrence)| {
                         *source == module.source
                             && known == &surface
                             && *known_occurrence == occurrence
-                    })
-                {
+                    });
+                if let Some(index) = known {
+                    group_surfaces[index].proven_complete_prefix |= surface.proven_complete_prefix;
+                } else {
                     seen_surfaces.push((module.source, surface.clone(), occurrence));
                     group_surfaces.push(surface);
                 }
@@ -3752,6 +3772,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
             // The bytes were read straight out of the target's mapping.
             acquisition: "ok".into(),
             functions: published,
+            proven_complete_prefix: proven_complete_legacy_prefix(table, &exports),
         });
         surfaces.extend(
             scanned
@@ -3763,6 +3784,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                     walk: table.walk.to_string(),
                     acquisition: "ok".into(),
                     functions: published,
+                    proven_complete_prefix: false,
                 }),
         );
         targets.extend(
@@ -3901,6 +3923,10 @@ fn lower_manifest(
             walk: crate::manifest_input::effective_surface_walk(surface),
             acquisition: acquisition_label(&surface.acquisition),
             functions: surface.functions.len(),
+            // The manifest helper inventories only the 68 legacy words and
+            // never reads the 3.x extension, so it cannot prove the
+            // extension impossible; a manifest `known_prefix` stays a gap.
+            proven_complete_prefix: false,
         });
         tables.push(TableSummary {
             version: surface
@@ -5341,13 +5367,15 @@ impl ConservativePlanCursor {
             .filter(|known| *known == &surface)
             .count();
         self.piece_surfaces.push(surface.clone());
-        if !self
-            .seen_surfaces
-            .iter()
-            .any(|(known_source, known, known_occurrence)| {
-                *known_source == source && known == &surface && *known_occurrence == occurrence
-            })
-        {
+        let known =
+            self.seen_surfaces
+                .iter()
+                .position(|(known_source, known, known_occurrence)| {
+                    *known_source == source && known == &surface && *known_occurrence == occurrence
+                });
+        if let Some(index) = known {
+            self.output_surfaces[index].proven_complete_prefix |= surface.proven_complete_prefix;
+        } else {
             self.seen_surfaces
                 .push((source, surface.clone(), occurrence));
             self.output_surfaces.push(surface);
@@ -6259,6 +6287,7 @@ mod tests {
                     file_offset: Some(0),
                     live_return: false,
                     manifest_supported: false,
+                    extension_impossible: false,
                 }],
                 interfaces: vec![],
             },
@@ -6469,6 +6498,7 @@ mod tests {
                 file_offset: Some(index as u64 * 0x1000),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             })
             .collect();
         scanned.entry_objects = vec![vec![object]; count];
@@ -8732,6 +8762,7 @@ mod tests {
             file_offset: Some(0x9000),
             live_return: true,
             manifest_supported: false,
+            extension_impossible: false,
         });
         grown.entry_objects.push(vec![existing; 8]);
         let before = plan.clone();
@@ -8797,6 +8828,7 @@ mod tests {
                 file_offset: Some(0x9000),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             },
         );
         grown.entry_objects.insert(0, vec![existing; 2]);
@@ -8875,6 +8907,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut grown = scanned_with(key, "/proc/self/fd/10", []);
         grown.scanned.tables = vec![
@@ -8995,6 +9028,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut grown = scanned_with(key, "/proc/self/fd/10", []);
         grown.scanned.tables = vec![
@@ -9106,6 +9140,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut grown = scanned_with(key, "/proc/self/fd/10", []);
         grown.scanned.tables = vec![
@@ -9209,6 +9244,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut grown = scanned_with(key, "/proc/self/fd/10", []);
         grown.scanned.tables = vec![
@@ -9315,6 +9351,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut grown = scanned_with(key, "/proc/self/fd/10", []);
         grown.scanned.tables = vec![
@@ -9438,6 +9475,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut unchanged = scanned_with(key, "/proc/self/fd/10", []);
         unchanged.scanned.tables = vec![
@@ -9550,6 +9588,7 @@ mod tests {
             file_offset: Some(file_offset),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut refreshed = scanned_with(key, "/proc/self/fd/10", []);
         refreshed.scanned.tables = vec![
@@ -9751,6 +9790,7 @@ mod tests {
             file_offset: Some(0x9000),
             live_return: true,
             manifest_supported: false,
+            extension_impossible: false,
         });
         grown.entry_objects.push(vec![existing; 8]);
         // Equal published evidence keeps discovery order: the attached table
@@ -10869,6 +10909,7 @@ mod tests {
             file_offset: Some(0x1000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         });
         scanned.entry_objects.push(vec![scanned.object]);
 
@@ -11075,6 +11116,7 @@ mod tests {
                 file_offset: Some(table as u64 * 0x1000),
                 live_return,
                 manifest_supported: false,
+                extension_impossible: false,
             })
             .collect();
         module.entry_objects = vec![vec![object; entries]; tables];

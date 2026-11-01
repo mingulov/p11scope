@@ -37,9 +37,10 @@ use crate::discovery::scan::{
     ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped, decode_exact_table,
     decode_observed_words, decoded_table_addresses, exact_legacy_prefix_bytes,
     exact_table_addresses_n, exact_table_bytes, export_agreement, index_maps_or_refuse,
-    read_elf_snapshot, read_maps_or_refuse, read_maps_or_refuse_with_buffers, scan_process_view,
-    scan_process_view_without_memory, scan_skip_truncates, table_evidence_score,
-    table_has_only_opaque_interfaces, table_linkage, target_layout,
+    proven_complete_legacy_prefix, read_elf_snapshot, read_maps_or_refuse,
+    read_maps_or_refuse_with_buffers, scan_process_view, scan_process_view_without_memory,
+    scan_skip_truncates, table_evidence_score, table_has_only_opaque_interfaces, table_linkage,
+    target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
@@ -2096,6 +2097,13 @@ impl CaptureFacts {
             for (table_index, table) in module.scanned.tables.iter().enumerate() {
                 let functions =
                     table.entries.len() + table.null_entries.len() + table.unpinned.len();
+                // The same witness `plan::lower_scanned` scores by, so the
+                // published linkage, naming, and completeness proof never disagree.
+                let exports = ObjectExports {
+                    object: module.scanned.key,
+                    symbols: &module.exports,
+                };
+                let proven = proven_complete_legacy_prefix(table, &exports);
                 let surface = (table.version, table.walk.to_string(), functions);
                 let surface_occurrence = surfaces.entry(surface.clone()).or_insert(0usize);
                 let scan_surface = SurfaceOccurrence::Scan {
@@ -2108,6 +2116,9 @@ impl CaptureFacts {
                 history
                     .surfaces
                     .entry(scan_surface.clone())
+                    .and_modify(|known| {
+                        known.proven_complete_prefix |= proven;
+                    })
                     .or_insert_with(|| plan::SurfaceSummary {
                         source: format!(
                             "{} table {}.{}",
@@ -2116,6 +2127,7 @@ impl CaptureFacts {
                         walk: table.walk.to_string(),
                         acquisition: "ok".into(),
                         functions,
+                        proven_complete_prefix: proven,
                     });
                 let mut inventory_bases = table
                     .file_offset
@@ -2156,6 +2168,7 @@ impl CaptureFacts {
                             walk: table.walk.to_string(),
                             acquisition: "ok".into(),
                             functions,
+                            proven_complete_prefix: false,
                         });
                     if let Some(table_file_offset) = table.file_offset {
                         inventory_bases.push(InventorySurfaceBase {
@@ -2184,12 +2197,6 @@ impl CaptureFacts {
                 }
                 let table_fact = (table.version, table.entries.len());
                 let table_occurrence = tables.entry(table_fact).or_insert(0usize);
-                // The same witness `plan::lower_scanned` scores by, so the
-                // published linkage and the plan's naming never disagree.
-                let exports = ObjectExports {
-                    object: module.scanned.key,
-                    symbols: &module.exports,
-                };
                 let table_score = table_evidence_score(
                     table_index,
                     &module.scanned.tables,
@@ -2335,6 +2342,7 @@ impl CaptureFacts {
                         walk: crate::manifest_input::effective_surface_walk(surface),
                         acquisition: manifest_acquisition_label(&surface.acquisition),
                         functions: surface.functions.len(),
+                        proven_complete_prefix: false,
                     });
                 history
                     .tables
@@ -3977,6 +3985,7 @@ impl ScannedModuleCopy {
                             file_offset: table.file_offset,
                             live_return: table.live_return,
                             manifest_supported: table.manifest_supported,
+                            extension_impossible: table.extension_impossible,
                         });
                     self.item = 0;
                     self.stage = 4;
@@ -8701,6 +8710,7 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                 }
                 existing.tables[index].live_return |= table.live_return;
                 existing.tables[index].manifest_supported |= table.manifest_supported;
+                existing.tables[index].extension_impossible |= table.extension_impossible;
                 index
             }
             None => {

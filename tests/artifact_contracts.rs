@@ -12031,6 +12031,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             walk: "full".into(),
             acquisition: "ok".into(),
             functions: 68,
+            proven_complete_prefix: false,
         }],
         vendor_interfaces: 0,
         interface_list: "absent".into(),

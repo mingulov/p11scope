@@ -106,6 +106,7 @@ RUN = [
     ("test_joint_ledger_oracle.py", []),
     ("test_joint_owner_proof_oracle.py", []),
     ("test_joint_promotion_oracle.py", []),
+    ("test_joint_stall_live.py", []),
     ("test_joint_throughput_cells.py", []),
     ("test_joint_two_provider_oracle.py", []),
     ("test_key_operation_ledger.py", []),

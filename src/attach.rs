@@ -7585,6 +7585,7 @@ impl Session {
     /// The gate rows map for the native acknowledgement: the acknowledgement
     /// wiring arms per-row reuse through it. Borrowed from the session;
     /// `None` wherever the gate is not built in.
+    #[allow(dead_code)] // staged: the acknowledgement wiring is the first caller
     pub(crate) fn loader_gate_rows(&self) -> Option<&Map> {
         if !LOADER_GATE_BUILD {
             return None;
@@ -12351,7 +12352,7 @@ mod tests {
         } else {
             for (name, _) in super::GATE_IDENTITY_MAPS {
                 assert!(
-                    detailed.maps.get(name).is_none(),
+                    !detailed.maps.contains_key(name),
                     "{name} must be absent from the gate-0 object"
                 );
             }
@@ -12368,7 +12369,7 @@ mod tests {
             let inventory = aya_obj::Object::parse(bytes).unwrap();
             for (name, _) in super::GATE_IDENTITY_MAPS {
                 assert!(
-                    inventory.maps.get(name).is_none(),
+                    !inventory.maps.contains_key(name),
                     "{name} must be absent from inventory objects"
                 );
             }
@@ -12388,7 +12389,7 @@ mod tests {
             let counter = aya_obj::Object::parse(bytes).unwrap();
             for (name, _) in super::GATE_IDENTITY_MAPS {
                 assert!(
-                    counter.maps.get(name).is_none(),
+                    !counter.maps.contains_key(name),
                     "{name} must be absent from counter objects"
                 );
             }
@@ -12402,7 +12403,7 @@ mod tests {
         let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
         assert_eq!(
             super::LOADER_GATE_BUILD,
-            detailed.maps.get("IMAGE_BANK_SELECT").is_some(),
+            detailed.maps.contains_key("IMAGE_BANK_SELECT"),
             "gate selection must match the embedded object"
         );
     }

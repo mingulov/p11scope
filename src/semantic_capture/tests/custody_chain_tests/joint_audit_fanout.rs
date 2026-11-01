@@ -8019,7 +8019,8 @@ fn joint_machine_linked_break_refuses_gap_without_resync() {
 /// the BEGIN-only quantum publishes, the malformed quantum breaks
 /// the stream (voiding the retained START), the next collect
 /// re-syncs, and the real END publishes on the fresh stream,
-/// tripping no bound.
+/// shedding its call into the counted unrouted-calls gap instead
+/// of joining it, tripping no bound.
 #[test]
 fn joint_machine_unlinked_midcall_break_end_publishes() {
     let mut fixture = MachineScene::unlinked(1);
@@ -8028,6 +8029,18 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
         "only an unlinked lane re-syncs after a break"
     );
     fixture.prime_unlinked();
+    let api_returns = |fixture: &MachineScene| -> u64 {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum()
+    };
+    let before = api_returns(&fixture);
     let (begin_a, end_a) = fixture
         .scene
         .encoded(std::process::id(), 0, "C_SignInit", 3);
@@ -8065,6 +8078,34 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
         assert!(
             !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()),
             "the END collect re-syncs the broken unlinked stream"
+        );
+    }
+    // Disposition pin: the END does not join — the break voided
+    // the retained START, so its call sheds. api_returns stays
+    // flat and the shed call is counted in the unrouted-calls
+    // gap rather than silently dropped.
+    assert_eq!(
+        api_returns(&fixture),
+        before,
+        "the END sheds instead of joining across the void + re-sync"
+    );
+    {
+        let gaps: Vec<(String, String)> = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect();
+        assert!(
+            gaps.iter().any(|(subject, reason)| {
+                subject == "semantic calls unrouted"
+                    && reason.contains("1 calls shed without a route")
+            }),
+            "the shed END call is counted, not silent: {gaps:?}"
         );
     }
     assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);

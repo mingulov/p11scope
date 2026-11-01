@@ -14,13 +14,13 @@
 //! and no unapplied call can overlap them.
 
 use super::{
-    AffectedScope, AttributeList, Attribution, Birth, CallKey, CallToken, CompleteInputPrefix,
-    CompletedFact, CreationFamily, FieldState, FieldValue, FindResult, HandleInput, KeyLabel,
-    Lifetime, LostOutcome, METADATA_FIELDS, MechanismEvidence, MetadataView, ObjectDomain,
-    ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId, ObjectLimits, ObjectProjection,
-    ObjectView, OriginFact, OutputEvidence, QueryStatus, ResultSlot, SessionEnd, SessionHandle,
-    SessionIncarnation, SessionOrigin, SessionState, SessionView, SlotScope, StateEstimate,
-    StateUsage, ViewOrigin, field_index,
+    AffectedScope, AsyncValue, AttributeList, Attribution, Birth, CallKey, CallToken,
+    CompleteInputPrefix, CompletedFact, CreationFamily, FieldState, FieldValue, FindResult,
+    HandleInput, KeyLabel, KnownScope, Lifetime, LostOutcome, METADATA_FIELDS, MechanismEvidence,
+    MetadataView, ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId,
+    ObjectLimits, ObjectProjection, ObjectView, OriginFact, OutputEvidence, QueryStatus,
+    ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin, SessionState,
+    SessionView, SlotScope, StateEstimate, StateUsage, ViewOrigin, field_index,
 };
 use p11scope_ebpf_common::object_policy::{
     DeriveResultProtocol, ObjectAction, SafeAttributeKind, authorized_result_pointer_args,
@@ -666,9 +666,11 @@ pub(super) struct ModelState {
     /// Live deferred origins by (origin session, target function):
     /// PENDING origins awaiting GetID or direct completion (6.07b).
     deferred_pending: BTreeMap<(SessionIncarnation, u32), DeferredOrigin>,
-    /// Detached deferred origins by (domain, target, value word):
-    /// GetID-minted custody awaiting Join or completion (6.07b).
-    deferred_detached: BTreeMap<(ObjectDomain, u32, u64), DetachedDeferred>,
+    /// Detached deferred origins by (domain, known scope, target,
+    /// value): GetID-minted custody awaiting Join or completion
+    /// (6.07b). The scope mirrors S1's slot dimension: the same id
+    /// on two known slots names two records.
+    deferred_detached: BTreeMap<(ObjectDomain, KnownScope, u32, AsyncValue), DetachedDeferred>,
     /// Mint order for oldest-first deferred eviction.
     deferred_sequence: u64,
     /// Origin tickets whose deferred records were consumed or
@@ -2594,7 +2596,7 @@ impl ModelState {
             + self
                 .deferred_detached
                 .keys()
-                .filter(|(held, _, _)| *held == domain)
+                .filter(|(held, _, _, _)| *held == domain)
                 .count();
         if held < bound {
             return;
@@ -2691,7 +2693,7 @@ impl ModelState {
             self.deferred_pending.remove(&key);
             self.deferred_releases.push(ticket);
         }
-        let dead_detached: Vec<((ObjectDomain, u32, u64), u64)> = self
+        let dead_detached: Vec<((ObjectDomain, KnownScope, u32, AsyncValue), u64)> = self
             .deferred_detached
             .iter()
             .filter(|(_, detached)| detached.origin.session == Some(s))
@@ -4089,10 +4091,10 @@ impl ModelState {
         let Some(record) = self.deferred_pending.get(&(session, target)).copied() else {
             return Err(DeferredRefusal::NoRecord);
         };
-        if self.session_scope(Some(session)) == SlotScope::Unknown {
+        let SlotScope::Known(scope) = self.session_scope(Some(session)) else {
             return Err(DeferredRefusal::UnknownSlot);
-        }
-        let key = (record.domain, target, value);
+        };
+        let key = (record.domain, scope, target, AsyncValue::from(value));
         if self.deferred_detached.contains_key(&key) {
             return Err(DeferredRefusal::Occupied);
         }
@@ -4115,8 +4117,11 @@ impl ModelState {
 
     /// Move whole detached custody to the joiner (Join transfer):
     /// origin, frozen inputs and position unchanged; the
-    /// shared-budget charge follows the origin ticket. Join acquires
-    /// no destination key; a missing record mutates nothing.
+    /// shared-budget charge follows the origin ticket. The record is
+    /// resolved under the joiner's own scope, mirroring S1's
+    /// slot-keyed Join; an unknown-scope joiner resolves nothing.
+    /// Join acquires no destination key; a missing record mutates
+    /// nothing.
     #[cfg_attr(not(test), allow(dead_code))] // First Q2 seal-path caller lands with journal P1.
     pub(super) fn join_deferred_holder(
         &mut self,
@@ -4125,7 +4130,13 @@ impl ModelState {
         value: u64,
         joiner: SessionIncarnation,
     ) -> bool {
-        match self.deferred_detached.get_mut(&(domain, target, value)) {
+        let SlotScope::Known(scope) = self.session_scope(Some(joiner)) else {
+            return false;
+        };
+        match self
+            .deferred_detached
+            .get_mut(&(domain, scope, target, AsyncValue::from(value)))
+        {
             Some(detached) => {
                 detached.holder = Some(joiner);
                 true
@@ -4331,7 +4342,10 @@ impl ModelState {
         let deferred_origins = self.deferred_pending.len()
             * size_of::<((SessionIncarnation, u32), DeferredOrigin)>()
             + self.deferred_detached.len()
-                * size_of::<((ObjectDomain, u32, u64), DetachedDeferred)>();
+                * size_of::<(
+                    (ObjectDomain, KnownScope, u32, AsyncValue),
+                    DetachedDeferred,
+                )>();
         let prune_lists: usize = self
             .domains
             .values()
@@ -4744,6 +4758,15 @@ mod tests {
                 .find(|detached| detached.origin.ticket == ticket)
                 .expect("detached record live")
                 .holder
+        }
+    }
+
+    /// The known scope value behind a reference scope, for detached
+    /// key literals.
+    fn known_scope(slot: u64, token_epoch: u64) -> KnownScope {
+        match SlotScope::reference_known(slot, token_epoch) {
+            SlotScope::Known(known) => known,
+            SlotScope::Unknown => unreachable!("reference scope is known"),
         }
     }
 
@@ -5281,7 +5304,7 @@ mod tests {
         let detached = fx
             .state
             .deferred_detached
-            .get(&(fx.domain, target, 42))
+            .get(&(fx.domain, known_scope(0, 0), target, AsyncValue::from(42)))
             .expect("record survives holder death");
         assert_eq!(detached.holder, None, "holder floats, still joinable");
         assert_eq!(detached.origin.ticket, token);
@@ -5410,7 +5433,8 @@ mod tests {
         fx.state
             .detach_deferred(fx.session, target, 42)
             .expect("A detaches");
-        let seq_a = fx.state.deferred_detached[&(fx.domain, target, 42)]
+        let seq_a = fx.state.deferred_detached
+            [&(fx.domain, known_scope(0, 0), target, AsyncValue::from(42))]
             .origin
             .sequence;
         let seq_b = fx.state.deferred_pending[&(session_b, target)].sequence;
@@ -5441,9 +5465,12 @@ mod tests {
             "model evicts B, the oldest still-pending record"
         );
         assert!(
-            fx.state
-                .deferred_detached
-                .contains_key(&(fx.domain, target, 42)),
+            fx.state.deferred_detached.contains_key(&(
+                fx.domain,
+                known_scope(0, 0),
+                target,
+                AsyncValue::from(42),
+            )),
             "model keeps the detached A"
         );
         assert_eq!(fx.state.gaps.get(&ObjectGap::PendingCapacity), Some(&1));
@@ -5884,7 +5911,10 @@ mod tests {
             .detach_deferred(fx.session, target, 42)
             .expect("A detaches");
         let pending_entry = size_of::<((SessionIncarnation, u32), DeferredOrigin)>();
-        let detached_entry = size_of::<((ObjectDomain, u32, u64), DetachedDeferred)>();
+        let detached_entry = size_of::<(
+            (ObjectDomain, KnownScope, u32, AsyncValue),
+            DetachedDeferred,
+        )>();
         let live = fx.state.estimate();
         assert_eq!(
             live.deferred_origins,
@@ -5927,7 +5957,8 @@ mod tests {
             )
             .expect("joiner session opens");
         assert!(fx.state.join_deferred_holder(fx.domain, target, 42, joiner));
-        let detached = fx.state.deferred_detached[&(fx.domain, target, 42)];
+        let detached = fx.state.deferred_detached
+            [&(fx.domain, known_scope(0, 0), target, AsyncValue::from(42))];
         assert_eq!(detached.holder, Some(joiner));
         assert_eq!(detached.origin.ticket, token);
         assert_eq!(detached.origin.session, Some(fx.session));
@@ -6015,7 +6046,8 @@ mod tests {
             "refused detach advances no sequence"
         );
         assert_eq!(
-            fx.state.deferred_detached[&(fx.domain, target, 42)]
+            fx.state.deferred_detached
+                [&(fx.domain, known_scope(0, 0), target, AsyncValue::from(42),)]
                 .origin
                 .ticket,
             first

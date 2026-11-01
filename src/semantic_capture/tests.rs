@@ -467,6 +467,106 @@ mod current_receipts_tests {
     }
 
     #[test]
+    fn stashed_disclosure_union_caps_without_growth_and_maxes_counts() {
+        use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+
+        let disclosure = |cookie: u64| ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 7,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(cookie + 1)],
+        };
+        // The prepaid shape: an exactly capped union must absorb an
+        // over-bound merge without growing past the cap it was given.
+        let mut tick = TickReport::default();
+        tick.reload_not_excluded.reserve_exact(MAX_INSTANCES);
+        for cookie in 0..MAX_INSTANCES as u64 {
+            tick.reload_not_excluded.push(disclosure(cookie));
+        }
+        assert_eq!(
+            tick.reload_not_excluded.capacity(),
+            MAX_INSTANCES,
+            "the twin needs exact prepaid capacity, like the collected accumulator"
+        );
+        tick.continued_across_global = 4;
+        tick.joined_across_global = 2;
+        let shed = tick.merge_stashed_disclosures(vec![disclosure(10_000)], 6, 1);
+        assert_eq!(shed, 1);
+        assert_eq!(tick.reload_not_excluded.len(), MAX_INSTANCES);
+        assert_eq!(
+            tick.reload_not_excluded.capacity(),
+            MAX_INSTANCES,
+            "the union must shed the incoming tail, never grow past the cap"
+        );
+        assert_eq!(tick.reload_not_excluded[0].image.task_cookie, 0);
+        assert_eq!(
+            tick.reload_not_excluded[MAX_INSTANCES - 1]
+                .image
+                .task_cookie,
+            MAX_INSTANCES as u64 - 1,
+            "the union keeps the kept side in order"
+        );
+        assert_eq!(tick.continued_across_global, 6);
+        assert_eq!(tick.joined_across_global, 2);
+    }
+
+    #[test]
+    fn disclosure_overflow_shed_stays_out_of_the_refused_endpoint_total() {
+        use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
+        use crate::inventory_semantics::{RefreshReceiptStash, stash_refresh_report};
+
+        // A disclosure-only overflow: 4097 identities through a
+        // 4096-capped stash. The shed identity is disclosure loss,
+        // never a refused endpoint, so the refused-endpoints total
+        // stays zero on every push.
+        let mut stash = RefreshReceiptStash::new();
+        for cookie in 0..=MAX_INSTANCES as u64 {
+            let mut refresh = TickReport::default();
+            refresh.reload_not_excluded.push(ReloadNotExcludedReport {
+                label: RELOAD_NOT_EXCLUDED_LABEL,
+                image: ImageIdentity {
+                    task_cookie: cookie,
+                    exec_id: 7,
+                },
+                file_slot: 3,
+                ids: vec![InstanceId::from_raw(cookie + 1)],
+            });
+            let (_, shed) = stash_refresh_report(&mut stash, &mut refresh);
+            assert_eq!(
+                shed, 0,
+                "disclosure-identity shed is not a refused endpoint (push {cookie})"
+            );
+        }
+    }
+
+    #[test]
+    fn reload_report_debug_redacts_image_cookies() {
+        use crate::discovery::instances::{InstanceId, RELOAD_NOT_EXCLUDED_LABEL};
+
+        let report = ReloadNotExcludedReport {
+            label: RELOAD_NOT_EXCLUDED_LABEL,
+            image: ImageIdentity {
+                task_cookie: 123_456_789,
+                exec_id: 987_654_321,
+            },
+            file_slot: 3,
+            ids: vec![InstanceId::from_raw(1)],
+        };
+        let rendered = format!("{report:?}");
+        assert!(
+            rendered.contains("instance_reload_not_excluded"),
+            "the redaction must keep the label: {rendered}"
+        );
+        assert!(
+            !rendered.contains("123456789") && !rendered.contains("987654321"),
+            "cookies must not print: {rendered}"
+        );
+    }
+
+    #[test]
     fn drained_receipt_expires_inside_quiescence_wait_but_validates_promptly() {
         let mut io = ScriptIo::new(NativeDomainId::mint());
         let mut capture = capture(&io);
@@ -7183,6 +7283,25 @@ mod b17_wire_projection {
             gaps.iter()
                 .any(|(subject, _)| subject == "reload disclosure identities shed"),
             "the shed identity must be a named gap: {gaps:?}"
+        );
+    }
+
+    // Control: a quiet stage records no disclosure-shed gap. The gap
+    // fires only on real shed (see the carried-shed twin).
+    #[test]
+    fn staged_quiet_batch_records_no_disclosure_shed_gap() {
+        let mut coordinator = coordinator();
+        let mut lane = shell_lane();
+        let batch =
+            SemanticBatch::from_tick_report(lane.domain(), TickReport::default(), Vec::new(), 130)
+                .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        let gaps = coordinator.registry().staged_scope_gaps_for_test();
+        assert!(
+            !gaps
+                .iter()
+                .any(|(subject, _)| subject == "reload disclosure identities shed"),
+            "no shed, no gap: {gaps:?}"
         );
     }
 }

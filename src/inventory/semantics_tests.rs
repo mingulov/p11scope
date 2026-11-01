@@ -8564,12 +8564,15 @@ fn stop_merge_appends_reload_disclosures_and_maxes_snapshots() {
     );
 }
 
-// The Stop union refuses an over-bound disclosure total instead of
-// staging past the batch cap both sides met alone. Refusal leaves
-// both sides untouched: nothing is lost, the stop simply cannot
-// merge.
+// The Stop union sheds an over-bound disclosure total instead of
+// refusing the semantic merge (controller bound-semantics ruling,
+// 2026-11-01: on overflow shed identities, never refuse the merge).
+// The stop outcome still merges, disclosures cap at MAX_INSTANCES
+// keeping the accumulator's side, the overflow counts on the
+// batch's carried shed, and the count snapshots max-merge. This
+// replaces the prior refusal pin the ruling overturns.
 #[test]
-fn stop_merge_refuses_overbound_reload_disclosures() {
+fn stop_merge_sheds_overbound_reload_disclosures() {
     use crate::discovery::instances::{InstanceId, MAX_INSTANCES, RELOAD_NOT_EXCLUDED_LABEL};
     use crate::semantic_capture::{
         Invalidation, InvalidationScope, ReloadNotExcludedReport, TickOutcome, TickReport,
@@ -8591,6 +8594,8 @@ fn stop_merge_refuses_overbound_reload_disclosures() {
     // the union; the scripted one reserves it explicitly.
     let mut accumulated = TickReport::scripted(Vec::with_capacity(MAX_INSTANCES), Vec::new());
     accumulated.reload_not_excluded = (0..MAX_INSTANCES as u64).map(disclosure).collect();
+    accumulated.continued_across_global = 4;
+    accumulated.joined_across_global = 2;
     let mut batch = SemanticBatch::from_tick_report(domain, accumulated, Vec::new(), 100)
         .expect("a full accumulator respects lane bounds");
     let mut stop = TickReport::scripted(
@@ -8602,18 +8607,32 @@ fn stop_merge_refuses_overbound_reload_disclosures() {
         Vec::new(),
     );
     stop.reload_not_excluded.push(disclosure(10_000));
-    assert_eq!(
-        batch.merge_collected_stop(&mut stop),
-        Err(SemanticRefusal::ProviderStorage)
-    );
+    stop.continued_across_global = 9;
+    stop.joined_across_global = 1;
+    batch
+        .merge_collected_stop(&mut stop)
+        .expect("an over-bound disclosure total sheds, never refuses");
     assert_eq!(
         batch.reload_not_excluded().len(),
         MAX_INSTANCES,
-        "refusal leaves the original untouched"
+        "the union caps at the batch bound"
     );
     assert_eq!(
-        stop.reload_not_excluded.len(),
-        1,
-        "refusal leaves the incoming report untouched"
+        batch.reload_not_excluded()[0].image.task_cookie,
+        0,
+        "the union keeps the accumulator's side"
+    );
+    assert_eq!(
+        batch.reload_not_excluded()[MAX_INSTANCES - 1]
+            .image
+            .task_cookie,
+        MAX_INSTANCES as u64 - 1,
+        "the overflow sheds the incoming tail"
+    );
+    assert_eq!(batch.continued_across_global(), 9);
+    assert_eq!(batch.joined_across_global(), 2);
+    assert!(
+        stop.reload_not_excluded.is_empty(),
+        "the union takes the stop quadrant"
     );
 }

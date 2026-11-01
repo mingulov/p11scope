@@ -56,6 +56,33 @@ to the first edge_observed record whose cumulative entries.count
 reaches it (the coarse tail-bound mapping); the report carries the
 sample count with p50/p99/max. Twins live in
 tests/python/test_s1_throughput_compare.py.
+
+--joint mode judges the keyed sibling workload instead: one HMAC key
+per worker thread (C_GenerateKey, paced C_SignInit + C_Sign under
+CKM_SHA256_HMAC, C_DestroyObject), over a --system capture whose
+semantic lane sealed linked. Gates 1-3 and the latency record are
+shared, with four Joint adjustments: the rate windows align to the
+hot files and bin the non-setup calls only (the unpaced setup
+prologue sits outside the paced span by construction; issued
+still counts every ledgered call); the driver's owned graph is
+selected by PID from the system snapshot (foreign callers, edges and
+scoped gaps are counted in the report, never gated); the pinned
+mechanism pair is 0x251/CKM_SHA256_HMAC/sign plus
+0x350/CKM_GENERIC_SECRET_KEY_GEN/generate_key, with the ledgered
+setup calls (C_Initialize, C_GetSlotList, C_OpenSession) and the
+key close (C_DestroyObject) conserved in the exact totals but
+exempt from the evidence sets, like teardown; and the
+capture-wide refused_endpoints/continuity_cuts counts are recorded,
+never gated (they count foreign admissions). Gate 4 becomes the
+Joint-active proof: object_observations populated with reason none
+(a linked seal, with no joint_journal_unavailable marker anywhere),
+clean object budgets and gaps, every key-operation row on the
+driver's instance with its equation and completed == started, the
+per-object started multiset exactly equal to the ledgered per-key
+operation multiset (expected numbers come from the ledgers only),
+no unknown-key rows, one created/generate view per key with its
+birth inside the window and lifetime destroyed, and one closed
+session row per ledgered C_OpenSession.
 """
 
 import argparse
@@ -106,6 +133,26 @@ LOSS_GAP_REASONS = frozenset({
 # entries/operations/api_returns, but lifecycle-only calls claim no
 # mechanism row, so they are exempt from the evidence-set checks.
 TEARDOWN_FUNCTIONS = frozenset({"C_CloseSession", "C_Finalize"})
+# Keyed setup calls, ledgered in their own file in --joint mode: the
+# Joint flow execs the driver after the observer seals its linked
+# lane, so setup is observed and must be conserved in the exact
+# totals; as COUNT_ONLY/lifecycle calls they claim no mechanism row.
+SETUP_FUNCTIONS = frozenset({"C_Initialize", "C_GetSlotList", "C_OpenSession"})
+# The keyed key close: a session call with no operation transition,
+# so it claims no mechanism row; the key lifecycle is proved in
+# gate 4 through the destroyed object views instead.
+DESTROY_FUNCTIONS = frozenset({"C_DestroyObject"})
+# The pinned --joint mechanism pair: HMAC sign plus generic-secret
+# keygen, each with its name and operations label. Evidence
+# attribution is enforced by the function-set equality and the
+# per-row ledger sums below.
+JOINT_MECHANISMS = {
+    0x251: ("CKM_SHA256_HMAC", ["sign"]),
+    0x350: ("CKM_GENERIC_SECRET_KEY_GEN", ["generate_key"]),
+}
+# The unlinked-lane marker: tolerated (never gated) in S1 mode, and
+# refused everywhere in --joint mode.
+UNLINKED_REASON = "joint_journal_unavailable"
 # Derived presentation keys on edge_observed records, stripped before
 # the record is compared with its snapshot edge.
 DERIVED_EDGE_KEYS = frozenset(
@@ -198,6 +245,7 @@ def load_ledgers(paths):
     _require(paths, "no ledgers given")
     _require(len(set(paths)) == len(paths), "duplicate ledger path given")
     merged = []
+    files = []
     pid = None
     ready_min = None
     ack_max = None
@@ -220,9 +268,17 @@ def load_ledgers(paths):
         pid = ready["pid"]
         ready_min = ready["t"] if ready_min is None else min(ready_min, ready["t"])
         ack_max = ack["t"] if ack_max is None else max(ack_max, ack["t"])
+        file_table = {}
         for row in rows:
             if row.get("kind") == "call":
                 merged.append(row)
+                cell = file_table.setdefault(row["fn"], {"total": 0,
+                                                         "errors": 0})
+                cell["total"] += 1
+                cell["errors"] += row["rv"] != 0
+        files.append({"path": path, "issued": ack["issued"],
+                      "ready": ready["t"], "ack": ack["t"],
+                      "fn_table": file_table})
     _require(merged, f"issued 0: empty run with {len(paths)} ledgers, no calls")
     fn_table = {}
     for row in merged:
@@ -230,23 +286,37 @@ def load_ledgers(paths):
         cell["total"] += 1
         cell["errors"] += row["rv"] != 0
     return {"pid": pid, "issued": len(merged), "ledgers": len(paths),
-            "calls": merged, "ready_min": ready_min, "ack_max": ack_max,
+            "calls": merged, "files": files,
+            "ready_min": ready_min, "ack_max": ack_max,
             "fn_table": fn_table, "fn_set": set(fn_table),
             "rv_set": {row["rv"] for row in merged}}
 
 
-def check_windows(view, min_rate):
+def check_windows(view, min_rate, joint=False):
     """Bin call END stamps into full 1 s windows aligned to ready.t.
 
     Every full window must hold at least min_rate calls; the partial
     tail is counted and returned, never gated. min_rate 0 records the
-    bins without gating (diagnostic runs only).
+    bins without gating (diagnostic runs only). In --joint mode the
+    unpaced setup prologue sits outside the paced span by
+    construction (the S1 flow never observes it at all), so the
+    windows align to the hot files and bin the non-setup calls
+    only; issued still counts every ledgered call.
     """
     _require(type(min_rate) is int and min_rate >= 0,
              "min_rate must be a non-negative integer")
-    ends = sorted(row["t1"] for row in view["calls"])
-    ready = view["ready_min"]
-    ack = view["ack_max"]
+    if joint:
+        paced = [entry for entry in view["files"]
+                 if "C_Initialize" not in entry["fn_table"]]
+        _require(paced, "no paced ledger: every file is a setup file")
+        ready = min(entry["ready"] for entry in paced)
+        ack = max(entry["ack"] for entry in paced)
+        ends = sorted(row["t1"] for row in view["calls"]
+                      if row["fn"] not in SETUP_FUNCTIONS)
+    else:
+        ends = sorted(row["t1"] for row in view["calls"])
+        ready = view["ready_min"]
+        ack = view["ack_max"]
     full = (ack - ready) // NS_PER_S
     if min_rate > 0:
         _require(full > 0,
@@ -284,12 +354,16 @@ def _started_event(events):
     raise S1Error("event stream incomplete: no started marker")
 
 
-def check_scope_and_clock(events, pid):
-    """The run was --pid-scoped on the driver, on the capture clock."""
+def check_scope_and_clock(events, pid, joint=False):
+    """The run was scoped on the driver (--pid, or --system for Joint)."""
     started = _started_event(events)
     scope = started.get("scope")
-    _require(scope == f"pid:{pid}",
-             f"event scope {scope!r} is not --pid for driver pid {pid}")
+    if joint:
+        _require(scope == "system",
+                 f"event scope {scope!r} is not --system for the Joint run")
+    else:
+        _require(scope == f"pid:{pid}",
+                 f"event scope {scope!r} is not --pid for driver pid {pid}")
     clock = started.get("clock")
     _require(type(clock) is dict, "started clock must be an object")
     _require(clock.get("basis") == "CLOCK_MONOTONIC"
@@ -305,26 +379,91 @@ def _singleton(doc, key):
     return rows[0]
 
 
-def select_driver(doc, pid):
+def select_driver(doc, pid, joint=False):
     """Resolve one current owned graph without promoting its withheld parent.
 
     The live wrapper binds start_time and the mapped provider to its actual
     process; this checks consistent report references, never reads a path
     from the report, and refuses missing, duplicate or unrelated rows.
+    In --joint mode the driver's graph is selected by PID from the
+    --system snapshot; foreign rows are counted, never gated.
     """
     _require(doc.get("schema") == "p11scope/inventory/v1",
              "current inventory schema is required")
-    caller = _singleton(doc, "callers")
-    module = _singleton(doc, "modules")
-    edge = _singleton(doc, "edges")
-    instance = _singleton(doc, "instances")
-    child = _singleton(doc, "semantic_edges")
+    foreign = {"callers": 0, "edges": 0}
+    if joint:
+        _require(doc.get("scope") == "system",
+                 f"inventory scope {doc.get('scope')!r} is not --system "
+                 "for the Joint run")
+        callers = doc.get("callers")
+        _require(type(callers) is list, "current throughput callers missing")
+        matches = [row for row in callers
+                   if type(row) is dict and row.get("pid") == pid]
+        _require(len(matches) == 1,
+                 f"no single caller for driver pid {pid}: "
+                 f"{len(matches)} rows")
+        caller = matches[0]
+        foreign["callers"] = len(callers) - 1
+        edges = doc.get("edges")
+        _require(type(edges) is list, "current throughput edges missing")
+        owned = [row for row in edges
+                 if type(row) is dict and row.get("caller") == caller.get("id")]
+        _require(len(owned) == 1,
+                 f"no single edge for driver pid {pid}: {len(owned)} rows")
+        edge = owned[0]
+        foreign["edges"] = len(edges) - 1
+        modules = doc.get("modules")
+        _require(type(modules) is list, "current throughput modules missing")
+        module_rows = [row for row in modules
+                       if type(row) is dict
+                       and row.get("id") == edge.get("module")]
+        _require(len(module_rows) == 1, "driver module row is not unique")
+        module = module_rows[0]
+        instances = doc.get("instances")
+        _require(type(instances) is list,
+                 "current throughput instances missing")
+        instance_rows = [row for row in instances
+                         if type(row) is dict
+                         and row.get("caller") == caller.get("id")
+                         and row.get("module") == module.get("id")]
+        _require(len(instance_rows) == 1,
+                 "driver instance row is not unique")
+        instance = instance_rows[0]
+        children = doc.get("semantic_edges")
+        _require(type(children) is list,
+                 "current throughput semantic rows missing")
+        child_rows = [row for row in children
+                      if type(row) is dict
+                      and row.get("caller") == caller.get("id")
+                      and row.get("module") == module.get("id")
+                      and row.get("instance") == instance.get("id")]
+        _require(len(child_rows) == 1, "driver semantic row is not unique")
+        child = child_rows[0]
+        _check_throughput_graph(doc, caller, module, edge, instance, child,
+                                pid, "system")
+    else:
+        caller = _singleton(doc, "callers")
+        module = _singleton(doc, "modules")
+        edge = _singleton(doc, "edges")
+        instance = _singleton(doc, "instances")
+        child = _singleton(doc, "semantic_edges")
+        _check_throughput_graph(doc, caller, module, edge, instance, child,
+                                pid, f"pid:{pid}")
+    observation = doc.get("observation")
+    return {"caller_ids": [caller["id"]], "pid": pid, "edge": edge,
+            "instance": instance, "sem_rows": [child],
+            "observation": observation, "foreign": foreign}
+
+
+def _check_throughput_graph(doc, caller, module, edge, instance, child,
+                            pid, scope):
+    """Check one resolved owned graph: identity, admission and shape."""
     for row, prefix in ((caller, "c"), (module, "m"), (instance, "i")):
         _require(type(row.get("id")) is str
                  and re.fullmatch(prefix + r"[0-9]+", row["id"]) is not None,
                  "invalid current throughput identity")
     _require(_u64(caller.get("pid")) and caller["pid"] == pid
-             and 0 < pid < 2 ** 32 and doc.get("scope") == f"pid:{pid}"
+             and 0 < pid < 2 ** 32 and doc.get("scope") == scope
              and _u64(caller.get("start_time")) and caller["start_time"] > 0
              and caller.get("retired") is False,
              "throughput caller is not the retained driver PID scope")
@@ -371,8 +510,6 @@ def select_driver(doc, pid):
              "native observation without a lifecycle account")
     _require(type(observation.get("semantic_capture")) is dict,
              "native observation without a semantic_capture summary")
-    return {"caller_ids": [caller["id"]], "pid": pid, "edge": edge,
-            "instance": instance, "sem_rows": [child], "observation": observation}
 
 
 def driver_series(events, edge):
@@ -437,8 +574,13 @@ def record_latency(view, series):
             "max_ns": samples[-1], "unmapped": unmapped}
 
 
-def check_conservation(view, selected):
-    """Issued == observed: totals, mechanism rows, function and rv sets."""
+def check_conservation(view, selected, joint=False):
+    """Issued == observed: totals, mechanism rows, function and rv sets.
+
+    In --joint mode the pinned pair is HMAC sign plus keygen, and the
+    ledgered setup and key-close calls join teardown in the
+    evidence-set exemption (conserved in the exact totals only).
+    """
     issued = view["issued"]
     edge = selected["edge"]
     entries = edge.get("entries")
@@ -474,9 +616,16 @@ def check_conservation(view, selected):
         _require(_u64(mechanism) and mechanism not in ids,
                  "duplicate or invalid mechanism identity")
         ids.add(mechanism)
-        _require(mechanism == 0x250 and row.get("name") == "CKM_SHA256"
-                 and row.get("operations") == ["digest"],
-                 "mechanism does not match the driver's SHA256 digest workload")
+        if joint:
+            spec = JOINT_MECHANISMS.get(mechanism)
+            _require(spec is not None and row.get("name") == spec[0]
+                     and row.get("operations") == spec[1],
+                     f"mechanism {mechanism:#x} is not the keyed HMAC row "
+                     "0x251 or the keygen row 0x350")
+        else:
+            _require(mechanism == 0x250 and row.get("name") == "CKM_SHA256"
+                     and row.get("operations") == ["digest"],
+                     "mechanism does not match the driver's SHA256 digest workload")
         evidence = row.get("evidence")
         _require(type(evidence) is dict, "mechanism without evidence")
         _require(evidence.get("truncated") is False, "truncated mechanism evidence")
@@ -497,8 +646,10 @@ def check_conservation(view, selected):
             row_rvs.add(entry["rv"])
             observed_rvs.add(entry["rv"])
         observed_fns.update(functions)
-    hot_calls = [row for row in view["calls"]
-               if row["fn"] not in TEARDOWN_FUNCTIONS]
+    exempt = TEARDOWN_FUNCTIONS
+    if joint:
+        exempt = exempt | SETUP_FUNCTIONS | DESTROY_FUNCTIONS
+    hot_calls = [row for row in view["calls"] if row["fn"] not in exempt]
     hot_fns = {row["fn"] for row in hot_calls}
     hot_rvs = {row["rv"] for row in hot_calls}
     missing = sorted(hot_fns - observed_fns)
@@ -548,11 +699,15 @@ def _gap_loss_reason(subject, reason):
     return None
 
 
-def check_loss(selected, doc, events):
+def check_loss(selected, doc, events, joint=False):
     """Check published loss and the exact terminal R59 child disclosure.
 
     The held Detailed EVENTS counter and exact stop collected/joined/shed
-    account remain mandatory independent live-wrapper checks.
+    account remain mandatory independent live-wrapper checks. In
+    --joint mode the capture-wide refused/continuity counts are
+    recorded, never gated (they count foreign admissions on a
+    --system capture), and foreign-scoped gaps are counted, never
+    gated; driver and caller-less gaps stay strict.
     """
     observation = selected["observation"]
     ring_loss = observation["lifecycle"].get("ring_loss")
@@ -576,13 +731,20 @@ def check_loss(selected, doc, events):
              f"stop_quiescence={quiescence})")
     _require(_u64(capture.get("admitted_endpoints")) and capture["admitted_endpoints"] > 0,
              "no admitted semantic endpoints")
-    for name in ("refused_endpoints", "continuity_cuts"):
-        _require(_u64(capture.get(name)) and capture[name] == 0,
-                 f"semantic_capture {name} is unknown or nonzero")
+    refused_endpoints = capture.get("refused_endpoints")
+    continuity_cuts = capture.get("continuity_cuts")
+    if joint:
+        _require(_u64(refused_endpoints) and _u64(continuity_cuts),
+                 "semantic_capture refused/continuity counts unreadable")
+    else:
+        for name in ("refused_endpoints", "continuity_cuts"):
+            _require(_u64(capture.get(name)) and capture[name] == 0,
+                     f"semantic_capture {name} is unknown or nonzero")
     _require(_u64(doc.get("gaps_suppressed")) and doc["gaps_suppressed"] == 0,
              "snapshot gaps_suppressed is unknown or nonzero")
     gaps = doc.get("gaps")
     _require(type(gaps) is list, "inventory gaps must be a list")
+    foreign_gaps = 0
     for gap in gaps:
         _require(type(gap) is dict, "gap entry must be an object")
         subject = gap.get("subject")
@@ -591,10 +753,21 @@ def check_loss(selected, doc, events):
                  "gap entry without subject/reason")
         _require(_u64(gap.get("repeats")) and gap["repeats"] > 0,
                  "gap entry without a positive repeat count")
-        _require(gap.get("caller") in (None, selected["edge"]["caller"])
-                 and gap.get("module") in (None, selected["edge"]["module"])
-                 and (gap.get("pid") is None or (_u64(gap["pid"]) and gap["pid"] == selected["pid"])),
-                 "gap references another caller/module/PID")
+        if joint:
+            pid = gap.get("pid")
+            _require(pid is None or _u64(pid), "gap pid out of range")
+            scoped = (gap.get("caller") in (None, selected["edge"]["caller"])
+                      and (pid is None or pid == selected["pid"]))
+            if not scoped:
+                foreign_gaps += 1
+                continue
+            _require(gap.get("module") in (None, selected["edge"]["module"]),
+                     "gap references another caller/module/PID")
+        else:
+            _require(gap.get("caller") in (None, selected["edge"]["caller"])
+                     and gap.get("module") in (None, selected["edge"]["module"])
+                     and (gap.get("pid") is None or (_u64(gap["pid"]) and gap["pid"] == selected["pid"])),
+                     "gap references another caller/module/PID")
         hit = _gap_loss_reason(subject, reason)
         _require(hit is None, hit)
     for row in events:
@@ -605,6 +778,14 @@ def check_loss(selected, doc, events):
         reason = payload.get("reason")
         _require(type(subject) is str and subject and type(reason) is str and reason,
                  "gap_recorded without subject/reason")
+        if joint:
+            pid = payload.get("pid")
+            _require(pid is None or _u64(pid), "gap_recorded pid out of range")
+            scoped = (payload.get("caller") in (None, selected["edge"]["caller"])
+                      and (pid is None or pid == selected["pid"]))
+            if not scoped:
+                foreign_gaps += 1
+                continue
         hit = _gap_loss_reason(subject, reason)
         _require(hit is None, hit)
     edge = selected["edge"]
@@ -657,8 +838,15 @@ def check_loss(selected, doc, events):
     _require(retained.get("suppressed", 0) == 0,
              "event stream incomplete: snapshot suppressed "
              f"{retained.get('suppressed')} gaps")
-    return {"ring_loss": ring_loss, "events_lost": unrouted,
-            "gaps": len(gaps)}
+    verdict = {"ring_loss": ring_loss, "events_lost": unrouted,
+               "gaps": len(gaps)}
+    if joint:
+        verdict["refused_endpoints"] = refused_endpoints
+        verdict["continuity_cuts"] = continuity_cuts
+        verdict["foreign_gaps"] = foreign_gaps
+        verdict["foreign_callers"] = selected["foreign"]["callers"]
+        verdict["foreign_edges"] = selected["foreign"]["edges"]
+    return verdict
 
 
 def check_s1_active(doc, selected):
@@ -676,8 +864,158 @@ def check_s1_active(doc, selected):
     return {"status": status, "reason": reason, "lane": lane}
 
 
+def _joint_expected_per_key(view):
+    """Ledgered operations per key: one entry per hot ledger file.
+
+    A key file carries C_SignInit calls; setup and teardown files
+    carry none. Each key file must hold exactly one key creation and
+    close, with balanced sign calls. Expected numbers come from the
+    ledgers only, never from observer JSON.
+    """
+    expected = []
+    for index, entry in enumerate(view["files"]):
+        table = entry["fn_table"]
+        inits = table.get("C_SignInit", {"total": 0})["total"]
+        if inits == 0:
+            continue
+        signs = table.get("C_Sign", {"total": 0})["total"]
+        _require(signs == inits,
+                 f"key file ledger {index}: C_Sign {signs} != "
+                 f"C_SignInit {inits}")
+        creates = table.get("C_GenerateKey", {"total": 0})["total"]
+        _require(creates == 1,
+                 f"key file ledger {index}: C_GenerateKey {creates} != 1")
+        closes = table.get("C_DestroyObject", {"total": 0})["total"]
+        _require(closes == 1,
+                 f"key file ledger {index}: C_DestroyObject {closes} != 1")
+        expected.append(inits)
+    _require(expected, "no key file: no ledger carries C_SignInit calls")
+    return sorted(expected)
+
+
+def check_joint_active(doc, selected, view, events):
+    """The Joint path carried the run: a linked seal over every key.
+
+    object_observations is populated with reason none and no
+    joint_journal_unavailable marker anywhere; every key-operation
+    row sits on the driver's instance with its equation and
+    completed == started; the per-object started multiset equals the
+    ledgered per-key operation multiset; no unknown-key rows persist;
+    every key was created in the window and destroyed; and one
+    closed session row exists per ledgered C_OpenSession.
+    """
+    observed = doc.get("object_observations")
+    _require(type(observed) is dict, "no object_observations section")
+    status = observed.get("status")
+    reason = observed.get("reason")
+    _require(status == "populated" and reason == "none",
+             f"object_observations status {status} reason {reason}, not "
+             "the Joint marker populated/none")
+    for gap in doc.get("gaps", []):
+        _require(type(gap) is dict and gap.get("reason") != UNLINKED_REASON,
+                 f"unlinked lane disclosure present: {UNLINKED_REASON}")
+    for row in events:
+        if row["kind"] != "gap_recorded":
+            continue
+        _require(row["event"].get("reason") != UNLINKED_REASON,
+                 f"unlinked lane disclosure present: {UNLINKED_REASON}")
+    gaps = observed.get("gaps")
+    _require(type(gaps) is dict, "object_observations without gaps")
+    _require(gaps.get("rows") == [] and gaps.get("suppressed") == 0,
+             "object_observations carries gap rows or suppression")
+    budgets = observed.get("budgets")
+    _require(type(budgets) is dict, "object_observations without budgets")
+    for name in ("key_rows", "object_rows"):
+        rows = budgets.get(name)
+        _require(type(rows) is dict, f"object budgets without {name}")
+        _require(_u64(rows.get("refused")) and rows["refused"] == 0,
+                 f"object budgets refuse {name} rows")
+    _require(budgets.get("allocation_refused") is False,
+             "object budgets refuse allocation")
+    expected = _joint_expected_per_key(view)
+    instance = selected["instance"]["id"]
+    rows = observed.get("key_operations")
+    _require(type(rows) is list, "object_observations without key rows")
+    per_object = {}
+    for row in rows:
+        _require(type(row) is dict, "key-operation row must be an object")
+        _require(row.get("instance") == instance,
+                 f"key row for foreign instance {row.get('instance')}")
+        obj = row.get("object")
+        _require(_u64(obj), "key-operation row without an object id")
+        _require(row.get("category") == "sign",
+                 f"object {obj} category {row.get('category')}, not sign")
+        _require(row.get("role") == "key",
+                 f"object {obj} role {row.get('role')}, not key")
+        _require(row.get("unit") == "operations",
+                 f"object {obj} unit {row.get('unit')}, not operations")
+        counters = [row.get(name) for name in
+                    ("started", "completed", "failed", "cancelled",
+                     "unknown", "active", "key_join_lost")]
+        _require(all(_u64(value) for value in counters),
+                 f"object {obj} key counters out of range")
+        started, completed = counters[0], counters[1]
+        _require(started == sum(counters[1:]),
+                 f"object {obj} row equation breaks: started {started} "
+                 f"!= completed {completed} + failed {counters[2]} + "
+                 f"cancelled {counters[3]} + unknown {counters[4]} + "
+                 f"active {counters[5]} + key_join_lost {counters[6]}")
+        _require(completed == started,
+                 f"object {obj} has completed {completed} != "
+                 f"started {started}")
+        per_object[obj] = per_object.get(obj, 0) + started
+    seen = sorted(per_object.values())
+    _require(seen == expected,
+             f"per-key operations {seen} != ledgered {expected}")
+    unknown = observed.get("unknown_key_operations")
+    _require(unknown == [],
+             f"unknown-key operations persist: {len(unknown or [])} rows")
+    objects = observed.get("objects")
+    _require(type(objects) is list, "object_observations without objects")
+    created = [row for row in objects
+               if type(row) is dict and row.get("origin") == "created"
+               and row.get("creation") == "generate"]
+    _require(len(created) == len(expected),
+             f"{len(expected)} ledgered keys but {len(created)} "
+             "created object views")
+    _require(len(objects) == len(expected),
+             f"{len(objects)} object views != {len(expected)} keys")
+    for row in created:
+        obj = row.get("object")
+        birth = row.get("birth")
+        _require(type(birth) is dict and _u64(birth.get("start_ns"))
+                 and _u64(birth.get("end_ns")),
+                 f"object {obj} birth is not an observed interval")
+        start, end = birth["start_ns"], birth["end_ns"]
+        _require(view["ready_min"] <= start <= end <= view["ack_max"],
+                 f"object {obj} birth [{start}, {end}] outside the "
+                 f"window [{view['ready_min']}, {view['ack_max']}]")
+        _require(row.get("lifetime") == "destroyed",
+                 f"object {obj} lifetime {row.get('lifetime')}, "
+                 "not destroyed")
+    sessions = observed.get("sessions")
+    _require(type(sessions) is list, "object_observations without sessions")
+    opens = view["fn_table"].get("C_OpenSession", {"total": 0})["total"]
+    _require(len(sessions) == opens,
+             f"object_observations sessions {len(sessions)} != "
+             f"ledgered {opens} sessions")
+    for row in sessions:
+        _require(type(row) is dict and _u64(row.get("session")),
+                 "session row without an id")
+        _require(row.get("origin") == "opened",
+                 f"session {row.get('session')} origin "
+                 f"{row.get('origin')}, not opened")
+        _require(row.get("status") == "closed",
+                 f"session {row.get('session')} status "
+                 f"{row.get('status')}, not closed")
+    lane = selected["observation"]["semantic_capture"].get("status")
+    return {"status": status, "reason": reason, "lane": lane,
+            "keys": len(expected), "per_key_ops": expected,
+            "sessions": len(sessions)}
+
+
 def compare(ledger_paths, event_paths, inventory_path,
-            min_rate=DEFAULT_MIN_RATE):
+            min_rate=DEFAULT_MIN_RATE, joint=False):
     """Run every gate; return the pass verdict or raise S1Error."""
     view = load_ledgers([str(path) for path in ledger_paths])
     events = []
@@ -700,22 +1038,26 @@ def compare(ledger_paths, event_paths, inventory_path,
         doc = read_inventory_file(inventory_path)
     except OSError as error:
         raise S1Error(f"unreadable inventory {inventory_path}") from error
-    check_scope_and_clock(events, view["pid"])
-    windows = check_windows(view, min_rate)
-    selected = select_driver(doc, view["pid"])
+    check_scope_and_clock(events, view["pid"], joint=joint)
+    windows = check_windows(view, min_rate, joint=joint)
+    selected = select_driver(doc, view["pid"], joint=joint)
     series = driver_series(events, selected["edge"])
     check_stream_matches_snapshot(series, selected["edge"])
     latency = record_latency(view, series)
-    conservation = check_conservation(view, selected)
-    loss = check_loss(selected, doc, events)
-    active = check_s1_active(doc, selected)
-    return {"verdict": "pass", "pid": view["pid"],
-            "ledgers": view["ledgers"], "issued": view["issued"],
-            "min_rate": min_rate, "windows": windows["windows"],
-            "tail": windows["tail"],
-            "full_windows": windows["full_windows"],
-            "conservation": conservation, "loss": loss, "s1": active,
-            "latency": latency}
+    conservation = check_conservation(view, selected, joint=joint)
+    loss = check_loss(selected, doc, events, joint=joint)
+    result = {"verdict": "pass", "pid": view["pid"],
+              "ledgers": view["ledgers"], "issued": view["issued"],
+              "min_rate": min_rate, "windows": windows["windows"],
+              "tail": windows["tail"],
+              "full_windows": windows["full_windows"],
+              "conservation": conservation, "loss": loss,
+              "latency": latency}
+    if joint:
+        result["joint"] = check_joint_active(doc, selected, view, events)
+    else:
+        result["s1"] = check_s1_active(doc, selected)
+    return result
 
 
 def main(argv=None):
@@ -729,16 +1071,20 @@ def main(argv=None):
     parser.add_argument("--min-rate", type=int, default=DEFAULT_MIN_RATE,
                         help="minimum calls/s in every full 1 s window "
                              "(default %(default)s; 0 records without gating)")
+    parser.add_argument("--joint", action="store_true",
+                        help="judge the keyed HMAC workload over a --system "
+                             "capture with the Joint-active gate 4")
     args = parser.parse_args(argv)
     if args.min_rate < 0:
         parser.error("--min-rate must be >= 0")
     try:
         result = compare(args.ledger, args.events, args.inventory,
-                         args.min_rate)
+                         args.min_rate, joint=args.joint)
     except S1Error as error:
         print(json.dumps({"verdict": "fail", "reason": str(error)},
                          sort_keys=True))
-        print(f"s1-throughput refused: {error}", file=sys.stderr)
+        name = "joint-throughput" if args.joint else "s1-throughput"
+        print(f"{name} refused: {error}", file=sys.stderr)
         return 1
     except (OSError, UnicodeError):
         print(json.dumps({"verdict": "fail",

@@ -2203,6 +2203,40 @@ class JointHealthy(unittest.TestCase):
             self.assertIn("joint", verdict)
             self.assertNotIn("s1", verdict)
 
+    def test_joint_windows_ignore_an_early_setup(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-earlysetup-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            shifted = []
+            for line in ledgers[0].read_text(encoding="utf-8").splitlines():
+                row = json.loads(line)
+                if row["kind"] == "ready":
+                    row["t"] -= 5_000_000_000
+                elif row["kind"] == "call":
+                    row["t0"] -= 5_000_000_000
+                    row["t1"] -= 5_000_000_000
+                else:
+                    row["t"] -= 5_000_000_000
+                shifted.append(row)
+            write_jsonl(ledgers[0], shifted)
+            result = s1.compare([str(path) for path in ledgers],
+                                [str(events)], str(inventory),
+                                FULL_RATE, joint=True)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["issued"], 20006)
+
+    def test_joint_windows_exclude_setup_calls(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-nosetuppad-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(
+                workdir, ops_per_key=(9998,), per_s=9999)
+            with self.assertRaisesRegex(
+                    s1.S1Error, r"window 0: 9999 calls/s below minimum"):
+                s1.compare([str(path) for path in ledgers], [str(events)],
+                           str(inventory), FULL_RATE, joint=True)
+
     def test_joint_fails_via_cli_with_a_json_fail_verdict(self):
         s1 = require_s1(self)
         with tempfile.TemporaryDirectory(prefix="joint-clifail-") as tmp:

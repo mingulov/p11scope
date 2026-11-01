@@ -2,6 +2,11 @@
 /* Detailed-only negative continuity and a lookup-only same-object query.
  * No task/mm pointer is retained or emitted. Nodes never leave either hash. */
 #include "image_identity_query.h"
+#ifdef P11SCOPE_LOADER_GATE
+/* The qualifier and select layout come from the issuer header, never from
+ * a duplicated constant. Invisible without the gate define. */
+#include "image_identity.h"
+#endif
 #ifndef P11SCOPE_IMAGE_QUERY_HOST_TEST
 #define IMG_BTF __attribute__((preserve_access_index))
 #else
@@ -42,6 +47,10 @@ struct {
     IMG_TYPE(value, struct image_query_control);
 } IMAGE_QUERY_CTL IMG_SEC(".maps");
 extern unsigned char TASK_COOKIE;
+#ifdef P11SCOPE_LOADER_GATE
+extern unsigned char TASK_COOKIE_B;
+extern unsigned char IMAGE_BANK_SELECT;
+#endif
 extern unsigned char INSTANCE_GEN;
 extern unsigned char CONFIG;
 static void *(*image_lookup)(void *, const void *) = (void *)1;
@@ -99,7 +108,23 @@ static IMG_INLINE int image_allowed(void)
 }
 static IMG_INLINE int image_cookie_valid(u64 cookie)
 {
+#ifdef P11SCOPE_LOADER_GATE
+    if (cookie && cookie <= IMG_LIMIT)
+        return 1;
+    /* Qualified bank-B identity at incarnation 0: bit 15 set, bits 16+
+     * clear, ticket 1..16384. Decoded exactly as image_identity.c issues
+     * it; the qualified keys keep same-number A/B cookies disjoint.
+     * Malformed, unqualified-out-of-range and foreign cookies (any nonzero
+     * incarnation, including a re-prepared bank A) still fail below. */
+    {
+        u64 ticket = cookie & ((1ULL << 15) - 1);
+        if ((cookie >> 15) == 1 && ticket && ticket <= IMG_LIMIT)
+            return 1;
+    }
+    return 0;
+#else
     return cookie && cookie <= IMG_LIMIT;
+#endif
 }
 static IMG_INLINE int image_index(u64 tgid, u64 cookie)
 {
@@ -357,12 +382,41 @@ int p11_image_query(struct image_iter_task *ctx)
             IMG_STORE(ctl->failed, 1);
         return 0;
     }
+    /* Epoch before cell: the qualifier below must match the ticket's bank
+     * and incarnation, exactly as the issuer binds them. A missing select
+     * word skips the callback; it never fails coverage. */
+#ifdef P11SCOPE_LOADER_GATE
+    u32 select_key = 0;
+    struct image_bank_select *select = image_lookup(&IMAGE_BANK_SELECT, &select_key);
+    u64 epoch_a = select ? IMG_READ(select->incarnation[0]) : 0;
+    u64 epoch_b = select ? IMG_READ(select->incarnation[1]) : 0;
+#endif
     u64 *cell = image_storage_get(&TASK_COOKIE, task, 0, 0);
+#ifdef P11SCOPE_LOADER_GATE
+    u64 bank = 0;
+    if (!cell) {
+        cell = image_storage_get(&TASK_COOKIE_B, task, 0, 0);
+        bank = 1;
+    }
+    if (!cell || !select)
+        return 0;
+    u64 fresh_first = IMG_READ(*cell);
+    if (!fresh_first || fresh_first > IMG_LIMIT)
+        return 0;
+    u64 epoch = bank ? epoch_b : epoch_a;
+    if (epoch >= IMAGE_IDENTITY_INCARNATION_LIMIT)
+        return 0;
+    u64 cookie = image_identity_qualify(fresh_first, bank, epoch);
+    if (!image_cookie_valid(cookie))
+        return 0;
+    void *fresh_map = bank ? (void *)&TASK_COOKIE_B : (void *)&TASK_COOKIE;
+#else
     if (!cell)
         return 0;
     u64 cookie = IMG_READ(*cell);
     if (!image_cookie_valid(cookie))
         return 0;
+#endif
     struct image_query_request *request = image_lookup(&IMAGE_QUERY_REQUESTS, &cookie);
     if (!request || request->generation != ctl->generation || request->cookie != cookie ||
         request->slot >= ctl->count)
@@ -377,13 +431,25 @@ int p11_image_query(struct image_iter_task *ctx)
     if (leader == task && !(task->flags & 0x00200000U) && record &&
         image_snapshot(record, exec_id, &row.sequence)) {
         IMG_BARRIER();
-        u64 *fresh = image_storage_get(&TASK_COOKIE, task, 0, 0);
-        if (fresh && IMG_READ(*fresh) == cookie &&
+        /* The fresh re-read follows the ticket's own bank and compares the
+         * raw stored ticket. Without the gate this expands to the original
+         * two lines, parenthesis for parenthesis. */
+#ifdef P11SCOPE_LOADER_GATE
+#define IMG_FRESH_MAP fresh_map
+#define IMG_FRESH_WANT fresh_first
+#else
+#define IMG_FRESH_MAP (&TASK_COOKIE)
+#define IMG_FRESH_WANT cookie
+#endif
+        u64 *fresh = image_storage_get(IMG_FRESH_MAP, task, 0, 0);
+        if (fresh && IMG_READ(*fresh) == IMG_FRESH_WANT &&
             task->group_leader == leader && IMG_READ(task->self_exec_id) == exec_id &&
             IMG_READ(record->seq) == row.sequence && image_allowed()) {
             row.exec_id = exec_id;
             row.status = IMG_ROW_READY;
         }
+#undef IMG_FRESH_MAP
+#undef IMG_FRESH_WANT
     }
     if (image_seq_write(ctx->meta->seq, &row, sizeof(row))) {
         IMG_STORE(ctl->failed, 1);

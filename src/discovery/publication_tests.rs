@@ -2894,10 +2894,10 @@ fn stale_ls_manifest(
 }
 
 /// Case 9: a non-p11-kit legacy static table. Five file-backed static
-/// tables: scan-only spills one past K=4 with unknown names; a stale
-/// manifest's exact-target fallback binds one table (bypass + authorized
-/// names + linkage "manifest"); a live return merges with the scan
-/// instance (bypass + linkage "live_return").
+/// tables: scan-only admits the fitting family whole with unknown names; a
+/// stale manifest's exact-target fallback binds one table (bypass +
+/// authorized names + linkage "manifest"); a live return merges with the
+/// scan instance (bypass + linkage "live_return").
 /// Guards: static behavior that must survive the heap work.
 #[test]
 fn legacy_static_table_scan_manifest_and_live() {
@@ -2940,7 +2940,8 @@ fn legacy_static_table_scan_manifest_and_live() {
         })
         .collect();
 
-    // 9a: scan-only. Five heuristic tables, one spills past K=4.
+    // 9a: scan-only. Five heuristic tables, a closure array that fits,
+    // so the family admits whole.
     let started = Instant::now();
     let engine_a = engine_over_pids(&[holder.pid]);
     assert_eq!(engine_a.modules.len(), 1);
@@ -2978,8 +2979,8 @@ fn legacy_static_table_scan_manifest_and_live() {
     assert_eq!(linkage_a, vec!["heuristic"; 5], "no sweep triples here");
     assert_eq!(
         engine_a.plan().uncorroborated_candidates,
-        1,
-        "the fifth heuristic table spills past K=4"
+        0,
+        "the fitting family admits whole, nothing spills"
     );
     assert_eq!(engine_a.plan().entries_seen, 5 * 68);
     assert_eq!(engine_a.budget.table_candidates_count(), 5);
@@ -3065,7 +3066,7 @@ fn legacy_static_table_scan_manifest_and_live() {
     assert_eq!(
         engine_b.plan().uncorroborated_candidates,
         0,
-        "manifest support bypasses K=4"
+        "the bound table plus four heuristic tables all admit"
     );
     assert_eq!(engine_b.plan().slots.len(), 68);
     for slot in &engine_b.plan().slots {
@@ -3296,12 +3297,14 @@ fn broad_stripped_build_adds_nothing_beyond_selected() {
     assert_costing(&broad, wall, "t11-broad-stripped");
 }
 
-/// Case 12 (Task 1.6): broad is fit-or-refuse-whole. Six validated
-/// heuristic tables exceed the selected profile's slot ceiling (100 targets
-/// each at 512, 400 each at 2112): selected admission takes the
-/// strongest-evidence prefix (4 tables) and spills 2; broad refuses the
+/// Case 12 (Task 1.6): broad is fit-or-refuse-whole. Four validated
+/// heuristic tables exceed the selected profile's slot ceiling (150 targets
+/// each at 512, 600 each at 2112): selected admission takes the
+/// strongest-evidence prefix (3 tables) and spills 1; broad refuses the
 /// module whole with zero spill — a prefix
 /// would break the dormant-activation promise without forcing PARTIAL.
+/// (Six tables would be a closure array, which selected admission also
+/// decides whole; four keep the heuristic prefix under test.)
 #[test]
 fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     use std::os::unix::fs::MetadataExt as _;
@@ -3316,15 +3319,15 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     };
     let object = PinnedObjectId(7);
     let per_table = if cfg!(feature = "wide-detailed-2112") {
-        400u32
+        600u32
     } else {
-        100u32
+        150u32
     };
     assert!(
-        4 * per_table <= p11scope_ebpf_common::MAX_SLOTS
-            && 6 * per_table > p11scope_ebpf_common::MAX_SLOTS
+        3 * per_table <= p11scope_ebpf_common::MAX_SLOTS
+            && 4 * per_table > p11scope_ebpf_common::MAX_SLOTS
     );
-    let tables: Vec<ScannedTable> = (0..6u32)
+    let tables: Vec<ScannedTable> = (0..4u32)
         .map(|table| ScannedTable {
             version: (3, 2),
             walk: "full",
@@ -3362,7 +3365,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
             interfaces: vec![],
         },
         object,
-        entry_objects: vec![vec![object; per_table as usize]; 6],
+        entry_objects: vec![vec![object; per_table as usize]; 4],
     };
     let mut selected_counters = DiscoveryCounters::default();
     let selected = build_current_plan(
@@ -3378,8 +3381,8 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         plan::AdmissionScope::Named,
     )
     .expect("selected plan builds");
-    assert_eq!(selected.slots.len(), (4 * per_table) as usize);
-    assert_eq!(selected.uncorroborated_candidates, 2);
+    assert_eq!(selected.slots.len(), (3 * per_table) as usize);
+    assert_eq!(selected.uncorroborated_candidates, 1);
     assert!(selected.modules_skipped.is_empty());
 
     // Alone, the oversized module refuses everything: the plan fails

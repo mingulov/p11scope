@@ -1528,6 +1528,20 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
             module.lifecycle.label(),
             module.admission.label()
         );
+        // A refused module names its admission reason in plain words, on its
+        // own detail line. Admitted modules carry no such line; unresolved
+        // admission is pending evidence, not a refusal.
+        if module.admission == AdmissionState::Refused && !module.admission_reasons.is_empty() {
+            let _ = writeln!(
+                out,
+                "  admission: {}",
+                escape_controls(&module.admission_reasons[0])
+            );
+            let more = module.admission_reasons.len() - 1;
+            if more > 0 {
+                let _ = writeln!(out, "  (+{more} more admission reasons)");
+            }
+        }
     }
     for edge in &presentation.edges {
         // "Active now" keeps the historical observation-window meaning:

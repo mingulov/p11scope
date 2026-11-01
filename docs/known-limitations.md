@@ -31,7 +31,13 @@ past the per-capture kernel-map memory cap on hosts with many CPUs.
 Counter banks share one 65,536-entry return-value pool, and
 saturation is reported in the collection health. Per-call
 profile/trace capture stays fixed at 512 attach slots (2,112 only in
-the WIDE source build).
+the WIDE source build). A recognized proxy closure array (p11-kit's fixed
+wrapper tables) is admitted whole or not at all in every scope, after all
+providers, so it can never crowd a real provider out of the attach slots.
+Its 6,530+ endpoints exceed every current ceiling, so the proxy layer
+itself stays refused with a named gap while the backends behind it attach
+(costs of covering it are measured in
+`docs/notes/2026-11-01-p11kit-proxy-layer-measurement.md`).
 
 Endpoint selection (`--select-endpoint` with `--mode metrics` and
 `--counter-mode`) details one function from the broad counter's own

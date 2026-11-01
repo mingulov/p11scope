@@ -111,7 +111,7 @@ if name=='cp':
     os.execv('/bin/cp',['cp',*args])
 if name=='cc':
     out=pathlib.Path(args[args.index('-o')+1])
-    out.write_text('#!'+sys.executable+'\nimport json,os,sys\njson.dump({"tool":"workload","args":sys.argv[1:]},open(os.environ["FAKE_EVENTS"],"a"))\nopen(os.environ["FAKE_EVENTS"],"a").write(chr(10))\nprint("SETTLED after 0s")\nprint("LEDGER C_Initialize=1 C_Finalize=1")\n')
+    out.write_text('#!'+sys.executable+'\nimport json,os,sys\njson.dump({"tool":"workload","args":sys.argv[1:]},open(os.environ["FAKE_EVENTS"],"a"))\nopen(os.environ["FAKE_EVENTS"],"a").write(chr(10))\nif not os.environ.get("FAKE_WORKLOAD_SILENT"):\n    print("READY cell=jwork pid=1 start=1 gen=0 exe=j-workload")\nprint("LEDGER cell=jwork pid=1 start=1 gen=0 exe=j-workload module=m fn=C_Sign mech=- n=1 bad=0 phase=main t0=1 t1=2")\n')
     out.chmod(0o755)
     sys.exit(0)
 if name=='softhsm2-util': sys.exit(1 if os.environ.get('FAKE_TOKEN_FAIL') else 0)
@@ -252,17 +252,21 @@ class JournalGateTests(unittest.TestCase):
         compiles = [event["args"] for event in events
                     if event["tool"] == "cc"]
         self.assertEqual(len(compiles), 1)
-        self.assertIn("counter-softhsm-workload.c", compiles[0][-2])
-        self.assertIn("-ldl", compiles[0])
+        self.assertIn("inventory-ledger.c", compiles[0][-3])
+        self.assertEqual(compiles[0][-2:], ["-ldl", "-lpthread"])
         self.assertTrue((out / "j-workload").is_file())
-        # Each workload iteration stays mapped 25 s before its burst,
-        # so discovery admits the caller and calls join instead of
-        # shedding as use-before-admission.
+        # One persistent caller with spread key-operation iterations:
+        # short-lived burst callers exit before admission and shed
+        # every call as use-before-admission.
         workloads = [event["args"] for event in events
                      if event["tool"] == "workload"]
-        self.assertTrue(workloads, "the guest never ran the workload")
-        for args in workloads:
-            self.assertEqual(args[1:], ["30", "25"])
+        self.assertEqual(len(workloads), 1,
+                         "the guest runs one persistent workload")
+        args = workloads[0]
+        self.assertEqual(args[0], "mech")
+        for flag in ("--cell", "--module", "--iters", "--sleep-us",
+                     "--hold"):
+            self.assertIn(flag, args)
 
     def write_budgets(self, programs):
         path = self.work / "budgets.json"
@@ -390,6 +394,18 @@ class JournalGateTests(unittest.TestCase):
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "nonqualifying")
         self.assertIn("token setup failed", row["detail"])
+
+    def test_workload_never_ready_is_nonqualifying(self):
+        # A workload that never prints READY (broken setup, dead
+        # token) fails the leg as infrastructure, never as a product
+        # verdict.
+        result, out = self.run_gate(
+            KERNEL, extra={"FAKE_WORKLOAD_SILENT": "1"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "nonqualifying")
+        self.assertIn("workload never readied", row["detail"])
 
     def test_garbled_staging_line_still_passes(self):
         # vng's console capture demonstrably garbles the boot-config

@@ -9131,6 +9131,7 @@ mod cancellation_tests;
 mod tests {
     use super::*;
     use crate::attach::BackendSelection;
+    use crate::discovery::engine::tests::copy_executable_via_waited_child;
     use crate::fixture_guard::DieWithParent as _;
     use std::ffi::OsString;
     use std::os::fd::{AsFd as _, BorrowedFd};
@@ -10076,8 +10077,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let command = directory.path().join("command");
         let replacement = directory.path().join("replacement");
-        std::fs::copy("/bin/true", &command).unwrap();
-        std::fs::copy("/bin/false", &replacement).unwrap();
+        // Waited-child copies: this test execs `command`, and an in-process
+        // copy would hold it open for writing across concurrent forks.
+        // (`set_permissions` only calls chmod, which opens no fd.)
+        copy_executable_via_waited_child(std::path::Path::new("/bin/true"), &command);
+        copy_executable_via_waited_child(std::path::Path::new("/bin/false"), &replacement);
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
 
@@ -11074,7 +11078,9 @@ mod tests {
     fn release_error_defers_settlement_for_owned_cleanup() {
         let directory = tempfile::tempdir().unwrap();
         let command = directory.path().join("command");
-        std::fs::copy("/bin/true", &command).unwrap();
+        // Waited-child copy: this test execs `command`, and an in-process
+        // copy would hold it open for writing across concurrent forks.
+        copy_executable_via_waited_child(std::path::Path::new("/bin/true"), &command);
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut child = OwnedChild::spawn(command.clone().into_os_string(), Vec::new()).unwrap();
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -20960,6 +20966,7 @@ mod history_tests;
 mod trace_identity_consumer_tests {
     use super::*;
     use crate::attach::detailed_identity::ProofSession;
+    use crate::discovery::engine::tests::copy_executable_via_waited_child;
     use crate::discovery::engine::tests::detailed_proof_driver as driver;
     use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
     use crate::fixture_guard::DieWithParent as _;
@@ -21474,7 +21481,10 @@ int main(int argc, char **argv) {
                 .unwrap()
                 .success()
         );
-        std::fs::copy(&old, &successor).unwrap();
+        // Waited-child copy: the child execs the successor on command 'c',
+        // and an in-process copy would hold it open for writing across
+        // concurrent forks.
+        copy_executable_via_waited_child(&old, &successor);
         (old, successor)
     }
 

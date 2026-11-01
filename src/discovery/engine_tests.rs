@@ -7882,13 +7882,11 @@ fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
 
     let dir = tempfile::tempdir().unwrap();
     let executable = dir.path().join("large-sh");
-    std::fs::copy(source_path, &executable).unwrap();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&executable)
-        .unwrap()
-        .set_len(2 * 1024 * 1024 * 1024 + 11 * 1024 * 1024)
-        .unwrap();
+    // Both the copy and the size extension run in waited children, never
+    // in-process: this executable is spawned below, and an in-process write
+    // fd would be inheritable by a concurrent fork from another test thread.
+    copy_executable_via_waited_child(source_path, &executable);
+    truncate_executable_via_waited_child(&executable, 2 * 1024 * 1024 * 1024 + 11 * 1024 * 1024);
     assert_eq!(
         std::fs::metadata(&executable).unwrap().len(),
         2 * 1024 * 1024 * 1024 + 11 * 1024 * 1024
@@ -15096,6 +15094,45 @@ fn compile_tabled_runner(dir: &std::path::Path) -> PathBuf {
     runner
 }
 
+/// Copy a fixture executable that a test will later exec through a
+/// waited-for `cp` child, never in-process: an in-process copy holds the
+/// destination open for writing, and a concurrent fork from another test
+/// thread inherits that fd — if the fork-child has not exec'd yet when the
+/// test execs the copy, the exec fails with ETXTBSY. A child writer owns
+/// the write fd privately, so no in-process fork can inherit it, and the
+/// wait proves the fd is closed before any exec of the copy.
+pub(crate) fn copy_executable_via_waited_child(source: &std::path::Path, target: &std::path::Path) {
+    let status = std::process::Command::new("cp")
+        .arg(source)
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "cp {} {}: {status}",
+        source.display(),
+        target.display()
+    );
+}
+
+/// Extend a fixture executable to `size` bytes through a waited-for
+/// `truncate` child, never in-process: like the copy above, an in-process
+/// size change holds the destination open for writing across concurrent
+/// forks. Waited before any exec of the target.
+pub(crate) fn truncate_executable_via_waited_child(target: &std::path::Path, size: u64) {
+    let status = std::process::Command::new("truncate")
+        .arg("-s")
+        .arg(size.to_string())
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "truncate -s {size} {}: {status}",
+        target.display()
+    );
+}
+
 impl TabledSeedProvider {
     fn grow_function_table(&mut self) {
         use std::io::Read as _;
@@ -15111,22 +15148,10 @@ impl TabledSeedProvider {
     }
 
     fn copy_tabled_runner(&self) -> PathBuf {
-        // Copy through a waited-for child, never in-process: an in-process
-        // copy holds the destination open for writing, and a concurrent fork
-        // from another test thread inherits that fd — if the fork-child has
-        // not exec'd yet when the runner execs the copy, the exec fails with
-        // ETXTBSY. A child writer owns the write fd privately, so no
-        // in-process fork can inherit it, and the wait proves the fd is
-        // closed before any exec of the copy.
+        // Through the shared waited-child writer: an in-process copy would
+        // hold the destination open for writing across concurrent forks.
         let target = self.dir.path().join("tabled-runner.copy");
-        assert!(
-            std::process::Command::new("cp")
-                .arg(self.dir.path().join("tabled-runner"))
-                .arg(&target)
-                .status()
-                .unwrap()
-                .success()
-        );
+        copy_executable_via_waited_child(&self.dir.path().join("tabled-runner"), &target);
         target
     }
 

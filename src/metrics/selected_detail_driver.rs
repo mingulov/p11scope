@@ -994,16 +994,21 @@ mod tests {
         CounterCell, CounterCollector, CounterHealth, CounterLimits, CounterObservation,
         CounterRead, CounterRow, ReadReservation, ReadWindow,
     };
-    use super::super::selected_detail::BanksBroad;
+    use super::super::selected_detail::{BanksBroad, verify_reserve_inputs};
     use super::*;
     use crate::attach::counter_banks::tests::{
         stage_toggle_banks, toggle_object_plan, toggle_provider,
     };
     use crate::discovery::identity::PinnedObjectId;
     use crate::inventory_promotion::lifecycle::{
-        SelectedActivationBinding, scripted_promotion_view_with_baseline_for_test,
+        SelectedActivationBinding, scripted_promotion_view_for_test,
+        scripted_promotion_view_with_baseline_for_test,
     };
-    use crate::inventory_promotion::{Promoter, PromotionRequest};
+    use crate::inventory_promotion::{
+        CaptureId, Promoter, PromotionCancel, PromotionEnd, PromotionRefusal, PromotionRequest,
+        PromotionRequestError, PromotionState, PromotionView, SelectedEndpointReceipt,
+        ViewRevision,
+    };
     use crate::plan::Slot;
     use crate::semantics_edge::resources::SemanticResourcePool;
     use p11scope_ebpf_common::{CountStats, SlotStats, TimestampStats};
@@ -3543,5 +3548,247 @@ mod tests {
             }
         }
         assert_no_totals(section);
+    }
+
+    /// Headless mailbox (P1a): a receipt naming another revision is
+    /// stale — the selection raced a redraw — and refuses without
+    /// queueing, never rebound to the viewed frame. The control stays
+    /// idle and a receipt naming the viewed revision still queues.
+    #[test]
+    fn headless_request_stale_view_refuses() {
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        let mut promoter = Promoter::new();
+        assert!(promoter.enable(CaptureId::new(11)));
+        let view = scripted_promotion_view_for_test();
+        assert_eq!(view.revision(), ViewRevision::new(3));
+        let stale = SelectedEndpointReceipt::new(ViewRevision::new(4), 0x80);
+        assert_eq!(
+            promoter.request_with_endpoint(Arc::clone(&view), CallerId(3), ModuleId(5), stale),
+            Err(PromotionRequestError::Refused(PromotionRefusal::StaleView)),
+            "a receipt for another view is stale, never rebound"
+        );
+        assert!(
+            promoter.take_request().is_none(),
+            "a stale request queues nothing"
+        );
+        assert_eq!(promoter.state(), PromotionState::Idle, "control stays idle");
+        assert!(promoter.enabled(), "the run stays bound");
+        // The mailbox is unpoisoned: the viewed revision still queues.
+        let fresh = SelectedEndpointReceipt::new(view.revision(), 0x80);
+        let id = promoter
+            .request_with_endpoint(Arc::clone(&view), CallerId(3), ModuleId(5), fresh)
+            .expect("viewed revision queues after a stale refusal");
+        let taken = promoter.take_request().expect("mailbox holds it");
+        assert_eq!(taken.id(), id);
+        assert_eq!(taken.endpoint(), Some(fresh));
+    }
+
+    /// Headless mailbox (P1a): a pair outside the fixed viewed frame
+    /// refuses `PairNotInView` — never queued, never replaced by
+    /// another row — on either axis. The control stays idle and the
+    /// exact pair still queues.
+    #[test]
+    fn headless_request_pair_not_in_view() {
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        let mut promoter = Promoter::new();
+        assert!(promoter.enable(CaptureId::new(11)));
+        let view = scripted_promotion_view_for_test();
+        let receipt = SelectedEndpointReceipt::new(view.revision(), 0x80);
+        for (caller, provider) in [(CallerId(3), ModuleId(6)), (CallerId(4), ModuleId(5))] {
+            assert_eq!(
+                promoter.request_with_endpoint(Arc::clone(&view), caller, provider, receipt),
+                Err(PromotionRequestError::PairNotInView),
+                "off-view pair refuses: {caller:?}/{provider:?}"
+            );
+        }
+        assert!(
+            promoter.take_request().is_none(),
+            "off-view requests queue nothing"
+        );
+        assert_eq!(promoter.state(), PromotionState::Idle, "control stays idle");
+        // The mailbox is unpoisoned: the exact pair still queues.
+        let id = promoter
+            .request_with_endpoint(Arc::clone(&view), CallerId(3), ModuleId(5), receipt)
+            .expect("exact pair queues after off-view refusals");
+        let taken = promoter.take_request().expect("mailbox holds it");
+        assert_eq!(taken.id(), id);
+        assert_eq!(taken.endpoint(), Some(receipt));
+    }
+
+    /// Headless mailbox (P1a): a view naming another capture refuses
+    /// `ForeignCapture` even when the receipt names the viewed
+    /// revision (the stale check passes first, pinning check order).
+    #[test]
+    fn headless_request_foreign_capture() {
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        let mut promoter = Promoter::new();
+        assert!(promoter.enable(CaptureId::new(11)));
+        let base = scripted_promotion_view_for_test();
+        let foreign = Arc::new(PromotionView::new(
+            CaptureId::new(12),
+            base.revision(),
+            Arc::clone(base.presentation()),
+        ));
+        let receipt = SelectedEndpointReceipt::new(foreign.revision(), 0x80);
+        assert_eq!(
+            receipt.view(),
+            foreign.revision(),
+            "the stale check passes by construction"
+        );
+        assert_eq!(
+            promoter.request_with_endpoint(Arc::clone(&foreign), CallerId(3), ModuleId(5), receipt),
+            Err(PromotionRequestError::ForeignCapture),
+            "a view from another capture never queues"
+        );
+        assert!(
+            promoter.take_request().is_none(),
+            "a foreign view queues nothing"
+        );
+        assert_eq!(promoter.state(), PromotionState::Idle, "control stays idle");
+        assert_eq!(promoter.capture(), Some(CaptureId::new(11)));
+        // The mailbox is unpoisoned: the bound capture still queues.
+        let fresh = SelectedEndpointReceipt::new(base.revision(), 0x80);
+        promoter
+            .request_with_endpoint(Arc::clone(&base), CallerId(3), ModuleId(5), fresh)
+            .expect("bound capture queues after a foreign refusal");
+        let taken = promoter.take_request().expect("mailbox holds it");
+        assert_eq!(taken.endpoint(), Some(fresh));
+    }
+
+    /// Headless mailbox (P1a): the one-slot mailbox refuses a repeat
+    /// of the in-flight pair as `Duplicate` and a distinct pair as
+    /// `Busy`, holding the first ticket throughout; cancel drains the
+    /// untaken request and the next request queues with a fresh serial.
+    #[test]
+    fn headless_mailbox_busy_duplicate() {
+        use crate::discovery::caller_registry::{CallerId, ModuleId};
+        let mut promoter = Promoter::new();
+        assert!(promoter.enable(CaptureId::new(11)));
+        let base = scripted_promotion_view_for_test();
+        let mut presentation = (**base.presentation()).clone();
+        let second = crate::inventory_present::EdgeView {
+            caller: CallerId(7),
+            module: ModuleId(9),
+            ..base.presentation().edges[0].clone()
+        };
+        presentation.edges.push(second);
+        let view = Arc::new(PromotionView::new(
+            CaptureId::new(11),
+            base.revision(),
+            Arc::new(presentation),
+        ));
+        let first = SelectedEndpointReceipt::new(view.revision(), 0x80);
+        let id1 = promoter
+            .request_with_endpoint(Arc::clone(&view), CallerId(3), ModuleId(5), first)
+            .expect("first request queues");
+        assert_eq!(promoter.state(), PromotionState::Queued);
+        assert_eq!(
+            promoter.snapshot(None).request,
+            Some(id1),
+            "mailbox holds the first ticket"
+        );
+        assert_eq!(
+            promoter.request_with_endpoint(Arc::clone(&view), CallerId(3), ModuleId(5), first),
+            Err(PromotionRequestError::Refused(PromotionRefusal::Duplicate)),
+            "a repeat of the in-flight pair is a duplicate"
+        );
+        let other = SelectedEndpointReceipt::new(view.revision(), 0x90);
+        assert_eq!(
+            promoter.request_with_endpoint(Arc::clone(&view), CallerId(7), ModuleId(9), other),
+            Err(PromotionRequestError::Refused(PromotionRefusal::Busy)),
+            "a distinct pair while outstanding is busy"
+        );
+        assert_eq!(
+            promoter.snapshot(None).request,
+            Some(id1),
+            "refusals queue nothing over the first ticket"
+        );
+        assert_eq!(promoter.cancel(), PromotionCancel::Cancelled);
+        assert_eq!(
+            promoter.state(),
+            PromotionState::Ended(PromotionEnd::Cancelled),
+            "cancel ends the untaken request"
+        );
+        assert!(
+            promoter.take_request().is_none(),
+            "cancel drains the mailbox"
+        );
+        let id2 = promoter
+            .request_with_endpoint(Arc::clone(&view), CallerId(3), ModuleId(5), first)
+            .expect("requeue succeeds after cancel");
+        assert_ne!(id2, id1, "the requeue takes a fresh serial");
+        let taken = promoter.take_request().expect("mailbox holds the requeue");
+        assert_eq!(taken.id(), id2);
+        assert_eq!(taken.endpoint(), Some(first));
+        assert_eq!(
+            (taken.caller(), taken.provider()),
+            (CallerId(3), ModuleId(5))
+        );
+    }
+
+    /// Headless mailbox (P1a): a legacy `None`-endpoint request taken
+    /// from a headless (display-less) promoter reaches the adapter and
+    /// refuses `EndpointUnresolved` on the `verify_reserve_inputs`
+    /// path — closed, with no window parked and no charge taken. The
+    /// baseline genuinely agrees with the request, so the refusal is
+    /// the missing receipt, not a mismatch; a receipt-carrying request
+    /// then verifies clean on the same custody.
+    #[test]
+    fn headless_legacy_none_endpoint_refused_closed() {
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let convert = convert_for(&scene.plan, scene.object);
+        let legacy = promotion_scene(
+            convert.clone(),
+            scene.objects.clone(),
+            scene.object,
+            None,
+            0xC00,
+            0xE9E,
+        );
+        assert_eq!(legacy.request.endpoint(), None);
+        assert!(
+            legacy.bundle.baseline.matches_request(&legacy.request),
+            "the baseline agrees: the refusal is the missing receipt"
+        );
+        let custody = DetailWindowCustody::new();
+        let before = scene.pool.snapshot().charged_bytes;
+        assert_eq!(
+            verify_reserve_inputs(
+                &legacy.request,
+                &legacy.bundle,
+                &scene.plan,
+                &scene.objects,
+                &custody,
+            ),
+            Err(SelectedDetailRefusal::EndpointUnresolved),
+            "a legacy request refuses closed at the adapter"
+        );
+        assert!(!custody.is_occupied(), "no window parks on refusal");
+        assert_eq!(
+            scene.pool.snapshot().charged_bytes,
+            before,
+            "no charge is taken on refusal"
+        );
+        // The custody is unpoisoned: a receipt-carrying request over a
+        // fresh bundle verifies clean on the same custody.
+        let proved = promotion_scene(
+            convert,
+            scene.objects.clone(),
+            scene.object,
+            Some(0x90),
+            0xC00,
+            0xE9E,
+        );
+        let resolved = verify_reserve_inputs(
+            &proved.request,
+            &proved.bundle,
+            &scene.plan,
+            &scene.objects,
+            &custody,
+        )
+        .expect("receipt request verifies after a legacy refusal");
+        assert_eq!(resolved.selected, 1);
+        assert_eq!(resolved.physical.file_offset, 0x90);
     }
 }

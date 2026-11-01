@@ -296,9 +296,9 @@ its proved offsets (`watch` on the discovery record, with `attached_at_ns`
 and `unobserved_windows` merged at capture end). A quiet pre-armed interval
 is a stated watch interval, not proven-exact coverage: no R2-D1-6 exactness
 producer ships yet, so attached modules always disclose their window.
-Inventory accepts and retains pre-arm inputs but Detailed-subset offset
-activation follows in a later packet (disclosed as a `pre-arm subset
-pending` scope gap). An in-place rewrite that preserves `(ino, size, ctime)`
+Inventory accepts and retains pre-arm inputs and attaches proved offsets
+through the inventory lane; per-input interval rows follow in a later
+packet (disclosed as a `pre-arm interval rows pending` scope gap). An in-place rewrite that preserves `(ino, size, ctime)`
 at the filesystem's granularity is undetectable by the retained-fd checks;
 heavier proof is later work.
 

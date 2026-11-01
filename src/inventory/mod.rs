@@ -1365,9 +1365,9 @@ fn run_with_terminal_budget(
     }
     coordinator.set_manifests(manifests.to_vec());
     // Packet 6.13 round-2 (F5): the startup pinning above is retained for
-    // the run. Detailed-subset offset activation follows in a later packet
-    // — disclosed, never silently dropped — but the validation, pin and
-    // held-FD custody here are real.
+    // the run and its proved offsets lower into the run's attach set before
+    // passes. Per-input interval rows follow in a later packet — disclosed,
+    // never silently dropped.
     if let Some(pinning) = prearm_pinning {
         let retained = pinning.inputs.len();
         coordinator.set_prearm_pinning(pinning);
@@ -1375,9 +1375,9 @@ fn run_with_terminal_budget(
         // so the capture attaches them through the existing native lane.
         coordinator.absorb_prearm_plan(started_ns);
         coordinator.note_scope_gap(
-            "pre-arm subset pending".into(),
+            "pre-arm interval rows pending".into(),
             format!(
-                "{retained} --prearm-module input(s) retained; Detailed-subset offset activation follows in a later packet"
+                "{retained} --prearm-module input(s) retained and lowered into the attach set; per-input interval rows follow in a later packet"
             ),
         );
     }
@@ -8517,9 +8517,9 @@ mod tests {
     }
 
     /// Packet 6.13 round-2 (F5): a valid `--prearm-module` under auto/native
-    /// pins and retains the provider instead of refusing every mode. The
-    /// Detailed-subset offset activation stays pending (disclosed gap), but
-    /// startup validation, pin and held-FD custody are real.
+    /// pins and retains the provider instead of refusing every mode.
+    /// Per-input interval rows stay pending (disclosed gap), but startup
+    /// validation, pin and held-FD custody are real.
     #[test]
     fn inventory_run_accepts_valid_prearm_under_auto_with_retained_gap() {
         // A trivial provider with no standard exports: pinning succeeds,

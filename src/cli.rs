@@ -612,7 +612,7 @@ Quiet cgroup usage remains unknown: endpoint samples do not prove continuous mem
 Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, not the cgroup tree.
 --module narrows the scan to named providers.
 --manifest is repeatable explicit operator attestation for the optional Detailed subset; requires auto or native.
---prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping; Detailed-subset offset activation follows in a later packet; requires auto or native.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and attaches proved offsets through the inventory lane; per-input interval rows follow in a later packet; requires auto or native.
 --key-operations opts in to per-key tracking through a linked journal session (default off); requires --capture auto or native, and a build with the journal object.
 In this version it adds per-edge mechanisms and API results; key operations are planned for 0.6.0.
 Subset preparation preserves broad physical counting; positive instance delivery awaits runtime activation.

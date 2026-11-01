@@ -72,8 +72,8 @@ refusal during a `--manifest` capture ends the first stop with an incomplete
 report and a nonzero exit. Uncertain native ownership stays retained and
 replacement admission stays blocked; the refusal is not proof of clean detach.
 
-In v0.6.0 release builds, with the per-key-tracking opt-in
-`p11scope inventory --key-operations` (default off), key operations are reported,
+In v0.6.0 release builds, key operations will be reported under the planned per-key-tracking opt-in
+`p11scope inventory --key-operations` (default off; the flag is not implemented yet),
 with the following birth-marker limits. If any watched call of a program is
 not fully captured — the call ran outside the selected scope, its binary
 interface was refused, or the call was dropped (a lost identity, start record
@@ -101,7 +101,9 @@ same process). Programs it starts while the capture runs (children) are not
 observed, even when they call the same provider. One narrow exception: a child
 started with vfork (as with posix_spawn) that still shares the target's memory
 and calls the provider before starting its own program is marked as not covered
-instead of being ignored.
+instead of being ignored: with single-link attach its call reaches the scope check and dirties the row,
+while with multi attach the kernel skips it first and no row is marked. Neither path is yet
+verified live.
 
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are

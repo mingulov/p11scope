@@ -430,21 +430,52 @@ and attach generation; the calibration cell also carries the observer's own
 calibration thread id and hit count. The flags word is checked and
 discarded; none of these values is emitted.
 
+Wire: each EVENTS record carries a private 40-byte tail `{entry_ip,
+entry_stamp, return_stamp}` after the unchanged 328-byte `Event`.
+Userspace keeps the entry IP inside the instance router (`EntryIp`: no
+`Debug`, `Display` or `Serialize`) and drops the tail before any decoder
+used by renderers. The entry IP, stamps, maps ranges and map_files
+identities never reach JSON, JSONL, trace, profile, dashboard, logs or
+errors; public output may carry only finite continuity, coverage and
+refusal facts and capture-local instance IDs.
+
+Userspace join input: `/proc/PID/maps` ranges of the watched file, each
+confirmed by `stat()` of `/proc/PID/map_files/<range>` against the identity
+recorded at calibration (device and inode numbers of a provider file, used
+for equality only, never emitted). The `(s_dev, i_ino)` maps key alone is
+not unique (btrfs subvolumes, overlay without xino) and is never a join
+authority.
+
+Required evidence before activation adds: an exact-offset canary scanner for
+the entry IP and stamps in the EVENTS tail and `INSTANCE_START`, with
+must-detect positive controls in public outputs; and a sentinel regression
+proving renderers never receive the tail.
+
 ## Post-attach birth marker (object journal slice D)
 
-**Status: IMPLEMENTED in development for v0.6.0; FULL/P0 release builds
-include the journal and birth marker (owner B2, 2026-11-01), and the linked
-birth seals activate only when the user opts in to per-key tracking (owner
-B1, 2026-11-01), with no new read. No formal privacy sign-off before about
-v0.9 (OD25).** The opt-in is `p11scope inventory --key-operations` (default
-off). At this revision the kernel publish/dirty hooks are implemented
+**Status: IMPLEMENTED in development for v0.6.0 behind two build switches, both default off:
+`P11SCOPE_BIRTH_MARKER=1` compiles the marker into Detailed objects, and `P11SCOPE_JOURNAL=1`
+builds the journal object. The owner approved both for FULL/P0 release builds (owner B2, 2026-11-01;
+final yes/no at freeze); embedding lands with WU-2 after the WU-4 live cells. The linked birth seals
+activate only when the user opts in to per-key tracking (owner B1, 2026-11-01), with no new read.
+No formal privacy sign-off before about v0.9 (OD25).** The opt-in will be
+`p11scope inventory --key-operations` (default off; selection ruling 2026-11-01, parser lands with WU-2).
+At this revision the kernel publish/dirty hooks are implemented
 and the Session-loop seal wire is pending (WU-2); until it lands, no production
 caller mints births from marker state.
-This adds state only in a Detailed lane Session that has published an attach generation (closure).
-Non-counter metrics, profile and trace Sessions load the same Detailed object (counter-mode Sessions load
-counter objects), so the control map exists there,
+In a marker build, this adds state only in a Detailed lane Session that has published an attach generation
+(closure): every `inventory --manifest` capture whose semantic lane seals publishes the attach generation
+and arms the marker, with or without the opt-in. Under `--system` that is one record per process that
+execs after closure. WU-2 is to arm the marker only under the flag if it can (selection ruling item 7);
+this text changes with it.
+In a marker build, non-counter metrics, profile and trace Sessions load the same Detailed object
+(counter-mode Sessions load counter objects), so the control map exists there,
 zeroed and frozen, and the hooks do one gated read. The marker adds no state to them. Inventory and counter
-objects do not contain the map. v1 and v2 are unchanged.
+objects do not contain the map. The journal object instead carries the control map and the DIRTY gap writer
+but no READY publish or exec-ID read, and its control row is only metadata-checked today, not yet read back
+as zero or frozen; WU-2 has the obligation to add the zero-check and freeze. The journal object is
+unreachable in production today. v1 is unchanged; the v2 table carries one row for this read beside the
+Exec task ticket row.
 
 Kernel-side state, owned by the exact observer Session:
 - The existing 8-byte `journal_bootstrap` word of the per-process `PROC_EPOCH` record (the record stays
@@ -456,8 +487,9 @@ Kernel-side state, owned by the exact observer Session:
   `self_exec_id` counter, the same value the approved image identity already reads. It is not a PID, path or
   name.
 - `JOURNAL_MARKER_CTL`: one 16-byte cell `{spent, failed}`, the marker admissions spent in this Session and
-  a sticky failure latch. Userspace reads it back as zero and freezes it before any probe attaches, and
-  never writes it.
+  a sticky failure latch. In a Detailed marker Session, userspace reads it back as zero and freezes it
+  before any probe attaches, and never writes it. (The journal object's control row is only
+  metadata-checked today; see Status above.)
 
 Writers, at exec, fork, first watched call or thread exit (before closure the exec and gap hooks each do
 one array read and return; fork only zeroes the marker in fresh task storage):
@@ -481,9 +513,10 @@ Scope note: under `--cgroup`, a process outside the selected scope that calls a 
 record holding DIRTY (a record the gap creates holds only DIRTY and zero fields; a record Stage A created
 first keeps its Stage A fields and gains DIRTY). Under `--pid` an outside process never reaches BPF, so it
 gets no record from the marker, except a CLONE_VM sharer of the target (a vfork or posix_spawn child before it
-execs) that calls a watched function: it is left not covered. Where its call reaches BPF it is marked DIRTY
-and spends one admission; whether either attach backend delivers such a call under `--pid` is not yet
-verified live. (The CLONE_VM fork hook
+execs) that calls a watched function: it is left not covered. Under the single-link backend the call
+reaches BPF (the kernel filter compares only the mm), so the scope check refuses it and the gap marks the
+row DIRTY, spending one admission; under the multi backend the kernel skips the call before BPF runs, so
+the row stays unmarked. Neither path is yet verified live. (The CLONE_VM fork hook
 already creates a shared-mm `PROC_EPOCH` row for such a child regardless of scope.) Stage A already keeps unscoped `PROC_EPOCH` records for processes that map a watched
 provider file (see above), so this is not new in kind. It is never emitted, and it dies with the task.
 
@@ -496,36 +529,17 @@ decided by measured task-storage accounting on a target kernel.
 
 Linked birth seals (owner B1): key-operation rows are born only when the user opts in to per-key tracking;
 otherwise the seals stay off and marker state alone mints no birth. Each seal re-checks fresh evidence —
-the read-back marker word, the admission latch, pidfd custody and the attach generation — against the
-attested grant, and adds no read beyond the ratified set above. The seal path keeps two bounded private
-capture-lifetime userspace copies, `SessionBirthEvidence` and `SessionBirthGrant`
-(`src/semantics_objects/journal.rs`), released at capture teardown and never published; their raw-value
+the image pair, the read-back marker word, the admission latch, pidfd custody and the attach generation —
+against the attested grant, and adds no read beyond the ratified set above. The seal path keeps two bounded
+private capture-lifetime userspace copies (`src/semantics_objects/journal.rs`), released at capture teardown
+and never published: `SessionBirthEvidence` (the image cookie/exec pair, the marker word, the admission
+failure state, the attach generation and custody) and `SessionBirthGrant` (the domain proof, the birth kind,
+the birth cut, the closure generation, the bundled evidence and the optional stream binding). Their raw-value
 `Debug` output must be redacted before activation. The Session-loop seal wire lands in the WU-2 packet.
 
 Output: nothing new is emitted. The marker only decides whether a process's key operations are reported as
 complete or withheld with a finite `joint_birth_native_<reason>`. No argv, environment, PIN, key, payload or
 raw buffer is read or kept, and no pointer is retained or emitted.
-
-Wire: each EVENTS record carries a private 40-byte tail `{entry_ip,
-entry_stamp, return_stamp}` after the unchanged 328-byte `Event`.
-Userspace keeps the entry IP inside the instance router (`EntryIp`: no
-`Debug`, `Display` or `Serialize`) and drops the tail before any decoder
-used by renderers. The entry IP, stamps, maps ranges and map_files
-identities never reach JSON, JSONL, trace, profile, dashboard, logs or
-errors; public output may carry only finite continuity, coverage and
-refusal facts and capture-local instance IDs.
-
-Userspace join input: `/proc/PID/maps` ranges of the watched file, each
-confirmed by `stat()` of `/proc/PID/map_files/<range>` against the identity
-recorded at calibration (device and inode numbers of a provider file, used
-for equality only, never emitted). The `(s_dev, i_ino)` maps key alone is
-not unique (btrfs subvolumes, overlay without xino) and is never a join
-authority.
-
-Required evidence before activation adds: an exact-offset canary scanner for
-the entry IP and stamps in the EVENTS tail and `INSTANCE_START`, with
-must-detect positive controls in public outputs; and a sentinel regression
-proving renderers never receive the tail.
 
 ## Bounds, loss and output
 
@@ -889,16 +903,16 @@ scan limitation. These receipts provide no trace-event naming authority.
 
 ## Object producer activation (H7 slice D, 2026-10-14)
 
-**Status: IMPLEMENTED the reviewed finite producer; H8 journal transactions
-and linked birth seals ship in v0.6.0 release builds and activate only under
-the per-key-tracking opt-in (the post-attach birth marker read and retention
-is described in
-[Post-attach birth marker](#post-attach-birth-marker-object-journal-slice-d)),
-and H9 model delivery remains open, and no public object field carries
-observed data** (`object_observations` is emitted only as an explicit
-unavailable marker while H9 is open). This amendment records the reviewed read sites, retention
+**Status: IMPLEMENTED the reviewed finite producer. H8 journal transactions and linked birth seals are
+planned for v0.6.0 release builds (owner B2 approved FULL/P0 inclusion, final at freeze; embedding lands
+with WU-2 after the WU-4 live cells) and will activate only under the per-key-tracking opt-in (the
+post-attach birth marker read and retention is described in
+[Post-attach birth marker](#post-attach-birth-marker-object-journal-slice-d)).
+H9 model delivery remains open. No public object field carries observed data**
+(`object_observations` is emitted only as an explicit unavailable marker while H9 is open). This amendment
+records the reviewed read sites, retention
 and honesty rules for the activated lane only. Every other section
-keeps its own status; v1/v2 bytes are unchanged.
+keeps its own status; v1 bytes are unchanged (v2 carries the one marker row beside the Exec task ticket row).
 
 The lane is the operator-attested allowlisted Detailed lane: BPF sets
 the required-object marker only under the allowlisted policy flag with

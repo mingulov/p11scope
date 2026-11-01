@@ -70,7 +70,10 @@ use crate::attach::{BackendSelection, CapturePolicy, Scope};
 use crate::cli::{CaptureArgs, Kind, ScopeArg};
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::PinnedObjectId;
-use crate::discovery::loader::{LoaderContextSpec, MAX_LOADER_CONTEXTS};
+use crate::discovery::loader::{
+    LoaderAttemptKind, LoaderAttemptOwner, LoaderContextSpec, LoaderPrepareReason,
+    MAX_LOADER_CONTEXTS,
+};
 use crate::discovery::scheduler::MAX_PENDING_REFRESH;
 use crate::process::ProcessView;
 use p11scope_ebpf_common::DISCOVERY_POINTERS;
@@ -1808,6 +1811,330 @@ fn pressure_ticket_spend_fits_256_without_ambient() {
     group.terminate_all(WHAT);
     println!(
         "t8: ticket-spend: gate 2+0 exact, envelope 256 exact, 257th refused, wall={:?} VmHWM={}KiB",
+        wall_start.elapsed(),
+        vm_hwm_kb()
+    );
+}
+
+/// T-P2 ledger prototype (unprivileged): every loader prepare lands in the
+/// attempt ledger with its ordinal, pid, owned/ambient tag, view, outcome
+/// and caller deltas, and prepare reasons derive per pid (first = initial,
+/// same view = rearm, new view = readmit). Live arms come through the real
+/// ownership-gated path (SmallGroup, like the ticket-spend control); the
+/// envelope fill uses recorded direct commits; the 257th refuses with the
+/// exact capacity reason. Successful prepares equal the minted ticket count
+/// (the private allocation count's observable proxy with no removals);
+/// ordinals are gapless 1..=n.
+#[test]
+fn pressure_ticket_ledger_records_every_prepare() {
+    const WHAT: &str = "t8-ticket-ledger";
+    let wall_start = Instant::now();
+    let fixtures = FixtureBuild::compile_all("ledger");
+    let second = fixtures.dir.path().join("second.so");
+    std::fs::copy(&fixtures.early, &second).expect("second provider must copy");
+    assert_ne!(
+        std::fs::metadata(&fixtures.early).unwrap().ino(),
+        std::fs::metadata(&second).unwrap().ino()
+    );
+    let mut group = SmallGroup::spawn(&fixtures, &second, WHAT);
+    let owned = group.pids();
+    assert_eq!(owned.len(), 3);
+
+    let hints = vec![fixtures.early.clone(), second.clone()];
+    let mut engine =
+        Engine::discover(&system_args(hints), &Scope::System, None).expect("system discovery");
+    assert_eq!(
+        engine.loader_arms, 0,
+        "{WHAT}: discovery alone arms nothing"
+    );
+    assert!(
+        minted_ids(&engine).is_empty(),
+        "{WHAT}: discovery alone mints nothing"
+    );
+    assert!(
+        engine.loader_registry.attempts().is_empty(),
+        "{WHAT}: discovery alone records nothing"
+    );
+
+    let provider_pids: BTreeSet<u32> = group
+        .children
+        .iter()
+        .filter(|child| child.role != "head")
+        .map(LiveChild::pid)
+        .collect();
+    let mut provider_views = BTreeSet::new();
+    for view in &engine.views {
+        let owned_provider = engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view.id());
+        if owned_provider {
+            assert!(
+                owned.contains(&view.pid()),
+                "{WHAT}: REFUSED: ambient provider-bearing view for foreign pid {}",
+                view.pid()
+            );
+            provider_views.insert(view.pid());
+        }
+    }
+    assert_eq!(
+        provider_views, provider_pids,
+        "{WHAT}: exactly the 2 owned provider views, no more, no fewer"
+    );
+
+    let mut session = ScriptedSession::default();
+    session.dynamic_loader_reports_added = true;
+    let mut additions_allowed = true;
+    let mut pending_views = PendingViewRetirements::new();
+    let mut owned_pids: Vec<u32> = provider_pids.iter().copied().collect();
+    owned_pids.sort_unstable();
+    for pid in &owned_pids {
+        let position = live_position(&engine, *pid, WHAT);
+        let view_id = engine.views[position].id();
+        assert!(
+            !engine.loader_arming_gated(view_id),
+            "{WHAT}: owned pid {pid} is provider-owned, not gated"
+        );
+        let _candidate_changed: bool = engine
+            .arm_loader_or_partial(
+                position,
+                &mut session,
+                &mut additions_allowed,
+                &mut pending_views,
+            )
+            .unwrap_or_else(|error| panic!("{WHAT}: arming owned pid {pid} failed: {error:#}"));
+        assert_eq!(
+            engine.loader_registry.ids_for_view(view_id).len(),
+            1,
+            "{WHAT}: owned pid {pid} must arm exactly one context"
+        );
+    }
+    assert_eq!(engine.loader_arms, 2, "{WHAT}: 2 real arm attempts");
+    assert_eq!(
+        minted_ids(&engine),
+        [1, 2].into_iter().collect::<BTreeSet<_>>(),
+        "{WHAT}: tickets 1..=2 minted exactly once"
+    );
+    assert_no_ambient_arms(&engine, &owned, WHAT);
+
+    // Ledger after the live arms: every prepare recorded, counts match the
+    // minted set, ordinals gapless. Live arms carry views (joinable to owned
+    // pids below); pid annotation for Engine-driven arms lands with R2.
+    let attempts = engine.loader_registry.attempts();
+    assert_eq!(attempts.len(), 4, "{WHAT}: 2 preflights + 2 prepares");
+    let ordinals: Vec<usize> = attempts.iter().map(|entry| entry.ordinal).collect();
+    assert_eq!(ordinals, vec![1, 2, 3, 4], "{WHAT}: gapless ordinals");
+    let live_prepares: Vec<_> = attempts
+        .iter()
+        .filter(|entry| entry.kind == LoaderAttemptKind::Prepare && entry.refusal.is_none())
+        .collect();
+    assert_eq!(live_prepares.len(), 2, "{WHAT}: 2 live prepares recorded");
+    assert_eq!(
+        engine.loader_registry.successful_prepare_count(),
+        minted_ids(&engine).len(),
+        "{WHAT}: ledger prepares equal minted tickets"
+    );
+    for entry in &live_prepares {
+        let view = entry.view.expect("{WHAT}: live prepare names its view");
+        let pid = engine
+            .views
+            .iter()
+            .find(|candidate| candidate.id() == view)
+            .map(|candidate| candidate.pid())
+            .expect("{WHAT}: live view still live");
+        assert!(
+            owned.contains(&pid),
+            "{WHAT}: REFUSED: ledger prepare for foreign pid {pid}"
+        );
+    }
+
+    // Envelope fill to 256 through recorded direct commits. Two synthetic
+    // pids alternate views in blocks so the reason oracle sees all three
+    // shapes: first per pid = initial, same view = rearm, new view = readmit.
+    let first_view = engine.views[live_position(&engine, owned_pids[0], WHAT)].id();
+    let second_view = engine.views[live_position(&engine, owned_pids[1], WHAT)].id();
+    let hook = p11scope_manifest::elf::SymbolFact {
+        virtual_address: 0x2100,
+        file_offset: 0x2100,
+    };
+    for ticket in 3..=MAX_LOADER_CONTEXTS as u16 {
+        let index = ticket - 3;
+        let pid = 6000 + u32::from(index % 2);
+        let view = if index < 100 { first_view } else { second_view };
+        let prepared = engine
+            .loader_registry
+            .preflight_recorded(
+                LoaderContextSpec {
+                    view,
+                    loader: PinnedObjectId(9),
+                    mapping: None,
+                    hook,
+                    state_address: None,
+                },
+                pid,
+                true,
+                u64::from(ticket),
+                u64::from(ticket) + 1000,
+            )
+            .expect("envelope fill must preflight below capacity");
+        engine
+            .loader_registry
+            .prepare_recorded(
+                prepared,
+                pid,
+                true,
+                u64::from(ticket) + 1,
+                u64::from(ticket) + 1001,
+            )
+            .expect("envelope fill must prepare");
+    }
+    assert_eq!(
+        minted_ids(&engine),
+        (1..=256).collect::<BTreeSet<_>>(),
+        "{WHAT}: tickets 1..=256"
+    );
+    assert_eq!(
+        engine.loader_registry.successful_prepare_count(),
+        256,
+        "{WHAT}: 256 ledger prepares equal 256 minted"
+    );
+    let attempts = engine.loader_registry.attempts();
+    assert_eq!(attempts.len(), 512, "{WHAT}: 256 preflights + 256 prepares");
+    let ordinals: Vec<usize> = attempts.iter().map(|entry| entry.ordinal).collect();
+    assert_eq!(
+        ordinals,
+        (1..=512usize).collect::<Vec<_>>(),
+        "{WHAT}: ordinals 1..=512 without gaps"
+    );
+    let mut last_view: BTreeMap<u32, crate::process::ProcessViewId> = BTreeMap::new();
+    let mut expected: Vec<(usize, u32, LoaderPrepareReason)> = Vec::new();
+    for entry in attempts.iter().filter(|entry| {
+        entry.kind == LoaderAttemptKind::Prepare && entry.refusal.is_none() && entry.pid.is_some()
+    }) {
+        let pid = entry.pid.unwrap();
+        let view = entry.view.unwrap();
+        let reason = match last_view.get(&pid) {
+            None => LoaderPrepareReason::Initial,
+            Some(previous) if *previous == view => LoaderPrepareReason::Rearm,
+            Some(_) => LoaderPrepareReason::Readmit,
+        };
+        last_view.insert(pid, view);
+        expected.push((entry.ordinal, pid, reason));
+    }
+    assert_eq!(
+        engine.loader_registry.prepare_reasons(),
+        expected,
+        "{WHAT}: derived reasons match the per-pid oracle"
+    );
+    let initials = expected
+        .iter()
+        .filter(|(_, _, reason)| *reason == LoaderPrepareReason::Initial)
+        .count();
+    let rearms = expected
+        .iter()
+        .filter(|(_, _, reason)| *reason == LoaderPrepareReason::Rearm)
+        .count();
+    let readmits = expected
+        .iter()
+        .filter(|(_, _, reason)| *reason == LoaderPrepareReason::Readmit)
+        .count();
+    assert_eq!(
+        (initials, rearms, readmits),
+        (2, 250, 2),
+        "{WHAT}: all three shapes"
+    );
+    let fill_prepare = attempts.iter().find(|entry| entry.ordinal == 6).unwrap();
+    assert_eq!(fill_prepare.pid, Some(6000));
+    assert_eq!(fill_prepare.owner, Some(LoaderAttemptOwner::Owned));
+    assert_eq!(fill_prepare.truncated_delta, 4);
+    assert_eq!(fill_prepare.failures_delta, 1004);
+
+    // The 257th refuses with the exact capacity reason and is recorded.
+    let refusal = engine
+        .loader_registry
+        .preflight_recorded(
+            LoaderContextSpec {
+                view: first_view,
+                loader: PinnedObjectId(9),
+                mapping: None,
+                hook,
+                state_address: None,
+            },
+            7000,
+            true,
+            99,
+            199,
+        )
+        .unwrap_err();
+    assert_eq!(refusal, "loader context capacity 256 is exhausted");
+    assert_eq!(
+        engine.loader_registry.successful_prepare_count(),
+        256,
+        "{WHAT}: refusal adds no prepare"
+    );
+    let attempts = engine.loader_registry.attempts();
+    assert_eq!(attempts.len(), 513, "{WHAT}: refusal recorded");
+    let refused = attempts.last().unwrap();
+    assert_eq!(refused.ordinal, 513);
+    assert_eq!(refused.kind, LoaderAttemptKind::Preflight);
+    assert_eq!(refused.refusal.as_deref(), Some(refusal.as_str()));
+
+    // The head still spends nothing and records nothing.
+    let ledger_len = engine.loader_registry.attempts().len();
+    let head_pid = group
+        .children
+        .iter()
+        .find(|child| child.role == "head")
+        .map(LiveChild::pid)
+        .unwrap();
+    if let Some(position) = engine
+        .views
+        .iter()
+        .position(|view| view.pid() == head_pid && view.still_the_same())
+    {
+        let head_view = engine.views[position].id();
+        assert!(
+            engine.loader_arming_gated(head_view),
+            "{WHAT}: the head view stays gated"
+        );
+        let head_armed = engine
+            .arm_loader_or_partial(
+                position,
+                &mut session,
+                &mut additions_allowed,
+                &mut pending_views,
+            )
+            .expect("head arming probes nothing invariantly");
+        assert!(!head_armed, "{WHAT}: the gated head must not arm");
+    }
+    assert_eq!(
+        engine.loader_arms, 2,
+        "{WHAT}: the head adds no arm attempt"
+    );
+    assert_eq!(
+        minted_ids(&engine).len(),
+        256,
+        "{WHAT}: the head mints no ticket"
+    );
+    assert_eq!(
+        engine.loader_registry.attempts().len(),
+        ledger_len,
+        "{WHAT}: the gated head records no attempt"
+    );
+
+    group.release_and_wait_ledgers(WHAT);
+    for child in &group.children {
+        if child.role == "head" {
+            continue;
+        }
+        let ledger = parse_provider_ledger(&child.log_text(), WHAT);
+        assert_eq!(ledger.burst, 1);
+        assert!(ledger.complete, "{WHAT}: {} ledger complete", child.pid());
+    }
+    drop(engine);
+    group.terminate_all(WHAT);
+    println!(
+        "t8: ticket-ledger: 2 live + 254 recorded fills = 256 prepares, 513 attempts, reasons 2/250/2, 257th refused, wall={:?} VmHWM={}KiB",
         wall_start.elapsed(),
         vm_hwm_kb()
     );

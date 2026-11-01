@@ -1,0 +1,9 @@
+# Owned spy-wrapped provider for the transparency cells.
+# Installed by scripts/ci/p11kit-transparency.sh as
+# $XDG_CONFIG_HOME/pkcs11/modules/owned-spy.module with the placeholder
+# below replaced by the probed OpenSC pkcs11-spy.so path. The workload runs
+# with PKCS11SPY=<owned provider copy> and PKCS11SPY_OUTPUT=<owned log>,
+# so the spy forwards into the owned copy and ledgers every call that
+# reached it. The proxy dlopens this module at C_Initialize, after the
+# observer attached: the late-load shape under test.
+module: @PKCS11_SPY@

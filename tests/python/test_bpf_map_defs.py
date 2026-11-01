@@ -960,7 +960,20 @@ class JournalMarkerInventoryTests(unittest.TestCase):
             | checker.REQUIRED_GLOBAL_EXEC_HELPERS
             | checker.REQUIRED_GLOBAL_EXE_HELPERS
             | checker.SELECTED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_MARKER_HELPERS
+            | {"JOURNAL_MARKER_CTL"}
         ) - set(missing)
+
+    def journal_symbols(self):
+        return (
+            {"p11_entry_journal"}
+            | checker.REQUIRED_GLOBAL_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
+            | checker.REQUIRED_GLOBAL_EXEC_HELPERS
+            | checker.REQUIRED_GLOBAL_EXE_HELPERS
+            | checker.SELECTED_GLOBAL_HELPERS
+            | {"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"}
+        )
 
     def quiet(self, func, *args):
         errors = io.StringIO()
@@ -980,25 +993,54 @@ class JournalMarkerInventoryTests(unittest.TestCase):
     def test_release_detailed_marker_absence_accepts(self):
         maps = {name: value for name, value in checker.SAFE_MAPS.items()
                 if name != "JOURNAL_MARKER_CTL"}
-        self.quiet(checker.validate_inventory, "default", maps,
-                   checker.SAFE_PROGRAMS,
-                   self.detailed_symbols(missing=checker.REQUIRED_GLOBAL_MARKER_HELPERS))
+        symbols = self.detailed_symbols(missing=set(checker.REQUIRED_GLOBAL_MARKER_HELPERS)
+                                        | {"JOURNAL_MARKER_CTL"})
+        self.quiet(checker.validate_inventory, "default-no-marker", maps,
+                   checker.SAFE_PROGRAMS, symbols)
+        with self.assertRaisesRegex(RuntimeError, "forbidden birth marker symbols"):
+            checker.validate_inventory("default-no-marker", maps,
+                                       checker.SAFE_PROGRAMS,
+                                       symbols | {"p11_instance_scope_gap"})
+
+    def test_release_detailed_marker_presence_accepts(self):
+        self.quiet(checker.validate_inventory, "default", checker.SAFE_MAPS,
+                   checker.SAFE_PROGRAMS, self.detailed_symbols())
 
     def test_release_detailed_stale_marker_inventory_refused(self):
-        maps = dict(checker.SAFE_MAPS)
-        maps["JOURNAL_MARKER_CTL"] = checker.map_def(2, 4, 16, 1)
+        maps = {name: value for name, value in checker.SAFE_MAPS.items()
+                if name != "JOURNAL_MARKER_CTL"}
         reason = self.refused(checker.validate_inventory, "default", maps,
                               checker.SAFE_PROGRAMS, self.detailed_symbols())
+        self.assertIn("map removed: JOURNAL_MARKER_CTL", reason)
+        reason = self.refused(checker.validate_inventory, "default-no-marker",
+                              checker.SAFE_MAPS, checker.SAFE_PROGRAMS,
+                              self.detailed_symbols())
         self.assertIn("map added: JOURNAL_MARKER_CTL", reason)
 
     def test_release_half_linked_marker_globals_refused(self):
-        for extra in ({"p11_instance_exec_birth"}, {"p11_instance_scope_gap"},
-                      set(checker.REQUIRED_GLOBAL_MARKER_HELPERS)):
-            with self.subTest(extra=sorted(extra)), \
-                    self.assertRaisesRegex(RuntimeError, "forbidden birth marker symbols"):
-                checker.validate_inventory("default", checker.SAFE_MAPS,
-                                           checker.SAFE_PROGRAMS,
-                                           self.detailed_symbols() | extra)
+        full = set(checker.REQUIRED_GLOBAL_MARKER_HELPERS) | {"JOURNAL_MARKER_CTL"}
+        for missing in ({"JOURNAL_MARKER_CTL"},
+                        {"p11_instance_exec_birth"},
+                        {"p11_instance_scope_gap"},
+                        full):
+            with self.subTest(missing=sorted(missing)):
+                with self.assertRaisesRegex(RuntimeError, "lacks required birth marker symbols") as raised:
+                    checker.validate_inventory("default", checker.SAFE_MAPS,
+                                               checker.SAFE_PROGRAMS,
+                                               self.detailed_symbols(missing=missing))
+                for name in sorted(missing):
+                    self.assertIn(name, str(raised.exception))
+
+    def test_release_diagnostic_and_wide_variants_forbid_marker(self):
+        marked = self.detailed_symbols() | {"JOURNAL_MARKER_CTL"}
+        for variant, maps, programs in (
+            ("diagnostic", checker.UNSAFE_MAPS, checker.UNSAFE_PROGRAMS),
+            ("wide-default", checker.WIDE_MAPS, checker.SAFE_PROGRAMS),
+            ("wide-diagnostic", checker.WIDE_UNSAFE_MAPS, checker.UNSAFE_PROGRAMS),
+        ):
+            with self.subTest(variant=variant):
+                with self.assertRaisesRegex(RuntimeError, "forbidden birth marker symbols"):
+                    checker.validate_inventory(variant, maps, programs, marked)
 
     def test_inventory_with_marker_map_refused(self):
         maps = dict(checker.INVENTORY_MAPS)
@@ -1037,7 +1079,7 @@ class JournalMarkerInventoryTests(unittest.TestCase):
             checker.SAFE_PROGRAMS,
             self.detailed_symbols(),
         )
-        self.assertIn("map added: JOURNAL_MARKER_CTL", reason)
+        self.assertIn("JOURNAL_MARKER_CTL.value_size: object=8 frozen=16", reason)
 
     def test_core_instance_helper_missing_still_refused(self):
         for missing in ("p11_instance_entry", "p11_instance_return", "p11_instance_exec"):
@@ -1046,6 +1088,36 @@ class JournalMarkerInventoryTests(unittest.TestCase):
                 checker.validate_inventory("default", checker.SAFE_MAPS,
                                            checker.SAFE_PROGRAMS,
                                            self.detailed_symbols(missing={missing}))
+
+    def test_journal_variant_accepts_frozen_inventory(self):
+        self.quiet(checker.validate_inventory, "journal", checker.JOURNAL_MAPS,
+                   checker.JOURNAL_PROGRAMS, self.journal_symbols())
+
+    def test_journal_variant_refuses_birth_and_missing_gap(self):
+        with self.assertRaisesRegex(RuntimeError, "forbidden READY publish body"):
+            checker.validate_inventory("journal", checker.JOURNAL_MAPS,
+                                       checker.JOURNAL_PROGRAMS,
+                                       self.journal_symbols() | {"p11_instance_exec_birth"})
+        for missing in ({"JOURNAL_MARKER_CTL"}, {"p11_instance_scope_gap"}):
+            with self.subTest(missing=sorted(missing)):
+                with self.assertRaisesRegex(RuntimeError, "lacks required marker symbols") as raised:
+                    checker.validate_inventory("journal", checker.JOURNAL_MAPS,
+                                               checker.JOURNAL_PROGRAMS,
+                                               self.journal_symbols() - missing)
+                for name in sorted(missing):
+                    self.assertIn(name, str(raised.exception))
+
+    def test_journal_variant_refuses_inventory_map_and_drift(self):
+        maps = dict(checker.JOURNAL_MAPS)
+        maps["USAGE"] = checker.INVENTORY_MAPS["USAGE"]
+        reason = self.refused(checker.validate_inventory, "journal", maps,
+                              checker.JOURNAL_PROGRAMS, self.journal_symbols())
+        self.assertIn("map added: USAGE", reason)
+        maps = dict(checker.JOURNAL_MAPS)
+        maps["JOURNAL_CTL"] = checker.map_def(2, 4, 25, 1)
+        reason = self.refused(checker.validate_inventory, "journal", maps,
+                              checker.JOURNAL_PROGRAMS, self.journal_symbols())
+        self.assertIn("JOURNAL_CTL.value_size: object=25 frozen=24", reason)
 
     def marker_fixture(self, name):
         source = Path(self.temp.name) / f"{name}.c"

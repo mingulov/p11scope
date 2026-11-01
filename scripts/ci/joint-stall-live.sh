@@ -77,9 +77,10 @@ except ValueError:
     print(json.dumps({"error": "bad numbers"})); sys.exit(2)
 out = {"duration": duration, "wall": wall, "exit": exit_code,
        "subjects": [], "abandons": 0, "no_progress": False,
-       "trips": [], "stderr_no_progress": False,
+       "trips": [], "stderr_no_progress": False, "stderr_abandon": False,
        "stderr_disposition": False, "time_ok": wall <= duration + slack,
-       "exit_ok": exit_code == 0, "run_json_ok": False}
+       "exit_ok": exit_code == 0, "run_json_ok": False,
+       "gaps_suppressed": None}
 try:
     with open(run_json, encoding="utf-8") as f:
         doc = json.load(f)
@@ -120,6 +121,8 @@ if ("joint finish made no progress" in stderr_text
         or "joint audit made no progress" in stderr_text
         or "live publication made no progress" in stderr_text):
     out["stderr_no_progress"] = True
+if "abandoned the unfinished live publication" in stderr_text:
+    out["stderr_abandon"] = True
 if "joint finish disposition required" in stderr_text:
     out["stderr_disposition"] = True
 # Lifecycle loss accounting (recorded, never gated).
@@ -130,8 +133,16 @@ try:
 except AttributeError:
     out["ring_loss"] = None
     out["lifecycle_records"] = None
-out["stall_ok"] = bool(out["time_ok"] and not out["no_progress"] and out["run_json_ok"])
-out["wedge_ok"] = bool(out["abandons"] == 0 and out["exit_ok"]
+try:
+    out["gaps_suppressed"] = doc.get("gaps_suppressed")
+except AttributeError:
+    out["gaps_suppressed"] = None
+# Stall checks gaps and stderr: --max-gaps 256 can suppress a late
+# finish gap (first-N-wins), but the trip stderr line is never capped.
+out["stall_ok"] = bool(out["time_ok"] and not out["no_progress"]
+                       and not out["stderr_no_progress"] and out["run_json_ok"])
+out["wedge_ok"] = bool(out["abandons"] == 0 and not out["stderr_abandon"]
+                       and out["exit_ok"]
                        and not out["no_progress"] and not out["stderr_no_progress"]
                        and not out["stderr_disposition"] and out["run_json_ok"])
 print(json.dumps(out))
@@ -152,6 +163,7 @@ self_test() {
     healthy_run="$work/in-healthy.json"; : > "$work/empty.stderr"
     cat > "$healthy_run" <<'EOF'
 {"gaps": [{"subject": "native capture lifecycle evidence lost", "reason": "x"}],
+ "gaps_suppressed": 1716,
  "observation": {"lifecycle": {"records": 10, "ring_loss": 3}}}
 EOF
     expect healthy 0 "$healthy_run" "$work/empty.stderr" 30 35 0 60
@@ -160,6 +172,7 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 assert d["stall_ok"] and d["wedge_ok"], d
 assert d["ring_loss"] == 3, d
+assert d["gaps_suppressed"] == 1716, d
 assert d["subjects"] == ["native capture lifecycle evidence lost"], d
 PY
     then pass=$((pass + 1)); else fail=$((fail + 1)); echo "self-test FAIL: healthy fields"; fi
@@ -208,6 +221,15 @@ PY
     expect live 1 "$healthy_run" "$work/live.stderr" 30 35 0 60
     echo "joint finish disposition required" > "$work/dispo.stderr"
     expect dispo 1 "$healthy_run" "$work/dispo.stderr" 30 35 1 60
+    echo "p11scope: abandoned the unfinished live publication, coverage is partial" > "$work/abandoned.stderr"
+    expect abandoned 1 "$healthy_run" "$work/abandoned.stderr" 30 35 0 60
+    if python3 -I - "$work/out-abandoned.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["stall_ok"] and not d["wedge_ok"], d
+assert d["stderr_abandon"] and not d["stderr_no_progress"], d
+PY
+    then pass=$((pass + 1)); else fail=$((fail + 1)); echo "self-test FAIL: abandoned fields"; fi
     echo "self-test: pass=$pass fail=$fail"
     [ "$fail" -eq 0 ]
 }

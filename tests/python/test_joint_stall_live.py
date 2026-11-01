@@ -249,6 +249,19 @@ class ScriptOracleTests(unittest.TestCase):
         self.assertEqual(rc, 1, payload)
         self.assertTrue(payload["stderr_no_progress"])
         self.assertFalse(payload["wedge_ok"])
+        # The cap can suppress a late gap, so stderr also fails the stall cell.
+        self.assertFalse(payload["stall_ok"])
+
+    def test_abandon_stderr_fails_wedge_only(self):
+        rc, payload = self.check(
+            '{"gaps": [], "gaps_suppressed": 1716}',
+            "p11scope: abandoned the unfinished live publication, coverage is partial")
+        self.assertEqual(rc, 1, payload)
+        self.assertTrue(payload["stderr_abandon"])
+        self.assertFalse(payload["stderr_no_progress"])
+        self.assertTrue(payload["stall_ok"])
+        self.assertFalse(payload["wedge_ok"])
+        self.assertEqual(payload["gaps_suppressed"], 1716)
 
     def test_disposition_stderr_fails_wedge(self):
         rc, payload = self.check('{"gaps": []}',

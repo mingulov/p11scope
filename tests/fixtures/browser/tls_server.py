@@ -167,6 +167,7 @@ class FlowServer:
     ``handshakes_ok`` (completed handshakes), ``client_certs_presented``
     (peer cert seen at handshake time, independent of requests),
     ``empty_certs`` (full handshake with an empty client certificate),
+    ``selection_stalls`` (peers that saw CertificateRequest and never
     finished: stuck at selection), ``client_cert_alerts``
     (certificate_unknown refusals: tolerated, never a witness on their
     own), ``cert_refusals`` (certificate_unknown refusals on

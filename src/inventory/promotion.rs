@@ -251,7 +251,10 @@ pub(crate) struct SelectedEndpointReceipt {
     file_offset: u64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // STAGED (6.15): minted by the driver packet's selection path.
+// Headless mailbox (P1a): the receipt contract is pinned by the
+// `headless_request_*` twins; the P1b mint is the first production
+// caller of `new`, so the not(test) lint allow stays until then.
+#[cfg_attr(not(test), allow(dead_code))]
 impl SelectedEndpointReceipt {
     pub(crate) fn new(view: ViewRevision, file_offset: u64) -> Self {
         Self { view, file_offset }
@@ -299,7 +302,10 @@ impl Promoter {
     /// the pair checks are identical, and the receipt must name this
     /// viewed revision — a receipt for another view is stale (the
     /// selection raced a redraw) and refuses without queueing.
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED (6.15): the driver packet queues with receipts.
+    // Headless mailbox (P1a): the queue-time checks are pinned by the
+    // `headless_request_*`/`headless_mailbox_*` twins; the P1b mint is
+    // the first production caller, so the not(test) lint allow stays.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn request_with_endpoint(
         &mut self,
         viewed: Arc<PromotionView>,

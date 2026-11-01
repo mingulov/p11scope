@@ -8431,8 +8431,11 @@ fn joint_machine_finish_after_pass_refresh_invalidation_publishes() {
 /// waited. Nothing of the original waits at Q any more, so there is nothing
 /// to expire there: Finish must take the ordinary at-Q tick, which merges
 /// the stash, and publish both calls. It must never refuse the empty expiry
-/// as a storage fault and lose the final publication.
-fn finish_after_pass_refresh_resolution_publishes(linked: bool) {
+/// as a storage fault and lose the final publication. `work` is the per-poll
+/// action budget: 1 advances one phase per poll, 1024 matches the production
+/// step budget (one poll may traverse the fallthrough and the at-Q tick
+/// together).
+fn finish_after_pass_refresh_resolution_publishes(linked: bool, work: usize) {
     use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
     let (mut fixture, waiter) = pass_refresh_before_finish(linked, true);
     let api_returns = |fixture: &MachineScene| -> u64 {
@@ -8469,7 +8472,7 @@ fn finish_after_pass_refresh_resolution_publishes(linked: bool) {
     let mut published = false;
     let mut refusals = Vec::new();
     for poll in 0..512 {
-        match fixture.poll_finish(1) {
+        match fixture.poll_finish(work) {
             Ok(JointCommitProgress::Pending) => {}
             Ok(JointCommitProgress::Published(_)) => {
                 published = true;
@@ -8489,12 +8492,15 @@ fn finish_after_pass_refresh_resolution_publishes(linked: bool) {
     }
     assert!(
         refusals.is_empty(),
-        "linked={linked}: the finish refused {} times (first {:?}); latched={:?}",
+        "linked={linked} work={work}: the finish refused {} times (first {:?}); latched={:?}",
         refusals.len(),
         refusals.first(),
         fixture.machine.disposition_reason()
     );
-    assert!(published, "linked={linked}: the finish publishes");
+    assert!(
+        published,
+        "linked={linked} work={work}: the finish publishes"
+    );
     assert_eq!(
         fixture.native.pending_q_resolutions, 0,
         "nothing waits at Q, so nothing expires there"
@@ -8542,12 +8548,20 @@ fn finish_after_pass_refresh_resolution_publishes(linked: bool) {
 
 #[test]
 fn joint_machine_finish_after_pass_refresh_resolution_publishes_linked() {
-    finish_after_pass_refresh_resolution_publishes(true);
+    // One leg per poll budget: single-action polls plus the
+    // production 1024-action step budget.
+    for work in [1, 1024] {
+        finish_after_pass_refresh_resolution_publishes(true, work);
+    }
 }
 
 #[test]
 fn joint_machine_finish_after_pass_refresh_resolution_publishes_unlinked() {
-    finish_after_pass_refresh_resolution_publishes(false);
+    // One leg per poll budget: single-action polls plus the
+    // production 1024-action step budget.
+    for work in [1, 1024] {
+        finish_after_pass_refresh_resolution_publishes(false, work);
+    }
 }
 
 /// A genuine storage refusal at the at-Q expiry still refuses. One call
@@ -8664,6 +8678,74 @@ fn joint_machine_finish_at_q_expiry_storage_refusal_still_latches() {
         );
         assert!(!fixture.scene.real.lane.is_finished());
         drop(hold);
+    }
+}
+
+/// With zero waiters, a stopped Capture or a wrong owner still refuses
+/// from the at-Q sizing: the owner and stop checks precede the validated
+/// zero count, so an empty expiry never reads as "nothing waits".
+#[test]
+fn joint_machine_pending_h0_at_q_zero_waiters_stop_and_owner_still_refuse() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
+    for linked in [true, false] {
+        for leg in ["stopped", "owner"] {
+            let (mut fixture, _waiter) = pass_refresh_before_finish(linked, true);
+            {
+                let held = fixture.scene.real.h0.0.borrow();
+                assert!(
+                    held.capture.awaiting.is_empty(),
+                    "the refresh resolved the waiter (linked={linked} leg={leg})"
+                );
+            }
+            fixture.enable_finish_fixture(Vec::new());
+            fixture.begin_finish().unwrap();
+            assert!(
+                matches!(fixture.poll_finish(1), Ok(JointCommitProgress::Pending)),
+                "the first poll observes Q (linked={linked} leg={leg})"
+            );
+            let other;
+            if leg == "owner" {
+                other = Some(
+                    SemanticCapture::in_domain(
+                        fixture.scene.real.lane.domain(),
+                        TickLimits::default(),
+                    )
+                    .unwrap(),
+                );
+            } else {
+                other = None;
+                fixture.scene.real.h0.0.borrow_mut().capture.stop();
+            }
+            let held = fixture.scene.real.h0.0.borrow();
+            let capture = other.as_ref().unwrap_or(&held.capture);
+            let refused = capture.pending_h0_at_q_storage_bytes(
+                fixture.machine.retained_raw_for_test().unwrap(),
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter(),
+                &fixture.scene.producers,
+                fixture.finish.as_ref().unwrap().observer.discovery_domain(),
+                fixture
+                    .machine
+                    .retained_finish_q_for_test()
+                    .expect("observed Q"),
+            );
+            let expected = if leg == "stopped" {
+                RawQuantumRefusal::Stopped
+            } else {
+                RawQuantumRefusal::ForeignCapture
+            };
+            assert_eq!(
+                refused,
+                Err(expected),
+                "zero waiters still refuse (linked={linked} leg={leg})"
+            );
+        }
     }
 }
 

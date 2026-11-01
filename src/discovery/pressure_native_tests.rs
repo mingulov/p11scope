@@ -1919,7 +1919,8 @@ fn pressure_ticket_ledger_records_every_prepare() {
 
     // Ledger after the live arms: every prepare recorded, counts match the
     // minted set, ordinals gapless. Live arms carry views (joinable to owned
-    // pids below); pid annotation for Engine-driven arms lands with R2.
+    // pids below); pid annotation for Engine-driven arms is future work
+    // (a v0.5.0 follow-up lane), not part of this port.
     let attempts = engine.loader_registry.attempts();
     assert_eq!(attempts.len(), 4, "{WHAT}: 2 preflights + 2 prepares");
     let ordinals: Vec<usize> = attempts.iter().map(|entry| entry.ordinal).collect();

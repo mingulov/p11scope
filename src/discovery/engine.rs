@@ -717,6 +717,8 @@ pub struct Engine {
     /// Test-only process-view allocation/release/eviction log (R3 pressure
     /// diagnostic): every ID minted, freed or rotated, with owned/ambient
     /// and armed/unarmed state at the record time. Never in release bytes.
+    /// Named `--pid` views are retained, not minted: their release logs
+    /// without a matching allocation.
     #[cfg(test)]
     view_log: Vec<ViewLogEntry>,
 }

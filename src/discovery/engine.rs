@@ -14251,16 +14251,30 @@ impl Engine {
             );
         } else if !outcome.unpublished_views.is_empty() {
             let unpublished = outcome.unpublished_views.clone();
+            // A checked-clean newcomer (fully scanned, no reconciled
+            // modules) carries no pins, modules or links, so leaving it
+            // unpublished undoes no attach or publish work; only views with
+            // reconciled modules still have work outstanding. Their own scan
+            // skips, if any, already cover unverified content. Read before
+            // retire drops the unpublished views' modules below.
+            let undone = unpublished.iter().any(|view| {
+                candidate
+                    .modules
+                    .iter()
+                    .any(|module| module.scanned.view == *view)
+            });
             self.retire_stale_candidate_sources(
                 session,
                 &mut candidate,
                 &unpublished,
                 &mut *outcome,
             );
-            self.mark_partial(
-                "live inventory transaction",
-                "additions were blocked; newly observed process generations were left unpublished for a later tick",
-            );
+            if undone {
+                self.mark_partial(
+                    "live inventory transaction",
+                    "additions were blocked; newly observed process generations were left unpublished for a later tick",
+                );
+            }
         }
         if !new_targets_attached {
             let owners = candidate_timing_owners(&candidate);

@@ -81,8 +81,8 @@ pub(crate) use pid_continuity::engine_fixture::{
     AttachmentBoundaryChange, PidSessionFixture, PreflightChange,
 };
 pub(crate) use pid_continuity::{
-    CompletedRearmReceipt, ExecBinding, PhysicalGapSummary, PidContinuityRefusal, PidLifecycleTap,
-    PreservationReceipt, clock_origins_comparable,
+    CompletedRearmReceipt, ExecBinding, LifecycleFacts, PhysicalGapSummary, PidContinuityRefusal,
+    PidLifecycleTap, PreservationReceipt, clock_origins_comparable,
 };
 
 // I3 will consume this preparation capability; I2b installs no callers or links.

@@ -19,12 +19,13 @@
 # Per kernel one throwaway guest runs a bounded linked inventory,
 # `inventory --system --capture native --key-operations --manifest
 # MANIFEST --duration 60s`, under the probe. Before the observer starts,
-# the guest initializes a guest-local SoftHSM token and starts a loop of
-# short PKCS#11 info workloads against the guest SoftHSM module, so the
-# linked lane seals on an attested provider and observes calls. The
-# workload loop, token and logs live on guest-local storage (the work
-# image); only the finished probe rows, observer text and workload log
-# are copied back to OUTDIR.
+# the guest initializes a guest-local SoftHSM token and starts one
+# persistent ledger caller (forty mech iterations a second apart, then
+# held) against the guest SoftHSM module, so the linked lane seals on
+# an attested provider and observes a full call stream from an admitted
+# caller. The caller, token and logs live on guest-local storage (the
+# work image); only the finished probe rows, observer text and ledger
+# log are copied back to OUTDIR.
 #
 # A load kernel passes only when the probe rows carry both journal roots
 # loaded with verifier stats, the per-program report passes, and the
@@ -93,7 +94,7 @@ fi
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPORT="$SCRIPT_DIR/bpf-load-report.py"
 SELECTOR="$SCRIPT_DIR/release-matrix-contract.py"
-WORKLOAD_SRC="$SCRIPT_DIR/../tests/fixtures/counter-softhsm-workload.c"
+WORKLOAD_SRC="$SCRIPT_DIR/../tests/fixtures/public-cli/inventory-ledger.c"
 if [ -z "$BUDGETS" ] && [ -f "$SCRIPT_DIR/../tests/bpf-verifier-budgets.json" ]; then
     BUDGETS="$SCRIPT_DIR/../tests/bpf-verifier-budgets.json"
 fi
@@ -165,9 +166,6 @@ WORK_IMAGE="$OUTDIR/guest-work.img"
 GUEST_LEG="$OUTDIR/journal-guest.sh"
 STAGED_PROBE="$OUTDIR/journal-probe.so"
 STAGED_MANIFEST="$OUTDIR/journal-manifest.json"
-# The workload binary name is short on purpose: the guest leg stops
-# workload processes by exact process name (`pkill -x`), which matches
-# the 15-char comm, so the name must fit comm exactly.
 STAGED_WORKLOAD="$OUTDIR/j-workload"
 if [ -e "$GUEST_ENV" ] || [ -L "$GUEST_ENV" ] || [ -e "$WORK_IMAGE" ] || [ -L "$WORK_IMAGE" ] \
     || [ -e "$GUEST_LEG" ] || [ -L "$GUEST_LEG" ] || [ -e "$OUTDIR/results.jsonl" ]; then
@@ -181,7 +179,7 @@ fi
 cp "$PROBE" "$STAGED_PROBE"
 cp "$MANIFEST" "$STAGED_MANIFEST"
 chmod 644 "$STAGED_PROBE" "$STAGED_MANIFEST"
-if ! cc -O1 -Wall -Wextra -Werror -o "$STAGED_WORKLOAD" "$WORKLOAD_SRC" -ldl; then
+if ! cc -O1 -Wall -Wextra -Werror -o "$STAGED_WORKLOAD" "$WORKLOAD_SRC" -ldl -lpthread; then
     echo "# error: cannot compile the guest workload" >&2
     exit 2
 fi
@@ -265,37 +263,49 @@ else
     echo "guest-stage=token-failed"
     exit 3
 fi
-# Each iteration stays mapped for 25 s (discovery admits the caller)
-# before its call burst, so calls join instead of shedding as
-# use-before-admission; the loop respawns until the observer exits.
-( while :; do SOFTHSM2_CONF="$CONF" "$WORKLOAD" "$MODULE" 30 25 >>"$TMPDIR/workload-$KERNEL.log" 2>&1; done ) &
-WLLOOP=$!
-echo "guest-stage=workload-started"
-cleanup_workload() {
-    kill "$WLLOOP" 2>/dev/null || true
-    # Exact process-name match only: this leg and the loop subshell are
-    # both `sh`, so the name can only hit workload processes. (Never
-    # match the full command line: our own argv carries the workload
-    # path and would match itself.) The in-flight child must be gone
-    # before the return: it holds its log under /var/tmp open, which
-    # otherwise keeps the work-image unmount busy and fails the guest.
-    pkill -x j-workload 2>/dev/null || true
+# One persistent caller with spread key-operation iterations: it maps
+# the provider once, sets up a session, prints READY, then paces forty
+# mech iterations a second apart and holds until killed. Short-lived
+# burst callers exit before admission and shed every call as
+# use-before-admission, so the leg waits for READY before the observer
+# starts and the caller outlives the whole run.
+LEDGER_LOG=$TMPDIR/ledger-$KERNEL.log
+SOFTHSM2_CONF="$CONF" "$WORKLOAD" mech --cell jwork --module "$MODULE" --iters 40 --sleep-us 1000000 --hold >>"$LEDGER_LOG" 2>&1 &
+LEDGER_PID=$!
+cleanup_ledger() {
+    kill "$LEDGER_PID" 2>/dev/null || true
     N=0
-    while [ "$N" -lt 10 ] && pgrep -x j-workload >/dev/null 2>&1; do
+    while [ "$N" -lt 10 ] && kill -0 "$LEDGER_PID" 2>/dev/null; do
         sleep 1
         N=$((N + 1))
     done
+    kill -9 "$LEDGER_PID" 2>/dev/null || true
+    wait "$LEDGER_PID" 2>/dev/null || true
 }
-trap cleanup_workload EXIT INT TERM
+trap cleanup_ledger EXIT INT TERM
+N=0
+while [ "$N" -lt 30 ]; do
+    if grep -q '^READY ' "$LEDGER_LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+    N=$((N + 1))
+done
+if grep -q '^READY ' "$LEDGER_LOG" 2>/dev/null; then
+    echo "guest-stage=workload-ready"
+else
+    echo "guest-stage=workload-not-ready"
+    exit 3
+fi
 ulimit -n 65536
 RC=0
 timeout -k 10 -s INT 150 env LD_PRELOAD="$PROBE" P11SCOPE_VERIFIER_STATS_FD=9 "$OBSERVER" inventory --system --capture native --key-operations --manifest "$MANIFEST" --duration 60s 9>"journal-probe-$KERNEL.jsonl" >"journal-$KERNEL.txt" 2>&1 || RC=$?
 echo "guest-stage=observer-rc=$RC"
-if [ -f "$TMPDIR/workload-$KERNEL.log" ]; then
-    cp "$TMPDIR/workload-$KERNEL.log" "./workload-$KERNEL.log"
+if [ -f "$LEDGER_LOG" ]; then
+    cp "$LEDGER_LOG" "./workload-$KERNEL.log"
 fi
 trap - EXIT INT TERM
-cleanup_workload
+cleanup_ledger
 exit "$RC"
 GUEST_LEG_EOF
 chmod 755 "$GUEST_LEG"
@@ -375,8 +385,12 @@ for KERNEL in "$@"; do
         infra_fail "guest SoftHSM token setup failed"
         continue
     fi
+    if grep -q '^guest-stage=workload-not-ready' "$VNG_LOG"; then
+        infra_fail "guest workload never readied"
+        continue
+    fi
     if ! grep -q '^guest-stage=token-ok' "$VNG_LOG" \
-        || ! grep -q '^guest-stage=workload-started' "$VNG_LOG"; then
+        || ! grep -q '^guest-stage=workload-ready' "$VNG_LOG"; then
         infra_fail "guest stages never ran"
         continue
     fi

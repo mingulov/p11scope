@@ -4167,12 +4167,14 @@ impl ClassicDriver<'_> {
                         warn,
                         None,
                     );
+                    // The held gap reuses the hold's own reason, so it
+                    // cannot disagree with the first error: the hold
+                    // already resolved graph refusal, machine latch,
+                    // then fallback.
+                    let held = error.clone();
                     first_error.get_or_insert(error);
-                    let held = coordinator
-                        .collected_graph_refused()
-                        .unwrap_or("joint finish disposition required");
                     coordinator
-                        .note_scope_gap("joint finish held for exit".to_string(), held.to_string());
+                        .note_scope_gap("joint finish held for exit".to_string(), held);
                 } else {
                     let live = lane.take().expect("a failed lane holds");
                     Self::hold_joint_lane_for_exit(

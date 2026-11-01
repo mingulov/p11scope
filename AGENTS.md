@@ -155,6 +155,26 @@ Honor authorization already given for the task, check ownership of resources,
 and clean up only resources created by the experiment. Do not disturb an
 unrelated browser, service, VM, container or another agent's capture.
 
+Ordinary tests and CI do not exercise capture: CI runs only the unprivileged
+default tests. Changes to capture, attachment, BPF, discovery or session
+lifecycle, and every integration candidate, also need real-system runs on
+authorized hosts, done continuously rather than deferred to release time:
+- the privileged library cells (`scripts/run-privileged-lib-tests.sh`; cells
+  that drive the CLI need the observer binary beside the test executable or
+  `P11SCOPE_E2E_OBSERVER`);
+- the real browser cells (`tests/python/test_browser_cells.py` with
+  `P11SCOPE_BIN` and `P11SCOPE_BROWSER_STRICT=1`, which start Firefox and
+  Chromium through Playwright);
+- the virtme-ng kernel runners (`scripts/qualify-*-vng.sh`) across the
+  supported kernel range;
+- `--system` captures with real workloads.
+
+A self-skip is not a pass. Report a cell that cannot run, with the reason, and
+fix the blocker. Test fixtures must probe provider locations rather than
+hard-code one distribution's path. For example, SoftHSM is under
+`/usr/lib/x86_64-linux-gnu/softhsm/` on Debian and Ubuntu and under
+`/usr/lib64/pkcs11/` on Fedora.
+
 ## Changes and Git history
 
 - Inspect branch, worktree and status first. Preserve unrelated changes;

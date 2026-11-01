@@ -329,9 +329,14 @@ fn exec_task_embedded_lifecycle_preserves_maps_hooks_and_class_boundary() {
 #[test]
 fn exec_generation_ticket_helper_respects_flavor_and_reservation_boundary() {
     let mut variants = vec![
-        ("detailed", p11scope::EBPF_OBJECT, true),
-        ("inventory", p11scope::EBPF_INVENTORY_OBJECT, false),
-        ("callers", p11scope::EBPF_INVENTORY_CALLERS_OBJECT, true),
+        ("detailed", p11scope::EBPF_OBJECT, true, true),
+        ("inventory", p11scope::EBPF_INVENTORY_OBJECT, false, false),
+        (
+            "callers",
+            p11scope::EBPF_INVENTORY_CALLERS_OBJECT,
+            true,
+            true,
+        ),
     ];
     for (name, bytes) in [
         ("counts", p11scope::EBPF_COUNTER_COUNTS_OBJECT),
@@ -339,7 +344,7 @@ fn exec_generation_ticket_helper_respects_flavor_and_reservation_boundary() {
         ("latency", p11scope::EBPF_COUNTER_LATENCY_OBJECT),
     ] {
         if !bytes.is_empty() {
-            variants.push((name, bytes, true));
+            variants.push((name, bytes, false, true));
         }
     }
     let script = r#"
@@ -422,7 +427,7 @@ scope_next = next(pc for pc, _ in root_insns if pc > guard_pc)
 refused = scope_next if '== 0x1 goto' in guard_text else scope_target
 assert emit[0] not in m.reachable(root_graph, [refused]), 'refused scope emitted an EXEC ticket'
 "#;
-    for (name, bytes, identity) in variants {
+    for (name, bytes, helper, maps) in variants {
         let object = aya_obj::Object::parse(bytes).unwrap();
         let helpers = object
             .functions
@@ -431,12 +436,12 @@ assert emit[0] not in m.reachable(root_graph, [refused]), 'refused scope emitted
             .count();
         assert_eq!(
             helpers,
-            usize::from(identity),
+            usize::from(helper),
             "{name}: cookie-only helper selection"
         );
-        assert_eq!(object.maps.contains_key("TASK_COOKIE"), identity, "{name}");
-        assert_eq!(object.maps.contains_key("COOKIE_CTL"), identity, "{name}");
-        if identity {
+        assert_eq!(object.maps.contains_key("TASK_COOKIE"), maps, "{name}");
+        assert_eq!(object.maps.contains_key("COOKIE_CTL"), maps, "{name}");
+        if helper {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("exec-ticket.o");
             fs::write(&path, bytes).unwrap();

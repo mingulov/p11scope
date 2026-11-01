@@ -2085,11 +2085,22 @@ fn emit_lifecycle(kind: u8, case_id: u8, scope: ScopeAuth, pause_eligible: bool)
     // process that later reuses the target's PID also passes (only the
     // entries' kernel pid filter holds the original task), so PID scope
     // never acquires a ticket: its EXEC carries zero, unavailable.
+    // The ticket is stamped only where a consumer reads it: unconditionally
+    // in InventoryCallers, and in Detailed only while short-lived tracking
+    // is armed outside aggregate captures. Counter flavors compile it out.
     #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
+    #[cfg(not(feature = "counter-broad"))]
     if kind == DISCOVERY_KIND_EXEC && scope.flags & FLAG_PID_FILTER == 0 {
-        let ticket = unsafe { p11_link_current_cookie() };
-        unsafe {
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), ticket);
+        #[cfg(feature = "inventory-callers")]
+        let armed = true;
+        #[cfg(not(feature = "inventory-callers"))]
+        let armed = scope.flags & FLAG_TRACK_SHORT_LIVED != 0
+            && scope.flags & FLAG_POLICY_AGGREGATE == 0;
+        if armed {
+            let ticket = unsafe { p11_link_current_cookie() };
+            unsafe {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).binding_id), ticket);
+            }
         }
     }
     // 6.14 Option B: the exe (s_dev, i_ino) pair rides pointers[0..2]
@@ -3087,6 +3098,7 @@ unsafe extern "C" {
     #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
     fn p11_link_current_identity(out: *mut ImageIdentity) -> u32;
     #[cfg(any(not(feature = "inventory-only"), feature = "inventory-callers"))]
+    #[cfg(not(feature = "counter-broad"))]
     fn p11_link_current_cookie() -> u64;
     /// Task 3 Stage A continuity halves (native instance_epoch.c): the entry
     /// half records the private probed address and entry stamp under the

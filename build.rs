@@ -939,6 +939,10 @@ fn build_variant_with_proof(
     if !matches!(flavor, BpfFlavor::InventoryGlobal) {
         append_flag("-C");
         append_flag("link-arg=--export=p11_link_current_identity");
+    }
+    // The EXEC ticket helper is exported only where the stamp can run:
+    // counter flavors compile the stamp out and must not retain it.
+    if matches!(flavor, BpfFlavor::Detailed | BpfFlavor::InventoryCallers) {
         append_flag("-C");
         append_flag("link-arg=--export=p11_link_current_cookie");
     }

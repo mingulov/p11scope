@@ -2035,6 +2035,22 @@ class DriverFixture(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(proc.stdout.strip(), expect)
 
+    def test_keyed_plan_refuses_beyond_the_ledger_ceiling(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-kceil-") as tmp:
+            driver = self.build_driver(Path(tmp))
+            exact = subprocess.run(
+                [str(driver), "--dry-run", "/no-provider.so", "keyed",
+                 "10k", "20", "ledger.jsonl"],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(exact.returncode, 0, exact.stderr)
+            self.assertIn("200000 calls 99999 ops", exact.stdout)
+            refused = subprocess.run(
+                [str(driver), "--dry-run", "/no-provider.so", "keyed",
+                 "100k", "3", "ledger.jsonl"],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("ledger ceiling", refused.stderr)
+
     def test_keyed_mode_names_all_four_modes_on_mistake(self):
         with tempfile.TemporaryDirectory(prefix="s1tp-kmode-") as tmp:
             driver = self.build_driver(Path(tmp))
@@ -2412,6 +2428,96 @@ class JointActiveGate(unittest.TestCase):
                                         "session"):
                 self.run_joint(Path(tmp), mutate)
 
+    def test_object_budget_refusal_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-budget-") as tmp:
+            def mutate(doc):
+                budgets = doc["object_observations"]["budgets"]
+                budgets["key_rows"]["refused"] = 1
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "refuse"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_object_gap_rows_or_suppression_fail(self):
+        def add_row(doc):
+            doc["object_observations"]["gaps"]["rows"].append(
+                {"subject": "key row shed", "reason": "budget"})
+        def suppress(doc):
+            doc["object_observations"]["gaps"]["suppressed"] = 1
+        for name, mutate in (("rows", add_row),
+                             ("suppressed", suppress)):
+            with tempfile.TemporaryDirectory(prefix="joint-ogap-") as tmp:
+                with self.assertRaisesRegex(
+                        require_s1(self).S1Error,
+                        "gap rows or suppression"):
+                    self.run_joint(Path(tmp), mutate)
+
+    def test_key_row_equation_break_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-equation-") as tmp:
+            def mutate(doc):
+                row = doc["object_observations"]["key_operations"][0]
+                row["completed"] += 1
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "row equation"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_completed_short_of_started_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-completed-") as tmp:
+            def mutate(doc):
+                row = doc["object_observations"]["key_operations"][0]
+                row["failed"] = 1
+                row["completed"] -= 1
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "has completed"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_key_row_identity_fields_fail(self):
+        for field, bad in (("category", "digest"), ("role", "session"),
+                           ("unit", "calls")):
+            with tempfile.TemporaryDirectory(prefix="joint-ident-") as tmp:
+                def mutate(doc, field=field, bad=bad):
+                    doc["object_observations"]["key_operations"][0][field] = bad
+                with self.assertRaisesRegex(require_s1(self).S1Error,
+                                            field):
+                    self.run_joint(Path(tmp), mutate)
+
+    def test_extra_object_view_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-extraobj-") as tmp:
+            def mutate(doc):
+                doc["object_observations"]["objects"].append(
+                    joint_object_view(99, origin="imported",
+                                      creation="unwrap"))
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "object views"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_birth_without_an_observed_interval_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-birthshape-") as tmp:
+            def mutate(doc):
+                view = doc["object_observations"]["objects"][0]
+                view["birth"] = {"start_ns": R0, "end_ns": "soon"}
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "observed interval"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_session_shape_failures_fail(self):
+        for field, bad, expect in (("origin", "imported", "not opened"),
+                                  ("status", "open", "not closed")):
+            with tempfile.TemporaryDirectory(prefix="joint-sesshape-") as tmp:
+                def mutate(doc, field=field, bad=bad):
+                    doc["object_observations"]["sessions"][0][field] = bad
+                with self.assertRaisesRegex(require_s1(self).S1Error,
+                                            expect):
+                    self.run_joint(Path(tmp), mutate)
+
+    def test_expected_per_key_without_a_key_file_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-nokeyfile-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledger, _events, _inventory = healthy_triple(workdir)
+            view = s1.load_ledgers([str(ledger)])
+            with self.assertRaisesRegex(s1.S1Error, "no key file"):
+                s1._joint_expected_per_key(view)
+
 
 class JointConservationGate(unittest.TestCase):
     def run_joint(self, workdir, mutate=None, ops_per_key=(9999,),
@@ -2518,6 +2624,56 @@ class JointConservationGate(unittest.TestCase):
                                         "loss gap"):
                 self.run_joint(Path(tmp), mutate)
 
+    def test_cross_row_mechanism_swap_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-xrow-") as tmp:
+            def mutate(doc):
+                child = doc["semantic_edges"][0]
+                sign, keygen = child["mechanisms"]
+                sign["evidence"]["functions"].append("C_GenerateKey")
+                sign["calls"] += keygen["calls"]
+                sign["errors"] += keygen["errors"]
+                child["mechanisms"] = [sign]
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "pinned"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_native_capture_events_lost_gap_fails(self):
+        reason = ("the EVENTS ring overwrote records before the drain "
+                  "read them (kernel reserve failures; exact count in "
+                  "unrouted_returns)")
+        with tempfile.TemporaryDirectory(prefix="joint-evloss-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "native capture events lost",
+                     "reason": reason, "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_native_capture_events_lost_event_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-evlost-ev-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            rows = [json.loads(line) for line in
+                    events.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            ended = rows[-1]
+            assert ended["kind"] == "ended"
+            gap = event_envelope(ended["seq"], R0 + 1_000, "gap_recorded",
+                                 {"index": 0, "caller": None, "module": None,
+                                  "pid": None,
+                                  "subject": "native capture events lost",
+                                  "reason": "ring overwrite before drain",
+                                  "budget": None})
+            rows.insert(-1, gap)
+            ended["seq"] += 1
+            write_jsonl(events, rows)
+            with self.assertRaisesRegex(s1.S1Error, "loss gap"):
+                s1.compare([str(path) for path in ledgers], [str(events)],
+                           str(inventory), FULL_RATE, joint=True)
+
     def test_joint_requires_system_scope(self):
         with tempfile.TemporaryDirectory(prefix="joint-scope-") as tmp:
             workdir = Path(tmp)
@@ -2527,6 +2683,21 @@ class JointConservationGate(unittest.TestCase):
             doc["scope"] = f"pid:{PID}"
             write_json(inventory, doc)
             with self.assertRaisesRegex(s1.S1Error, "system"):
+                s1.compare([str(path) for path in ledgers], [str(events)],
+                           str(inventory), FULL_RATE, joint=True)
+
+    def test_joint_events_scope_must_be_system(self):
+        with tempfile.TemporaryDirectory(prefix="joint-evscope-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            rows = [json.loads(line) for line in
+                    events.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            assert rows[0]["kind"] == "started"
+            rows[0]["event"]["scope"] = f"pid:{PID}"
+            write_jsonl(events, rows)
+            with self.assertRaisesRegex(s1.S1Error, "not --system"):
                 s1.compare([str(path) for path in ledgers], [str(events)],
                            str(inventory), FULL_RATE, joint=True)
 
@@ -2545,6 +2716,112 @@ class JointConservationGate(unittest.TestCase):
             with self.assertRaisesRegex(require_s1(self).S1Error,
                                         "retained"):
                 self.run_joint(Path(tmp), mutate)
+
+
+def split_joint_events_at(workdir, events_path, cut):
+    """Split a Joint event log into two rotation parts at row `cut`.
+
+    The concatenated stream stays exactly contiguous: the `rotated`
+    marker takes the next sequence number and the tail shifts by one
+    (production shape; the shared loader sorts by seq, so the marker
+    position inside the current part is irrelevant). The ended
+    summary records one rotation with nothing evicted. Returns both
+    part paths.
+    """
+    rows = [json.loads(line) for line in
+            events_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    first, rest = rows[:cut], rows[cut:]
+    older = workdir / (events_path.name + ".1")
+    write_jsonl(older, first)
+    marker_seq = first[-1]["seq"] + 1
+    marker = {"schema": "p11scope/inventory-events/v1", "seq": marker_seq,
+              "at_ns": rest[0]["at_ns"], "kind": "rotated",
+              "event": {"prior_file": older.name,
+                        "prior_events": len(first),
+                        "prior_bytes": older.stat().st_size,
+                        "rotation_seq": 1}}
+    renumbered = []
+    seq = marker_seq + 1
+    for row in rest:
+        row = dict(row)
+        row["seq"] = seq
+        seq += 1
+        renumbered.append(row)
+    for row in renumbered:
+        if row["kind"] == "ended":
+            row["event"]["stream"] = {"rotations": 1, "evicted_events": 0,
+                                      "evicted_bytes": 0}
+    write_jsonl(events_path, [marker] + renumbered)
+    return older, events_path
+
+
+class JointRotation(unittest.TestCase):
+    def test_joint_rotated_stream_passes(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-rot-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            older, current = split_joint_events_at(workdir, events, 3)
+            result = s1.compare([str(path) for path in ledgers],
+                                [str(older), str(current)], str(inventory),
+                                FULL_RATE, joint=True)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["loss"]["stream_rotations"], 1)
+
+    def test_joint_evicted_stream_fails(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-evict-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            older, current = split_joint_events_at(workdir, events, 3)
+            rows = [json.loads(line) for line in
+                    current.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            for row in rows:
+                if row["kind"] == "ended":
+                    row["event"]["stream"]["evicted_events"] = 4
+                    row["event"]["stream"]["evicted_bytes"] = 400
+            write_jsonl(current, rows)
+            with self.assertRaisesRegex(s1.S1Error, "retention"):
+                s1.compare([str(path) for path in ledgers],
+                           [str(older), str(current)], str(inventory),
+                           FULL_RATE, joint=True)
+
+    def test_joint_rotation_hole_fails(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-hole-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            older, current = split_joint_events_at(workdir, events, 3)
+            rows = [json.loads(line) for line in
+                    current.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            for row in rows[1:]:
+                row["seq"] += 1
+            write_jsonl(current, rows)
+            with self.assertRaisesRegex(s1.S1Error, "sequence"):
+                s1.compare([str(path) for path in ledgers],
+                           [str(older), str(current)], str(inventory),
+                           FULL_RATE, joint=True)
+
+    def test_joint_rotation_count_mismatch_fails(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-rotcount-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            older, current = split_joint_events_at(workdir, events, 3)
+            rows = [json.loads(line) for line in
+                    current.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            for row in rows:
+                if row["kind"] == "ended":
+                    row["event"]["stream"]["rotations"] = 2
+            write_jsonl(current, rows)
+            with self.assertRaisesRegex(s1.S1Error, "rotation"):
+                s1.compare([str(path) for path in ledgers],
+                           [str(older), str(current)], str(inventory),
+                           FULL_RATE, joint=True)
 
 
 if __name__ == "__main__":

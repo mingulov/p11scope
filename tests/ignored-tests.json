@@ -1384,7 +1384,7 @@
     {
       "file": "src/metrics/counter_reader.rs",
       "path": "metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64",
-      "reason": "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: K0 profile --select-endpoint counts to -o JSON with live-plan resolution, exact workload-ledger aggregate and explicit zero-call detail",
+      "reason": "requires cc-built owned LP64 growth fixtures and authorized native Multi staging as root: K0 profile --select-endpoint counts to -o JSON with live-plan resolution, exact workload-ledger aggregate and explicit zero-call detail",
       "cell": "privileged"
     },
     {
@@ -1396,13 +1396,13 @@
     {
       "file": "src/metrics/k0_live_cells.rs",
       "path": "metrics::k0_live_cells::k0_live_detail_matches_ledger_counts_lp64",
-      "reason": "privileged K0 cell (Fedora, root): profile --select-endpoint counts on a real SoftHSM workload with an exact ledger-known C_Sign count",
+      "reason": "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): profile --select-endpoint counts on a real SoftHSM workload with an exact ledger-known C_Sign count",
       "cell": "privileged"
     },
     {
       "file": "src/metrics/k0_live_cells.rs",
       "path": "metrics::k0_live_cells::k0_live_exec_voids_detail_counts_lp64",
-      "reason": "privileged K0 cell (Fedora, root): profile --select-endpoint counts voids as caller-changed when the SoftHSM workload execs mid-window",
+      "reason": "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): profile --select-endpoint counts voids as caller-changed when the SoftHSM workload execs mid-window",
       "cell": "privileged"
     },
     {

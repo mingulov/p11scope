@@ -22,6 +22,7 @@ import socket
 import ssl
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -111,7 +112,8 @@ def _stall_outcomes(server) -> str:
         f"spoke={server.spoke_tls} hello={server.client_hello_complete} "
         f"certreq={cert_reqs} "
         f"empty={server.empty_certs} stalls={server.selection_stalls} "
-        f"alerts={server.client_cert_alerts} abandoned={server.abandoned} "
+        f"alerts={server.client_cert_alerts} refusals={server.cert_refusals} "
+        f"abandoned={server.abandoned} "
         f"failures={server.handshake_failures} errors={server.handshake_errors}")
 
 
@@ -194,9 +196,12 @@ class BrowserCells(unittest.TestCase):
         ``s1`` opts into the v0.5.0 S1 proof over the report's S1
         sections (no Joint content, no mechanism use, no logins,
         balanced sessions): a dict with ``sessions_opened_min`` for
-        cells whose floored calls need a session, or
-        ``sessions_zero`` for never-mapped cells. None (the twin
-        default) skips the S1 checks.
+        cells whose window must contain a session open, or
+        ``sessions_zero`` for never-mapped cells. Attach-drive cells
+        must not set ``sessions_opened_min``: the browser opens its
+        sessions at startup, strictly before capture, so floored calls
+        legitimately ride cached sessions. None (the twin default)
+        skips the S1 checks.
         """
         report = oracle.load_report(result.report_path)
         module_sha = oracle.sha256_of(store.lib)
@@ -246,18 +251,25 @@ class BrowserCells(unittest.TestCase):
     def assert_pinbound_stall(self, label, facts, server):
         """The CERT_REQUIRED flow stalled at the PIN boundary (P2-2).
 
-        Requires affirmative selection progress on the stalled
-        connection: a complete ClientHello plus a token-selection
-        witness — an empty certificate or a CertificateRequest-backed
-        stall — with no successful handshake, no presented cert, no
-        served request, no protocol failure, and a TLS-flow (not crashed
-        or never-launched) browser outcome. A stall counts only when the
-        same connection observed the server's outbound CertificateRequest
-        (a complete hello alone can yield HelloRetryRequest waiting for
-        ClientHello2, which is pre-selection). Client cert alerts and
-        abandoned transports are tolerated but never sufficient: alerts
-        are ambiguous (selection refusal vs server-cert rejection) and
-        abandons carry no selection information. A navigation timeout
+        Requires affirmative selection progress: a complete ClientHello
+        plus a token-selection witness — an empty certificate, a
+        CertificateRequest-backed stall, or a CertificateRequest-backed
+        refusal (the client answering the received CertificateRequest
+        with a fatal certificate_unknown alert) — with no successful
+        handshake, no presented cert, no served request, no protocol
+        failure, and a TLS-flow (not crashed or never-launched) browser
+        outcome. A stall or refusal counts only when the same connection
+        observed the server's outbound CertificateRequest (a complete
+        hello alone can yield HelloRetryRequest waiting for
+        ClientHello2, which is pre-selection). Bare alerts and abandoned
+        transports are tolerated but never sufficient: a bare alert is
+        ambiguous (selection refusal vs server-cert rejection) and an
+        abandon carries no selection information. The refusal leg is
+        unambiguous here: the cells run with ignored server-cert errors
+        (the paired plain cell loads the same certificate with HTTP 200,
+        and the no-token control yields an empty certificate instead),
+        so a fatal alert after the CertificateRequest flight refuses
+        selection, not the server certificate. A navigation timeout
         alone proves nothing about selection and is never a witness.
         """
         outcomes = _stall_outcomes(server)
@@ -278,11 +290,13 @@ class BrowserCells(unittest.TestCase):
                 getattr(server, "cert_requests_sent", 0), 1,
                 f"{label}: stall without outbound CertificateRequest "
                 f"(selection never began) [{outcomes}]")
-        witness = server.empty_certs + server.selection_stalls
+        witness = (server.empty_certs + server.selection_stalls
+                   + server.cert_refusals)
         self.assertGreaterEqual(
             witness, 1,
             f"{label}: no token-selection witness "
-            f"(need empty-cert or CertificateRequest-backed stall) [{outcomes}]")
+            f"(need empty-cert, CertificateRequest-backed stall, or "
+            f"CertificateRequest-backed refusal) [{outcomes}]")
         self.assertNotIn("flow_error", facts,
                          f"{label}: flow setup failed: {facts.get('flow_error')}")
         self.assertFalse(facts.get("loaded", True),
@@ -315,9 +329,13 @@ class BrowserCells(unittest.TestCase):
         self.assertTrue(result.flow.get("target_alive"), "browser target disappeared?!")
         self.assertTrue(result.flow.get("target_identity"), "browser target PID reused?!")
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
+        # No opened floor: Firefox opens its NSS token sessions at
+        # startup, strictly before the profiler can attach, so the
+        # window sees enumeration on cached sessions (C_OpenSession=0
+        # with C_FindObjects>0) and sessions.opened is legitimately 0.
         self.check_report(result, store, oracle.FF_STARTUP_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_FLOOR,
-                          s1={"sessions_opened_min": 1})
+                          s1={})
 
     @gate("chromium")
     def test_cr_plain_validates_without_private_token_use(self):
@@ -340,9 +358,12 @@ class BrowserCells(unittest.TestCase):
         self.assertTrue(result.flow.get("target_alive"), "browser target disappeared?!")
         self.assertTrue(result.flow.get("target_identity"), "browser target PID reused?!")
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
+        # No opened floor: Chromium opens its NSS token sessions at
+        # startup, strictly before the profiler can attach (same
+        # window argument as FF-STARTUP).
         self.check_report(result, store, oracle.CR_ENUMERATION_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT,
-                          s1={"sessions_opened_min": 1})
+                          s1={})
 
     @gate("firefox")
     def test_ff_nomod_observes_nothing(self):
@@ -413,9 +434,10 @@ class BrowserCells(unittest.TestCase):
         self.assertTrue(result.flow.get("mapped_at_end"), "module unmapped?!")
         # Selection enumerates stably (x5 on every run) but the
         # interactive-PIN boundary holds: login and signing never happen.
+        # No opened floor (same window argument as FF-STARTUP).
         self.check_report(result, store, oracle.CR_ENUMERATION_FLOORS, attached=True,
                           allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT,
-                          s1={"sessions_opened_min": 1})
+                          s1={})
 
     # -- Unprivileged counterexample twins (P2-2/P2-3; run everywhere) --
     #
@@ -785,6 +807,7 @@ class BrowserCells(unittest.TestCase):
             "handshakes_ok": 0, "spoke_tls": 1, "client_hello_complete": 0,
             "cert_requests_sent": 0, "empty_certs": 0,
             "selection_stalls": 0, "client_cert_alerts": 0, "abandoned": 1,
+            "cert_refusals": 0,
             "handshake_failures": 0, "handshake_errors": [],
         }
         stats.update(overrides)
@@ -847,6 +870,36 @@ class BrowserCells(unittest.TestCase):
             self._pinbound_stats(selection_stalls=1, abandoned=0,
                                  client_hello_complete=1, cert_requests_sent=1),
             self._pinbound_timeout_facts())
+
+    def test_pinbound_refusal_after_cert_request_accepted(self):
+        """Twin: a CertificateRequest-backed client refusal witnesses selection.
+
+        Chromium answers the received CertificateRequest with a fatal
+        certificate_unknown alert (fail-fast refusal) instead of
+        stalling; the alert after affirmative CertificateRequest
+        progress witnesses selection like the empty cert and the stall.
+        Shape mirrors the live CR-PINBOUND run (3 hellos, 3
+        CertificateRequests, 2 refusals, 1 abandon, hung navigation).
+        """
+        self._pinbound_rig(
+            self._pinbound_stats(
+                connections=3, client_hello_complete=3, cert_requests_sent=3,
+                client_cert_alerts=2, cert_refusals=2, abandoned=1,
+                selection_stalls=0, empty_certs=0),
+            self._pinbound_timeout_facts())
+
+    def test_pinbound_rejects_bare_alert_without_cert_request(self):
+        """Twin: alerts without CertificateRequest progress stay insufficient.
+
+        A client that aborts before the server's CertificateRequest
+        flight went out never reached selection; bare alerts must not
+        become a witness (anti-over-acceptance for the refusal leg).
+        """
+        stats = self._pinbound_stats(
+            client_hello_complete=1, client_cert_alerts=2, cert_refusals=0,
+            cert_requests_sent=0)
+        with self.assertRaises(AssertionError):
+            self._pinbound_rig(stats, self._pinbound_timeout_facts())
 
     def test_pinbound_rig_healthy_accepted(self):
         """Guard: the rig passes with a boundary witness (no over-reject)."""
@@ -1009,6 +1062,55 @@ class BrowserCells(unittest.TestCase):
                               flow.requests_served), (1, 0, 1))
             self.assertEqual(flow.client_hello_complete, 1)
             self.assertEqual(flow.cert_requests_sent, 0)
+
+    def test_flow_server_survives_garbage_peer(self):
+        """Twin: a non-TLS peer must not kill the flow server.
+
+        The garbage connection is recorded as an unrelated protocol
+        failure; the acceptor must keep serving afterwards (no dead
+        serve_forever thread, no follow-up request left hanging).
+        Stdlib sockets plus one real TLS client.
+        """
+        if shutil.which("openssl") is None:
+            self.skipTest("openssl missing")
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        thread_errors: list = []
+        previous_hook = threading.excepthook
+        threading.excepthook = thread_errors.append
+        try:
+            with tls_server.FlowServer(cert=cert, key=key) as flow:
+                raw = socket.create_connection(("127.0.0.1", flow.port))
+                try:
+                    raw.sendall(b"GARBAGE-NOT-TLS")
+                finally:
+                    raw.close()
+                deadline = time.monotonic() + 10
+                while flow.handshake_failures == 0 and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertEqual(flow.handshake_failures, 1)
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                sock = socket.create_connection(("127.0.0.1", flow.port))
+                sock.settimeout(10)
+                with context.wrap_socket(sock, server_hostname="127.0.0.1") as peer:
+                    peer.sendall(b"GET / HTTP/1.0\r\n\r\n")
+                    body = b""
+                    try:
+                        while b"g33-flow-ok" not in body:
+                            chunk = peer.recv(4096)
+                            if not chunk:
+                                break
+                            body += chunk
+                    except TimeoutError:
+                        self.fail("flow server died on the garbage peer: "
+                                  "follow-up request never answered")
+                self.assertIn(b"g33-flow-ok", body)
+                self.assertEqual(flow.requests_served, 1)
+        finally:
+            threading.excepthook = previous_hook
+        self.assertEqual(thread_errors, [],
+                         "flow server thread died on the garbage peer")
 
     def test_flow_server_partial_client_hello_is_abandoned(self):
         """P2-2 twin: a partial ClientHello plus silence is abandoned, not a stall.
@@ -1325,6 +1427,53 @@ def live_cells_missing_s1(source):
     return found, missing
 
 
+def attach_cells_with_opened_floor(source):
+    """``@gate`` attach-drive cells whose ``s1=`` sets ``sessions_opened_min``.
+
+    Parses ``source`` (this suite file) like ``live_cells_missing_s1``.
+    Attach cells must never floor in-window session opens: the browser
+    opens its NSS token sessions at startup, strictly before the
+    profiler can attach, so navigation traffic rides cached sessions
+    and ``sessions.opened`` is legitimately zero. Returns the violating
+    cell names (empty means the suite honors the window).
+    """
+    violations = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef) or node.name != "BrowserCells":
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef):
+                continue
+            gated = any(
+                (isinstance(expr, ast.Call)
+                 and isinstance(expr.func, ast.Name)
+                 and expr.func.id == "gate")
+                or (isinstance(expr, ast.Name) and expr.id == "gate")
+                for expr in item.decorator_list)
+            if not gated:
+                continue
+            calls = [call for call in ast.walk(item)
+                     if isinstance(call, ast.Call)]
+            attached = any(
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "attach_drive"
+                for call in calls)
+            if not attached:
+                continue
+            for call in calls:
+                if not (isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "check_report"):
+                    continue
+                for keyword in call.keywords:
+                    if keyword.arg != "s1" or not isinstance(keyword.value, ast.Dict):
+                        continue
+                    keys = [key.value for key in keyword.value.keys
+                            if isinstance(key, ast.Constant)]
+                    if "sessions_opened_min" in keys:
+                        violations.append(item.name)
+    return violations
+
+
 def healthy_sessions(opened=2, inherited=0, closed=1, async_opened=0,
                      peak=2):
     """Balanced S1 session accounting (balance follows the counters)."""
@@ -1467,6 +1616,18 @@ class BrowserS1Oracle(unittest.TestCase):
             Path(__file__).read_text())
         self.assertEqual(len(found), 5)
         self.assertEqual(missing, [])
+
+    def test_attach_cells_require_no_opened_floor(self):
+        """Twin: attach cells must not floor in-window session opens.
+
+        Sessions open at browser startup, strictly before the
+        attach-mode capture window exists; requiring
+        ``sessions_opened_min`` there fails on correct captures.
+        """
+        require_s1_wiring(self)
+        violations = attach_cells_with_opened_floor(
+            Path(__file__).read_text())
+        self.assertEqual(violations, [])
 
 
 if __name__ == "__main__":

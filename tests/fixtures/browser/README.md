@@ -86,7 +86,7 @@ gate cells.
 | CR-PLAIN | attach-drive | HTTPS visit, registered | `C_FindObjects*` ≥1; calibrated x5, no `C_Login`/`C_Sign*`, page 200, NSS witness |
 | FF-NOMOD | run-direct, http | screenshot, unregistered | zero calls, exit 0, PNG bytes |
 | FF-PINBOUND | attach-drive | `CERT_REQUIRED` visit | stall (fast-fail or hang), no `C_Login`/`C_SignInit`/`C_Sign` ever |
-| CR-PINBOUND | attach-drive, no auto-select | `CERT_REQUIRED` visit | selection ≥1; calibrated x5, no login/sign, stall, not loaded |
+| CR-PINBOUND | attach-drive, no auto-select | `CERT_REQUIRED` visit | selection ≥1; calibrated x5, no login/sign, stall or fail-fast refusal, not loaded |
 
 What the catalog proves:
 
@@ -102,10 +102,13 @@ What the catalog proves:
 - CR-PLAIN/CR-PINBOUND characterize Chromium with the provider mapped
   and reachable: plain validation enumerates (stable x5) without any
   private-token operation, and the `CERT_REQUIRED` visit enumerates
-  then stalls at the interactive-PIN boundary (fast-fail or hang, both
-  handshake-witnessed) with login and signing never happening. The
-  fresh-HOME NSS witness proves the registration was effective before
-  any absence is interpreted.
+  then stops at the interactive-PIN boundary with login and signing
+  never happening. Chromium refuses fail-fast (a fatal alert answering
+  the received CertificateRequest, retried, navigation left hanging)
+  rather than stalling; the witness accepts an empty certificate, a
+  CertificateRequest-backed stall, or a CertificateRequest-backed
+  refusal. The fresh-HOME NSS witness proves the registration was
+  effective before any absence is interpreted.
 - FF-NOMOD is the absence twin through the owned-child (`run`) path.
 
 ## Calibrated boundaries (do not "fix" in the harness)

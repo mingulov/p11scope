@@ -1876,7 +1876,8 @@ fn returned_word_fits_layout(word: u64, layout: u8) -> bool {
 /// Unreadable entry evidence is never an absent session; capture states are
 /// enums, and a captured VALUE (including zero or MECH_NONE's numeric value)
 /// stays exact. Other capture bits, ordinary corroboration and ingress are
-/// unchanged; asynchronous capture-state rewriting is a separate packet.
+/// unchanged, except that an OK `C_AsyncGetID` return may gain the
+/// value-unreadable bit for a null output pointer or unreadable id.
 fn returned_fields_agree(
     begin: &ValidatedJournalBegin,
     event: &p11scope_ebpf_common::Event,
@@ -1906,6 +1907,20 @@ fn returned_fields_agree(
     }
     let before = begin.capture();
     let after = event.capture;
+    // Wire-contract rule: an OK `C_AsyncGetID` return may gain ONLY
+    // the value-unreadable bit (null output pointer or unreadable
+    // id), with the mechanism word unchanged. Every other function,
+    // return code or bit change falls through to the strict rule
+    // below — in particular the bit never clears and never appears
+    // beside another change.
+    if semantics.lifecycle == lifecycle::ASYNC_GET_ID
+        && event.rv == 0
+        && event.mechanism == begin.entry_mechanism()
+        && (before ^ after) == capture::ASYNC_VALUE_UNREADABLE
+        && after & capture::ASYNC_VALUE_UNREADABLE != 0
+    {
+        return true;
+    }
     let entry_state = before & capture::MECHANISM_MASK;
     let return_state = after & capture::MECHANISM_MASK;
     let entry_failed = before & capture::ARG_READ_FAILURE != 0;

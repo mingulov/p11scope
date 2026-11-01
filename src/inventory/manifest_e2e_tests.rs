@@ -286,6 +286,52 @@ impl Drop for E2eProcess {
     }
 }
 
+/// Bounded observer-log tail for failure evidence: the last 60 lines
+/// within 16 KiB, so a failure carries the observer's own words.
+fn observer_log_tail(log: &Path) -> Vec<String> {
+    const MAX_LINES: usize = 60;
+    const MAX_BYTES: usize = 16384;
+    let text = match std::fs::read_to_string(log) {
+        Ok(text) => text,
+        Err(error) => return vec![format!("<log unreadable: {error}>")],
+    };
+    let mut lines: Vec<&str> = text.lines().collect();
+    if lines.len() > MAX_LINES {
+        lines.drain(..lines.len() - MAX_LINES);
+    }
+    let mut bytes = 0;
+    let mut kept = Vec::new();
+    for line in lines.into_iter().rev() {
+        if bytes + line.len() + 1 > MAX_BYTES {
+            break;
+        }
+        bytes += line.len() + 1;
+        kept.push(line.to_string());
+    }
+    kept.reverse();
+    kept
+}
+
+/// One failure line carrying the observer's exit status, the report
+/// path and the bounded log tail.
+fn observer_evidence(log: &Path, report: &Path, status: &str) -> String {
+    format!(
+        "observer {status}; report={}; log tail={:?}",
+        report.display(),
+        observer_log_tail(log)
+    )
+}
+
+/// Keep the workload directory on failure so the printed report path
+/// stays readable; on success the directory drops as before.
+fn keep_workload_on_failure(workload: E2eWorkload, outcome: Result<()>, tag: &str) -> Result<()> {
+    if outcome.is_err() {
+        eprintln!("{tag} evidence kept at {}", workload.dir.path().display());
+        let _ = workload.dir.keep();
+    }
+    outcome
+}
+
 #[test]
 fn headline_workload_holds_after_done_without_adding_calls() -> Result<()> {
     let module = softhsm_path()?;
@@ -511,14 +557,19 @@ fn privileged_inventory_system_manifest_e2e_softhsm_edges_lp64() -> Result<()> {
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = E2eWorkload::build(&module)?;
-    let manifest = mech_manifest(&workload, &module)?;
+    let outcome = man1_e2e_inner(&workload, &module, &observer);
+    keep_workload_on_failure(workload, outcome, "MAN1_E2E")
+}
+
+fn man1_e2e_inner(workload: &E2eWorkload, module: &str, observer: &Path) -> Result<()> {
+    let manifest = mech_manifest(workload, module)?;
     let out = workload.path("inv.json");
     let gate = workload.path("gate");
     let ledger_out = workload.path("ledger.out");
     let observer_out = workload.path("observer.out");
     let mut target = workload.spawn(
         &ledger_out,
-        &module,
+        module,
         &gate,
         100_000,
         2_000,
@@ -533,7 +584,7 @@ fn privileged_inventory_system_manifest_e2e_softhsm_edges_lp64() -> Result<()> {
         gate.display()
     );
     let observer_log = std::fs::File::create(&observer_out)?;
-    let mut child = Command::new(&observer)
+    let mut child = Command::new(observer)
         .args([
             "inventory",
             "--system",
@@ -562,14 +613,17 @@ fn privileged_inventory_system_manifest_e2e_softhsm_edges_lp64() -> Result<()> {
         if published {
             break;
         }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "the observer exited before pass 0: {}",
+                observer_evidence(&observer_out, &out, &format!("exited {status}"))
+            );
+        }
         ensure!(
             Instant::now() < gate_deadline,
-            "pass 0 never published (observer pid={})",
-            child.id()
-        );
-        ensure!(
-            child.try_wait()?.is_none(),
-            "the observer exited before pass 0"
+            "pass 0 never published (observer pid={}): {}",
+            child.id(),
+            observer_evidence(&observer_out, &out, "still running")
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -582,8 +636,9 @@ fn privileged_inventory_system_manifest_e2e_softhsm_edges_lp64() -> Result<()> {
         }
         ensure!(
             Instant::now() < stop_deadline,
-            "the observer never stopped (pid={})",
-            child.id()
+            "the observer never stopped (pid={}): {}",
+            child.id(),
+            observer_evidence(&observer_out, &out, "still running")
         );
         std::thread::sleep(Duration::from_millis(100));
     };
@@ -591,7 +646,11 @@ fn privileged_inventory_system_manifest_e2e_softhsm_edges_lp64() -> Result<()> {
     target.kill();
     let rc = status.code().unwrap_or(-1);
     println!("MAN1_E2E observer rc={rc}");
-    ensure!(rc == 0, "inventory --system --manifest exits 0, got {rc}");
+    ensure!(
+        rc == 0,
+        "inventory --system --manifest exits 0, got {rc}: {}",
+        observer_evidence(&observer_out, &out, &format!("exited {status}"))
+    );
     if let Ok(text) = std::fs::read_to_string(&observer_out) {
         for line in text.lines().filter(|line| line.contains("semantic calls:")) {
             println!("MAN1_E2E {line}");
@@ -1147,6 +1206,16 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = E2eWorkload::build(&module)?;
+    let outcome = scale4097_inner(&workload, &module, &observer, endpoint_target);
+    keep_workload_on_failure(workload, outcome, "SCALE2_E2E")
+}
+
+fn scale4097_inner(
+    workload: &E2eWorkload,
+    module: &str,
+    observer: &Path,
+    endpoint_target: u64,
+) -> Result<()> {
     // Distinct copies, one full-surface manifest each, until the
     // resolved total reaches the target past the default budget. Near
     // the 8192 cap a full-copies-only population overshoots into whole-
@@ -1155,7 +1224,7 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     // copies plus one smaller helper-discovered tail so the admitted total
     // equals the target with nothing refused.
     let first_copy = workload.path("copy-0.so");
-    std::fs::copy(&module, &first_copy)?;
+    std::fs::copy(module, &first_copy)?;
     let first_manifest = workload.path("copy-0.json");
     let per_copy =
         full_surface_manifest(first_copy.to_str().context("copy path")?, &first_manifest)?;
@@ -1164,7 +1233,7 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
         per_copy >= SCALE_MIN_SURFACE,
         "a scale copy resolves its full surface, got {per_copy}"
     );
-    let mech_manifest_path = mech_manifest(&workload, &module)?;
+    let mech_manifest_path = mech_manifest(workload, module)?;
     let mut manifests = vec![mech_manifest_path];
     let mut copies = vec![first_copy];
     manifests.push(first_manifest);
@@ -1188,7 +1257,7 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
                 "scale population hit the copy cap at {running} endpoints"
             );
             let copy = workload.path(&format!("copy-{index}.so"));
-            std::fs::copy(&module, &copy)?;
+            std::fs::copy(module, &copy)?;
             let manifest_path = workload.path(&format!("copy-{index}.json"));
             let resolved =
                 full_surface_manifest(copy.to_str().context("copy path")?, &manifest_path)?;
@@ -1216,7 +1285,7 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
         );
         for index in 1..full {
             let copy = workload.path(&format!("copy-{index}.so"));
-            std::fs::copy(&module, &copy)?;
+            std::fs::copy(module, &copy)?;
             let manifest_path = workload.path(&format!("copy-{index}.json"));
             let resolved =
                 full_surface_manifest(copy.to_str().context("copy path")?, &manifest_path)?;
@@ -1282,7 +1351,7 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     let observer_out = workload.path("observer.out");
     let mut target = workload.spawn(
         &ledger_out,
-        &module,
+        module,
         &gate,
         100_000,
         2_000,
@@ -1295,7 +1364,7 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
         gate.display()
     );
     let observer_log = std::fs::File::create(&observer_out)?;
-    let mut command = Command::new(&observer);
+    let mut command = Command::new(observer);
     command.arg("inventory").arg("--system");
     for manifest in &manifests {
         command
@@ -1325,14 +1394,17 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
         if published {
             break;
         }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "the observer exited before pass 0: {}",
+                observer_evidence(&observer_out, &out, &format!("exited {status}"))
+            );
+        }
         ensure!(
             Instant::now() < gate_deadline,
-            "pass 0 never published (observer pid={})",
-            child.id()
-        );
-        ensure!(
-            child.try_wait()?.is_none(),
-            "the observer exited before pass 0"
+            "pass 0 never published (observer pid={}): {}",
+            child.id(),
+            observer_evidence(&observer_out, &out, "still running")
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1345,8 +1417,9 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
         }
         ensure!(
             Instant::now() < stop_deadline,
-            "the observer never stopped (pid={})",
-            child.id()
+            "the observer never stopped (pid={}): {}",
+            child.id(),
+            observer_evidence(&observer_out, &out, "still running")
         );
         std::thread::sleep(Duration::from_millis(100));
     };
@@ -1354,7 +1427,11 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
     drop(holder);
     let rc = status.code().unwrap_or(-1);
     println!("SCALE2_E2E observer rc={rc}");
-    ensure!(rc == 0, "inventory --system --manifest exits 0, got {rc}");
+    ensure!(
+        rc == 0,
+        "inventory --system --manifest exits 0, got {rc}: {}",
+        observer_evidence(&observer_out, &out, &format!("exited {status}"))
+    );
     if let Ok(text) = std::fs::read_to_string(&observer_out) {
         for line in text.lines().filter(|line| line.contains("semantic calls:")) {
             println!("SCALE2_E2E {line}");

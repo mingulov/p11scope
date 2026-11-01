@@ -1239,6 +1239,40 @@ fn lingering_ids(watched: &[(String, u32)], live: &HashSet<u32>) -> Vec<(String,
         .collect()
 }
 
+/// Live map or program IDs through `GET_NEXT_ID` only, never
+/// `GET_FD_BY_ID`: the walk reads the kernel object registry
+/// without acquiring any object reference (same pattern as the
+/// inventory activation tests). The reclaim watch must observe a
+/// dying load without opening it: FD-opening enumeration during
+/// teardown grace strands the load-private program arrays.
+fn live_ids(command: aya_obj::generated::bpf_cmd) -> anyhow::Result<HashSet<u32>> {
+    let mut live = HashSet::new();
+    let mut id = 0u32;
+    loop {
+        let mut attr = [id, 0, 0];
+        // SAFETY: bpf(2) GET_NEXT_ID with a 3-word id/next/flags attr.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                command as u32,
+                &mut attr,
+                std::mem::size_of::<[u32; 3]>(),
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                break;
+            }
+            return Err(error.into());
+        }
+        anyhow::ensure!(attr[1] > attr[0], "GET_NEXT_ID made no progress");
+        id = attr[1];
+        live.insert(id);
+    }
+    Ok(live)
+}
+
 impl BankProofDriver {
     /// Single-load cell: one object owns both banks' maps; slot A is
     /// installed and current, slot B is empty. No birth attach (ambient
@@ -4123,6 +4157,25 @@ mod tests {
                 "A census covers {name}"
             );
         }
+        // The reference-free enumerator must see every watched
+        // object while A is alive; otherwise the absence poll
+        // below would pass vacuously.
+        let live_maps = live_ids(aya_obj::generated::bpf_cmd::BPF_MAP_GET_NEXT_ID)
+            .expect("live map ids");
+        let live_progs = live_ids(aya_obj::generated::bpf_cmd::BPF_PROG_GET_NEXT_ID)
+            .expect("live prog ids");
+        for (name, id) in &objects_a.maps {
+            assert!(
+                live_maps.contains(id),
+                "A census map {name}={id} visible before reclaim"
+            );
+        }
+        for (name, id) in &objects_a.progs {
+            assert!(
+                live_progs.contains(id),
+                "A census prog {name}={id} visible before reclaim"
+            );
+        }
         driver.reclaim(0).expect("reclaim A");
         // Kernel-side teardown of the dropped load (program-array slot
         // release, program unload) can lag the last FD close by an RCU
@@ -4130,12 +4183,10 @@ mod tests {
         // requirement stays exact: every A map and program must be gone.
         let started = Instant::now();
         let waited_ms = loop {
-            let live_maps: HashSet<u32> = aya::maps::loaded_maps()
-                .filter_map(|info| info.ok().map(|info| info.id()))
-                .collect();
-            let live_progs: HashSet<u32> = aya::programs::loaded_programs()
-                .filter_map(|info| info.ok().map(|info| info.id()))
-                .collect();
+            let live_maps = live_ids(aya_obj::generated::bpf_cmd::BPF_MAP_GET_NEXT_ID)
+                .expect("live map ids");
+            let live_progs = live_ids(aya_obj::generated::bpf_cmd::BPF_PROG_GET_NEXT_ID)
+                .expect("live prog ids");
             let lingering_maps = lingering_ids(&objects_a.maps, &live_maps);
             let lingering_progs = lingering_ids(&objects_a.progs, &live_progs);
             if lingering_maps.is_empty() && lingering_progs.is_empty() {

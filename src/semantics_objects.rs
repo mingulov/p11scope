@@ -1302,3 +1302,32 @@ impl ObjectSemantics {
         self.state.replay_pending_count()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AsyncValue;
+
+    // Async ids are private correlation keys: Debug names the type
+    // but never renders the raw value, in any base.
+    #[test]
+    fn async_value_debug_redacts_raw_value() {
+        let raw = 0x1234_5678_9abc_def0u64;
+        let rendered = format!("{:?}", AsyncValue::from(raw));
+        assert!(
+            !rendered.contains(&raw.to_string()),
+            "decimal raw value must never render: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{raw:x}")),
+            "lower-hex raw value must never render: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{raw:X}")),
+            "upper-hex raw value must never render: {rendered}"
+        );
+        assert!(
+            rendered.contains("AsyncValue"),
+            "Debug still names the type: {rendered}"
+        );
+    }
+}

@@ -72,6 +72,39 @@ refusal during a `--manifest` capture ends the first stop with an incomplete
 report and a nonzero exit. Uncertain native ownership stays retained and
 replacement admission stays blocked; the refusal is not proof of clean detach.
 
+In v0.6.0 release builds, key operations will be reported under the planned per-key-tracking opt-in
+`p11scope inventory --key-operations` (default off; the flag is not implemented yet),
+with the following birth-marker limits. If any watched call of a program is
+not fully captured — the call ran outside the selected scope, its binary
+interface was refused, or the call was dropped (a lost identity, start record
+or ring slot, or a thread killed in the middle of the call) — that program
+gets no key-operation rows for the rest of the capture. The program's call
+counts and per-function summaries continue; only its key-operation rows stay
+absent. For scope misses, widen the scope (`--cgroup` or `--system`);
+otherwise re-run the capture.
+
+Each recording can newly cover only a fixed number of programs (about 16.8
+million). Once that budget is spent, programs already in the report keep their
+key-operation rows, but programs started afterwards get none. Call counts
+continue for all programs. This happens only in very long captures or under
+extreme program-start churn; ordinary runs never reach the budget. Split the
+capture into shorter runs to stay under it.
+
+On 5.15 kernels, a program that starts while the kernel is momentarily busy
+recording it can miss coverage entirely: its later calls are counted but never
+joined to key-operation rows. This loses coverage for that program only; it
+never produces a wrong row. Re-run the capture so the program starts cleanly.
+
+Under `--pid`, only the named process contributes key operations; it stays
+covered when it replaces itself with a new program in place (an exec keeps the
+same process). Programs it starts while the capture runs (children) are not
+observed, even when they call the same provider. One narrow exception, with
+`--attach-backend singles` only: a child started with vfork (as with
+posix_spawn) that still shares the target's memory and calls the provider before
+starting its own program is marked as not covered. With `multi` the kernel drops
+such a call before p11scope sees it, so the child is simply not observed.
+(`auto` can pick either.) Neither case is verified live yet.
+
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are
 missed, with no marker in the output; restarting such processes is the

@@ -169,7 +169,13 @@ Start with `inspect`: it shows every provider-shaped module the target maps.
 An optional `--module` only narrows that set. On the measured p11-kit stack,
 p11-kit's fixed closure array exceeds the 512-slot ceiling and is refused
 whole, while the later-fitting SoftHSM2 backend attaches; the report is
-explicitly `PARTIAL`, not a claim that the proxy layer was captured.
+explicitly `PARTIAL`, not a claim that the proxy layer was captured. The
+terminal report names each refused or partially covered module with its
+reason: `run` and `profile` print a `Module gaps` section with the first
+five and an "and K more" line, and `inventory` prints the admission
+reason under each refused module. A capture whose only mapped provider is
+the proxy layer completes with that named gap; an attach-scoped `--pid`
+capture on such a process stops at startup with the named refusal.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,

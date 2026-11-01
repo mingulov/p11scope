@@ -484,14 +484,17 @@ report format.
 - Detailed per-call capture has 512 attach slots in release builds; this is
   separate from Inventory's 4,096 default / 8,192 maximum physical endpoints
   and the explicit aggregate counter modes. Detailed `--pid`, `run`, and any capture aimed with
-  `--module` admit providers in discovery order. A `--cgroup` or `--system`
+  `--module` admit providers in discovery order. A recognized proxy closure
+  array is decided after every provider and admitted whole or not at all, so
+  it never crowds out a real provider. A `--cgroup` or `--system`
   capture without `--module` admits each provider whole or not at all, by
   value — `--manifest` providers first, then providers whose function table
   is corroborated, then heuristic finds, proxy closure arrays last. Heuristic
   finds and closure arrays may not use the last 128 slots (25%), which stay
   free for corroborated providers found later in the capture. A refusal names
   what holds the slots; in such a shared capture it also names the reserve and
-  suggests `--module`.
+  suggests `--module`. The terminal report names every refused or partially
+  covered module with its reason.
 - Kernel-side state has fixed limits too: a lifetime budget of 16,384 process
   identities per `profile`/`trace` capture (under `--cgroup` and `--system`
   every process created in scope spends them) and 16,448 concurrent in-flight

@@ -366,7 +366,46 @@ const IDENTITY_MAPS: [(&str, ExactMapMetadata); 6] = [
     ("ROOT_CTL", map_metadata(MapType::Array, 4, 64, 1, 0)),
 ];
 
-fn validate_identity_inventory<'a>(maps: impl Iterator<Item = (&'a str, bool)>) -> Result<()> {
+/// True when this build wires the loader gate (`P11SCOPE_LOADER_GATE=1`,
+/// emitted by build.rs as `P11SCOPE_LOADER_GATE_ENABLED`). Only gate-1
+/// Detailed objects carry [`GATE_IDENTITY_MAPS`]; every other flavor and
+/// every gate-0 object stays gate-free.
+pub(crate) const LOADER_GATE_BUILD: bool = {
+    // Byte comparison: `matches!` on `str` is not const.
+    let bytes = env!("P11SCOPE_LOADER_GATE_ENABLED").as_bytes();
+    bytes.len() == 1 && bytes[0] == b'1'
+};
+
+/// Exact metadata for every map a gate-1 Detailed object adds, read from
+/// the built object (BTF DATASEC plus the Rust `maps` section). Counter
+/// and inventory objects never carry these; a gate-0 build refuses them.
+const GATE_IDENTITY_MAPS: [(&str, ExactMapMetadata); 5] = [
+    (
+        "TASK_COOKIE_B",
+        map_metadata(MapType::TaskStorage, 4, 8, 0, 1),
+    ),
+    (
+        "COOKIE_CTL_B",
+        map_metadata(MapType::Array, 4, 40, 1, 0),
+    ),
+    (
+        "IMAGE_BANK_SELECT",
+        map_metadata(MapType::Array, 4, 96, 1, 0),
+    ),
+    (
+        "LOADER_GATE",
+        map_metadata(MapType::Array, 4, 32, 256, 0),
+    ),
+    (
+        "LOADER_GATE_CTL",
+        map_metadata(MapType::Array, 4, 72, 1, 0),
+    ),
+];
+
+fn validate_identity_inventory<'a>(
+    maps: impl Iterator<Item = (&'a str, bool)>,
+    gate: bool,
+) -> Result<()> {
     let mut storage = BTreeSet::new();
     for (name, unsupported) in maps {
         if unsupported {
@@ -375,28 +414,50 @@ fn validate_identity_inventory<'a>(maps: impl Iterator<Item = (&'a str, bool)>) 
             if name == "PROC_EPOCH" {
                 continue;
             }
-            if !matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION") {
+            let known = matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION")
+                || (gate && name == "TASK_COOKIE_B");
+            if !known {
                 bail!("unexpected Unsupported map {name}");
             }
             storage.insert(name);
-        } else if matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION") {
+        } else if matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION")
+            || (gate && name == "TASK_COOKIE_B")
+        {
             bail!("{name} must be an Unsupported task-storage map");
         }
     }
-    if storage != BTreeSet::from(["ROOT_AFFILIATION", "TASK_COOKIE", "THREAD_OWNER"]) {
+    let mut required = BTreeSet::from(["ROOT_AFFILIATION", "TASK_COOKIE", "THREAD_OWNER"]);
+    if gate {
+        required.insert("TASK_COOKIE_B");
+    }
+    if storage != required {
         bail!("missing required task-storage maps: {storage:?}");
     }
     Ok(())
 }
 
 fn identity_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::maps::MapData> {
-    let (_, expected) = IDENTITY_MAPS
+    let expected = IDENTITY_MAPS
         .iter()
+        .chain(GATE_IDENTITY_MAPS.iter())
         .find(|(candidate, _)| *candidate == name)
+        .map(|(_, expected)| expected)
         .with_context(|| format!("unexpected identity map {name}"))?;
     let data = match (name, map) {
-        ("TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION", Map::Unsupported(data)) => data,
-        ("COOKIE_CTL" | "OWNER_CTL" | "ROOT_CTL", Map::Array(data)) => data,
+        (
+            "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION" | "TASK_COOKIE_B",
+            Map::Unsupported(data),
+        ) => data,
+        (
+            "COOKIE_CTL"
+            | "OWNER_CTL"
+            | "ROOT_CTL"
+            | "COOKIE_CTL_B"
+            | "IMAGE_BANK_SELECT"
+            | "LOADER_GATE"
+            | "LOADER_GATE_CTL",
+            Map::Array(data),
+        ) => data,
         _ => bail!("unexpected {name} identity map variant"),
     };
     validate_map_metadata(name, data, *expected)?;
@@ -567,6 +628,7 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
     validate_identity_inventory(
         ebpf.maps()
             .map(|(name, map)| (name, matches!(map, Map::Unsupported(_)))),
+        LOADER_GATE_BUILD,
     )?;
     for (name, _) in IDENTITY_MAPS {
         identity_map_data(
@@ -574,6 +636,15 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
             ebpf.map(name)
                 .with_context(|| format!("missing {name} map"))?,
         )?;
+    }
+    if LOADER_GATE_BUILD {
+        for (name, _) in GATE_IDENTITY_MAPS {
+            identity_map_data(
+                name,
+                ebpf.map(name)
+                    .with_context(|| format!("missing {name} map"))?,
+            )?;
+        }
     }
     let cookie = ImageIdentityControl {
         limit: IMAGE_IDENTITY_TICKET_LIMIT,
@@ -12008,23 +12079,27 @@ mod tests {
             ("OWNER_CTL", false),
             ("ROOT_CTL", false),
         ];
-        validate_identity_inventory(valid.into_iter()).unwrap();
+        validate_identity_inventory(valid.into_iter(), false).unwrap();
         for index in [0, 1, 2] {
             assert!(
                 validate_identity_inventory(
                     valid
                         .into_iter()
                         .enumerate()
-                        .filter_map(|(i, v)| (i != index).then_some(v))
+                        .filter_map(|(i, v)| (i != index).then_some(v)),
+                    false
                 )
                 .is_err()
             );
             let mut wrong = valid;
             wrong[index].1 = false;
-            assert!(validate_identity_inventory(wrong.into_iter()).is_err());
+            assert!(validate_identity_inventory(wrong.into_iter(), false).is_err());
         }
         for extra in ["OTHER", "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL"] {
-            assert!(validate_identity_inventory(valid.into_iter().chain([(extra, true)])).is_err());
+            assert!(
+                validate_identity_inventory(valid.into_iter().chain([(extra, true)]), false)
+                    .is_err()
+            );
         }
     }
 

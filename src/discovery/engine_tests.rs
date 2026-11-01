@@ -7953,6 +7953,11 @@ fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
 #[test]
 fn a_cleanly_retired_loader_context_publishes_no_skip() {
     let (mut engine, owner) = Engine::retiring_loader_context(std::process::id());
+    // This test's subject is loader-retirement skip semantics, not tick
+    // scheduling: unbound the wall-clock deep-scan quantum (the same
+    // isolation the frame budget already gets in test builds) so a loaded
+    // host cannot inject a tick-deferral skip into the retirement batch.
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, Vec::new())
         .expect("an ordinary retirement batch");

@@ -4047,6 +4047,13 @@ thread_local! {
     /// names the other. Cleared by the twin when done.
     static POSED_AUDIT_NO_PROGRESS_TRIP: std::cell::Cell<Option<FinishNoProgressTrip>> =
         const { std::cell::Cell::new(None) };
+    /// Posed disposition reason for the exit-hold twin: substituted
+    /// lanes carry no live machine to latch, so the twin stages the
+    /// latched refusal here (like the lane's `scripted_*` seams stage
+    /// machine behavior) and the accessor returns it. Cleared by the
+    /// twin when done.
+    static POSED_DISPOSITION_REASON: std::cell::Cell<Option<SemanticRefusal>> =
+        const { std::cell::Cell::new(None) };
 }
 
 impl AttestedSemanticLane {
@@ -4175,13 +4182,30 @@ impl AttestedSemanticLane {
     /// The machine's latched disposition refusal, if it latched one.
     /// Reads only the machine latch (the commit-path trigger), never
     /// the lane's Finish flag, so a Finish refusal cannot misname a
-    /// commit hold.
+    /// commit hold. In tests, a posed reason wins (substituted lanes
+    /// carry no live machine).
     pub(crate) fn joint_disposition_reason(&self) -> Option<SemanticRefusal> {
+        #[cfg(test)]
+        if let Some(posed) = POSED_DISPOSITION_REASON.with(|posed| posed.get()) {
+            return Some(posed);
+        }
         self.live.as_deref().and_then(|live| {
             live.joint_machine
                 .as_ref()
                 .and_then(|machine| machine.disposition_reason())
         })
+    }
+
+    /// Pose (or clear) the disposition reason the accessor returns, so
+    /// the exit-hold twin can stage a latched lane without a live
+    /// machine. Associated rather than a method: substituted lanes
+    /// carry no live machine, so there is no lane state to hang it
+    /// on. The twin clears it when done (thread-local).
+    #[cfg(test)]
+    pub(crate) fn pose_joint_disposition_reason_for_test(reason: Option<SemanticRefusal>) {
+        POSED_DISPOSITION_REASON.with(|posed| {
+            posed.set(reason);
+        });
     }
 
     /// The recorded Audited no-progress trip, if the wall-time bound

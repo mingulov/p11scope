@@ -505,6 +505,7 @@ fn an_unpinned_entry_whose_name_is_exported_contradicts_the_table() {
         file_offset: Some(0x100),
         live_return: false,
         manifest_supported: false,
+        extension_impossible: false,
     };
     let symbols = vec![
         ("C_Initialize".to_string(), 0x10),

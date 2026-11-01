@@ -3339,6 +3339,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
             file_offset: Some(0x3000 + u64::from(table) * 0x400),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         })
         .collect();
     let module = ReconciledModule {
@@ -3430,6 +3431,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
                 file_offset: Some(0x9000),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             }],
             interfaces: vec![],
         },

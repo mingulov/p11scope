@@ -40,6 +40,10 @@ pub(crate) const MAX_TABLE_CANDIDATES: usize = 512;
 /// with: the accepted width when a 3.x-labelled table validates only
 /// its legacy prefix (a provider mislabelling quirk).
 const LEGACY_PREFIX_SLOTS: usize = 68;
+/// Slots in a 3.0/3.1 `CK_FUNCTION_LIST_3_0`: a failure inside
+/// `LEGACY_PREFIX_SLOTS..STANDARD_30_SLOTS` refutes both the 92-wide
+/// and the 104-wide hypotheses, leaving the 68-slot prefix complete.
+const STANDARD_30_SLOTS: usize = 92;
 const MAX_DECODED_TABLE_ENTRIES: usize = 512 * 104;
 pub(crate) const MAX_INTERFACE_RECORDS: usize = 512;
 const MAX_MAPS_BYTES: u64 = 64 * 1024 * 1024;
@@ -1886,6 +1890,14 @@ pub struct ScannedTable {
     /// never decoded, never retained across input changes (a retired module
     /// takes its marks with it).
     pub manifest_supported: bool,
+    /// True when the 3.x extension is present but structurally impossible:
+    /// the full declared extent was readable, the 68-slot legacy prefix
+    /// validated, and the first structural failure falls in
+    /// `68..92`, refuting the 92-wide and 104-wide layouts. Set only by
+    /// `decode_candidate`; truncation, `decode_observed_words`, and anchor
+    /// recovery never set it. Unioned by `merge_scanned_module` like the
+    /// other monotonic observation flags, and ignored by `PartialEq`.
+    pub extension_impossible: bool,
 }
 
 impl PartialEq for ScannedTable {
@@ -2143,6 +2155,41 @@ pub(crate) fn export_agreement(
         .filter(|skip| exports.offsets_of(&skip.subject).next().is_some())
         .count();
     agreement
+}
+
+/// Whether a 3.x-labelled 68-slot prefix is the module's complete reachable
+/// surface, proven without calling the provider: the scan showed the full
+/// declared extent readable with the first structural failure in `68..92`
+/// (`extension_impossible`, refuting 92/104-wide), the module exports
+/// neither 3.x interface getter (no conforming route to a 3.x table), and
+/// every retained entry agrees with its export. `exports` is the module
+/// object's completely read `.dynsym` witness (a failed read never yields
+/// a `ReconciledModule`), so absence there is proven absence. Truncation,
+/// a getter export, a disagreeing entry, an unpinned record, or a missing
+/// file owner all stay unproven.
+pub(crate) fn proven_complete_legacy_prefix(
+    table: &ScannedTable,
+    exports: &ObjectExports<'_>,
+) -> bool {
+    if !table.extension_impossible {
+        return false;
+    }
+    if table.version.0 != 3 || table.walk != "known_prefix" {
+        return false;
+    }
+    if table.decoded_slot_count() != LEGACY_PREFIX_SLOTS || !table.unpinned.is_empty() {
+        return false;
+    }
+    if table.file_offset.is_none() {
+        return false;
+    }
+    if exports.offsets_of("C_GetInterface").next().is_some()
+        || exports.offsets_of("C_GetInterfaceList").next().is_some()
+    {
+        return false;
+    }
+    let agreement = export_agreement(table, exports);
+    agreement.corroborates() && agreement.agreeing == table.entries.len()
 }
 
 /// Publication evidence for one candidate table, strongest first: a table
@@ -2476,6 +2523,8 @@ fn decode_candidate(
         };
         (bytes, true)
     };
+    let full_extent_readable = !short_prefix;
+    let mut failed_ordinal: Option<usize> = None;
 
     // Validate the readable candidate before reserving decoded records.
     // Each validated slot is retained: file-backed entries as their normalized
@@ -2529,6 +2578,7 @@ fn decode_candidate(
             if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
+            failed_ordinal = Some(ordinal);
             short_prefix = true;
             break;
         };
@@ -2538,6 +2588,7 @@ fn decode_candidate(
             if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
+            failed_ordinal = Some(ordinal);
             short_prefix = true;
             break;
         }
@@ -2548,6 +2599,7 @@ fn decode_candidate(
             if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
+            failed_ordinal = Some(ordinal);
             short_prefix = true;
             break;
         };
@@ -2664,6 +2716,10 @@ fn decode_candidate(
             file_offset: *file_offset,
         });
     }
+    let extension_impossible = full_extent_readable
+        && version.0 == 3
+        && failed_ordinal
+            .is_some_and(|ordinal| (LEGACY_PREFIX_SLOTS..STANDARD_30_SLOTS).contains(&ordinal));
     Ok(Some((
         ScannedTable {
             version,
@@ -2678,6 +2734,7 @@ fn decode_candidate(
             // caller that owns it, never manufactured here.
             live_return: false,
             manifest_supported: false,
+            extension_impossible,
         },
         len,
     )))
@@ -2845,6 +2902,7 @@ pub(crate) fn decode_observed_words(
         file_offset: file_owner.map(|(_, _, offset)| offset),
         live_return: false,
         manifest_supported: false,
+        extension_impossible: false,
     };
     if let Some(id) = runtime_identity {
         budget.runtime_table_contents.insert(
@@ -7103,6 +7161,7 @@ mod tests {
             file_offset: Some(0x2000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         }
     }
 
@@ -8531,6 +8590,7 @@ mod tests {
                 file_offset: Some(address),
                 live_return,
                 manifest_supported: manifest,
+                extension_impossible: false,
             };
         let tables = [
             table(0x1000, "full", false, false),         // 0: heuristic
@@ -8601,6 +8661,7 @@ mod tests {
             file_offset: Some(0x9000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let tables = [table];
         for name_class in ["other", "null", "unreadable"] {
@@ -8654,6 +8715,7 @@ mod tests {
             file_offset: Some(0xa000),
             live_return: true,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let manifest_backed = ScannedTable {
             address: 0xb000,
@@ -8718,6 +8780,7 @@ mod tests {
             file_offset: Some(0xc000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let vendor_linked_discovered_second = ScannedTable {
             address: 0xd000,
@@ -8766,6 +8829,7 @@ mod tests {
                 file_offset: Some(0),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             },
             ScannedTable {
                 version: (3, 2),
@@ -8777,6 +8841,7 @@ mod tests {
                 file_offset: Some(0),
                 live_return: false,
                 manifest_supported: false,
+                extension_impossible: false,
             },
         ];
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
@@ -8817,6 +8882,7 @@ mod tests {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
         snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
@@ -8863,6 +8929,7 @@ mod tests {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
         snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
@@ -10685,6 +10752,7 @@ mod tests {
             file_offset: Some(0x2000),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut snapshot = vec![0u8; INTERFACE_BYTES];
         snapshot[..WORD].copy_from_slice(&1u64.to_ne_bytes());
@@ -10757,6 +10825,7 @@ mod tests {
             file_offset: Some(0),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut table_v3 = table_v2.clone();
         table_v3.version = (3, 2);
@@ -10845,6 +10914,7 @@ mod tests {
             file_offset: None,
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         };
         let mut changed = table.clone();
         changed.entries = vec![entry(0x200)];

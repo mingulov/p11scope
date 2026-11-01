@@ -6559,6 +6559,7 @@ pub(crate) mod tests {
                 | "C_CloseAllSessions"
                 | "C_CreateObject"
                 | "C_GetSessionInfo"
+                | "C_AsyncGetID"
         ));
         let function = function_id(name);
         let semantics = crate::kinds::DESCRIPTORS[function as usize + 1];
@@ -7005,6 +7006,36 @@ pub(crate) mod tests {
             facts.capture_flags = capture::MECHANISM_VALUE;
         });
         assert!(!producer_pair_agrees(&begin, &end), "no mechanism argument");
+    }
+
+    #[test]
+    fn object_journal_agreement_accepts_get_id_value_unreadable_on_ok() {
+        // Null-output / unreadable-id GetID: an OK return may gain
+        // ONLY the value-unreadable bit, with the mechanism word
+        // unchanged.
+        let (begin, end) = producer_agreement_pair("C_AsyncGetID", |_, facts| {
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+        });
+        assert!(producer_pair_agrees(&begin, &end));
+    }
+
+    #[test]
+    fn object_journal_agreement_refuses_value_unreadable_elsewhere() {
+        // The bit-6 allowance is GetID+OK only: a failed GetID, any
+        // other function, or a cleared bit still refuses.
+        let (begin, end) = producer_agreement_pair("C_AsyncGetID", |_, facts| {
+            facts.rv = 5;
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+        });
+        assert!(!producer_pair_agrees(&begin, &end), "failed GetID");
+        let (begin, end) = producer_agreement_pair("C_GetSessionInfo", |_, facts| {
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+        });
+        assert!(!producer_pair_agrees(&begin, &end), "other function");
+        let (begin, end) = producer_agreement_pair("C_AsyncGetID", |start, _| {
+            start.capture |= capture::ASYNC_VALUE_UNREADABLE;
+        });
+        assert!(!producer_pair_agrees(&begin, &end), "cleared bit");
     }
 
     #[test]

@@ -1451,7 +1451,7 @@
     {
       "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_key_operations_live_discovery_fault_refuses_without_latching",
-      "reason": "privileged: live DD transport fault refuses without latching (serial; omitted journal build asserts the refusal)",
+      "reason": "privileged: live discovery transport fault refuses without latching (serial; omitted journal build asserts the refusal)",
       "cell": "privileged"
     },
     {

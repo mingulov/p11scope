@@ -8423,6 +8423,246 @@ fn joint_machine_finish_after_pass_refresh_invalidation_publishes() {
     }
 }
 
+/// The same pass refresh resolves the only route-waiting call into the lane
+/// stash before Finish starts, while the original still records that it
+/// waited. Nothing of the original waits at Q any more, so there is nothing
+/// to expire there: Finish must take the ordinary at-Q tick, which merges
+/// the stash, and publish both calls. It must never refuse the empty expiry
+/// as a storage fault and lose the final publication.
+fn finish_after_pass_refresh_resolution_publishes(linked: bool) {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    let (mut fixture, waiter) = pass_refresh_before_finish(linked, true);
+    let api_returns = |fixture: &MachineScene| -> u64 {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum()
+    };
+    let before = api_returns(&fixture);
+    {
+        let held = fixture.scene.real.h0.0.borrow();
+        assert!(
+            held.capture.awaiting.is_empty(),
+            "the refresh resolved the waiter (linked={linked})"
+        );
+        assert_eq!(held.stash.min_outcome_position(), Some(waiter));
+    }
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "AwaitH0");
+    assert!(
+        fixture
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .h0_waiting(),
+        "the original still records its waiter"
+    );
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    let mut published = false;
+    let mut refusals = Vec::new();
+    for poll in 0..512 {
+        match fixture.poll_finish(1) {
+            Ok(JointCommitProgress::Pending) => {}
+            Ok(JointCommitProgress::Published(_)) => {
+                published = true;
+                break;
+            }
+            Err(reason) => {
+                refusals.push((
+                    poll,
+                    reason,
+                    fixture.machine.diagnostic_snapshot_for_test().0,
+                ));
+                if fixture.machine.finish_disposition_required() {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        refusals.is_empty(),
+        "linked={linked}: the finish refused {} times (first {:?}); latched={:?}",
+        refusals.len(),
+        refusals.first(),
+        fixture.machine.disposition_reason()
+    );
+    assert!(published, "linked={linked}: the finish publishes");
+    assert_eq!(
+        fixture.native.pending_q_resolutions, 0,
+        "nothing waits at Q, so nothing expires there"
+    );
+    assert!(fixture.scene.real.lane.is_finished());
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    assert_eq!(
+        api_returns(&fixture),
+        before + 2,
+        "the resolved call publishes with the routed one, neither is shed"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .h0
+            .0
+            .borrow()
+            .stash
+            .min_outcome_position()
+            .is_none(),
+        "the at-Q tick merges the stashed resolution"
+    );
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    match coordinator.reference_h3_last_disposition() {
+        Some(H3DispositionEvidence::Clean {
+            staged_max,
+            pending_floor: None,
+        }) => assert!(staged_max >= waiter),
+        other => panic!("the final frame stages the resolved call clean, not {other:?}"),
+    }
+    assert!(
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| gap.subject != "semantic calls unrouted"),
+        "the resolved call is not shed"
+    );
+    assert_eq!(fixture.machine.finish_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert!(no_progress_gaps(&fixture).is_empty());
+    assert!(audit_no_progress_gaps(&fixture).is_empty());
+}
+
+#[test]
+fn joint_machine_finish_after_pass_refresh_resolution_publishes_linked() {
+    finish_after_pass_refresh_resolution_publishes(true);
+}
+
+#[test]
+fn joint_machine_finish_after_pass_refresh_resolution_publishes_unlinked() {
+    finish_after_pass_refresh_resolution_publishes(false);
+}
+
+/// A genuine storage refusal at the at-Q expiry still refuses. One call
+/// still waits at Q and the semantic pool is one byte short of the expiry's
+/// declared bound: Finish reserves nothing, expires nothing, never falls
+/// back to the ordinary tick, and latches ProviderStorage after its retry
+/// bound with the waiter still waiting.
+#[test]
+fn joint_machine_finish_at_q_expiry_storage_refusal_still_latches() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::inventory_semantics::JOINT_FINISH_STORAGE_RETRIES;
+    for linked in [true, false] {
+        let (mut fixture, waiter) = pass_refresh_before_finish(linked, false);
+        fixture.enable_finish_fixture(Vec::new());
+        fixture.begin_finish().unwrap();
+        assert!(
+            matches!(fixture.poll_finish(1), Ok(JointCommitProgress::Pending)),
+            "the first poll observes Q"
+        );
+        let bytes = {
+            let held = fixture.scene.real.h0.0.borrow();
+            held.capture
+                .pending_h0_at_q_storage_bytes(
+                    fixture.machine.retained_raw_for_test().unwrap(),
+                    fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .joint_capture()
+                        .adapter(),
+                    &fixture.scene.producers,
+                    fixture.finish.as_ref().unwrap().observer.discovery_domain(),
+                    fixture
+                        .machine
+                        .retained_finish_q_for_test()
+                        .expect("observed Q"),
+                )
+                .unwrap()
+        };
+        assert!(bytes > 0, "one call waits at Q (linked={linked})");
+        let resource = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot();
+        let hold = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .reserve_semantic_storage(resource.limit_bytes - resource.charged_bytes - (bytes - 1))
+            .unwrap();
+        // The next poll may still finish discovery at Q; from the first
+        // refusal on, every poll refuses until the retry bound latches.
+        let mut refusals = 0u16;
+        for _ in 0..usize::from(JOINT_FINISH_STORAGE_RETRIES) + 8 {
+            match fixture.poll_finish(1) {
+                Ok(JointCommitProgress::Pending) => {
+                    assert_eq!(
+                        refusals, 0,
+                        "a storage refusal is never followed by progress"
+                    )
+                }
+                Ok(JointCommitProgress::Published(_)) => {
+                    panic!("a refused expiry never publishes (linked={linked})")
+                }
+                Err(reason) => {
+                    refusals += 1;
+                    assert_eq!(
+                        reason,
+                        SemanticRefusal::ProviderStorage,
+                        "refusal {refusals} (linked={linked})"
+                    );
+                    assert_eq!(
+                        fixture.machine.finish_disposition_required(),
+                        refusals == JOINT_FINISH_STORAGE_RETRIES,
+                        "only the retry bound latches (refusal {refusals})"
+                    );
+                    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "AwaitH0");
+                    if refusals == JOINT_FINISH_STORAGE_RETRIES {
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(refusals, JOINT_FINISH_STORAGE_RETRIES);
+        assert_eq!(
+            fixture.machine.disposition_reason(),
+            Some(SemanticRefusal::ProviderStorage)
+        );
+        assert_eq!(
+            fixture.native.pending_q_resolutions, 0,
+            "a refused reservation expires nothing"
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .h0
+                .0
+                .borrow()
+                .capture
+                .awaiting
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [waiter],
+            "the waiter is still waiting"
+        );
+        assert!(!fixture.scene.real.lane.is_finished());
+        drop(hold);
+    }
+}
+
 #[test]
 fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
     use crate::discovery::engine::inventory_coordinator::JointCommitProgress;

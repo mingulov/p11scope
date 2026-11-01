@@ -41,14 +41,14 @@ use p11scope_ebpf_common::{
     CounterMode, EVIDENCE_ABI_REFUSALS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
     EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_TEMPLATE_TAIL_FAILURES, EVIDENCE_UNMATCHED_RETURNS,
-    EVIDENCE_UNREGISTERED_MECHANISMS, ImageBankSelect, ImageIdentityControl, LATENCY_BUCKETS,
-    LoaderGateControl, OWNER_BAD_CONTROL, OWNER_BAD_RECORD, OWNER_BOOKKEEPING_FAILED,
-    OWNER_CLASSIFIER_FAILED, OWNER_DELETE_FAILED, OWNER_DIRECTORY_MISMATCH, OWNER_LOOKUP_UNKNOWN,
-    OWNER_REFUND_FAILED, OWNER_START_COUNT_MISMATCH, OWNER_START_KEY_MISMATCH,
-    OWNER_START_ROW_MISSING, OWNER_STATE_DELETE_FAILED, ROOT_BAD_CELL, ROOT_BAD_CONTROL,
-    ROOT_CAPACITY, ROOT_CREATE_FAILED, ROOT_EXISTING_CHILD, ROOT_EXIT_CLASSIFIER, ROOT_EXIT_DELETE,
-    ROOT_REFUND_FAILED, ROOT_RESERVE_CAS, RootAffiliationControl, RvKey, SlotStats,
-    ThreadOwnerControl,
+    EVIDENCE_UNREGISTERED_MECHANISMS, IMAGE_IDENTITY_TICKET_LIMIT, ImageBankSelect,
+    ImageIdentityControl, LATENCY_BUCKETS, LOADER_GATE_SLOTS, LoaderGateControl, OWNER_BAD_CONTROL,
+    OWNER_BAD_RECORD, OWNER_BOOKKEEPING_FAILED, OWNER_CLASSIFIER_FAILED, OWNER_DELETE_FAILED,
+    OWNER_DIRECTORY_MISMATCH, OWNER_LOOKUP_UNKNOWN, OWNER_REFUND_FAILED,
+    OWNER_START_COUNT_MISMATCH, OWNER_START_KEY_MISMATCH, OWNER_START_ROW_MISSING,
+    OWNER_STATE_DELETE_FAILED, ROOT_BAD_CELL, ROOT_BAD_CONTROL, ROOT_CAPACITY, ROOT_CREATE_FAILED,
+    ROOT_EXISTING_CHILD, ROOT_EXIT_CLASSIFIER, ROOT_EXIT_DELETE, ROOT_REFUND_FAILED,
+    ROOT_RESERVE_CAS, RootAffiliationControl, RvKey, SlotStats, ThreadOwnerControl,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -334,9 +334,21 @@ pub struct LoaderTransitions {
 impl LoaderTransitions {
     /// Map the gate control cell to published totals. `None` (map absent
     /// or control malformed) stays `None`: a refused field never links,
-    /// and absence is never published as zero.
-    pub fn from_control(_control: Option<LoaderGateControl>) -> Option<Self> {
-        None
+    /// and absence is never published as zero. Only the five approved
+    /// F1 totals leave this function; `limit`, `cutover`, `retired`
+    /// and `retained` stay private.
+    pub fn from_control(control: Option<LoaderGateControl>) -> Option<Self> {
+        let control = control?;
+        if control.limit != u64::from(LOADER_GATE_SLOTS) {
+            return None;
+        }
+        Some(Self {
+            arms: control.admitted,
+            reclaims: control.reclaims,
+            retained_peak: control.retained_peak,
+            refusals: control.refusals,
+            update_losses: control.update_losses,
+        })
     }
 }
 
@@ -360,13 +372,38 @@ pub struct ImageTransitions {
 impl ImageTransitions {
     /// Derive the published totals. `None` unless the bank producer
     /// (SELECT) and both bank controls are present and valid: a refused
-    /// field never links, and absence is never published as zero.
+    /// field never links, and absence is never published as zero. The
+    /// issuance watermark adds the folded total to the live per-bank
+    /// watermarks without spending a ticket; a folded bank contributes
+    /// through the folded total only, never twice. Only the four
+    /// approved F2 totals leave this function.
     pub fn from_cells(
-        _select: Option<ImageBankSelect>,
-        _bank_a: Option<ImageIdentityControl>,
-        _bank_b: Option<ImageIdentityControl>,
+        select: Option<ImageBankSelect>,
+        bank_a: Option<ImageIdentityControl>,
+        bank_b: Option<ImageIdentityControl>,
     ) -> Option<Self> {
-        None
+        let select = select?;
+        let bank_a = bank_a?;
+        let bank_b = bank_b?;
+        for bank in [&bank_a, &bank_b] {
+            if bank.limit != IMAGE_IDENTITY_TICKET_LIMIT || bank.next_ticket > bank.limit {
+                return None;
+            }
+        }
+        let live = |folded: u64, next_ticket: u64| {
+            if folded == 0 { next_ticket } else { 0 }
+        };
+        let tickets_issued = select
+            .folded_issued
+            .saturating_add(live(select.folded[0], bank_a.next_ticket));
+        let tickets_issued =
+            tickets_issued.saturating_add(live(select.folded[1], bank_b.next_ticket));
+        Some(Self {
+            tickets_issued,
+            bank_cuts: select.cuts,
+            bank_refusals: select.refusals,
+            update_losses: select.update_losses,
+        })
     }
 }
 

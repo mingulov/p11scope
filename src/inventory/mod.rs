@@ -12824,7 +12824,9 @@ mod tests {
             "the abandon gap names the latched refusal: {:?}",
             gaps(&mut driver)
         );
-        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(None);
+        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+            None,
+        );
     }
 
     #[test]

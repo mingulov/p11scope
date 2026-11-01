@@ -23860,6 +23860,66 @@ fn a_closed_tick_leaves_a_newcomer_unpublished_and_requested() {
     );
 }
 
+fn has_additions_blocked_mark(engine: &Engine) -> bool {
+    engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live inventory transaction"
+            && skip.reason
+                == "additions were blocked; newly observed process generations were left unpublished for a later tick"
+    })
+}
+
+/// Item 6 (CI system-cell pending-8 flake): a closed tick — the terminal
+/// drain's shape, additions blocked — that admits a provider-free newcomer
+/// must not mark `additions were blocked`. The newcomer was checked (its
+/// scan found no modules), so no attach or publish work is undone; the loss
+/// class must not claim otherwise. The retry request is still retained.
+#[test]
+fn terminal_closed_tick_with_provider_free_newcomer_marks_no_additions_blocked() {
+    let sleep = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a provider-free newcomer"),
+    );
+    let (mut engine, _cgroup) = u07_engine(&[sleep.pid()], &[]);
+    let mut session = ScriptedSession::default();
+    let mut additions = false;
+    u07_tick(&mut engine, &mut session, &mut additions);
+    assert!(
+        !has_additions_blocked_mark(&engine),
+        "a checked-clean newcomer must not mark additions-blocked: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&sleep.pid()),
+        "the unpublished newcomer is still requested again"
+    );
+}
+
+/// Negative control for the above: a closed tick that admits a PROVIDER
+/// newcomer still marks `additions were blocked` — its targets never
+/// attached, which is real undone work.
+#[test]
+fn terminal_closed_tick_with_provider_newcomer_still_marks_additions_blocked() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "u07-closed-mark");
+    let driver = system_scope_build_driver(dir.path());
+    let child = system_scope_spawn_loaded(&driver, &provider);
+    let (mut engine, _cgroup) = u07_engine(&[child.pid()], &[provider]);
+    let mut session = ScriptedSession::default();
+    let mut additions = false;
+    u07_tick(&mut engine, &mut session, &mut additions);
+    assert!(
+        has_additions_blocked_mark(&engine),
+        "a provider newcomer left unpublished must still mark additions-blocked: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&child.pid()),
+        "the unpublished newcomer is still requested again"
+    );
+}
+
 /// Task 1's carried concern, on the U-07 chain. Every newcomer is part of
 /// the tick's candidate, so a generation that ends while a newcomer's links
 /// are attached downgrades the whole candidate to a conservative

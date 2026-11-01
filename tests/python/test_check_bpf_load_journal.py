@@ -88,6 +88,13 @@ if name=='vng':
     if os.environ.get('FAKE_BAD_HELPER')=='bad': (out/'guest-env.sh').write_text('return 0\n')
     release=kernel[1:]+'-test' if kernel.startswith('v') else kernel+'-test'
     env={**os.environ,'FAKE_RELEASE':release}
+    if os.environ.get('FAKE_STRIP_STAGED'):
+        done=subprocess.run(['/bin/sh','-c',command],env=env,capture_output=True,text=True)
+        for line in done.stdout.splitlines():
+            if not line.startswith(('staged-boot-config-','boot-config-present-')):
+                print(line)
+        sys.stdout.write(done.stderr)
+        sys.exit(done.returncode)
     sys.exit(subprocess.run(['/bin/sh','-c',command],env=env).returncode)
 if name=='mkfs.ext4': sys.exit(0)
 if name=='id': print('0');sys.exit(0)
@@ -104,7 +111,7 @@ if name=='cp':
     os.execv('/bin/cp',['cp',*args])
 if name=='cc':
     out=pathlib.Path(args[args.index('-o')+1])
-    out.write_text('#!/bin/sh\necho "SETTLED after 0s"\necho "LEDGER C_Initialize=1 C_Finalize=1"\n')
+    out.write_text('#!'+sys.executable+'\nimport json,os,sys\njson.dump({"tool":"workload","args":sys.argv[1:]},open(os.environ["FAKE_EVENTS"],"a"))\nopen(os.environ["FAKE_EVENTS"],"a").write(chr(10))\nprint("SETTLED after 0s")\nprint("LEDGER C_Initialize=1 C_Finalize=1")\n')
     out.chmod(0o755)
     sys.exit(0)
 if name=='softhsm2-util': sys.exit(1 if os.environ.get('FAKE_TOKEN_FAIL') else 0)
@@ -247,7 +254,15 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(len(compiles), 1)
         self.assertIn("counter-softhsm-workload.c", compiles[0][-2])
         self.assertIn("-ldl", compiles[0])
-        self.assertTrue((out / "journal-workload").is_file())
+        self.assertTrue((out / "j-workload").is_file())
+        # Each workload iteration stays mapped 25 s before its burst,
+        # so discovery admits the caller and calls join instead of
+        # shedding as use-before-admission.
+        workloads = [event["args"] for event in events
+                     if event["tool"] == "workload"]
+        self.assertTrue(workloads, "the guest never ran the workload")
+        for args in workloads:
+            self.assertEqual(args[1:], ["30", "25"])
 
     def write_budgets(self, programs):
         path = self.work / "budgets.json"
@@ -375,6 +390,16 @@ class JournalGateTests(unittest.TestCase):
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "nonqualifying")
         self.assertIn("token setup failed", row["detail"])
+
+    def test_garbled_staging_line_still_passes(self):
+        # vng's console capture demonstrably garbles the boot-config
+        # staging line while the leg runs fine; the gate keys on the
+        # strictly-later guest-work-ready line instead.
+        result, out = self.run_gate(KERNEL, extra={"FAKE_STRIP_STAGED": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertTrue(row["pass"])
+        self.assertEqual(row["qualification"], "qualified")
 
     def test_long_path_exceeds_command_budget(self):
         # Past 950 raw bytes the guest would silently never run, so the

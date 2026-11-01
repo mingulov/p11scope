@@ -33,6 +33,9 @@ use p11scope::cli::{
 use p11scope::discovery::engine::Engine;
 use p11scope::discovery::hooks::HookRegistry;
 use p11scope::process::{ProcessView, ProcessViewId};
+use p11scope::render::{
+    PrearmWatch, PrearmWatchEnd, PrearmWatchState, UnobservedReason, UnobservedWindow,
+};
 use p11scope_discover::discover::discover as discover_provider;
 use p11scope_manifest::manifest::Manifest;
 use std::collections::BTreeSet;
@@ -860,5 +863,280 @@ fn inventory_prearm_section_empty_without_flag() {
         document["prearm"],
         serde_json::Value::Array(Vec::new()),
         "no flag, no rows — but the section exists"
+    );
+}
+
+/// Whole-file digest oracle: computed in-test from file bytes, never
+/// from the pin under test.
+fn file_sha256(path: &Path) -> String {
+    use sha2::Digest as _;
+    let bytes = std::fs::read(path).unwrap();
+    p11scope_manifest::identity::hex(&sha2::Sha256::digest(bytes))
+}
+
+/// Sorted key list of a JSON object: the exact-shape half of the
+/// row-content pins — any renamed, added or dropped key fails.
+fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// Assert the identity subset a `prearm[]` row carries for its input:
+/// the operator spelling plus the pinned file's device, inode and
+/// whole-file digest. Values are identical on both surfaces (same
+/// pins); only the envelope differs (flat here, nested `identity`
+/// there — the envelope is pinned in-crate at the run seam).
+fn assert_row_identity(record: &serde_json::Value, provider: &Path) {
+    let key = manifest_key(provider);
+    assert_eq!(
+        record["path"].as_str().unwrap(),
+        provider.to_string_lossy(),
+        "the operator spelling: {record}"
+    );
+    assert_eq!(
+        record["dev"],
+        serde_json::json!([key.device.major, key.device.minor]),
+        "the mapped-device key: {record}"
+    );
+    assert_eq!(record["ino"].as_u64(), Some(key.inode));
+    assert_eq!(
+        record["sha256"].as_str(),
+        Some(file_sha256(provider).as_str()),
+        "the whole-file digest: {record}"
+    );
+}
+
+/// Row-content twin (never-mapped terminal): a pre-armed input no scope
+/// member maps ends its watch at scope end with no arm instant, no
+/// change bracket and no window. The in-test contrast (live shape
+/// before the end, terminal shape after) proves the twin sees the
+/// transition; exact key sets prove no key drifts.
+#[test]
+fn inventory_prearm_row_never_mapped_terminal_shape() {
+    let lifecycle = build_lifecycle("row-never");
+    let child = sleep_child();
+    let pid = child.child.id();
+    let mut engine = discover_pid(
+        &capture_args(vec![], vec![], vec![lifecycle.provider.clone()], pid),
+        pid,
+    );
+    let live = discovery_json(&engine)["discovery"][0]["watch"].clone();
+    assert_eq!(
+        live,
+        serde_json::json!({"since_ns": null, "state": "pinned_unarmed"}),
+        "the live watch carries no end keys: {live}"
+    );
+
+    engine.end_prearm_watches();
+    let record = discovery_json(&engine)["discovery"][0].clone();
+    assert_eq!(record["sources"], serde_json::json!(["prearm"]));
+    assert_eq!(
+        record["corroboration"],
+        serde_json::json!(["uncorroborated"]),
+        "nothing maps the input: {record}"
+    );
+    assert_row_identity(&record, &lifecycle.provider);
+    let watch = &record["watch"];
+    assert_eq!(
+        sorted_keys(watch),
+        ["ended_by", "since_ns", "state", "until_ns"],
+        "no change bracket on an unchanged watch: {watch}"
+    );
+    assert!(watch["since_ns"].is_null());
+    assert_eq!(watch["state"], "ended");
+    assert_eq!(watch["ended_by"], "scope_end");
+    assert!(watch["until_ns"].as_u64().unwrap() > 0);
+}
+
+/// Row-content twin (replacement terminal): rename-over between pin and
+/// capture end keeps the pinned identity and reports the change — the
+/// `changed` uncertainty bracket, the `object_changed` end, and the old
+/// file's identity still on the row. The discover seam sets `until` to
+/// the detection instant (no terminal clamp here — the inventory hook's
+/// clamp is pinned in-crate).
+#[test]
+fn inventory_prearm_row_replacement_terminal_shape() {
+    let lifecycle = build_lifecycle("row-replace");
+    let child = sleep_child();
+    let pid = child.child.id();
+    let old_key = manifest_key(&lifecycle.provider);
+    let old_sha = file_sha256(&lifecycle.provider);
+    let mut engine = discover_pid(
+        &capture_args(vec![], vec![], vec![lifecycle.provider.clone()], pid),
+        pid,
+    );
+    let live = discovery_json(&engine)["discovery"][0]["watch"].clone();
+    assert_eq!(
+        live,
+        serde_json::json!({"since_ns": null, "state": "pinned_unarmed"}),
+        "unarmed before the replacement: {live}"
+    );
+
+    std::thread::sleep(Duration::from_millis(20)); // ctime granularity margin
+    let other = cc_so(&lifecycle.dir, "other", "int g(void){return 2;}\n");
+    std::fs::rename(&other, &lifecycle.provider).unwrap();
+    engine.refresh_prearm_object_changes();
+
+    let record = discovery_json(&engine)["discovery"][0].clone();
+    let watch = &record["watch"];
+    assert_eq!(
+        sorted_keys(watch),
+        ["changed", "ended_by", "since_ns", "state", "until_ns"],
+        "the change bracket rides the ended watch: {watch}"
+    );
+    assert!(watch["since_ns"].is_null());
+    assert_eq!(watch["state"], "ended");
+    assert_eq!(watch["ended_by"], "object_changed");
+    assert_eq!(
+        watch["until_ns"], watch["changed"]["detected_ns"],
+        "until is the detection instant: {watch}"
+    );
+    assert_eq!(
+        watch["changed"]["previous_ino"].as_u64(),
+        Some(old_key.inode),
+        "the bracket names the pinned inode: {watch}"
+    );
+    assert!(watch["changed"]["last_ok_ns"].as_u64().unwrap() > 0);
+    assert!(
+        watch["changed"]["detected_ns"].as_u64().unwrap()
+            >= watch["changed"]["last_ok_ns"].as_u64().unwrap(),
+        "the bracket orders last-ok before detection: {watch}"
+    );
+    // Custody reading: the row still names the pinned (old) file.
+    assert_eq!(
+        record["path"].as_str().unwrap(),
+        lifecycle.provider.to_string_lossy()
+    );
+    assert_eq!(
+        record["dev"],
+        serde_json::json!([old_key.device.major, old_key.device.minor])
+    );
+    assert_eq!(record["ino"].as_u64(), Some(old_key.inode));
+    assert_eq!(record["sha256"].as_str(), Some(old_sha.as_str()));
+    assert_eq!(
+        record["corroboration"],
+        serde_json::json!(["uncorroborated"])
+    );
+}
+
+/// Row-content twin (mapped live): a pre-armed input its scope member
+/// maps reads scan-agreed with a live unarmed watch — discovery never
+/// arms (assembly merges real attach stamps later). The pre/post-load
+/// contrast proves the twin sees both the mapping and the still-live
+/// wait.
+#[test]
+fn inventory_prearm_row_mapped_live_shape() {
+    let lifecycle = build_lifecycle("row-mapped");
+    let mut barrier = Barrier::start(&lifecycle.driver, &lifecycle.provider);
+    let pre_engine = discover_pid(
+        &capture_args(
+            vec![],
+            vec![],
+            vec![lifecycle.provider.clone()],
+            barrier.pid(),
+        ),
+        barrier.pid(),
+    );
+    let pre_json = discovery_json(&pre_engine)["discovery"][0].clone();
+    assert_eq!(
+        pre_json["corroboration"],
+        serde_json::json!(["uncorroborated"]),
+        "unmapped before the load: {pre_json}"
+    );
+    assert_eq!(
+        pre_json["watch"],
+        serde_json::json!({"since_ns": null, "state": "pinned_unarmed"}),
+        "unarmed before the load: {pre_json}"
+    );
+
+    barrier.load();
+    let post_engine = discover_pid(
+        &capture_args(
+            vec![],
+            vec![],
+            vec![lifecycle.provider.clone()],
+            barrier.pid(),
+        ),
+        barrier.pid(),
+    );
+    let post_json = discovery_json(&post_engine)["discovery"][0].clone();
+    assert_eq!(
+        post_json["corroboration"],
+        serde_json::json!(["agreed"]),
+        "the mapped reading: {post_json}"
+    );
+    assert_eq!(
+        post_json["watch"],
+        serde_json::json!({"since_ns": null, "state": "pinned_unarmed"}),
+        "still unarmed — discovery never arms: {post_json}"
+    );
+    assert_row_identity(&post_json, &lifecycle.provider);
+    barrier.shutdown();
+}
+
+/// Row-content twin (armed and window value shapes): the armed watch
+/// and unobserved-window values a `prearm[]` row carries when the lane
+/// really attaches — pinned here through the public frozen serializers
+/// (arming itself needs attach receipts, a privileged cell; the
+/// assembly math is pinned in-crate).
+#[test]
+fn inventory_prearm_row_armed_and_window_value_shapes() {
+    let armed_live = PrearmWatch {
+        since_ns: Some(7),
+        state: PrearmWatchState::Armed,
+        until_ns: None,
+        ended_by: None,
+        changed: None,
+    };
+    assert_eq!(
+        serde_json::to_value(armed_live).unwrap(),
+        serde_json::json!({"since_ns": 7, "state": "armed"}),
+        "a live armed watch carries no end keys"
+    );
+    let armed_ended = PrearmWatch {
+        since_ns: Some(7),
+        state: PrearmWatchState::Ended,
+        until_ns: Some(9),
+        ended_by: Some(PrearmWatchEnd::ScopeEnd),
+        changed: None,
+    };
+    assert_eq!(
+        serde_json::to_value(armed_ended).unwrap(),
+        serde_json::json!({
+            "since_ns": 7,
+            "state": "ended",
+            "until_ns": 9,
+            "ended_by": "scope_end",
+        }),
+        "an armed-then-ended watch keeps its arm instant"
+    );
+    let pre_attach = UnobservedWindow {
+        start_ns: 3,
+        end_ns: 5,
+        reason: UnobservedReason::PreAttach,
+    };
+    assert_eq!(
+        serde_json::to_value(pre_attach).unwrap(),
+        serde_json::json!({
+            "start_ns": 3,
+            "end_ns": 5,
+            "reason": "pre_attach",
+        }),
+        "the conservative pre-attach window"
+    );
+    let unattached = UnobservedWindow {
+        start_ns: 3,
+        end_ns: 5,
+        reason: UnobservedReason::MappedUnattached,
+    };
+    assert_eq!(
+        serde_json::to_value(unattached).unwrap(),
+        serde_json::json!({
+            "start_ns": 3,
+            "end_ns": 5,
+            "reason": "mapped_unattached",
+        }),
+        "the mapped-but-unattached window"
     );
 }

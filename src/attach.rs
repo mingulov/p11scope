@@ -9329,7 +9329,7 @@ impl Session {
     /// halves), so the admission is always checked against the
     /// Session retaining the EVENTS identity it binds. `None` while
     /// the Session retains no native domain.
-    #[allow(dead_code)] // No Session-loop wire until live activation; tests pair via test_pair.
+    // Per-hook linkage read for the linked-DD pump; tests pair via test_pair.
     pub(crate) fn drain_producers(&self) -> Option<SessionDrainProducers> {
         Some(SessionDrainProducers {
             native: self.native_domain()?,

@@ -25,7 +25,8 @@ use p11scope_ebpf_common::{
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
     EVIDENCE_ABI_REFUSALS, EVIDENCE_RING_LOSS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
-    IMAGE_IDENTITY_TICKET_LIMIT, ImageIdentityControl, MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT,
+    IMAGE_IDENTITY_TICKET_LIMIT, ImageBankSelect, ImageIdentityControl, LoaderGateControl,
+    MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT,
     PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE, RootAffiliationControl, SlotSemantics,
     TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT,
     ThreadOwnerControl, attach_cookie,
@@ -366,7 +367,46 @@ const IDENTITY_MAPS: [(&str, ExactMapMetadata); 6] = [
     ("ROOT_CTL", map_metadata(MapType::Array, 4, 64, 1, 0)),
 ];
 
-fn validate_identity_inventory<'a>(maps: impl Iterator<Item = (&'a str, bool)>) -> Result<()> {
+/// True when this build wires the loader gate (`P11SCOPE_LOADER_GATE=1`,
+/// emitted by build.rs as `P11SCOPE_LOADER_GATE_ENABLED`). Only gate-1
+/// Detailed objects carry [`GATE_IDENTITY_MAPS`]; every other flavor and
+/// every gate-0 object stays gate-free.
+pub(crate) const LOADER_GATE_BUILD: bool = {
+    // Byte comparison: `matches!` on `str` is not const.
+    let bytes = env!("P11SCOPE_LOADER_GATE_ENABLED").as_bytes();
+    bytes.len() == 1 && bytes[0] == b'1'
+};
+
+/// Exact metadata for every map a gate-1 Detailed object adds, read from
+/// the built object (BTF DATASEC plus the Rust `maps` section). Counter
+/// and inventory objects never carry these; a gate-0 build refuses them.
+const GATE_IDENTITY_MAPS: [(&str, ExactMapMetadata); 5] = [
+    (
+        "TASK_COOKIE_B",
+        map_metadata(MapType::TaskStorage, 4, 8, 0, 1),
+    ),
+    (
+        "COOKIE_CTL_B",
+        map_metadata(MapType::Array, 4, 40, 1, 0),
+    ),
+    (
+        "IMAGE_BANK_SELECT",
+        map_metadata(MapType::Array, 4, 96, 1, 0),
+    ),
+    (
+        "LOADER_GATE",
+        map_metadata(MapType::Array, 4, 32, 256, 0),
+    ),
+    (
+        "LOADER_GATE_CTL",
+        map_metadata(MapType::Array, 4, 72, 1, 0),
+    ),
+];
+
+fn validate_identity_inventory<'a>(
+    maps: impl Iterator<Item = (&'a str, bool)>,
+    gate: bool,
+) -> Result<()> {
     let mut storage = BTreeSet::new();
     for (name, unsupported) in maps {
         if unsupported {
@@ -375,28 +415,50 @@ fn validate_identity_inventory<'a>(maps: impl Iterator<Item = (&'a str, bool)>) 
             if name == "PROC_EPOCH" {
                 continue;
             }
-            if !matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION") {
+            let known = matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION")
+                || (gate && name == "TASK_COOKIE_B");
+            if !known {
                 bail!("unexpected Unsupported map {name}");
             }
             storage.insert(name);
-        } else if matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION") {
+        } else if matches!(name, "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION")
+            || (gate && name == "TASK_COOKIE_B")
+        {
             bail!("{name} must be an Unsupported task-storage map");
         }
     }
-    if storage != BTreeSet::from(["ROOT_AFFILIATION", "TASK_COOKIE", "THREAD_OWNER"]) {
+    let mut required = BTreeSet::from(["ROOT_AFFILIATION", "TASK_COOKIE", "THREAD_OWNER"]);
+    if gate {
+        required.insert("TASK_COOKIE_B");
+    }
+    if storage != required {
         bail!("missing required task-storage maps: {storage:?}");
     }
     Ok(())
 }
 
 fn identity_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::maps::MapData> {
-    let (_, expected) = IDENTITY_MAPS
+    let expected = IDENTITY_MAPS
         .iter()
+        .chain(GATE_IDENTITY_MAPS.iter())
         .find(|(candidate, _)| *candidate == name)
+        .map(|(_, expected)| expected)
         .with_context(|| format!("unexpected identity map {name}"))?;
     let data = match (name, map) {
-        ("TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION", Map::Unsupported(data)) => data,
-        ("COOKIE_CTL" | "OWNER_CTL" | "ROOT_CTL", Map::Array(data)) => data,
+        (
+            "TASK_COOKIE" | "THREAD_OWNER" | "ROOT_AFFILIATION" | "TASK_COOKIE_B",
+            Map::Unsupported(data),
+        ) => data,
+        (
+            "COOKIE_CTL"
+            | "OWNER_CTL"
+            | "ROOT_CTL"
+            | "COOKIE_CTL_B"
+            | "IMAGE_BANK_SELECT"
+            | "LOADER_GATE"
+            | "LOADER_GATE_CTL",
+            Map::Array(data),
+        ) => data,
         _ => bail!("unexpected {name} identity map variant"),
     };
     validate_map_metadata(name, data, *expected)?;
@@ -407,6 +469,8 @@ fn identity_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::maps::MapD
 enum IdentityPreparation {
     WriteCookie,
     ReadCookie,
+    WriteBankSelect,
+    ReadBankSelect,
     WriteOwner,
     ReadOwner,
     WriteRoot,
@@ -418,22 +482,33 @@ enum IdentityPreparation {
 
 fn prepare_identity_with(
     owned: bool,
+    gate: bool,
     mut operation: impl FnMut(IdentityPreparation) -> Result<()>,
 ) -> Result<()> {
-    let controls = [
+    let image = [
         IdentityPreparation::WriteCookie,
         IdentityPreparation::ReadCookie,
+    ];
+    let bank = gate.then_some([
+        IdentityPreparation::WriteBankSelect,
+        IdentityPreparation::ReadBankSelect,
+    ]);
+    let rest = [
         IdentityPreparation::WriteOwner,
         IdentityPreparation::ReadOwner,
         IdentityPreparation::WriteRoot,
         IdentityPreparation::ReadRoot,
     ];
-    for step in controls
+    let bank_storage = gate.then_some(IdentityPreparation::Freeze("TASK_COOKIE_B"));
+    for step in image
         .into_iter()
+        .chain(bank.into_iter().flatten())
+        .chain(rest)
         .chain(owned.then_some(IdentityPreparation::SeedRoot))
         .chain(owned.then_some(IdentityPreparation::ReadSeed))
+        .chain([IdentityPreparation::Freeze("TASK_COOKIE")])
+        .chain(bank_storage)
         .chain([
-            IdentityPreparation::Freeze("TASK_COOKIE"),
             IdentityPreparation::Freeze("THREAD_OWNER"),
             IdentityPreparation::Freeze("ROOT_AFFILIATION"),
             IdentityPreparation::Freeze("COOKIE_CTL"),
@@ -496,6 +571,47 @@ fn initial_root_control(owned: bool) -> RootAffiliationControl {
         affiliation_reserved: u64::from(owned),
         ..Default::default()
     }
+}
+
+/// The bank-A prepared select image every gate-1 load publishes before
+/// links: bank A current and prepared, every count and incarnation zero.
+/// The bank-aware allocator refuses all issuance until this exists, so no
+/// gate-1 identity can precede it. Bank B stays unprepared here; its
+/// preparation (fresh `COOKIE_CTL_B` plus the `prepared[1]` flip before
+/// bank A fills) has no owner yet and lands with the cutover work.
+fn initial_bank_select() -> ImageBankSelect {
+    ImageBankSelect {
+        bank: 0,
+        prepared: [1, 0],
+        ..Default::default()
+    }
+}
+
+fn bank_select_fields(c: ImageBankSelect) -> [u64; 12] {
+    [
+        c.bank,
+        c.prepared[0],
+        c.prepared[1],
+        c.cuts,
+        c.refusals,
+        c.incarnation[0],
+        c.incarnation[1],
+        c.folded[0],
+        c.folded[1],
+        c.folds,
+        c.folded_issued,
+        c.update_losses,
+    ]
+}
+
+fn validate_bank_select_readback(
+    expected: ImageBankSelect,
+    actual: ImageBankSelect,
+) -> Result<()> {
+    if bank_select_fields(actual) != bank_select_fields(expected) {
+        bail!("IMAGE_BANK_SELECT exact readback differs from initial select");
+    }
+    Ok(())
 }
 
 fn root_seed_authority<'fd>(
@@ -567,6 +683,7 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
     validate_identity_inventory(
         ebpf.maps()
             .map(|(name, map)| (name, matches!(map, Map::Unsupported(_)))),
+        LOADER_GATE_BUILD,
     )?;
     for (name, _) in IDENTITY_MAPS {
         identity_map_data(
@@ -574,6 +691,15 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
             ebpf.map(name)
                 .with_context(|| format!("missing {name} map"))?,
         )?;
+    }
+    if LOADER_GATE_BUILD {
+        for (name, _) in GATE_IDENTITY_MAPS {
+            identity_map_data(
+                name,
+                ebpf.map(name)
+                    .with_context(|| format!("missing {name} map"))?,
+            )?;
+        }
     }
     let cookie = ImageIdentityControl {
         limit: IMAGE_IDENTITY_TICKET_LIMIT,
@@ -588,7 +714,8 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
         .map(|child| root_seed_authority(scope, child.pid(), child.pin().pidfd()))
         .transpose()?;
     let root = initial_root_control(root_pidfd.is_some());
-    prepare_identity_with(root_pidfd.is_some(), |step| {
+    let bank_select = initial_bank_select();
+    prepare_identity_with(root_pidfd.is_some(), LOADER_GATE_BUILD, |step| {
         match step {
             IdentityPreparation::WriteCookie => {
                 let mut control: Array<_, ImageIdentityControl> =
@@ -601,6 +728,20 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
                 if cookie_control_fields(control.get(&0, 0)?) != cookie_control_fields(cookie) {
                     bail!("COOKIE_CTL exact readback differs from initial control");
                 }
+            }
+            IdentityPreparation::WriteBankSelect => {
+                let mut select: Array<_, ImageBankSelect> = Array::try_from(
+                    ebpf.map_mut("IMAGE_BANK_SELECT")
+                        .context("IMAGE_BANK_SELECT map")?,
+                )?;
+                select.set(0, bank_select, 0)?;
+            }
+            IdentityPreparation::ReadBankSelect => {
+                let select: Array<_, ImageBankSelect> = Array::try_from(
+                    ebpf.map("IMAGE_BANK_SELECT")
+                        .context("IMAGE_BANK_SELECT map")?,
+                )?;
+                validate_bank_select_readback(bank_select, select.get(&0, 0)?)?;
             }
             IdentityPreparation::WriteOwner => {
                 let mut control: Array<_, ThreadOwnerControl> =
@@ -7424,6 +7565,52 @@ impl Session {
         counter_snapshot_with(read, abi_refusals)
     }
 
+    /// One gate-1 `Array` cell, when this build carries the gate and the
+    /// loaded object carries the map. A gate-0 session binds nothing; a
+    /// malformed map errors like every other control read.
+    fn gate_cell<T: aya::Pod>(&self, name: &str) -> Result<Option<T>> {
+        if !LOADER_GATE_BUILD {
+            return Ok(None);
+        }
+        let Some(map) = self.ebpf.map(name) else {
+            return Ok(None);
+        };
+        let cell: Array<_, T> =
+            Array::try_from(map).with_context(|| format!("{name} gate map"))?;
+        Ok(Some(
+            cell.get(&0, 0)
+                .with_context(|| format!("{name} gate cell"))?,
+        ))
+    }
+
+    /// The loader-gate control cell for the snapshot read path. Unpublished
+    /// (zero) cells read back as real zero bytes; the snapshot mapping
+    /// refuses them honestly.
+    pub(crate) fn loader_gate_control(&self) -> Result<Option<LoaderGateControl>> {
+        self.gate_cell("LOADER_GATE_CTL")
+    }
+
+    /// The published bank-select word for the snapshot read path.
+    pub(crate) fn image_bank_select(&self) -> Result<Option<ImageBankSelect>> {
+        self.gate_cell("IMAGE_BANK_SELECT")
+    }
+
+    /// The bank-B control cell for the snapshot read path. Unpublished
+    /// until bank-B preparation lands.
+    pub(crate) fn bank_b_control(&self) -> Result<Option<ImageIdentityControl>> {
+        self.gate_cell("COOKIE_CTL_B")
+    }
+
+    /// The gate rows map for the native acknowledgement: the acknowledgement
+    /// wiring arms per-row reuse through it. Borrowed from the session;
+    /// `None` wherever the gate is not built in.
+    pub(crate) fn loader_gate_rows(&self) -> Option<&Map> {
+        if !LOADER_GATE_BUILD {
+            return None;
+        }
+        self.ebpf.map("LOADER_GATE")
+    }
+
     fn read_pid_health(&mut self) -> std::result::Result<u64, PidContinuityRefusal> {
         let tap = self
             .pid_lifecycle
@@ -12008,30 +12195,312 @@ mod tests {
             ("OWNER_CTL", false),
             ("ROOT_CTL", false),
         ];
-        validate_identity_inventory(valid.into_iter()).unwrap();
+        validate_identity_inventory(valid.into_iter(), false).unwrap();
         for index in [0, 1, 2] {
             assert!(
                 validate_identity_inventory(
                     valid
                         .into_iter()
                         .enumerate()
-                        .filter_map(|(i, v)| (i != index).then_some(v))
+                        .filter_map(|(i, v)| (i != index).then_some(v)),
+                    false
                 )
                 .is_err()
             );
             let mut wrong = valid;
             wrong[index].1 = false;
-            assert!(validate_identity_inventory(wrong.into_iter()).is_err());
+            assert!(validate_identity_inventory(wrong.into_iter(), false).is_err());
         }
         for extra in ["OTHER", "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL"] {
-            assert!(validate_identity_inventory(valid.into_iter().chain([(extra, true)])).is_err());
+            assert!(
+                validate_identity_inventory(valid.into_iter().chain([(extra, true)]), false)
+                    .is_err()
+            );
         }
+    }
+
+    #[test]
+    fn gate1_task_storage_inventory_is_accepted() {
+        // A gate-1 Detailed object carries TASK_COOKIE_B beside the three
+        // base task-storage maps; the preflight must accept that inventory.
+        // Today it refuses with `unexpected Unsupported map TASK_COOKIE_B`,
+        // which blocks every gate-1 load at doctor preflight.
+        let gate1 = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("TASK_COOKIE_B", true),
+            ("COOKIE_CTL", false),
+            ("COOKIE_CTL_B", false),
+            ("IMAGE_BANK_SELECT", false),
+            ("LOADER_GATE", false),
+            ("LOADER_GATE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        validate_identity_inventory(gate1.into_iter(), true).unwrap();
+    }
+
+    #[test]
+    fn gate0_inventory_refuses_gate1_task_storage() {
+        // The same bank-B map is refused in a gate-0 inventory: a gate-0
+        // build must never silently accept gate-1 bytes.
+        let gate1 = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("TASK_COOKIE_B", true),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        let error = validate_identity_inventory(gate1.into_iter(), false).unwrap_err();
+        assert!(
+            error.to_string().contains("TASK_COOKIE_B"),
+            "the refusal must name the map: {error:?}"
+        );
+    }
+
+    #[test]
+    fn gate_inventory_refuses_missing_gate1_task_storage() {
+        // A gate-1 build refuses an object without its required bank map.
+        let no_bank = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        assert!(validate_identity_inventory(no_bank.into_iter(), true).is_err());
+    }
+
+    #[test]
+    fn gate_inventory_refuses_wrong_variant_gate1_task_storage() {
+        // Bank task storage must be an Unsupported map, like its twin.
+        let wrong_variant = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("TASK_COOKIE_B", false),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        let error =
+            validate_identity_inventory(wrong_variant.into_iter(), true).unwrap_err();
+        assert!(
+            error.to_string().contains("TASK_COOKIE_B"),
+            "the refusal must name the map: {error:?}"
+        );
+    }
+
+    #[test]
+    fn gate_identity_table_names_exactly_the_gate1_maps() {
+        // The preflight pins every map a gate-1 Detailed object adds: no
+        // more, no fewer. Membership only; prepare order is unconstrained.
+        let mut names: Vec<&str> = super::GATE_IDENTITY_MAPS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "COOKIE_CTL_B",
+                "IMAGE_BANK_SELECT",
+                "LOADER_GATE",
+                "LOADER_GATE_CTL",
+                "TASK_COOKIE_B",
+            ]
+        );
+    }
+
+    #[test]
+    fn gate_identity_metadata_checks_every_tuple_field() {
+        // Wrong metadata on any gate-1 map refuses, field by field.
+        for (name, expected) in super::GATE_IDENTITY_MAPS {
+            compare_map_metadata(name, expected, expected).unwrap();
+            for actual in [
+                ExactMapMetadata {
+                    map_type: MapType::Hash,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    key_size: expected.key_size + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    value_size: expected.value_size + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    max_entries: expected.max_entries + 1,
+                    ..expected
+                },
+                ExactMapMetadata {
+                    flags: expected.flags ^ 1,
+                    ..expected
+                },
+            ] {
+                assert!(
+                    compare_map_metadata(name, actual, expected).is_err(),
+                    "{name}: {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate_identity_metadata_matches_embedded_gate_object() {
+        // The build flavor and the embedded Detailed bytes agree: gate-1
+        // carries all five maps with exact metadata, gate-0 carries none.
+        let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        if super::LOADER_GATE_BUILD {
+            for (name, expected) in super::GATE_IDENTITY_MAPS {
+                let actual = detailed
+                    .maps
+                    .get(name)
+                    .unwrap_or_else(|| panic!("{name} missing from the gate-1 object"));
+                assert_eq!(actual.map_type(), expected.map_type as u32, "{name} type");
+                assert_eq!(actual.key_size(), expected.key_size, "{name} key");
+                assert_eq!(actual.value_size(), expected.value_size, "{name} value");
+                assert_eq!(
+                    actual.max_entries(),
+                    expected.max_entries,
+                    "{name} entries"
+                );
+                assert_eq!(actual.map_flags(), expected.flags, "{name} flags");
+            }
+        } else {
+            for (name, _) in super::GATE_IDENTITY_MAPS {
+                assert!(
+                    detailed.maps.get(name).is_none(),
+                    "{name} must be absent from the gate-0 object"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate_maps_are_absent_from_inventory_objects() {
+        // The gate wires Detailed only; inventory objects never carry it.
+        for bytes in [
+            crate::EBPF_INVENTORY_OBJECT,
+            crate::EBPF_INVENTORY_CALLERS_OBJECT,
+        ] {
+            let inventory = aya_obj::Object::parse(bytes).unwrap();
+            for (name, _) in super::GATE_IDENTITY_MAPS {
+                assert!(
+                    inventory.maps.get(name).is_none(),
+                    "{name} must be absent from inventory objects"
+                );
+            }
+        }
+    }
+
+    #[cfg(p11scope_counter_objects)]
+    #[test]
+    fn gate_maps_are_absent_from_counter_objects() {
+        // Counter flavors compile without the gate define; their objects
+        // stay gate-free in every flavor of this build.
+        for bytes in [
+            crate::EBPF_COUNTER_COUNTS_OBJECT,
+            crate::EBPF_COUNTER_TIMESTAMPS_OBJECT,
+            crate::EBPF_COUNTER_LATENCY_OBJECT,
+        ] {
+            let counter = aya_obj::Object::parse(bytes).unwrap();
+            for (name, _) in super::GATE_IDENTITY_MAPS {
+                assert!(
+                    counter.maps.get(name).is_none(),
+                    "{name} must be absent from counter objects"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loader_gate_build_matches_embedded_object() {
+        // The build-time gate selection and the embedded Detailed bytes
+        // agree: the select map exists exactly in gate-1 builds.
+        let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        assert_eq!(
+            super::LOADER_GATE_BUILD,
+            detailed.maps.get("IMAGE_BANK_SELECT").is_some(),
+            "gate selection must match the embedded object"
+        );
+    }
+
+    #[ignore = "privileged: gate session binds live gate and bank cells"]
+    #[test]
+    fn gate_session_binds_live_gate_and_bank_cells() -> anyhow::Result<()> {
+        // The doctor self-preflight session, kept alive to read the cells:
+        // gate-1 exposes the published select word and the real (still
+        // unpublished) gate/bank cells; gate-0 exposes none, and both
+        // snapshot mappings report their honest refusal.
+        let session = super::Session::start_inner(
+            &super::Scope::Pid(std::process::id()),
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            super::AttachBackend::Singles,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        if super::LOADER_GATE_BUILD {
+            let select = session
+                .image_bank_select()?
+                .expect("gate-1 binds IMAGE_BANK_SELECT");
+            assert_eq!(select.bank, 0);
+            assert_eq!(select.prepared, [1, 0]);
+            assert_eq!(select.cuts, 0);
+            let gate = session
+                .loader_gate_control()?
+                .expect("gate-1 binds LOADER_GATE_CTL");
+            assert_eq!(
+                gate.limit, 0,
+                "gate control is unpublished before the acknowledgement wiring"
+            );
+            let bank_b = session
+                .bank_b_control()?
+                .expect("gate-1 binds COOKIE_CTL_B");
+            assert_eq!(
+                bank_b.limit, 0,
+                "bank B is unpublished before its preparation"
+            );
+            assert!(session.loader_gate_rows().is_some());
+            assert!(
+                crate::metrics::loader_transitions(&session)?.is_none(),
+                "unpublished gate control refuses honestly"
+            );
+            assert!(
+                crate::metrics::image_transitions(&session)?.is_none(),
+                "unpublished bank B refuses honestly"
+            );
+        } else {
+            assert!(session.image_bank_select()?.is_none());
+            assert!(session.loader_gate_control()?.is_none());
+            assert!(session.bank_b_control()?.is_none());
+            assert!(session.loader_gate_rows().is_none());
+            assert!(
+                crate::metrics::loader_transitions(&session)?.is_none(),
+                "gate-0 snapshots refuse honestly"
+            );
+            assert!(
+                crate::metrics::image_transitions(&session)?.is_none(),
+                "gate-0 snapshots refuse honestly"
+            );
+        }
+        Ok(())
     }
 
     #[test]
     fn identity_preparation_stops_at_every_write_readback_and_freeze_failure() {
         let mut expected = Vec::new();
-        prepare_identity_with(true, |step| {
+        prepare_identity_with(true, false, |step| {
             expected.push(step);
             Ok(())
         })
@@ -12058,7 +12527,7 @@ mod tests {
         for fail in 0..expected.len() {
             let mut calls = Vec::new();
             let mut linked = false;
-            let result = prepare_identity_with(true, |step| {
+            let result = prepare_identity_with(true, false, |step| {
                 calls.push(step);
                 if calls.len() == fail + 1 {
                     bail!("injected setup failure");
@@ -12074,7 +12543,7 @@ mod tests {
         }
 
         let mut unowned = Vec::new();
-        prepare_identity_with(false, |step| {
+        prepare_identity_with(false, false, |step| {
             unowned.push(step);
             Ok(())
         })
@@ -12094,7 +12563,7 @@ mod tests {
         for fail in 0..unowned.len() {
             let mut calls = Vec::new();
             let mut completed = false;
-            let result = prepare_identity_with(false, |step| {
+            let result = prepare_identity_with(false, false, |step| {
                 calls.push(step);
                 if calls.len() == fail + 1 {
                     bail!("injected unowned setup failure");
@@ -12110,6 +12579,131 @@ mod tests {
             assert!(!calls.contains(&IdentityPreparation::ReadSeed));
             assert_eq!(calls, unowned[..=fail]);
         }
+    }
+
+    #[test]
+    fn initial_bank_select_publishes_bank_a_prepared() {
+        // The bank-aware allocator refuses every identity until the select
+        // word is published; the initial image is bank A prepared, zero
+        // counts, zero incarnations. Every word is pinned: a wrong bank or
+        // prepared bit would refuse or misroute all issuance.
+        let select = super::initial_bank_select();
+        assert_eq!(select.bank, 0);
+        assert_eq!(select.prepared, [1, 0]);
+        assert_eq!(select.cuts, 0);
+        assert_eq!(select.refusals, 0);
+        assert_eq!(select.incarnation, [0, 0]);
+        assert_eq!(select.folded, [0, 0]);
+        assert_eq!(select.folds, 0);
+        assert_eq!(select.folded_issued, 0);
+        assert_eq!(select.update_losses, 0);
+    }
+
+    #[test]
+    fn bank_select_readback_rejects_each_field_mismatch() {
+        let expected = super::initial_bank_select();
+        super::validate_bank_select_readback(expected, expected).unwrap();
+        // Twelve u64 words; each one alone must fail the exact readback.
+        for word in 0..12 {
+            let mut actual = expected;
+            let cell = match word {
+                0 => &mut actual.bank,
+                1 => &mut actual.prepared[0],
+                2 => &mut actual.prepared[1],
+                3 => &mut actual.cuts,
+                4 => &mut actual.refusals,
+                5 => &mut actual.incarnation[0],
+                6 => &mut actual.incarnation[1],
+                7 => &mut actual.folded[0],
+                8 => &mut actual.folded[1],
+                9 => &mut actual.folds,
+                10 => &mut actual.folded_issued,
+                _ => &mut actual.update_losses,
+            };
+            *cell = cell.wrapping_add(1);
+            assert!(
+                super::validate_bank_select_readback(expected, actual).is_err(),
+                "word {word} must fail the readback"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_preparation_publishes_bank_select_before_freeze() {
+        // Gate-1 preparation writes the bank-A select image with an exact
+        // readback, then freezes the bank task storage. The select word
+        // itself stays unfrozen: bank-B preparation and the later
+        // fold-claim cycle rewrite it from userspace.
+        let mut expected = Vec::new();
+        prepare_identity_with(true, true, |step| {
+            expected.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            expected,
+            &[
+                IdentityPreparation::WriteCookie,
+                IdentityPreparation::ReadCookie,
+                IdentityPreparation::WriteBankSelect,
+                IdentityPreparation::ReadBankSelect,
+                IdentityPreparation::WriteOwner,
+                IdentityPreparation::ReadOwner,
+                IdentityPreparation::WriteRoot,
+                IdentityPreparation::ReadRoot,
+                IdentityPreparation::SeedRoot,
+                IdentityPreparation::ReadSeed,
+                IdentityPreparation::Freeze("TASK_COOKIE"),
+                IdentityPreparation::Freeze("TASK_COOKIE_B"),
+                IdentityPreparation::Freeze("THREAD_OWNER"),
+                IdentityPreparation::Freeze("ROOT_AFFILIATION"),
+                IdentityPreparation::Freeze("COOKIE_CTL"),
+                IdentityPreparation::Freeze("OWNER_CTL"),
+                IdentityPreparation::Freeze("ROOT_CTL"),
+            ]
+        );
+        for fail in 0..expected.len() {
+            let mut calls = Vec::new();
+            let mut linked = false;
+            let result = prepare_identity_with(true, true, |step| {
+                calls.push(step);
+                if calls.len() == fail + 1 {
+                    bail!("injected gate setup failure");
+                }
+                Ok(())
+            })
+            .map(|()| {
+                linked = true;
+            });
+            assert!(result.is_err());
+            assert!(!linked);
+            assert_eq!(calls, expected[..=fail]);
+        }
+    }
+
+    #[test]
+    fn gate0_preparation_has_no_bank_steps() {
+        // Gate-0 preparation keeps exactly the historical step sequence.
+        let mut owned = Vec::new();
+        prepare_identity_with(true, false, |step| {
+            owned.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!owned.contains(&IdentityPreparation::WriteBankSelect));
+        assert!(!owned.contains(&IdentityPreparation::ReadBankSelect));
+        assert!(
+            !owned.contains(&IdentityPreparation::Freeze("TASK_COOKIE_B")),
+            "gate-0 freezes no bank storage"
+        );
+        let mut unowned = Vec::new();
+        prepare_identity_with(false, false, |step| {
+            unowned.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!unowned.contains(&IdentityPreparation::WriteBankSelect));
+        assert!(!unowned.contains(&IdentityPreparation::ReadBankSelect));
     }
 
     #[test]

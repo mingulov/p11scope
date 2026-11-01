@@ -4132,6 +4132,291 @@ pub(crate) mod tests {
         assert_eq!(out[0].module.as_ref().unwrap().ino, 22);
     }
 
+    /// WU-15 round 2: an Initialize row whose completed calls all returned
+    /// CKR_OK reports `ok` with the potential-provider likelihood.
+    #[test]
+    fn initialize_row_with_ok_returns_reports_ok_and_potential_provider() {
+        let mut row = report("C_Initialize", 3, 0, false);
+        row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 3);
+        let ev = evidence();
+        let state = state_fixture();
+        let profile = profile_json(
+            &[row],
+            VersionedEvidence::wrap(&ev),
+            &state,
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["functions"][0]["initialization"],
+            serde_json::json!({"outcome": "ok", "potential_provider": true})
+        );
+    }
+
+    /// The ALREADY class is its own outcome, and it still evidences a
+    /// responding Cryptoki: the likelihood is present.
+    #[test]
+    fn initialize_row_with_already_returns_reports_already_and_potential_provider() {
+        let mut row = report("C_Initialize", 2, 0, false);
+        row.rv_counts
+            .insert(pkcs11_types::CkRv::CRYPTOKI_ALREADY_INITIALIZED.0, 2);
+        let ev = evidence();
+        let state = state_fixture();
+        let profile = profile_json(
+            &[row],
+            VersionedEvidence::wrap(&ev),
+            &state,
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["functions"][0]["initialization"],
+            serde_json::json!({"outcome": "already_initialized", "potential_provider": true})
+        );
+    }
+
+    /// Error-only rows report `error` with no likelihood key: one error RV,
+    /// two distinct error RVs (still one class, never `mixed`), and a
+    /// PENDING-only row (a non-success return for a synchronous lifecycle
+    /// call; the outcome vocabulary has no pending word, and the row
+    /// evidenced no successful initialization).
+    #[test]
+    fn initialize_row_with_errors_only_reports_error_without_potential() {
+        use pkcs11_types::CkRv;
+        for rvs in [
+            vec![(CkRv::GENERAL_ERROR.0, 4)],
+            vec![(CkRv::GENERAL_ERROR.0, 2), (CkRv::DEVICE_ERROR.0, 1)],
+            vec![(CkRv::PENDING.0, 2)],
+        ] {
+            let mut row = report("C_Initialize", 4, 0, false);
+            row.rv_counts = rvs.into_iter().collect();
+            let ev = evidence();
+            let state = state_fixture();
+            let profile = profile_json(
+                &[row],
+                VersionedEvidence::wrap(&ev),
+                &state,
+                &capture_fixture(),
+            );
+            assert_eq!(
+                profile["functions"][0]["initialization"],
+                serde_json::json!({"outcome": "error"}),
+            );
+        }
+    }
+
+    /// More than one outcome class over the row's completed calls is
+    /// `mixed`. Every mixed pair contains `ok` or `already_initialized`
+    /// (a lone `error` class cannot mix with itself), so the likelihood
+    /// is always present.
+    #[test]
+    fn initialize_row_with_mixed_classes_reports_mixed() {
+        use pkcs11_types::CkRv;
+        for rvs in [
+            vec![(CkRv::OK.0, 1), (CkRv::GENERAL_ERROR.0, 1)],
+            vec![
+                (CkRv::CRYPTOKI_ALREADY_INITIALIZED.0, 2),
+                (CkRv::GENERAL_ERROR.0, 1),
+            ],
+            vec![(CkRv::OK.0, 1), (CkRv::CRYPTOKI_ALREADY_INITIALIZED.0, 1)],
+        ] {
+            let mut row = report("C_Initialize", 2, 0, false);
+            row.rv_counts = rvs.into_iter().collect();
+            let ev = evidence();
+            let state = state_fixture();
+            let profile = profile_json(
+                &[row],
+                VersionedEvidence::wrap(&ev),
+                &state,
+                &capture_fixture(),
+            );
+            assert_eq!(
+                profile["functions"][0]["initialization"],
+                serde_json::json!({"outcome": "mixed", "potential_provider": true}),
+            );
+        }
+    }
+
+    /// No completed-call evidence, no claim: an idle row, a row whose only
+    /// RV entry carries a zero count, and a row with lost RV detail
+    /// (`calls > 0` but empty `rv_counts`) all omit the object. The claim
+    /// derives only from `rv_counts`, never from `calls`.
+    #[test]
+    fn initialize_row_without_completed_calls_omits_initialization() {
+        let ev = evidence();
+        let state = state_fixture();
+        let idle = report("C_Initialize", 0, 0, false);
+        let profile = profile_json(
+            std::slice::from_ref(&idle),
+            VersionedEvidence::wrap(&ev),
+            &state,
+            &capture_fixture(),
+        );
+        assert!(
+            profile["functions"][0].get("initialization").is_none(),
+            "idle row must omit the claim: {}",
+            profile["functions"][0]
+        );
+
+        let mut zeroed = report("C_Initialize", 0, 0, false);
+        zeroed.rv_counts.insert(pkcs11_types::CkRv::OK.0, 0);
+        let metrics = json(
+            std::slice::from_ref(&zeroed),
+            &ev,
+            &capture_fixture(),
+        );
+        assert!(
+            metrics["functions"][0].get("initialization").is_none(),
+            "zero-count RVs assert nothing observed: {}",
+            metrics["functions"][0]
+        );
+
+        let lost = report("C_Initialize", 3, 0, false);
+        let metrics = json(std::slice::from_ref(&lost), &ev, &capture_fixture());
+        assert!(
+            metrics["functions"][0].get("initialization").is_none(),
+            "calls without RV detail stay unknown: {}",
+            metrics["functions"][0]
+        );
+    }
+
+    /// Only rows that name exactly `C_Initialize` carry the claim, however
+    /// successful their own calls were.
+    #[test]
+    fn non_initialize_row_omits_initialization() {
+        let ev = evidence();
+        let state = state_fixture();
+        for name in ["C_Sign", "unknown", "c_initialize"] {
+            let mut row = report(name, 5, 0, false);
+            row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 5);
+            let profile = profile_json(
+                std::slice::from_ref(&row),
+                VersionedEvidence::wrap(&ev),
+                &state,
+                &capture_fixture(),
+            );
+            assert!(
+                profile["functions"][0].get("initialization").is_none(),
+                "{name} must omit the claim: {}",
+                profile["functions"][0]
+            );
+        }
+    }
+
+    /// The claim renders identically in the metrics lane and under every
+    /// counter mode: one shared row builder feeds both lanes, and the
+    /// counter mode only selects the timing shape beside it.
+    #[test]
+    fn initialization_claim_renders_in_metrics_lane_and_all_counter_modes() {
+        let ev = evidence();
+        let state = state_fixture();
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let mut row = report("C_Initialize", 2, 0, false);
+            row.mode = mode;
+            row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 2);
+            let wanted = serde_json::json!({"outcome": "ok", "potential_provider": true});
+            let metrics = json(std::slice::from_ref(&row), &ev, &capture_fixture());
+            assert_eq!(metrics["functions"][0]["initialization"], wanted, "{mode:?}");
+            let profile = profile_json(
+                std::slice::from_ref(&row),
+                VersionedEvidence::wrap(&ev),
+                &state,
+                &capture_fixture(),
+            );
+            assert_eq!(profile["functions"][0]["initialization"], wanted, "{mode:?}");
+        }
+    }
+
+    /// The claim is row-scoped: an aliased row that names `C_Initialize`
+    /// among its names reports the row's own outcomes (aliased counts are
+    /// never split into guessed per-name shares).
+    #[test]
+    fn initialize_claim_covers_aliased_rows_by_row_outcomes() {
+        let mut row = report("C_Initialize", 2, 0, true);
+        row.names.push("C_GetFunctionList".into());
+        row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 2);
+        let ev = evidence();
+        let state = state_fixture();
+        let profile = profile_json(
+            &[row],
+            VersionedEvidence::wrap(&ev),
+            &state,
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["functions"][0]["initialization"],
+            serde_json::json!({"outcome": "ok", "potential_provider": true})
+        );
+    }
+
+    /// The live function table marks qualifying Initialize rows with the
+    /// same outcome and likelihood words the JSON row carries; other rows
+    /// and rows without completed calls carry no marker.
+    #[test]
+    fn live_view_marks_initialize_rows_with_outcome_and_potential() {
+        use pkcs11_types::CkRv;
+        let mut ok = report("C_Initialize", 2, 0, false);
+        ok.rv_counts.insert(CkRv::OK.0, 2);
+        let mut already = report("C_Initialize", 1, 0, false);
+        already.rv_counts.insert(CkRv::CRYPTOKI_ALREADY_INITIALIZED.0, 1);
+        let mut error = report("C_Initialize", 1, 0, false);
+        error.rv_counts.insert(CkRv::GENERAL_ERROR.0, 1);
+        let mut mixed = report("C_Initialize", 2, 0, false);
+        mixed.rv_counts.insert(CkRv::OK.0, 1);
+        mixed.rv_counts.insert(CkRv::GENERAL_ERROR.0, 1);
+        let mut other = report("C_Sign", 5, 0, false);
+        other.rv_counts.insert(CkRv::OK.0, 5);
+        let uncompleted = report("C_Initialize", 0, 1, false);
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live(
+            &[ok, already, error, mixed, other, uncompleted],
+            &ev,
+            Duration::from_secs(65),
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+        );
+        let init_lines: Vec<&str> = out
+            .lines()
+            .filter(|line| line.contains("C_Initialize"))
+            .collect();
+        assert_eq!(init_lines.len(), 5, "{out}");
+        for marker in [
+            "[init: ok, potential provider]",
+            "[init: already_initialized, potential provider]",
+            "[init: mixed, potential provider]",
+        ] {
+            assert!(
+                init_lines.iter().any(|line| line.contains(marker)),
+                "missing {marker} in:\n{out}"
+            );
+        }
+        let error_line = init_lines
+            .iter()
+            .find(|line| line.contains("[init: error]"))
+            .expect("error row carries [init: error]");
+        assert!(
+            !error_line.contains("potential provider"),
+            "error row must not claim the likelihood: {error_line}"
+        );
+        let sign_line = out
+            .lines()
+            .find(|line| line.contains("C_Sign"))
+            .expect("C_Sign row renders");
+        assert!(
+            !sign_line.contains("[init:"),
+            "non-Initialize row must carry no marker: {sign_line}"
+        );
+        let unmarked = init_lines
+            .iter()
+            .filter(|line| !line.contains("[init:"))
+            .count();
+        assert_eq!(unmarked, 1, "only the in-flight row lacks a marker:\n{out}");
+    }
+
     fn state_fixture() -> crate::semantics::State {
         crate::semantics::State::with_policy(&empty_plan(), CapturePolicy::Allowlisted)
     }

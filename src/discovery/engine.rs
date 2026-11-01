@@ -21391,19 +21391,6 @@ impl Engine {
         if victims.is_empty() {
             return;
         }
-        for id in &victims {
-            if let Some(view) = self.views.iter().find(|view| view.id() == *id) {
-                self.scheduler.note_evicted(view.pid());
-            }
-        }
-        self.close_cgroup_admissions_at_removal(&victims);
-        self.settle_leader_exits_at_removal(victims.iter().copied());
-        for id in &victims {
-            self.pinned.remove_view(*id);
-            self.scan_inputs.remove(id);
-        }
-        self.loader_contexts
-            .retain(|(view, _, _), _| !victims.contains(view));
         #[cfg(test)]
         {
             let logged: Vec<(ProcessViewId, Option<u32>)> = victims
@@ -21421,6 +21408,19 @@ impl Engine {
                 self.record_view_log(ViewLogKind::Evicted, id, pid);
             }
         }
+        for id in &victims {
+            if let Some(view) = self.views.iter().find(|view| view.id() == *id) {
+                self.scheduler.note_evicted(view.pid());
+            }
+        }
+        self.close_cgroup_admissions_at_removal(&victims);
+        self.settle_leader_exits_at_removal(victims.iter().copied());
+        for id in &victims {
+            self.pinned.remove_view(*id);
+            self.scan_inputs.remove(id);
+        }
+        self.loader_contexts
+            .retain(|(view, _, _), _| !victims.contains(view));
         self.views.retain(|view| !victims.contains(&view.id()));
         for id in &victims {
             self.release_view_id(*id);

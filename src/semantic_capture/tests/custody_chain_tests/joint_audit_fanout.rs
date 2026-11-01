@@ -615,7 +615,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         adapter: &JournalAdapter,
         q: &crate::attach::CollectedFinishQ,
         discovery: &crate::events::DiscoveryDomain,
-    ) -> Result<usize, SemanticRefusal> {
+    ) -> Result<Option<usize>, SemanticRefusal> {
         // Standalone pending-Q tests borrow their separate original observer;
         // their strict wrapper/Raw checks do not create a global Finish owner.
         if self.finish.is_some() {
@@ -6858,6 +6858,7 @@ fn joint_machine_collected_finish_budget_refusal_preserves_originals() {
                 &q,
             )
             .unwrap()
+            .expect("one call waits at Q")
     };
     assert!(bytes > 0, "the report and all expiry temporaries are paid");
     let snapshot = fixture
@@ -8113,6 +8114,555 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
     assert_eq!(fixture.machine.disposition_reason(), None);
     assert!(audit_no_progress_gaps(&fixture).is_empty());
     assert!(no_progress_gaps(&fixture).is_empty());
+    // Void + acknowledgement legs. The shed END left a loss barrier
+    // that no seal acknowledged: the q2 seal refused on a check that
+    // runs before H3, and only an H3 loss void acknowledges. The next
+    // clean frame must still publish, its seal must void that barrier
+    // exactly once (H3Loss, never H3Pending) and acknowledge past it,
+    // and the frame after that must mint clean H3 again. The
+    // follow-up calls join S1Only history across the void: the void
+    // drops staged joint proof, not the S1 API return.
+    let barrier = match fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_h3_last_disposition()
+    {
+        Some(H3DispositionEvidence::StagedLoss { barrier }) => barrier,
+        other => panic!("the shed END leaves a loss barrier, not {other:?}"),
+    };
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0,
+        "the q2 publication acknowledges no H3 loss"
+    );
+    let before_void = api_returns(&fixture);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    fixture.reach_phase("Audited");
+    let void_below = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow()
+        .capture
+        .pending_h3_watermark()
+        .expect("the lane still mints at the follow-up audit")
+        .0;
+    assert!(void_below > barrier);
+    assert_eq!(
+        fixture
+            .machine
+            .diagnostic_audit_for_test()
+            .map(|(gap, h3, bound, floor, _)| (gap, h3, bound, floor)),
+        Some((
+            Some(crate::semantics_objects::journal::JournalGap::H3Loss),
+            "StagedLoss",
+            Some(barrier),
+            None
+        )),
+        "the clean follow-up frame voids the unacknowledged barrier once"
+    );
+    fixture.published_labeled("midcall-followup-void", None);
+    assert_eq!(
+        api_returns(&fixture),
+        before_void + 1,
+        "the follow-up call joins S1Only history across the void"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        void_below,
+        "the H3 loss void acknowledges its whole audited interval"
+    );
+    let before_clean = api_returns(&fixture);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 5);
+    fixture.published_labeled("midcall-followup-clean", None);
+    let clean_below = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow()
+        .capture
+        .pending_h3_watermark()
+        .expect("the lane still mints after the clean follow-up")
+        .0;
+    match fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_h3_last_disposition()
+    {
+        Some(H3DispositionEvidence::Clean {
+            staged_max,
+            pending_floor: None,
+        }) => assert!(
+            staged_max >= clean_below - 1,
+            "clean H3 covers the second follow-up: staged_max={staged_max} h0_below={clean_below}"
+        ),
+        other => panic!("H3 returns to Clean after the acknowledged void, not {other:?}"),
+    }
+    assert_eq!(api_returns(&fixture), before_clean + 1);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        void_below,
+        "a clean frame voids nothing further"
+    );
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    assert!(audit_no_progress_gaps(&fixture).is_empty());
+}
+
+/// A running original left in AwaitH0 by one route-waiting call (file 0's
+/// scans fail), followed by the same pass's actual binder refresh (the
+/// `apply` step between hooks) before any further hook tick. With
+/// `resolve_waiter` the refresh scans file 0 successfully and resolves the
+/// waiter into the lane stash; otherwise file 0 keeps failing and file 1's
+/// provider reload mints a positioned InstancesRetired into the stash above
+/// the waiter. Returns the scene and the waiter's H0 position.
+fn pass_refresh_before_finish(linked: bool, resolve_waiter: bool) -> (MachineScene, u64) {
+    let mut fixture = if linked {
+        MachineScene::new(2)
+    } else {
+        MachineScene::unlinked(2)
+    };
+    if linked {
+        fixture.prime(2);
+    } else {
+        fixture.prime_unlinked();
+    }
+    {
+        let mut held = fixture.scene.real.h0.0.borrow_mut();
+        let (base, epoch, global) = held.io.scan_input(0);
+        held.io
+            .scan_inputs
+            .insert(0, (base + 0x20_000, epoch + 1, global));
+        held.io.script.fail_file = Some(0);
+    }
+    for (file, sequence) in [(0, 3), (1, 4)] {
+        fixture
+            .scene
+            .push(std::process::id(), file, "C_SignInit", sequence);
+    }
+    for _ in 0..128 {
+        fixture.service(1).unwrap();
+        if fixture.scene.real.h0.0.borrow().capture.awaiting.len() == 1
+            && fixture.machine.retained_h0_for_test().is_some()
+        {
+            break;
+        }
+    }
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "AwaitH0");
+    assert!(
+        fixture
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .h0_waiting()
+    );
+    let waiter = {
+        let held = fixture.scene.real.h0.0.borrow();
+        assert!(held.stash.min_outcome_position().is_none());
+        let waiting = held.capture.awaiting.keys().copied().collect::<Vec<_>>();
+        assert_eq!(waiting.len(), 1, "one genuine route-waiting call");
+        waiting[0]
+    };
+    {
+        let mut held = fixture.scene.real.h0.0.borrow_mut();
+        if resolve_waiter {
+            held.io.script.fail_file = None;
+        } else {
+            let (base, epoch, global) = held.io.scan_input(1);
+            held.io
+                .scan_inputs
+                .insert(1, (base + 0x20_000, epoch + 1, global));
+        }
+    }
+    let real = &mut fixture.scene.real;
+    crate::inventory_semantics::bind_semantic_callers_inner(
+        &mut real.scene.coordinator,
+        &mut real.lane,
+        None,
+    );
+    (fixture, waiter)
+}
+
+/// The reviewed stop-path wedge candidate, driven through the real machine
+/// Finish: a refresh-minted positioned invalidation sits in the lane stash
+/// above a still-waiting call when Finish starts, and the at-Q resolution
+/// restamps the watermark above it without merging the stash. The waiter
+/// expires at Q into a counted unrouted shed, so the finalizer's H3 is
+/// StagedLoss at the waiter (the stash floor is never read) and the audit
+/// voids it as H3Loss instead of pending on the stash floor. The void
+/// acknowledges past the stashed invalidation, the final at-Q collection
+/// merges the stash, and the finish publishes clean without any bound trip.
+#[test]
+fn joint_machine_finish_after_pass_refresh_invalidation_publishes() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::semantics_objects::journal::JournalGap;
+    for linked in [true, false] {
+        let (mut fixture, waiter) = pass_refresh_before_finish(linked, false);
+        let stashed = {
+            let mut held = fixture.scene.real.h0.0.borrow_mut();
+            assert_eq!(
+                held.capture.awaiting.keys().copied().collect::<Vec<_>>(),
+                [waiter],
+                "the refresh leaves the call waiting (linked={linked})"
+            );
+            let outcomes = held.stash.take_outcomes();
+            let stashed = match outcomes.as_slice() {
+                [TickOutcome::Invalidation(loss)] => {
+                    assert!(matches!(
+                        loss.scope(),
+                        InvalidationScope::InstancesRetired { file_slot: 1, .. }
+                    ));
+                    loss.position().expect("a positioned refresh invalidation")
+                }
+                other => panic!("one stashed InstancesRetired, not {other:?}"),
+            };
+            assert_eq!(held.stash.push_all(Vec::new(), outcomes), 0);
+            assert!(stashed > waiter);
+            assert_eq!(
+                held.capture.pending_h3_watermark().map(|bounds| bounds.0),
+                Some(stashed + 1)
+            );
+            stashed
+        };
+        fixture.enable_finish_fixture(Vec::new());
+        fixture.begin_finish().unwrap();
+        let mut first_audit = None;
+        let mut published = false;
+        for _ in 0..512 {
+            if first_audit.is_none()
+                && fixture.machine.diagnostic_snapshot_for_test().0 == "Audited"
+            {
+                first_audit = fixture.machine.diagnostic_audit_for_test();
+                assert_eq!(
+                    fixture
+                        .scene
+                        .real
+                        .h0
+                        .0
+                        .borrow()
+                        .stash
+                        .min_outcome_position(),
+                    Some(stashed),
+                    "the at-Q resolution leaves the stash unmerged"
+                );
+            }
+            match fixture.poll_finish(1) {
+                Ok(JointCommitProgress::Pending) => {}
+                Ok(JointCommitProgress::Published(_)) => {
+                    published = true;
+                    break;
+                }
+                Err(reason) => panic!("the finish must not refuse (linked={linked}): {reason:?}"),
+            }
+        }
+        assert!(published, "the finish publishes within its bound");
+        assert_eq!(
+            first_audit.map(|(gap, h3, bound, floor, _)| (gap, h3, bound, floor)),
+            Some((Some(JournalGap::H3Loss), "StagedLoss", Some(waiter), None)),
+            "the expired waiter is a loss barrier, never a pending stash floor"
+        );
+        assert_eq!(fixture.native.pending_q_resolutions, 1);
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert!(fixture.scene.real.lane.is_finished());
+        assert!(
+            coordinator.reference_h3_acknowledged_below() > stashed,
+            "the H3 loss void acknowledges past the stashed invalidation"
+        );
+        match coordinator.reference_h3_last_disposition() {
+            Some(H3DispositionEvidence::Clean {
+                staged_max,
+                pending_floor: None,
+            }) => assert!(staged_max >= stashed),
+            other => panic!("the final frame stages the stash clean, not {other:?}"),
+        }
+        assert!(
+            fixture
+                .scene
+                .real
+                .h0
+                .0
+                .borrow()
+                .stash
+                .min_outcome_position()
+                .is_none(),
+            "the final at-Q collection merges the stashed invalidation"
+        );
+        assert!(
+            coordinator.registry().gaps().iter().any(|gap| {
+                gap.subject == "semantic calls unrouted"
+                    && gap
+                        .reason
+                        .starts_with("1 calls shed without a route (unobserved=1)")
+            }),
+            "the expired waiter is a counted shed"
+        );
+        assert_eq!(fixture.machine.finish_no_progress_trip_for_test(), None);
+        assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+        assert!(no_progress_gaps(&fixture).is_empty());
+        assert!(audit_no_progress_gaps(&fixture).is_empty());
+    }
+}
+
+/// The same pass refresh resolves the only route-waiting call into the lane
+/// stash before Finish starts, while the original still records that it
+/// waited. Nothing of the original waits at Q any more, so there is nothing
+/// to expire there: Finish must take the ordinary at-Q tick, which merges
+/// the stash, and publish both calls. It must never refuse the empty expiry
+/// as a storage fault and lose the final publication.
+fn finish_after_pass_refresh_resolution_publishes(linked: bool) {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    let (mut fixture, waiter) = pass_refresh_before_finish(linked, true);
+    let api_returns = |fixture: &MachineScene| -> u64 {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum()
+    };
+    let before = api_returns(&fixture);
+    {
+        let held = fixture.scene.real.h0.0.borrow();
+        assert!(
+            held.capture.awaiting.is_empty(),
+            "the refresh resolved the waiter (linked={linked})"
+        );
+        assert_eq!(held.stash.min_outcome_position(), Some(waiter));
+    }
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "AwaitH0");
+    assert!(
+        fixture
+            .machine
+            .retained_raw_for_test()
+            .unwrap()
+            .h0_waiting(),
+        "the original still records its waiter"
+    );
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    let mut published = false;
+    let mut refusals = Vec::new();
+    for poll in 0..512 {
+        match fixture.poll_finish(1) {
+            Ok(JointCommitProgress::Pending) => {}
+            Ok(JointCommitProgress::Published(_)) => {
+                published = true;
+                break;
+            }
+            Err(reason) => {
+                refusals.push((
+                    poll,
+                    reason,
+                    fixture.machine.diagnostic_snapshot_for_test().0,
+                ));
+                if fixture.machine.finish_disposition_required() {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        refusals.is_empty(),
+        "linked={linked}: the finish refused {} times (first {:?}); latched={:?}",
+        refusals.len(),
+        refusals.first(),
+        fixture.machine.disposition_reason()
+    );
+    assert!(published, "linked={linked}: the finish publishes");
+    assert_eq!(
+        fixture.native.pending_q_resolutions, 0,
+        "nothing waits at Q, so nothing expires there"
+    );
+    assert!(fixture.scene.real.lane.is_finished());
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    assert_eq!(
+        api_returns(&fixture),
+        before + 2,
+        "the resolved call publishes with the routed one, neither is shed"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .h0
+            .0
+            .borrow()
+            .stash
+            .min_outcome_position()
+            .is_none(),
+        "the at-Q tick merges the stashed resolution"
+    );
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    match coordinator.reference_h3_last_disposition() {
+        Some(H3DispositionEvidence::Clean {
+            staged_max,
+            pending_floor: None,
+        }) => assert!(staged_max >= waiter),
+        other => panic!("the final frame stages the resolved call clean, not {other:?}"),
+    }
+    assert!(
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| gap.subject != "semantic calls unrouted"),
+        "the resolved call is not shed"
+    );
+    assert_eq!(fixture.machine.finish_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert!(no_progress_gaps(&fixture).is_empty());
+    assert!(audit_no_progress_gaps(&fixture).is_empty());
+}
+
+#[test]
+fn joint_machine_finish_after_pass_refresh_resolution_publishes_linked() {
+    finish_after_pass_refresh_resolution_publishes(true);
+}
+
+#[test]
+fn joint_machine_finish_after_pass_refresh_resolution_publishes_unlinked() {
+    finish_after_pass_refresh_resolution_publishes(false);
+}
+
+/// A genuine storage refusal at the at-Q expiry still refuses. One call
+/// still waits at Q and the semantic pool is one byte short of the expiry's
+/// declared bound: Finish reserves nothing, expires nothing, never falls
+/// back to the ordinary tick, and latches ProviderStorage after its retry
+/// bound with the waiter still waiting.
+#[test]
+fn joint_machine_finish_at_q_expiry_storage_refusal_still_latches() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::inventory_semantics::JOINT_FINISH_STORAGE_RETRIES;
+    for linked in [true, false] {
+        let (mut fixture, waiter) = pass_refresh_before_finish(linked, false);
+        fixture.enable_finish_fixture(Vec::new());
+        fixture.begin_finish().unwrap();
+        assert!(
+            matches!(fixture.poll_finish(1), Ok(JointCommitProgress::Pending)),
+            "the first poll observes Q"
+        );
+        let bytes = {
+            let held = fixture.scene.real.h0.0.borrow();
+            held.capture
+                .pending_h0_at_q_storage_bytes(
+                    fixture.machine.retained_raw_for_test().unwrap(),
+                    fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .joint_capture()
+                        .adapter(),
+                    &fixture.scene.producers,
+                    fixture.finish.as_ref().unwrap().observer.discovery_domain(),
+                    fixture
+                        .machine
+                        .retained_finish_q_for_test()
+                        .expect("observed Q"),
+                )
+                .unwrap()
+                .expect("one call waits at Q")
+        };
+        assert!(bytes > 0, "one call waits at Q (linked={linked})");
+        let resource = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_resource_snapshot();
+        let hold = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .reserve_semantic_storage(resource.limit_bytes - resource.charged_bytes - (bytes - 1))
+            .unwrap();
+        // The next poll may still finish discovery at Q; from the first
+        // refusal on, every poll refuses until the retry bound latches.
+        let mut refusals = 0u16;
+        for _ in 0..usize::from(JOINT_FINISH_STORAGE_RETRIES) + 8 {
+            match fixture.poll_finish(1) {
+                Ok(JointCommitProgress::Pending) => {
+                    assert_eq!(
+                        refusals, 0,
+                        "a storage refusal is never followed by progress"
+                    )
+                }
+                Ok(JointCommitProgress::Published(_)) => {
+                    panic!("a refused expiry never publishes (linked={linked})")
+                }
+                Err(reason) => {
+                    refusals += 1;
+                    assert_eq!(
+                        reason,
+                        SemanticRefusal::ProviderStorage,
+                        "refusal {refusals} (linked={linked})"
+                    );
+                    assert_eq!(
+                        fixture.machine.finish_disposition_required(),
+                        refusals == JOINT_FINISH_STORAGE_RETRIES,
+                        "only the retry bound latches (refusal {refusals})"
+                    );
+                    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "AwaitH0");
+                    if refusals == JOINT_FINISH_STORAGE_RETRIES {
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(refusals, JOINT_FINISH_STORAGE_RETRIES);
+        assert_eq!(
+            fixture.machine.disposition_reason(),
+            Some(SemanticRefusal::ProviderStorage)
+        );
+        assert_eq!(
+            fixture.native.pending_q_resolutions, 0,
+            "a refused reservation expires nothing"
+        );
+        assert_eq!(
+            fixture
+                .scene
+                .real
+                .h0
+                .0
+                .borrow()
+                .capture
+                .awaiting
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [waiter],
+            "the waiter is still waiting"
+        );
+        assert!(!fixture.scene.real.lane.is_finished());
+        drop(hold);
+    }
 }
 
 #[test]

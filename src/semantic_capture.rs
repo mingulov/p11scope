@@ -2233,6 +2233,8 @@ impl SemanticCapture {
     /// Check actual owner/original association without allocating scratch.
     /// A different Raw's waiters are preserved, and may not share any image
     /// selected by this expiry because the router expires a whole image.
+    /// `Ok(0)` is a fully validated original none of whose calls still
+    /// waits here; each caller decides what that means for it.
     fn pending_h0_at_q_selection(
         &self,
         quantum: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
@@ -2289,9 +2291,6 @@ impl SemanticCapture {
                 return Err(RawQuantumRefusal::Admission);
             }
         }
-        if count == 0 {
-            return Err(RawQuantumRefusal::H0Undelivered);
-        }
         // Every route the scoped router operation can emit must still have
         // its SAME original awaiting record in this Capture.
         for facts in self.router.pending_facts() {
@@ -2311,6 +2310,9 @@ impl SemanticCapture {
     /// with the paid accumulator, scoped-image/job scratch and counter growth.
     /// The finite counters keep their existing H0 retention class; the extra
     /// S1 lease owns report/scratch overlap, not the eventual router-node drop.
+    /// `Ok(None)`: the validated original has no call waiting here any more
+    /// (a pass refresh between hooks resolved it into the lane stash), so
+    /// there is nothing to expire or pay for at Q.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pending_h0_at_q_storage_bytes(
         &self,
@@ -2319,9 +2321,13 @@ impl SemanticCapture {
         producers: &crate::attach::SessionDrainProducers,
         discovery: &crate::events::DiscoveryDomain,
         q: &crate::attach::CollectedFinishQ,
-    ) -> Result<usize, crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
+    ) -> Result<Option<usize>, crate::semantics_objects::journal::joint_driver::RawQuantumRefusal>
+    {
         use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
         let count = self.pending_h0_at_q_selection(quantum, adapter, producers, discovery, q)?;
+        if count == 0 {
+            return Ok(None);
+        }
         let bytes = (|| {
             std::mem::size_of::<TickReport>()
                 .checked_add(pending_q_array_bytes::<TickOutcome>(count)?.checked_mul(2)?)?
@@ -2331,7 +2337,7 @@ impl SemanticCapture {
                 )?)?
                 .checked_add(self.router.pending_expiry_storage_bytes()?)
         })();
-        bytes.ok_or(RawQuantumRefusal::Capacity)
+        bytes.map(Some).ok_or(RawQuantumRefusal::Capacity)
     }
 
     /// Resolve only validated original waiters into the caller's already-paid
@@ -2350,6 +2356,9 @@ impl SemanticCapture {
     ) -> Result<(), crate::semantics_objects::journal::joint_driver::RawQuantumRefusal> {
         use crate::semantics_objects::journal::joint_driver::RawQuantumRefusal;
         let count = self.pending_h0_at_q_selection(quantum, adapter, producers, discovery, q)?;
+        if count == 0 {
+            return Err(RawQuantumRefusal::H0Undelivered);
+        }
         if io.domain() != Some(self.router.domain()) {
             return Err(RawQuantumRefusal::ForeignCapture);
         }

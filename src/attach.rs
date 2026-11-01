@@ -7687,6 +7687,19 @@ impl Session {
         )
     }
 
+    /// Snapshot the PID-scope exec witness for K0 selected detail:
+    /// the broad tap's lifecycle facts, `None` when this session
+    /// watches no single original, `Err` when the witness failed.
+    /// Read-only; the DISCOVERY drains keep feeding the tap.
+    pub(crate) fn pid_lifecycle_facts(
+        &self,
+    ) -> Result<Option<LifecycleFacts>, PidContinuityRefusal> {
+        self.pid_lifecycle
+            .as_ref()
+            .map(|tap| tap.facts())
+            .transpose()
+    }
+
     pub(crate) fn prepare_ended_pid_retirement(
         &self,
         view: &crate::process::ProcessView,

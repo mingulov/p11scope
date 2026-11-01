@@ -6001,17 +6001,21 @@ mod tests {
             }
         }
         if let Some(name) = select {
-            // 6.15: the selection resolved against the live plan (slot 7
-            // of the staged 512) and composed additively; the honest
-            // host-composition seam refusal rides the record while the
-            // aggregate above already proved exact.
+            // K0: the selection resolved against the live plan (slot 7
+            // of the staged 512) and the window opened after the
+            // transcript, so the idle window renders explicit zeros:
+            // the transcript stays in the aggregate above (exact) and
+            // out of the windowed detail.
             let selected = &document["evidence"]["selected_detail"];
             let record = &selected["selection"];
             assert_eq!(record["endpoint"], serde_json::json!(name));
             assert_eq!(record["slot"], serde_json::json!(7));
             assert_eq!(record["file_offset"], serde_json::json!(offsets[7]));
             assert_eq!(record["names"], serde_json::json!([name]));
-            assert_eq!(record["refusal"], serde_json::json!("bundle_unavailable"));
+            assert!(
+                record.get("refusal").is_none(),
+                "the idle window succeeds: {record:?}"
+            );
             let record_map = record.as_object().expect("selection is an object");
             assert!(
                 record_map.get("original_pid").is_none(),
@@ -6019,13 +6023,42 @@ mod tests {
             );
             assert_eq!(
                 record_map.len(),
-                5,
+                4,
                 "resolved selection carries exactly its closed keys: {record_map:?}"
             );
             assert_eq!(selected["events"], serde_json::json!([]));
-            assert!(selected.get("lineage").is_none());
-            assert!(selected.get("aggregate").is_none());
-            assert!(selected.get("detail").is_none());
+            assert!(selected.get("lineage").is_none(), "K0 joins no lineage");
+            let aggregate = selected.get("aggregate").expect("window aggregate renders");
+            assert_eq!(aggregate["seq_before"], serde_json::json!(1));
+            assert_eq!(aggregate["seq_after"], serde_json::json!(2));
+            let aggregate_rows = aggregate["rows"].as_array().expect("aggregate rows");
+            assert_eq!(aggregate_rows.len(), STAGED);
+            for (index, row) in aggregate_rows.iter().enumerate() {
+                assert_eq!(row["entered"], serde_json::json!(0), "row {index} idle");
+                assert_eq!(row["returned"], serde_json::json!(0), "row {index} idle");
+                assert_eq!(row["errors"], serde_json::json!(0), "row {index} idle");
+            }
+            let detail = selected.get("detail").expect("window detail renders");
+            assert_eq!(detail["scope"], serde_json::json!("detail"));
+            assert_eq!(detail["mode"], serde_json::json!(mode.name()));
+            assert!(
+                detail["detail_generation"].as_u64().is_some(),
+                "detail names its broad generation"
+            );
+            let detail_rows = detail["rows"].as_array().expect("detail rows");
+            assert_eq!(
+                detail_rows.len(),
+                1,
+                "Detail carries only the selected slot"
+            );
+            assert_eq!(detail_rows[0]["slot"], serde_json::json!(7));
+            assert_eq!(detail_rows[0]["entered"], serde_json::json!(0));
+            assert_eq!(detail_rows[0]["returned"], serde_json::json!(0));
+            assert_eq!(detail_rows[0]["errors"], serde_json::json!(0));
+            assert_eq!(
+                detail_rows[0], aggregate_rows[7],
+                "Detail equals the aggregate cells for the slot"
+            );
         }
         parts.fixture.command("QUIT");
         parts.fixture.expect("DONE 512");
@@ -6058,7 +6091,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: 6.15 profile --select-endpoint counts to -o JSON with live-plan resolution plus exact workload-ledger aggregate"]
+    #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: K0 profile --select-endpoint counts to -o JSON with live-plan resolution, exact workload-ledger aggregate and explicit zero-call detail"]
     fn selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64() {
         counter_cli_capture_cell_with_selection(
             CounterMode::Counts,

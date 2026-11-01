@@ -33,6 +33,15 @@ saturation is reported in the collection health. Per-call
 profile/trace capture stays fixed at 512 attach slots (2,112 only in
 the WIDE source build).
 
+Endpoint selection (`--select-endpoint` with `--mode metrics` and
+`--counter-mode`) details one function from the broad counter's own
+cells between a selection-time read and the close read. It resolves
+on `--pid` and owned-`run` captures only; `--cgroup` and `--system`
+refuse by name. If the watched process replaces itself (exec) between
+the two reads, the slot retires, or the close boundary cannot be
+proven clean, the detail is withheld with a named reason while
+aggregate counts continue.
+
 A capture follows at most 256 provider loads and tracks at most
 16,384 program images; past either limit the report carries a named
 gap and reads PARTIAL (full entries below). Stopping a very large

@@ -592,6 +592,11 @@ attach::tests::bpf_loop_probe_reports_helper_presence_on_live_kernel
 # Historical/private opt-in counter refusals; never current host positives.
 attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels
 metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses_clean_lp64
+# K0 selected-detail live cells (ledger-known SoftHSM positive plus
+# exec-in-window negative): root on Fedora with gcc, softhsm2-util,
+# SoftHSM2 and a built observer binary; run by hand via the controller.
+metrics::k0_live_cells::k0_live_detail_matches_ledger_counts_lp64
+metrics::k0_live_cells::k0_live_exec_voids_detail_counts_lp64
 # Unprivileged system-population graph sizing: memory, drain and release
 # are hard gates, the stop time is measured and disclosed (R-40).
 discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale
@@ -632,6 +637,8 @@ SKIP_REASONS=(
 "live-kernel BPF lane: reports bpf_loop helper presence without asserting it; run exact --ignored as root in an authorized BPF lane"
 "pre-5.17 kernel lane: proves preparation refuses cleanly without the bpf_loop helper (passes vacuously on newer hosts); run exact --ignored as root on that kernel lane"
 "6.1 E2BIG lane: proves the verifier-budget refusal maps before lifecycle without activating; run exact --ignored as root on the 6.1 verifier-budget host"
+"needs root on Fedora with gcc, softhsm2-util, SoftHSM2 and a built observer binary (P11SCOPE_E2E_OBSERVER or the p11scope sibling); run the exact ignored test by hand as root with TMPDIR as in the evidence run"
+"needs root on Fedora with gcc, softhsm2-util, SoftHSM2 and a built observer binary (P11SCOPE_E2E_OBSERVER or the p11scope sibling); run the exact ignored test by hand as root with TMPDIR as in the evidence run"
 "unprivileged system-population graph sizing (4096 pin files plus 16384 native links; memory, drain and release asserts gate, the stop time is measured, not gated); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture on a host whose hard RLIMIT_NOFILE fits the population"
 "needs root, gcc/softhsm tooling and a built observer with p11scope-discover beside it; run by hand via scripts/ci/stop-races.sh (results.jsonl entry), unscheduled in CI"
 )

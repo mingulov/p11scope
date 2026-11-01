@@ -27,6 +27,10 @@ pub(crate) mod selected_detail;
 // composition calls the orchestration entries; the selection stage
 // and composer are production-live.
 pub(crate) mod selected_detail_driver;
+// K0 live cells (this lane): `--select-endpoint` detail on a real
+// SoftHSM workload, run by the controller on Fedora as root.
+#[cfg(test)]
+mod k0_live_cells;
 
 pub(crate) use counter_projection::{CaptureCollection, CaptureSnapshot, CounterCaptureInputs};
 

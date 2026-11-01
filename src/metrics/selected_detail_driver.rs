@@ -7,12 +7,12 @@
 //! driver: the `--select-endpoint` name resolves against the live
 //! broad plan (exactly one slot, never first-match) and the scope
 //! resolves to one live original (`--pid`/owned only). The
-//! preparation bundle and the install entry are the host-composition
-//! seam: the metrics host records their honest unavailability
-//! ([`SelectedDriverRefusal::BundleUnavailable`]) and the aggregate
-//! capture continues untouched. The composition packet replaces that
-//! refusal with the genuine producers; nothing else in this module
-//! changes.
+//! K0 window ([`open_k0_window`]/[`close_k0_window`]) details the
+//! selection from the broad banks' own cells between a
+//! selection-time read and the close read; an exec of the selected
+//! caller voids it via the broad exec witness. Unresolvable
+//! selections and voided windows record their named refusal and the
+//! aggregate capture continues untouched.
 //!
 //! The [`PromotionDriver`] runs the full D2.3 ordering over the real
 //! seams — adapter reserve, lifecycle start with the gated source,
@@ -22,16 +22,17 @@
 //! it once the host composition lands (STAGED below).
 
 use super::counter_collector::{
-    CounterCollector, CounterDeltas, CounterLimits, CounterRead, ReadStage,
+    CounterCollector, CounterDeltas, CounterLimits, CounterObservation, CounterRead, ReadStage,
 };
+use super::counter_reader::ReaderShapeCause;
 use super::selected_detail::{
     AcceptedBracket, BoundWindow, BroadBracketCollector, BroadSession, DetailCloseRefusal,
     DetailCloseReport, DetailWindowCustody, DetailWindowEvent, GatedActivationSource,
     PreparedChildReceipt, ReserveRefusal, SelectedDetailRefusal,
 };
 use crate::attach::Scope;
-use crate::attach::counter_banks::CounterDetailWindow;
-use crate::attach::{LifecycleFacts, PidContinuityRefusal};
+use crate::attach::counter_banks::{BankRefusal, CounterDetailWindow, DetailToggleRefusal};
+use crate::attach::{LifecycleFacts, PidContinuityRefusal, Session};
 use crate::discovery::engine::inventory_coordinator::semantics::PromotionInstallCapacity;
 use crate::discovery::identity::PinnedObjects;
 use crate::inventory_promotion::lifecycle::{
@@ -84,10 +85,9 @@ pub(crate) enum SelectedDriverRefusal {
     Detail(SelectedDetailRefusal),
     /// The CLI name matched zero broad slots.
     EndpointUnknown,
-    /// The metrics host cannot mint the preparation bundle or install
-    /// a lane (no coordinator/baseline producer): the host-composition
-    /// seam. Recorded honestly; aggregate capture continues.
-    BundleUnavailable,
+    // NOTE: the pre-K0 `bundle_unavailable` seam word is retired from
+    // production; it stays in the schema vocabulary (schema JSON +
+    // oracle) so reports written before K0 still validate.
 }
 
 impl SelectedDriverRefusal {
@@ -121,7 +121,6 @@ impl SelectedDriverRefusal {
             },
             Self::Detail(detail) => detail.name(),
             Self::EndpointUnknown => "endpoint_unknown",
-            Self::BundleUnavailable => "bundle_unavailable",
         }
     }
 }
@@ -911,11 +910,11 @@ impl Default for SelectionLedger {
 }
 
 /// Production metrics selection stage (driver stage 0 in the capture
-/// loop): resolve the CLI name, record the selection or its named
-/// refusal, then record the host-composition seam refusal for the
-/// bundle the metrics host cannot mint. Returns the resolution for
-/// the composition packet; the ledger is the durable record either
-/// way. Aggregate capture is untouched on every path.
+/// loop): resolve the CLI name and record the selection or its named
+/// refusal. A resolution carries no refusal yet: the caller opens the
+/// K0 window over it, and the close records the detail or its void.
+/// Returns the resolution for the K0 open; the ledger is the durable
+/// record either way. Aggregate capture is untouched on every path.
 pub(crate) fn run_metrics_selection_stage(
     name: &str,
     broad_plan: &AttachPlan,
@@ -925,11 +924,6 @@ pub(crate) fn run_metrics_selection_stage(
     match resolve_selection(name, broad_plan, scope) {
         Ok(resolved) => {
             ledger.record_selection(name, &resolved);
-            // Host-composition seam: the metrics host cannot mint the
-            // preparation bundle or install a lane (no coordinator /
-            // baseline producer). Recorded honestly; the aggregate
-            // capture continues untouched.
-            ledger.mark_selection_refused(SelectedDriverRefusal::BundleUnavailable.name());
             Some(resolved)
         }
         Err(refusal) => {
@@ -946,15 +940,34 @@ pub(crate) fn run_metrics_selection_stage(
 pub(crate) type K0Facts = Result<Option<LifecycleFacts>, PidContinuityRefusal>;
 
 /// The open K0 window: the resolved selection, the detail collector
-/// holding the selection-time read as its baseline, and the
-/// selection-time witness facts. The window closes exactly once via
-/// [`close_k0_window`]; any void records its named refusal and renders
-/// nothing.
-#[cfg_attr(not(test), allow(dead_code))] // STUB (K0 RED): production opens no window yet; twins drive it.
+/// holding the selection-time read as its baseline, the
+/// selection-time witness facts, and the collector limits (reused for
+/// the close read so both bounds share one budget).
 pub(crate) struct K0Window {
     resolved: ResolvedSelection,
     collector: CounterCollector,
     before: LifecycleFacts,
+    limits: CounterLimits,
+}
+
+/// Map a failed K0 read to its ledger word: quarantine and pool
+/// pressure name themselves, a missing binding names the broad, and
+/// every other stage maps to the topology catch-all (the existing
+/// `read_stage_refusal` precedent, with pool pressure named precisely
+/// instead of folded into the catch-all).
+fn k0_read_refusal(stage: ReadStage) -> SelectedDriverRefusal {
+    match stage {
+        ReadStage::Shape(ReaderShapeCause::BindingAbsent) => SelectedDriverRefusal::Detail(
+            SelectedDetailRefusal::Gate(DetailToggleRefusal::BroadNotCounter),
+        ),
+        ReadStage::BankQuarantined => SelectedDriverRefusal::Detail(SelectedDetailRefusal::Gate(
+            DetailToggleRefusal::Quarantined,
+        )),
+        ReadStage::Budget => {
+            SelectedDriverRefusal::Detail(SelectedDetailRefusal::Gate(DetailToggleRefusal::Budget))
+        }
+        _ => SelectedDriverRefusal::Detail(SelectedDetailRefusal::BroadPlanTopology),
+    }
 }
 
 /// Open the K0 window over an already-recorded resolution: validate
@@ -962,8 +975,9 @@ pub(crate) struct K0Window {
 /// broad read through a dedicated collector (`Initial` installs the
 /// baseline). A failed read or unprovable witness records its mapped
 /// refusal and opens nothing; aggregate capture is untouched.
-#[cfg_attr(not(test), allow(dead_code))] // STUB (K0 RED): production opens no window yet; twins drive it.
-pub(crate) fn open_k0_window(
+/// Metrics-internal like the reads it observes: production enters
+/// through [`open_k0_production`].
+pub(super) fn open_k0_window(
     resolved: ResolvedSelection,
     limits: CounterLimits,
     reserve: SemanticResourceReserver,
@@ -971,23 +985,50 @@ pub(crate) fn open_k0_window(
     before_facts: K0Facts,
     ledger: &mut SelectionLedger,
 ) -> Option<K0Window> {
-    // STUB (K0 RED): the open always succeeds without validating, so
-    // every K0 twin below fails on the unimplemented behavior.
-    let _ = (limits, before, ledger);
+    let before_witness = match before_facts {
+        Ok(Some(facts)) => facts,
+        _ => {
+            ledger.mark_selection_refused(
+                SelectedDriverRefusal::Detail(SelectedDetailRefusal::BroadPlanTopology).name(),
+            );
+            return None;
+        }
+    };
+    let mut collector = CounterCollector::new(limits, reserve);
+    match collector.observe(before) {
+        CounterObservation::Initial => {}
+        CounterObservation::ReadFailed(stage) => {
+            ledger.mark_selection_refused(k0_read_refusal(stage).name());
+            return None;
+        }
+        // A first observation never advances (no baseline exists
+        // yet) and never changes generation (none is installed);
+        // both arms refuse closed if the collector ever says so.
+        CounterObservation::Unavailable(_)
+        | CounterObservation::GenerationChanged { .. }
+        | CounterObservation::Advanced { .. } => {
+            ledger.mark_selection_refused(
+                SelectedDriverRefusal::Detail(SelectedDetailRefusal::BroadPlanTopology).name(),
+            );
+            return None;
+        }
+    }
     Some(K0Window {
         resolved,
-        collector: CounterCollector::new(limits, reserve),
-        before: before_facts.ok().flatten().unwrap_or_default(),
+        collector,
+        before: before_witness,
+        limits,
     })
 }
 
-/// Close the K0 window: slot retirement, exec-witness, and
-/// loss checks in contract order, then the close read through the
-/// collector and the aggregate/detail render. Any void records its
-/// named refusal; `lineage`, `aggregate` and `detail` stay absent and
-/// the main report's aggregate alone carries the capture.
-#[cfg_attr(not(test), allow(dead_code))] // STUB (K0 RED): production closes no window yet; twins drive it.
-pub(crate) fn close_k0_window(
+/// Close the K0 window: close-boundary, slot-retirement,
+/// exec-witness, and loss checks in contract order, then the close
+/// read through the collector and the aggregate/detail render. Any
+/// void records its named refusal; `lineage`, `aggregate` and
+/// `detail` stay absent and the main report's aggregate alone
+/// carries the capture. Metrics-internal like the reads it observes:
+/// production enters through [`close_k0_production`].
+pub(super) fn close_k0_window(
     window: K0Window,
     close_plan: &AttachPlan,
     after: Result<CounterRead, ReadStage>,
@@ -995,10 +1036,157 @@ pub(crate) fn close_k0_window(
     clean_close: bool,
     ledger: &mut SelectionLedger,
 ) {
-    // STUB (K0 RED): the close records today's seam refusal and never
-    // renders, so every K0 close twin below fails on it.
-    let _ = (window, close_plan, after, after_facts, clean_close);
-    ledger.mark_selection_refused(SelectedDriverRefusal::BundleUnavailable.name());
+    use super::selected_detail::{render_aggregate_bracket, render_detail_rows};
+    use SelectedDriverRefusal::{Detail, Promotion};
+    let K0Window {
+        resolved,
+        mut collector,
+        before,
+        limits: _,
+    } = window;
+    if !clean_close {
+        ledger.mark_selection_refused(
+            Detail(SelectedDetailRefusal::Gate(
+                DetailToggleRefusal::BroadStopping,
+            ))
+            .name(),
+        );
+        return;
+    }
+    let published = close_plan.slots.iter().any(|slot| {
+        slot.index == resolved.slot
+            && slot.object == resolved.physical.object
+            && slot.file_offset == resolved.physical.file_offset
+    });
+    if !published {
+        ledger.mark_selection_refused(
+            Detail(SelectedDetailRefusal::Gate(
+                DetailToggleRefusal::NotPublished,
+            ))
+            .name(),
+        );
+        return;
+    }
+    let after_witness = match after_facts {
+        Ok(Some(facts)) => facts,
+        _ => {
+            ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
+            return;
+        }
+    };
+    if after_witness.fault_serial != before.fault_serial
+        || after_witness.latest_exec != before.latest_exec
+    {
+        ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
+        return;
+    }
+    if after_witness.greatest_break_ns != before.greatest_break_ns {
+        ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerRetired).name());
+        return;
+    }
+    let mut deltas = match collector.observe(after) {
+        CounterObservation::Advanced { deltas, .. } => deltas,
+        CounterObservation::ReadFailed(stage) => {
+            ledger.mark_selection_refused(k0_read_refusal(stage).name());
+            return;
+        }
+        CounterObservation::Unavailable(_)
+        | CounterObservation::GenerationChanged { .. }
+        | CounterObservation::Initial => {
+            ledger.mark_selection_refused(Detail(SelectedDetailRefusal::BroadPlanTopology).name());
+            return;
+        }
+    };
+    let current = collector
+        .current()
+        .expect("an advanced K0 collector holds its close read");
+    let view = current.view();
+    ledger.aggregate = Some(render_aggregate_bracket(&deltas, view.mode, 1, 2));
+    deltas.retain_slot(resolved.slot);
+    ledger.detail = Some(render_detail_rows(
+        &deltas,
+        view.mode,
+        view.generation.get(),
+    ));
+}
+
+/// One production K0 read off the broad banks: the binding comes only
+/// from actual preparation, and a missing binding or a quarantined
+/// broad maps to its own stage. Charges the caller's reserver — the
+/// Engine's counter pool in production — exactly like a broad tick
+/// read; no new pool, object, or reservation.
+fn k0_broad_read(
+    session: &Session,
+    plan: &AttachPlan,
+    pins: &PinnedObjects,
+    limits: CounterLimits,
+    reserve: &SemanticResourceReserver,
+) -> Result<CounterRead, ReadStage> {
+    let binding = session
+        .counter_reader_binding()
+        .map_err(|refusal| match refusal {
+            BankRefusal::Quarantined => ReadStage::BankQuarantined,
+            _ => ReadStage::BankRouting,
+        })?;
+    match binding {
+        Some(binding) => super::counter_reader::read_bound(binding, plan, pins, limits, reserve),
+        None => Err(ReadStage::Shape(ReaderShapeCause::BindingAbsent)),
+    }
+}
+
+/// Production K0 open inside `capture_profile`: the selection-time
+/// broad read plus the shared open body. Plain budget numbers cross
+/// the metrics boundary (the limits type stays metrics-internal).
+#[allow(clippy::too_many_arguments)] // One production open over all retained inputs; twins drive the core directly.
+pub(crate) fn open_k0_production(
+    resolved: ResolvedSelection,
+    rows: usize,
+    rv_keys: usize,
+    reserve: SemanticResourceReserver,
+    session: &Session,
+    plan: &AttachPlan,
+    pins: &PinnedObjects,
+    before_facts: K0Facts,
+    ledger: &mut SelectionLedger,
+) -> Option<K0Window> {
+    let limits = CounterLimits { rows, rv_keys };
+    let before = k0_broad_read(session, plan, pins, limits, &reserve);
+    open_k0_window(resolved, limits, reserve, before, before_facts, ledger)
+}
+
+/// Everything `run_terminal` needs to close an opened K0 window: the
+/// window, the close witness facts snapshotted before the terminal
+/// discovery drain, and whether the close boundary is proven clean.
+pub(crate) struct K0Close {
+    pub(crate) window: K0Window,
+    pub(crate) facts: K0Facts,
+    pub(crate) clean: bool,
+}
+
+/// Production K0 close inside `run_terminal`: the close read off the
+/// broad banks, then the shared close body. The close read runs even
+/// when the boundary is unclean; the close body discards it before
+/// observing and voids as broad-stopping.
+pub(crate) fn close_k0_production(
+    close: K0Close,
+    session: &Session,
+    plan: &AttachPlan,
+    pins: &PinnedObjects,
+    ledger: &mut SelectionLedger,
+) {
+    let K0Close {
+        window,
+        facts,
+        clean,
+    } = close;
+    let after = k0_broad_read(
+        session,
+        plan,
+        pins,
+        window.limits,
+        window.collector.reserver(),
+    );
+    close_k0_window(window, plan, after, facts, clean, ledger);
 }
 
 /// Compose the additive `selected_detail` evidence object (M2
@@ -1646,19 +1834,20 @@ mod tests {
     }
 
     #[test]
-    fn metrics_selection_stage_records_resolution_then_host_seam() {
+    fn metrics_selection_stage_records_resolution_for_k0_window() {
         // The production metrics call-site through the real invoked
-        // path: resolve genuinely, record the selection or its named
-        // refusal, then record the bundle the metrics host cannot
-        // mint. The composer adds exactly one evidence object and
-        // touches nothing else.
+        // path: resolve genuinely and record the selection or its
+        // named refusal. A resolution carries no refusal yet: the K0
+        // open follows, and the close records the detail or its void.
+        // The composer adds exactly one evidence object and touches
+        // nothing else.
         let pool = test_pool();
         let scene = stage_single_provider(pool, 4);
         let scope = Scope::Pid(std::process::id());
         let mut ledger = SelectionLedger::new();
         let resolved =
             run_metrics_selection_stage("C_Toggle0002", &scene.plan, &scope, &mut ledger)
-                .expect("live name resolves for the composition packet");
+                .expect("live name resolves for the K0 window");
         assert_eq!(resolved.slot, 2);
         assert_eq!(
             resolved.original.pid(),
@@ -1668,7 +1857,7 @@ mod tests {
         let record = ledger.selection.as_ref().expect("selection records");
         assert_eq!(record.endpoint, "C_Toggle0002");
         assert_eq!(record.slot, Some(2));
-        assert_eq!(record.refusal, Some("bundle_unavailable"));
+        assert_eq!(record.refusal, None, "resolution alone refuses nothing");
         let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
         let resolved_record = composed["evidence"]["selected_detail"]["selection"]
             .as_object()
@@ -1679,10 +1868,10 @@ mod tests {
         );
         assert_eq!(
             resolved_record.len(),
-            5,
+            4,
             "resolved selection carries exactly its closed keys: {resolved_record:?}"
         );
-        for key in ["endpoint", "slot", "file_offset", "names", "refusal"] {
+        for key in ["endpoint", "slot", "file_offset", "names"] {
             assert!(
                 resolved_record.contains_key(key),
                 "resolved selection names {key}: {resolved_record:?}"
@@ -4560,12 +4749,18 @@ mod tests {
     #[test]
     fn k0_failed_close_read_maps_stage() {
         // A failed close read voids with the read's mapped word —
-        // quarantine names itself, every other stage maps to the
-        // topology catch-all — and renders nothing.
+        // quarantine, pool pressure and a missing binding name
+        // themselves, every other stage maps to the topology
+        // catch-all — and renders nothing.
         for (label, stage, word) in [
             ("quarantined", ReadStage::BankQuarantined, "quarantined"),
             ("routing", ReadStage::BankRouting, "broad_plan_topology"),
             ("budget", ReadStage::Budget, "budget"),
+            (
+                "absent",
+                ReadStage::Shape(ReaderShapeCause::BindingAbsent),
+                "broad_not_counter",
+            ),
         ] {
             let pool = test_pool();
             let scene = stage_single_provider(pool, 4);
@@ -4827,6 +5022,11 @@ mod tests {
         for (label, stage, word) in [
             ("quarantined", ReadStage::BankQuarantined, "quarantined"),
             ("routing", ReadStage::BankRouting, "broad_plan_topology"),
+            (
+                "absent",
+                ReadStage::Shape(ReaderShapeCause::BindingAbsent),
+                "broad_not_counter",
+            ),
         ] {
             let pool = test_pool();
             let scene = stage_single_provider(pool, 4);

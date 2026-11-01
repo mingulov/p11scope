@@ -41,9 +41,12 @@ existing metrics behavior. `--select-endpoint <FUNCTION>` beside
 `--mode metrics` with `--counter-mode` names one endpoint for full
 detail while aggregate counters continue; the name must resolve to
 exactly one broad slot, otherwise the selection refuses by name and
-the capture continues aggregate-only. The attempt is recorded in the
-report's additive `selected_detail` ledger; aggregate and detail
-counts are never summed.
+the capture continues aggregate-only. The detail is the function's
+own broad-counter cells between selection and close; if the watched
+process replaces itself (exec) in between, the detail is withheld
+with a named reason while aggregate counts continue. The attempt is
+recorded in the report's additive `selected_detail` ledger; aggregate
+and detail counts are never summed.
 
 - [What it does](#what-it-does)
 - [What it does NOT intentionally decode](#what-it-does-not-intentionally-decode)
@@ -792,7 +795,13 @@ Limits that matter in pods:
   resolves against the live broad plan: zero matches refuse as unknown,
   two or more refuse as ambiguous (narrow providers with `--module`),
   never first-match. Only `--pid` and owned-`run` scopes resolve to one
-  original; `--cgroup` and `--system` refuse by name. The selection
+  original; `--cgroup` and `--system` refuse by name. The detail is the
+  function's own broad-counter cells between a selection-time read and
+  the close read, in the measurement's own mode (counts, timestamps or
+  latency cells). If the watched process replaces itself (exec) between
+  the two reads, the slot retires, or the close boundary cannot be
+  proven clean, the detail is withheld with a named reason; a window
+  with no calls still renders explicit zero rows. The selection
   attempt — resolved slot or named refusal — is recorded in the
   report's additive `selected_detail` evidence object; unrelated
   endpoints stay aggregate-only, and aggregate and detail counts are

@@ -47,34 +47,39 @@ When a metrics+counter capture carries an endpoint selection (`--select-endpoint
 the terminal evidence also contains an optional additive `selected_detail`
 envelope. Captures without the flag omit it. Its keys are `selection` (the
 requested endpoint plus its resolved slot, or the named refusal when the
-resolve attempt failed), `events` (window and driver rows in tick order),
-and the close products `lineage`, `aggregate`, and `detail`, which are
-absent until a window closes and detail deltas record. The envelope never
-merges into `counter_summary` — aggregate and detail ledgers stay
-independent, so promotion and demotion cannot double-count. If any
-resolve or promote step cannot complete, the envelope names the refusal
-and the aggregate alone carries the capture.
+resolve attempt failed or the window voided), `events` (window and driver
+rows in tick order), and the close products `lineage`, `aggregate`, and
+`detail`, which are absent until a window closes with recorded detail
+deltas. K0 windows render `aggregate` and `detail` and omit `lineage`.
+The envelope never merges into `counter_summary` — aggregate and detail
+ledgers stay independent, so promotion and demotion cannot double-count.
+If any resolve step cannot complete, or the window voids (exec of the
+watched process, slot retirement, capture loss, or an unclean close
+boundary), the envelope names the refusal and the aggregate alone
+carries the capture.
 
 The envelope's nested shape is closed. `selection` always names `endpoint`
 and carries `slot` together with `file_offset` exactly when the name
 resolved, the slot group's `names`, and a finite `refusal` word
-(`endpoint_unknown`, `bundle_unavailable`, a `promotion_*` word or an
-adapter word). A resolved selection may still carry a refusal for a later
-step the host could not complete. The selection record never publishes
-process identity: there is no PID/TID field. `events` is always present
+(`endpoint_unknown`, a `promotion_*` word or an adapter word; reports
+written before K0 may carry the retired `bundle_unavailable`). A
+resolved selection may still carry a refusal for a later step the host
+could not complete. The selection record never publishes process
+identity: there is no PID/TID field. `events` is always present
 (possibly empty); each row is one closed shape — a window row
 (`reserved`, `bound`, `cas_won`, `cas_refused`, `closed`,
 `cancelled_unactivated`, with request/caller/provider/seq and an optional
 note), a `close_refused` row (view, endpoint offset, gate word), a
 `reserve_refused` row (adapter word, nullable seq), a `start_refused` row
 (human reason word), or a `promotion_outcome` row (`refused`/`ended` with
-the human reason word, `active` with the confirmed pair). `lineage` joins
-one window to its broad rows (request, view, endpoint offset, broad and
-detail generations, bracketing seqs and marks, nullable drift,
-`after_read` matched/unavailable/`mismatched:*`). `aggregate` renders the
-broad deltas over the window interval and `detail` the child's own rows;
-both carry per-mode cells (counts bare, timestamps with totals, latency
-with buckets) and never a combined total.
+the human reason word, `active` with the confirmed pair). K0 windows emit
+no event rows. `lineage` joins one window to its broad rows (request,
+view, endpoint offset, broad and detail generations, bracketing seqs and
+marks, nullable drift, `after_read` matched/unavailable/`mismatched:*`).
+`aggregate` renders the broad deltas over the window interval and
+`detail` the selected slot's own broad cells over the same window; both
+carry per-mode cells (counts bare, timestamps with totals, latency with
+buckets) and never a combined total.
 
 When a Detailed capture's semantic lane discloses a global-only instance
 continuation, the terminal profile-lane evidence also contains an

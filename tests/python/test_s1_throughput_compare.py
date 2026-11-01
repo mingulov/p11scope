@@ -351,6 +351,340 @@ def ledger_last_t1(ledger_path):
     return max(row["t1"] for row in rows if row["kind"] == "call")
 
 
+JOINT_SIGN_MECH = 0x251
+JOINT_SIGN_NAME = "CKM_SHA256_HMAC"
+JOINT_GEN_MECH = 0x350
+JOINT_GEN_NAME = "CKM_GENERIC_SECRET_KEY_GEN"
+
+
+def joint_hot_ledger(ops, per_s, pid=PID, tid=PID, start_ns=R0, rv=0):
+    """One key file: GenerateKey + ops x (SignInit, Sign) + DestroyObject.
+
+    Call t1 stamps pack exactly per_s per 1 s window from start_ns,
+    like uniform_ledger; t0 trails t1 by 500 ns.
+    """
+    rows = [{"kind": "ready", "pid": pid, "tid": tid, "t": start_ns,
+             "clock": "CLOCK_MONOTONIC", "unit": "ns"}]
+    step = 1_000_000_000 // per_s
+    fns = (["C_GenerateKey"] + ["C_SignInit", "C_Sign"] * ops
+           + ["C_DestroyObject"])
+    last = start_ns
+    for seq, fn in enumerate(fns, start=1):
+        end = start_ns + (seq - 1) * step + 1000
+        rows.append({"kind": "call", "seq": seq, "fn": fn,
+                     "rv": rv, "pid": pid, "tid": tid,
+                     "t0": end - 500, "t1": end})
+        last = end
+    rows.append({"kind": "ack", "issued": len(fns), "t": last + 500})
+    return rows
+
+
+def joint_setup_ledger(sessions=1, pid=PID, start_ns=R0):
+    """The keyed setup file: Initialize, two slot probes, one open each."""
+    rows = [{"kind": "ready", "pid": pid, "tid": pid, "t": start_ns,
+             "clock": "CLOCK_MONOTONIC", "unit": "ns"}]
+    fns = (["C_Initialize", "C_GetSlotList", "C_GetSlotList"]
+           + ["C_OpenSession"] * sessions)
+    for seq, fn in enumerate(fns, start=1):
+        end = start_ns + seq * 1000
+        rows.append({"kind": "call", "seq": seq, "fn": fn,
+                     "rv": 0, "pid": pid, "tid": pid,
+                     "t0": end - 500, "t1": end})
+    rows.append({"kind": "ack", "issued": len(fns),
+                 "t": start_ns + (len(fns) + 1) * 1000})
+    return rows
+
+
+def joint_teardown_ledger(sessions=1, pid=PID, start_ns=R0 + 2_000_001_000):
+    """The keyed teardown file: one close per session, then finalize."""
+    rows = [{"kind": "ready", "pid": pid, "tid": pid, "t": start_ns,
+             "clock": "CLOCK_MONOTONIC", "unit": "ns"}]
+    fns = ["C_CloseSession"] * sessions + ["C_Finalize"]
+    for seq, fn in enumerate(fns, start=1):
+        end = start_ns + seq * 1000
+        rows.append({"kind": "call", "seq": seq, "fn": fn,
+                     "rv": 0, "pid": pid, "tid": pid,
+                     "t0": end - 500, "t1": end})
+    rows.append({"kind": "ack", "issued": len(fns),
+                 "t": start_ns + (len(fns) + 1) * 1000})
+    return rows
+
+
+def joint_mechanism_rows(sign_calls, keygen_calls, sign_errors=0,
+                         keygen_errors=0):
+    """The two pinned Joint mechanism rows: HMAC sign plus keygen."""
+    return [
+        {"mechanism": JOINT_SIGN_MECH,
+         "mechanism_hex": hex(JOINT_SIGN_MECH), "name": JOINT_SIGN_NAME,
+         "operations": ["sign"], "calls": sign_calls,
+         "errors": sign_errors,
+         "last_seen_ns": R0 + 2_000_000_000,
+         "evidence": {
+             "functions": ["C_Sign", "C_SignInit"],
+             "returns": [{"rv": 0, "rv_hex": "0x0", "name": "CKR_OK"}],
+             "truncated": False}},
+        {"mechanism": JOINT_GEN_MECH,
+         "mechanism_hex": hex(JOINT_GEN_MECH), "name": JOINT_GEN_NAME,
+         "operations": ["generate_key"], "calls": keygen_calls,
+         "errors": keygen_errors,
+         "last_seen_ns": R0 + 2_000_000_000,
+         "evidence": {
+             "functions": ["C_GenerateKey"],
+             "returns": [{"rv": 0, "rv_hex": "0x0", "name": "CKR_OK"}],
+             "truncated": False}},
+    ]
+
+
+def joint_semantic_row(edge, issued, sign_calls, keygen_calls, lossy=False):
+    """The driver's semantic child: two Joint mechanism rows, exact totals."""
+    started = sign_calls // 2 + keygen_calls
+    return {"caller": edge["caller"], "module": edge["module"],
+            "instance": "i0",
+            "entries": {"unit": "api_entries", "count": None,
+                        "observation": "unavailable"},
+            "api_returns": {"unit": "api_returns", "count": issued,
+                            "saturated": False, "historical_only_returns": 0},
+            "semantics": "observed",
+            "mechanisms": joint_mechanism_rows(sign_calls, keygen_calls),
+            "operations": {"calls": issued,
+                       "started": started, "completed": started,
+                       "cancelled": 0, "failed": 0, "unknown": 0, "orphans": 0,
+                       "dropped": 0, "last_seen_ns": R0 + 2_000_000_000,
+                       "active": [],
+                       "evidence": {"state_reconciliations": 0,
+                                    "session_cancel_ambiguities": 0,
+                                    "session_cancel_unknown_flags": 0,
+                                    "operation_state_imports": 0,
+                                    "auth_state_ambiguities": 0,
+                                    "semantic_capture_failures": 0,
+                                    "async_duplicates": 0,
+                                    "async_evictions": 0,
+                                    "unmatched_closes": 0}},
+            "coverage": {"lossy": lossy, "reasons": (
+                ["capture_stopped", "semantic_loss"] if lossy else [])}}
+
+
+def joint_key_row(instance, object_id, ops):
+    return {"instance": instance, "object": object_id, "category": "sign",
+            "role": "key", "metadata_at_use": None, "unit": "operations",
+            "started": ops, "completed": ops, "failed": 0, "cancelled": 0,
+            "unknown": 0, "active": 0, "key_join_lost": 0}
+
+
+def joint_object_view(object_id, session=1, birth_start=R0 + 500,
+                     birth_end=R0 + 1500, origin="created",
+                     creation="generate", lifetime="destroyed"):
+    blank = {"status": "unknown", "value": None}
+    value = {"status": "value", "value": 0}
+    return {"object": object_id, "session": session, "origin": origin,
+            "creation": creation,
+            "birth": {"start_ns": birth_start, "end_ns": birth_end},
+            "lifetime": lifetime, "lifetime_reason": None,
+            "attribution": "valid", "attribution_reason": None,
+            "requested": {"class": value, "key_type": value, "token": value,
+                          "value_len": blank, "modulus_bits": blank,
+                          "ec_params": blank},
+            "established": {"class": value, "key_type": value,
+                            "token": value, "value_len": blank,
+                            "modulus_bits": blank, "ec_params": blank},
+            "queries": {"class": "established", "key_type": "established",
+                        "token": "established", "value_len": "not_queried",
+                        "modulus_bits": "not_queried",
+                        "ec_params": "not_queried"},
+            "label": None, "successful_references": 3,
+            "successful_key_references": 2, "accessing_sessions": 1}
+
+
+def joint_object_observations(ops_per_key, sessions=1, instance="i0",
+                              status="populated", reason="none"):
+    """A populated section: one created+destroyed view and one sign row
+    per key, in window births, closed sessions, no unknown rows."""
+    return {
+        "version": 1, "revision": 4, "status": status, "reason": reason,
+        "sessions": [{"session": number + 1, "origin": "opened",
+                      "status": "closed"} for number in range(sessions)],
+        "objects": [joint_object_view(11 + index, session=1 + (index % sessions))
+                    for index in range(len(ops_per_key))],
+        "key_operations": [joint_key_row(instance, 11 + index, ops)
+                           for index, ops in enumerate(ops_per_key)],
+        "unknown_key_operations": [],
+        "gaps": {"rows": [], "suppressed": 0},
+        "budgets": {"key_rows": {"limit": 65536,
+                                 "occupied": len(ops_per_key), "refused": 0},
+                    "object_rows": {"limit": 65536,
+                                    "occupied": len(ops_per_key),
+                                    "refused": 0},
+                    "unknown_rows": {"occupied": 0}, "encoded_bytes": 410,
+                    "allocation_refused": False, "refusal_reason": "none"},
+    }
+
+
+def joint_inventory_doc(edge, sem_rows, observations, pid=PID,
+                        ring_loss=0, unrouted=0, quiescence="quiesced",
+                        drain=True, lane_status="stopped",
+                        refused_endpoints=0, continuity_cuts=0,
+                        gaps=(), suppressed=0, foreign_edge=None):
+    """A --system snapshot: the driver's owned graph, foreign rows first."""
+    edges = [foreign_edge] if foreign_edge is not None else []
+    edges.append(edge)
+    return {
+        "schema": "p11scope/inventory/v1", "scope": "system",
+        "callers": [{"id": "c0", "pid": 999, "start_time": 999,
+                     "retired": False},
+                    {"id": "c1", "pid": pid, "start_time": 12345,
+                     "retired": False}],
+        "modules": [{"id": "m0", "lifecycle": "mapped", "unloaded_observed": False,
+                     "admission": {"state": "admitted", "class": "operator",
+                                   "endpoints": 68, "reasons": []}}],
+        "edges": edges,
+        "instances": [{"id": "i0", "caller": "c1", "module": "m0",
+                       "state": "observed", "reason": None}],
+        "semantic_edges": list(sem_rows),
+        "object_observations": observations,
+        "observation": {
+            "lane": "native",
+            "lifecycle": {"records": 3, "ring_loss": ring_loss,
+                          "malformed": 0, "failed_quanta": 0,
+                          "recovery_rescans": 0},
+            "semantic_capture": {"status": lane_status,
+                                 "admitted_endpoints": 68,
+                                 "refused_endpoints": refused_endpoints,
+                                 "continuity_cuts": continuity_cuts,
+                                 "unrouted_returns": unrouted,
+                                 "stop_quiescence": quiescence,
+                                 "final_drain": drain}},
+        "gaps": [{"caller": None, "module": None, "pid": None,
+                  "subject": subject, "reason": reason, "budget": None,
+                  "repeats": 1} for subject, reason in gaps],
+        "gaps_suppressed": 0,
+        "budgets": {"retained_history": {"limit": 1024, "retained": 0,
+                                         "suppressed": suppressed}},
+    }
+
+
+def joint_events_doc(edge_final, series, foreign_series=(),
+                     basis="CLOCK_MONOTONIC", unit="ns", started_ns=R0,
+                     unretained=0, gaps_suppressed=0, gap_events=(),
+                     evicted=False, with_ended=True):
+    """A --system event log: started, driver records, ended."""
+    rows = [event_envelope(0, started_ns, "started",
+                           {"scope": "system",
+                            "clock": {"basis": basis, "unit": unit},
+                            "started_ns": started_ns, "limits": {}})]
+    seq = 1
+    for at_ns, count in series:
+        edge = dict(edge_final)
+        edge["entries"] = dict(edge_final["entries"])
+        edge["entries"]["count"] = count
+        record = dict(edge)
+        record["presence"] = "mapped"
+        record["capture"] = "armed"
+        record["activity"] = "recently observed"
+        record["identity_context"] = {"version": 1}
+        rows.append(event_envelope(seq, at_ns, "edge_observed", record))
+        seq += 1
+    for at_ns, count in foreign_series:
+        edge = driver_edge(count, caller="c0", module="m0")
+        edge["entries"]["count"] = count
+        rows.append(event_envelope(seq, at_ns, "edge_observed", edge))
+        seq += 1
+    for index, (subject, reason) in enumerate(gap_events):
+        rows.append(event_envelope(
+            seq, started_ns + 1_000, "gap_recorded",
+            {"index": index, "caller": None, "module": None, "pid": None,
+             "subject": subject, "reason": reason, "budget": None}))
+        seq += 1
+    if evicted:
+        rows.append(event_envelope(
+            seq, started_ns + 2_000, "retention_evicted",
+            {"evicted_file": "events.jsonl.1", "evicted_events": 4,
+             "evicted_bytes": 400, "covered_events": 0,
+             "covered_bytes": 0, "reason": "retention"}))
+        seq += 1
+    if with_ended:
+        rows.append(event_envelope(
+            seq, started_ns + 3_000_000_000, "ended",
+            {"ended_ns": started_ns + 3_000_000_000, "passes": 3,
+             "budgets": {}, "gaps_suppressed": gaps_suppressed,
+             "stream": {"rotations": 0, "evicted_events": 0,
+                        "evicted_bytes": 0},
+             "edge_events": len(series) + len(foreign_series),
+             "edges_unretained": unretained,
+             "instance_events": 0, "instances_unretained": 0,
+             "semantic_edge_events": 0, "semantic_edges_unretained": 0,
+             "key_operation_events": 0, "key_operations_unretained": 0}))
+    return rows
+
+
+def healthy_joint_triple(workdir, ops_per_key=(9999,), per_s=FULL_RATE,
+                         pid=PID, sessions=1, latency_step_ns=1_000_000,
+                         **inventory_kwargs):
+    """Write a fully passing Joint ledger set + events + inventory."""
+    ledger_paths = []
+    setup = joint_setup_ledger(sessions=sessions, pid=pid)
+    setup_path = workdir / "setup.jsonl"
+    write_jsonl(setup_path, setup)
+    ledger_paths.append(setup_path)
+    last_t1 = 0
+    for index, ops in enumerate(ops_per_key):
+        hot = joint_hot_ledger(ops, per_s, pid=pid, tid=pid + index)
+        if len(ops_per_key) == 1:
+            hot_path = workdir / "hot.jsonl"
+        else:
+            hot_path = workdir / f"hot.t{index}.jsonl"
+        write_jsonl(hot_path, hot)
+        ledger_paths.append(hot_path)
+        last_t1 = max(last_t1, max(row["t1"] for row in hot
+                                  if row["kind"] == "call"))
+    teardown = joint_teardown_ledger(sessions=sessions, pid=pid)
+    teardown_path = workdir / "teardown.jsonl"
+    write_jsonl(teardown_path, teardown)
+    ledger_paths.append(teardown_path)
+    issued = sum(1 for path in ledger_paths for row in
+                 json.loads(f"[{','.join(path.read_text().splitlines())}]")
+                 if row["kind"] == "call")
+    edge = driver_edge(issued, caller="c1", module="m0")
+    sign_calls = 2 * sum(ops_per_key)
+    sem = joint_semantic_row(edge, issued, sign_calls, len(ops_per_key))
+    observations = joint_object_observations(ops_per_key, sessions=sessions)
+    foreign = driver_edge(0, caller="c0", module="m0")
+    inventory = joint_inventory_doc(edge, [sem], observations, pid=pid,
+                                    foreign_edge=foreign, **inventory_kwargs)
+    mid = issued // 2
+    series = [(last_t1 + latency_step_ns, mid),
+              (last_t1 + 2 * latency_step_ns, issued)]
+    events = joint_events_doc(edge, series,
+                              foreign_series=[(last_t1 + 500_000, 0)])
+    events_path = workdir / "events.jsonl"
+    inventory_path = workdir / "inventory.json"
+    write_jsonl(events_path, events)
+    write_json(inventory_path, inventory)
+    return ledger_paths, events_path, inventory_path
+
+
+def rewrite_joint_events_for_edge(workdir, edge, last_t1):
+    """Rebuild the Joint events file around the (mutated) driver edge."""
+    final = edge["entries"]["count"]
+    series = [(last_t1 + 1_000_000, final // 2),
+              (last_t1 + 2_000_000, final)]
+    write_jsonl(workdir / "events.jsonl",
+                joint_events_doc(edge, series,
+                                 foreign_series=[(last_t1 + 500_000, 0)]))
+
+
+def joint_hot_last_t1(ledger_paths):
+    last = 0
+    for path in ledger_paths:
+        with open(path, encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("kind") == "call":
+                    last = max(last, row["t1"])
+    return last
+
+
 class HealthyTwin(unittest.TestCase):
     def test_healthy_10k_passes_with_recorded_windows_and_latency(self):
         s1 = require_s1(self)
@@ -1229,6 +1563,39 @@ CK_RV C_Digest(CK_SESSION_HANDLE session, CK_BYTE *data, CK_ULONG data_len, CK_B
 }
 """
 
+KEYED_STUB_ENTRIES = r"""/* Keyed entries for the keyed/keyed-churn modes (same record style). */
+typedef unsigned long CK_OBJECT_HANDLE;
+typedef struct { unsigned long type; void *value; unsigned long value_len; } CK_ATTRIBUTE;
+static unsigned long next_object = 500;
+CK_RV C_GenerateKey(CK_SESSION_HANDLE session, CK_MECHANISM *mechanism, CK_ATTRIBUTE *templ, CK_ULONG count, CK_OBJECT_HANDLE *key) {
+    record("C_GenerateKey");
+    (void)session; (void)mechanism; (void)templ; (void)count;
+    if (key == 0) return 1;
+    *key = next_object++;
+    return CKR_OK;
+}
+CK_RV C_SignInit(CK_SESSION_HANDLE session, CK_MECHANISM *mechanism, CK_OBJECT_HANDLE key) {
+    record("C_SignInit");
+    (void)session; (void)mechanism; (void)key;
+    return CKR_OK;
+}
+CK_RV C_Sign(CK_SESSION_HANDLE session, CK_BYTE *data, CK_ULONG data_len, CK_BYTE *sig, CK_ULONG *sig_len) {
+    record("C_Sign");
+    (void)session; (void)data; (void)data_len;
+    if (sig_len == 0) return 1;
+    if (sig != 0 && *sig_len >= 4) {
+        sig[0] = 5; sig[1] = 6; sig[2] = 7; sig[3] = 8;
+    }
+    *sig_len = 4;
+    return CKR_OK;
+}
+CK_RV C_DestroyObject(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE object) {
+    (void)session; (void)object; record("C_DestroyObject"); return CKR_OK;
+}
+"""
+
+KEYED_STUB_PROVIDER = STUB_PROVIDER + KEYED_STUB_ENTRIES
+
 GCC_FLAGS = ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]
 
 
@@ -1262,6 +1629,14 @@ class DriverFixture(unittest.TestCase):
         stub = self.compiled / "stub.so"
         if not stub.exists():
             stub_src.write_text(STUB_PROVIDER, encoding="utf-8")
+            build_c(self, [stub_src], stub, extra=["-shared", "-fPIC"])
+        return stub
+
+    def build_keyed_stub(self, workdir):
+        stub_src = self.compiled / "keyed-stub.c"
+        stub = self.compiled / "keyed-stub.so"
+        if not stub.exists():
+            stub_src.write_text(KEYED_STUB_PROVIDER, encoding="utf-8")
             build_c(self, [stub_src], stub, extra=["-shared", "-fPIC"])
         return stub
 
@@ -1622,6 +1997,486 @@ class DriverFixture(unittest.TestCase):
             view = s1.load_ledgers(
                 [str(path) for path in ledgers] + [str(teardown)])
             self.assertEqual(view["issued"], 2009)
+
+    def test_keyed_help_names_the_keyed_modes(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-khelp-") as tmp:
+            driver = self.build_driver(Path(tmp))
+            proc = subprocess.run([str(driver), "--help"], capture_output=True,
+                                  text=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("keyed / keyed-churn", proc.stdout)
+            self.assertIn("CKM_SHA256_HMAC", proc.stdout)
+            self.assertIn("4 calls keyed, 11", proc.stdout)
+
+    def test_keyed_dry_run_pins_the_keyed_plan(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-kdry-") as tmp:
+            driver = self.build_driver(Path(tmp))
+            cases = (
+                (["--dry-run", "/no-provider.so", "keyed", "1k", "2",
+                  "ledger.jsonl"],
+                 "gen-calls dry run: provider=/no-provider.so mode=keyed "
+                 "rate=1000/s duration=2s 2000 calls 999 ops threads=1 "
+                 "key=generic-secret-hmac-sha256 ledgers=ledger.jsonl "
+                 "setup=ledger-setup.jsonl (4 calls) "
+                 "teardown=ledger-teardown.jsonl (2 calls)"),
+                (["--dry-run", "/no-provider.so", "keyed-churn", "1k", "2",
+                  "churn"],
+                 "gen-calls dry run: provider=/no-provider.so "
+                 "mode=keyed-churn rate=1000/s duration=2s 2000 calls "
+                 "968 ops threads=32 waves=4 "
+                 "key=generic-secret-hmac-sha256 "
+                 "ledgers=churn.t<nn>.jsonl setup=churn-setup.jsonl "
+                 "(11 calls) teardown=churn-teardown.jsonl (9 calls)"),
+            )
+            for argv, expect in cases:
+                proc = subprocess.run([str(driver), *argv],
+                                      capture_output=True, text=True,
+                                      timeout=30)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), expect)
+
+    def test_keyed_mode_names_all_four_modes_on_mistake(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-kmode-") as tmp:
+            driver = self.build_driver(Path(tmp))
+            proc = subprocess.run(
+                [str(driver), "/no-provider.so", "Keyed", "1k", "2",
+                 "ledger.jsonl"], capture_output=True, text=True,
+                timeout=30)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("single, churn, keyed or keyed-churn", proc.stderr)
+
+    def test_keyed_mode_requires_the_keyed_entry_points(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-kreq-") as tmp:
+            workdir = Path(tmp)
+            driver = self.build_driver(workdir)
+            stub = self.build_stub(workdir)
+            proc = subprocess.run(
+                [str(driver), str(stub), "keyed", "1k", "2",
+                 str(workdir / "ledger.jsonl")],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 2, proc.stdout)
+            self.assertIn("keyed entry point", proc.stderr)
+            self.assertFalse((workdir / "ledger.jsonl").exists())
+
+    def test_keyed_stub_run_emits_valid_setup_hot_and_teardown_ledgers(self):
+        t0 = require_t0(self)
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="s1tp-klive-") as tmp:
+            workdir = Path(tmp)
+            driver = self.build_driver(workdir)
+            stub = self.build_keyed_stub(workdir)
+            ledger = workdir / "ledger.jsonl"
+            calls = workdir / "provider-calls"
+            env = dict(os.environ, S1TP_STUB_CALLS=str(calls))
+            proc = subprocess.run(
+                [str(driver), str(stub), "keyed", "1k", "2", str(ledger)],
+                capture_output=True, text=True, timeout=60, env=env)
+            self.assertEqual(proc.returncode, 0,
+                             f"rc={proc.returncode}: {proc.stderr[-2000:]}")
+            self.assertIn("READY pid=", proc.stdout)
+            setup = workdir / "ledger-setup.jsonl"
+            teardown = workdir / "ledger-teardown.jsonl"
+            for path, want in ((setup, 4), (ledger, 2000), (teardown, 2)):
+                with open(path, encoding="utf-8") as stream:
+                    rows = t0.read_ledger(stream)
+                self.assertEqual(t0.validate_ledger(rows)["issued"], want,
+                                 path.name)
+            with open(setup, encoding="utf-8") as stream:
+                setup_rows = t0.read_ledger(stream)
+            fns = [row["fn"] for row in setup_rows
+                   if row.get("kind") == "call"]
+            self.assertEqual(fns, ["C_Initialize", "C_GetSlotList",
+                                   "C_GetSlotList", "C_OpenSession"])
+            with open(ledger, encoding="utf-8") as stream:
+                hot_rows = t0.read_ledger(stream)
+            hot = [row["fn"] for row in hot_rows if row.get("kind") == "call"]
+            self.assertEqual(hot[0], "C_GenerateKey")
+            self.assertEqual(hot[-1], "C_DestroyObject")
+            self.assertEqual(hot.count("C_SignInit"), 999)
+            self.assertEqual(hot.count("C_Sign"), 999)
+            recorded = calls.read_text().splitlines()
+            self.assertEqual(recorded.count("C_GenerateKey"), 1)
+            self.assertEqual(recorded.count("C_SignInit"), 999)
+            self.assertEqual(recorded.count("C_Sign"), 999)
+            self.assertEqual(recorded.count("C_DestroyObject"), 1)
+            view = s1.load_ledgers(
+                [str(setup), str(ledger), str(teardown)])
+            self.assertEqual(view["issued"], 2006)
+            windows = s1.check_windows(view, 1000)
+            self.assertTrue(all(window["count"] >= 1000
+                                for window in windows["windows"]),
+                            windows["windows"])
+
+    def test_keyed_churn_run_emits_one_ledger_per_thread(self):
+        t0 = require_t0(self)
+        with tempfile.TemporaryDirectory(prefix="s1tp-kchurn-") as tmp:
+            workdir = Path(tmp)
+            driver = self.build_driver(workdir)
+            stub = self.build_keyed_stub(workdir)
+            prefix = workdir / "churn"
+            proc = subprocess.run(
+                [str(driver), str(stub), "keyed-churn", "1k", "2",
+                 str(prefix)], capture_output=True, text=True, timeout=120)
+            self.assertEqual(proc.returncode, 0,
+                             f"rc={proc.returncode}: {proc.stderr[-2000:]}")
+            ledgers = sorted(workdir.glob("churn.t*.jsonl"))
+            self.assertEqual(len(ledgers), 32)
+            total = 0
+            for path in ledgers:
+                with open(path, encoding="utf-8") as stream:
+                    rows = t0.read_ledger(stream)
+                total += t0.validate_ledger(rows)["issued"]
+                hot = [row["fn"] for row in rows
+                       if row.get("kind") == "call"]
+                self.assertEqual(hot[0], "C_GenerateKey", path.name)
+                self.assertEqual(hot[-1], "C_DestroyObject", path.name)
+                self.assertEqual(hot.count("C_SignInit"),
+                                 hot.count("C_Sign"), path.name)
+                self.assertGreater(hot.count("C_SignInit"), 0, path.name)
+            self.assertEqual(total, 2000)
+            with open(workdir / "churn-setup.jsonl",
+                       encoding="utf-8") as stream:
+                setup_rows = t0.read_ledger(stream)
+            self.assertEqual(t0.validate_ledger(setup_rows)["issued"], 11)
+            setup_fns = [row["fn"] for row in setup_rows
+                         if row.get("kind") == "call"]
+            self.assertEqual(setup_fns,
+                             ["C_Initialize", "C_GetSlotList",
+                              "C_GetSlotList"] + ["C_OpenSession"] * 8)
+
+
+class JointHealthy(unittest.TestCase):
+    def test_healthy_joint_single_key_passes(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-healthy-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            result = s1.compare([str(path) for path in ledgers],
+                                [str(events)], str(inventory),
+                                FULL_RATE, joint=True)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["issued"], 20006)
+            self.assertEqual(result["min_rate"], FULL_RATE)
+            self.assertEqual(len(result["windows"]), 2)
+            self.assertTrue(all(window["count"] >= FULL_RATE
+                                for window in result["windows"]),
+                            result["windows"])
+            self.assertEqual(result["conservation"]["entries"], 20006)
+            self.assertEqual(result["joint"]["status"], "populated")
+            self.assertEqual(result["joint"]["keys"], 1)
+            self.assertEqual(result["joint"]["per_key_ops"], [9999])
+            self.assertEqual(result["loss"]["events_lost"], 0)
+            self.assertEqual(result["latency"]["samples"], 20006)
+
+    def test_healthy_joint_churn_passes_with_uneven_keys(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-churn-") as tmp:
+            workdir = Path(tmp)
+            ops = (2500, 2000, 1500)
+            ledgers, events, inventory = healthy_joint_triple(
+                workdir, ops_per_key=ops, per_s=1000, sessions=8)
+            result = s1.compare([str(path) for path in ledgers],
+                                [str(events)], str(inventory),
+                                1000, joint=True)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["joint"]["keys"], 3)
+            self.assertEqual(result["joint"]["per_key_ops"],
+                             [1500, 2000, 2500])
+            self.assertEqual(result["issued"], 11 + 12006 + 9)
+
+    def test_healthy_joint_via_cli_reports_the_joint_block(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-cli-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = s1.main(["--joint", "--min-rate", str(FULL_RATE),
+                              "--ledger", str(ledgers[0]),
+                              "--ledger", str(ledgers[1]),
+                              "--ledger", str(ledgers[2]),
+                              "--events", str(events),
+                              "--inventory", str(inventory)])
+            self.assertEqual(rc, 0)
+            verdict = json.loads(out.getvalue())
+            self.assertEqual(verdict["verdict"], "pass")
+            self.assertIn("joint", verdict)
+            self.assertNotIn("s1", verdict)
+
+    def test_joint_fails_via_cli_with_a_json_fail_verdict(self):
+        s1 = require_s1(self)
+        with tempfile.TemporaryDirectory(prefix="joint-clifail-") as tmp:
+            workdir = Path(tmp)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            doc = json.loads(inventory.read_text(encoding="utf-8"))
+            doc["object_observations"]["status"] = "unavailable"
+            doc["object_observations"]["reason"] = "journal_unavailable"
+            write_json(inventory, doc)
+            out = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                rc = s1.main(["--joint",
+                              "--ledger", str(ledgers[0]),
+                              "--ledger", str(ledgers[1]),
+                              "--ledger", str(ledgers[2]),
+                              "--events", str(events),
+                              "--inventory", str(inventory)])
+            self.assertEqual(rc, 1)
+            verdict = json.loads(out.getvalue())
+            self.assertEqual(verdict["verdict"], "fail")
+            self.assertIn("journal_unavailable", verdict["reason"])
+            self.assertNotIn("Traceback", err.getvalue())
+
+
+class JointActiveGate(unittest.TestCase):
+    def run_joint(self, workdir, mutate=None, ops_per_key=(9999,),
+                  min_rate=FULL_RATE, **kwargs):
+        s1 = require_s1(self)
+        ledgers, events, inventory = healthy_joint_triple(
+            workdir, ops_per_key=ops_per_key, **kwargs)
+        if mutate is not None:
+            doc = json.loads(inventory.read_text(encoding="utf-8"))
+            mutate(doc)
+            write_json(inventory, doc)
+        return s1.compare([str(path) for path in ledgers], [str(events)],
+                          str(inventory), min_rate, joint=True)
+
+    def test_unavailable_object_observations_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-unavail-") as tmp:
+            def mutate(doc):
+                doc["object_observations"]["status"] = "unavailable"
+                doc["object_observations"]["reason"] = "bootstrap_unavailable"
+                doc["object_observations"]["key_operations"] = []
+                doc["object_observations"]["objects"] = []
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "bootstrap_unavailable"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_journal_unavailable_reason_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-junavail-") as tmp:
+            def mutate(doc):
+                doc["object_observations"]["status"] = "unavailable"
+                doc["object_observations"]["reason"] = "journal_unavailable"
+                doc["object_observations"]["key_operations"] = []
+                doc["object_observations"]["objects"] = []
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "journal_unavailable"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_unlinked_disclosure_gap_fails(self):
+        for subject in ("semantic lane disclosure",
+                        "key operations are planned for 0.6.0; "
+                        "this capture keeps S1 mechanisms and API results"):
+            with tempfile.TemporaryDirectory(prefix="joint-discl-") as tmp:
+                def mutate(doc, subject=subject):
+                    doc["gaps"].append(
+                        {"caller": None, "module": None, "pid": None,
+                         "subject": subject,
+                         "reason": "joint_journal_unavailable",
+                         "budget": None, "repeats": 1})
+                with self.assertRaisesRegex(
+                        require_s1(self).S1Error,
+                        "joint_journal_unavailable"):
+                    self.run_joint(Path(tmp), mutate)
+
+    def test_per_key_count_off_by_one_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-offbyone-") as tmp:
+            def mutate(doc):
+                row = doc["object_observations"]["key_operations"][0]
+                row["started"] += 1
+                row["completed"] += 1
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "per-key"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_key_never_created_in_the_window_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-nocreate-") as tmp:
+            def mutate(doc):
+                doc["object_observations"]["objects"] = []
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "created"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_birth_outside_the_window_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-birth-") as tmp:
+            def mutate(doc):
+                view = doc["object_observations"]["objects"][0]
+                view["birth"] = {"start_ns": R0 - 2_000_000_000,
+                                 "end_ns": R0 - 1_000_000_000}
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "birth"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_live_key_never_destroyed_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-live-") as tmp:
+            def mutate(doc):
+                doc["object_observations"]["objects"][0]["lifetime"] = "live"
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "destroyed"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_unknown_key_operations_fail(self):
+        with tempfile.TemporaryDirectory(prefix="joint-unknown-") as tmp:
+            def mutate(doc):
+                doc["object_observations"]["unknown_key_operations"] = [
+                    {"category": "sign", "reason": "unbound",
+                     "unit": "operations", "completed": 1, "failed": 0,
+                     "cancelled": 0, "unknown": 0, "active": 0}]
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "unknown-key"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_foreign_instance_key_row_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-foreignrow-") as tmp:
+            def mutate(doc):
+                doc["object_observations"]["key_operations"].append(
+                    joint_key_row("i9", 99, 5))
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "i9"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_session_count_mismatch_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-sessions-") as tmp:
+            def mutate(doc):
+                doc["object_observations"]["sessions"] = []
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "session"):
+                self.run_joint(Path(tmp), mutate)
+
+
+class JointConservationGate(unittest.TestCase):
+    def run_joint(self, workdir, mutate=None, ops_per_key=(9999,),
+                  min_rate=FULL_RATE, **kwargs):
+        s1 = require_s1(self)
+        ledgers, events, inventory = healthy_joint_triple(
+            workdir, ops_per_key=ops_per_key, **kwargs)
+        if mutate is not None:
+            doc = json.loads(inventory.read_text(encoding="utf-8"))
+            mutate(doc)
+            edge = next(row for row in doc["edges"]
+                        if row["caller"] == "c1")
+            write_json(inventory, doc)
+            rewrite_joint_events_for_edge(
+                workdir, edge, joint_hot_last_t1(ledgers))
+        return s1.compare([str(path) for path in ledgers], [str(events)],
+                          str(inventory), min_rate, joint=True)
+
+    def test_s1_tally_is_not_the_joint_denominator(self):
+        with tempfile.TemporaryDirectory(prefix="joint-s1tally-") as tmp:
+            def mutate(doc):
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] = 65
+                child["api_returns"]["count"] = 65
+                for row in child["mechanisms"]:
+                    row["calls"] = 0
+                    row["errors"] = 0
+                child["mechanisms"][0]["calls"] = 65
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "65 != issued 20006"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_missing_keygen_row_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-nokeygen-") as tmp:
+            def mutate(doc):
+                child = doc["semantic_edges"][0]
+                child["mechanisms"] = [child["mechanisms"][0]]
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "C_GenerateKey"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_digest_mechanism_fails_for_the_keyed_workload(self):
+        with tempfile.TemporaryDirectory(prefix="joint-digest-") as tmp:
+            def mutate(doc):
+                row = doc["semantic_edges"][0]["mechanisms"][0]
+                row["mechanism"] = 0x250
+                row["mechanism_hex"] = "0x250"
+                row["name"] = "CKM_SHA256"
+                row["operations"] = ["digest"]
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "0x251"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_setup_call_inside_a_mechanism_row_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-setuprow-") as tmp:
+            def mutate(doc):
+                row = doc["semantic_edges"][0]["mechanisms"][0]
+                row["evidence"]["functions"].append("C_OpenSession")
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "C_OpenSession"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_foreign_refused_endpoints_are_recorded_never_gated(self):
+        with tempfile.TemporaryDirectory(prefix="joint-refused-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledgers, events, inventory = healthy_joint_triple(
+                workdir, refused_endpoints=3792, continuity_cuts=3)
+            result = s1.compare([str(path) for path in ledgers],
+                                [str(events)], str(inventory),
+                                FULL_RATE, joint=True)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["loss"]["refused_endpoints"], 3792)
+            self.assertEqual(result["loss"]["continuity_cuts"], 3)
+
+    def test_foreign_scoped_gap_is_counted_never_gated(self):
+        with tempfile.TemporaryDirectory(prefix="joint-fgap-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            doc = json.loads(inventory.read_text(encoding="utf-8"))
+            doc["gaps"].append(
+                {"caller": "c0", "module": "m0", "pid": 999,
+                 "subject": "semantic admission refused",
+                 "reason": "semantic_unavailable:no_receipt",
+                 "budget": None, "repeats": 3792})
+            write_json(inventory, doc)
+            result = s1.compare([str(path) for path in ledgers],
+                                [str(events)], str(inventory),
+                                FULL_RATE, joint=True)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["loss"]["foreign_gaps"], 1)
+
+    def test_callerless_shed_gap_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-shed-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "semantic calls unrouted",
+                     "reason": "13 calls shed without a route "
+                               "(unobserved=13) with 0 bindings",
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_joint_requires_system_scope(self):
+        with tempfile.TemporaryDirectory(prefix="joint-scope-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            doc = json.loads(inventory.read_text(encoding="utf-8"))
+            doc["scope"] = f"pid:{PID}"
+            write_json(inventory, doc)
+            with self.assertRaisesRegex(s1.S1Error, "system"):
+                s1.compare([str(path) for path in ledgers], [str(events)],
+                           str(inventory), FULL_RATE, joint=True)
+
+    def test_missing_driver_caller_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-nodriver-") as tmp:
+            def mutate(doc):
+                doc["callers"] = [doc["callers"][0]]
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        str(PID)):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_retired_driver_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-retired-") as tmp:
+            def mutate(doc):
+                doc["callers"][1]["retired"] = True
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "retained"):
+                self.run_joint(Path(tmp), mutate)
 
 
 if __name__ == "__main__":

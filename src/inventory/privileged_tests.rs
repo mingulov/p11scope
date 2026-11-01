@@ -3737,6 +3737,7 @@ fn privileged_joint_driver_live_finish_begin_poll_wound_down_lp64() -> Result<()
         convert_subset,
         &scope,
         crate::attach::BackendSelection::Auto,
+        None,
     )
     .map_err(|refusal| anyhow::anyhow!("live lane attaches: {refusal}"))?;
     ensure!(lane.is_live(), "the lane owns its live session");
@@ -4217,6 +4218,7 @@ fn start_joint_lane(
         convert_subset,
         &scope,
         crate::attach::BackendSelection::Auto,
+        None,
     )
     .map_err(|refusal| anyhow::anyhow!("live lane attaches: {refusal}"))?;
     ensure!(lane.is_live(), "the lane owns its live session");
@@ -4225,6 +4227,204 @@ fn start_joint_lane(
     ensure!(lane.has_joint_machine(), "the machine initializes live");
     joint_drive_line(&lane, coordinator, "r16-lane", "started");
     Ok(lane)
+}
+
+/// Flag-on variant of [`start_joint_lane`]: the lane starts with a
+/// journal request, so on a journal build the session seals linked.
+/// Requires `P11SCOPE_JOURNAL=1`; the twins ensure it loudly.
+fn start_joint_lane_with_journal(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    manifests: Vec<PathBuf>,
+) -> Result<crate::inventory_semantics::AttestedSemanticLane> {
+    use anyhow::Context as _;
+    ensure!(
+        env!("P11SCOPE_JOURNAL_ENABLED") == "1",
+        "a linked lane requires P11SCOPE_JOURNAL=1"
+    );
+    coordinator.set_semantic_manifests(manifests);
+    let attach_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the attach subset prepares")?;
+    let convert_subset = coordinator
+        .prepare_semantic_subset()
+        .subset
+        .context("the conversion subset prepares")?;
+    let scope = Scope::System;
+    let spec = crate::attach::journal::JournalSpec;
+    let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
+        attach_subset,
+        convert_subset,
+        &scope,
+        crate::attach::BackendSelection::Auto,
+        Some(&spec),
+    )
+    .map_err(|refusal| anyhow::anyhow!("linked live lane attaches: {refusal}"))?;
+    ensure!(lane.is_live(), "the lane owns its live session");
+    lane.initialize_joint(coordinator)
+        .map_err(|refusal| anyhow::anyhow!("the joint machine initializes: {refusal}"))?;
+    ensure!(lane.has_joint_machine(), "the machine initializes live");
+    Ok(lane)
+}
+
+/// WU-2a live-DD positive: a real linked lane pumps discovery
+/// through the live arm. Post-attach spawns guarantee traffic; the
+/// pump must observe records (an unlinked lane skips with Ok(0), and
+/// the neutered-live mutant returns Ok(0) forever — both fail the
+/// poll loop). Root BPF lane, serial, journal build only.
+#[test]
+#[ignore = "privileged: live linked lane pumps discovery through the live arm"]
+fn privileged_key_operations_linked_lane_pumps_live_discovery() -> Result<()> {
+    use anyhow::Context as _;
+    use std::time::{Duration, Instant};
+    let workload = JointWorkload::build()?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-pump-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-pump-held.dr37.json",
+    )?;
+    let mut lane =
+        start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    // Post-attach spawns are genuine discovery traffic (fork, exec,
+    // exit) the pump must observe; fresh traffic per iteration keeps
+    // the poll self-healing under ring pressure from parallel tests.
+    let started = Instant::now();
+    let pumped = loop {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .context("spawn discovery traffic")?;
+        child.wait().context("reap discovery traffic")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pumped = lane
+            .service_linked_live_discovery(64, deadline)
+            .map_err(|refusal| anyhow::anyhow!("the live pump serves: {refusal}"))?;
+        if pumped > 0 {
+            break pumped;
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(60),
+            "the live pump never observed post-attach spawns"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    ensure!(lane.has_joint_machine(), "the machine stays installed");
+    eprintln!("KEY_OPS_PUMP pumped={pumped}");
+    Ok(())
+}
+
+/// WU-2a live-DD fault: a stopped capture faults the live arm, the
+/// pump refuses with Unavailable, and nothing latches — the machine
+/// stays installed, the lane stays live, and a second pump refuses
+/// the same way. Root BPF lane, serial, journal build only.
+#[test]
+#[ignore = "privileged: live DD transport fault refuses without latching"]
+fn privileged_key_operations_live_discovery_fault_refuses_without_latching() -> Result<()> {
+    use std::time::{Duration, Instant};
+    let workload = JointWorkload::build()?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-fault-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-fault-held.dr37.json",
+    )?;
+    let mut lane =
+        start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    lane.stop_live_capture_for_test();
+    for attempt in 0..2 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let refused = lane.service_linked_live_discovery(64, deadline);
+        ensure!(
+            matches!(
+                &refused,
+                Err(crate::inventory_semantics::SemanticRefusal::Unavailable)
+            ),
+            "attempt {attempt}: a faulted live capture refuses: {refused:?}"
+        );
+        ensure!(lane.has_joint_machine(), "attempt {attempt}: no latch");
+        ensure!(lane.is_live(), "attempt {attempt}: the lane stays live");
+    }
+    eprintln!("KEY_OPS_FAULT refused=Unavailable latched=false");
+    Ok(())
+}
+
+/// WU-2a marker gate: an ordinary live seal publishes no attach
+/// generation (0, cell untouched), while a journal live seal mints
+/// one (>= 1). Root BPF lane, serial.
+#[test]
+#[ignore = "privileged: live seal generation publishes only with the journal pair"]
+fn privileged_key_operations_seal_generation_gated_by_flag() -> Result<()> {
+    let workload = JointWorkload::build()?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-gen-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-gen-held.dr37.json",
+    )?;
+    // Flag off: the ordinary seal keeps generation 0 in every build.
+    let lane = start_joint_lane(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    assert_eq!(
+        lane.live_seal_generation_for_test(),
+        Some(0),
+        "an ordinary live seal publishes nothing"
+    );
+    drop(lane);
+    drop(coordinator);
+    // Flag on: only a journal build can seal linked and publish.
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        eprintln!("KEY_OPS_GENERATION ordinary=0 journal=inapplicable");
+        return Ok(());
+    }
+    let workload = JointWorkload::build()?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-gen-soft2.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-gen-held2.dr37.json",
+    )?;
+    let lane = start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    let generation = lane.live_seal_generation_for_test();
+    assert!(
+        generation.is_some_and(|generation| generation >= 1),
+        "a journal live seal publishes its generation: {generation:?}"
+    );
+    eprintln!(
+        "KEY_OPS_GENERATION ordinary=0 journal={}",
+        generation.unwrap_or(0)
+    );
+    Ok(())
 }
 
 /// One JOINT_R16 drive-state line: the lane gates plus the machine's

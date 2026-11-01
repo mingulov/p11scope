@@ -3086,10 +3086,17 @@ pub(crate) fn journal_pair_preflight_from_parsed(parsed: &aya_obj::Object) -> Jo
 /// Seal one operator-attested subset into Session-owned attachment
 /// authority with a NATIVE mint: validates exactly like the test
 /// sealer, then mints the generation from the mmapable attach cell
-/// (BPF stamps exec'ing records from it as `exec_attach_gen`), so the
-/// sealed generation always names a natively published endpoint set.
-/// A failed native mint refuses the sealing. Production seals here;
-/// the interim userspace counter never feeds production authority.
+/// (BPF stamps exec'ing records from it as `exec_attach_gen`), so a
+/// journal seal's generation always names a natively published
+/// endpoint set. A failed native mint refuses the sealing. Production
+/// seals here; the interim userspace counter never feeds production
+/// authority.
+/// The mint publishes closure only when the loaded object carries the
+/// journal pair (the only journal loader is the `--key-operations`
+/// lane): ordinary seals keep generation 0 with the attach cell
+/// untouched, so marker hooks stop at the gated read. No production
+/// consumer needs a nonzero ordinary closure — every generation check
+/// is same-seal equality — and the kernel exec stamp needs no gate.
 /// (Too many arguments is the honest shape: every seal input is
 /// injected, none supplied.)
 #[allow(clippy::too_many_arguments)]
@@ -3108,6 +3115,9 @@ pub(crate) fn seal_attached_subset_native(
     // in the core, shared with the host twins' scripted inventory and mint.
     let programs: BTreeSet<&str> = ebpf.programs().map(|(name, _)| name).collect();
     let maps = instance::InstanceMaps { ebpf };
+    // Closure publishes only under the loaded journal pair: ordinary
+    // objects seal with generation 0 and never touch the attach cell.
+    let journal_pair = journal_pair_present(&programs);
     seal_attached_subset_from_programs(
         subset,
         domain,
@@ -3118,6 +3128,9 @@ pub(crate) fn seal_attached_subset_native(
         watched,
         &programs,
         || {
+            if !journal_pair {
+                return Ok(0);
+            }
             maps.mint_attach_generation()
                 .map_err(|_| crate::inventory_semantics::SemanticRefusal::Attachment)
         },
@@ -6293,6 +6306,10 @@ impl Session {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // The attested start threads the shared factory directly now (it
+    // carries the journal request `start` pins to `None`); only tests
+    // keep the direct constructor.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start(
         plan: &AttachPlan,
         scope: &Scope,
@@ -6505,8 +6522,19 @@ impl Session {
         subset: crate::inventory_semantics::AttestedSubset,
         scope: &Scope,
         selection: BackendSelection,
+        journal: Option<&journal::JournalSpec>,
     ) -> Result<(Self, AttachedSemanticSet)> {
-        let mut session = Self::start(
+        // Gate the journal request before any host probe or load:
+        // builds that omit the production object refuse here with the
+        // finite build reason. (The preparation re-resolves the same
+        // bytes; resolution is side-effect-free.)
+        if let Some(spec) = journal {
+            spec.prepare().map(|_| ())?;
+        }
+        // Thread through the shared factory directly: `Self::start`
+        // pins the journal request to `None`, which would silently
+        // drop the opt-in. Defaults match `Self::start` exactly.
+        let mut session = Self::start_with_selected(
             subset.plan(),
             scope,
             subset.pins(),
@@ -6515,6 +6543,12 @@ impl Session {
             None,
             None,
             selection,
+            None,
+            None,
+            journal,
+            false,
+            require_multi_capable_host(),
+            || crate::uretprobe_hazard::admit(None, false),
         )?;
         // H7 slice D: freeze the receipt-bound object rows before minting
         // the receipt. A readback disagreement refuses the attested
@@ -6912,6 +6946,8 @@ impl Session {
                     // map; the birth-marker feature verdict stays Detailed.
                     if !journal {
                         instance::prepare_marker_control(&ebpf, roots)?;
+                    } else {
+                        journal::prepare_journal_marker_control(&ebpf)?;
                     }
                     selected_detailed::validate_maps(&ebpf)?;
                 }
@@ -20149,6 +20185,18 @@ mod tests {
             }
         }
 
+        /// Split the scene for factory twins: the attested subset plus
+        /// the tempdir that must outlive the start (pins reference it).
+        fn into_subset(
+            self,
+        ) -> (
+            crate::inventory_semantics::AttestedSubset,
+            tempfile::TempDir,
+        ) {
+            let Self { _dir, subset, .. } = self;
+            (subset, _dir)
+        }
+
         /// Seal through the production core over `programs` with a scripted
         /// mint. Only the loaded-inventory read and the attach-cell mint are
         /// substituted native I/O; validation, linkage derivation and
@@ -20352,6 +20400,175 @@ mod tests {
                 "{present} alone drains unlinked"
             );
         }
+    }
+
+    /// The real journal object inventory seals linked through the
+    /// production core: the foundation the flag-on lane builds on. In
+    /// builds without the journal object the twin pins the omission.
+    #[test]
+    fn sealed_real_journal_inventory_drains_linked() {
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            assert!(super::journal::journal_object().is_empty());
+            return;
+        }
+        let scene = SealDrainScene::attest();
+        let journal =
+            aya_obj::Object::parse(super::journal::journal_object()).expect("journal bytes parse");
+        let programs: BTreeSet<&str> = journal.programs.keys().map(String::as_str).collect();
+        let minted = std::cell::Cell::new(0u32);
+        let attached = scene
+            .seal(&programs, || {
+                minted.set(minted.get() + 1);
+                Ok(59)
+            })
+            .expect("a valid subset seals over the journal inventory");
+        assert!(
+            attached.journal_linked(),
+            "the real journal inventory seals linked"
+        );
+        assert_eq!(
+            attached.generation(),
+            59,
+            "the seal observes the scripted mint"
+        );
+        assert_eq!(minted.get(), 1, "one successful seal mints once");
+        let mut cell = None;
+        super::retain_sealed_linkage(&mut cell, &attached);
+        assert_eq!(cell, Some(true), "retention keeps the sealed fact");
+        assert!(
+            super::drain_linkage_from_sealed(cell),
+            "the journal seal drains linked"
+        );
+    }
+
+    /// The attested factory gates a journal request before any host
+    /// probe or load: without the journal object the refusal names
+    /// the finite build reason. With the journal object the gate
+    /// passes — unprivileged the refusal (if any) is a later host or
+    /// load stage, never the build reason; privileged the session
+    /// starts linked with a published generation.
+    #[test]
+    fn attested_start_gates_journal_before_any_probe_or_load() {
+        let (subset, _dir) = SealDrainScene::attest().into_subset();
+        let scope = super::Scope::Pid(std::process::id());
+        let spec = super::journal::JournalSpec;
+        let attempted = super::Session::start_attested(
+            subset,
+            &scope,
+            super::BackendSelection::Singles,
+            Some(&spec),
+        );
+        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+            let error = match attempted {
+                Ok(_) => panic!("a journal request on a non-journal build refuses"),
+                Err(error) => error,
+            };
+            assert!(
+                format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+                "the refusal names the build reason: {error:#}"
+            );
+            return;
+        }
+        match attempted {
+            Ok((session, attached)) => {
+                assert!(attached.journal_linked(), "a journal session seals linked");
+                let producers = session
+                    .drain_producers()
+                    .expect("a journal session retains producers");
+                assert!(
+                    producers.journal_linked(),
+                    "a journal session drains linked"
+                );
+                assert!(
+                    attached.generation() >= 1,
+                    "a journal session publishes its generation"
+                );
+            }
+            Err(error) => assert!(
+                !format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+                "past the gate the build reason never fires: {error:#}"
+            ),
+        }
+    }
+
+    /// The attested factory threads its journal request into the
+    /// shared factory directly (the public start keeps its shape for
+    /// its other callers); a copied `None` or a lingering `Self::start`
+    /// call would silently drop the request.
+    #[test]
+    fn attested_start_threads_journal_into_shared_factory() {
+        let production = include_str!("attach.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let start = pin_body(production, "pub(crate) fn start_attested(", "\n    }\n").unwrap();
+        assert!(
+            start.contains("start_with_selected("),
+            "start_attested threads through the shared factory: {start}"
+        );
+        assert!(
+            !start.contains("Self::start("),
+            "start_attested no longer drops its journal request: {start}"
+        );
+    }
+
+    /// Ruling item 7: the native seal publishes the attach generation
+    /// only when the loaded object carries the journal pair (the only
+    /// journal loader is the flag-on lane). Ordinary seals keep
+    /// generation 0 with the attach cell untouched, so marker hooks
+    /// stop at the gated read.
+    #[test]
+    fn native_seal_publishes_generation_only_with_journal_pair() {
+        let production = include_str!("attach.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let native = production
+            .split_once("fn seal_attached_subset_native(")
+            .unwrap()
+            .1
+            .split_once("fn seal_attached_subset_from_programs(")
+            .unwrap()
+            .0;
+        assert!(
+            native.contains("journal_pair_present(&programs)"),
+            "the mint gates on the loaded pair: {native}"
+        );
+        assert!(
+            native.contains("mint_attach_generation()"),
+            "the gated arm still mints: {native}"
+        );
+        assert!(
+            native.contains("Ok(0)"),
+            "the ungated arm keeps generation 0: {native}"
+        );
+    }
+
+    /// B2(c): journal sessions read their marker control row back as
+    /// zero and freeze it before any link, matching the Detailed path.
+    /// The verdict over pure values is pinned in the journal tests;
+    /// this pins the wiring into the preparation step.
+    #[test]
+    fn journal_sessions_read_back_and_freeze_marker_control() {
+        let production = include_str!("attach.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let runtime = production
+            .split_once("SessionPreparation::ValidateRuntime =>")
+            .unwrap()
+            .1
+            .split_once("SessionPreparation::")
+            .unwrap()
+            .0;
+        assert!(
+            runtime.contains("instance::prepare_marker_control(&ebpf, roots)?;"),
+            "the Detailed arm keeps its control preparation: {runtime}"
+        );
+        assert!(
+            runtime.contains("journal::prepare_journal_marker_control(&ebpf)?;"),
+            "the journal arm reads back and freezes its control row: {runtime}"
+        );
     }
 
     /// A refused seal retains no linkage and mints nothing: the descriptor

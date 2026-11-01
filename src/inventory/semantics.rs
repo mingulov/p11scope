@@ -1644,16 +1644,18 @@ impl AttestedSemanticLane {
     /// conversion envelope. A second mint fails only when the retained
     /// inputs moved under the startup, which refuses honestly. The
     /// minted shell domain is replaced with the Session's native domain.
+    /// A journal request starts the linked session; `None` stays ordinary.
     pub(crate) fn start_live(
         attach_subset: AttestedSubset,
         convert_subset: AttestedSubset,
         scope: &Scope,
         backend: BackendSelection,
+        journal: Option<&crate::attach::journal::JournalSpec>,
     ) -> Result<Self, SemanticRefusal> {
         if convert_subset.plan().slots.is_empty() {
             return Err(SemanticRefusal::Unattested);
         }
-        let (session, attached) = Session::start_attested(attach_subset, scope, backend)
+        let (session, attached) = Session::start_attested(attach_subset, scope, backend, journal)
             .map_err(|_| SemanticRefusal::Attachment)?;
         Self::from_live_owner(session, attached, convert_subset).map_err(|(_, reason)| reason)
     }
@@ -2169,6 +2171,28 @@ impl AttestedSemanticLane {
     #[cfg(test)]
     pub(crate) fn set_test_joint_linked(&mut self, on: bool) {
         self.test_joint_linked = on;
+    }
+
+    /// Stop the live capture through the test seam, so the live-DD
+    /// fault twin can fault a real linked lane without kernel
+    /// surgery: stopping is a genuine capture state (the terminal
+    /// sequence stops it), and linkage still derives from the real
+    /// seal — the seam injects only the fault, never authority.
+    /// No live lane means no-op (the twin's refusal assertion then
+    /// fails on its own).
+    #[cfg(test)]
+    pub(crate) fn stop_live_capture_for_test(&mut self) {
+        if let Some(live) = self.live.as_mut() {
+            live.capture.stop();
+        }
+    }
+
+    /// Read the live seal's attach generation through the test seam
+    /// (read-only): the marker-gating twin observes publication
+    /// without disturbing the lane. `None` without a live lane.
+    #[cfg(test)]
+    pub(crate) fn live_seal_generation_for_test(&self) -> Option<u64> {
+        self.live.as_ref().map(|live| live.attached.generation())
     }
 
     /// Script the Joint-machine init outcome (or clear it with
@@ -5155,6 +5179,72 @@ mod joint_terminal_tests {
         let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
         assert_eq!(lane.service_linked_live_discovery(8, expired), Ok(0));
         assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn live_start_refuses_unattested_before_any_factory_work() {
+        // The conversion-envelope guard runs before the attested
+        // factory with or without a journal request: no BPF access,
+        // no bypass under the flag.
+        use crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset;
+        for journal in [None, Some(&crate::attach::journal::JournalSpec)] {
+            let attach = AttestedSubset::scripted(
+                crate::plan::AttachPlan::from_slots(vec![]),
+                PinnedObjects::empty(),
+                BTreeMap::new(),
+            );
+            let convert = AttestedSubset::scripted(
+                crate::plan::AttachPlan::from_slots(vec![]),
+                PinnedObjects::empty(),
+                BTreeMap::new(),
+            );
+            assert!(
+                matches!(
+                    AttestedSemanticLane::start_live(
+                        attach,
+                        convert,
+                        &crate::attach::Scope::Pid(std::process::id()),
+                        crate::attach::BackendSelection::Auto,
+                        journal,
+                    ),
+                    Err(SemanticRefusal::Unattested)
+                ),
+                "journal={}: an empty conversion envelope refuses first",
+                journal.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn live_pump_arm_calls_the_capture_and_maps_faults() {
+        // The live arm needs privilege, so this pins its wiring: the
+        // arm calls the shared live-discovery service on the real
+        // session, maps a transport fault to Unavailable, and never
+        // assigns the machine (a fault must not latch). Kills the
+        // neutered-live mutant, which drops the capture call.
+        let production = include_str!("semantics.rs")
+            .split_once("mod joint_terminal_tests")
+            .unwrap()
+            .0;
+        let arm = production
+            .split_once("fn service_linked_live_discovery(")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        assert!(
+            arm.contains(".service_live_discovery_until(&mut live.session, work, deadline)"),
+            "the live arm pumps through the shared service: {arm}"
+        );
+        assert!(
+            arm.contains("SemanticRefusal::Unavailable"),
+            "a live transport fault refuses: {arm}"
+        );
+        assert!(
+            !arm.contains("live_joint_machine = "),
+            "a live fault never latches the machine: {arm}"
+        );
     }
 
     #[test]

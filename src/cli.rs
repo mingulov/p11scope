@@ -173,6 +173,9 @@ pub struct InventoryArgs {
     /// `--prearm-module` inputs (packet 6.13); see `CaptureArgs`. Refused
     /// under `--capture scan`, like `--manifest`.
     pub prearm_modules: Vec<PathBuf>,
+    /// `--key-operations`: opt-in per-key tracking (linked journal lane).
+    /// Default off; refused under `--capture scan`, like `--manifest`.
+    pub key_operations: bool,
     pub hooks: HookRegistry,
     pub json: bool,
     /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 256 default.
@@ -419,9 +422,9 @@ usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
@@ -583,9 +586,9 @@ Without --pid or --cgroup, target readiness is unassessed.
 
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
 
 example (4242 is an example PID, not a detected target):
@@ -600,6 +603,7 @@ Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, 
 --module narrows the scan to named providers.
 --manifest is repeatable explicit operator attestation for the optional Detailed subset; requires auto or native.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping; Detailed-subset offset activation follows in a later packet; requires auto or native.
+--key-operations opts in to per-key tracking through a linked journal session (default off); requires --capture auto or native, and a build with the journal object.
 In this version it adds per-edge mechanisms and API results; key operations are planned for 0.6.0.
 Subset preparation preserves broad physical counting; positive instance delivery awaits runtime activation.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
@@ -1124,6 +1128,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut modules = Vec::new();
     let mut manifests = Vec::new();
     let mut prearm_modules = Vec::new();
+    let mut key_operations = false;
     let mut hooks = HookRegistry::builtin();
     let mut json = false;
     let mut max_scan_pids: Option<usize> = None;
@@ -1206,6 +1211,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             "--module" => modules.push(require_path(&mut args, "--module")?),
             "--manifest" => manifests.push(require_path(&mut args, "--manifest")?),
             "--prearm-module" => prearm_modules.push(require_path(&mut args, "--prearm-module")?),
+            "--key-operations" => key_operations = true,
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--json" => json = true,
             "--dashboard" => dashboard = true,
@@ -1368,6 +1374,11 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             "--prearm-module requires --capture auto or native",
         ));
     }
+    if key_operations && capture == Some(CaptureMode::Scan) {
+        return Err(usage_err(
+            "--key-operations requires --capture auto or native",
+        ));
+    }
     if diagnostics.is_some() && capture == Some(CaptureMode::Scan) {
         return Err(usage_err("--diagnostics requires --capture auto or native"));
     }
@@ -1390,6 +1401,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         modules,
         manifests,
         prearm_modules,
+        key_operations,
         hooks,
         json,
         max_scan_pids,
@@ -2854,6 +2866,68 @@ mod tests {
     }
 
     #[test]
+    fn inventory_key_operations_parses_and_defaults_off() {
+        // Opt-in on every scope, never narrowed to one scope.
+        for scope in [
+            vec!["--pid", "7"],
+            vec!["--cgroup", "/sys/fs/cgroup/p11scope.slice"],
+            vec!["--system"],
+        ] {
+            let mut argv = vec!["inventory", "--key-operations"];
+            argv.extend(scope);
+            let Command::Inventory(parsed) = parse(args(&argv)).unwrap() else {
+                panic!("{argv:?} should parse as inventory");
+            };
+            assert!(parsed.key_operations, "{argv:?} should opt in");
+        }
+        // Absent means off.
+        let Command::Inventory(parsed) = parse(args(&["inventory", "--pid", "7"])).unwrap() else {
+            panic!("expected inventory");
+        };
+        assert!(!parsed.key_operations, "the flag defaults off");
+    }
+
+    #[test]
+    fn inventory_key_operations_refuses_scan() {
+        // Refused by name under `--capture scan`, like `--manifest`,
+        // whichever order the flags arrive in.
+        for argv in [
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--capture",
+                "scan",
+                "--key-operations",
+            ],
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--key-operations",
+                "--capture",
+                "scan",
+            ],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage { message, topic: HelpTopic::Inventory })
+                    if message.contains("--key-operations requires --capture auto or native")),
+                "{argv:?} should refuse --key-operations under scan"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_help_names_key_operations_flag() {
+        // The flag, its scope, and its capture requirement are
+        // documented where the inventory flag surface is pinned.
+        let help = HelpTopic::Inventory.text();
+        assert!(help.contains("[--key-operations]"), "{help}");
+        assert!(help.contains("--key-operations"), "{help}");
+        assert!(help.contains("requires --capture auto or native"), "{help}");
+    }
+
+    #[test]
     fn inventory_diagnostics_options_are_capture_only() {
         for (argv, expected) in [
             (
@@ -4157,14 +4231,14 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        // 8794 / 0x8aded99b248a97ce (6.15 CLI selection): USAGE diff
-        // vs the 8267/0x8b8a pin is exactly the `--select-endpoint`
-        // synopsis insertions (2 sites) + the 4-line selection flag
-        // paragraph; no other drift. Pair measured by this test (old
-        // pair reproduced as `right` by the same extractor before the
+        // 8851 / 0xee7da085a2b63bea (inventory `--key-operations`):
+        // USAGE diff vs the 8794/0x8ade pin is exactly the
+        // `[--key-operations]` synopsis insertions (3 sites, 19 bytes
+        // each); no other drift. Pair measured by this test (old pair
+        // reproduced as `right` by the same extractor before the
         // update).
-        assert_eq!(USAGE.len(), 8794);
-        assert_eq!(hash, 0x8aded99b248a97ce);
+        assert_eq!(USAGE.len(), 8851);
+        assert_eq!(hash, 0xee7da085a2b63bea);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

@@ -842,6 +842,10 @@ Limits that matter in pods:
   argument error before output files open. Subset preparation preserves broad
   physical counting; this
   preparation gate alone does not activate positive Inventory instance delivery.
+  `--key-operations` (default off) opts in to per-key tracking through a linked
+  journal session; it requires `--capture auto` or `native` and a build with
+  the journal object. A refused journal start keeps the S1 capture with a
+  finite reason.
   Missing retained names read `Unknown executable` or `Unknown module`;
   an observed ` (deleted)` path marker stays on the executable label.
   Retired images say `Application executed a new image`, and exited

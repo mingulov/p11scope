@@ -4420,6 +4420,29 @@ mod tests {
     use super::*;
     use p11scope_ebpf_common::object_policy::SafeCurve;
 
+    /// No naive redemption in the completion primitive: origins mint
+    /// only for calls with a staged completion (`apply_end`), while
+    /// `complete` refuses already-staged calls — so a `redeem` call
+    /// here could never trigger and would only retire a true marker.
+    /// The sound Q2 caller needs the async-control sealing design
+    /// (F2/U-3: `CallKind::Control`, census, staging, producer
+    /// BEGIN/END); remove this pin when that design lands.
+    #[test]
+    fn complete_stages_without_redeeming() {
+        let production = include_str!("state.rs").split_once("mod tests").unwrap().0;
+        let complete = production
+            .split_once("pub(super) fn complete(")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        assert!(
+            !complete.contains("redeem_deferred"),
+            "complete stages only; redemption awaits the Q2 design: {complete}"
+        );
+    }
+
     fn scalar(value: u16) -> FieldState {
         FieldState::Value(FieldValue::Scalar(value))
     }

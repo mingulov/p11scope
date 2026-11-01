@@ -702,6 +702,7 @@ fn run_public_selection(
         &|| Ok(crate::attach::MultiCapableHost::for_test()),
         None,
         None,
+        false,
     )
 }
 

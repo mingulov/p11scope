@@ -1,14 +1,17 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! STAGED: unreachable in production (all Session factories pass None; only tests pass Some); activation obligations in planning docs/superpowers/2026-10-31-v060-staged-registry.md.
+//! Reachable under `inventory --key-operations`: the opt-in lane threads a
+//! real `JournalSpec` through the attested Session start; all other factories
+//! pass `None` and stay ordinary. Remaining staged row: R4 deferred custody in
+//! planning docs/superpowers/2026-10-31-v060-staged-registry.md.
 //! Production journal-object selection, load contract and class fill.
 //!
 //! The production journal object is a Detailed object whose entry/return
 //! roots are replaced by the journal pair (`p11_entry_journal` /
 //! `p11_return_journal`) plus the four journal maps. It is built only by the
 //! opt-in `P11SCOPE_JOURNAL=1` route; the private proof ELF is never selected
-//! or embedded here. Loading stays unlinked: this module reports linkage as a
-//! value the Session preparation consumes, and the seal/drain flags keep
-//! their literal `false` until the activation packet wires them.
+//! or embedded here. `journal_linked` is derived from the actually loaded
+//! programs: only a session whose loaded object carries both journal roots
+//! seals and drains linked.
 
 use super::instance::INSTANCE_PROGRAMS;
 use super::selected_detailed::PROGRAMS as SELECTED_DETAILED_PROGRAMS;
@@ -17,7 +20,7 @@ use super::{
     validate_policy_map,
 };
 use crate::semantics_objects::journal::{EndpointClass, endpoint_class};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use aya::Ebpf;
 use aya::maps::MapType;
 use p11scope_ebpf_common::MAX_DESCRIPTORS;
@@ -209,6 +212,51 @@ pub(crate) fn validate_journal_maps(ebpf: &Ebpf) -> Result<()> {
         validate_policy_map(ebpf, name, expected)?;
     }
     Ok(())
+}
+
+/// Read the journal object's marker control row back as zero and
+/// freeze it before any link, matching the Detailed path: a spent or
+/// latched row, a missing row, or an unreadable row refuses the
+/// session instead of starting. The journal object always carries
+/// the map, so presence is required unconditionally.
+pub(crate) fn prepare_journal_marker_control(ebpf: &Ebpf) -> Result<()> {
+    const NAME: &str = "JOURNAL_MARKER_CTL";
+    let map = ebpf.map(NAME);
+    let Some(map) = map else {
+        return journal_marker_control_verdict(false, None);
+    };
+    let data = super::policy_map_data(NAME, map)?;
+    super::validate_map_metadata(NAME, data, super::map_metadata(MapType::Array, 4, 16, 1, 0))?;
+    let control: aya::maps::Array<
+        &aya::maps::MapData,
+        p11scope_ebpf_common::JournalAdmissionControl,
+    > = aya::maps::Array::try_from(map)?;
+    let readback = control
+        .get(&0, 0)
+        .with_context(|| format!("reading {NAME} control row"))?;
+    journal_marker_control_verdict(true, Some(readback))?;
+    super::freeze_map(NAME, map)
+}
+
+/// Pure control-row verdict behind [`prepare_journal_marker_control`]:
+/// the journal session requires the map, and an enabled map needs
+/// zero readback before freezing.
+fn journal_marker_control_verdict(
+    present: bool,
+    readback: Option<p11scope_ebpf_common::JournalAdmissionControl>,
+) -> Result<()> {
+    if !present {
+        bail!("JOURNAL_MARKER_CTL missing from the journal object (stale build)");
+    }
+    match readback {
+        Some(control) if control.spent == 0 && control.failed == 0 => Ok(()),
+        Some(control) => bail!(
+            "JOURNAL_MARKER_CTL moved before links: spent={} failed={}",
+            control.spent,
+            control.failed
+        ),
+        None => bail!("JOURNAL_MARKER_CTL has no readback row"),
+    }
 }
 
 /// Production `JOURNAL_CLASSES` value for one descriptor: the configured
@@ -471,6 +519,57 @@ mod tests {
         let text = format!("{error:#}");
         assert!(text.contains("JOURNAL_CLASSES metadata"), "{text}");
         assert!(text.contains("differs from exact expected"), "{text}");
+    }
+
+    /// B2(c): the journal control row reads back as zero before any
+    /// link, like the Detailed row. Live map access stays out of
+    /// tests; the verdict below is pinned over pure values.
+    #[test]
+    fn journal_marker_control_zero_readback_accepts() {
+        let control = p11scope_ebpf_common::JournalAdmissionControl::default();
+        super::journal_marker_control_verdict(true, Some(control)).expect("zero readback accepts");
+    }
+
+    /// B2(c): a spent or latched journal control row before links
+    /// refuses the session instead of starting.
+    #[test]
+    fn journal_marker_control_moved_readback_refuses() {
+        for control in [
+            p11scope_ebpf_common::JournalAdmissionControl {
+                spent: 1,
+                failed: 0,
+            },
+            p11scope_ebpf_common::JournalAdmissionControl {
+                spent: 0,
+                failed: 1,
+            },
+            p11scope_ebpf_common::JournalAdmissionControl {
+                spent: 3,
+                failed: 5,
+            },
+        ] {
+            let error = super::journal_marker_control_verdict(true, Some(control)).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("moved before links"),
+                "{control:?}: {error:#}"
+            );
+        }
+    }
+
+    /// B2(c): a journal object without the control row, or an
+    /// unreadable row, refuses instead of running blind.
+    #[test]
+    fn journal_marker_control_absent_row_refuses() {
+        let error = super::journal_marker_control_verdict(false, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("missing from the journal object"),
+            "{error:#}"
+        );
+        let error = super::journal_marker_control_verdict(true, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no readback row"),
+            "{error:#}"
+        );
     }
 
     /// The journal load set is exactly ordinary Detailed with the pair

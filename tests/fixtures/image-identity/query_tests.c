@@ -447,22 +447,22 @@ int main(int argc, char **argv)
     query_tgid = 101; cookie = 1; cookie_present = 1; cookie_b_present = 0;
     task.self_exec_id = 5; request.cookie = 1; query();
     assert(writes == 2 && rows[0].status == IMG_ROW_READY && rows[1].status == IMG_ROW_END);
-    assert(rows[0].cookie == 1 && rows[0].sequence == 1);
+    assert(rows[0].cookie == 1 && rows[0].sequence == 2);
     query_tgid = 102; cookie_present = 0; cookie_b = 1; cookie_b_present = 1;
     task.self_exec_id = 7; request.cookie = b1; query();
     assert(writes == 2 && rows[0].status == IMG_ROW_READY && rows[1].status == IMG_ROW_END);
-    assert(rows[0].cookie == b1 && rows[0].cookie != 1 && rows[0].sequence == 1);
+    assert(rows[0].cookie == b1 && rows[0].cookie != 1 && rows[0].sequence == 2);
     query_tgid = 101; cookie = 1; cookie_present = 1; cookie_b_present = 0;
     task.self_exec_id = 5; request.cookie = 1; query();
     assert(writes == 2 && rows[0].status == IMG_ROW_READY && rows[1].status == IMG_ROW_END);
-    assert(rows[0].cookie == 1 && rows[0].exec_id == 5 && rows[0].sequence == 1);
+    assert(rows[0].cookie == 1 && rows[0].exec_id == 5 && rows[0].sequence == 2);
     query_tgid = 102; p11_image_exec_release(0);
     query_tgid = 102; cookie_present = 0; cookie_b = 1; cookie_b_present = 1;
     task.self_exec_id = 7; request.cookie = b1; query();
     assert(writes == 2 && rows[0].status == IMG_ROW_UNKNOWN && rows[1].status == IMG_ROW_END);
     query_tgid = 101; cookie = 1; cookie_present = 1; cookie_b_present = 0;
     task.self_exec_id = 5; request.cookie = 1; query();
-    assert(writes == 2 && rows[0].status == IMG_ROW_READY && rows[0].sequence == 1);
+    assert(writes == 2 && rows[0].status == IMG_ROW_READY && rows[0].sequence == 2);
     /* A missing select word skips the query without failing coverage. */
     reset();
     query_tgid = 101; assert(p11_image_entry(101, 1, 5));

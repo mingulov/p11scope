@@ -26,10 +26,9 @@ use p11scope_ebpf_common::{
     EVIDENCE_ABI_REFUSALS, EVIDENCE_RING_LOSS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
     IMAGE_IDENTITY_TICKET_LIMIT, ImageBankSelect, ImageIdentityControl, LoaderGateControl,
-    MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT,
-    PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE, RootAffiliationControl, SlotSemantics,
-    TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT,
-    ThreadOwnerControl, attach_cookie,
+    MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT, PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE,
+    RootAffiliationControl, SlotSemantics, TAIL_CALLS_INTERFACE_WORKER_SLOT,
+    TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT, ThreadOwnerControl, attach_cookie,
 };
 use p11scope_manifest::elf::ElfAbi;
 use pkcs11_types::mechanism_registry::MechanismRegistry;
@@ -385,22 +384,13 @@ const GATE_IDENTITY_MAPS: [(&str, ExactMapMetadata); 5] = [
         "TASK_COOKIE_B",
         map_metadata(MapType::TaskStorage, 4, 8, 0, 1),
     ),
-    (
-        "COOKIE_CTL_B",
-        map_metadata(MapType::Array, 4, 40, 1, 0),
-    ),
+    ("COOKIE_CTL_B", map_metadata(MapType::Array, 4, 40, 1, 0)),
     (
         "IMAGE_BANK_SELECT",
         map_metadata(MapType::Array, 4, 96, 1, 0),
     ),
-    (
-        "LOADER_GATE",
-        map_metadata(MapType::Array, 4, 32, 256, 0),
-    ),
-    (
-        "LOADER_GATE_CTL",
-        map_metadata(MapType::Array, 4, 72, 1, 0),
-    ),
+    ("LOADER_GATE", map_metadata(MapType::Array, 4, 32, 256, 0)),
+    ("LOADER_GATE_CTL", map_metadata(MapType::Array, 4, 72, 1, 0)),
 ];
 
 fn validate_identity_inventory<'a>(
@@ -450,13 +440,8 @@ fn identity_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::maps::MapD
             Map::Unsupported(data),
         ) => data,
         (
-            "COOKIE_CTL"
-            | "OWNER_CTL"
-            | "ROOT_CTL"
-            | "COOKIE_CTL_B"
-            | "IMAGE_BANK_SELECT"
-            | "LOADER_GATE"
-            | "LOADER_GATE_CTL",
+            "COOKIE_CTL" | "OWNER_CTL" | "ROOT_CTL" | "COOKIE_CTL_B" | "IMAGE_BANK_SELECT"
+            | "LOADER_GATE" | "LOADER_GATE_CTL",
             Map::Array(data),
         ) => data,
         _ => bail!("unexpected {name} identity map variant"),
@@ -604,10 +589,7 @@ fn bank_select_fields(c: ImageBankSelect) -> [u64; 12] {
     ]
 }
 
-fn validate_bank_select_readback(
-    expected: ImageBankSelect,
-    actual: ImageBankSelect,
-) -> Result<()> {
+fn validate_bank_select_readback(expected: ImageBankSelect, actual: ImageBankSelect) -> Result<()> {
     if bank_select_fields(actual) != bank_select_fields(expected) {
         bail!("IMAGE_BANK_SELECT exact readback differs from initial select");
     }
@@ -7575,8 +7557,7 @@ impl Session {
         let Some(map) = self.ebpf.map(name) else {
             return Ok(None);
         };
-        let cell: Array<_, T> =
-            Array::try_from(map).with_context(|| format!("{name} gate map"))?;
+        let cell: Array<_, T> = Array::try_from(map).with_context(|| format!("{name} gate map"))?;
         Ok(Some(
             cell.get(&0, 0)
                 .with_context(|| format!("{name} gate cell"))?,
@@ -12287,8 +12268,7 @@ mod tests {
             ("OWNER_CTL", false),
             ("ROOT_CTL", false),
         ];
-        let error =
-            validate_identity_inventory(wrong_variant.into_iter(), true).unwrap_err();
+        let error = validate_identity_inventory(wrong_variant.into_iter(), true).unwrap_err();
         assert!(
             error.to_string().contains("TASK_COOKIE_B"),
             "the refusal must name the map: {error:?}"
@@ -12365,11 +12345,7 @@ mod tests {
                 assert_eq!(actual.map_type(), expected.map_type as u32, "{name} type");
                 assert_eq!(actual.key_size(), expected.key_size, "{name} key");
                 assert_eq!(actual.value_size(), expected.value_size, "{name} value");
-                assert_eq!(
-                    actual.max_entries(),
-                    expected.max_entries,
-                    "{name} entries"
-                );
+                assert_eq!(actual.max_entries(), expected.max_entries, "{name} entries");
                 assert_eq!(actual.map_flags(), expected.flags, "{name} flags");
             }
         } else {

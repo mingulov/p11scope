@@ -6488,6 +6488,35 @@ mod tests {
     }
 
     #[test]
+    fn bank_load_objects_enumerates_every_loaded_program() {
+        // A hardcoded [entry, birth] program census silently unwatches
+        // a third program loaded into the censused bank load (e.g. a
+        // future load_query_slot caller before the census). The census
+        // must enumerate every loaded program with the
+        // activation-test pattern (programs() + info(), skipping
+        // NotLoaded) and pin the loaded set to exactly the slot's two
+        // bank programs, so an extra program fails loudly.
+        let source = include_str!("image_bank_proof.rs");
+        let body = fn_body_between(
+            source,
+            "    pub fn bank_load_objects(",
+            "    /// Memlock bytes for the shared proof maps",
+        );
+        assert!(
+            body.contains("load.bpf.programs()"),
+            "the program census enumerates every program in the load"
+        );
+        assert!(
+            body.contains("NotLoaded"),
+            "the program census skips programs the load never loaded"
+        );
+        assert!(
+            body.contains("entry_prog(slot)") && body.contains("birth_prog(slot)"),
+            "the program census still pins the slot's two bank programs"
+        );
+    }
+
+    #[test]
     fn proof_slot_entry_loads_keep_one_attach_type_per_array() {
         // Since CVE-2025-40123 a program array keeps its first
         // program's expected attach type and refuses callers with a

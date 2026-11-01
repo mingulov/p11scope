@@ -385,6 +385,29 @@ json.dump({"observation": {"lane": lane},
           open(path, "w"))
 EOF
     }
+    st_inventory_gaps() {
+        # st_inventory_gaps DIR STATE COUNT LOSSY LANE GAPS: one SoftHSM2
+        # edge with caller c0 plus a gaps array (a JSON array string)
+        # for the exit-time demoted-tail gate controls.
+        mkdir -p "$SELF_TEST_WORK/$1"
+        python3 -I - "$SELF_TEST_WORK/$1/inventory.json" "$2" "$3" "$4" "$5" "$6" <<'EOF'
+import json, sys
+path, state, count, lossy, lane, gaps = (sys.argv[1], sys.argv[2], sys.argv[3],
+                                        sys.argv[4], sys.argv[5], sys.argv[6])
+json.dump({"observation": {"lane": lane},
+           "modules": [{"id": "m0", "paths": ["/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"]}],
+           "callers": [{"id": "c0", "pid": 4242}],
+           "edges": [{"caller": "c0", "module": "m0",
+                      "entries": {"count": int(count),
+                                  "saturated": False,
+                                  "coverage": {"state": state,
+                                               "lossy": {"true": True, "false": False,
+                                                         "null": None}[lossy]}}}],
+           "gaps": json.loads(gaps),
+           "gaps_suppressed": 0},
+          open(path, "w"))
+EOF
+    }
     # check_counted: ops=100 threads=2 wants exactly 105.
     st_inventory counted-ok counted 105 false native
     st_gate pass counted-ok check_counted "$SELF_TEST_WORK/counted-ok" 100 2
@@ -395,6 +418,34 @@ EOF
         st_inventory counted-bad $shape
         st_gate fail counted-bad check_counted "$SELF_TEST_WORK/counted-bad" 100 2
     done
+    # check_counted exit-time demoted tail (controller ruling
+    # 2026-11-01, N5 count gate): ops=100 threads=2 wants exactly
+    # 105; the tail case carries edge=90 plus one rejected demoted
+    # gap with base=90 absolute=105 and exit-time evidence. One pass
+    # control and one failure control per mode.
+    ST_TAIL_REJECTED='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (15 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    ST_TAIL_LEADER='{"caller":"c0","module":null,"pid":4242,"subject":"leader exit status unresolved at stop","reason":"1 pending leader exit(s) remain unknown; first hook=1 domain=NativeDomainId(1); semantic inputs retain custody refusal","budget":null,"repeats":1}'
+    ST_TAIL_CUSTODY='{"caller":null,"module":null,"pid":null,"subject":"native capture scope custody unproven","reason":"PID custody lost: the PID target exited; every watched no-use interval ends at the earlier of the custody instant and the last clean read; a watch starting at or after that instant reads unknown, and no watch starts again","budget":null,"repeats":1}'
+    ST_TAIL_IMAGE='{"caller":null,"module":null,"pid":null,"subject":"exact image authority unavailable","reason":"no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection","budget":null,"repeats":1}'
+    ST_TAIL_PLACED='{"caller":"c0","module":"m0","pid":null,"subject":"demoted count placed","reason":"a demoted count placed post-demotion growth on this edge (fixture reason shortened; the gate matches the subject)","budget":null,"repeats":1}'
+    st_inventory_gaps tail-ok counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_TAIL_CUSTODY,$ST_TAIL_IMAGE]"
+    st_gate pass tail-ok check_counted "$SELF_TEST_WORK/tail-ok" 100 2
+    ST_BAD_ABSOLUTE='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 104] (14 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-bad-absolute counted 90 false native "[$ST_BAD_ABSOLUTE,$ST_TAIL_LEADER]"
+    st_gate fail tail-bad-absolute check_counted "$SELF_TEST_WORK/tail-bad-absolute" 100 2
+    ST_BASE_NE_EDGE='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (89, 105] (16 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-base-ne-edge counted 90 false native "[$ST_BASE_NE_EDGE,$ST_TAIL_LEADER]"
+    st_gate fail tail-base-ne-edge check_counted "$SELF_TEST_WORK/tail-base-ne-edge" 100 2
+    ST_SECOND_REJECTED='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 100] (10 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-two-gaps counted 90 false native "[$ST_TAIL_REJECTED,$ST_SECOND_REJECTED,$ST_TAIL_LEADER]"
+    st_gate fail tail-two-gaps check_counted "$SELF_TEST_WORK/tail-two-gaps" 100 2
+    st_inventory_gaps tail-placed counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_TAIL_PLACED]"
+    st_gate fail tail-placed check_counted "$SELF_TEST_WORK/tail-placed" 100 2
+    st_inventory_gaps tail-no-exit counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_IMAGE]"
+    st_gate fail tail-no-exit check_counted "$SELF_TEST_WORK/tail-no-exit" 100 2
+    ST_BUDGET_REJECTED='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (15 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":{"resource":"callers","limit":4096,"requested":4097},"repeats":1}'
+    st_inventory_gaps tail-budget counted 90 false native "[$ST_BUDGET_REJECTED,$ST_TAIL_LEADER]"
+    st_gate fail tail-budget check_counted "$SELF_TEST_WORK/tail-budget" 100 2
     st_inventory witnessed-ok witnessed 0 null native
     st_gate pass witnessed-ok check_witnessed "$SELF_TEST_WORK/witnessed-ok"
     for shape in "counted 0 null native" "witnessed 0 false native" \
@@ -409,7 +460,7 @@ EOF
     st_gate fail anchor-bad check_native_lane "$SELF_TEST_WORK/anchor-bad"
     st_inventory anchor-lane unknown 0 null scan
     st_gate fail anchor-lane check_native_lane "$SELF_TEST_WORK/anchor-lane"
-    [ "$ST_GATE_OK" -eq 14 ] || { echo "self-test: ran $ST_GATE_OK gate controls, want 14" >&2; exit 1; }
+    [ "$ST_GATE_OK" -eq 21 ] || { echo "self-test: ran $ST_GATE_OK gate controls, want 21" >&2; exit 1; }
     # Prebuilt + denominator-mode controls: per-round arm order in
     # each mode, ARMS/PREBUILT validation, and prebuilt input
     # staging (a missing or non-executable input refuses by name;

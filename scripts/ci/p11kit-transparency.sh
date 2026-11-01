@@ -15,7 +15,7 @@
 # (pkcs11-spy.so), p11-kit, p11-kit-modules (proxy, trust, client),
 # python3, procps, util-linux, softhsm2-util (in softhsm2).
 # Dnf prerequisites (Fedora 44): gcc, softhsm, opensc, p11-kit,
-# p11-kit-server (client/server), python3, procps-ng, util-linux.
+# p11-kit-server, p11-kit-client, python3, procps-ng, util-linux.
 # SoftHSM 2.7 note: Fedora's stock provider has the legacy32 table shape
 # (owned by exec-scan-legacy32); Fedora cells use an owned copy of a
 # Debian SoftHSM build as the qualified provider (see P11KIT_SOFTHSM_DEB).

@@ -5898,10 +5898,9 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
 }
 
 impl ClassicDriver<'_> {
-    /// Linked Joint hook (§6.06): service the machine and pump linked
-    /// live DISCOVERY on the shared per-hook budget. Test-commit shape
-    /// preserves the pre-R1 machine-first order; the R1 change flips
-    /// it to pump-first with a guaranteed discovery share.
+    /// Linked Joint hook (§6.06): pump linked live DISCOVERY first
+    /// with a guaranteed share, then service the machine on the same
+    /// shared per-hook budget (R1, mirroring the unlinked rule).
     fn service_linked_joint_hook(
         lane: &mut crate::inventory_semantics::AttestedSemanticLane,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
@@ -5909,11 +5908,44 @@ impl ClassicDriver<'_> {
         acquisition: Option<&mut dyn ImageAcquisition>,
         tick_refusal: &mut Option<crate::inventory_semantics::SemanticRefusal>,
     ) {
-        // The machine owns its latch and retries; a refused
-        // hook simply services again on the next tick. The
-        // first refusal is kept instead of dropped: it names
-        // the lane's stop if the lane later holds with no
-        // latched reason of its own.
+        // Linked-DD pump (§6.06): pump first with a guaranteed share.
+        // When the shared budget holds more than one action and the
+        // hook deadline stands, pump `(remaining - 1).min(256)`
+        // through the lane's owner seam and spend the drained records,
+        // reserving one action for the machine below. The budget gates
+        // mirror `JointWorkBudget::available`/`spend`, which stay
+        // private to the machine (`machine.rs`); this arm reads and
+        // spends the shared fields directly. A fault or over-work
+        // answer records `Unavailable` for the fallback stop reason
+        // but never latches the machine: it sets the capture's sticky
+        // discovery status, so the lane's coverage fails permanently
+        // at the next audit while publication proceeds with coverage
+        // failed. One-credit hooks skip the pump and advance the
+        // machine, as in the unlinked rule.
+        let mut pump_refusal = None;
+        if budget.remaining_actions > 1 && Instant::now() < budget.deadline {
+            let work = (budget.remaining_actions - 1)
+                .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM);
+            match lane.service_linked_live_discovery(work, budget.deadline) {
+                Ok(records) if records <= work => {
+                    budget.remaining_actions = budget.remaining_actions.saturating_sub(records);
+                }
+                Ok(_) => {
+                    pump_refusal = Some(crate::inventory_semantics::SemanticRefusal::Unavailable);
+                }
+                Err(reason) => {
+                    pump_refusal = Some(reason);
+                }
+            }
+        }
+        // Then service the machine on the same budget, whatever the
+        // pump returned, so a DD fault cannot pre-empt EVENTS service.
+        // The machine owns its latch and retries; a refused hook
+        // simply services again on the next tick. The first refusal is
+        // kept instead of dropped: the machine's refusal from this
+        // hook wins over the pump's `Unavailable`, and it names the
+        // lane's stop if the lane later holds with no latched reason
+        // of its own.
         if let Err(reason) = lane.service_joint_for_linked_hook(
             coordinator,
             crate::inventory_semantics::JointServiceMode::Running,
@@ -5922,28 +5954,8 @@ impl ClassicDriver<'_> {
         ) {
             tick_refusal.get_or_insert(reason);
         }
-        // Linked-DD pump (§6.06): after machine service, on the
-        // shared per-hook budget, pump linked live DISCOVERY
-        // through the lane's owner seam. The machine keeps
-        // priority; the pump runs regardless of the machine
-        // outcome, and a fault only names the fallback stop
-        // reason — it never latches the machine. The pump is
-        // last in the hook, so the drained count needs no spend
-        // bookkeeping (re-add it if a later consumer follows
-        // the pump); an over-work answer still names the
-        // fallback reason, like the machine's distrust.
-        let work = budget
-            .remaining_actions
-            .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM);
-        match lane.service_linked_live_discovery(work, budget.deadline) {
-            Ok(records) if records <= work => {}
-            Ok(_) => {
-                tick_refusal
-                    .get_or_insert(crate::inventory_semantics::SemanticRefusal::Unavailable);
-            }
-            Err(reason) => {
-                tick_refusal.get_or_insert(reason);
-            }
+        if let Some(reason) = pump_refusal {
+            tick_refusal.get_or_insert(reason);
         }
     }
 

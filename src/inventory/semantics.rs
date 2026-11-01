@@ -2666,10 +2666,11 @@ impl AttestedSemanticLane {
     /// bounded: exit-retained, finished, machineless, unlinked or
     /// budget-empty calls answer `Ok(0)` without touching the seam.
     /// A transport fault answers `Err(Unavailable)` and never latches
-    /// the machine: linked publication completes without DD, and the
-    /// next hook services both again. Complements the machine-side
-    /// prohibition (linked Joint keeps its publication-bearing
-    /// DISCOVERY for its existing owner).
+    /// the machine, but it sets the capture's sticky discovery status,
+    /// so the linked lane's coverage fails permanently at the next
+    /// audit while publication proceeds with coverage failed.
+    /// Complements the machine-side prohibition (linked Joint keeps
+    /// its publication-bearing DISCOVERY for its existing owner).
     pub(crate) fn service_linked_live_discovery(
         &mut self,
         work: usize,
@@ -2718,9 +2719,10 @@ impl AttestedSemanticLane {
             && !live.gated
             && !live.finished
         {
-            // A fault refuses without latching the machine: linked
-            // publication completes without DD, and the next hook
-            // services both again.
+            // A fault refuses without latching the machine, but sets
+            // the sticky discovery status: the next audit fails the
+            // lane's coverage permanently while publication proceeds
+            // with coverage failed.
             return live
                 .capture
                 .service_live_discovery_until(&mut live.session, work, deadline)

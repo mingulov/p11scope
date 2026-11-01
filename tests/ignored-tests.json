@@ -1441,6 +1441,30 @@
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_per_call_overhead",
       "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane on a quiet host (E4); N5 per-call overhead cell"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_key_operations_linked_lane_pumps_live_discovery",
+      "reason": "privileged: live linked lane pumps discovery through the live arm (journal build, serial)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_key_operations_live_discovery_fault_refuses_without_latching",
+      "reason": "privileged: live DD transport fault refuses without latching (journal build, serial)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_key_operations_seal_generation_gated_by_flag",
+      "reason": "privileged: live seal generation publishes only with the journal pair (serial)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching",
+      "reason": "privileged: live linked fault fails coverage without latching, finish publishes (journal build, serial; WU-4 live)",
+      "cell": "privileged"
     }
   ]
 }

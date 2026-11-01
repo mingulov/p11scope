@@ -478,11 +478,11 @@ PY
     # key-operations display latch (bootstrap_unavailable) does not
     # complete in production runs at this base, so the display state
     # is recorded in the row, never gated.
-    if [ ! -f "$J_TXT" ] || ! grep -q 'p11scope: semantic lane ready' "$J_TXT"; then
-        add_reason "semantic lane never sealed"
-    elif grep -q 'key operations unavailable' "$J_TXT"; then
+    if [ -f "$J_TXT" ] && grep -q 'key operations unavailable' "$J_TXT"; then
         REFUSAL=$(grep 'key operations unavailable' "$J_TXT" | head -1 | cut -c1-160)
         add_reason "linked lane refused: $REFUSAL"
+    elif [ ! -f "$J_TXT" ] || ! grep -q 'p11scope: semantic lane ready' "$J_TXT"; then
+        add_reason "semantic lane never sealed"
     elif ! grep -Eq 'semantic calls: collected [0-9]+, joined [1-9][0-9]*, shed [0-9]+, bindings [1-9][0-9]*' "$J_TXT"; then
         add_reason "linked lane idle (no joined calls)"
     fi

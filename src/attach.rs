@@ -12388,6 +12388,133 @@ mod tests {
     }
 
     #[test]
+    fn initial_bank_select_publishes_bank_a_prepared() {
+        // The bank-aware allocator refuses every identity until the select
+        // word is published; the initial image is bank A prepared, zero
+        // counts, zero incarnations. Every word is pinned: a wrong bank or
+        // prepared bit would refuse or misroute all issuance.
+        let select = super::initial_bank_select();
+        assert_eq!(select.bank, 0);
+        assert_eq!(select.prepared, [1, 0]);
+        assert_eq!(select.cuts, 0);
+        assert_eq!(select.refusals, 0);
+        assert_eq!(select.incarnation, [0, 0]);
+        assert_eq!(select.folded, [0, 0]);
+        assert_eq!(select.folds, 0);
+        assert_eq!(select.folded_issued, 0);
+        assert_eq!(select.update_losses, 0);
+    }
+
+    #[test]
+    fn bank_select_readback_rejects_each_field_mismatch() {
+        let expected = super::initial_bank_select();
+        super::validate_bank_select_readback(expected, expected).unwrap();
+        // Twelve u64 words; each one alone must fail the exact readback.
+        for word in 0..12 {
+            let mut actual = expected;
+            {
+                let words = [
+                    &mut actual.bank,
+                    &mut actual.prepared[0],
+                    &mut actual.prepared[1],
+                    &mut actual.cuts,
+                    &mut actual.refusals,
+                    &mut actual.incarnation[0],
+                    &mut actual.incarnation[1],
+                    &mut actual.folded[0],
+                    &mut actual.folded[1],
+                    &mut actual.folds,
+                    &mut actual.folded_issued,
+                    &mut actual.update_losses,
+                ];
+                *words[word] = words[word].wrapping_add(1);
+            }
+            assert!(
+                super::validate_bank_select_readback(expected, actual).is_err(),
+                "word {word} must fail the readback"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_preparation_publishes_bank_select_before_freeze() {
+        // Gate-1 preparation writes the bank-A select image with an exact
+        // readback, then freezes the bank task storage. The select word
+        // itself stays unfrozen: bank-B preparation and the later
+        // fold-claim cycle rewrite it from userspace.
+        let mut expected = Vec::new();
+        prepare_identity_with(true, true, |step| {
+            expected.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            expected,
+            &[
+                IdentityPreparation::WriteCookie,
+                IdentityPreparation::ReadCookie,
+                IdentityPreparation::WriteBankSelect,
+                IdentityPreparation::ReadBankSelect,
+                IdentityPreparation::WriteOwner,
+                IdentityPreparation::ReadOwner,
+                IdentityPreparation::WriteRoot,
+                IdentityPreparation::ReadRoot,
+                IdentityPreparation::SeedRoot,
+                IdentityPreparation::ReadSeed,
+                IdentityPreparation::Freeze("TASK_COOKIE"),
+                IdentityPreparation::Freeze("TASK_COOKIE_B"),
+                IdentityPreparation::Freeze("THREAD_OWNER"),
+                IdentityPreparation::Freeze("ROOT_AFFILIATION"),
+                IdentityPreparation::Freeze("COOKIE_CTL"),
+                IdentityPreparation::Freeze("OWNER_CTL"),
+                IdentityPreparation::Freeze("ROOT_CTL"),
+            ]
+        );
+        for fail in 0..expected.len() {
+            let mut calls = Vec::new();
+            let mut linked = false;
+            let result = prepare_identity_with(true, true, |step| {
+                calls.push(step);
+                if calls.len() == fail + 1 {
+                    bail!("injected gate setup failure");
+                }
+                Ok(())
+            })
+            .map(|()| {
+                linked = true;
+            });
+            assert!(result.is_err());
+            assert!(!linked);
+            assert_eq!(calls, expected[..=fail]);
+        }
+    }
+
+    #[test]
+    fn gate0_preparation_has_no_bank_steps() {
+        // Gate-0 preparation keeps exactly the historical step sequence.
+        let mut owned = Vec::new();
+        prepare_identity_with(true, false, |step| {
+            owned.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!owned.contains(&IdentityPreparation::WriteBankSelect));
+        assert!(!owned.contains(&IdentityPreparation::ReadBankSelect));
+        assert!(
+            !owned.contains(&IdentityPreparation::Freeze("TASK_COOKIE_B")),
+            "gate-0 freezes no bank storage"
+        );
+        let mut unowned = Vec::new();
+        prepare_identity_with(false, false, |step| {
+            unowned.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!unowned.contains(&IdentityPreparation::WriteBankSelect));
+        assert!(!unowned.contains(&IdentityPreparation::ReadBankSelect));
+    }
+
+    #[test]
     fn identity_controls_read_back_every_named_field() {
         assert_eq!(
             cookie_control_fields(ImageIdentityControl {

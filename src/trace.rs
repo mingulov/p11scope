@@ -897,10 +897,7 @@ mod tests {
         let line = evidence_line(&ev, crate::attach::CapturePolicy::Allowlisted);
         let value: serde_json::Value =
             serde_json::from_str(line.strip_prefix("EVIDENCE ").unwrap()).unwrap();
-        assert_eq!(
-            value["modules_skipped"][0]["name"],
-            "/opt/p11-kit-trust.so"
-        );
+        assert_eq!(value["modules_skipped"][0]["name"], "/opt/p11-kit-trust.so");
         assert!(
             value["modules_skipped"][0]["reason"]
                 .as_str()

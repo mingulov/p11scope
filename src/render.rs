@@ -1934,6 +1934,114 @@ fn scope_label(scope: &str) -> &'static str {
     }
 }
 
+/// Named module gaps shown in the terminal summary: at most this many
+/// `modules_skipped` lines plus an "and K more" line.
+pub(crate) const MODULE_GAPS_SHOWN: usize = 5;
+
+/// Attached providers named inside one closure-array gap line: the top
+/// three by counted calls plus an "and K more" suffix.
+const GAP_PROVIDERS_SHOWN: usize = 3;
+
+/// The named module gaps behind a PARTIAL verdict: every refused or
+/// partially covered module with its reason in plain words, what is still
+/// counted, and the hint. Empty when nothing was refused. Paths and reasons
+/// come from target-namespace labels, so every one is control-escaped.
+fn module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
+    let total = ev.discovery.modules_skipped.len();
+    if total == 0 {
+        return String::new();
+    }
+    let shown = total.min(MODULE_GAPS_SHOWN);
+    let mut out = format!("Module gaps (showing {shown} of {total}):\n");
+    for skipped in ev.discovery.modules_skipped.iter().take(shown) {
+        out.push_str(&format!(
+            "  {}: {}\n",
+            escape_controls(&skipped.name),
+            gap_line_body(ev, reports, skipped)
+        ));
+    }
+    if total > shown {
+        out.push_str(&format!("  and {} more\n", total - shown));
+    }
+    out
+}
+
+/// One named gap line's body: the status, the planner's reason, and the
+/// hint. A refused proxy layer points at the attached providers that count
+/// its forwarded calls; a refused provider points at `--module` (unless the
+/// reason already carries that hint, as shared-scope refusals do).
+fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) -> String {
+    let status = if crate::plan::is_growth_omission(&skipped.reason) {
+        "partially covered"
+    } else {
+        "not attached"
+    };
+    let mut body = format!("{status} — {}", escape_controls(&skipped.reason));
+    if crate::plan::is_closure_array_refusal(&skipped.reason) {
+        body.push_str(&closure_forwarding_hint(ev, reports));
+    } else if !skipped.reason.contains("--module") {
+        body.push_str(&format!(
+            "; capture it alone with --module {}",
+            escape_controls(&skipped.name)
+        ));
+    }
+    body
+}
+
+/// Where a refused proxy layer's forwarded calls are counted: the attached
+/// providers with their completed calls, top three plus "and K more" — or,
+/// when nothing below it counted, an explicit statement to that effect.
+fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport]) -> String {
+    let mut calls = std::collections::BTreeMap::<ModuleId, u64>::new();
+    for report in reports {
+        if let Some(module) = report.module {
+            let total = calls
+                .get(&module)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(report.calls);
+            calls.insert(module, total);
+        }
+    }
+    let mut providers: Vec<(&str, u64)> = calls
+        .iter()
+        .filter(|(_, calls)| **calls > 0)
+        .filter_map(|(id, calls)| {
+            ev.discovery
+                .modules
+                .iter()
+                .find(|module| module.id == *id)
+                .map(|module| (module.path.as_str(), *calls))
+        })
+        .collect();
+    providers.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    if providers.is_empty() {
+        if ev.discovery.modules.is_empty() {
+            return "; no provider below it was captured".into();
+        }
+        return "; the attached providers counted 0 calls".into();
+    }
+    let mut list: Vec<String> = providers
+        .iter()
+        .take(GAP_PROVIDERS_SHOWN)
+        .map(|(path, calls)| {
+            format!(
+                "{}: {calls} call{}",
+                escape_controls(path),
+                if *calls == 1 { "" } else { "s" }
+            )
+        })
+        .collect();
+    let more = providers.len().saturating_sub(GAP_PROVIDERS_SHOWN);
+    if more > 0 {
+        list.push(format!("and {more} more"));
+    }
+    format!(
+        "; calls it forwards are counted at the attached providers ({})",
+        list.join(", ")
+    )
+}
+
 /// Human context from aggregate map rows and the existing evidence verdict.
 /// Scope is a kind, never a target PID, path or application identity.
 pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> String {
@@ -1969,6 +2077,7 @@ pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> Stri
             "Coverage partial: event detail was lost. Aggregate counts use the counter maps.\n",
         );
     }
+    text.push_str(&module_gap_lines(ev, reports));
     for (has_owner_gap, total, description) in [
         (
             reports.iter().any(|row| row.module_ambiguous),
@@ -5890,7 +5999,10 @@ pub(crate) mod tests {
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(text.contains("1 modules refused"), "{text}");
         assert!(text.contains("Module gaps (showing 1 of 1):"), "{text}");
-        assert!(text.contains("/opt/p11-kit-trust.so: not attached — "), "{text}");
+        assert!(
+            text.contains("/opt/p11-kit-trust.so: not attached — "),
+            "{text}"
+        );
         assert!(text.contains("module needs 68 more"), "{text}");
         assert!(
             text.contains("capture it alone with --module /opt/p11-kit-trust.so"),
@@ -5910,7 +6022,10 @@ pub(crate) mod tests {
         ev.verdict();
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(text.contains("1 modules partially covered"), "{text}");
-        assert!(text.contains("/opt/grown.so: partially covered — "), "{text}");
+        assert!(
+            text.contains("/opt/grown.so: partially covered — "),
+            "{text}"
+        );
         assert!(text.contains("kept its 511 attached endpoints"), "{text}");
         assert!(
             text.contains("capture it alone with --module /opt/grown.so"),
@@ -5940,7 +6055,10 @@ pub(crate) mod tests {
         });
         ev.verdict();
         let text = scope_summary("pid", &[row], &ev);
-        assert!(text.contains("/opt/libp11-kit.so: not attached — "), "{text}");
+        assert!(
+            text.contains("/opt/libp11-kit.so: not attached — "),
+            "{text}"
+        );
         assert!(text.contains("64 lookalike function tables"), "{text}");
         assert!(
             text.contains(
@@ -5956,6 +6074,7 @@ pub(crate) mod tests {
     #[test]
     fn scope_summary_names_a_refused_closure_array_with_nothing_below_it() {
         let mut ev = evidence();
+        ev.discovery.modules.clear();
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libp11-kit.so".into(),
             reason: "module needs 6530 more; only 512 attach slots are available; 0 are in use \
@@ -5965,9 +6084,30 @@ pub(crate) mod tests {
         });
         ev.verdict();
         let text = scope_summary("pid", &[], &ev);
-        assert!(text.contains("/opt/libp11-kit.so: not attached — "), "{text}");
         assert!(
-            text.contains("no provider below it was captured"),
+            text.contains("/opt/libp11-kit.so: not attached — "),
+            "{text}"
+        );
+        assert!(text.contains("no provider below it was captured"), "{text}");
+    }
+
+    /// A refused closure array above attached-but-quiet providers says the
+    /// providers counted nothing, rather than naming a count.
+    #[test]
+    fn scope_summary_names_a_refused_closure_array_above_quiet_providers() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libp11-kit.so".into(),
+            reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
+                 (68 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
+                 tables (a proxy closure array is admitted whole or not at all)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[], &ev);
+        assert!(!ev.discovery.modules.is_empty());
+        assert!(
+            text.contains("the attached providers counted 0 calls"),
             "{text}"
         );
     }

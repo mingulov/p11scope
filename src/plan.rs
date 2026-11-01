@@ -287,6 +287,13 @@ pub(crate) fn is_growth_omission(reason: &str) -> bool {
     reason.starts_with(GROWTH_OMISSION)
 }
 
+/// Whether a `modules_skipped` reason records a refused proxy closure
+/// array (whole or growth): the terminal report names where its forwarded
+/// calls are counted instead of suggesting `--module` for it.
+pub(crate) fn is_closure_array_refusal(reason: &str) -> bool {
+    reason.contains("(a proxy closure array is admitted whole or not at all)")
+}
+
 /// The omitted count a growth omission states — the `N` of
 /// `admitted module needs N more;` — or `None` for any other reason.
 pub(crate) fn growth_omitted_count(reason: &str) -> Option<usize> {

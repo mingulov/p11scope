@@ -157,8 +157,10 @@ is_positive_int() {
 # exit-time demoted tail (case b: exactly one rejected demoted count gap
 # for the sample caller with base == edge and absolute == want, plus
 # exit-time evidence and no placed, budget or sharing gaps; controller
-# ruling 2026-11-01). Prints "<want> counted" and records the case
-# letter in DIR/gate_case.
+# ruling 2026-11-01). Prints "<want> counted" and records one forensic
+# line in DIR/gate_case: "a pid=<sample pid>" for the exact case, "b
+# pid=<sample pid> base=<base> absolute=<absolute>" for the demoted
+# tail (pid is "unknown" when the sample caller has no catalog row).
 check_counted() {
     python3 -I - "$1/inventory.json" "$2" "$3" <<'EOF'
 import json, os, re, sys
@@ -203,9 +205,16 @@ rejected = [g for g in gaps
             if g.get("subject") == "rejected demoted count" and g.get("caller") == sample_caller]
 
 
-def record(case):
+sample_pid = "unknown"
+for caller in doc.get("callers") or []:
+    if caller.get("id") == sample_caller and caller.get("pid") is not None:
+        sample_pid = caller.get("pid")
+        break
+
+
+def record(case, detail=""):
     with open(os.path.join(os.path.dirname(path), "gate_case"), "w") as handle:
-        handle.write(case + "\n")
+        handle.write(f"{case} pid={sample_pid}{detail}\n")
 
 
 if edge == want:
@@ -244,7 +253,7 @@ for gap in gaps:
     if rides and (gap.get("subject") == "ambiguous shared endpoint"
                   or "sharing appeared" in gap.get("reason", "")):
         sys.exit(f"mid-life sharing gap rides the sample edge: {gap.get('subject')!r}")
-record("b")
+record("b", f" base={base} absolute={absolute}")
 print(f"{want} counted", file=sys.stdout)
 print(f"check_counted: case b exit-time demoted tail base={base} absolute={absolute} want={want}",
       file=sys.stderr)

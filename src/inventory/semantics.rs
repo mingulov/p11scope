@@ -2910,7 +2910,7 @@ impl AttestedSemanticLane {
             .filter(|binding| binding.scope_current())
             .map(SemanticCallerBinding::pin)
             .collect();
-        let (mut report, shed) = tick_collected_with_stash_merge(
+        let (report, shed) = tick_collected_with_stash_merge(
             &mut live.capture,
             &mut live.stashed_refresh,
             |capture| capture.tick_collected(&mut live.session, &pins, raw),

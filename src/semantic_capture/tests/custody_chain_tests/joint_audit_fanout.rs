@@ -526,7 +526,7 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
         let HeldH0 {
             capture, io, stash, ..
         } = &mut *owned;
-        let (mut report, shed) = tick_collected_with_stash_merge(capture, stash, |capture| {
+        let (report, shed) = tick_collected_with_stash_merge(capture, stash, |capture| {
             capture.tick_collected_with(io, raw)
         })
         .map_err(|_| SemanticRefusal::Unavailable)?;

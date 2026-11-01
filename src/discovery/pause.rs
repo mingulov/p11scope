@@ -1371,18 +1371,26 @@ impl PauseCoordinator {
         self.finish_nonconfirmed(retained_error.unwrap_or_else(|| MSG_PAUSE_HELPER_REJECTED.into()))
     }
 
+    /// Proves the owned child stopped: the exact preflight task set, every
+    /// task in `T`. The helper's SIGSTOP lands asynchronously, so a matching
+    /// set that is still running waits a millisecond and samples again
+    /// within the causal deadline. A changed set is never waited out: new
+    /// or vanished tasks fail the proof immediately.
     fn sample_stopped(&self, io: &mut impl PauseIo, deadline: u64) -> Result<u64, String> {
-        let states = io.task_states(self.pid)?;
-        let now = io.now_ns()?;
-        if now > deadline {
-            return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
+        loop {
+            let states = io.task_states(self.pid)?;
+            let now = io.now_ns()?;
+            if now > deadline {
+                return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
+            }
+            if states.keys().ne(self.expected_tasks.keys()) {
+                return Err("task set changed or was not entirely stopped".into());
+            }
+            if states.values().all(|state| *state == b'T') {
+                return Ok(now);
+            }
+            io.wait_one_ms()?;
         }
-        if states.keys().ne(self.expected_tasks.keys())
-            || states.values().any(|state| *state != b'T')
-        {
-            return Err("task set changed or was not entirely stopped".into());
-        }
-        Ok(now)
     }
 
     fn observe_resumed(
@@ -2775,6 +2783,10 @@ mod tests {
         now: VecDeque<Result<u64, String>>,
         fallback_now: u64,
         states: VecDeque<Result<BTreeMap<u32, u8>, String>>,
+        /// Last staged task set, repeated once the queue drains: like the
+        /// real `/proc` read, the fake's world persists until scripted
+        /// otherwise. `None` until the first staged read.
+        stable_states: Option<BTreeMap<u32, u8>>,
         queue: VecDeque<Result<Option<DiscoveryItem>, String>>,
         authorization: Option<u64>,
         authorization_results: VecDeque<Result<Option<u64>, String>>,
@@ -2825,6 +2837,7 @@ mod tests {
                 now: VecDeque::new(),
                 fallback_now: 0,
                 states: VecDeque::new(),
+                stable_states: None,
                 queue: VecDeque::new(),
                 authorization: None,
                 authorization_results: VecDeque::new(),
@@ -2904,13 +2917,17 @@ mod tests {
         }
 
         fn task_states(&mut self, _: u32) -> Result<BTreeMap<u32, u8>, String> {
-            self.states.pop_front().unwrap_or_else(|| {
-                if self.resumed && !self.post_resume_all_stopped {
-                    Ok([(41, b'R'), (42, b'T')].into_iter().collect())
-                } else {
-                    Ok(stopped())
+            if let Some(states) = self.states.pop_front() {
+                if let Ok(states) = &states {
+                    self.stable_states = Some(states.clone());
                 }
-            })
+                return states;
+            }
+            if self.resumed && !self.post_resume_all_stopped {
+                Ok([(41, b'R'), (42, b'T')].into_iter().collect())
+            } else {
+                Ok(self.stable_states.clone().unwrap_or_else(stopped))
+            }
         }
 
         fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
@@ -3762,8 +3779,8 @@ mod tests {
     }
 
     /// A child that never stops (every sample reports it running) cannot
-    /// confirm: the delivery wait ends at the confirmation deadline with an
-    /// ordinary failure, never a lifecycle one.
+    /// confirm: the delivery wait ends at the confirmation deadline, which
+    /// `always` refuses as a required pause failure.
     #[test]
     fn a_stop_that_never_lands_fails_on_the_confirmation_deadline() {
         let mut io = successful_io(vec![record(10, 0, false)]);
@@ -3774,7 +3791,7 @@ mod tests {
 
         let error = coordinator.service(&mut io).unwrap_err();
 
-        assert!(!error.lifecycle());
+        assert!(error.required());
         assert!(
             format!("{error}").contains(MSG_PAUSE_CONFIRMATION_DEADLINE),
             "a running child fails on the deadline, not the task set: {error}"

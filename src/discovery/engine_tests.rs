@@ -5724,6 +5724,88 @@ fn arming_views_that_share_one_loader_reads_its_bytes_once() {
     }
 }
 
+/// The loader-facts reuse is exact-file only. A retained key serves the
+/// unchanged file with zero reads; a byte-identical copy (another inode) and
+/// the same file after any change (a new ctime) both miss and are read and
+/// charged in full, so a flood of distinct or changing loader files still
+/// meets the capture's attempted-I/O ceiling.
+#[test]
+fn loader_facts_reuse_only_the_unchanged_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let shell = StoppedShell::spawn();
+    let view = ProcessView::open(ProcessViewId(0), shell.0.id()).unwrap();
+    let locator = Engine::loader_locator(&view, &mut CaptureWorkBudget::default())
+        .unwrap()
+        .expect("/bin/sh is a dynamic executable with a PT_INTERP loader");
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("loader-copy.so");
+    std::fs::copy(
+        format!(
+            "/proc/{}/root{}",
+            shell.0.id(),
+            locator.authority.loader_path.display()
+        ),
+        &copy,
+    )
+    .unwrap();
+    let size = std::fs::metadata(&copy).unwrap().len();
+    let file = std::fs::File::open(&copy).unwrap();
+    let mut budget = CaptureWorkBudget::default();
+    let charged = |budget: &mut CaptureWorkBudget, file: &std::fs::File| {
+        let before = budget.attempted_io_bytes();
+        let (facts, fresh) = loader_elf_facts(file, budget).unwrap();
+        (facts, fresh, budget.attempted_io_bytes() - before)
+    };
+
+    // A fresh read is charged and offers its key; nothing is retained until
+    // the caller's arm commits, so a second read is charged again.
+    let (facts, fresh, spent) = charged(&mut budget, &file);
+    assert_eq!(spent, size, "a fresh loader read charges the whole file");
+    assert_eq!(facts, locator_facts(&file));
+    let key = fresh.expect("a stable fresh read offers its key");
+    let (_, again, spent) = charged(&mut budget, &file);
+    assert_eq!(spent, size, "unretained facts are read again");
+    assert_eq!(again, Some(key));
+
+    // Retained: the unchanged file reuses the facts with zero reads.
+    assert!(budget.note_loader_elf_facts(key, facts.clone()));
+    let (reused, none, spent) = charged(&mut budget, &file);
+    assert_eq!(spent, 0, "the unchanged file reuses its retained facts");
+    assert_eq!(none, None, "a reuse offers no key to retain");
+    assert_eq!(reused, facts);
+
+    // A byte-identical copy is another file: read and charged in full.
+    let other = dir.path().join("loader-other.so");
+    std::fs::copy(&copy, &other).unwrap();
+    let other_file = std::fs::File::open(&other).unwrap();
+    let (other_facts, other_key, spent) = charged(&mut budget, &other_file);
+    assert_eq!(
+        spent, size,
+        "a distinct loader file is never served the cache"
+    );
+    assert_eq!(other_facts, facts);
+    assert_ne!(other_key, Some(key));
+
+    // Any change to the retained file moves its ctime: a miss, charged again.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_, changed_key, spent) = charged(&mut budget, &file);
+    assert_eq!(spent, size, "a changed loader file is read again");
+    assert_ne!(changed_key, Some(key));
+}
+
+/// The facts a direct snapshot read gives, for comparison with the cache.
+fn locator_facts(file: &std::fs::File) -> LoaderElfFacts {
+    let snapshot = read_elf_snapshot(file, &mut CaptureWorkBudget::default()).unwrap();
+    LoaderElfFacts {
+        abi: snapshot.abi(),
+        hook: snapshot
+            .defined_symbol("_dl_debug_state")
+            .map(|hook| hook.filter(|hook| snapshot.is_executable_offset(hook.file_offset))),
+        state_address: loader_state_address(&snapshot),
+    }
+}
+
 #[test]
 fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
     struct ChildGuard(std::process::Child);

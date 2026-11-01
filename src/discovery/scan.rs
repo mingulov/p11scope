@@ -11,7 +11,7 @@ use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{ExaminedObject, Pin, pin_of};
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::process::{MountNamespaceId, PidPin, ProcessView, ProcessViewId};
-use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
+use p11scope_manifest::elf::{ElfAbi, ElfSnapshot, SymbolFact};
 use p11scope_manifest::identity::{InspectedObject, open_object};
 use p11scope_manifest::maps::{
     Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved, parse_maps,
@@ -915,6 +915,45 @@ pub(crate) struct ElfExportFacts {
     pub(crate) excluded_anchor_ranges: Vec<(u64, u64)>,
 }
 
+/// Identity of one dynamic loader file whose ELF facts loader arming read: the
+/// opened descriptor's own `st_dev` plus its `(ino, size, ctime)` pin. Both
+/// the reading and the reusing side key on `fstat` of an opened descriptor,
+/// so the comparison is like-for-like; any change to the file moves its
+/// ctime and misses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LoaderFactsKey {
+    pub(crate) device: u64,
+    pub(crate) pin: Pin,
+}
+
+/// The file-derived facts loader arming and its revalidation take from one
+/// dynamic loader ELF: its ABI, its executable `_dl_debug_state` hook and its
+/// `r_state` address, each with the exact decode error the snapshot gave.
+/// Only these few words are kept, never the file bytes. Nothing here comes
+/// from a target process, so the facts are safe to share across views the
+/// way the scan's export facts are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoaderElfFacts {
+    pub(crate) abi: ElfAbi,
+    pub(crate) hook: Result<Option<SymbolFact>, String>,
+    pub(crate) state_address: Result<Option<u64>, String>,
+}
+
+fn loader_cache_bytes(key: &LoaderFactsKey, value: &LoaderElfFacts) -> u64 {
+    let dynamic = value
+        .hook
+        .as_ref()
+        .err()
+        .map_or(0, String::len)
+        .saturating_add(value.state_address.as_ref().err().map_or(0, String::len));
+    u64::try_from(
+        std::mem::size_of_val(key)
+            .saturating_add(std::mem::size_of_val(value))
+            .saturating_add(dynamic),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 fn inspected_cache_bytes(key: &InspectedFileKey, value: &InspectedFile) -> u64 {
     let dynamic = value
         .identity
@@ -1016,6 +1055,11 @@ pub struct CaptureWorkBudget {
     runtime_table_contents: BTreeMap<(ProcessViewId, u64, u64, usize), (u64, u64)>,
     inspected_files: BTreeMap<InspectedFileKey, InspectedFile>,
     elf_export_facts: BTreeMap<InspectedFileKey, ElfExportFacts>,
+    /// Dynamic loader facts one completed loader arm read and revalidated.
+    /// A later arm of the same unchanged loader file reuses them instead of
+    /// re-reading the whole loader for its locator, snapshot and both
+    /// revalidation brackets.
+    loader_elf_facts: BTreeMap<LoaderFactsKey, LoaderElfFacts>,
     interface_records: usize,
     admitted_interfaces: BTreeSet<InterfaceIdentity>,
     /// New distinct candidates refused by the cardinality ceilings. Sticky
@@ -1068,6 +1112,7 @@ impl CaptureWorkBudget {
             runtime_table_contents: BTreeMap::new(),
             inspected_files: BTreeMap::new(),
             elf_export_facts: BTreeMap::new(),
+            loader_elf_facts: BTreeMap::new(),
             interface_records: 0,
             admitted_interfaces: BTreeSet::new(),
             table_refusals: 0,
@@ -1693,6 +1738,44 @@ impl CaptureWorkBudget {
             .inspected_files
             .insert(key, value)
             .map_or(0, |old| inspected_cache_bytes(&key, &old));
+        self.retained_cache_bytes = self
+            .retained_cache_bytes
+            .saturating_sub(old)
+            .saturating_add(bytes);
+        true
+    }
+
+    pub(crate) fn loader_elf_facts_for(&self, key: &LoaderFactsKey) -> Option<LoaderElfFacts> {
+        self.loader_elf_facts.get(key).cloned()
+    }
+
+    /// Retains one loader's facts under the same retained-cache accounting
+    /// as the export facts (bounded by the export entry limit and the shared
+    /// cache bytes under Inventory policy).
+    pub(crate) fn note_loader_elf_facts(
+        &mut self,
+        key: LoaderFactsKey,
+        value: LoaderElfFacts,
+    ) -> bool {
+        if !self.may_mutate_retained_state() {
+            return false;
+        }
+        let bytes = loader_cache_bytes(&key, &value);
+        if !self.cache_can_replace(
+            self.loader_elf_facts
+                .get(&key)
+                .map(|old| loader_cache_bytes(&key, old)),
+            bytes,
+            self.loader_elf_facts.len(),
+            self.inventory_limits()
+                .map(|limits| limits.retained.export_cache_entries),
+        ) {
+            return false;
+        }
+        let old = self
+            .loader_elf_facts
+            .insert(key, value)
+            .map_or(0, |old| loader_cache_bytes(&key, &old));
         self.retained_cache_bytes = self
             .retained_cache_bytes
             .saturating_sub(old)

@@ -346,6 +346,39 @@ enum TracePhase {
     Seeding,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewLogOwner {
+    Owned,
+    Ambient,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewLogArmed {
+    Armed,
+    Unarmed,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewLogKind {
+    Allocated,
+    Released,
+    Evicted,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewLogEntry {
+    pub(crate) ordinal: usize,
+    pub(crate) kind: ViewLogKind,
+    pub(crate) view: ProcessViewId,
+    pub(crate) pid: Option<u32>,
+    pub(crate) owner: ViewLogOwner,
+    pub(crate) armed: ViewLogArmed,
+}
+
 pub struct Engine {
     return_probe_admission: Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
     plan: plan::AttachPlan,
@@ -681,6 +714,52 @@ pub struct Engine {
     /// Unkeyed names examined by the latest `names_view_bounded` call (names test).
     #[cfg(test)]
     names_inspected: Cell<usize>,
+    /// Test-only process-view allocation/release/eviction log (R3 pressure
+    /// diagnostic): every ID minted, freed or rotated, with owned/ambient
+    /// and armed/unarmed state at the record time. Never in release bytes.
+    #[cfg(test)]
+    view_log: Vec<ViewLogEntry>,
+}
+
+#[cfg(test)]
+impl Engine {
+    pub(crate) fn view_log(&self) -> &[ViewLogEntry] {
+        &self.view_log
+    }
+
+    fn view_log_owner(&self, view: ProcessViewId) -> ViewLogOwner {
+        if self
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view)
+        {
+            ViewLogOwner::Owned
+        } else {
+            ViewLogOwner::Ambient
+        }
+    }
+
+    fn view_log_armed(&self, view: ProcessViewId) -> ViewLogArmed {
+        if self.loader_registry.ids_for_view(view).is_empty() {
+            ViewLogArmed::Unarmed
+        } else {
+            ViewLogArmed::Armed
+        }
+    }
+
+    fn record_view_log(&mut self, kind: ViewLogKind, view: ProcessViewId, pid: Option<u32>) {
+        let ordinal = self.view_log.len() + 1;
+        let owner = self.view_log_owner(view);
+        let armed = self.view_log_armed(view);
+        self.view_log.push(ViewLogEntry {
+            ordinal,
+            kind,
+            view,
+            pid,
+            owner,
+            armed,
+        });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9780,6 +9859,8 @@ impl Engine {
             collected_test_transport_pending: false,
             #[cfg(test)]
             names_inspected: Cell::new(0),
+            #[cfg(test)]
+            view_log: Vec::new(),
         }
     }
 
@@ -11140,6 +11221,13 @@ impl Engine {
     }
 
     fn allocate_view_id(&mut self) -> Result<ProcessViewId> {
+        let id = self.allocate_view_id_inner()?;
+        #[cfg(test)]
+        self.record_view_log(ViewLogKind::Allocated, id, None);
+        Ok(id)
+    }
+
+    fn allocate_view_id_inner(&mut self) -> Result<ProcessViewId> {
         if self.inventory.is_some() {
             self.inventory_state()?;
             let Some(inventory) = self.inventory.as_mut() else {
@@ -11187,6 +11275,14 @@ impl Engine {
     }
 
     fn release_view_id(&mut self, id: ProcessViewId) {
+        #[cfg(test)]
+        let release_pid = self
+            .views
+            .iter()
+            .find(|view| view.id() == id)
+            .map(|view| view.pid());
+        #[cfg(test)]
+        self.record_view_log(ViewLogKind::Released, id, release_pid);
         // A retained collected transaction keeps its original ID: under
         // collected Finish the bookkeeping below still runs, but the ID
         // never returns to the free list (no reuse after Q; the Engine ends
@@ -21306,6 +21402,23 @@ impl Engine {
         }
         self.loader_contexts
             .retain(|(view, _, _), _| !victims.contains(view));
+        #[cfg(test)]
+        {
+            let logged: Vec<(ProcessViewId, Option<u32>)> = victims
+                .iter()
+                .map(|id| {
+                    let pid = self
+                        .views
+                        .iter()
+                        .find(|view| view.id() == *id)
+                        .map(|view| view.pid());
+                    (*id, pid)
+                })
+                .collect();
+            for (id, pid) in logged {
+                self.record_view_log(ViewLogKind::Evicted, id, pid);
+            }
+        }
         self.views.retain(|view| !victims.contains(&view.id()));
         for id in &victims {
             self.release_view_id(*id);
@@ -29972,5 +30085,56 @@ mod backlog_transfer_tests {
             engine.discovery_held_len() + session.staged_discovery_len() <= DISCOVERY_HELD_CAP,
             "retained holdings stay within the shared allowance"
         );
+    }
+}
+
+#[cfg(test)]
+mod view_log_tests {
+    use super::*;
+
+    #[test]
+    fn view_log_records_allocations_and_releases_with_gapless_ordinals() {
+        let mut engine = Engine::empty();
+        assert!(engine.view_log().is_empty());
+        let first = engine.allocate_view_id().unwrap();
+        let second = engine.allocate_view_id().unwrap();
+        assert_eq!(engine.view_log().len(), 2);
+        let ordinals: Vec<usize> = engine
+            .view_log()
+            .iter()
+            .map(|entry| entry.ordinal)
+            .collect();
+        assert_eq!(ordinals, vec![1, 2]);
+        assert!(
+            engine
+                .view_log()
+                .iter()
+                .all(|entry| entry.kind == ViewLogKind::Allocated)
+        );
+        assert!(
+            engine
+                .view_log()
+                .iter()
+                .all(|entry| entry.armed == ViewLogArmed::Unarmed)
+        );
+        engine.release_view_id(first);
+        engine.release_view_id(second);
+        assert_eq!(engine.view_log().len(), 4);
+        let kinds: Vec<ViewLogKind> = engine.view_log().iter().map(|entry| entry.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ViewLogKind::Allocated,
+                ViewLogKind::Allocated,
+                ViewLogKind::Released,
+                ViewLogKind::Released,
+            ]
+        );
+        let ordinals: Vec<usize> = engine
+            .view_log()
+            .iter()
+            .map(|entry| entry.ordinal)
+            .collect();
+        assert_eq!(ordinals, vec![1, 2, 3, 4]);
     }
 }

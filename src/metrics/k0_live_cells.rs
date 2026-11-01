@@ -558,10 +558,10 @@ fn k0_detail_inner(workload: &K0Workload, module: &str, observer: &Path) -> Resu
     let ledger_out = workload.path("k0p.ledger.out");
     // Four main-phase iterations, one clean C_Sign each; setup and
     // teardown never call C_Sign, so the window count is exactly 4.
-    let mut target = workload.spawn_mech(&ledger_out, &module, &gate, 4)?;
+    let mut target = workload.spawn_mech(&ledger_out, module, &gate, 4)?;
     target.wait_for("READY ", Duration::from_secs(60))?;
     let pid = target.child.id();
-    let mut child = spawn_observer(&observer, pid, 60, &out, &log)?;
+    let mut child = spawn_observer(observer, pid, 60, &out, &log)?;
     wait_for_observer_row(
         &log,
         CAPTURE_READY_NEEDLE,
@@ -639,7 +639,7 @@ fn k0_exec_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result
     // Generation 0 runs 2 iterations, execs the same ledger binary,
     // and generation 1 runs 4: every image's count is distinct, and
     // the same provider maps on both sides of the exec.
-    let mut target = workload.spawn_chain(&ledger_out, &module, &gate, &gates, 2)?;
+    let mut target = workload.spawn_chain(&ledger_out, module, &gate, &gates, 2)?;
     target.wait_for_line(
         &["WATCH_READY", "gen=0", "phase=go"],
         "gen0 go",
@@ -648,7 +648,7 @@ fn k0_exec_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result
     std::fs::write(c8_gate(&gates, 0, "go"), b"open\n")?;
     target.wait_for("READY ", Duration::from_secs(60))?;
     let pid = target.child.id();
-    let mut child = spawn_observer(&observer, pid, 150, &out, &log)?;
+    let mut child = spawn_observer(observer, pid, 150, &out, &log)?;
     wait_for_observer_row(
         &log,
         CAPTURE_READY_NEEDLE,

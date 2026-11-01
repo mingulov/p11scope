@@ -2387,9 +2387,11 @@ pub(crate) fn exact_table_addresses_n(
 /// Whether a slot-validation failure at `ordinal` still leaves a complete
 /// validated 68-slot legacy prefix: the mislabelled-table shape (a 3.x
 /// version word over a 2.x table), accepted as its prefix instead of
-/// rejected. `prefix_non_null` counts validated non-NULL slots below 68.
+/// rejected. `prefix_non_null` counts validated non-NULL slots below 68;
+/// at least two are required so a single-entry BSS lookalike cannot admit
+/// a second table and churn the attach set pass to pass.
 fn mislabelled_tail_ordinal(version: (u8, u8), ordinal: usize, prefix_non_null: usize) -> bool {
-    version.0 == 3 && ordinal >= LEGACY_PREFIX_SLOTS && prefix_non_null > 0
+    version.0 == 3 && ordinal >= LEGACY_PREFIX_SLOTS && prefix_non_null > 1
 }
 
 /// Decodes one candidate at `offset` inside `snapshot` (whose first byte is at
@@ -7828,6 +7830,92 @@ mod tests {
             table.decoded_slot_count(),
             70,
             "holes and moved-aside records stay counted as decoded"
+        );
+    }
+
+    /// A stable mapping yields an identical admitted set every pass: a
+    /// BSS word in the tail span flipping to a version-like value between
+    /// deep-scan passes (no mapping change) must not admit a second
+    /// single-entry table. Such churn was once suspected of the Fedora
+    /// call retirements, but those gaps reproduce with a static scan, so
+    /// this is sweep-stability hardening, not their cause. This twin pins
+    /// that stability over the real tail shape (executable-led
+    /// personality slot, data typeinfo slot, BSS tail).
+    #[test]
+    fn mislabelled_68_slot_prefix_stays_stable_when_tail_words_change_between_passes() {
+        let maps = mislabelled_fixture_maps();
+        let map_index = MapIndex::new(&maps).unwrap();
+        // One mapping-sized snapshot: real table at offset 0 (68 distinct
+        // executable slots, Fedora tail with personality + typeinfo), then
+        // BSS zeros. Pass B flips one BSS word (slot 99's position) to a
+        // version word with a single distinct executable entry behind it.
+        fn sweep_snapshot(with_false_version: bool) -> Vec<u8> {
+            let mut snapshot = vec![0u8; 2048];
+            snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+            for ordinal in 0..68 {
+                let address = 0x1500u64 + ordinal as u64 * 0x10;
+                let at = 8 + ordinal * 8;
+                snapshot[at..at + 8].copy_from_slice(&address.to_le_bytes());
+            }
+            // Fedora tail: slot 68 executable (personality), slot 69 data
+            // (typeinfo), slots 70..98 file constants (data), slots 99..103
+            // BSS (zeros here, the file-tail span).
+            let tail = [(68usize, 0x1500u64), (69, 0x4500u64)];
+            for (slot, word) in tail {
+                let at = 8 + slot * 8;
+                snapshot[at..at + 8].copy_from_slice(&word.to_le_bytes());
+            }
+            for slot in 70..99 {
+                let at = 8 + slot * 8;
+                snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+            }
+            if with_false_version {
+                // BSS counter reaching 515 between passes: a version word
+                // at slot 99's position with one new executable entry
+                // (offset 0xa00, outside the real 68 distinct offsets
+                // 0x500..0x930) behind 67 NULL holes, then data tail.
+                let base = 8 + 99 * 8;
+                snapshot[base..base + 8].copy_from_slice(&0x0203u64.to_le_bytes());
+                snapshot[base + 8..base + 16].copy_from_slice(&0x1a00u64.to_le_bytes());
+                for ordinal in 68..104 {
+                    let at = base + 8 + ordinal * 8;
+                    snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+                }
+            }
+            snapshot
+        }
+        let first = sweep_snapshot(false);
+        let second = sweep_snapshot(true);
+        let (tables_a, skipped_a) = detect_tables(
+            &first,
+            0x7000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
+        let (tables_b, skipped_b) = detect_tables(
+            &second,
+            0x7000,
+            &map_index,
+            &mut CaptureWorkBudget::default(),
+        );
+        assert!(skipped_a.is_empty(), "{skipped_a:?}");
+        assert!(skipped_b.is_empty(), "{skipped_b:?}");
+        assert_eq!(
+            tables_a.len(),
+            1,
+            "the first pass finds the real 68-slot table"
+        );
+        assert_eq!(tables_a[0].entries.len(), 68);
+        // The BSS false version must not admit a second table: same count,
+        // same entries, same key on both passes with no mapping change.
+        assert_eq!(
+            tables_b.len(),
+            tables_a.len(),
+            "a BSS version-like word must not grow the admitted set"
+        );
+        assert_eq!(
+            tables_b, tables_a,
+            "the admitted set must be identical when only BSS tail words change"
         );
     }
 

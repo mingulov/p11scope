@@ -3617,7 +3617,9 @@ mod tests {
 
     /// Headless mailbox (P1a): a view naming another capture refuses
     /// `ForeignCapture` even when the receipt names the viewed
-    /// revision (the stale check passes first, pinning check order).
+    /// revision, so the stale check cannot be what refuses it. The
+    /// inputs refuse the same way under either check order, so this
+    /// twin does not pin the order.
     #[test]
     fn headless_request_foreign_capture() {
         use crate::discovery::caller_registry::{CallerId, ModuleId};

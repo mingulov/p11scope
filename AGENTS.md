@@ -101,9 +101,10 @@ boundaries and whitespace; do not claim runtime qualification from those checks.
   verify its SHA, configuration and required jobs/shards instead of duplicating
   it locally. Installed/kernel-specific acceptance remains separate. Later
   changes invalidate affected checks, not every unrelated historical result.
-- The ordinary CI matrix covers default unignored tests. Track required
-  ignored/excluded/feature/live cells separately and run exact selectors;
-  membership counts alone do not prove a positive executed. Register new or
+- `ci.yml` covers default unignored tests and `privileged-tests.yml` the
+  curated privileged cells. Track other ignored/feature/live cells separately
+  and run exact selectors; membership counts alone do not prove a positive
+  executed. Register new or
   renamed Python suites in the same patch and run
   `python3 -I scripts/run-python-suites.py --check` before remote pushes.
   Use that runner with filenames to execute affected standalone suites.
@@ -154,6 +155,23 @@ Privileged, container and VM experiments need the host owner's authorization.
 Honor authorization already given for the task, check ownership of resources,
 and clean up only resources created by the experiment. Do not disturb an
 unrelated browser, service, VM, container or another agent's capture.
+
+Hosted CI runs privileged tests: GitHub runners provide passwordless root,
+BTF and KVM. `.github/workflows/privileged-tests.yml` runs on every push:
+- the curated privileged library cells (`scripts/run-privileged-lib-tests.sh`,
+  sharded, with a coverage check);
+- the system-scale capture cells;
+- the public CLI cells on the runner kernel and in virtme-ng guests;
+- real Firefox and Chromium cells (Playwright, strict).
+
+`bpf-kernels.yml` loads every program across kernels. Keep both green for
+capture, attachment, BPF, discovery and lifecycle changes, and add a cell when
+a mode or scope ships. Kernels, distributions, long cells and quiet performance
+runs that CI lacks still need authorized hosts.
+
+A self-skip is not a pass. Fixtures must probe provider paths rather than
+hard-code one: SoftHSM is under `/usr/lib/x86_64-linux-gnu/softhsm/` on
+Debian/Ubuntu and under `/usr/lib64/pkcs11/` on Fedora.
 
 ## Changes and Git history
 

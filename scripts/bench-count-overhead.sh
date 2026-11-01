@@ -152,12 +152,20 @@ is_positive_int() {
 
 # check_counted DIR OPS THREADS: the on-arm exactness gate. inventory.json
 # must hold exactly one SoftHSM2 edge reading counted with exactly
-# OPS+2*THREADS+1, explicitly non-lossy and unsaturated. Prints
-# "<count> counted".
+# OPS+2*THREADS+1, explicitly non-lossy and unsaturated — either exactly
+# on the edge (case a), or as the edge plus one honestly disclosed
+# exit-time demoted tail (case b: exactly one rejected demoted count gap
+# for the sample caller with base == edge and absolute == want, plus
+# exit-time evidence and no placed, budget or sharing gaps; controller
+# ruling 2026-11-01). Prints "<want> counted" and records one forensic
+# line in DIR/gate_case: "a pid=<sample pid>" for the exact case, "b
+# pid=<sample pid> base=<base> absolute=<absolute>" for the demoted
+# tail (pid is "unknown" when the sample caller has no catalog row).
 check_counted() {
     python3 -I - "$1/inventory.json" "$2" "$3" <<'EOF'
-import json, sys
-doc = json.load(open(sys.argv[1]))
+import json, os, re, sys
+path = sys.argv[1]
+doc = json.load(open(path))
 ops, threads = int(sys.argv[2]), int(sys.argv[3])
 lanes = doc.get("observation", {}).get("lane", None)
 if lanes != "native":
@@ -178,11 +186,77 @@ if state != "counted":
     sys.exit(f"edge state is {state!r}, want counted")
 if coverage.get("lossy") is not False:
     sys.exit(f"edge lossy is {coverage.get('lossy')!r}, want false")
-if entries.get("count") != want:
-    sys.exit(f"edge count {entries.get('count')} != {want} (ops={ops} threads={threads})")
 if entries.get("saturated"):
     sys.exit("edge saturated")
-print(f"{want} counted")
+edge = entries.get("count")
+sample_caller = edges[0].get("caller")
+sample_module = edges[0].get("module")
+gaps = doc.get("gaps") or []
+if doc.get("gaps_suppressed"):
+    sys.exit(f"gaps_suppressed is {doc.get('gaps_suppressed')}, gap counts are incomplete")
+for gap in gaps:
+    if gap.get("caller") == sample_caller and gap.get("budget") is not None:
+        sys.exit(f"budget-bearing gap for the sample caller: {gap.get('subject')!r}")
+placed = [g for g in gaps
+          if g.get("subject") == "demoted count placed" and g.get("caller") == sample_caller]
+if placed:
+    sys.exit(f"{len(placed)} demoted count placed gaps for the sample caller")
+rejected = [g for g in gaps
+            if g.get("subject") == "rejected demoted count" and g.get("caller") == sample_caller]
+
+
+sample_pid = "unknown"
+for caller in doc.get("callers") or []:
+    if caller.get("id") == sample_caller and caller.get("pid") is not None:
+        sample_pid = caller.get("pid")
+        break
+
+
+def record(case, detail=""):
+    with open(os.path.join(os.path.dirname(path), "gate_case"), "w") as handle:
+        handle.write(f"{case} pid={sample_pid}{detail}\n")
+
+
+if edge == want:
+    if rejected:
+        sys.exit(f"edge is exact but {len(rejected)} rejected demoted count gaps name the sample caller")
+    record("a")
+    print(f"{want} counted")
+    sys.exit(0)
+if len(rejected) != 1:
+    sys.exit(f"want exactly 1 rejected demoted count gap for the sample caller, have {len(rejected)}")
+reason = rejected[0].get("reason", "")
+match = re.search(r"absolute count range \((\d+), (\d+)\] \((\d+) unattributed calls\)", reason)
+if match is None:
+    sys.exit("demoted gap reason lacks an absolute count range")
+base, absolute, unattributed = int(match.group(1)), int(match.group(2)), int(match.group(3))
+if unattributed != absolute - base:
+    sys.exit(f"demoted gap unattributed {unattributed} != absolute-base {absolute - base}")
+if base != edge:
+    sys.exit(f"demoted base {base} != edge {edge}")
+if absolute != want:
+    sys.exit(f"demoted absolute {absolute} != {want} (ops={ops} threads={threads})")
+if "budget" in reason or "limit" in reason:
+    sys.exit("demoted gap line mentions budget/limit")
+leader = [g for g in gaps
+          if g.get("subject") == "leader exit status unresolved at stop"
+          and g.get("caller") == sample_caller]
+custody = [g for g in gaps
+           if g.get("subject") == "native capture scope custody unproven"
+           and "PID custody lost: the PID target exited" in g.get("reason", "")
+           and g.get("caller") in (None, sample_caller)]
+if not leader and not custody:
+    sys.exit("demoted tail lacks exit-time evidence (no leader-exit or PID-custody gap)")
+for gap in gaps:
+    rides = ((gap.get("caller") is None or gap.get("caller") == sample_caller)
+             and (gap.get("module") is None or gap.get("module") == sample_module))
+    if rides and (gap.get("subject") == "ambiguous shared endpoint"
+                  or "sharing appeared" in gap.get("reason", "")):
+        sys.exit(f"mid-life sharing gap rides the sample edge: {gap.get('subject')!r}")
+record("b", f" base={base} absolute={absolute}")
+print(f"{want} counted", file=sys.stdout)
+print(f"check_counted: case b exit-time demoted tail base={base} absolute={absolute} want={want}",
+      file=sys.stderr)
 EOF
 }
 
@@ -385,9 +459,37 @@ json.dump({"observation": {"lane": lane},
           open(path, "w"))
 EOF
     }
+    st_inventory_gaps() {
+        # st_inventory_gaps DIR STATE COUNT LOSSY LANE GAPS [SUPPRESSED]:
+        # one SoftHSM2 edge with caller c0 plus a gaps array (a JSON
+        # array string) for the exit-time demoted-tail gate controls.
+        # SUPPRESSED sets gaps_suppressed (default 0).
+        mkdir -p "$SELF_TEST_WORK/$1"
+        python3 -I - "$SELF_TEST_WORK/$1/inventory.json" "$2" "$3" "$4" "$5" "$6" "${7:-0}" <<'EOF'
+import json, sys
+path, state, count, lossy, lane, gaps, supp = (sys.argv[1], sys.argv[2], sys.argv[3],
+                                        sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7])
+json.dump({"observation": {"lane": lane},
+           "modules": [{"id": "m0", "paths": ["/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"]}],
+           "callers": [{"id": "c0", "pid": 4242}],
+           "edges": [{"caller": "c0", "module": "m0",
+                      "entries": {"count": int(count),
+                                  "saturated": False,
+                                  "coverage": {"state": state,
+                                               "lossy": {"true": True, "false": False,
+                                                         "null": None}[lossy]}}}],
+           "gaps": json.loads(gaps),
+           "gaps_suppressed": int(supp)},
+          open(path, "w"))
+EOF
+    }
     # check_counted: ops=100 threads=2 wants exactly 105.
     st_inventory counted-ok counted 105 false native
     st_gate pass counted-ok check_counted "$SELF_TEST_WORK/counted-ok" 100 2
+    ST_GATE_CASE=$(cat "$SELF_TEST_WORK/counted-ok/gate_case") \
+        || { echo "self-test: counted-ok wrote no gate_case" >&2; exit 1; }
+    [ "$ST_GATE_CASE" = "a pid=unknown" ] \
+        || { echo "self-test: counted-ok gate_case is '$ST_GATE_CASE', want 'a pid=unknown'" >&2; exit 1; }
     for shape in "witnessed 105 false native" "counted 104 false native" \
             "counted 105 true native" "counted 105 null native" \
             "counted 105 false scan"; do
@@ -395,6 +497,79 @@ EOF
         st_inventory counted-bad $shape
         st_gate fail counted-bad check_counted "$SELF_TEST_WORK/counted-bad" 100 2
     done
+    # check_counted exit-time demoted tail (controller ruling
+    # 2026-11-01, N5 count gate): ops=100 threads=2 wants exactly
+    # 105; the tail case carries edge=90 plus one rejected demoted
+    # gap with base=90 absolute=105 and exit-time evidence. One pass
+    # control and one failure control per mode.
+    ST_TAIL_REJECTED='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (15 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    ST_TAIL_LEADER='{"caller":"c0","module":null,"pid":4242,"subject":"leader exit status unresolved at stop","reason":"1 pending leader exit(s) remain unknown; first hook=1 domain=NativeDomainId(1); semantic inputs retain custody refusal","budget":null,"repeats":1}'
+    ST_TAIL_CUSTODY='{"caller":null,"module":null,"pid":null,"subject":"native capture scope custody unproven","reason":"PID custody lost: the PID target exited; every watched no-use interval ends at the earlier of the custody instant and the last clean read; a watch starting at or after that instant reads unknown, and no watch starts again","budget":null,"repeats":1}'
+    ST_TAIL_IMAGE='{"caller":null,"module":null,"pid":null,"subject":"exact image authority unavailable","reason":"no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection","budget":null,"repeats":1}'
+    ST_TAIL_PLACED='{"caller":"c0","module":"m0","pid":null,"subject":"demoted count placed","reason":"a demoted count placed post-demotion growth on this edge (fixture reason shortened; the gate matches the subject)","budget":null,"repeats":1}'
+    st_inventory_gaps tail-ok counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_TAIL_CUSTODY,$ST_TAIL_IMAGE]"
+    st_gate pass tail-ok check_counted "$SELF_TEST_WORK/tail-ok" 100 2
+    ST_GATE_CASE=$(cat "$SELF_TEST_WORK/tail-ok/gate_case") \
+        || { echo "self-test: tail-ok wrote no gate_case" >&2; exit 1; }
+    [ "$ST_GATE_CASE" = "b pid=4242 base=90 absolute=105" ] \
+        || { echo "self-test: tail-ok gate_case is '$ST_GATE_CASE', want 'b pid=4242 base=90 absolute=105'" >&2; exit 1; }
+    ST_BAD_ABSOLUTE='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 104] (14 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-bad-absolute counted 90 false native "[$ST_BAD_ABSOLUTE,$ST_TAIL_LEADER]"
+    st_gate fail tail-bad-absolute check_counted "$SELF_TEST_WORK/tail-bad-absolute" 100 2
+    ST_BASE_NE_EDGE='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (89, 105] (16 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-base-ne-edge counted 90 false native "[$ST_BASE_NE_EDGE,$ST_TAIL_LEADER]"
+    st_gate fail tail-base-ne-edge check_counted "$SELF_TEST_WORK/tail-base-ne-edge" 100 2
+    ST_SECOND_REJECTED='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 100] (10 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-two-gaps counted 90 false native "[$ST_TAIL_REJECTED,$ST_SECOND_REJECTED,$ST_TAIL_LEADER]"
+    st_gate fail tail-two-gaps check_counted "$SELF_TEST_WORK/tail-two-gaps" 100 2
+    st_inventory_gaps tail-placed counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_TAIL_PLACED]"
+    st_gate fail tail-placed check_counted "$SELF_TEST_WORK/tail-placed" 100 2
+    st_inventory_gaps tail-no-exit counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_IMAGE]"
+    st_gate fail tail-no-exit check_counted "$SELF_TEST_WORK/tail-no-exit" 100 2
+    ST_BUDGET_REJECTED='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (15 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":{"resource":"callers","limit":4096,"requested":4097},"repeats":1}'
+    st_inventory_gaps tail-budget counted 90 false native "[$ST_BUDGET_REJECTED,$ST_TAIL_LEADER]"
+    st_gate fail tail-budget check_counted "$SELF_TEST_WORK/tail-budget" 100 2
+    # Overcount control: absolute above want is double counting, not an
+    # honest tail (the ruling's `absolute > want` guarantee).
+    ST_BAD_ABSOLUTE_HIGH='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 106] (16 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-bad-absolute-high counted 90 false native "[$ST_BAD_ABSOLUTE_HIGH,$ST_TAIL_LEADER]"
+    st_gate fail tail-bad-absolute-high check_counted "$SELF_TEST_WORK/tail-bad-absolute-high" 100 2
+    # Mid-life sharing controls (ruling point 4): a sharing gap riding
+    # the sample edge fails, whether by subject or by reason; a
+    # foreign-module sharing gap does not ride and passes.
+    ST_SHARING_SUBJECT='{"caller":null,"module":"m0","pid":null,"subject":"ambiguous shared endpoint","reason":"a native witness endpoint is shared by 2 admitted modules: which module was used is ambiguous, so no edge and no module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-sharing counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_SHARING_SUBJECT]"
+    st_gate fail tail-sharing check_counted "$SELF_TEST_WORK/tail-sharing" 100 2
+    ST_SHARING_REASON='{"caller":null,"module":"m0","pid":null,"subject":"rejected demoted count","reason":"a native witness endpoint is shared by 2 admitted modules (re-resolved with 5 unattributed calls after sharing appeared): which module was used is ambiguous, so no edge and no module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-sharing-reason counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_SHARING_REASON]"
+    st_gate fail tail-sharing-reason check_counted "$SELF_TEST_WORK/tail-sharing-reason" 100 2
+    ST_SHARING_FOREIGN='{"caller":null,"module":"m1","pid":null,"subject":"ambiguous shared endpoint","reason":"a native witness endpoint is shared by 2 admitted modules: which module was used is ambiguous, so no edge and no module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-sharing-foreign-ok counted 90 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER,$ST_SHARING_FOREIGN]"
+    st_gate pass tail-sharing-foreign-ok check_counted "$SELF_TEST_WORK/tail-sharing-foreign-ok" 100 2
+    # Case (a) zero-gap clause: an exact edge with a caller-attributed
+    # rejected gap is not the exact case.
+    st_inventory_gaps tail-exact-with-rejected counted 105 false native "[$ST_TAIL_REJECTED,$ST_TAIL_LEADER]"
+    st_gate fail tail-exact-with-rejected check_counted "$SELF_TEST_WORK/tail-exact-with-rejected" 100 2
+    # Unattributed consistency: the claimed count must equal
+    # absolute-base (here 14 claimed for a 15-wide range).
+    ST_UNATTRIBUTED_MISMATCH='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (14 unattributed calls); historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-unattributed-mismatch counted 90 false native "[$ST_UNATTRIBUTED_MISMATCH,$ST_TAIL_LEADER]"
+    st_gate fail tail-unattributed-mismatch check_counted "$SELF_TEST_WORK/tail-unattributed-mismatch" 100 2
+    # Budget/limit word clause: each word fails on its own with a null
+    # structured budget (one control per disjunct).
+    ST_BUDGET_WORD='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (15 unattributed calls); historical counts remain and no witness or module-level use is recorded; demotion budget exhausted","budget":null,"repeats":1}'
+    st_inventory_gaps tail-budget-word counted 90 false native "[$ST_BUDGET_WORD,$ST_TAIL_LEADER]"
+    st_gate fail tail-budget-word check_counted "$SELF_TEST_WORK/tail-budget-word" 100 2
+    ST_LIMIT_WORD='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven for absolute count range (90, 105] (15 unattributed calls); historical counts remain and no witness or module-level use is recorded; over the demotion limit","budget":null,"repeats":1}'
+    st_inventory_gaps tail-limit-word counted 90 false native "[$ST_LIMIT_WORD,$ST_TAIL_LEADER]"
+    st_gate fail tail-limit-word check_counted "$SELF_TEST_WORK/tail-limit-word" 100 2
+    # Suppressed gaps: an exact edge with incomplete gap counts fails.
+    st_inventory_gaps tail-suppressed counted 105 false native "[]" 1
+    st_gate fail tail-suppressed check_counted "$SELF_TEST_WORK/tail-suppressed" 100 2
+    # Missing range: a rejected gap without an absolute count range fails.
+    ST_NO_RANGE='{"caller":"c0","module":null,"pid":null,"subject":"rejected demoted count","reason":"the current physical owner is not proven; historical counts remain and no witness or module-level use is recorded","budget":null,"repeats":1}'
+    st_inventory_gaps tail-no-range counted 90 false native "[$ST_NO_RANGE,$ST_TAIL_LEADER]"
+    st_gate fail tail-no-range check_counted "$SELF_TEST_WORK/tail-no-range" 100 2
     st_inventory witnessed-ok witnessed 0 null native
     st_gate pass witnessed-ok check_witnessed "$SELF_TEST_WORK/witnessed-ok"
     for shape in "counted 0 null native" "witnessed 0 false native" \
@@ -409,7 +584,7 @@ EOF
     st_gate fail anchor-bad check_native_lane "$SELF_TEST_WORK/anchor-bad"
     st_inventory anchor-lane unknown 0 null scan
     st_gate fail anchor-lane check_native_lane "$SELF_TEST_WORK/anchor-lane"
-    [ "$ST_GATE_OK" -eq 14 ] || { echo "self-test: ran $ST_GATE_OK gate controls, want 14" >&2; exit 1; }
+    [ "$ST_GATE_OK" -eq 31 ] || { echo "self-test: ran $ST_GATE_OK gate controls, want 31" >&2; exit 1; }
     # Prebuilt + denominator-mode controls: per-round arm order in
     # each mode, ARMS/PREBUILT validation, and prebuilt input
     # staging (a missing or non-executable input refuses by name;

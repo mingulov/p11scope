@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/check-bpf-load-journal.sh"
 KERNEL = "v6.6.157"
 CONTROL_KERNEL = "v5.15.221"
+CONTROL_KERNEL_61 = "v6.1.188"
 
 next_program_id = 200
 
@@ -72,7 +73,19 @@ def journal_rows():
 
 LINKED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.6.0)
+p11scope: semantic calls: collected 233, joined 203, shed 30, bindings 1, refused 0
 key operations: unavailable (bootstrap_unavailable)
+"""
+
+LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
+p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.6.0)
+p11scope: semantic calls: collected 233, joined 203, shed 30, bindings 1, refused 0
+key operations: not reported by this version (planned for 0.6.0)
+"""
+
+IDLE_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
+p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.6.0)
+key operations: not reported by this version (planned for 0.6.0)
 """
 
 TOOL_SOURCE = r'''
@@ -148,13 +161,17 @@ class JournalGateTests(unittest.TestCase):
         self.events = self.work / "events.jsonl"
         self.cache = self.work / "cache"
         for kernel, release in ((KERNEL, "6.6.157-test"),
-                                (CONTROL_KERNEL, "5.15.221-test")):
+                                (CONTROL_KERNEL, "5.15.221-test"),
+                                (CONTROL_KERNEL_61, "6.1.188-test")):
             config = self.cache / f"virtme-ng/{kernel}/amd64/boot/config-{release}"
             config.parent.mkdir(parents=True)
             config.write_text("owned test config\n")
         rows = journal_rows()
         (self.work / "rows.json").write_text(json.dumps({
             "linked": rows,
+            "linked-unlatched": rows,
+            "linked-idle": rows,
+            "refused-noseal": [row for row in rows if row["btf_id"] == 48],
             "missing-root": [row for row in rows
                              if row["root"] != "p11_return_journal"],
             "unlinked": [row for row in rows if row["btf_id"] == 48],
@@ -166,11 +183,19 @@ class JournalGateTests(unittest.TestCase):
         }))
         (self.work / "texts.json").write_text(json.dumps({
             "linked": {"rc": 0, "text": LINKED_TEXT},
+            "linked-unlatched": {"rc": 0, "text": LINKED_UNLATCHED_TEXT},
+            "linked-idle": {"rc": 0, "text": IDLE_TEXT},
             "missing-root": {"rc": 0, "text": LINKED_TEXT},
             "unlinked": {"rc": 0, "text": LINKED_TEXT.replace(
                 "key operations: unavailable (bootstrap_unavailable)",
                 "key operations: not reported by this version (planned for 0.6.0)")},
             "refused-build": {"rc": 0, "text":
+                "p11scope: semantic lane ready; mechanisms and API results "
+                "are recorded from now on (key operations: planned for 0.6.0)\n"
+                "gap: key operations unavailable: "
+                "journal-pair-unavailable-in-build: this build omits the "
+                "production journal object; broad inventory continues\n"},
+            "refused-noseal": {"rc": 0, "text":
                 "gap: key operations unavailable: "
                 "journal-pair-unavailable-in-build: this build omits the "
                 "production journal object; broad inventory continues\n"},
@@ -235,7 +260,8 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(row["cell"], f"journal-load-{KERNEL}")
         self.assertTrue(row["pass"])
         self.assertEqual(row["qualification"], "qualified")
-        self.assertIn("linked bootstrap_unavailable", row["detail"])
+        self.assertIn("linked sealed live", row["detail"])
+        self.assertIn("observations=bootstrap_unavailable", row["detail"])
         self.assertIn("unbudgeted", row["detail"])
         self.assertIn("journal rows", row["detail"])
         # The linked command shape is pinned, not just the verdict.
@@ -297,20 +323,51 @@ class JournalGateTests(unittest.TestCase):
         self.assertIn("journal pair incomplete", row["detail"])
 
     def test_unlinked_lane_fails(self):
-        # The lane sealed ordinary: no journal rows and no linked line.
+        # No journal rows and no routed calls: the cell fails even
+        # though a seal line is present.
         result, out = self.run_gate(KERNEL, mode="unlinked")
         self.assertEqual(result.returncode, 1, result.stdout)
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "failed")
-        self.assertIn("linked lane not reported (unlinked lane sealed)",
-                      row["detail"])
         self.assertIn("journal pair missing", row["detail"])
+
+    def test_linked_unlatched_lane_passes(self):
+        # The production lane seals linked and routes calls, but the
+        # key-operations display latch does not complete in real runs:
+        # seal plus no-refusal gap plus loaded pair plus joined calls
+        # is the linked proof, whatever the display says.
+        result, out = self.run_gate(KERNEL, mode="linked-unlatched")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertTrue(row["pass"])
+        self.assertEqual(row["qualification"], "qualified")
+        self.assertIn("linked sealed live", row["detail"])
+
+    def test_sealed_but_idle_fails(self):
+        # A seal with no joined calls is vacuous: the lane never
+        # observed its caller, so the cell fails.
+        result, out = self.run_gate(KERNEL, mode="linked-idle")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("idle", row["detail"])
 
     def test_refused_build_fails_with_finite_reason(self):
         # A build without the journal object fails the cell with the
         # finite build reason, never passing and never crashing.
         result, out = self.run_gate(KERNEL, mode="refused-build")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("journal-pair-unavailable-in-build", row["detail"])
+
+    def test_refused_lane_without_seal_names_the_reason(self):
+        # Both lanes refused, so no seal line exists; the row still
+        # names the finite refusal reason instead of just the seal.
+        result, out = self.run_gate(KERNEL, mode="refused-noseal")
         self.assertEqual(result.returncode, 1, result.stdout)
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])
@@ -347,6 +404,17 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         (row,) = self.read_rows(out)
         self.assertEqual(row["cell"], f"journal-load-{CONTROL_KERNEL}")
+        self.assertTrue(row["pass"])
+        self.assertEqual(row["qualification"], "qualified")
+        self.assertIn("uprobe-multi-required", row["detail"])
+
+    def test_refusal_control_passes_on_61(self):
+        # 6.1 is pre-Multi too: the same finite refusal passes the
+        # control cell there.
+        result, out = self.run_gate(CONTROL_KERNEL_61, mode="refusal-515")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertEqual(row["cell"], f"journal-load-{CONTROL_KERNEL_61}")
         self.assertTrue(row["pass"])
         self.assertEqual(row["qualification"], "qualified")
         self.assertIn("uprobe-multi-required", row["detail"])
@@ -540,6 +608,9 @@ class ScriptContractTests(unittest.TestCase):
 
     def test_control_covers_515_releases(self):
         self.assertIn("v5.15.*", self.text)
+
+    def test_control_covers_61_releases(self):
+        self.assertIn("v6.1.*", self.text)
 
     def test_default_kernel_list(self):
         self.assertIn("v6.6.157 v6.12.111 v6.18.58 v7.0.14", self.text)

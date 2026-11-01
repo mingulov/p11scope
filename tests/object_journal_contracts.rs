@@ -2262,8 +2262,12 @@ fn object_journal_elf_matches_detailed_attribute_capture() {
         "expected production journal ELF is absent: build-selection interface gap: {}",
         journal.display()
     );
+    let directory = tempfile::tempdir().expect("temporary detailed object");
+    let detailed = directory.path().join("p11scope-ebpf");
+    std::fs::write(&detailed, p11scope::EBPF_OBJECT).expect("write embedded detailed object");
     let output = std::process::Command::new("python3")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("P11SCOPE_OBJECT_CAPTURE_OBJECT", &detailed)
         .env("P11SCOPE_OBJECT_CAPTURE_JOURNAL_OBJECT", &journal)
         .env(
             "P11SCOPE_OBJECT_CAPTURE_FULL",

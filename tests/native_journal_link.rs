@@ -500,7 +500,6 @@ fn journal_switch_refuses_before_tools_or_outputs() {
         assert_eq!(entries, ["preserved"]);
     }
     for setting in [
-        ("CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES", "1"),
         ("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA", "1"),
         ("CARGO_FEATURE_WIDE_DETAILED_2112", "1"),
         ("P11SCOPE_SMALL_RING", "1"),
@@ -639,22 +638,25 @@ fn journal_unset_selects_exactly_carriable_builds() {
             "{setting:?}"
         );
     }
-    // Unset with P0: omitted silently for now; the P0 journal ships separately.
-    let (output, reached, _) = preflight_switch(
-        "P11SCOPE_JOURNAL",
-        None,
-        &[("CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES", "1")],
-    );
-    assert!(
-        reached,
-        "unset P0 must omit silently, not refuse: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "0");
-    assert_eq!(
-        selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"),
-        "0"
-    );
+    // Unset and explicit =1 with P0: selected with attribute capture
+    // stubbed, like the P0 Detailed object.
+    for value in [None, Some(OsStr::new("1"))] {
+        let (output, reached, _) = preflight_switch(
+            "P11SCOPE_JOURNAL",
+            value,
+            &[("CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES", "1")],
+        );
+        assert!(
+            reached,
+            "{value:?} P0 preflight refused: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(selection_of(&output, "P11SCOPE_JOURNAL_ENABLED"), "1");
+        assert_eq!(
+            selection_of(&output, "P11SCOPE_BIRTH_MARKER_ENABLED"),
+            "1"
+        );
+    }
     // Explicit =1 with WIDE keeps today's refusal.
     let (output, reached, entries) = preflight_switch(
         "P11SCOPE_JOURNAL",

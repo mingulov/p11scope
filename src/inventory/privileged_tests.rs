@@ -14,7 +14,9 @@ use crate::attach::capture::{
 };
 use crate::discovery::caller_registry::UseCoverage;
 use crate::discovery::inventory_attach_set::TargetDelta;
-use crate::inventory_capture::{CaptureLane, Retirement, RetirementLoad, Stopped};
+use crate::inventory_capture::{
+    CaptureLane, Retirement, RetirementLoad, Stopped, ZERO_PASS_GAP_SUBJECT,
+};
 use anyhow::{bail, ensure};
 use std::cell::{Cell, RefCell};
 use std::process::{Child, Command, Stdio};
@@ -1791,7 +1793,10 @@ fn parse_ledger(text: &str) -> Vec<LedgerEntry> {
 }
 
 /// One `edge_observed` record for a single edge, in stream order.
+/// `seq` is the stream order (observations order by `seq`, never by a
+/// bare stamp comparison across a commit boundary).
 struct EdgeRecord {
+    seq: u64,
     at_ns: u64,
     count: u64,
     state: String,
@@ -1810,13 +1815,15 @@ fn edge_series(
             && line["event"]["module"] == module_id
     }) {
         match (
+            line["seq"].as_u64(),
             line["at_ns"].as_u64(),
             line["event"]["entries"]
                 .get("count")
                 .and_then(serde_json::Value::as_u64),
             line["event"]["entries"]["coverage"]["state"].as_str(),
         ) {
-            (Some(at_ns), Some(count), Some(state)) => series.push(EdgeRecord {
+            (Some(seq), Some(at_ns), Some(count), Some(state)) => series.push(EdgeRecord {
+                seq,
                 at_ns,
                 count,
                 state: state.to_string(),
@@ -1842,13 +1849,13 @@ fn ab_helpers_parse_a_canned_ledger_and_stream() {
     assert_eq!(ledger[1].func, "C_Init");
     assert!(ledger.iter().all(|entry| entry.bad == 0));
     let lines: Vec<serde_json::Value> = [
-        serde_json::json!({"kind": "edge_observed", "at_ns": 10, "event": {
+        serde_json::json!({"kind": "edge_observed", "seq": 1, "at_ns": 10, "event": {
             "caller": "c0", "module": "m1",
             "entries": {"count": 0, "coverage": {"state": "quiet"}}}}),
-        serde_json::json!({"kind": "edge_observed", "at_ns": 20, "event": {
+        serde_json::json!({"kind": "edge_observed", "seq": 2, "at_ns": 20, "event": {
             "caller": "c0", "module": "m1",
             "entries": {"count": 1, "coverage": {"state": "counted"}}}}),
-        serde_json::json!({"kind": "edge_observed", "at_ns": 30, "event": {
+        serde_json::json!({"kind": "edge_observed", "seq": 3, "at_ns": 30, "event": {
             "caller": "c0", "module": "m1", "entries": {"coverage": {}}}}),
     ]
     .into_iter()
@@ -1856,8 +1863,10 @@ fn ab_helpers_parse_a_canned_ledger_and_stream() {
     let (series, malformed) = edge_series(&lines, "c0", "m1");
     assert_eq!(malformed, 1);
     assert_eq!(series.len(), 2);
+    assert_eq!(series[0].seq, 1);
     assert_eq!(series[0].count, 0);
     assert_eq!(series[0].state, "quiet");
+    assert_eq!(series[1].seq, 2);
     assert_eq!(series[1].count, 1);
 }
 
@@ -1965,6 +1974,100 @@ fn ab_idle_hold_across_commits(
     commits.iter().any(|commit| *commit > lo && *commit < hi)
 }
 
+/// One stream position for P3's sequence check: the line's `seq`, its
+/// write stamp, and its commit index (how many `pass_committed` lines
+/// precede it in stream order).
+struct AbOrderPoint {
+    seq: u64,
+    at_ns: u64,
+    commit: usize,
+}
+
+/// Commit index of the line at `index`: the count of `pass_committed`
+/// lines before it. Lines of one commit share the commit's stamp.
+fn ab_commit_index(lines: &[serde_json::Value], index: usize) -> usize {
+    lines[..index]
+        .iter()
+        .filter(|line| line["kind"] == "pass_committed")
+        .count()
+}
+
+/// P3's sequence verdict: the caller was admitted before B was ever
+/// observed. Order is judged by `seq`
+/// (`docs/schema/inventory-events-v1.md`: `at_ns` is write time, one
+/// `published_ns` stamps a whole commit, observations order by `seq`).
+/// Equal stamps within one commit are legitimate; across commits the
+/// stamps stay strict — a later commit never carries an earlier stamp.
+fn ab_admission_precedes_b(admitted: &AbOrderPoint, first_b: &AbOrderPoint) -> Result<()> {
+    ensure!(
+        admitted.seq < first_b.seq,
+        "caller admitted at seq {}, B first observed at seq {}",
+        admitted.seq,
+        first_b.seq
+    );
+    if admitted.commit == first_b.commit {
+        ensure!(
+            admitted.at_ns == first_b.at_ns,
+            "one commit carries one stamp: admitted at {}, B first observed at {}",
+            admitted.at_ns,
+            first_b.at_ns
+        );
+    } else {
+        ensure!(
+            admitted.at_ns < first_b.at_ns,
+            "caller admitted at {}, B first observed at {}",
+            admitted.at_ns,
+            first_b.at_ns
+        );
+    }
+    Ok(())
+}
+
+/// The stream-wide commit-stamp check: commit stamps never run
+/// backwards — a later commit must not carry an earlier `at_ns`.
+fn ab_commit_stamps_nondecreasing(lines: &[serde_json::Value]) -> Result<()> {
+    let mut previous: Option<u64> = None;
+    for line in lines.iter().filter(|line| line["kind"] == "pass_committed") {
+        let at_ns = line["at_ns"]
+            .as_u64()
+            .context("a pass_committed line without at_ns")?;
+        if let Some(before) = previous {
+            ensure!(
+                before <= at_ns,
+                "a later commit carries an earlier stamp: {before} then {at_ns}"
+            );
+        }
+        previous = Some(at_ns);
+    }
+    Ok(())
+}
+
+/// The P3 sequence twin: the verdict judges order by `seq`, allows the
+/// legitimate same-commit equal stamp, and keeps the stamps strict
+/// across commits. Inverting the `seq` comparison (or dropping it for a
+/// bare stamp check) turns the twin red.
+#[test]
+fn ab_admission_order_judges_by_seq_with_same_commit_equality() {
+    let point = |seq: u64, at_ns: u64, commit: usize| AbOrderPoint { seq, at_ns, commit };
+    // The legitimate same-commit stamp: equality allowed, seq decides.
+    assert!(ab_admission_precedes_b(&point(1, 110, 0), &point(2, 110, 0)).is_ok());
+    // Twin: the same stamps with broken seq order fail.
+    assert!(ab_admission_precedes_b(&point(2, 110, 0), &point(1, 110, 0)).is_err());
+    // One commit carries one stamp: same-commit skew fails.
+    assert!(ab_admission_precedes_b(&point(1, 110, 0), &point(2, 120, 0)).is_err());
+    // Across commits the stamps stay strict.
+    assert!(ab_admission_precedes_b(&point(1, 110, 0), &point(9, 120, 1)).is_ok());
+    assert!(ab_admission_precedes_b(&point(1, 110, 0), &point(9, 110, 1)).is_err());
+    assert!(ab_admission_precedes_b(&point(1, 120, 0), &point(9, 110, 1)).is_err());
+    // Seq order breaks across commits too.
+    assert!(ab_admission_precedes_b(&point(9, 110, 1), &point(2, 120, 0)).is_err());
+    // The stream-wide check: flat or rising commits pass, a backwards
+    // commit fails.
+    let commit = |at_ns: u64| serde_json::json!({"kind": "pass_committed", "at_ns": at_ns});
+    assert!(ab_commit_stamps_nondecreasing(&[commit(10), commit(10), commit(20)]).is_ok());
+    assert!(ab_commit_stamps_nondecreasing(&[commit(10), commit(9)]).is_err());
+}
+
 #[test]
 fn ab_lifecycle_loss_predicate_accepts_only_honest_states() {
     let edge = |state: &str, reason: Option<&str>| serde_json::json!({"entries": {"coverage": {"state": state, "reason": reason}}});
@@ -2056,6 +2159,7 @@ fn ab_idle_hold_requires_two_unchanged_records_across_a_commit() {
     };
     let commit = serde_json::json!({"kind": "pass_committed", "event": {}});
     let first = EdgeRecord {
+        seq: 1,
         at_ns: 10,
         count: 1,
         state: "counted".to_string(),
@@ -2090,6 +2194,7 @@ fn ab_idle_hold_requires_two_unchanged_records_across_a_commit() {
     ));
     // First counted at/after gate2: not an idle hold.
     let late = EdgeRecord {
+        seq: 1,
         at_ns: 100,
         count: 1,
         state: "counted".to_string(),
@@ -2322,15 +2427,23 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
-    let admitted_ns = lines
+    let admitted_index = lines
         .iter()
-        .find(|line| {
+        .position(|line| {
             line["kind"] == "caller_event"
                 && line["event"]["event"] == "admitted"
                 && line["event"]["caller"] == caller_id
         })
-        .and_then(|line| line["at_ns"].as_u64())
         .context("AB caller never admitted")?;
+    let admitted = AbOrderPoint {
+        seq: lines[admitted_index]["seq"]
+            .as_u64()
+            .context("the admission line carries no seq")?,
+        at_ns: lines[admitted_index]["at_ns"]
+            .as_u64()
+            .context("the admission line carries no stamp")?,
+        commit: ab_commit_index(&lines, admitted_index),
+    };
     let (series_a, malformed_a) = edge_series(&lines, caller_id, mod_a);
     let (series_b, malformed_b) = edge_series(&lines, caller_id, mod_b);
     ensure!(
@@ -2351,12 +2464,22 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
     )?;
 
     // P3's sequence: the caller was admitted before B was ever observed,
-    // and B was observed strictly after its gate opened.
-    ensure!(
-        admitted_ns < series_b[0].at_ns,
-        "caller admitted at {admitted_ns}, B first observed at {}",
-        series_b[0].at_ns
-    );
+    // judged by `seq` (one commit's lines share the commit's stamp), and
+    // B was observed strictly after its gate opened. Commit stamps never
+    // run backwards across the stream.
+    let b_first_index = lines
+        .iter()
+        .position(|line| line["seq"].as_u64() == Some(series_b[0].seq))
+        .context("B's first observation is not in the stream")?;
+    ab_admission_precedes_b(
+        &admitted,
+        &AbOrderPoint {
+            seq: series_b[0].seq,
+            at_ns: series_b[0].at_ns,
+            commit: ab_commit_index(&lines, b_first_index),
+        },
+    )?;
+    ab_commit_stamps_nondecreasing(&lines)?;
     ensure!(
         series_b[0].at_ns > gate1_ns.get(),
         "B first observed at {}, gate1 opened at {}",
@@ -2503,6 +2626,43 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
     Ok(())
 }
 
+/// Readiness witness for the held-call gate: the observer's event log
+/// holds a published pass (`pass_committed`), so the activating extend —
+/// the provider endpoints' attach — completed before the gate opens. A
+/// polled file read (the run loop polls `stop` every service tick): no
+/// sleep, no timeout change.
+fn observer_published_a_pass(events: &Path) -> bool {
+    std::fs::read_to_string(events).is_ok_and(|text| {
+        text.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|record| record["kind"] == "pass_committed")
+        })
+    })
+}
+
+/// The witness twin: a missing log, an idle log and a `started`-only log
+/// hold the gate; the first `pass_committed` opens it. A bare substring
+/// check (or a dropped `kind` match) turns this red.
+#[test]
+fn held_gate_witness_opens_only_on_a_published_pass() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let events = dir.path().join("stop.jsonl");
+    assert!(!observer_published_a_pass(&events));
+    std::fs::write(&events, "")?;
+    assert!(!observer_published_a_pass(&events));
+    std::fs::write(
+        &events,
+        "{\"kind\": \"started\", \"event\": {}}\n{\"kind\": \"caller_event\", \"event\": {}}\n",
+    )?;
+    assert!(!observer_published_a_pass(&events));
+    std::fs::write(
+        &events,
+        "{\"kind\": \"started\", \"event\": {}}\n{\"kind\": \"pass_committed\", \"event\": {}}\n",
+    )?;
+    assert!(observer_published_a_pass(&events));
+    Ok(())
+}
+
 /// C5.1 cell 3: a call held in the provider across the stop. Retirement still
 /// closes within its budget (detach does not wait for the call), the run
 /// reads `settlement: unsettled`, the held call's entry is witnessed, and
@@ -2526,9 +2686,17 @@ fn privileged_native_lane_stop_held_call_unsettled_lp64() -> Result<()> {
     )?;
     let started = Instant::now();
     let held_at = RefCell::new(None::<Instant>);
+    let events = workload.path("stop.jsonl");
+    let gate_opened_at = Cell::new(None::<Duration>);
     let stop = || {
-        if started.elapsed() > Duration::from_secs(3) && !gate.exists() {
+        // Readiness witness instead of a fixed delay: the gate opens only
+        // after the observer publishes a pass, which proves the activating
+        // extend — the provider endpoints' attach — completed. Until then
+        // the held call waits; the 60 s bound below still ends a run whose
+        // observer never publishes. Polled every service tick: no sleep.
+        if !gate.exists() && observer_published_a_pass(&events) {
             let _ = std::fs::write(&gate, b"");
+            gate_opened_at.set(Some(started.elapsed()));
         }
         if held_at.borrow().is_none() && held.has("HELD ") {
             *held_at.borrow_mut() = Some(Instant::now());
@@ -2538,7 +2706,6 @@ fn privileged_native_lane_stop_held_call_unsettled_lp64() -> Result<()> {
             .is_some_and(|at| at.elapsed() > Duration::from_secs(3))
             || started.elapsed() > Duration::from_secs(60)
     };
-    let events = workload.path("stop.jsonl");
     let stop_began = Cell::new(None::<Instant>);
     let observed = || {
         let stopping = stop();
@@ -2580,18 +2747,19 @@ fn privileged_native_lane_stop_held_call_unsettled_lp64() -> Result<()> {
     drop(file);
     held.wait_for("RETURNED ", Duration::from_secs(10))?;
     eprintln!(
-        "C51_HELD pid={} stop_to_exit={stop_latency:?} witnesses={}",
+        "C51_HELD pid={} gate_opened_at={:?} stop_to_exit={stop_latency:?} witnesses={}",
         held.pid(),
+        gate_opened_at.get(),
         document["observation"]["native_witnesses"]
     );
     Ok(())
 }
 
 /// C5.1 cell 4: SIGINT arrives during the activating extend (the real signal
-/// through the production stop flag). The run still makes one full pass
-/// after activation, stops through the bounded stop, and retires cleanly.
+/// through the production stop flag). The F9 latch runs zero passes, stages
+/// the zero-pass gap, publishes the stop report, and retires cleanly.
 #[test]
-#[ignore = "root-owned live BPF lane; SIGINT during activation still gets one full pass"]
+#[ignore = "root-owned live BPF lane; SIGINT during activation runs zero passes and reports the F9 stop"]
 fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
     let workload = Workload::build()?;
     let target = workload.spawn(
@@ -2676,39 +2844,105 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         collection_tick: SERVICE_TICK,
     };
     let began = Instant::now();
-    let stopped = run_classic(&mut driver, Some(lane), &clock, &mut |_, _| Ok(()))
-        .map_err(|outcome| {
-            assert!(
-                outcome.retained.is_none(),
-                "this semantic:None test driver is synchronous: {outcome:?}"
-            );
-            outcome
-                .error
-                .expect("a synchronous loop failure has its error")
-        })?
-        .context("a native run stops its lane")?;
+    let mut pass_publications = 0;
+    let mut stop_publications = 0;
+    let mut retiring_publications = 0;
+    let stopped = run_classic(&mut driver, Some(lane), &clock, &mut |_, point| {
+        match point {
+            Publish::Pass { .. } => pass_publications += 1,
+            Publish::Stop { .. } => stop_publications += 1,
+            Publish::Retiring { .. } => retiring_publications += 1,
+        }
+        Ok(())
+    })
+    .map_err(|outcome| {
+        assert!(
+            outcome.retained.is_none(),
+            "this semantic:None test driver is synchronous: {outcome:?}"
+        );
+        outcome
+            .error
+            .expect("a synchronous loop failure has its error")
+    })?
+    .context("a native run stops its lane")?;
     // The run is over: end the driver's coordinator borrow before the
     // direct coordinator reads below (its Drop would extend it).
     drop(driver);
     let elapsed = began.elapsed();
-    ensure!(stopped.summary.passes == 1, "{:?}", stopped.summary);
-    ensure!(coordinator.passes() == 1);
+    // F9: the stop landed in the activating extend, so the loop gates the
+    // host and runs zero passes — no collection, no apply, no pass commit.
+    ensure!(stopped.summary.passes == 0, "{:?}", stopped.summary);
+    ensure!(coordinator.passes() == 0);
+    // The F9 outcome is reported: the named zero-pass gap reached the
+    // published gaps (so the stop's terminal commit ran), and the stop
+    // report published with no pass publication.
+    let gaps: Vec<(String, String)> = coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect();
     ensure!(
-        matches!(stopped.summary.retirement, Retirement::Closed(_)),
-        "{:?}",
-        stopped.summary
+        gaps.iter()
+            .any(|(subject, reason)| subject == ZERO_PASS_GAP_SUBJECT
+                && reason == "operator stop requested before pass 0 started; no collection ran"),
+        "the F9 zero-pass gap is missing: {gaps:?}"
+    );
+    ensure!(
+        pass_publications == 0,
+        "no pass was published: {pass_publications}"
+    );
+    ensure!(
+        stop_publications == 1,
+        "the stop still publishes: {stop_publications}"
+    );
+    ensure!(
+        retiring_publications == 1,
+        "retirement is announced once: {retiring_publications}"
+    );
+    // Cleanup completed: every attached link closed within the budget, and
+    // the owned stop drain ran (begin-stop through a retired poll).
+    let Retirement::Closed(cleanup) = &stopped.summary.retirement else {
+        bail!("{:?}", stopped.summary);
+    };
+    ensure!(
+        cleanup.closed > 0 && cleanup.attempted == cleanup.closed,
+        "every attached link closed: {cleanup:?}"
+    );
+    ensure!(
+        cleanup.failures.is_empty() && cleanup.retained_links == 0,
+        "clean close: {cleanup:?}"
     );
     let probe = &stopped.capture;
-    // Pass read, terminal read, last read.
-    ensure!(probe.reads.len() == 3, "{:?}", probe.reads);
-    let coverage = edge_coverage(&coordinator, target.pid())?;
-    if coverage.is_empty() {
-        bail!("the one pass mapped no edge");
-    }
+    ensure!(
+        probe.stop_began.is_some() && probe.retired_after.is_some(),
+        "the owned stop drain ran: began={:?} retired_after={:?}",
+        probe.stop_began,
+        probe.retired_after
+    );
+    // Terminal read, last read — and no pass read, since no pass ran.
+    ensure!(probe.reads.len() == 2, "{:?}", probe.reads);
+    // F9: no pass ran, so no pass admitted the caller or mapped an edge
+    // (admission happens in pass apply; the terminal sweep stages rows
+    // but admits nothing).
+    let admitted: Vec<_> = coordinator
+        .adapter()
+        .records()
+        .filter(|record| record.pid == target.pid())
+        .map(|record| record.id)
+        .collect();
+    ensure!(
+        admitted.is_empty(),
+        "no pass admits the caller: {admitted:?}"
+    );
+    let edges: Vec<_> = coordinator.registry().edges().collect();
+    ensure!(edges.is_empty(), "no pass maps an edge: {edges:?}");
     eprintln!(
-        "C51_SIGINT pid={} loop_ms={} coverage={coverage:?}",
+        "C51_SIGINT pid={} loop_ms={} gaps={gaps:?} reads={} passes={} pass_pubs={pass_publications} stop_pubs={stop_publications}",
         target.pid(),
-        elapsed.as_millis()
+        elapsed.as_millis(),
+        probe.reads.len(),
+        stopped.summary.passes,
     );
     Ok(())
 }

@@ -3713,6 +3713,74 @@ mod tests {
         assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
     }
 
+    /// The helper's SIGSTOP is asynchronous: under host load the target is
+    /// still running when the first sample reads it, and the stop lands
+    /// milliseconds later. The same task set reporting `R` and then `T` is
+    /// delivery latency, not a changed child, so the proof waits for the
+    /// stop within its causal deadline instead of failing the cycle.
+    #[test]
+    fn a_stop_still_landing_confirms_once_every_task_reports_stopped() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        let landing: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from([Ok(landing.clone()), Ok(landing), Ok(stopped())]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert!(
+            io.events.iter().filter(|event| **event == "wait").count() >= 2,
+            "the proof waits for delivery: {:?}",
+            io.events
+        );
+    }
+
+    /// Delivery tolerance never covers a changed child: paranoia about new or
+    /// vanished tasks fails the sample immediately, without spending the
+    /// causal deadline waiting for a task set that is already wrong.
+    #[test]
+    fn a_changed_task_set_fails_without_waiting_for_delivery() {
+        for tasks in [
+            [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect(),
+            [(41, b'T')].into_iter().collect(),
+        ] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.states = VecDeque::from([Ok(tasks)]);
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+            assert_eq!(
+                io.events.iter().filter(|event| **event == "wait").count(),
+                0,
+                "a changed task set fails fast"
+            );
+        }
+    }
+
+    /// A child that never stops (every sample reports it running) cannot
+    /// confirm: the delivery wait ends at the confirmation deadline with an
+    /// ordinary failure, never a lifecycle one.
+    #[test]
+    fn a_stop_that_never_lands_fails_on_the_confirmation_deadline() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        let running: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from(vec![Ok(running); 600]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(!error.lifecycle());
+        assert!(
+            format!("{error}").contains(MSG_PAUSE_CONFIRMATION_DEADLINE),
+            "a running child fails on the deadline, not the task set: {error}"
+        );
+    }
+
     #[test]
     fn coalesced_outcome_a_uses_one_deadline_one_owner_and_one_resume() {
         let winner = record(10, 0, false);
@@ -7567,5 +7635,376 @@ mod tests {
             preflight_reap.is_some_and(|offset| offset < owned),
             "the preflight reap must precede the owned coordinator"
         );
+    }
+
+    /// SoftHSM2 provider layouts across hosts (Debian multiarch, the
+    /// `/usr/lib` layout of the vng guests, Fedora `/usr/lib64`). The first
+    /// present one wins; the run fails loudly when none is installed.
+    fn wrapper_softhsm_lib() -> &'static str {
+        const CANDIDATES: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+            "/usr/lib/softhsm/libsofthsm2.so",
+            "/usr/lib64/pkcs11/libsofthsm2.so",
+        ];
+        CANDIDATES
+            .iter()
+            .copied()
+            .find(|path| std::path::Path::new(path).is_file())
+            .expect("a SoftHSM2 provider must be installed for the wrapper cells")
+    }
+
+    /// A fresh SoftHSM token for one cell. Each cell owns its token directory,
+    /// so cells never share token state even when run back to back.
+    fn wrapper_token(dir: &std::path::Path) -> std::path::PathBuf {
+        let tokens = dir.join("tokens");
+        std::fs::create_dir_all(&tokens).expect("token dir");
+        let conf = dir.join("softhsm2.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "directories.tokendir = {}\nobjectstore.backend = file\nlog.level = ERROR\n",
+                tokens.display()
+            ),
+        )
+        .expect("token conf");
+        let output = std::process::Command::new("/usr/bin/softhsm2-util")
+            .env("SOFTHSM2_CONF", &conf)
+            .args([
+                "--init-token",
+                "--free",
+                "--label",
+                "pausewrap",
+                "--so-pin",
+                "5678",
+                "--pin",
+                "1234",
+            ])
+            .output()
+            .expect("spawn softhsm2-util");
+        assert!(
+            output.status.success(),
+            "token init: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        wrapper_chown_invoker(dir);
+        conf
+    }
+
+    /// Root-created token state is unusable to the owned child, which runs as
+    /// the sudo invoker. Hand the cell dir to that account. Without sudo (or
+    /// unprivileged) there is nothing to hand over, and the run itself refuses
+    /// loudly below.
+    fn wrapper_chown_invoker(dir: &std::path::Path) {
+        let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) else {
+            return;
+        };
+        // SAFETY: reading the effective uid has no preconditions.
+        if uid == "0" || unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let status = std::process::Command::new("chown")
+            .arg("-R")
+            .arg(format!("{uid}:{gid}"))
+            .arg(dir)
+            .status()
+            .expect("spawn chown");
+        assert!(status.success(), "handing the cell dir to the invoker");
+    }
+
+    /// `run` passes `SOFTHSM2_CONF` through its clean child environment, so
+    /// the direct oracle needs it in the observer's environment. Restored on
+    /// drop; privileged cells run `--exact --test-threads=1`.
+    struct WrapperEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl WrapperEnvGuard {
+        fn set(conf: &std::path::Path) -> Self {
+            let previous = std::env::var_os("SOFTHSM2_CONF");
+            // SAFETY: the cell runs alone; nothing else in this process
+            // touches the environment while the guard is alive.
+            unsafe { std::env::set_var("SOFTHSM2_CONF", conf) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for WrapperEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe {
+                match self.previous.take() {
+                    Some(previous) => std::env::set_var("SOFTHSM2_CONF", previous),
+                    None => std::env::remove_var("SOFTHSM2_CONF"),
+                }
+            }
+        }
+    }
+
+    fn wrapper_work_dir(cell: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pause-wrap-{cell}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("cell dir");
+        dir
+    }
+
+    fn wrapper_pkcs11_tool(module: &str) -> Vec<std::ffi::OsString> {
+        vec![
+            "/usr/bin/pkcs11-tool".into(),
+            "--module".into(),
+            module.into(),
+            "-O".into(),
+            "--login".into(),
+            "--pin".into(),
+            "1234".into(),
+        ]
+    }
+
+    fn wrapper_profile(
+        pause: PausePolicy,
+        command: Vec<std::ffi::OsString>,
+        out: &std::path::Path,
+    ) -> (crate::run::OwnedRunOutcome, serde_json::Value) {
+        let args = crate::cli::RunArgs {
+            track_short_lived: false,
+            kind: crate::cli::Kind::Profile,
+            modules: Vec::new(),
+            manifests: Vec::new(),
+            prearm_modules: Vec::new(),
+            hooks: crate::discovery::hooks::HookRegistry::builtin(),
+            metrics: false,
+            counter_mode: None,
+            select_endpoint: None,
+            duration: None,
+            out: Some(out.to_path_buf()),
+            max_events: None,
+            max_scan_pids: None,
+            ring_bytes: None,
+            drain_interval: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            pause,
+            attach_backend: crate::attach::BackendSelection::default(),
+            kill_on_timeout: false,
+            command,
+        };
+        let outcome = crate::run::run_owned(&args).expect("owned run completes");
+        let text = std::fs::read_to_string(out).expect("report exists");
+        let document: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        (outcome, document)
+    }
+
+    fn wrapper_total_calls(document: &serde_json::Value) -> u64 {
+        document["functions"]
+            .as_array()
+            .expect("functions array")
+            .iter()
+            .map(|function| function["calls"].as_u64().expect("call count"))
+            .sum()
+    }
+
+    fn assert_sigstop_lattice(evidence: &crate::render::Evidence) {
+        assert_eq!(
+            evidence.pause_confirmed + evidence.pause_partial,
+            evidence.pause_attempts,
+            "pause counters do not add up"
+        );
+        assert!(evidence.pause_attempts > 0, "auto attempted nothing");
+        assert_eq!(evidence.pause_partial, 0, "every stop must confirm");
+        assert_eq!(evidence.pause, "sigstop");
+        assert_eq!(evidence.pause_confirmed, evidence.pause_attempts);
+    }
+
+    /// `run --pause auto -- env VAR=… pkcs11-tool …`: the same task execs a
+    /// second image before loading the provider. The pause follows that exec
+    /// chain, so the wrapper observes exactly the direct run's calls with
+    /// every stop confirmed.
+    #[test]
+    #[ignore = "privileged: run --pause auto through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_auto_env_wrapper_matches_direct_count_lp64() {
+        let dir = wrapper_work_dir("env");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        let (direct, direct_doc) = wrapper_profile(
+            PausePolicy::Auto,
+            wrapper_pkcs11_tool(module),
+            &dir.join("direct.json"),
+        );
+        assert_eq!(direct.child_exit_code, Some(0));
+        let oracle = wrapper_total_calls(&direct_doc);
+        assert!(oracle > 0, "the oracle workload must observe calls");
+        assert_sigstop_lattice(&direct.evidence);
+        let mut wrapped = vec![
+            std::ffi::OsString::from("/usr/bin/env"),
+            std::ffi::OsString::from(format!("SOFTHSM2_CONF={}", conf.display())),
+        ];
+        wrapped.extend(wrapper_pkcs11_tool(module));
+        let (outcome, document) =
+            wrapper_profile(PausePolicy::Auto, wrapped, &dir.join("wrapped.json"));
+        assert_eq!(outcome.child_exit_code, Some(0));
+        assert_eq!(
+            wrapper_total_calls(&document),
+            oracle,
+            "the env wrapper must observe exactly the direct count"
+        );
+        assert_sigstop_lattice(&outcome.evidence);
+    }
+
+    /// `run --pause auto -- sh -c 'exec …'`: the shell replaces itself with
+    /// the workload in the same task. Same oracle and lattice as the env cell.
+    #[test]
+    #[ignore = "privileged: run --pause auto through sh -c exec with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64() {
+        let dir = wrapper_work_dir("shexec");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        let (direct, direct_doc) = wrapper_profile(
+            PausePolicy::Auto,
+            wrapper_pkcs11_tool(module),
+            &dir.join("direct.json"),
+        );
+        assert_eq!(direct.child_exit_code, Some(0));
+        let oracle = wrapper_total_calls(&direct_doc);
+        assert!(oracle > 0, "the oracle workload must observe calls");
+        assert_sigstop_lattice(&direct.evidence);
+        let script = format!("exec /usr/bin/pkcs11-tool --module {module} -O --login --pin 1234");
+        let wrapped = vec![
+            std::ffi::OsString::from("/bin/sh"),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from(script),
+        ];
+        let (outcome, document) =
+            wrapper_profile(PausePolicy::Auto, wrapped, &dir.join("wrapped.json"));
+        assert_eq!(outcome.child_exit_code, Some(0));
+        assert_eq!(
+            wrapper_total_calls(&document),
+            oracle,
+            "the sh -c exec wrapper must observe exactly the direct count"
+        );
+        assert_sigstop_lattice(&outcome.evidence);
+    }
+
+    /// `run --pause auto -- sh -c '…'` without `exec`: the provider loads in
+    /// a grandchild outside PID scope, which the pause cannot cover. The run
+    /// stays honest: the workload succeeds invisibly, zero calls are
+    /// observed, and the report is PARTIAL with no silent success.
+    #[test]
+    #[ignore = "privileged: run --pause auto through a forking sh wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64() {
+        let dir = wrapper_work_dir("shfork");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        let (direct, direct_doc) = wrapper_profile(
+            PausePolicy::Auto,
+            wrapper_pkcs11_tool(module),
+            &dir.join("direct.json"),
+        );
+        assert_eq!(direct.child_exit_code, Some(0));
+        assert!(
+            wrapper_total_calls(&direct_doc) > 0,
+            "the oracle proves the token can produce calls"
+        );
+        let script = format!("/usr/bin/pkcs11-tool --module {module} -O --login --pin 1234");
+        let wrapped = vec![
+            std::ffi::OsString::from("/bin/sh"),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from(script),
+        ];
+        let (outcome, document) =
+            wrapper_profile(PausePolicy::Auto, wrapped, &dir.join("wrapped.json"));
+        assert_eq!(
+            outcome.child_exit_code,
+            Some(0),
+            "the grandchild workload must succeed invisibly"
+        );
+        assert_eq!(
+            wrapper_total_calls(&document),
+            0,
+            "no call in the owned task may be observed"
+        );
+        assert!(
+            document["functions"]
+                .as_array()
+                .expect("functions array")
+                .is_empty(),
+            "no attach slot may be planned for the owned task"
+        );
+        assert_eq!(outcome.evidence.completeness, "PARTIAL");
+        assert_eq!(
+            outcome.evidence.pause_confirmed + outcome.evidence.pause_partial,
+            outcome.evidence.pause_attempts,
+            "pause counters do not add up"
+        );
+    }
+
+    /// `--pause off` twin: the wrapper shape without any pause completes and
+    /// publishes the neutral lattice. Call counts stay out of this cell: an
+    /// unpaused child can outrun discovery under load, so exact counts are
+    /// verified live, not pinned here.
+    #[test]
+    #[ignore = "privileged: run --pause off through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_never_env_wrapper_matches_direct_count_lp64() {
+        let dir = wrapper_work_dir("never");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        let (direct, _) = wrapper_profile(
+            PausePolicy::Never,
+            wrapper_pkcs11_tool(module),
+            &dir.join("direct.json"),
+        );
+        assert_eq!(direct.child_exit_code, Some(0));
+        assert_eq!(direct.evidence.pause, "none");
+        assert_eq!(direct.evidence.pause_attempts, 0);
+        let mut wrapped = vec![
+            std::ffi::OsString::from("/usr/bin/env"),
+            std::ffi::OsString::from(format!("SOFTHSM2_CONF={}", conf.display())),
+        ];
+        wrapped.extend(wrapper_pkcs11_tool(module));
+        let (outcome, _) = wrapper_profile(PausePolicy::Never, wrapped, &dir.join("wrapped.json"));
+        assert_eq!(outcome.child_exit_code, Some(0));
+        assert_eq!(outcome.evidence.pause, "none");
+        assert_eq!(outcome.evidence.pause_attempts, 0);
+    }
+
+    /// A second exec after the provider already loads: the owned task maps
+    /// SoftHSM under its first image (via `LD_PRELOAD`) and then execs the
+    /// workload. The exec refresh keeps the observation exact and confirmed.
+    #[test]
+    #[ignore = "privileged: run --pause auto through a preload-then-exec wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_auto_preloaded_exec_matches_direct_count_lp64() {
+        let dir = wrapper_work_dir("preload");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        let (direct, direct_doc) = wrapper_profile(
+            PausePolicy::Auto,
+            wrapper_pkcs11_tool(module),
+            &dir.join("direct.json"),
+        );
+        assert_eq!(direct.child_exit_code, Some(0));
+        let oracle = wrapper_total_calls(&direct_doc);
+        assert!(oracle > 0, "the oracle workload must observe calls");
+        assert_sigstop_lattice(&direct.evidence);
+        let script = format!("exec /usr/bin/pkcs11-tool --module {module} -O --login --pin 1234");
+        let wrapped = vec![
+            std::ffi::OsString::from("/usr/bin/env"),
+            std::ffi::OsString::from(format!("SOFTHSM2_CONF={}", conf.display())),
+            std::ffi::OsString::from(format!("LD_PRELOAD={module}")),
+            std::ffi::OsString::from("/bin/sh"),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from(script),
+        ];
+        let (outcome, document) =
+            wrapper_profile(PausePolicy::Auto, wrapped, &dir.join("wrapped.json"));
+        assert_eq!(outcome.child_exit_code, Some(0));
+        assert_eq!(
+            wrapper_total_calls(&document),
+            oracle,
+            "the preloaded exec must observe exactly the direct count"
+        );
+        assert_sigstop_lattice(&outcome.evidence);
     }
 }

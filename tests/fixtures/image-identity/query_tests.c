@@ -1,6 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Calls the production entry, pre-mm invalidator and iterator. Helpers are
  * scripted; shared cells use real atomic accesses, including host writers. */
+#ifdef P11SCOPE_LOADER_GATE
+/* The bank-B scenarios issue and qualify through the production issuer
+ * header, so the test shape cannot drift from the allocator's own. It
+ * comes before libc: glibc undefines __always_inline first, so the
+ * issuer header must come first (same order as ticket_query_tests.c). */
+#include "image_identity.h"
+#endif
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -23,6 +30,12 @@ static void index_cas_result(unsigned long long prior, unsigned long long expect
 u32 p11_selected_bootstrap_allowed(u32 tgid) { (void)tgid; return 0; }
 u32 p11_selected_invalidate_tgid(u32 tgid) { (void)tgid; return 0; }
 unsigned char TASK_COOKIE, INSTANCE_GEN, CONFIG;
+#ifdef P11SCOPE_LOADER_GATE
+unsigned char TASK_COOKIE_B, IMAGE_BANK_SELECT;
+static u64 cookie_b, indexed_tgid_b, index_cookie_b, query_tgid;
+static int cookie_present, cookie_b_present, index_present_b, select_present;
+static struct image_bank_select select_word;
+#endif
 static u64 coverage, flags, index_cookie, record_key, indexed_tgid, cookie, now;
 static int index_present, record_present, index_fail, record_fail, storage_busy;
 static unsigned int index_updates, record_updates, storage_reads, writes;
@@ -70,14 +83,28 @@ static void pause_writer(void)
     __atomic_store_n(&writer_locked, 1, __ATOMIC_SEQ_CST);
     while (!__atomic_load_n(&release_writer, __ATOMIC_SEQ_CST)) sched_yield();
 }
+static u64 *index_slot(u64 tgid)
+{
+    if (index_present && tgid == indexed_tgid) return &index_cookie;
+#ifdef P11SCOPE_LOADER_GATE
+    if (index_present_b && tgid == indexed_tgid_b) return &index_cookie_b;
+#endif
+    return 0;
+}
 static void *lookup(void *map, const void *key)
 {
     if (map == &INSTANCE_GEN) { assert(*(u32 *)key == 3); return &coverage; }
     if (map == &CONFIG) { assert(*(u32 *)key == 0); return &flags; }
+#ifdef P11SCOPE_LOADER_GATE
+    if (map == &IMAGE_BANK_SELECT) {
+        assert(*(u32 *)key == 0);
+        return select_present ? &select_word : 0;
+    }
+#endif
     if (map == &IMAGE_TGID_INDEX || map == &IMAGE_CONTINUITY) {
         assert(!pthread_mutex_lock(&map_lock));
         void *result = map == &IMAGE_TGID_INDEX ?
-            (index_present && *(u64 *)key == indexed_tgid ? (void *)&index_cookie : 0) :
+            (void *)index_slot(*(u64 *)key) :
             (record_present && *(u64 *)key == record_key ? &continuity :
              retired_present && *(u64 *)key == retired_key ? &retired_continuity : 0);
         assert(!pthread_mutex_unlock(&map_lock));
@@ -98,14 +125,33 @@ static long update_locked(void *map, const void *key, const void *value, u64 mod
             indexed_tgid = *(u64 *)key; index_cookie = index_race_cookie;
             index_present = 1; return -17;
         }
+#ifdef P11SCOPE_LOADER_GATE
+        if (index_present && *(u64 *)key == indexed_tgid) return -17;
+        if (index_present_b && *(u64 *)key == indexed_tgid_b) return -17;
+        if (!index_present) {
+            indexed_tgid = *(u64 *)key; index_cookie = *(u64 *)value; index_present = 1;
+            return 0;
+        }
+        if (!index_present_b) {
+            indexed_tgid_b = *(u64 *)key; index_cookie_b = *(u64 *)value; index_present_b = 1;
+            return 0;
+        }
+        return -17;
+#else
         if (index_present) return -17;
         indexed_tgid = *(u64 *)key; index_cookie = *(u64 *)value; index_present = 1;
         return 0;
+#endif
     }
     assert(map == &IMAGE_CONTINUITY);
     record_updates++;
     /* Ready cannot precede complete index_cookie publication. */
+#ifdef P11SCOPE_LOADER_GATE
+    assert((index_present && IMG_READ(index_cookie) == *(u64 *)key) ||
+        (index_present_b && IMG_READ(index_cookie_b) == *(u64 *)key));
+#else
     assert(index_present && IMG_READ(index_cookie) == *(u64 *)key);
+#endif
     if (record_fail) return record_fail;
     if (record_present && record_key == *(u64 *)key) return -17;
     if (record_present) {
@@ -122,11 +168,27 @@ static long update(void *map, const void *key, const void *value, u64 mode)
     assert(!pthread_mutex_unlock(&map_lock));
     return result;
 }
-static u64 pid(void) { return (77ULL << 32) | 78; }
 static u64 clock_now(void) { return now; }
+#ifdef P11SCOPE_LOADER_GATE
+static u64 pid(void) { return (query_tgid << 32) | 78; }
+#else
+static u64 pid(void) { return (77ULL << 32) | 78; }
+#endif
 static void *storage(void *map, void *selected, void *initial, u64 mode)
 {
     storage_reads++;
+#ifdef P11SCOPE_LOADER_GATE
+    int bank_b = (map == &TASK_COOKIE_B);
+    assert((bank_b || map == &TASK_COOKIE) && selected == &task && !initial && !mode);
+    if (storage_reads == 2) {
+        if (mutate_on_fresh == 1) { if (bank_b) cookie_b++; else cookie++; }
+        if (mutate_on_fresh == 2) task.self_exec_id++;
+        if (mutate_on_fresh == 3) IMG_STORE(continuity.seq, IMG_READ(continuity.seq) + 2);
+    }
+    if (storage_busy) return 0;
+    if (bank_b) return cookie_b_present ? &cookie_b : 0;
+    return cookie_present ? &cookie : 0;
+#else
     assert(map == &TASK_COOKIE && selected == &task && !initial && !mode);
     if (storage_reads == 2) {
         if (mutate_on_fresh == 1) cookie++;
@@ -134,6 +196,7 @@ static void *storage(void *map, void *selected, void *initial, u64 mode)
         if (mutate_on_fresh == 3) IMG_STORE(continuity.seq, IMG_READ(continuity.seq) + 2);
     }
     return storage_busy ? 0 : &cookie;
+#endif
 }
 static long emit(void *seq, const void *row, u32 size)
 {
@@ -146,6 +209,12 @@ static long emit(void *seq, const void *row, u32 size)
 static void reset(void)
 {
     coverage = IMG_ENABLED; flags = 1 << 2; now = 1; cookie = 1;
+#ifdef P11SCOPE_LOADER_GATE
+    cookie_b = indexed_tgid_b = index_cookie_b = 0; query_tgid = 77;
+    cookie_present = 1; cookie_b_present = index_present_b = 0;
+    memset(&select_word, 0, sizeof(select_word)); select_word.prepared[0] = 1;
+    select_present = 1;
+#endif
     index_present = record_present = index_fail = record_fail = storage_busy = 0;
     retired_present = record_race = 0; index_race_cookie = retired_key = 0;
     write_fail_at = -1; mutate_on_fresh = deadline_after_write = 0;
@@ -364,5 +433,44 @@ int main(int argc, char **argv)
     __atomic_store_n(&release_writer, 1, __ATOMIC_SEQ_CST);
     assert(!pthread_join(worker, 0)); hold_writer = 0;
     assert(!p11_image_entry(77, 1, 1) && coverage == IMG_FAILED);
+#ifdef P11SCOPE_LOADER_GATE
+    /* Qualified bank-B cookies seed, query and invalidate; the retained
+     * bank-A row is undisturbed, and same-number A/B cookies never alias.
+     * Malformed, unqualified-out-of-range and foreign cookies fail exactly
+     * as they do without the gate. */
+    reset();
+    u64 b1 = image_identity_qualify(1, 1, 0);
+    assert(b1 == 32769);
+    query_tgid = 101; assert(p11_image_entry(101, 1, 5));
+    query_tgid = 102; assert(p11_image_entry(102, b1, 7));
+    assert(coverage == IMG_ENABLED);
+    query_tgid = 101; cookie = 1; cookie_present = 1; cookie_b_present = 0;
+    task.self_exec_id = 5; request.cookie = 1; query();
+    assert(writes == 2 && rows[0].status == IMG_ROW_READY && rows[1].status == IMG_ROW_END);
+    assert(rows[0].cookie == 1 && rows[0].sequence == 1);
+    query_tgid = 102; cookie_present = 0; cookie_b = 1; cookie_b_present = 1;
+    task.self_exec_id = 7; request.cookie = b1; query();
+    assert(writes == 2 && rows[0].status == IMG_ROW_READY && rows[1].status == IMG_ROW_END);
+    assert(rows[0].cookie == b1 && rows[0].cookie != 1 && rows[0].sequence == 1);
+    query_tgid = 101; cookie = 1; cookie_present = 1; cookie_b_present = 0;
+    task.self_exec_id = 5; request.cookie = 1; query();
+    assert(writes == 2 && rows[0].status == IMG_ROW_READY && rows[1].status == IMG_ROW_END);
+    assert(rows[0].cookie == 1 && rows[0].exec_id == 5 && rows[0].sequence == 1);
+    query_tgid = 102; p11_image_exec_release(0);
+    query_tgid = 102; cookie_present = 0; cookie_b = 1; cookie_b_present = 1;
+    task.self_exec_id = 7; request.cookie = b1; query();
+    assert(writes == 2 && rows[0].status == IMG_ROW_UNKNOWN && rows[1].status == IMG_ROW_END);
+    query_tgid = 101; cookie = 1; cookie_present = 1; cookie_b_present = 0;
+    task.self_exec_id = 5; request.cookie = 1; query();
+    assert(writes == 2 && rows[0].status == IMG_ROW_READY && rows[0].sequence == 1);
+    reset();
+    query_tgid = 103;
+    assert(!p11_image_entry(103, IMG_LIMIT + 1, 9) && coverage == IMG_FAILED);
+    reset();
+    query_tgid = 104;
+    assert(!p11_image_entry(104, image_identity_qualify(1, 1, 1), 9));
+    assert(coverage == IMG_FAILED);
+    puts("image continuity: qualified bank-B cookies seed, query and invalidate");
+#endif
     puts("image continuity: entry/index_cookie/poison/query/limits verified");
 }

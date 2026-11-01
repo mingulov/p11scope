@@ -7731,6 +7731,51 @@ fn image_continuity_native_entry_index_poison_and_query() {
 }
 
 #[test]
+fn image_continuity_native_bank_b_cookies_seed_query_and_invalidate() {
+    // The same continuity/query regression compiled with the loader gate:
+    // the legacy suite must pass unchanged under the extended validity,
+    // then the qualified bank-B scenarios seed, query and invalidate.
+    let directory = tempfile::tempdir().expect("temporary native bank-B query test");
+    let binary = directory.path().join("image-query-bank-b-tests");
+    let compile = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unknown-attributes",
+            "-DP11SCOPE_LOADER_GATE",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/image-identity/query_tests.c",
+            "-pthread",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("compile native bank-B continuity/query regression");
+    assert!(
+        compile.status.success(),
+        "native bank-B compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(binary)
+        .output()
+        .expect("run native bank-B continuity/query regression");
+    assert!(
+        run.status.success(),
+        "native bank-B regression failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("qualified bank-B cookies seed, query and invalidate"),
+        "the bank-B scenarios must run, not just compile: {stdout}"
+    );
+}
+
+#[test]
 fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
     let directory = tempfile::tempdir().expect("temporary native instance test");
     // Both state sizes (F5): the small-state build must shrink

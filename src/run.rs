@@ -5817,6 +5817,12 @@ fn capture_profile(
     // Diagnostics are optional; closed/slow stderr cannot skip owned cleanup.
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
     let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+    // K0: snapshot the exec witness while the tap is still live.
+    // Quiescence invalidates the PID lifecycle tap (and the later
+    // terminal drain would too), so a snapshot past this point always
+    // reads terminal and would void every window as caller-changed.
+    // The close compares this against the selection-time facts.
+    let mut k0_close_facts = k0_window.as_ref().map(|_| session.pid_lifecycle_facts());
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
     // apply after the poll; EVENTS reduce in place. Every failure below
@@ -6002,10 +6008,6 @@ fn capture_profile(
         }
     };
     let (quiesced, stop_quiescence) = quiesce_outcome;
-    // K0: snapshot the exec witness before the terminal discovery
-    // drain invalidates the tap; the close compares this against the
-    // selection-time facts.
-    let mut k0_close_facts = k0_window.as_ref().map(|_| session.pid_lifecycle_facts());
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
     let outcome = finish_capture_with(
         &mut finish_context,
@@ -14163,6 +14165,17 @@ mod tests {
         assert!(
             profile.contains("with_selected_detail(j, ledger)"),
             "capture_profile must compose the additive ledger"
+        );
+        // K0: the close witness snapshot precedes quiescence, which
+        // invalidates the PID lifecycle tap; a snapshot past it would
+        // always read terminal and void every window as caller-changed.
+        let snapshot = profile
+            .find("k0_close_facts = k0_window.as_ref()")
+            .expect("K0 close snapshot");
+        let quiesce = profile.find("quiesce_terminal(").expect("quiescence");
+        assert!(
+            snapshot < quiesce,
+            "capture_profile must snapshot the K0 close witness before quiescence"
         );
     }
 

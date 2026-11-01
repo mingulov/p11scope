@@ -2387,9 +2387,11 @@ pub(crate) fn exact_table_addresses_n(
 /// Whether a slot-validation failure at `ordinal` still leaves a complete
 /// validated 68-slot legacy prefix: the mislabelled-table shape (a 3.x
 /// version word over a 2.x table), accepted as its prefix instead of
-/// rejected. `prefix_non_null` counts validated non-NULL slots below 68.
+/// rejected. `prefix_non_null` counts validated non-NULL slots below 68;
+/// at least two are required so a single-entry BSS lookalike cannot admit
+/// a second table and churn the attach set pass to pass.
 fn mislabelled_tail_ordinal(version: (u8, u8), ordinal: usize, prefix_non_null: usize) -> bool {
-    version.0 == 3 && ordinal >= LEGACY_PREFIX_SLOTS && prefix_non_null > 0
+    version.0 == 3 && ordinal >= LEGACY_PREFIX_SLOTS && prefix_non_null > 1
 }
 
 /// Decodes one candidate at `offset` inside `snapshot` (whose first byte is at

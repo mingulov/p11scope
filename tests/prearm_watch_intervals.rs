@@ -27,7 +27,9 @@
 mod support;
 
 use p11scope::attach::{BackendSelection, Scope};
-use p11scope::cli::{CaptureArgs, Kind, ScopeArg};
+use p11scope::cli::{
+    CallerMetadataMode, CaptureArgs, CaptureMode, IdentityBackendSelection, Kind, ScopeArg,
+};
 use p11scope::discovery::engine::Engine;
 use p11scope::discovery::hooks::HookRegistry;
 use p11scope::process::{ProcessView, ProcessViewId};
@@ -806,5 +808,57 @@ fn prearm_empty_input_changes_nothing() {
     assert_eq!(
         without.pinned().pinned().count(),
         with_empty.pinned().pinned().count()
+    );
+}
+
+/// Inventory JSON emission guard at the public seam: a capture without
+/// `--prearm-module` renders an empty `prearm[]` section. The additive-only
+/// proof for the emission surface — no flag, no rows, but the section
+/// exists. (Row-content twins cannot run here: the host gate hard-refuses
+/// unprivileged auto/native before any lane opens, and scan refuses
+/// pre-arm by name; row content is pinned in-crate at the same run seam
+/// with the documented host-probe and native-preparation fakes.)
+#[test]
+fn inventory_prearm_section_empty_without_flag() {
+    let child = sleep_child();
+    let pid = child.child.id();
+    // The `-o` report needs a trusted directory (no group-writable
+    // ancestors), so it goes under the private TMPDIR lane, not the
+    // target tmpdir.
+    let out = std::env::temp_dir().join(format!("inv-empty-{pid}.json"));
+    let _ = std::fs::remove_file(&out);
+    let code = p11scope::inventory::run(
+        ScopeArg::Pid(pid),
+        &[],
+        &[],
+        &[],
+        &HookRegistry::builtin(),
+        true,
+        None,
+        None,
+        None,
+        None,
+        Some(&out),
+        false,
+        None,
+        None,
+        None,
+        CaptureMode::Scan,
+        BackendSelection::default(),
+        None,
+        None,
+        IdentityBackendSelection::default(),
+        false,
+        CallerMetadataMode::default(),
+    )
+    .expect("scan inventory over an owned child");
+    assert_eq!(code, 0);
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        document["prearm"],
+        serde_json::Value::Array(Vec::new()),
+        "no flag, no rows — but the section exists"
     );
 }

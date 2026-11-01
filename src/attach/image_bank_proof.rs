@@ -1213,6 +1213,23 @@ pub(crate) struct BankProofDriver {
     backend: Backend,
 }
 
+/// Kernel objects owned by one bank load: `(name, id)` pairs for the
+/// load-private maps and the slot's bank programs. See
+/// [`BankProofDriver::bank_load_objects`].
+pub struct BankLoadObjects {
+    pub maps: Vec<(String, u32)>,
+    pub progs: Vec<(String, u32)>,
+}
+
+/// Watched objects still present in a live-id set, by name and id.
+fn lingering_ids(watched: &[(String, u32)], live: &HashSet<u32>) -> Vec<(String, u32)> {
+    watched
+        .iter()
+        .filter(|(_, id)| live.contains(id))
+        .cloned()
+        .collect()
+}
+
 impl BankProofDriver {
     /// Single-load cell: one object owns both banks' maps; slot A is
     /// installed and current, slot B is empty. No birth attach (ambient
@@ -2090,6 +2107,34 @@ impl BankProofDriver {
             .get(&key)
             .expect("bank load present")
             .map_id(name)
+    }
+
+    /// Kernel map and program ids owned by one bank load, for the
+    /// rollover reclaim watch: every map in the load except the
+    /// shared pins (which legitimately survive a reclaim), plus the
+    /// slot's two bank programs. A reclaimed load must leave none
+    /// of these behind.
+    pub fn bank_load_objects(&self, slot: u32) -> anyhow::Result<BankLoadObjects> {
+        let key = self.bank_load_key(slot);
+        let load = self.loads.get(key).expect("bank load present");
+        let names: Vec<String> = load.bpf.maps().map(|(name, _)| name.to_string()).collect();
+        let mut maps = Vec::new();
+        for name in &names {
+            if SHARED_PIN_MAPS.contains(&name.as_str()) {
+                continue;
+            }
+            maps.push((name.clone(), load.map_id(name)?));
+        }
+        maps.sort();
+        let mut progs = Vec::new();
+        for name in [Self::entry_prog(slot), Self::birth_prog(slot)] {
+            let program = load
+                .bpf
+                .program(name)
+                .ok_or_else(|| anyhow::anyhow!("no such program"))?;
+            progs.push((name.to_string(), program.info()?.id()));
+        }
+        Ok(BankLoadObjects { maps, progs })
     }
 
     /// Memlock bytes for the shared proof maps (select/gate/arrays/account).
@@ -4055,38 +4100,49 @@ mod tests {
             "A-prime B: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        driver.reclaim(0).expect("reclaim A");
-        // Kernel-side teardown of the dropped load (program-array slot
-        // release, program unload) can lag the last FD close by an RCU
-        // grace period, so the disappearance check polls briefly. The
-        // requirement stays exact: every A map must be gone.
-        const RECLAIM_MAPS: [&str; 4] = [
+        let objects_a = driver.bank_load_objects(0).expect("A objects census");
+        for name in [
             "TASK_COOKIE",
             "COOKIE_CTL",
             "IMAGE_CONTINUITY",
             "IMAGE_TGID_INDEX",
-        ];
+            "TAIL_CALLS",
+            "STACK_GUARD",
+        ] {
+            assert!(
+                objects_a.maps.iter().any(|(seen, _)| seen == name),
+                "A census covers {name}"
+            );
+        }
+        driver.reclaim(0).expect("reclaim A");
+        // Kernel-side teardown of the dropped load (program-array slot
+        // release, program unload) can lag the last FD close by an RCU
+        // grace period, so the disappearance check polls briefly. The
+        // requirement stays exact: every A map and program must be gone.
         let started = Instant::now();
         let waited_ms = loop {
-            let live: Vec<u32> = aya::maps::loaded_maps()
+            let live_maps: HashSet<u32> = aya::maps::loaded_maps()
                 .filter_map(|info| info.ok().map(|info| info.id()))
                 .collect();
-            let lingering: Vec<(&str, u32)> = RECLAIM_MAPS
-                .iter()
-                .zip(ids_a.iter())
-                .filter(|(_, id)| live.contains(id))
-                .map(|(name, id)| (*name, *id))
+            let live_progs: HashSet<u32> = aya::programs::loaded_programs()
+                .filter_map(|info| info.ok().map(|info| info.id()))
                 .collect();
-            if lingering.is_empty() {
+            let lingering_maps = lingering_ids(&objects_a.maps, &live_maps);
+            let lingering_progs = lingering_ids(&objects_a.progs, &live_progs);
+            if lingering_maps.is_empty() && lingering_progs.is_empty() {
                 break started.elapsed().as_millis();
             }
             assert!(
                 started.elapsed() < Duration::from_secs(30),
-                "A-prime: A maps still loaded 30s after reclaim: {lingering:?}"
+                "A-prime: A objects still loaded 30s after reclaim: maps={lingering_maps:?} progs={lingering_progs:?}"
             );
             std::thread::sleep(Duration::from_millis(50));
         };
-        println!("P11_BANK_APRIME_reclaim waited_ms={waited_ms}");
+        println!(
+            "P11_BANK_APRIME_reclaim waited_ms={waited_ms} watched_maps={} watched_progs={}",
+            objects_a.maps.len(),
+            objects_a.progs.len()
+        );
         driver.prepare(0).expect("prepare A-prime");
         let ids_aprime = [
             driver
@@ -6345,6 +6401,30 @@ mod tests {
             assert!(helper.contains(arm), "owner_array maps {arm}");
             assert!(install.contains(arm), "install_slot maps {arm}");
         }
+    }
+
+    #[test]
+    fn lingering_ids_reports_exactly_the_live_watched_objects() {
+        let watched = vec![
+            ("TASK_COOKIE".to_string(), 2263u32),
+            ("TAIL_CALLS".to_string(), 2261u32),
+            ("p11_bank_entry_a".to_string(), 101u32),
+        ];
+        let live: HashSet<u32> = [2261, 999].into_iter().collect();
+        assert_eq!(
+            lingering_ids(&watched, &live),
+            vec![("TAIL_CALLS".to_string(), 2261u32)],
+            "one leaked array is reported by name and id"
+        );
+        let live: HashSet<u32> = [999].into_iter().collect();
+        assert!(
+            lingering_ids(&watched, &live).is_empty(),
+            "a fully reclaimed load lingers nothing"
+        );
+        assert!(
+            lingering_ids(&[], &live).is_empty(),
+            "an empty watch reports nothing"
+        );
     }
 
     #[test]

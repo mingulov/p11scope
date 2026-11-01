@@ -5742,14 +5742,48 @@ mod tests {
         drop(engine);
     }
 
-    /// Guard removing a CLI cell's `-o` report on scope exit (success or
-    /// panic), so TMPDIR keeps no scratch.
+    /// Guard removing a CLI cell's `-o` report on success, so TMPDIR
+    /// keeps no scratch. On panic the report stays and its path plus a
+    /// bounded tail print, so the failure carries its evidence.
     struct RemoveReportOnDrop(std::path::PathBuf);
 
     impl Drop for RemoveReportOnDrop {
         fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("counter CLI evidence kept at {}", self.0.display());
+                for line in report_tail(&self.0) {
+                    eprintln!("counter CLI report: {line}");
+                }
+                return;
+            }
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    /// Bounded report tail for failure evidence: the last 40 lines
+    /// within 8 KiB.
+    fn report_tail(path: &std::path::Path) -> Vec<String> {
+        const MAX_LINES: usize = 40;
+        const MAX_BYTES: usize = 8192;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => return vec![format!("<report unreadable: {error}>")],
+        };
+        let mut lines: Vec<&str> = text.lines().collect();
+        if lines.len() > MAX_LINES {
+            lines.drain(..lines.len() - MAX_LINES);
+        }
+        let mut bytes = 0;
+        let mut kept = Vec::new();
+        for line in lines.into_iter().rev() {
+            if bytes + line.len() + 1 > MAX_BYTES {
+                break;
+            }
+            bytes += line.len() + 1;
+            kept.push(line.to_string());
+        }
+        kept.reverse();
+        kept
     }
 
     /// Row-0 liveness predicate for the CLI cells' `-o` JSON: the held call

@@ -367,6 +367,42 @@ fn ledger_main_counts(out: &Path, func: &str) -> Result<(u64, u64)> {
     Ok((entered, bad))
 }
 
+/// Bounded observer-log tail for failure evidence: the last 40 lines
+/// within 8 KiB, so a failure carries the observer's own words.
+fn observer_log_tail(log: &Path) -> Vec<String> {
+    const MAX_LINES: usize = 40;
+    const MAX_BYTES: usize = 8192;
+    let text = match std::fs::read_to_string(log) {
+        Ok(text) => text,
+        Err(error) => return vec![format!("<log unreadable: {error}>")],
+    };
+    let mut lines: Vec<&str> = text.lines().collect();
+    if lines.len() > MAX_LINES {
+        lines.drain(..lines.len() - MAX_LINES);
+    }
+    let mut bytes = 0;
+    let mut kept = Vec::new();
+    for line in lines.into_iter().rev() {
+        if bytes + line.len() + 1 > MAX_BYTES {
+            break;
+        }
+        bytes += line.len() + 1;
+        kept.push(line.to_string());
+    }
+    kept.reverse();
+    kept
+}
+
+/// One failure line carrying the observer's exit status, the report
+/// path and the bounded log tail.
+fn observer_evidence(log: &Path, report: &Path, status: &str) -> String {
+    format!(
+        "observer {status}; report={}; log tail={:?}",
+        report.display(),
+        observer_log_tail(log)
+    )
+}
+
 /// Wait for the observer's first row naming `needle`: attach plus
 /// discovery plus the pre-loop selection read all precede the first
 /// frame, so opening the workload gate here keeps every main-phase
@@ -375,6 +411,7 @@ fn wait_for_observer_row(
     observer_out: &Path,
     needle: &str,
     child: &mut Child,
+    report: &Path,
     budget: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + budget;
@@ -384,14 +421,17 @@ fn wait_for_observer_row(
         if seen {
             return Ok(());
         }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "the observer exited before showing {needle:?}: {}",
+                observer_evidence(observer_out, report, &format!("exited {status}"))
+            );
+        }
         ensure!(
             Instant::now() < deadline,
-            "observer never showed {needle:?} (pid={})",
-            child.id()
-        );
-        ensure!(
-            child.try_wait()?.is_none(),
-            "the observer exited before showing {needle:?}"
+            "observer never showed {needle:?} (pid={}): {}",
+            child.id(),
+            observer_evidence(observer_out, report, "still running")
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -402,7 +442,12 @@ fn c8_gate(prefix: &Path, generation: u32, phase: &str) -> PathBuf {
     PathBuf::from(format!("{}.{generation}.{phase}", prefix.display()))
 }
 
-fn wait_for_observer_stop(child: &mut Child, budget: Duration) -> Result<std::process::ExitStatus> {
+fn wait_for_observer_stop(
+    child: &mut Child,
+    log: &Path,
+    report: &Path,
+    budget: Duration,
+) -> Result<std::process::ExitStatus> {
     let deadline = Instant::now() + budget;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -410,11 +455,22 @@ fn wait_for_observer_stop(child: &mut Child, budget: Duration) -> Result<std::pr
         }
         ensure!(
             Instant::now() < deadline,
-            "the observer never stopped (pid={})",
-            child.id()
+            "the observer never stopped (pid={}): {}",
+            child.id(),
+            observer_evidence(log, report, "still running")
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Keep the workload directory on failure so the printed report path
+/// stays readable; on success the directory drops as before.
+fn keep_workload_on_failure(workload: K0Workload, outcome: Result<()>, tag: &str) -> Result<()> {
+    if outcome.is_err() {
+        eprintln!("{tag} evidence kept at {}", workload.dir.path().display());
+        let _ = workload.dir.keep();
+    }
+    outcome
 }
 
 fn spawn_observer(
@@ -454,6 +510,11 @@ fn k0_live_detail_matches_ledger_counts_lp64() -> Result<()> {
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = K0Workload::build(&module)?;
+    let outcome = k0_detail_inner(&workload, &module, &observer);
+    keep_workload_on_failure(workload, outcome, "K0P")
+}
+
+fn k0_detail_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<()> {
     let out = workload.path("k0p.json");
     let log = workload.path("k0p.observer.log");
     let gate = workload.path("k0p.gate");
@@ -464,15 +525,19 @@ fn k0_live_detail_matches_ledger_counts_lp64() -> Result<()> {
     target.wait_for("READY ", Duration::from_secs(60))?;
     let pid = target.child.id();
     let mut child = spawn_observer(&observer, pid, 60, &out, &log)?;
-    wait_for_observer_row(&log, "C_Sign", &mut child, Duration::from_secs(120))?;
+    wait_for_observer_row(&log, "C_Sign", &mut child, &out, Duration::from_secs(120))?;
     std::fs::write(&gate, b"open\n")?;
     target.wait_for("DONE ", Duration::from_secs(60))?;
     // The held pid stays mapped while the observer closes on its own
     // duration: no leader exit can void the window.
-    let status = wait_for_observer_stop(&mut child, Duration::from_secs(180))?;
+    let status = wait_for_observer_stop(&mut child, &log, &out, Duration::from_secs(180))?;
     target.ensure_alive("at observer stop")?;
     target.kill();
-    ensure!(status.success(), "observer exited {status}");
+    ensure!(
+        status.success(),
+        "observer exited {status}: {}",
+        observer_evidence(&log, &out, &format!("exited {status}"))
+    );
     let (entered, bad) = ledger_main_counts(&ledger_out, "C_Sign")?;
     ensure!(entered == 4 && bad == 0, "workload did 4 clean signs");
     let document: serde_json::Value =
@@ -517,6 +582,11 @@ fn k0_live_exec_voids_detail_counts_lp64() -> Result<()> {
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = K0Workload::build(&module)?;
+    let outcome = k0_exec_inner(&workload, &module, &observer);
+    keep_workload_on_failure(workload, outcome, "K0X")
+}
+
+fn k0_exec_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<()> {
     let out = workload.path("k0x.json");
     let log = workload.path("k0x.observer.log");
     let gate = workload.path("k0x.gate");
@@ -535,7 +605,7 @@ fn k0_live_exec_voids_detail_counts_lp64() -> Result<()> {
     target.wait_for("READY ", Duration::from_secs(60))?;
     let pid = target.child.id();
     let mut child = spawn_observer(&observer, pid, 150, &out, &log)?;
-    wait_for_observer_row(&log, "C_Sign", &mut child, Duration::from_secs(120))?;
+    wait_for_observer_row(&log, "C_Sign", &mut child, &out, Duration::from_secs(120))?;
     std::fs::write(&gate, b"open\n")?;
     target.wait_for_line(&["DONE", "gen=0"], "gen0 done", Duration::from_secs(60))?;
     std::fs::write(c8_gate(&gates, 0, "next"), b"open\n")?;
@@ -550,10 +620,14 @@ fn k0_live_exec_voids_detail_counts_lp64() -> Result<()> {
     // The exec lands strictly inside the window: after the
     // selection-time read (first frame precedes the gate) and before
     // the close read (DONE gen=1 precedes observer stop).
-    let status = wait_for_observer_stop(&mut child, Duration::from_secs(240))?;
+    let status = wait_for_observer_stop(&mut child, &log, &out, Duration::from_secs(240))?;
     target.ensure_alive("at observer stop")?;
     target.kill();
-    ensure!(status.success(), "observer exited {status}");
+    ensure!(
+        status.success(),
+        "observer exited {status}: {}",
+        observer_evidence(&log, &out, &format!("exited {status}"))
+    );
     let text = std::fs::read_to_string(&ledger_out)?;
     ensure!(
         text.lines()

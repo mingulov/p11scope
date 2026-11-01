@@ -4376,10 +4376,11 @@ fn privileged_key_operations_linked_lane_pumps_live_discovery() -> Result<()> {
     Ok(())
 }
 
-/// Live discovery fault: a stopped capture faults the live arm, the
-/// pump refuses with Unavailable, and nothing latches — the machine
-/// stays installed, the lane stays live, and a second pump refuses
-/// the same way. Root BPF lane, serial.
+/// Live discovery fault: a malformed staged record faults the live
+/// arm on a running capture; the pump refuses with Unavailable, and
+/// nothing latches — the machine stays installed and unlatched, the
+/// lane stays live, and a second pump refuses the same way. Root
+/// BPF lane, serial.
 #[test]
 #[ignore = "privileged: live DD transport fault refuses without latching"]
 fn privileged_key_operations_live_discovery_fault_refuses_without_latching() -> Result<()> {
@@ -4408,7 +4409,7 @@ fn privileged_key_operations_live_discovery_fault_refuses_without_latching() -> 
     }
     let mut lane =
         start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
-    lane.stop_live_capture_for_test();
+    lane.stage_malformed_discovery_for_test();
     for attempt in 0..2 {
         let deadline = Instant::now() + Duration::from_secs(5);
         let refused = lane.service_linked_live_discovery(64, deadline);
@@ -4417,21 +4418,26 @@ fn privileged_key_operations_live_discovery_fault_refuses_without_latching() -> 
                 &refused,
                 Err(crate::inventory_semantics::SemanticRefusal::Unavailable)
             ),
-            "attempt {attempt}: a faulted live capture refuses: {refused:?}"
+            "attempt {attempt}: a faulted live pump refuses: {refused:?}"
         );
         ensure!(lane.has_joint_machine(), "attempt {attempt}: no latch");
+        ensure!(
+            lane.joint_disposition_reason().is_none(),
+            "attempt {attempt}: no disposition latched: {:?}",
+            lane.joint_disposition_reason()
+        );
         ensure!(lane.is_live(), "attempt {attempt}: the lane stays live");
     }
     eprintln!("KEY_OPS_FAULT refused=Unavailable latched=false");
     Ok(())
 }
 
-/// Live discovery fault with coverage consequence: a stopped capture
-/// faults the live pump with `Unavailable` without latching the
-/// machine; the machine stays installed and serviceable (never
-/// DispositionRequired), the terminal batch carries the coverage
-/// failure, Finish still publishes, and the driver's fallback stop
-/// reason names `Unavailable`. Root BPF lane, serial.
+/// Live discovery fault with coverage consequence: a malformed staged
+/// record faults the live pump with `Unavailable` on a running
+/// capture, without latching the machine; the next audited batch
+/// carries the coverage failure and routes post-fault provider calls
+/// to the coverage fault, the driver's fallback stop reason names
+/// `Unavailable`, and Finish still publishes. Root BPF lane, serial.
 #[test]
 #[ignore = "privileged: live linked fault fails coverage without latching, finish publishes"]
 fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> Result<()> {
@@ -4439,7 +4445,6 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
     use crate::semantic_capture::{InvalidationScope, TickOutcome};
     use anyhow::Context as _;
     use std::time::{Duration, Instant};
-    // Lane A: fault, driver tick refusal, Finish publishes.
     let workload = JointWorkload::build()?;
     let mut coordinator =
         system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
@@ -4464,7 +4469,8 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
     }
     let mut lane =
         start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
-    lane.stop_live_capture_for_test();
+    // Fault the pump on the running capture.
+    lane.stage_malformed_discovery_for_test();
     let deadline = Instant::now() + Duration::from_secs(5);
     let refused = lane.service_linked_live_discovery(64, deadline);
     ensure!(
@@ -4472,14 +4478,115 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
             &refused,
             Err(crate::inventory_semantics::SemanticRefusal::Unavailable)
         ),
-        "a faulted live capture refuses: {refused:?}"
+        "a faulted live pump refuses: {refused:?}"
     );
     ensure!(lane.has_joint_machine(), "no latch: machine installed");
     ensure!(
         lane.joint_disposition_reason().is_none(),
-        "not DispositionRequired after a pump fault"
+        "not DispositionRequired after a pump fault: {:?}",
+        lane.joint_disposition_reason()
     );
     ensure!(lane.is_live(), "the lane stays live");
+    // Post-fault provider calls: a gated script process maps first,
+    // then runs its calls right before the audit drive, so the next
+    // audited batch carries them.
+    let go = workload.path("keyops-cov-go");
+    let go_arg = go.to_str().context("go path")?.to_string();
+    let soft_arg = workload
+        .soft_copy
+        .to_str()
+        .context("soft-copy path")?
+        .to_string();
+    let process = workload.spawn(
+        "cov",
+        &[
+            "b", "--cell", "C", "--module", &soft_arg, "--go", &go_arg, "--iters", "2", "--hold",
+        ],
+        &[],
+    )?;
+    drive_until_mapped(&mut coordinator, &[process.pid()])?;
+    std::fs::write(&go, b"")?;
+    process.wait_for("DONE ", Duration::from_secs(60))?;
+    let (_by_fn, total, bad) = ledger_calls(&process.out)?;
+    ensure!(
+        bad == 0,
+        "the post-fault script never fails: {:?}",
+        process.lines()
+    );
+    ensure!(total > 0, "the script made post-fault provider calls");
+    // Drive the begun transaction one machine step at a time until
+    // the audited batch stages, then assert the coverage failure on
+    // it directly.
+    lane.begin_joint_commit(true).map_err(|refusal| {
+        let reason = match refusal {
+            crate::inventory_semantics::JointCommitRefusal::NotInitialized => "not initialized",
+            crate::inventory_semantics::JointCommitRefusal::OutstandingRequest => {
+                "outstanding request"
+            }
+            crate::inventory_semantics::JointCommitRefusal::DispositionRequired => {
+                "disposition required"
+            }
+        };
+        anyhow::anyhow!("keyops-cov: begin refused: {reason}")
+    })?;
+    let revision_before = coordinator.registry().published_revision();
+    let audit_started = Instant::now();
+    let (outcome_count, covfault_calls) = loop {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        lane.service_joint(
+            &mut coordinator,
+            crate::inventory_semantics::JointServiceMode::Running,
+            &mut budget,
+        )
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "keyops-cov: audit service refused: {reason} disposition={:?} waiters={:?}",
+                lane.joint_disposition_reason(),
+                lane.joint_stuck_diagnostic_for_test(),
+            )
+        })?;
+        if let Some(batch) = coordinator.pending_semantic_batch_for_test() {
+            let outcomes = batch.outcomes();
+            ensure!(
+                outcomes.iter().any(|outcome| matches!(
+                    outcome,
+                    TickOutcome::Invalidation(loss)
+                        if matches!(loss.scope(), InvalidationScope::CoverageFailed)
+                )),
+                "the audited batch carries CoverageFailed ({} outcomes)",
+                outcomes.len()
+            );
+            let covfault = outcomes
+                .iter()
+                .filter(|outcome| {
+                    matches!(
+                        outcome,
+                        TickOutcome::Call(call)
+                            if matches!(call.route(), Route::Unknown(UnknownReason::CoverageFault))
+                    )
+                })
+                .count();
+            ensure!(
+                covfault > 0,
+                "the audited batch routes post-fault calls to CoverageFault ({} outcomes)",
+                outcomes.len()
+            );
+            break (outcomes.len(), covfault);
+        }
+        ensure!(
+            audit_started.elapsed() < Duration::from_secs(120),
+            "keyops-cov: no audited batch after 120 s; stuck audit={:?} h3={:?} waiters={:?}",
+            lane.joint_audit_diagnostic_for_test(),
+            coordinator.reference_h3_audit_state(),
+            lane.joint_stuck_diagnostic_for_test(),
+        );
+    };
+    // One driver hook on the faulted lane: the pump refuses again
+    // on the sticky fault, the hook still services the machine, and
+    // the fallback stop reason names Unavailable.
     let service_calls_before = lane.joint_service_calls_for_test();
     let mut driver = ClassicDriver {
         coordinator: &mut coordinator,
@@ -4535,16 +4642,74 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
     );
     ensure!(
         lane.joint_disposition_reason().is_none(),
-        "the serviced machine latches nothing"
+        "the serviced machine latches nothing: {:?}",
+        lane.joint_disposition_reason()
     );
     ensure!(
         driver.joint_tick_refusal == Some(crate::inventory_semantics::SemanticRefusal::Unavailable),
         "the fallback stop reason names Unavailable: {:?}",
         driver.joint_tick_refusal
     );
-    // Finish still publishes on the faulted lane.
     let mut lane = driver.semantic.take().expect("lane stays seated");
     let coordinator = &mut *driver.coordinator;
+    // The faulted transaction still publishes with coverage failed.
+    let publish_started = Instant::now();
+    loop {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        lane.service_joint(
+            &mut *coordinator,
+            crate::inventory_semantics::JointServiceMode::Running,
+            &mut budget,
+        )
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "keyops-cov: publish service refused: {reason} disposition={:?} waiters={:?}",
+                lane.joint_disposition_reason(),
+                lane.joint_stuck_diagnostic_for_test(),
+            )
+        })?;
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1024,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let commit = lane
+            .poll_joint_commit(&mut *coordinator, &mut budget)
+            .map_err(|reason| {
+                anyhow::anyhow!(
+                    "keyops-cov: commit poll refused: {reason} disposition={:?} waiters={:?}",
+                    lane.joint_disposition_reason(),
+                    lane.joint_stuck_diagnostic_for_test(),
+                )
+            })?;
+        if matches!(
+            commit,
+            crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_)
+        ) {
+            let revision_after = coordinator.registry().published_revision();
+            ensure!(
+                revision_after == revision_before + 1,
+                "keyops-cov: one published revision per transaction: \
+                 {revision_before} -> {revision_after}"
+            );
+            break;
+        }
+        ensure!(
+            publish_started.elapsed() < Duration::from_secs(120),
+            "keyops-cov: unpublished after 120 s; stuck audit={:?} h3={:?} waiters={:?}",
+            lane.joint_audit_diagnostic_for_test(),
+            coordinator.reference_h3_audit_state(),
+            lane.joint_stuck_diagnostic_for_test(),
+        );
+    }
+    ensure!(
+        lane.joint_disposition_reason().is_none(),
+        "the published machine latches nothing: {:?}",
+        lane.joint_disposition_reason()
+    );
+    // Finish still publishes on the faulted lane.
     lane.begin_joint_finish(coordinator)
         .map_err(|reason| anyhow::anyhow!("finish begins on the faulted lane: {reason}"))?;
     let mut published = false;
@@ -4566,53 +4731,10 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
     }
     ensure!(published, "Finish publishes with coverage failed");
     drop(driver);
-    // Lane B: the terminal batch carries the coverage failure.
-    let workload = JointWorkload::build()?;
-    let mut coordinator =
-        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
-    let manifest_soft = provider_joint_manifest(
-        workload.workload.dir.path(),
-        &workload.soft_copy,
-        JOINT_SOFT_FUNCTIONS,
-        "keyops-covb-soft.dr37.json",
-    )?;
-    let manifest_held = provider_joint_manifest(
-        workload.workload.dir.path(),
-        &workload.held,
-        &["C_SignInit", "C_Sign"],
-        "keyops-covb-held.dr37.json",
-    )?;
-    let mut lane =
-        start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
-    lane.stop_live_capture_for_test();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let refused = lane.service_linked_live_discovery(64, deadline);
-    ensure!(
-        matches!(
-            &refused,
-            Err(crate::inventory_semantics::SemanticRefusal::Unavailable)
-        ),
-        "lane B faults: {refused:?}"
+    eprintln!(
+        "KEY_OPS_COVFAULT refused=Unavailable latched=false outcomes={outcome_count} \
+         covfault={covfault_calls} finish=published"
     );
-    let batch = lane.finish_semantic_stop().context("lane B stops")?;
-    let outcomes = batch.outcomes();
-    ensure!(
-        outcomes.iter().any(|outcome| matches!(
-            outcome,
-            TickOutcome::Invalidation(loss)
-                if matches!(loss.scope(), InvalidationScope::CoverageFailed)
-        )),
-        "the terminal batch carries CoverageFailed"
-    );
-    ensure!(
-        outcomes.iter().any(|outcome| matches!(
-            outcome,
-            TickOutcome::Call(call)
-                if matches!(call.route(), Route::Unknown(UnknownReason::CoverageFault))
-        )),
-        "the terminal batch routes CoverageFault"
-    );
-    eprintln!("KEY_OPS_COVFAULT refused=Unavailable latched=false finish=published");
     Ok(())
 }
 

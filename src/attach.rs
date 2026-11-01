@@ -9524,6 +9524,19 @@ impl Session {
         self.discovery_staged.take()
     }
 
+    /// Stage a malformed discovery marker at the head of the staged
+    /// FIFO, so the live linked fault twin can fault the pump on a
+    /// running capture: the next dequeue observes the marker first,
+    /// the pump marks its sticky discovery status and refuses, and
+    /// the capture keeps running. Test-only; production markers
+    /// arrive only from the ring consumer.
+    #[cfg(test)]
+    pub(crate) fn stage_malformed_discovery_for_test(&mut self) {
+        self.discovery_staged
+            .items
+            .push_front(events::DiscoveryItem::Malformed);
+    }
+
     pub(crate) fn discovery_dequeue(&mut self) -> Result<Option<events::DiscoveryItem>> {
         if let Some(item) = self.discovery_staged.pop() {
             return Ok(Some(item));

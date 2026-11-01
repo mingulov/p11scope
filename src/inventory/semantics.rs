@@ -2288,17 +2288,19 @@ impl AttestedSemanticLane {
         &self.hook_order
     }
 
-    /// Stop the live capture through the test seam, so the live-DD
-    /// fault twin can fault a real linked lane without kernel
-    /// surgery: stopping is a genuine capture state (the terminal
-    /// sequence stops it), and linkage still derives from the real
-    /// seal — the seam injects only the fault, never authority.
-    /// No live lane means no-op (the twin's refusal assertion then
-    /// fails on its own).
+    /// Fault the live pump through the test seam, so the live
+    /// discovery fault twins can fault a real linked lane without
+    /// kernel surgery: a malformed marker stages at the head of the
+    /// live session's queue, the next pump observes it first, marks
+    /// the capture's sticky discovery status and refuses — while the
+    /// capture keeps running, as under a genuine discovery fault.
+    /// Linkage still derives from the real seal: the seam injects
+    /// only the fault, never authority. No live lane means no-op
+    /// (the twin's refusal assertion then fails on its own).
     #[cfg(test)]
-    pub(crate) fn stop_live_capture_for_test(&mut self) {
+    pub(crate) fn stage_malformed_discovery_for_test(&mut self) {
         if let Some(live) = self.live.as_mut() {
-            live.capture.stop();
+            live.session.stage_malformed_discovery_for_test();
         }
     }
 

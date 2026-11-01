@@ -1349,12 +1349,6 @@ pub(crate) fn stash_refresh_report(
     (images, shed)
 }
 
-/// Merge the lane's stashed refresh evidence behind a tick report's
-/// own, returning the receipt/outcome merge shed count (the
-/// refused-endpoints share). The stashed and merged disclosure
-/// shed joins the report's carried disclosure shed instead, never
-/// this total. Shared by regular ticks and terminal quanta so quiet
-/// proofs register on every path.
 /// One collected H0 tick plus the lane-stash merge behind its
 /// report: the single sequencing the live collected path and the
 /// held machine I/O share, so the merge cannot be dropped on one
@@ -1371,6 +1365,12 @@ pub(crate) fn tick_collected_with_stash_merge(
     Ok((report, shed))
 }
 
+/// Merge the lane's stashed refresh evidence behind a tick report's
+/// own, returning the receipt/outcome merge shed count (the
+/// refused-endpoints share). The stashed and merged disclosure
+/// shed joins the report's carried disclosure shed instead, never
+/// this total. Shared by regular ticks and terminal quanta so quiet
+/// proofs register on every path.
 pub(crate) fn merge_stash_into_report(
     stash: &mut RefreshReceiptStash,
     report: &mut TickReport,

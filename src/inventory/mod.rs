@@ -4167,12 +4167,13 @@ impl ClassicDriver<'_> {
                         warn,
                         None,
                     );
+                    // The held gap reuses the hold's own reason, so it
+                    // cannot disagree with the first error: the hold
+                    // already resolved graph refusal, machine latch,
+                    // then fallback.
+                    let held = error.clone();
                     first_error.get_or_insert(error);
-                    let held = coordinator
-                        .collected_graph_refused()
-                        .unwrap_or("joint finish disposition required");
-                    coordinator
-                        .note_scope_gap("joint finish held for exit".to_string(), held.to_string());
+                    coordinator.note_scope_gap("joint finish held for exit".to_string(), held);
                 } else {
                     let live = lane.take().expect("a failed lane holds");
                     Self::hold_joint_lane_for_exit(
@@ -12822,6 +12823,125 @@ mod tests {
                 "provider_storage_refused".to_string()
             )],
             "the abandon gap names the latched refusal: {:?}",
+            gaps(&mut driver)
+        );
+        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+            None,
+        );
+    }
+
+    #[test]
+    fn not_begun_fail_held_gap_names_latched_storage_refusal() {
+        // Clear the posed reason even if an assertion panics: the
+        // override is thread-local and must not leak into the next
+        // test on this thread.
+        struct ClearPosedReason;
+        impl Drop for ClearPosedReason {
+            fn drop(&mut self) {
+                crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+                    None,
+                );
+            }
+        }
+        let _clear = ClearPosedReason;
+        // No graph refusal is seeded, so the coordinator's terminal
+        // refusal stays None: only the posed machine latch can name
+        // the hold. The commit poll fails with a different,
+        // non-retryable refusal, so the latch must win by name.
+        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+            Some(crate::inventory_semantics::SemanticRefusal::ProviderStorage),
+        );
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        lane.set_scripted_commit_poll_for_test(Some(Err(
+            crate::inventory_semantics::SemanticRefusal::Unavailable,
+        )));
+        driver.semantic = Some(lane);
+        driver.joint_commit_pending = true;
+        driver.step_retained_joint_finish();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the finished-lane refusal abandons"
+        );
+        assert!(driver.semantic.is_none(), "the lane is held");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("provider_storage_refused"),
+            "the first error names the latched refusal"
+        );
+        let held: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "joint finish held for exit")
+            .collect();
+        assert_eq!(
+            held.as_slice(),
+            &[(
+                "joint finish held for exit".to_string(),
+                "provider_storage_refused".to_string()
+            )],
+            "the held gap names the latched refusal: {:?}",
+            gaps(&mut driver)
+        );
+        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+            None,
+        );
+    }
+
+    #[test]
+    fn not_begun_fail_held_gap_names_graph_refusal_first() {
+        // Precedence twin: with both a terminal graph refusal and a
+        // posed machine latch, the graph refusal wins in the first
+        // error and the held gap, matching the hold's documented
+        // graph-first order.
+        struct ClearPosedReason;
+        impl Drop for ClearPosedReason {
+            fn drop(&mut self) {
+                crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+                    None,
+                );
+            }
+        }
+        let _clear = ClearPosedReason;
+        crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(
+            Some(crate::inventory_semantics::SemanticRefusal::ProviderStorage),
+        );
+        let mut coordinator = coordinator();
+        coordinator
+            .seed_collected_graph_refusal_for_test("terminal graph refused before native mutation");
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        lane.set_scripted_commit_poll_for_test(Some(Err(
+            crate::inventory_semantics::SemanticRefusal::Unavailable,
+        )));
+        driver.semantic = Some(lane);
+        driver.joint_commit_pending = true;
+        driver.step_retained_joint_finish();
+        assert_eq!(
+            driver.joint_finish,
+            JointFinishDriver::Abandoned,
+            "the finished-lane refusal abandons"
+        );
+        assert!(driver.semantic.is_none(), "the lane is held");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("terminal graph refused before native mutation"),
+            "the first error names the graph refusal"
+        );
+        let held: Vec<(String, String)> = gaps(&mut driver)
+            .into_iter()
+            .filter(|(subject, _)| subject == "joint finish held for exit")
+            .collect();
+        assert_eq!(
+            held.as_slice(),
+            &[(
+                "joint finish held for exit".to_string(),
+                "terminal graph refused before native mutation".to_string()
+            )],
+            "the held gap names the graph refusal: {:?}",
             gaps(&mut driver)
         );
         crate::inventory_semantics::AttestedSemanticLane::pose_joint_disposition_reason_for_test(

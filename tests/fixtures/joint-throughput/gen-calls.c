@@ -32,7 +32,12 @@
  * compared window. Keyed modes ledger it in its own T0-valid file
  * (<base>-setup.jsonl): the Joint flow execs this process after the
  * observer seals its linked lane, so every setup call is observed and
- * must be conserved. The hot loop is ledgered per worker: digest modes
+ * must be conserved. When GEN_CALLS_SETUP_GATE names a path, this
+ * process prints MAPPED and waits for that path after dlopen but
+ * before its first provider call, so the observer can admit the
+ * fresh mapping before first use (first use after admission keeps
+ * the usage edge counted; use before admission voids it for good).
+ * The hot loop is ledgered per worker: digest modes
  * run repeated single-part C_DigestInit + C_Digest operations under
  * CKM_SHA_256, two ledgered calls per op, on a fixed 64-byte input;
  * keyed modes create one session generic-secret key per worker after
@@ -262,7 +267,10 @@ static void usage(const char *name) {
            "              No internal deadline: requires one absolute 30 s\n"
            "              process supervisor from launch, then TERM/reap.\n"
            "  %s --help | --dry-run PROVIDER MODE RATE DURATION_S LEDGER "
-           "[GO_FILE [FINISH_FILE]]\n",
+           "[GO_FILE [FINISH_FILE]]\n"
+           "GEN_CALLS_SETUP_GATE optional env path: after dlopen, print\n"
+           "              MAPPED and wait for the path before the first\n"
+           "              provider call\n",
            name, name);
 }
 
@@ -1006,6 +1014,19 @@ int main(int argc, char **argv) {
     struct provider provider;
     if (open_provider(provider_path, &provider, keyed) != 0) {
         return 2;
+    }
+    /* Optional admission window: the provider is mapped now, but no
+     * provider call has run yet. When the controller sets
+     * GEN_CALLS_SETUP_GATE, print MAPPED and wait for that path, so
+     * the observer can admit the fresh mapping before first use. */
+    const char *setup_gate = getenv("GEN_CALLS_SETUP_GATE");
+    if (setup_gate != NULL && setup_gate[0] != '\0') {
+        printf("MAPPED pid=%d\n", (int)getpid());
+        fflush(stdout);
+        if (wait_for_go(setup_gate) != 0) {
+            dlclose(provider.handle);
+            return 2;
+        }
     }
     /* Keyed setup is observed (post-closure exec), so every setup call
      * is stamped while it runs and ledgered before READY. A clock or

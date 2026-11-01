@@ -2045,6 +2045,40 @@ class DriverFixture(unittest.TestCase):
             self.assertEqual(proc.returncode, 2)
             self.assertIn("single, churn, keyed or keyed-churn", proc.stderr)
 
+    def test_setup_gate_opens_a_mapping_window_before_first_use(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-mapped-") as tmp:
+            workdir = Path(tmp)
+            driver = self.build_driver(workdir)
+            stub = self.build_keyed_stub(workdir)
+            gate = workdir / "setup-go"
+            gate.touch()
+            env = dict(os.environ, GEN_CALLS_SETUP_GATE=str(gate))
+            proc = subprocess.run(
+                [str(driver), str(stub), "keyed", "1k", "1",
+                 str(workdir / "ledger.jsonl")],
+                capture_output=True, text=True, timeout=60, env=env)
+            self.assertEqual(proc.returncode, 0,
+                             f"rc={proc.returncode}: {proc.stderr[-2000:]}")
+            mapped = proc.stdout.index("MAPPED pid=")
+            ready = proc.stdout.index("READY pid=")
+            self.assertLess(mapped, ready)
+
+    def test_unset_setup_gate_prints_no_mapped(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-nomapped-") as tmp:
+            workdir = Path(tmp)
+            driver = self.build_driver(workdir)
+            stub = self.build_keyed_stub(workdir)
+            env = {key: value for key, value in os.environ.items()
+                   if key != "GEN_CALLS_SETUP_GATE"}
+            proc = subprocess.run(
+                [str(driver), str(stub), "keyed", "1k", "1",
+                 str(workdir / "ledger.jsonl")],
+                capture_output=True, text=True, timeout=60, env=env)
+            self.assertEqual(proc.returncode, 0,
+                             f"rc={proc.returncode}: {proc.stderr[-2000:]}")
+            self.assertNotIn("MAPPED", proc.stdout)
+            self.assertIn("READY pid=", proc.stdout)
+
     def test_keyed_mode_requires_the_keyed_entry_points(self):
         with tempfile.TemporaryDirectory(prefix="s1tp-kreq-") as tmp:
             workdir = Path(tmp)

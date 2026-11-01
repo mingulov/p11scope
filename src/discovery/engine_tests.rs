@@ -7882,13 +7882,11 @@ fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
 
     let dir = tempfile::tempdir().unwrap();
     let executable = dir.path().join("large-sh");
-    std::fs::copy(source_path, &executable).unwrap();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&executable)
-        .unwrap()
-        .set_len(2 * 1024 * 1024 * 1024 + 11 * 1024 * 1024)
-        .unwrap();
+    // Both the copy and the size extension run in waited children, never
+    // in-process: this executable is spawned below, and an in-process write
+    // fd would be inheritable by a concurrent fork from another test thread.
+    copy_executable_via_waited_child(source_path, &executable);
+    truncate_executable_via_waited_child(&executable, 2 * 1024 * 1024 * 1024 + 11 * 1024 * 1024);
     assert_eq!(
         std::fs::metadata(&executable).unwrap().len(),
         2 * 1024 * 1024 * 1024 + 11 * 1024 * 1024
@@ -7955,6 +7953,11 @@ fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
 #[test]
 fn a_cleanly_retired_loader_context_publishes_no_skip() {
     let (mut engine, owner) = Engine::retiring_loader_context(std::process::id());
+    // This test's subject is loader-retirement skip semantics, not tick
+    // scheduling: unbound the wall-clock deep-scan quantum (the same
+    // isolation the frame budget already gets in test builds) so a loaded
+    // host cannot inject a tick-deferral skip into the retirement batch.
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, Vec::new())
         .expect("an ordinary retirement batch");
@@ -15096,6 +15099,104 @@ fn compile_tabled_runner(dir: &std::path::Path) -> PathBuf {
     runner
 }
 
+/// Copy a fixture executable that a test will later exec through a
+/// waited-for `cp` child, never in-process: an in-process copy holds the
+/// destination open for writing, and a concurrent fork from another test
+/// thread inherits that fd — if the fork-child has not exec'd yet when the
+/// test execs the copy, the exec fails with ETXTBSY. A child writer owns
+/// the write fd privately, so no in-process fork can inherit it, and the
+/// wait proves the fd is closed before any exec of the copy.
+pub(crate) fn copy_executable_via_waited_child(source: &std::path::Path, target: &std::path::Path) {
+    let status = std::process::Command::new("cp")
+        .arg(source)
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "cp {} {}: {status}",
+        source.display(),
+        target.display()
+    );
+}
+
+/// Extend a fixture executable to `size` bytes through a waited-for
+/// `truncate` child, never in-process: like the copy above, an in-process
+/// size change holds the destination open for writing across concurrent
+/// forks. Waited before any exec of the target.
+pub(crate) fn truncate_executable_via_waited_child(target: &std::path::Path, size: u64) {
+    let status = std::process::Command::new("truncate")
+        .arg("-s")
+        .arg(size.to_string())
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "truncate -s {size} {}: {status}",
+        target.display()
+    );
+}
+
+/// Render a caught panic payload for message assertions: the loud-failure
+/// path must name its operands, not merely panic.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| message.to_string())
+        })
+        .expect("panic payload carries a message")
+}
+
+#[test]
+fn copy_executable_via_waited_child_reports_source_destination_and_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("missing-source");
+    let target = dir.path().join("destination");
+    let outcome = std::panic::catch_unwind(|| copy_executable_via_waited_child(&source, &target));
+    let payload = outcome.expect_err("copying a missing source must fail loudly");
+    let message = panic_message(&payload);
+    assert!(
+        message.contains(&source.display().to_string()),
+        "failure names the source: {message:?}"
+    );
+    assert!(
+        message.contains(&target.display().to_string()),
+        "failure names the destination: {message:?}"
+    );
+    assert!(
+        message.contains("exit status"),
+        "failure names the exit status: {message:?}"
+    );
+}
+
+#[test]
+fn truncate_executable_via_waited_child_reports_target_size_and_status() {
+    let dir = tempfile::tempdir().unwrap();
+    // `truncate` creates a missing file, so the failure needs a missing
+    // parent: the target can never be opened for writing.
+    let target = dir.path().join("missing-parent").join("destination");
+    let outcome = std::panic::catch_unwind(|| truncate_executable_via_waited_child(&target, 4096));
+    let payload = outcome.expect_err("truncating an unopenable target must fail loudly");
+    let message = panic_message(&payload);
+    assert!(
+        message.contains(&target.display().to_string()),
+        "failure names the target: {message:?}"
+    );
+    assert!(
+        message.contains("4096"),
+        "failure names the size: {message:?}"
+    );
+    assert!(
+        message.contains("exit status"),
+        "failure names the exit status: {message:?}"
+    );
+}
+
 impl TabledSeedProvider {
     fn grow_function_table(&mut self) {
         use std::io::Read as _;
@@ -15111,22 +15212,10 @@ impl TabledSeedProvider {
     }
 
     fn copy_tabled_runner(&self) -> PathBuf {
-        // Copy through a waited-for child, never in-process: an in-process
-        // copy holds the destination open for writing, and a concurrent fork
-        // from another test thread inherits that fd — if the fork-child has
-        // not exec'd yet when the runner execs the copy, the exec fails with
-        // ETXTBSY. A child writer owns the write fd privately, so no
-        // in-process fork can inherit it, and the wait proves the fd is
-        // closed before any exec of the copy.
+        // Through the shared waited-child writer: an in-process copy would
+        // hold the destination open for writing across concurrent forks.
         let target = self.dir.path().join("tabled-runner.copy");
-        assert!(
-            std::process::Command::new("cp")
-                .arg(self.dir.path().join("tabled-runner"))
-                .arg(&target)
-                .status()
-                .unwrap()
-                .success()
-        );
+        copy_executable_via_waited_child(&self.dir.path().join("tabled-runner"), &target);
         target
     }
 
@@ -48999,10 +49088,21 @@ fn assert_completed_rearm_new_exec_cannot_borrow_previous_recovery(recovered_cla
             engine.exec_rearm_views[&engine.views[0].id()],
             Some(request.serial)
         );
+        // Diagnostic message only (ruling WU1B-1): the condition is unchanged.
+        // A future failure prints the batch outcome and the surrounding
+        // route state so the next occurrence self-diagnoses.
+        let batch = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
         assert!(
-            apply_ordinary_batch(&mut engine, &mut session, Vec::new())
-                .unwrap()
-                .required_complete
+            batch.required_complete,
+            "completed-rearm borrow batch incomplete: batch={batch:?} class={class} \
+             recovered_class={recovered_class} pid={pid} request={request:?} before={before:?} \
+             views={} view_live={} refresh_after={:?}",
+            engine.views.len(),
+            engine
+                .views
+                .first()
+                .is_some_and(|view| view.still_the_same()),
+            engine.refresh_requested.get(&pid),
         );
         let current = session
             .pid_continuity

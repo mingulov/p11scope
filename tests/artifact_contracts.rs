@@ -12,6 +12,35 @@ use support::DieWithParent as _;
 #[path = "support/transport_boundaries.rs"]
 mod transport_boundaries;
 
+/// Write an executable stub that a test will later exec: stage the bytes to
+/// a never-executed sibling, then copy them into place through a waited-for
+/// `cp` child, never in-process. An in-process write holds the destination
+/// open for writing, and a concurrent fork from another test thread inherits
+/// that fd — if the fork-child has not exec'd yet when the test execs the
+/// stub, the exec fails with ETXTBSY. The staging file is never executed and
+/// carries no mode bit; the waited `cp` owns the stub's write fd privately,
+/// so no in-process fork can inherit it, and the wait proves the fd is closed
+/// before any exec of the stub. `chmod` stays in-process: it opens no fd.
+fn write_executable_stub_via_waited_child(path: &std::path::Path, content: &[u8], mode: u32) {
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(".src");
+    let staging = std::path::PathBuf::from(staging);
+    fs::write(&staging, content).expect("write executable-stub staging file");
+    let status = Command::new("cp")
+        .arg(&staging)
+        .arg(path)
+        .status()
+        .expect("copy executable stub through a waited child");
+    assert!(
+        status.success(),
+        "cp {} {}: {status}",
+        staging.display(),
+        path.display()
+    );
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("make stub executable");
+    fs::remove_file(&staging).expect("remove executable-stub staging file");
+}
+
 #[test]
 fn owner_retry_boundaries_are_the_only_owner_exports_requested_by_the_build() {
     // Ordinary flavors keep these two literal owner exports. The private
@@ -2335,12 +2364,11 @@ fn receipt_receipt_lane14_release_work_is_private_and_single_owner() {
     fs::create_dir(&bin).unwrap();
     fs::create_dir(&protected).unwrap();
     fs::write(&sentinel, b"must survive\n").unwrap();
-    fs::write(
-        bin.join("rm"),
+    write_executable_stub_via_waited_child(
+        &bin.join("rm"),
         b"#!/bin/sh\nprintf '%s\\n' rm >> \"$P11SCOPE_RECEIPT_TRIPWIRE_LOG\"\nexit 97\n",
-    )
-    .unwrap();
-    fs::set_permissions(bin.join("rm"), fs::Permissions::from_mode(0o700)).unwrap();
+        0o700,
+    );
     let output = Command::new("/bin/sh")
         .arg("scripts/build-release.sh")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
@@ -2458,12 +2486,11 @@ fn receipt_receipt_lane14_capture_binding_is_literal_and_checker_evidence_framed
     let work = fixture.path().join("work");
     fs::create_dir(&work).expect("create framing work directory");
     let stub = fixture.path().join("stub-checker");
-    fs::write(
+    write_executable_stub_via_waited_child(
         &stub,
         b"#!/bin/sh\nprintf 'checker-stdout\\n'\nprintf 'checker-stderr\\n' >&2\nexit \"${P11SCOPE_TASK8_CHECKER_STATUS:-0}\"\n",
-    )
-    .expect("write stub checker");
-    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).expect("make stub executable");
+        0o700,
+    );
     let runner = fixture.path().join("run-framing.sh");
     fs::write(
         &runner,
@@ -2727,16 +2754,15 @@ fn task7_tripwire_bin(log: &std::path::Path) -> tempfile::TempDir {
         } else {
             "exit 97\n".to_string()
         };
-        fs::write(
+        write_executable_stub_via_waited_child(
             &path,
             format!(
                 "#!/bin/sh\necho \"${{0##*/}}\" >> {log}\n{completion}",
                 log = log.display()
-            ),
-        )
-        .expect("write release preflight tripwire");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .expect("make release preflight tripwire executable");
+            )
+            .as_bytes(),
+            0o700,
+        );
     }
     bin
 }
@@ -4777,7 +4803,7 @@ fn port_forward_term_during_launch_reaps_the_trap_visible_generation() {
     let bin = directory.path().join("bin");
     fs::create_dir(&bin).expect("create Python wrapper directory");
     let python_wrapper = bin.join("python3");
-    fs::write(
+    write_executable_stub_via_waited_child(
         &python_wrapper,
         r#"#!/bin/sh
 if [ "$1" = -I ] && [ "$2" = scripts/lane-lib-oracle-3.py ] && [ "$#" -gt 6 ]; then
@@ -4790,11 +4816,10 @@ if [ "$1" = -I ] && [ "$2" = scripts/lane-lib-oracle-3.py ] && [ "$#" -gt 6 ]; t
     esac
 fi
 exec "$PF_TEST_REAL_PYTHON" "$@"
-"#,
-    )
-    .expect("write Python validation wrapper");
-    fs::set_permissions(&python_wrapper, fs::Permissions::from_mode(0o755))
-        .expect("make Python validation wrapper executable");
+"#
+        .as_bytes(),
+        0o755,
+    );
     fs::write(
         &gate_script,
         format!(
@@ -4918,7 +4943,7 @@ fn mutated_process_group_record_never_signals_the_live_decoy_or_unvalidated_owne
     let bin = directory.path().join("bin");
     fs::create_dir(&bin).expect("create Python wrapper directory");
     let python_wrapper = bin.join("python3");
-    fs::write(
+    write_executable_stub_via_waited_child(
         &python_wrapper,
         r#"#!/bin/sh
 if [ "$1" = -I ] && [ "$2" = scripts/lane-lib-oracle-3.py ] && [ "$#" -gt 6 ]; then
@@ -4967,11 +4992,10 @@ PY
     esac
 fi
 exec "$PF_TEST_REAL_PYTHON" "$@"
-"#,
-    )
-    .expect("write Python mutation wrapper");
-    fs::set_permissions(&python_wrapper, fs::Permissions::from_mode(0o755))
-        .expect("make Python mutation wrapper executable");
+"#
+        .as_bytes(),
+        0o755,
+    );
     let script = directory.path().join("lifecycle.sh");
     fs::write(
         &script,
@@ -5679,23 +5703,19 @@ fn receipt_receipt_drivers_execute_behavioral_self_tests() {
         "systemd-run",
     ] {
         let path = guard.path().join(command);
-        fs::write(
+        write_executable_stub_via_waited_child(
             &path,
             b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_RECEIPT_TRIPWIRE_LOG\"\nexit 97\n",
-        )
-        .expect("write Task 4 command tripwire");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .expect("make Task 4 command tripwire executable");
+            0o700,
+        );
     }
     let lane14_guard = tempfile::tempdir().expect("create Lane 14 first-mutator tripwire");
     let lane14_rm = lane14_guard.path().join("rm");
-    fs::write(
+    write_executable_stub_via_waited_child(
         &lane14_rm,
         b"#!/bin/sh\nprintf '%s\\n' \"${0##*/}\" >> \"$P11SCOPE_RECEIPT_TRIPWIRE_LOG\"\nexit 97\n",
-    )
-    .expect("write Lane 14 rm tripwire");
-    fs::set_permissions(&lane14_rm, fs::Permissions::from_mode(0o700))
-        .expect("make Lane 14 rm tripwire executable");
+        0o700,
+    );
 
     // A comment or unreachable branch containing `--self-test` must not turn
     // off the guard. The first mutator is caught, its sentinel survives, and
@@ -5922,10 +5942,11 @@ fn attach_pod_selects_only_the_validated_pod_cgroup() {
         "unsafe real find path: {real_find:?}"
     );
     let write_stub = |name: &str, body: &str| {
-        let path = stub.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write scope stub");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .expect("make scope stub executable");
+        write_executable_stub_via_waited_child(
+            &stub.join(name),
+            format!("#!/bin/sh\n{body}").as_bytes(),
+            0o700,
+        );
     };
     write_stub(
         "timeout",

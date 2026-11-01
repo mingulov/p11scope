@@ -461,8 +461,11 @@ jobs:
                   "run-short", "run-cover", "mt-exact", "system", "sigint", "second-sigint",
                   "fifo-refused"}
           problems = sorted("missing cell " + name for name in need - set(cells))
+          # The script marks these three as nonqualifying smoke by design;
+          # any other nonqualifying or failed row fails the job.
+          smoke_cells = {"run-short", "run-cover", "trace-pid"}
           for row in rows:
-              smoke = row["cell"] in ("run-short", "run-cover") and row["qualification"] == "nonqualifying"
+              smoke = row["cell"] in smoke_cells and row["qualification"] == "nonqualifying"
               status = "PASS" if row["pass"] else ("SMOKE" if smoke else "FAIL")
               print(status, row["cell"], row["detail"][:200])
               if not row["pass"] and not smoke:

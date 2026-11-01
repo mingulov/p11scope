@@ -22,11 +22,12 @@ use super::{
     ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin, SessionState,
     SessionView, SlotScope, StateEstimate, StateUsage, ViewOrigin, field_index,
 };
+use crate::semantics::{KNOWN_CANCEL_FLAGS, cancel_operation_mask, direct_cancel_flag};
 use p11scope_ebpf_common::object_policy::{
     DeriveResultProtocol, ObjectAction, SafeAttributeKind, authorized_result_pointer_args,
     derive_result_protocol, object_descriptor,
 };
-use p11scope_ebpf_common::{ARG_NONE, lifecycle, semantic_flags, transition};
+use p11scope_ebpf_common::{ARG_NONE, SlotSemantics, lifecycle, semantic_flags, transition};
 use pkcs11_types::CkRv;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
@@ -1720,6 +1721,7 @@ impl ModelState {
                 }
                 lifecycle::LOGOUT => self.apply_logout(call, outcome, session, effects),
                 lifecycle::FINALIZE => self.apply_finalize(call, outcome, effects, ledger),
+                lifecycle::SESSION_CANCEL => self.apply_cancel(outcome, session),
                 _ => {}
             },
             // Neutral terminals apply no object effect: ordering, overlap
@@ -2710,6 +2712,47 @@ impl ModelState {
         }
     }
 
+    /// Cancel-selected disposal: the session's pending origins plus
+    /// the detached records it holds, for operations the (full)
+    /// cancel mask names. The per-record predicate mirrors S1's
+    /// (`descriptor.operations & mask`, `direct_cancel_flag`), so an
+    /// operation-less record survives on both trackers. Records the
+    /// session originated but no longer holds stay, like S1's
+    /// non-owned ids. Queued releases flush at the trailing disposal
+    /// return with ledger access.
+    fn dispose_cancelled_deferred(&mut self, s: SessionIncarnation) {
+        let mask = cancel_operation_mask(KNOWN_CANCEL_FLAGS);
+        let selected = |function: u32| {
+            let descriptor = pkcs11_module::function_name(function as usize)
+                .and_then(crate::kinds::descriptor)
+                .unwrap_or(SlotSemantics::COUNT_ONLY);
+            descriptor.operations & mask != 0
+                || direct_cancel_flag(descriptor.direct) & KNOWN_CANCEL_FLAGS != 0
+        };
+        let dead_pending: Vec<((SessionIncarnation, u32), u64)> = self
+            .deferred_pending
+            .iter()
+            .filter(|((session, function), _)| *session == s && selected(*function))
+            .map(|(key, record)| (*key, record.ticket.0))
+            .collect();
+        for (key, ticket) in dead_pending {
+            self.deferred_pending.remove(&key);
+            self.deferred_releases.push(ticket);
+        }
+        let dead_detached: Vec<((ObjectDomain, KnownScope, u32, AsyncValue), u64)> = self
+            .deferred_detached
+            .iter()
+            .filter(|(_, detached)| {
+                detached.holder == Some(s) && selected(detached.origin.function)
+            })
+            .map(|(key, detached)| (*key, detached.origin.ticket.0))
+            .collect();
+        for (key, ticket) in dead_detached {
+            self.deferred_detached.remove(&key);
+            self.deferred_releases.push(ticket);
+        }
+    }
+
     /// Resolve one input at completion against its begin-cut origin.
     fn join_input(
         &mut self,
@@ -3627,6 +3670,25 @@ impl ModelState {
         }
         let scope = self.session_scope(session);
         self.retire_scope(call.domain, scope, ObjectGap::LogoutUncertain, effects);
+    }
+
+    /// `C_SessionCancel` OK ends the acting session's selected
+    /// deferred custody, mirroring S1's `clear_selected` pending and
+    /// detached retains. The model sees no flags word through sealed
+    /// facts, so every OK cancel selects all known operations: a full
+    /// cancel agrees exactly, while partial-mask precision and the
+    /// failed-cancel flag count await the flags channel. Only OK
+    /// clears — anything else, like S1, clears nothing. Silent like
+    /// every other deferred disposal; charges release at the trailing
+    /// flush.
+    fn apply_cancel(&mut self, outcome: Outcome, session: Option<SessionIncarnation>) {
+        if outcome != Outcome::Ok {
+            return;
+        }
+        let Some(s) = session else {
+            return;
+        };
+        self.dispose_cancelled_deferred(s);
     }
 
     fn apply_finalize(

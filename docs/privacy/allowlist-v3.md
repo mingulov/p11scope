@@ -456,7 +456,8 @@ proving renderers never receive the tail.
 **Status: IMPLEMENTED in development for v0.6.0 behind two build switches, both default off:
 `P11SCOPE_BIRTH_MARKER=1` compiles the marker into Detailed objects, and `P11SCOPE_JOURNAL=1`
 builds the journal object. The owner approved both for FULL/P0 release builds (owner B2, 2026-11-01;
-final yes/no at freeze); embedding lands with WU-2 after the WU-4 live cells. The linked birth seals
+final yes/no at freeze); the embedding is WU-2 work, and shipping it is gated on the WU-4 live cells
+(the R52 cells and marker cost) and the freeze decision. The linked birth seals
 activate only when the user opts in to per-key tracking (owner B1, 2026-11-01), with no new read.
 No formal privacy sign-off before about v0.9 (OD25).** The opt-in will be
 `p11scope inventory --key-operations` (default off; selection ruling 2026-11-01, parser lands with WU-2).
@@ -904,8 +905,8 @@ scan limitation. These receipts provide no trace-event naming authority.
 ## Object producer activation (H7 slice D, 2026-10-14)
 
 **Status: IMPLEMENTED the reviewed finite producer. H8 journal transactions and linked birth seals are
-planned for v0.6.0 release builds (owner B2 approved FULL/P0 inclusion, final at freeze; embedding lands
-with WU-2 after the WU-4 live cells) and will activate only under the per-key-tracking opt-in (the
+planned for v0.6.0 release builds (owner B2 approved FULL/P0 inclusion, final at freeze; the embedding is
+WU-2 work, and shipping it is gated on the WU-4 live cells) and will activate only under the per-key-tracking opt-in (the
 post-attach birth marker read and retention is described in
 [Post-attach birth marker](#post-attach-birth-marker-object-journal-slice-d)).
 H9 model delivery remains open. No public object field carries observed data**

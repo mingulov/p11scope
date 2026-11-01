@@ -20,7 +20,24 @@ use std::cell::{Cell, RefCell};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 
-const SOFTHSM: &str = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so";
+/// SoftHSM2 provider layouts across hosts and guest images (Debian
+/// multiarch, the /usr/lib layout of the vng guests, Fedora /usr/lib64).
+/// The first present one wins; the Debian path is named when none is.
+fn softhsm() -> &'static str {
+    static FOUND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    FOUND.get_or_init(|| {
+        const CANDIDATES: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+            "/usr/lib/softhsm/libsofthsm2.so",
+            "/usr/lib64/pkcs11/libsofthsm2.so",
+        ];
+        CANDIDATES
+            .iter()
+            .copied()
+            .find(|path| Path::new(path).is_file())
+            .unwrap_or(CANDIDATES[0])
+    })
+}
 
 fn ledger_source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/public-cli/inventory-ledger.c")
@@ -38,8 +55,9 @@ struct Workload {
 impl Workload {
     fn build() -> Result<Self> {
         ensure!(
-            Path::new(SOFTHSM).exists(),
-            "SoftHSM2 provider {SOFTHSM} is missing"
+            Path::new(softhsm()).exists(),
+            "SoftHSM2 provider {} is missing",
+            softhsm()
         );
         let dir = tempfile::tempdir()?;
         let ledger = dir.path().join("ledger");
@@ -471,18 +489,34 @@ fn privileged_native_lane_pid_lp64() -> Result<()> {
     let target = workload.spawn(
         "target",
         &[
-            "mech", "--cell", "T", "--module", SOFTHSM, "--iters", "2", "--gate", &gate_arg,
+            "mech",
+            "--cell",
+            "T",
+            "--module",
+            softhsm(),
+            "--iters",
+            "2",
+            "--gate",
+            &gate_arg,
             "--hold",
         ],
     )?;
     let foreign = workload.spawn(
         "foreign",
         &[
-            "mech", "--cell", "F", "--module", SOFTHSM, "--iters", "2", "--gate", &gate_arg,
+            "mech",
+            "--cell",
+            "F",
+            "--module",
+            softhsm(),
+            "--iters",
+            "2",
+            "--gate",
+            &gate_arg,
             "--hold",
         ],
     )?;
-    let mut coordinator = pid_coordinator(target.pid(), Path::new(SOFTHSM))?;
+    let mut coordinator = pid_coordinator(target.pid(), Path::new(softhsm()))?;
     let probe = pid_probe(target.pid(), &coordinator)?;
     let lane = NativeLane::start(probe, &mut coordinator, LaneWindows::PROVISIONAL, None)
         .map_err(|(_, reason)| anyhow::anyhow!("{reason}"))?;
@@ -643,7 +677,15 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
     let target = workload.spawn(
         "target",
         &[
-            "mech", "--cell", "D", "--module", SOFTHSM, "--iters", "4", "--gate", &gate_arg,
+            "mech",
+            "--cell",
+            "D",
+            "--module",
+            softhsm(),
+            "--iters",
+            "4",
+            "--gate",
+            &gate_arg,
             "--hold",
         ],
     )?;
@@ -708,7 +750,7 @@ fn privileged_native_lane_dashboard_slow_pty_lp64() -> Result<()> {
     let mut stdout = Vec::new();
     let code = run_with_terminal(
         InspectScope::Pid(target.pid()),
-        &[PathBuf::from(SOFTHSM)],
+        &[PathBuf::from(softhsm())],
         &HookRegistry::builtin(),
         true,
         None,
@@ -1599,7 +1641,7 @@ fn privileged_native_lane_system_late_dlopen_lp64() -> Result<()> {
             "--cell",
             "P7",
             "--module",
-            SOFTHSM,
+            softhsm(),
             "--iters",
             "2",
             "--gate",
@@ -1625,7 +1667,8 @@ fn privileged_native_lane_system_late_dlopen_lp64() -> Result<()> {
             || started.elapsed() > Duration::from_secs(90)
     };
     let events = workload.path("system.jsonl");
-    let (document, stream) = run_product(InspectScope::System, Path::new(SOFTHSM), &events, &stop)?;
+    let (document, stream) =
+        run_product(InspectScope::System, Path::new(softhsm()), &events, &stop)?;
     ensure!(done_at.borrow().is_some(), "the late ledger never finished");
     ensure!(
         document["observation"]["lane"] == "native",
@@ -2090,7 +2133,7 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
     let workload = Workload::build()?;
     // B is a second copy of the provider: a distinct (path, ino) module.
     let b_path = workload.path("b-provider.so");
-    std::fs::copy(SOFTHSM, &b_path)?;
+    std::fs::copy(softhsm(), &b_path)?;
     let gate = workload.path("gate");
     let gate2 = workload.path("gate2");
     let gate_arg = gate.to_str().context("gate path")?.to_string();
@@ -2103,7 +2146,7 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
             "--cell",
             "AB",
             "--module",
-            SOFTHSM,
+            softhsm(),
             "--module",
             &b_arg,
             "--iters",
@@ -2168,7 +2211,7 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
             .is_some_and(|at| at.elapsed() > Duration::from_secs(3))
             || started.elapsed() > Duration::from_secs(120)
     };
-    let modules = vec![PathBuf::from(SOFTHSM), b_path.clone()];
+    let modules = vec![PathBuf::from(softhsm()), b_path.clone()];
     let (document, stream) = run_product_modules(InspectScope::System, &modules, &events, &stop)?;
     ensure!(gate1_ns.get() != 0, "gate1 never opened");
     ensure!(gate2_ns.get() != 0, "gate2 never opened");
@@ -2263,7 +2306,7 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
     ensure!(module_a["id"] != module_b["id"], "A and B share one module");
     use std::os::unix::fs::MetadataExt;
     ensure!(
-        module_a["identity"]["inode"] == std::fs::metadata(SOFTHSM)?.ino(),
+        module_a["identity"]["inode"] == std::fs::metadata(softhsm())?.ino(),
         "A module inode: {}",
         module_a["identity"]
     );
@@ -2554,11 +2597,18 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
     let target = workload.spawn(
         "target",
         &[
-            "mech", "--cell", "S", "--module", SOFTHSM, "--iters", "2", "--hold",
+            "mech",
+            "--cell",
+            "S",
+            "--module",
+            softhsm(),
+            "--iters",
+            "2",
+            "--hold",
         ],
     )?;
     target.wait_for("DONE ", Duration::from_secs(30))?;
-    let mut coordinator = pid_coordinator(target.pid(), Path::new(SOFTHSM))?;
+    let mut coordinator = pid_coordinator(target.pid(), Path::new(softhsm()))?;
     let mut probe = pid_probe(target.pid(), &coordinator)?;
     probe.raise_sigint_on_activation = true;
     let flag = StopFlag::install();
@@ -2690,7 +2740,7 @@ fn churn_phase(
 ) -> Result<(serde_json::Value, BTreeMap<String, f64>, u32)> {
     let mut mapper = Command::new("sleep")
         .arg("600")
-        .env("LD_PRELOAD", SOFTHSM)
+        .env("LD_PRELOAD", softhsm())
         .env("SOFTHSM2_CONF", &workload.conf)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2728,7 +2778,7 @@ fn churn_phase(
             || started.elapsed() > Duration::from_secs(u64::from(seconds) + 60)
     };
     let events = workload.path(&format!("churn-{rate}.jsonl"));
-    let result = run_product(InspectScope::System, Path::new(SOFTHSM), &events, &stop);
+    let result = run_product(InspectScope::System, Path::new(softhsm()), &events, &stop);
     if let Some(mut running) = child.borrow_mut().take() {
         let _ = running.kill();
         let _ = running.wait();
@@ -2982,7 +3032,7 @@ fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
     let mut providers = Vec::with_capacity(copies);
     for copy in 0..copies {
         let out = workload.path(&format!("softhsm-{copy}.so"));
-        std::fs::copy(SOFTHSM, &out)?;
+        std::fs::copy(softhsm(), &out)?;
         providers.push(out);
     }
     let gate = workload.path("gate");
@@ -3555,8 +3605,8 @@ fn softhsm_joint_manifest(workload: &Workload) -> Result<std::path::PathBuf> {
     use anyhow::Context as _;
     use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
     use p11scope_manifest::manifest::*;
-    let path = std::path::Path::new(SOFTHSM);
-    ensure!(path.exists(), "SoftHSM2 provider {SOFTHSM} is missing");
+    let path = std::path::Path::new(softhsm());
+    ensure!(path.exists(), "SoftHSM2 provider {} is missing", softhsm());
     let file = open_object(path).map_err(anyhow::Error::msg)?;
     let inspected = inspect_file(&file).map_err(anyhow::Error::msg)?;
     let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
@@ -3658,12 +3708,20 @@ fn privileged_joint_driver_live_finish_begin_poll_wound_down_lp64() -> Result<()
     let target = workload.spawn(
         "target",
         &[
-            "mech", "--cell", "T", "--module", SOFTHSM, "--iters", "2", "--gate", &gate_arg,
+            "mech",
+            "--cell",
+            "T",
+            "--module",
+            softhsm(),
+            "--iters",
+            "2",
+            "--gate",
+            &gate_arg,
             "--hold",
         ],
     )?;
     let manifest = softhsm_joint_manifest(&workload)?;
-    let mut coordinator = pid_coordinator(target.pid(), Path::new(SOFTHSM))?;
+    let mut coordinator = pid_coordinator(target.pid(), Path::new(softhsm()))?;
     coordinator.set_semantic_manifests(vec![manifest]);
     let scope = Scope::Pid(target.pid());
     let attach_subset = coordinator
@@ -3895,7 +3953,7 @@ impl JointWorkload {
             &held,
         )?;
         let soft_copy = workload.path("soft-copy.so");
-        std::fs::copy(SOFTHSM, &soft_copy).context("copying SoftHSM2")?;
+        std::fs::copy(softhsm(), &soft_copy).context("copying SoftHSM2")?;
         Ok(Self {
             workload,
             joint,

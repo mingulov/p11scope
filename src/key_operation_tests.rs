@@ -13839,6 +13839,7 @@ fn ledger_prerequisites() -> Vec<String> {
     let module = [
         "/usr/lib/softhsm/libsofthsm2.so",
         "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+        "/usr/lib64/pkcs11/libsofthsm2.so",
     ]
     .into_iter()
     .find(|path| std::path::Path::new(path).is_file());
@@ -13898,6 +13899,7 @@ fn run_rsa_ledger() -> Vec<serde_json::Value> {
     let module = [
         "/usr/lib/softhsm/libsofthsm2.so",
         "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+        "/usr/lib64/pkcs11/libsofthsm2.so",
     ]
     .into_iter()
     .find(|path| std::path::Path::new(path).is_file())

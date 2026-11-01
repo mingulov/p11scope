@@ -4743,6 +4743,54 @@ mod tests {
             self.state.apply_end(token, &mut effects, ledger);
         }
 
+        /// Drive one C_SessionCancel END through begin+end replay
+        /// against a caller-held ledger, so cancel disposal runs on
+        /// the production end path with ledger access.
+        fn session_cancel_with_ledger(
+            &mut self,
+            session: HandleInput<SessionHandle>,
+            rv: u64,
+            ledger: &mut super::super::journal::StagingLedger,
+        ) {
+            self.next_key += 1;
+            self.next_token += 1;
+            let token = CallToken(self.next_token);
+            let call = PendingCall {
+                domain: self.domain,
+                key: CallKey::reference(self.next_key),
+                begin: 10,
+                entry_ns: 100,
+                function: crate::kinds::function_id("C_SessionCancel").expect("catalog function"),
+                kind: CallKind::Lifecycle(lifecycle::SESSION_CANCEL),
+                session,
+                inputs: [HandleInput::Absent, HandleInput::Absent],
+                requested: [None, None],
+                derive_protocol: DeriveResultProtocol::Unavailable,
+                entry_mechanism: MechClass::Value,
+                entry_output: OutputEvidence::NotCaptured,
+                scope: SlotScope::Unknown,
+                completion: Some(Completion {
+                    cut: 11,
+                    end_ns: 110,
+                    rv,
+                    return_mechanism: MechanismEvidence::NotCaptured,
+                    results: [ResultSlot::NotCaptured, ResultSlot::NotCaptured],
+                    session_out: HandleInput::Absent,
+                    found: FindResult::NotCaptured,
+                    attributes: None,
+                    malformed: false,
+                }),
+                fenced: false,
+                begin_applied: false,
+                end_applied: false,
+                snapshot: EMPTY_SNAPSHOT,
+            };
+            self.state.pending.insert(token, call);
+            self.state.apply_begin(token);
+            let mut effects = ObjectEffects::default();
+            self.state.apply_end(token, &mut effects, ledger);
+        }
+
         fn minted(effects: &ObjectEffects, token: CallToken) -> bool {
             effects
                 .effects
@@ -6189,6 +6237,208 @@ mod tests {
             "a same-scope join takes custody"
         );
         assert_eq!(fx.detached_holder(first), Some(joiner));
+    }
+
+    // Cancel → re-init → complete: a session cancel disposes the
+    // session's deferred records, so the re-init mints fresh and the
+    // completion redeems the new origin — the same record S1
+    // consumes. Without disposal the model would redeem the stale
+    // origin against the new completion.
+    #[test]
+    fn deferred_session_cancel_disposes_for_remint() {
+        use crate::semantics_edge::{EdgeSemantics, EffectOrigin, OperationEffect, SemanticCall};
+
+        // Model side: mint A, cancel, re-mint B, redeem B only.
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let mut ledger = super::super::journal::StagingLedger::new();
+        let session = HandleInput::Value(SessionHandle::new(DSESSION).unwrap());
+        let (token_a, effects_a) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        assert!(
+            DeferredFixture::minted(&effects_a, token_a),
+            "first origin mints"
+        );
+        fx.session_cancel_with_ledger(session, CkRv::OK.0, &mut ledger);
+        assert!(
+            !fx.state
+                .deferred_pending
+                .contains_key(&(fx.session, target)),
+            "cancel disposes the pending origin"
+        );
+        let (token_b, effects_b) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        assert!(
+            DeferredFixture::minted(&effects_b, token_b),
+            "re-init mints fresh after cancel"
+        );
+        assert_ne!(token_a, token_b);
+        assert_eq!(
+            fx.state.deferred_pending[&(fx.session, target)].ticket,
+            token_b,
+            "the live record is the re-minted origin"
+        );
+        assert!(fx.state.redeem_deferred(token_a).is_none());
+        assert!(fx.state.redeem_deferred(token_b).is_some());
+
+        // S1 side: the same script consumes the re-minted origin.
+        let mut edge = EdgeSemantics::default();
+        let mut pending_a = SemanticCall {
+            function: "C_SignInit".into(),
+            rv: CkRv::PENDING.0,
+            session: DSESSION,
+            ts_ns: 100,
+            ..SemanticCall::default()
+        };
+        edge.observe(&pending_a);
+        let cancel = SemanticCall {
+            function: "C_SessionCancel".into(),
+            rv: CkRv::OK.0,
+            session: DSESSION,
+            flags: crate::semantics::KNOWN_CANCEL_FLAGS,
+            ts_ns: 200,
+            ..SemanticCall::default()
+        };
+        edge.observe(&cancel);
+        pending_a.ts_ns = 300;
+        edge.observe(&pending_a);
+        let complete = SemanticCall {
+            function: "C_AsyncComplete".into(),
+            rv: CkRv::OK.0,
+            session: DSESSION,
+            target_function: target,
+            ts_ns: 400,
+            ..SemanticCall::default()
+        };
+        let origin = EffectOrigin {
+            function: "C_AsyncComplete".into(),
+            session: DSESSION,
+            ts_ns: 400,
+        };
+        let mut sink = Vec::new();
+        edge.observe_with_effects(&complete, &origin, &mut sink);
+        assert_eq!(sink.len(), 1, "the completion replays exactly one start");
+        match &sink[0] {
+            OperationEffect::Started {
+                origin, category, ..
+            } => {
+                assert_eq!(*category, "sign");
+                assert_eq!(
+                    origin.ts_ns, 300,
+                    "S1 consumes the re-minted origin, like the model"
+                );
+            }
+            other => panic!("expected the replayed start, got {other:?}"),
+        }
+    }
+
+    // Cancel disposal is selective: another session's origins, an
+    // operation-less origin (no cancel flag names it, on either
+    // tracker) and a failed cancel's target all survive.
+    #[test]
+    fn deferred_session_cancel_keeps_foreign_and_operation_less_origins() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let mut ledger = super::super::journal::StagingLedger::new();
+        let session = HandleInput::Value(SessionHandle::new(DSESSION).unwrap());
+        fx.state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("second session opens");
+        let other_handle = HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap());
+        let (token_a, effects_a) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        assert!(DeferredFixture::minted(&effects_a, token_a));
+        let (token_b, effects_b) =
+            fx.pending_access_with_ledger(other_handle, HandleInput::Absent, target, &mut ledger);
+        assert!(DeferredFixture::minted(&effects_b, token_b));
+        fx.session_cancel_with_ledger(session, CkRv::OK.0, &mut ledger);
+        assert!(
+            !fx.state
+                .deferred_pending
+                .contains_key(&(fx.session, target)),
+            "the cancelled session's origin is disposed"
+        );
+        assert!(
+            fx.state.redeem_deferred(token_b).is_some(),
+            "another session's origin survives the cancel"
+        );
+
+        // An operation-less origin survives even a full cancel.
+        let size_target = fx.target("C_GetObjectSize");
+        let (token_size, effects_size) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, size_target, &mut ledger);
+        assert!(
+            DeferredFixture::minted(&effects_size, token_size),
+            "operation-less origin mints"
+        );
+        fx.session_cancel_with_ledger(session, CkRv::OK.0, &mut ledger);
+        assert!(
+            fx.state.redeem_deferred(token_size).is_some(),
+            "no cancel flag names an operation-less origin"
+        );
+
+        // A failed cancel disposes nothing.
+        let (token_c, effects_c) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        assert!(DeferredFixture::minted(&effects_c, token_c));
+        fx.session_cancel_with_ledger(session, CkRv::GENERAL_ERROR.0, &mut ledger);
+        assert!(
+            fx.state.redeem_deferred(token_c).is_some(),
+            "a failed cancel disposes nothing"
+        );
+    }
+
+    // Detached disposal follows the holder, like S1: cancelling the
+    // holding session removes the record, while cancelling a
+    // non-holding origin session keeps it.
+    #[test]
+    fn deferred_session_cancel_disposes_by_holder() {
+        let mut fx = DeferredFixture::new();
+        let target = fx.target("C_SignInit");
+        let mut ledger = super::super::journal::StagingLedger::new();
+        let session = HandleInput::Value(SessionHandle::new(DSESSION).unwrap());
+        let joiner = fx
+            .state
+            .alloc_session(
+                fx.domain,
+                SessionHandle::new(DSESSION + 1).unwrap(),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("joiner session opens");
+        let joiner_handle = HandleInput::Value(SessionHandle::new(DSESSION + 1).unwrap());
+
+        // Holder == origin: cancelling the session removes the record.
+        let (token_a, _) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("origin detaches");
+        fx.session_cancel_with_ledger(session, CkRv::OK.0, &mut ledger);
+        assert!(fx.state.deferred_detached.is_empty());
+        assert!(fx.state.redeem_deferred(token_a).is_none());
+
+        // Joined away: cancelling the origin keeps the holder's record.
+        let (token_b, _) =
+            fx.pending_access_with_ledger(session, HandleInput::Absent, target, &mut ledger);
+        fx.state
+            .detach_deferred(fx.session, target, 42)
+            .expect("re-detach succeeds after disposal");
+        assert!(
+            fx.state.join_deferred_holder(fx.domain, target, 42, joiner),
+            "same-scope join takes custody"
+        );
+        fx.session_cancel_with_ledger(session, CkRv::OK.0, &mut ledger);
+        assert_eq!(fx.state.deferred_detached.len(), 1);
+        assert_eq!(fx.detached_holder(token_b), Some(joiner));
+        fx.session_cancel_with_ledger(joiner_handle, CkRv::OK.0, &mut ledger);
+        assert!(fx.state.deferred_detached.is_empty());
+        assert!(fx.state.redeem_deferred(token_b).is_none());
     }
 
     // Mint-before-dispatch ordering: a destroy-PENDING freezes its

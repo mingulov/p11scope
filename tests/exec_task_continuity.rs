@@ -1,6 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Finite native/CO-RE controls. No verifier, kernel load or link-health claim.
 
+use p11scope_ebpf_common::{FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_TRACK_SHORT_LIVED};
 use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
 const EXEC_TARGET_SHAPES: u32 = 16;
@@ -686,13 +687,61 @@ for pc, text in insns:
 assert reserve_guard in guards and kind_pc in guards, 'reserve and kind must guard the ticket'
 extra = guards - {reserve_guard, kind_pc}
 assert extra, 'Detailed EXEC ticket needs a flags gate beyond reserve and kind'
+# Pin the flags mask, not just gate existence. Expected values are
+# source-anchored (argv from FLAG_*): TRACK set, AGG clear, and on the
+# combined tree with the PID-ticket fix PID clear as well. A wrong-mask
+# mutant must fail; a PID-only gate must not satisfy this pin.
+track = int(sys.argv[2])
+mask_two = int(sys.argv[3])
+mask_three = int(sys.argv[4])
+texts = dict(insns)
+order = [pc for pc, _ in insns]
+index_of = {pc: i for i, pc in enumerate(order)}
+pinned = []
+for guard_pc in sorted(extra):
+    guard_text = texts[guard_pc]
+    gm = re.search(r'\bif (r\d+) (==|!=) (0x[0-9a-f]+) goto ', guard_text)
+    if not gm:
+        continue
+    reg, polarity, val_hex = gm.groups()
+    val = int(val_hex, 16)
+    mask = None
+    start = index_of[guard_pc]
+    for j in range(start - 1, max(start - 6, -1), -1):
+        prev = insns[j][1]
+        am = re.search(r'\b' + reg + r' &= (0x[0-9a-f]+)', prev)
+        if am:
+            mask = int(am.group(1), 16)
+            break
+    if mask is None:
+        continue
+    edges = graph.get(guard_pc, [])
+    if len(edges) != 2:
+        continue
+    target = m.relative_target(guard_pc, guard_text)
+    following = edges[0] if edges[1] == target else edges[1]
+    if polarity == '==':
+        equal_arm, other_arm = target, following
+    else:
+        equal_arm, other_arm = following, target
+    equal_reaches = ticket in m.reachable(graph, [equal_arm])
+    other_reaches = ticket in m.reachable(graph, [other_arm])
+    if val == track and mask in (mask_two, mask_three) and equal_reaches and not other_reaches:
+        pinned.append((guard_pc, mask, val))
+assert pinned, f'Detailed EXEC ticket needs a TRACK/AGG mask gate (& {mask_two:#x}/{mask_three:#x} == {track:#x}); extra guards {sorted(extra)} lack it'
 "#;
+    let track = FLAG_TRACK_SHORT_LIVED;
+    let mask_two = FLAG_TRACK_SHORT_LIVED | FLAG_POLICY_AGGREGATE;
+    let mask_three = mask_two | FLAG_PID_FILTER;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("exec-ticket-gate.o");
     fs::write(&path, p11scope::EBPF_OBJECT).unwrap();
     let check = Command::new("python3")
         .args(["-I", "-c", script])
         .arg(path)
+        .arg(track.to_string())
+        .arg(mask_two.to_string())
+        .arg(mask_three.to_string())
         .output()
         .unwrap();
     assert!(

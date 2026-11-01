@@ -219,6 +219,32 @@ judge() {
   result "$cell" 0 "$JUDGE_DETAIL" failed
   return 1
 }
+judge_composite() {
+  # judge_composite CELL DETAIL RC...: map a composite verdict (T6, T7) to
+  # a contract row honoring EXPECTED_FAIL, like judge(). Expected-failure
+  # needs a genuine property failure (rc 1) with no harness error (rc 2):
+  # a harness failure must never be swallowed as expected.
+  local cell=$1 detail=$2; shift 2
+  local r prop_fail=0 harness_fail=0
+  for r in "$@"; do
+    [ "$r" = 0 ] || prop_fail=1
+    { [ "$r" = 0 ] || [ "$r" = 1 ]; } || harness_fail=1
+  done
+  if [ "$prop_fail" = 0 ]; then
+    if [ -n "${EXPECTED_FAIL[$cell]:-}" ]; then
+      result "$cell" 1 "EXPECTED-FAILURE no longer reproduces (${EXPECTED_FAIL[$cell]}): $detail" qualified
+    else
+      result "$cell" 1 "$detail" qualified
+    fi
+    return 0
+  fi
+  if [ -n "${EXPECTED_FAIL[$cell]:-}" ] && [ "$harness_fail" = 0 ]; then
+    result "$cell" 0 "expected-failure (${EXPECTED_FAIL[$cell]}): $detail" expected-failure
+    return 0
+  fi
+  result "$cell" 0 "$detail" failed
+  return 1
+}
 judge_inventory_capture() {
   # judge_inventory_capture CELL INVFILE -- <oracle args...>: inventory-mode
   # verdict (admission whole / named refusal). Sets JUDGE_RC/JUDGE_DETAIL
@@ -561,12 +587,7 @@ PY
     --layer "provider:$OUT/owned.pin:spy" --target-identity "$OUT/client.pin" \
     --require-exact provider --spy-binding provider --forbid-unknown
   local s_rc=$JUDGE_RC; local s_detail="$JUDGE_DETAIL"
-  if [ "$crc" = 0 ] && [ "$s_rc" = 0 ]; then
-    result "$cell" 1 "client: $c_detail || server: $s_detail" qualified
-    return 0
-  fi
-  result "$cell" 0 "client(rc=$crc): $c_detail || server(rc=$s_rc): $s_detail" failed
-  return 1
+  judge_composite "$cell" "client(rc=$crc): $c_detail || server(rc=$s_rc): $s_detail" "$crc" "$s_rc"
 }
 
 # --- T5: profile --pid through the proxy, merge config (real-world case) ---
@@ -689,12 +710,7 @@ PY
     --layer "provider:$OUT/owned.pin:spy" --target-identity "$OUT/proxy.pin" \
     --exact-only provider "$LOOP_FUNCS" --spy-binding provider --forbid-unknown
   local prc=$JUDGE_RC; local p_detail="$JUDGE_DETAIL"
-  if [ "$irc" = 0 ] && [ "$prc" = 0 ]; then
-    result "$cell" 1 "inventory: $i_detail || profile: $p_detail" qualified
-    return 0
-  fi
-  result "$cell" 0 "inventory(rc=$irc): $i_detail || profile(rc=$prc): $p_detail" failed
-  return 1
+  judge_composite "$cell" "inventory(rc=$irc): $i_detail || profile(rc=$prc): $p_detail" "$irc" "$prc"
 }
 
 # --- T4: run --pause auto through the proxy, isolated config ---

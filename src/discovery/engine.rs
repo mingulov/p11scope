@@ -2098,13 +2098,18 @@ impl CaptureFacts {
                 let functions =
                     table.entries.len() + table.null_entries.len() + table.unpinned.len();
                 // The same witness `plan::lower_scanned` scores by, so the
-                // published linkage, naming, and completeness proof never disagree.
+                // published linkage and the plan's naming never disagree.
                 let exports = ObjectExports {
                     object: module.scanned.key,
                     symbols: &module.exports,
                 };
-                let proven = proven_complete_legacy_prefix(table, &exports);
-                let surface = (table.version, table.walk.to_string(), functions);
+                // A proven 68-slot prefix reports a full walk, like the plan.
+                let walk = if proven_complete_legacy_prefix(table, &exports) {
+                    "full"
+                } else {
+                    table.walk
+                };
+                let surface = (table.version, walk.to_string(), functions);
                 let surface_occurrence = surfaces.entry(surface.clone()).or_insert(0usize);
                 let scan_surface = SurfaceOccurrence::Scan {
                     module: owner,
@@ -2116,18 +2121,14 @@ impl CaptureFacts {
                 history
                     .surfaces
                     .entry(scan_surface.clone())
-                    .and_modify(|known| {
-                        known.proven_complete_prefix |= proven;
-                    })
                     .or_insert_with(|| plan::SurfaceSummary {
                         source: format!(
                             "{} table {}.{}",
                             module.scanned.path, table.version.0, table.version.1
                         ),
-                        walk: table.walk.to_string(),
+                        walk: walk.to_string(),
                         acquisition: "ok".into(),
                         functions,
-                        proven_complete_prefix: proven,
                     });
                 let mut inventory_bases = table
                     .file_offset
@@ -2168,7 +2169,6 @@ impl CaptureFacts {
                             walk: table.walk.to_string(),
                             acquisition: "ok".into(),
                             functions,
-                            proven_complete_prefix: false,
                         });
                     if let Some(table_file_offset) = table.file_offset {
                         inventory_bases.push(InventorySurfaceBase {
@@ -2342,7 +2342,6 @@ impl CaptureFacts {
                         walk: crate::manifest_input::effective_surface_walk(surface),
                         acquisition: manifest_acquisition_label(&surface.acquisition),
                         functions: surface.functions.len(),
-                        proven_complete_prefix: false,
                     });
                 history
                     .tables

@@ -875,8 +875,7 @@ pub struct Evidence {
     /// Per-surface discovery provenance (walk outcome, acquisition status).
     /// A surface that was not fully walked or failed to acquire means
     /// functions the manifest declares may never have been probed, even
-    /// when `skipped`/`aliased` are empty. A 68-slot prefix proven to be
-    /// the complete reachable surface is exempt.
+    /// when `skipped`/`aliased` are empty.
     pub surfaces: Vec<crate::plan::SurfaceSummary>,
     /// Present-but-undecoded vendor interfaces (never walked).
     pub vendor_interfaces: usize,
@@ -1533,13 +1532,11 @@ fn physical_gap_category_requires_exact_internal_subject_and_description() {
 impl Evidence {
     /// COMPLETE only when nothing was lost: every planned probe attached,
     /// nothing was skipped, no aliasing ambiguity, no call left in flight,
-    /// every surface was fully walked with a successful acquisition (a
-    /// 68-slot prefix proven to be the complete reachable surface counts
-    /// as fully walked), no vendor interfaces were left undecoded,
-    /// (profile mode) the ring buffer neither dropped nor emitted a
-    /// malformed record, no template was truncated, no mechanism's
-    /// parameter decode failed on every single observed call, and no
-    /// pinned provider object changed.
+    /// every surface was fully walked with a successful acquisition, no
+    /// vendor interfaces were left undecoded, (profile mode) the ring
+    /// buffer neither dropped nor emitted a malformed record, no template
+    /// was truncated, no mechanism's parameter decode failed on every
+    /// single observed call, and no pinned provider object changed.
     ///
     /// Discovery gates it too, and three of those conditions are the ones a
     /// gap-counting verdict gets wrong on its own: a capture that discovered no
@@ -1618,7 +1615,7 @@ impl Evidence {
             "surfaces",
             self.surfaces
                 .iter()
-                .any(|s| !s.proven_complete_prefix && (s.walk != "full" || s.acquisition != "ok")),
+                .any(|s| s.walk != "full" || s.acquisition != "ok"),
         );
         cause(o, "vendor_interfaces", self.vendor_interfaces > 0);
         cause(
@@ -2218,9 +2215,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
             "surfaces" => count(
                 ev.surfaces
                     .iter()
-                    .filter(|s| {
-                        !s.proven_complete_prefix && (s.walk != "full" || s.acquisition != "ok")
-                    })
+                    .filter(|s| s.walk != "full" || s.acquisition != "ok")
                     .count() as u64,
                 "surface gaps",
             ),
@@ -3405,7 +3400,6 @@ pub(crate) mod tests {
             walk: "full".into(),
             acquisition: "ok".into(),
             functions: 68,
-            proven_complete_prefix: false,
         }
     }
 
@@ -5474,7 +5468,6 @@ pub(crate) mod tests {
             walk: "full".into(),
             acquisition: "ok".into(),
             functions: 92,
-            proven_complete_prefix: false,
         });
         ev.verdict();
         let v = profile_json(
@@ -6206,7 +6199,6 @@ pub(crate) mod tests {
             walk: walk.into(),
             acquisition: "ok".into(),
             functions: spans.iter().map(|span| span.fields().len()).sum(),
-            proven_complete_prefix: false,
         }];
         assert_eq!(ev.surfaces[0].functions, 104);
         assert!(
@@ -6255,6 +6247,7 @@ pub(crate) mod tests {
         snapshot: &[u8],
         exports: std::sync::Arc<[(String, u64)]>,
         hook_exports: Vec<String>,
+        expect_walk: &str,
     ) -> GapClasses {
         use crate::discovery::identity::{PinnedObjectId, ReconciledModule};
         use crate::discovery::scan::{CaptureWorkBudget, ScannedModule, decode_exact_table};
@@ -6276,6 +6269,10 @@ pub(crate) mod tests {
         .expect("budget must admit the table")
         .expect("the fixture table must decode");
         assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(
+            table.walk, "known_prefix",
+            "the scan keeps the mislabelling quirk label"
+        );
         let key = table.entries[0].object;
         let object = PinnedObjectId(0);
         let entry_count = table.entries.len();
@@ -6302,7 +6299,7 @@ pub(crate) mod tests {
         };
         let plan = build_from_reconciled_modules(std::slice::from_ref(&reconciled));
         assert_eq!(plan.surfaces.len(), 1);
-        assert_eq!(plan.surfaces[0].walk, "known_prefix");
+        assert_eq!(plan.surfaces[0].walk, expect_walk);
         assert_eq!(plan.surfaces[0].acquisition, "ok");
         assert_eq!(plan.surfaces[0].functions, 68);
         let mut ev = evidence();
@@ -6334,6 +6331,7 @@ pub(crate) mod tests {
             &fedora_shaped_snapshot(),
             exports,
             vec!["C_GetFunctionList".into()],
+            "full",
         );
         assert_eq!(
             classes.observation.status, "exact",
@@ -6356,6 +6354,7 @@ pub(crate) mod tests {
             &fedora_shaped_snapshot(),
             names.into(),
             vec!["C_GetFunctionList".into(), "C_GetInterface".into()],
+            "known_prefix",
         );
         assert_eq!(classes.observation.status, "lossy");
         assert!(
@@ -6373,6 +6372,7 @@ pub(crate) mod tests {
             &truncated,
             fedora_exports_without_interface_getters(),
             vec!["C_GetFunctionList".into()],
+            "known_prefix",
         );
         assert_eq!(classes.observation.status, "lossy");
         assert!(
@@ -6391,6 +6391,7 @@ pub(crate) mod tests {
             &fedora_shaped_snapshot(),
             names.into(),
             vec!["C_GetFunctionList".into()],
+            "known_prefix",
         );
         assert_eq!(classes.observation.status, "lossy");
         assert!(

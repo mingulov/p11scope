@@ -653,31 +653,13 @@ pub struct ModuleSummary {
 /// manifest that never finished walking a surface can't be reported as a
 /// complete capture just because its (empty) function list produced no
 /// skips or aliases.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SurfaceSummary {
     /// Short human label for the surface (legacy table or interface name).
     pub source: String,
     pub walk: String,
     pub acquisition: String,
     pub functions: usize,
-    /// True when a 3.x-labelled 68-slot prefix is proven to be the
-    /// module's complete reachable surface (scan `extension_impossible`
-    /// plus no interface-getter exports plus full export agreement).
-    /// Internal only, never serialized: the JSON schema keeps exactly
-    /// `source`, `walk`, `acquisition`, `functions`. Ignored by
-    /// `PartialEq` (identity is the four serialized fields); merges
-    /// union it via `|=` so a proven reading upgrades a truncated one.
-    #[serde(skip)]
-    pub proven_complete_prefix: bool,
-}
-
-impl PartialEq for SurfaceSummary {
-    fn eq(&self, other: &Self) -> bool {
-        self.source == other.source
-            && self.walk == other.walk
-            && self.acquisition == other.acquisition
-            && self.functions == other.functions
-    }
 }
 
 /// A surface label for capture output. Never the interface's recorded name:
@@ -3062,7 +3044,7 @@ fn merge(
         let mut seen_skips = BTreeSet::new();
         let mut seen_tables = Vec::new();
         let mut seen_surfaces = Vec::new();
-        let mut group_surfaces: Vec<SurfaceSummary> = Vec::new();
+        let mut group_surfaces = Vec::new();
         let mut group_skips = Vec::new();
         // A refused growth's endpoints no other module attaches, and the kept
         // endpoints this module stays attached through.
@@ -3171,16 +3153,14 @@ fn merge(
                     .filter(|known| *known == &surface)
                     .count();
                 module_surfaces.push(surface.clone());
-                let known = seen_surfaces
+                if !seen_surfaces
                     .iter()
-                    .position(|(source, known, known_occurrence)| {
+                    .any(|(source, known, known_occurrence)| {
                         *source == module.source
                             && known == &surface
                             && *known_occurrence == occurrence
-                    });
-                if let Some(index) = known {
-                    group_surfaces[index].proven_complete_prefix |= surface.proven_complete_prefix;
-                } else {
+                    })
+                {
                     seen_surfaces.push((module.source, surface.clone(), occurrence));
                     group_surfaces.push(surface);
                 }
@@ -3763,16 +3743,24 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
             linkage: table_linkage(&score),
             exports_agreeing: Some(export_agreement(table, &exports).agreeing),
         });
+        // A 68-slot prefix proven to be the complete reachable surface
+        // reports a full walk: every function a conforming caller can
+        // reach was walked. The source still names the declared 3.x
+        // version, so the mislabelling quirk stays visible.
+        let walk = if proven_complete_legacy_prefix(table, &exports) {
+            "full"
+        } else {
+            table.walk
+        };
         surfaces.push(SurfaceSummary {
             source: format!(
                 "{} table {}.{}",
                 scanned.path, table.version.0, table.version.1
             ),
-            walk: table.walk.to_string(),
+            walk: walk.to_string(),
             // The bytes were read straight out of the target's mapping.
             acquisition: "ok".into(),
             functions: published,
-            proven_complete_prefix: proven_complete_legacy_prefix(table, &exports),
         });
         surfaces.extend(
             scanned
@@ -3784,7 +3772,6 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
                     walk: table.walk.to_string(),
                     acquisition: "ok".into(),
                     functions: published,
-                    proven_complete_prefix: false,
                 }),
         );
         targets.extend(
@@ -3923,10 +3910,6 @@ fn lower_manifest(
             walk: crate::manifest_input::effective_surface_walk(surface),
             acquisition: acquisition_label(&surface.acquisition),
             functions: surface.functions.len(),
-            // The manifest helper inventories only the 68 legacy words and
-            // never reads the 3.x extension, so it cannot prove the
-            // extension impossible; a manifest `known_prefix` stays a gap.
-            proven_complete_prefix: false,
         });
         tables.push(TableSummary {
             version: surface
@@ -5367,15 +5350,13 @@ impl ConservativePlanCursor {
             .filter(|known| *known == &surface)
             .count();
         self.piece_surfaces.push(surface.clone());
-        let known =
-            self.seen_surfaces
-                .iter()
-                .position(|(known_source, known, known_occurrence)| {
-                    *known_source == source && known == &surface && *known_occurrence == occurrence
-                });
-        if let Some(index) = known {
-            self.output_surfaces[index].proven_complete_prefix |= surface.proven_complete_prefix;
-        } else {
+        if !self
+            .seen_surfaces
+            .iter()
+            .any(|(known_source, known, known_occurrence)| {
+                *known_source == source && known == &surface && *known_occurrence == occurrence
+            })
+        {
             self.seen_surfaces
                 .push((source, surface.clone(), occurrence));
             self.output_surfaces.push(surface);

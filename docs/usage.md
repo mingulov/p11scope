@@ -177,9 +177,9 @@ refused. The terminal report names each refused or partially covered module
 with its reason: `run` and `profile` print a `Module gaps` section with the
 first five and an "and K more" line, and `inventory` prints the admission
 reason under each refused module. A capture whose only mapped provider is
-the proxy layer starts with that prefix partial ("3 of 64 template tables
-attached" on the measured stack) and completes with the named gap; only a
-capture that can attach nothing at all stops at startup with a named refusal.
+the proxy layer starts with that prefix partial (three template tables on
+the measured stack) and completes with the named gap; only a capture that
+can attach nothing at all stops at startup with a named refusal.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,

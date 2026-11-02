@@ -51,6 +51,7 @@
 use super::session_fixture::ScriptedSession;
 use super::*;
 use crate::discovery::identity::{ManifestStaleReason, pin_manifest_objects_deferred};
+use crate::fixture_guard::DieWithParent as _;
 use p11scope_ebpf_common::{
     DISCOVERY_INTERFACES, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
@@ -304,6 +305,7 @@ impl StageChild {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            .die_with_parent()
             .spawn()
             .expect("spawn workload stage");
         let stdin = child.stdin.take().expect("piped stdin");
@@ -525,6 +527,7 @@ impl LsChild {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            .die_with_parent()
             .spawn()
             .expect("spawn lshold");
         let stdin = child.stdin.take().expect("piped stdin");
@@ -3483,6 +3486,7 @@ fn broad_p11kit_admission_arithmetic() {
         )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .expect("python3 holds libp11-kit");
     let mut ready = String::new();
@@ -4560,6 +4564,7 @@ int main(int argc, char **argv) {
             .args(&libraries)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );

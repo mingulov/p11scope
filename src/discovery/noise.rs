@@ -264,6 +264,7 @@ impl DiscoveryNoiseAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_guard::DieWithParent as _;
 
     const ESRCH_REASON: &str = "open failed: No such process (os error 3)";
     const MAPS_REASON: &str = "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot";
@@ -365,6 +366,7 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::from(pty.slave.try_clone().unwrap()))
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );

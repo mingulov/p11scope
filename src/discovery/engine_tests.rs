@@ -1,6 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 use super::session_fixture::ScriptedSession;
 use super::*;
+use crate::fixture_guard::DieWithParent as _;
 #[path = "async_global_tests.rs"]
 mod async_global;
 #[path = "cold_view_tests.rs"]
@@ -3339,6 +3340,7 @@ fn a_view_retired_after_its_group_exited_is_not_a_link_loss() {
     // that never happened.
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(40), child.id()).unwrap();
@@ -3377,6 +3379,7 @@ fn a_view_retired_while_its_group_lives_is_still_a_link_loss() {
     // held is genuinely gone and the gap is real.
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(42), child.id()).unwrap();
@@ -3396,6 +3399,7 @@ fn a_view_retired_while_its_group_lives_is_still_a_link_loss() {
 fn cgroup_exec_rejects_a_stale_retained_generation() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(35), child.id()).unwrap();
@@ -3532,6 +3536,7 @@ fn outer_batch_coalesces_pre_admission_exit_into_the_admission_gap() {
 fn outer_batch_counts_deferred_exit_once_when_no_view_is_admitted() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();
@@ -3890,6 +3895,7 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     };
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(18), child.id()).unwrap();
@@ -3928,6 +3934,7 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     // `p11scope run` on every short-lived child.
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(19), child.id()).unwrap();
@@ -3959,6 +3966,7 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     // and the next pass re-checks.
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(20), child.id()).unwrap();
@@ -3996,6 +4004,7 @@ fn a_named_target_that_provably_exited_ends_the_capture_rather_than_failing_it()
     let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
@@ -5011,6 +5020,7 @@ fn an_ordinary_dynamic_target_binds_its_live_loader_context() {
         std::process::Command::new("sh")
             .args(["-c", "printf R; kill -STOP $$"])
             .stdout(std::process::Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -5073,6 +5083,7 @@ fn assert_no_executable_loader_arm(start_time_only: bool) {
     let mut child = ChildGuard(
         std::process::Command::new("sleep")
             .arg("60")
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -5249,6 +5260,7 @@ fn arming_a_static_executable_is_not_armable_not_partial() {
     let mut child = ChildGuard(
         std::process::Command::new(&busybox)
             .args(["sleep", "60"])
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -5330,6 +5342,7 @@ fn genuine_arm_failures_still_mark_partial() {
         std::process::Command::new("sh")
             .args(["-c", "printf R; kill -STOP $$"])
             .stdout(std::process::Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -5631,6 +5644,7 @@ fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
         std::process::Command::new(&executable)
             .args(["-c", "printf R; kill -STOP $$"])
             .stdout(std::process::Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -5848,6 +5862,7 @@ fn a_loader_hit_remapped_by_a_same_batch_exec_is_not_a_discovery_loss() {
 fn a_generation_change_a_pin_proves_was_an_exit_is_not_a_loss() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let mut engine = Engine::empty();
@@ -5973,6 +5988,7 @@ fn refresh_inventory_with(engine: &mut Engine, session: &mut ScriptedSession) {
 fn a_scope_member_that_ended_before_discovery_reached_it_is_not_a_loss() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();
@@ -6231,6 +6247,7 @@ fn capture_start_members_that_ended_are_not_losses() {
         .map(|_| {
             let mut child = std::process::Command::new("sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .unwrap();
             let pid = child.id();
@@ -6300,6 +6317,7 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
             .map(|_| {
                 std::process::Command::new("sleep")
                     .arg("30")
+                    .die_with_parent()
                     .spawn()
                     .unwrap()
             })
@@ -6540,6 +6558,7 @@ fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
             .map(|_| {
                 std::process::Command::new("sleep")
                     .arg("30")
+                    .die_with_parent()
                     .spawn()
                     .unwrap()
             })
@@ -6645,6 +6664,7 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
             .map(|_| {
                 std::process::Command::new("sleep")
                     .arg("30")
+                    .die_with_parent()
                     .spawn()
                     .unwrap()
             })
@@ -6812,6 +6832,7 @@ fn retained_views_survive_ordinary_rotation_passes() {
             .map(|_| {
                 std::process::Command::new("sleep")
                     .arg("30")
+                    .die_with_parent()
                     .spawn()
                     .unwrap()
             })
@@ -6940,6 +6961,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
             .map(|_| {
                 std::process::Command::new("sleep")
                     .arg("30")
+                    .die_with_parent()
                     .spawn()
                     .unwrap()
             })
@@ -7179,6 +7201,7 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
             .map(|_| {
                 std::process::Command::new("sleep")
                     .arg("30")
+                    .die_with_parent()
                     .spawn()
                     .unwrap()
             })
@@ -7379,6 +7402,7 @@ fn reconcile_quantum_zero_defers_the_whole_slice() {
             .map(|_| {
                 std::process::Command::new("sleep")
                     .arg("30")
+                    .die_with_parent()
                     .spawn()
                     .unwrap()
             })
@@ -7514,6 +7538,7 @@ fn refresh_requests_survive_allocation_exhaustion() {
             .map(|_| {
                 std::process::Command::new("sleep")
                     .arg("30")
+                    .die_with_parent()
                     .spawn()
                     .unwrap()
             })
@@ -7611,6 +7636,7 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
         .map(|_| {
             std::process::Command::new("sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .unwrap()
         })
@@ -7750,6 +7776,7 @@ fn discover_plan_has_no_fatal_allocation() {
 fn a_record_from_a_proven_exited_generation_is_not_a_discovery_loss() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();
@@ -7853,6 +7880,7 @@ fn an_exec_refresh_never_queues_its_live_view_for_conservative_retirement() {
 fn a_capture_refresh_ends_on_a_proven_exit_instead_of_failing() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();
@@ -7976,6 +8004,7 @@ fn manifest_helper_wait_fails_a_stalled_child() {
     let mut guard = SystemScopeChildGuard::new(
         std::process::Command::new("sleep")
             .arg("30")
+            .die_with_parent()
             .spawn()
             .expect("spawn the stalled child"),
     );
@@ -8002,6 +8031,7 @@ fn manifest_helper_wait_accepts_a_progressing_child_past_the_stall_limit() {
     let mut guard = SystemScopeChildGuard::new(
         std::process::Command::new("sh")
             .args(["-c", "i=0; while [ $i -lt 3000000 ]; do i=$((i + 1)); done"])
+            .die_with_parent()
             .spawn()
             .expect("spawn the progressing child"),
     );
@@ -8031,6 +8061,7 @@ fn manifest_helper_wait_caps_total_cpu() {
     let mut guard = SystemScopeChildGuard::new(
         std::process::Command::new("sh")
             .args(["-c", "i=0; while [ $i -lt 3000000 ]; do i=$((i + 1)); done"])
+            .die_with_parent()
             .spawn()
             .expect("spawn the busy child"),
     );
@@ -8073,6 +8104,7 @@ impl DiscoveryLifecycleFixture {
                 .stdin(std::process::Stdio::null())
                 .stdout(output.try_clone().unwrap())
                 .stderr(output)
+                .die_with_parent()
                 .spawn()
                 .expect("exec an isolated offline manifest helper"),
         );
@@ -8141,6 +8173,7 @@ impl DiscoveryLifecycleFixture {
                 .env_clear()
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
+                .die_with_parent()
                 .spawn()
                 .expect("start the owned loader behind its pre-load barrier"),
         );
@@ -9373,6 +9406,7 @@ fn a_real_terminal_drain_blocks_expected_exit_until_its_journal_clears() {
     let mut child = SystemScopeChildGuard::new(
         std::process::Command::new("sleep")
             .arg("30")
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -9591,6 +9625,7 @@ fn retirement_intent_is_persistent_and_recorded_loss_is_sticky() {
 fn expected_exit_waits_for_the_original_process_pin() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(16), child.id()).unwrap();
@@ -9717,6 +9752,7 @@ impl LoadedSeedProvider {
         let library = self._dir.path().join("seed-provider.so");
         let child = std::process::Command::new(&runner)
             .arg(&library)
+            .die_with_parent()
             .spawn()
             .unwrap();
         let pid = child.id();
@@ -9821,6 +9857,7 @@ fn loaded_seed_peer_waits_for_exact_runner_and_provider_mapping() {
         .arg(&library)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let mut held = crate::discovery::test_subject::OwnedMapper::from_child(
@@ -9973,6 +10010,7 @@ int main(int argc, char **argv) {
     assert!(link.status().unwrap().success());
     let child = std::process::Command::new(&runner)
         .arg(&library)
+        .die_with_parent()
         .spawn()
         .unwrap();
     let fixture = LoadedSeedProvider {
@@ -12084,6 +12122,7 @@ impl TabledSeedProvider {
             .arg(self.dir.path().join("tabled-replacement.so"))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let pid = child.id();
@@ -12155,6 +12194,7 @@ fn loaded_tabled_provider() -> (TabledSeedProvider, ProcessView, PathBuf) {
         .arg(dir.path().join("tabled-replacement.so"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();
@@ -16253,6 +16293,7 @@ int main(int argc, char **argv) {
         .arg(&library)
         .arg(&ready)
         .arg(&go)
+        .die_with_parent()
         .spawn()
         .unwrap();
     let mut fixture = LoadedSeedProvider {
@@ -17507,6 +17548,7 @@ fn owned_mapper_rejects_bad_readiness_and_reaps_the_child() {
         .args(["-c", "printf 'wrong\\n'; read -r ignored"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
@@ -17525,6 +17567,7 @@ fn owned_mapper_bounds_partial_readiness_and_reaps_the_child() {
         .args(["-c", "printf 'rea'; read -r ignored"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
@@ -17748,6 +17791,7 @@ fn pin_test_modules(view: &ProcessView, modules: &[ScannedModule]) -> PinnedObje
 fn engine_with_one_accepted_provider() -> (std::process::Child, Engine, Vec<ScannedModule>) {
     let child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(3), child.id()).unwrap();
@@ -17873,14 +17917,24 @@ fn spawn_held_sleep_child() -> HeldChild {
         std::io::Error::last_os_error()
     );
     // SAFETY: fork in a multithreaded binary. The child calls only
-    // async-signal-safe functions before the exec (close, read, write,
-    // execvp) and `_exit(127)` if the exec fails; it never returns to test
-    // code, runs no destructors, and touches no allocator state. All
-    // pointers are parent C strings, valid across the fork.
+    // async-signal-safe functions before the exec (prctl, getppid, close,
+    // read, write, execvp) and `_exit(127)` if the exec fails; it never
+    // returns to test code, runs no destructors, and touches no allocator
+    // state. All pointers are parent C strings, valid across the fork.
+    let owner = std::process::id();
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
     if pid == 0 {
         unsafe {
+            // Parent-death guard (same body as
+            // `crate::fixture_guard::DieWithParent`): a test that dies
+            // mid-hold must not strand the sleeper.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                libc::_exit(127);
+            }
+            if libc::getppid() != owner as libc::pid_t {
+                libc::_exit(127);
+            }
             libc::close(ready[0]);
             libc::close(release[1]);
             let byte = [1u8];
@@ -18085,6 +18139,7 @@ fn conservative_replays_under_churn_never_burn_capacity() {
     let capacity = p11scope_ebpf_common::MAX_SLOTS;
     let child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let _reap = ChildReaper(child);
@@ -22090,6 +22145,7 @@ fn candidate_admission_keeps_exact_retained_and_local_stale_view_ids() {
     fn exited_view(id: ProcessViewId) -> ProcessView {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
+            .die_with_parent()
             .spawn()
             .unwrap();
         let view = ProcessView::open(id, child.id()).unwrap();
@@ -23205,6 +23261,7 @@ fn capture_start_releases_view_ids_for_members_that_ended_before_scan() {
         .map(|_| {
             let mut child = std::process::Command::new("sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .unwrap();
             let pid = child.id();
@@ -23283,6 +23340,7 @@ fn refresh_releases_view_ids_for_members_that_ended_before_scan() {
         .map(|_| {
             let mut child = std::process::Command::new("sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .unwrap();
             let pid = child.id();
@@ -23334,6 +23392,7 @@ fn refresh_releases_view_ids_for_members_that_ended_before_scan() {
 fn spawn_execed_sleep() -> std::process::Child {
     let child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();
@@ -26560,6 +26619,7 @@ fn counter_start_readmits_retained_plan_under_its_budget_after_stale_removal() {
 fn multi_process_start_retires_views_that_went_stale_during_attach_live() {
     let child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let exiting = std::cell::RefCell::new(ChildReaper(child));
@@ -27632,6 +27692,7 @@ fn p2_refuse_then_exit(
     let mut child = std::process::Command::new("/bin/cat")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(711), child.id()).unwrap();
@@ -29407,6 +29468,7 @@ fn system_scope_spawn_loaded_multi(driver: &Path, providers: &[PathBuf]) -> Syst
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -31286,6 +31348,7 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
         .arg("30")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .expect("an owned sleeper");
     let pid = child.id();
@@ -31854,6 +31917,7 @@ fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
+                    .die_with_parent()
                     .spawn()
                     .unwrap(),
             )
@@ -32738,6 +32802,7 @@ impl LazyLoader {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
@@ -34779,6 +34844,7 @@ pub(crate) mod detailed_proof_driver {
         let mut child = Child(
             std::process::Command::new("/bin/sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );
@@ -35081,6 +35147,7 @@ pub(crate) mod detailed_proof_driver {
         for id in 1..=2 {
             let child = std::process::Command::new("/bin/sleep")
                 .arg("60")
+                .die_with_parent()
                 .spawn()
                 .unwrap();
             engine
@@ -35261,6 +35328,7 @@ pub(crate) mod detailed_proof_driver {
         let (mut engine, mut io) = fixture();
         let child = std::process::Command::new("/bin/sleep")
             .arg("60")
+            .die_with_parent()
             .spawn()
             .unwrap();
         let children = Children(vec![child]);
@@ -35470,6 +35538,7 @@ pub(crate) mod detailed_proof_driver {
     fn add_child_view(engine: &mut Engine, id: u32) -> Children {
         let child = std::process::Command::new("/bin/sleep")
             .arg("60")
+            .die_with_parent()
             .spawn()
             .unwrap();
         engine
@@ -35974,6 +36043,7 @@ pub(crate) mod detailed_proof_driver {
         for id in 1..=9 {
             let child = std::process::Command::new("/bin/sleep")
                 .arg("60")
+                .die_with_parent()
                 .spawn()
                 .unwrap();
             engine
@@ -36476,6 +36546,7 @@ pub(crate) mod detailed_proof_driver {
         for id in 1..=9 {
             let child = std::process::Command::new("/bin/sleep")
                 .arg("60")
+                .die_with_parent()
                 .spawn()
                 .unwrap();
             engine
@@ -37933,6 +38004,7 @@ fn peer_census_alignment_respawns_a_mismatched_peer() {
     // A foreign owned child is a peer with a proven different census.
     let alien = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .expect("spawn the mismatched peer");
     let alien_pid = alien.id();
@@ -39292,6 +39364,7 @@ fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity()
     // The cap filler: a provider-free sleeper, exploratory by construction.
     let mut sleeper = std::process::Command::new("sleep")
         .arg("60")
+        .die_with_parent()
         .spawn()
         .expect("spawn ambient sleeper");
     let ambient = sleeper.id();
@@ -39440,6 +39513,7 @@ fn pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe()
     // which is exactly the ambient noise this twin excludes.
     let mut sleeper = std::process::Command::new("sleep")
         .arg("60")
+        .die_with_parent()
         .spawn()
         .expect("spawn dirty filler");
     let filler = sleeper.id();
@@ -39540,6 +39614,7 @@ fn pressure_service_pass_never_evicts_parked_head_view() {
     // shield stands between it and eviction.
     let mut headpeer = std::process::Command::new("sleep")
         .arg("60")
+        .die_with_parent()
         .spawn()
         .expect("spawn head peer");
     let head_pid = headpeer.id();
@@ -39643,6 +39718,7 @@ fn probationary_probe_completes_provider_free_newcomer_at_capacity() {
     let seed_pid = engine.views[0].pid();
     let mut head = std::process::Command::new("sleep")
         .arg("60")
+        .die_with_parent()
         .spawn()
         .expect("spawn provider-free newcomer");
     let head_pid = head.id();
@@ -39746,6 +39822,7 @@ fn probationary_probe_refuses_without_a_complete_scan() {
     let head = SystemScopeChildGuard::new(
         std::process::Command::new("sleep")
             .arg("60")
+            .die_with_parent()
             .spawn()
             .expect("spawn provider-free newcomer"),
     );
@@ -48760,6 +48837,7 @@ impl TwoViewProviderEngine {
         let first_guard = SystemScopeChildGuard::new(child);
         let child = std::process::Command::new("sleep")
             .arg("30")
+            .die_with_parent()
             .spawn()
             .unwrap();
         let view = ProcessView::open(ProcessViewId(4), child.id()).unwrap();
@@ -49112,6 +49190,7 @@ fn engine_with_accepted_providers(count: usize) -> (Vec<SystemScopeChildGuard>, 
     for index in 0..count {
         let child = std::process::Command::new("sleep")
             .arg("30")
+            .die_with_parent()
             .spawn()
             .unwrap();
         engine.scope = Scope::Pid(child.id());
@@ -49189,10 +49268,12 @@ fn collected_graph_barrier_fences_records_and_assessments() {
     // arrives as a record while the graph lives.
     let w_child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let u_child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let w = ProcessView::open(ProcessViewId(4), w_child.id()).unwrap();
@@ -49270,10 +49351,12 @@ fn collected_graph_barrier_fences_records_and_assessments() {
     // no pending assessment and no open journal/batch.
     let w_child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let u_child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let w_pid = w_child.id();
@@ -52086,6 +52169,7 @@ fn collected_graph_reclaim_refusal_retains_and_finishes() {
     // inputs so the refusal site requests the graph.
     let spare = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .expect("a spare child");
     let _spare = SystemScopeChildGuard::new(spare);
@@ -54351,6 +54435,7 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
     engine.scope = Scope::Pid(selected);
     let mut headpeer = std::process::Command::new("sleep")
         .arg("60")
+        .die_with_parent()
         .spawn()
         .expect("spawn head peer");
     let head_pid = headpeer.id();
@@ -54996,6 +55081,7 @@ int main(int argc, char **argv) {
             .arg(&library)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -55545,6 +55631,7 @@ fn acquired_ia32_sparse_table_uses_the_real_process_abi() {
         Command::new(&program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );

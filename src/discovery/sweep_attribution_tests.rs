@@ -5,6 +5,7 @@
 use super::*;
 use crate::discovery::engine::select_deep_scan_candidates;
 use crate::discovery::proof_stats::{MAX_PROOF_STAT_THREADS, MIN_PARALLEL_BATCH};
+use crate::fixture_guard::DieWithParent as _;
 use p11scope_manifest::maps::Device;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -4704,6 +4705,7 @@ impl D4ThreadChild {
             .stdin(Stdio::from(OwnedFd::from(helper)))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
+            .die_with_parent()
             .spawn()
             .expect("fresh exec of the matching libtest helper");
         // Own the process before any fallible READY I/O or validation.
@@ -5371,6 +5373,7 @@ impl D4ThreadChild {
             .stdin(Stdio::from(OwnedFd::from(helper)))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
+            .die_with_parent()
             .spawn()
             .expect("fresh exec of the matching literal-clone libtest helper");
         let mut owned = Self {
@@ -6453,6 +6456,7 @@ impl D4ZombieChild {
             .stdin(Stdio::from(OwnedFd::from(helper)))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
+            .die_with_parent()
             .spawn()
             .expect("fixture: matching zombie helper re-exec");
         let mut owned = Self {

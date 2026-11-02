@@ -261,6 +261,7 @@ fn zombie_group_without_live_member_is_exited_at_sweep_seam() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .expect("sleep spawns");
     let mut io = OsConfirmIo::default();
@@ -281,6 +282,7 @@ fn zombie_group_without_live_member_is_exited_at_sweep_seam() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .expect("sleep spawns");
     let pid = dead.id();
@@ -1618,6 +1620,7 @@ fn privileged_d4_btrfs_zombie_cold_admission_backend_parity() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .expect("sleep spawns");
     let live_id = adapter

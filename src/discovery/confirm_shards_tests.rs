@@ -10,6 +10,7 @@ use crate::discovery::scan::{
     read_maps_or_refuse,
 };
 use crate::discovery::sweep_attribution::{ObjectChecks, RANGE_NOT_MAPPED, attribute_unselected};
+use crate::fixture_guard::DieWithParent as _;
 use p11scope_manifest::maps::Device;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
@@ -459,6 +460,7 @@ fn privileged_sharded_confirmation_equals_the_serial_production_probe() {
             .map(|_| {
                 std::process::Command::new("sleep")
                     .arg("60")
+                    .die_with_parent()
                     .spawn()
                     .unwrap()
             })

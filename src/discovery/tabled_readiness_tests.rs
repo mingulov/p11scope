@@ -57,6 +57,7 @@ fn held_constructor_fixture() -> (TabledSeedProvider, PathBuf, UnixStream) {
         .env("P11S_TEST_CONSTRUCTOR_GATE", &gate_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let fixture = TabledSeedProvider {
@@ -120,6 +121,7 @@ fn tabled_readiness_refuses_a_runner_that_exits_before_loading() {
         .arg(&library)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let mut fixture = TabledSeedProvider {

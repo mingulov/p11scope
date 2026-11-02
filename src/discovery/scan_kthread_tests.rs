@@ -8,6 +8,7 @@
 //! classifier sees here is scripted except in the one real-`/proc` test.
 
 use super::*;
+use crate::fixture_guard::DieWithParent as _;
 use crate::process::{PF_KTHREAD, start_time_from_stat, stat_flags_from_stat_text};
 use std::io::{self, Cursor};
 
@@ -257,6 +258,7 @@ fn scan_empty_maps_exited_view_is_never_absence() {
     // before the pin, which then fails on the dead mount namespace.
     let mut child = std::process::Command::new("cat")
         .stdin(std::process::Stdio::piped())
+        .die_with_parent()
         .spawn()
         .expect("spawn a child that waits to be killed");
     let pid = child.id();

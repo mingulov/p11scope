@@ -7,6 +7,7 @@ use super::{RetainedGroupMember, ValidatedMemberSelector};
 use crate::discovery::caller_registry;
 use crate::discovery::scan::{CaptureWorkBudget, WORK_CEILING_REASON};
 use crate::discovery::sweep_attribution::{FD_RESOURCE_REASON, ReservationOwner, SegmentPolicy};
+use crate::fixture_guard::DieWithParent as _;
 use crate::process::{PidPin, generation_gone, process_is_zombie};
 use std::cell::RefCell;
 use std::io::Read as _;
@@ -337,6 +338,7 @@ fn spawn_python_child(script: &str, work: &std::path::Path) -> std::process::Chi
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .expect("python3 spawns (docs/development.md prerequisite)")
 }

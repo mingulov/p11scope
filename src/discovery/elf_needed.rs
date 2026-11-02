@@ -1342,6 +1342,7 @@ pub(crate) mod fixture {
 mod tests {
     use super::fixture::*;
     use super::*;
+    use crate::fixture_guard::DieWithParent as _;
 
     fn watched(path: &Path, soname: &[u8]) -> WatchedProvider {
         let (dev, ino) = record_identity_of(path);
@@ -2705,6 +2706,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let deadline =

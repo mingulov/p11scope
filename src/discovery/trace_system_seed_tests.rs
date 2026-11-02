@@ -11,6 +11,7 @@
 use super::*;
 use crate::attach::detailed_identity::{CgroupCandidate, TraceSeed};
 use crate::events::{DiscoveryDrain, EventDrain, ScriptedRecords};
+use crate::fixture_guard::DieWithParent as _;
 use crate::semantics::ProcessKey;
 use crate::trace_identity::TraceIdentityStore;
 use p11scope_ebpf_common::{Event, ImageIdentity};
@@ -340,12 +341,21 @@ impl Capture {
                     if matches!(provider_stage, ProviderStage::AfterInitialScan) {
                         command.env("P11SCOPE_FIXTURE_GATE", "1");
                     }
+                    command.die_with_parent();
                     command.spawn().unwrap()
                 } else {
-                    Command::new("/bin/sleep").arg("30").spawn().unwrap()
+                    Command::new("/bin/sleep")
+                        .arg("30")
+                        .die_with_parent()
+                        .spawn()
+                        .unwrap()
                 }
             } else {
-                Command::new("/bin/sleep").arg("30").spawn().unwrap()
+                Command::new("/bin/sleep")
+                    .arg("30")
+                    .die_with_parent()
+                    .spawn()
+                    .unwrap()
             };
             children.0.push(child);
             if index == unrelated && matches!(provider_stage, ProviderStage::InitiallyMapped) {
@@ -587,6 +597,7 @@ fn late_provider_fixture_waits_for_driver_exec_before_original_view() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let mut held = crate::discovery::test_subject::OwnedMapper::from_child(
@@ -833,6 +844,7 @@ fn fresh_system_trace_provider_association_alone_cannot_grant_a_name() {
                     .as_ref()
                     .unwrap()
                     .command()
+                    .die_with_parent()
                     .spawn()
                     .unwrap();
                 let pid = child.id();

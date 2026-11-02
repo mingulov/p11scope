@@ -225,6 +225,10 @@ def render(manifest, samples):
             lines.append(f"  delta {label:8s} ({costlier} - {baseline}): "
                          f"{fmt(delta)} {unit} ({pct:+.2%}, {flag})")
         lines.append("")
+    lines.append("note: the on-armed arm measures gated read only, not an "
+                 "armed-marker cost (no production session writes READY at "
+                 "this revision; the READY writer lands with lane "
+                 "journal-ready). Rerun this arm once WB-3 lands.")
     return "\n".join(lines) + "\n"
 
 

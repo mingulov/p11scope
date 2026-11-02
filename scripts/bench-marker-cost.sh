@@ -5,7 +5,9 @@
 # Method: two self-measured workloads run beside a live observer under
 # four arms — no observer (none), the off build profiling (off-profile),
 # the on build profiling with the marker disarmed (on-profile), and the
-# on build with --key-operations armed (on-armed):
+# on build with --key-operations armed (on-armed; gated read only at
+# this revision — no production session writes READY, so the cost table
+# labels it honestly instead of claiming an armed-marker cost):
 #   exec-storm: scripts/fixtures/exec-storm.c fork+execs /bin/true
 #     EXEC_OPS times (default 2000), CLOCK_MONOTONIC around the loop.
 #     Measure: wall ns per exec, workload-side.
@@ -17,10 +19,14 @@
 # BPF run-time deltas (kernel.bpf_stats_enabled, set for the campaign,
 # re-asserted per sample against concurrent cells, restored after)
 # corroborate independently: the sched_process_exec total beside
-# exec-storm, the p11_entry total beside call-rate. A sample whose
-# hook program is present must show at least one hook event per workload
-# op (a zero delta would certify unattached hooks); absence is recorded
-# per arm and reported, never silently treated as zero cost.
+# exec-storm, the p11_entry total beside call-rate. A before-read over
+# attached-but-idle hooks is 0/0 (bpftool omits zero counters with
+# stats on); after the workload the window must show positive run time
+# and at least one hook event per op, else the sample fails (a zero
+# delta would certify unattached hooks). A hook program that is not
+# loaded at all (the sealed journal lane carries p11_entry_journal,
+# not p11_entry) records absent per arm and is reported, never read
+# as zero.
 #
 # Arms run ABBA across rounds (odd rounds forward, even rounds
 # reversed), so linear host drift cannot masquerade as an arm
@@ -54,7 +60,9 @@
 # ROUNDS (default 2), EXEC_OPS, CALL_RATE, CALL_DURATION, MAX_LOAD1,
 # COOLDOWN, DURATION (default 120: observer backstop per sample),
 # ATTACH_TIMEOUT_S (default 120), MODULE (default the system SoftHSM2),
-# LOCK, TMPDIR (disk filesystem; the campaign keeps per-sample evidence
+# LOCK, P11SCOPE_BENCH_COMMIT (the source commit; required outside a
+# git repo, where the tree records unknown-no-git),
+# TMPDIR (disk filesystem; the campaign keeps per-sample evidence
 # under a private work dir and copies the log, manifest and cost table
 # to OUTDIR at the end).
 #
@@ -146,6 +154,100 @@ for r in range(1, int(sys.argv[2]) + 1):
         order.reverse()
     print(f"round {r}: {' '.join(order)}")
 EOF
+}
+
+# bpf_parse_totals PROG STATS: read `bpftool -j prog show` JSON on
+# stdin, print "<run_time_ns> <run_cnt>" summed over every program
+# named PROG (or its 15-byte kernel truncation). Exit 0 on a reading;
+# exit 4 with "absent" when no program matches (a miss is recorded
+# absence, never a zero); exit 1 on any corrupt read. With stats on,
+# a matched program whose counters are omitted reads as zero: bpftool
+# omits run_time_ns/run_cnt until the program first runs, so a
+# before-read over attached-but-idle hooks is 0/0, not a failure.
+bpf_parse_totals() {
+    python3 -I -c '
+import json, sys
+want, stats = sys.argv[1], sys.argv[2]
+try:
+    progs = json.load(sys.stdin)
+except Exception as exc:
+    sys.exit(f"bpftool output is not JSON with stats={stats}: {exc}")
+if type(progs) is not list:
+    sys.exit(f"bpftool output is not a prog list with stats={stats}")
+total_ns = total_cnt = 0
+found = False
+for prog in progs:
+    if type(prog) is not dict:
+        continue
+    name = prog.get("name", "")
+    if name != want and name != want[:15]:
+        continue
+    found = True
+    row = []
+    for field in ("run_time_ns", "run_cnt"):
+        value = prog.get(field)
+        if value is None and stats == "1":
+            value = 0
+        if type(value) is not int or value < 0:
+            if value is None:
+                sys.exit(f"prog {name!r} has no {field} with stats={stats}"
+                         f" (a concurrent cell may have restored stats=0 or unloaded it)")
+            sys.exit(f"prog {name!r} has invalid {field} {value!r} with stats={stats}")
+        row.append(value)
+    total_ns += row[0]
+    total_cnt += row[1]
+if not found:
+    print("absent")
+    sys.exit(4)
+print(total_ns, total_cnt)
+' "$1" "$2"
+}
+
+# bpf_delta BEFORE AFTER OPS ARM: print the "<ns> <cnt>" window delta.
+# Fail on backwards counters or a vacuous window: zero hook run time,
+# or fewer than one event per op, means unattached hooks, which must
+# fail the sample rather than certify zero cost.
+bpf_delta() {
+    bd_ns0=${1% *} bd_cnt0=${1#* }
+    bd_ns1=${2% *} bd_cnt1=${2#* }
+    [ "$bd_ns1" -ge "$bd_ns0" ] && [ "$bd_cnt1" -ge "$bd_cnt0" ] || {
+        echo "bpf counters went backwards" >&2
+        return 1
+    }
+    bd_ns=$((bd_ns1 - bd_ns0)) bd_cnt=$((bd_cnt1 - bd_cnt0))
+    [ "$bd_ns" -gt 0 ] || {
+        echo "$4 sample ran $3 ops with zero hook run time" >&2
+        return 1
+    }
+    [ "$bd_cnt" -ge "$3" ] || {
+        echo "$4 sample ran $3 ops with $bd_cnt hook events (< 1/op)" >&2
+        return 1
+    }
+    echo "$bd_ns $bd_cnt"
+}
+
+# resolve_commit: set COMMIT and TREE_STATUS. P11SCOPE_BENCH_COMMIT
+# wins when set (required outside a git repo, e.g. the Fedora rsync
+# mirror); otherwise the commit comes from git. Outside a repo the
+# tree reads unknown-no-git. Returns nonzero when neither source works.
+resolve_commit() {
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        rc_git=1
+    else
+        rc_git=
+    fi
+    if [ -n "${P11SCOPE_BENCH_COMMIT-}" ]; then
+        COMMIT=$P11SCOPE_BENCH_COMMIT
+    elif [ -n "$rc_git" ]; then
+        COMMIT=$(git rev-parse HEAD) || return 1
+    else
+        return 1
+    fi
+    if [ -n "$rc_git" ]; then
+        TREE_STATUS=$(git status --porcelain -- . ':!target' | head -n 20 | tr '\n' ';')
+    else
+        TREE_STATUS=unknown-no-git
+    fi
 }
 
 if [ "${1-}" = "--dry-run" ]; then
@@ -295,11 +397,11 @@ EOF
     # and the tree reads unknown-no-git; inside a repo git stays.
     RC_DIR=$(mktemp -d "$SELF_TEST_WORK/norepo-XXXXXX") \
         || { echo "self-test: mktemp failed" >&2; exit 1; }
-    RC_OUT=$(cd "$RC_DIR" || exit 1; export GIT_CEILING_DIRECTORIES=$RC_DIR; P11SCOPE_BENCH_COMMIT=deadbeef1234; export P11SCOPE_BENCH_COMMIT; resolve_commit || exit 1; printf '%s|%s' "$COMMIT" "$TREE_STATUS") \
+    RC_OUT=$(cd "$RC_DIR" || exit 1; export GIT_CEILING_DIRECTORIES="$RC_DIR"; P11SCOPE_BENCH_COMMIT=deadbeef1234; export P11SCOPE_BENCH_COMMIT; resolve_commit || exit 1; printf '%s|%s' "$COMMIT" "$TREE_STATUS") \
         || { echo "self-test: env commit refused outside a repo" >&2; exit 1; }
     [ "$RC_OUT" = "deadbeef1234|unknown-no-git" ] \
         || { echo "self-test: bad env resolve $RC_OUT" >&2; exit 1; }
-    if RC_OUT=$(cd "$RC_DIR" || exit 1; export GIT_CEILING_DIRECTORIES=$RC_DIR; unset P11SCOPE_BENCH_COMMIT; resolve_commit); then
+    if RC_OUT=$(cd "$RC_DIR" || exit 1; export GIT_CEILING_DIRECTORIES="$RC_DIR"; unset P11SCOPE_BENCH_COMMIT; resolve_commit); then
         echo "self-test: missing commit accepted outside a repo" >&2; exit 1
     fi
     RC_REPO=$(mktemp -d "$SELF_TEST_WORK/repo-XXXXXX") \
@@ -522,6 +624,8 @@ wait_for_first_pass() {
 # program whose name is PROG or its 15-byte kernel truncation, or
 # "absent" when none is loaded. Sums (never picks one): with uprobe_multi
 # there is one program per hook anyway, and a sum cannot hide a twin.
+# A "0 0" reading means attached-but-idle with stats on (bpftool omits
+# zero counters); it is not absence.
 bpf_totals() {
     bpf_json=$(sudo -n bpftool -j prog show 2>"$WORK/bpftool.stderr")
     bpf_rc=$?
@@ -531,41 +635,17 @@ bpf_totals() {
         echo "bpf_stats_enabled=$(cat /proc/sys/kernel/bpf_stats_enabled 2>/dev/null)" >&2
         return 1
     fi
-    printf '%s' "$bpf_json" | python3 -I -c '
-import json, sys
-want = sys.argv[1]
-try:
-    with open("/proc/sys/kernel/bpf_stats_enabled", encoding="utf-8") as handle:
-        stats = handle.read().strip()
-except OSError:
-    stats = "unknown"
-try:
-    progs = json.load(sys.stdin)
-except Exception as exc:
-    sys.exit(f"bpftool output is not JSON with stats={stats}: {exc}")
-if type(progs) is not list:
-    sys.exit(f"bpftool output is not a prog list with stats={stats}")
-total_ns = total_cnt = 0
-found = False
-for prog in progs:
-    if type(prog) is not dict:
-        continue
-    name = prog.get("name", "")
-    if name != want and name != want[:15]:
-        continue
-    found = True
-    for field in ("run_time_ns", "run_cnt"):
-        value = prog.get(field)
-        if type(value) is not int or value < 0:
-            sys.exit(f"prog {name!r} has no integer {field} with stats={stats}"
-                     f" (a concurrent cell may have restored stats=0 or unloaded it)")
-    total_ns += prog["run_time_ns"]
-    total_cnt += prog["run_cnt"]
-if not found:
-    print("absent")
-else:
-    print(total_ns, total_cnt)
-' "$1"
+    bpf_stats=$(cat /proc/sys/kernel/bpf_stats_enabled 2>/dev/null || echo unknown)
+    if bpf_out=$(printf '%s' "$bpf_json" | bpf_parse_totals "$1" "$bpf_stats"); then
+        printf '%s\n' "$bpf_out"
+    else
+        bpf_rc=$?
+        if [ "$bpf_rc" -eq 4 ]; then
+            printf '%s\n' "$bpf_out"
+            return 0
+        fi
+        return 1
+    fi
 }
 
 if [ -n "$MODULE" ]; then
@@ -609,10 +689,9 @@ echo "=== discover ==="
 echo "=== machine ==="
 KERNEL=$(uname -r)
 CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
-COMMIT=$(git rev-parse HEAD)
+resolve_commit || die "no git repo in $PWD: set P11SCOPE_BENCH_COMMIT to the built commit"
 ON_SHA=$(sha256sum "$ON_OBSERVER" | cut -d' ' -f1)
 OFF_SHA=$(sha256sum "$OFF_OBSERVER" | cut -d' ' -f1)
-TREE_STATUS=$(git status --porcelain -- . ':!target' | head -n 20 | tr '\n' ';')
 echo "kernel: $KERNEL"
 echo "cpu: $CPU"
 echo "commit: $COMMIT"
@@ -770,16 +849,8 @@ run_sample() {
         if [ "$rs_bpf_before" = absent ] || [ "$rs_bpf_after" = absent ]; then
             rs_bpf_ns=absent rs_bpf_cnt=absent
         else
-            rs_bns0=${rs_bpf_before% *} rs_bcnt0=${rs_bpf_before#* }
-            rs_bns1=${rs_bpf_after% *} rs_bcnt1=${rs_bpf_after#* }
-            [ "$rs_bns1" -ge "$rs_bns0" ] && [ "$rs_bcnt1" -ge "$rs_bcnt0" ] \
-                || { echo "bpf counters went backwards" >&2; return 1; }
-            rs_bpf_ns=$((rs_bns1 - rs_bns0)) rs_bpf_cnt=$((rs_bcnt1 - rs_bcnt0))
-            # A zero delta would certify unattached hooks: the workload ran
-            # rs_ops ops through a present hook, so require at least one
-            # event per op and positive run time.
-            [ "$rs_bpf_ns" -gt 0 ] || { echo "$rs_arm sample ran $rs_ops ops with zero hook run time" >&2; return 1; }
-            [ "$rs_bpf_cnt" -ge "$rs_ops" ] || { echo "$rs_arm sample ran $rs_ops ops with $rs_bpf_cnt hook events (< 1/op)" >&2; return 1; }
+            rs_bpf=$(bpf_delta "$rs_bpf_before" "$rs_bpf_after" "$rs_ops" "$rs_arm") || return 1
+            rs_bpf_ns=${rs_bpf% *} rs_bpf_cnt=${rs_bpf#* }
         fi
         kill -INT "$SPID" 2>/dev/null || true
         if wait "$SPID"; then SPID=; else rs_status=$?; SPID=; echo "observer exited $rs_status" >&2; return 1; fi

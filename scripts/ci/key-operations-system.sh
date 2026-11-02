@@ -235,7 +235,9 @@ fi
 export P11SCOPE_KEY_FIXTURE_PIN=1234
 export P11SCOPE_KEY_FIXTURE_TIMEOUT_MS=$FIXTURE_ALARM_MS
 
-SUDO="sudo -n"
+# The root observer must see the disposable token: stock sudoers
+# scrubs SOFTHSM2_CONF, so preserve it like the bench script does.
+SUDO="sudo -n --preserve-env=SOFTHSM2_CONF"
 [ "$SELFTEST" = 1 ] && SUDO=""
 
 wait_for_line() {
@@ -567,31 +569,45 @@ if [ "$ON_FLOW_OK" -eq 0 ]; then
     fi
 elif python3 -I "$LEDGER_CHECK" "$OUTDIR/churn-on-ledger.jsonl" \
         > "$OUTDIR/churn-on-ledger-check.log" 2>&1; then
-    oo_line=$(python3 -I "$CHECKS" oo "$OUTDIR/churn-on-out.json")
-    oo_status=${oo_line%% *}; oo_status=${oo_status#status=}
-    oo_reason=${oo_line#*reason=}
-    if [ "$oo_status" = "populated" ] || [ "$oo_status" = "available" ]; then
-        if python3 -I "$QUALIFY" "$OUTDIR/churn-on-ledger.jsonl" \
-                "$OUTDIR/churn-on-out.json" \
-                > "$OUTDIR/churn-on-oracle.log" 2>&1; then
-            row churn-on-ledger 1 qualified "oracle compare passed"
-        else
-            cp "$OUTDIR/churn-on-out.json" "$OUTDIR/churn-linked-sample.json" || die "sample copy failed"
-            oracle_text=$(tail -n 5 "$OUTDIR/churn-on-oracle.log" | tr '\n' ';')
-            row churn-on-ledger 1 expected-failure \
-                "OPEN-6: oracle refused the populated linked shape: $oracle_text (sample: churn-linked-sample.json)"
-        fi
+    if ! oo_line=$(python3 -I "$CHECKS" oo "$OUTDIR/churn-on-out.json"); then
+        row churn-on-ledger 0 failed "observer report missing or unparsable"
+        FAILURES=$((FAILURES + 1))
     else
-        if python3 -I "$QUALIFY" "$OUTDIR/churn-on-ledger.jsonl" \
-                "$OUTDIR/churn-on-out.json" \
-                > "$OUTDIR/churn-on-oracle.log" 2>&1; then
-            oracle_text=" oracle unexpectedly passed on $oo_status"
+        oo_status=${oo_line%% *}; oo_status=${oo_status#status=}
+        oo_reason=${oo_line#*reason=}
+        if [ "$ON_EXIT" -ne 0 ]; then
+            row churn-on-ledger 0 failed \
+                "observer exit $ON_EXIT with object_observations $oo_status ($oo_reason): not the pinned signature (exit 0)"
+            FAILURES=$((FAILURES + 1))
+        elif [ "$oo_status" = "populated" ]; then
+            if python3 -I "$QUALIFY" "$OUTDIR/churn-on-ledger.jsonl" \
+                    "$OUTDIR/churn-on-out.json" \
+                    > "$OUTDIR/churn-on-oracle.log" 2>&1; then
+                row churn-on-ledger 1 qualified "oracle compare passed"
+            else
+                cp "$OUTDIR/churn-on-out.json" "$OUTDIR/churn-linked-sample.json" || die "sample copy failed"
+                oracle_text=$(tail -n 5 "$OUTDIR/churn-on-oracle.log" | tr '\n' ';')
+                row churn-on-ledger 1 expected-failure \
+                    "OPEN-6: oracle refused the populated linked shape: $oracle_text (sample: churn-linked-sample.json)"
+            fi
+        elif [ "$oo_status" = "unavailable" ] && [ "$oo_reason" = "journal_unavailable" ]; then
+            if python3 -I "$QUALIFY" "$OUTDIR/churn-on-ledger.jsonl" \
+                    "$OUTDIR/churn-on-out.json" \
+                    > "$OUTDIR/churn-on-oracle.log" 2>&1; then
+                row churn-on-ledger 0 failed \
+                    "oracle unexpectedly passed on unavailable (journal_unavailable); the pinned refusal went stale"
+                FAILURES=$((FAILURES + 1))
+            else
+                oracle_text=" oracle: $(tail -n 3 "$OUTDIR/churn-on-oracle.log" | tr '\n' ';')"
+                cp "$OUTDIR/churn-on-out.json" "$OUTDIR/churn-linked-sample.json" || die "sample copy failed"
+                row churn-on-ledger 1 expected-failure \
+                    "product: object_observations unavailable (journal_unavailable);$oracle_text (sample: churn-linked-sample.json)"
+            fi
         else
-            oracle_text=" oracle: $(tail -n 3 "$OUTDIR/churn-on-oracle.log" | tr '\n' ';')"
+            row churn-on-ledger 0 failed \
+                "object_observations $oo_status ($oo_reason) on exit $ON_EXIT: not the pinned signature (exit 0 + unavailable journal_unavailable, or a populated oracle refusal)"
+            FAILURES=$((FAILURES + 1))
         fi
-        cp "$OUTDIR/churn-on-out.json" "$OUTDIR/churn-linked-sample.json" || die "sample copy failed"
-        row churn-on-ledger 1 expected-failure \
-            "product: object_observations $oo_status ($oo_reason);$oracle_text (sample: churn-linked-sample.json)"
     fi
 else
     row churn-on-ledger 0 failed "application ledger failed validation"

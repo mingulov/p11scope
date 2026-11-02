@@ -25,10 +25,21 @@ import sys
 # truncated collection), never a userspace disclosure: first-burst shed
 # rows, custody notes and "unknown" coverage are honest non-loss and
 # must not match. "custody lost" is deliberately absent: a dead PID
-# target loses no kernel data.
+# target loses no kernel data, and neither is "native owner lost" (a
+# userspace scan error, not dropped kernel data).
+#
+# Subject tokens below are the product's real gap subjects
+# (src/discovery/caller_registry.rs, inventory_coordinator/leader_exit.rs
+# and semantics.rs); reason tokens are the real lifecycle/EVENTS
+# phrasings (src/attach/inventory/capture.rs, caller_registry.rs).
 LOSS_RE = re.compile(
-    r"ring[ _]loss|event[ _]loss|events[ _]lost|lost[ _]+[0-9]+[ _]+events"
-    r"|discovery[ _]loss|truncat|overflow|dropped[ _]+events?",
+    r"ring[ _]loss|event[ _]loss|events[ _]lost"
+    r"|lost[ _]+[0-9]+[ _]+(events|records?)"
+    r"|discovery[ _]loss|truncat|overflow|dropped[ _]+events?"
+    r"|semantic[ _]capture[ _]loss|semantic[ _]calls[ _]lost"
+    r"|native[ _]count[ _]refresh[ _]loss|lifecycle[ _]evidence[ _]lost"
+    r"|leader[ _]task[ _]link[ _]loss|batch[ _]+dropped"
+    r"|ring[ _]+lost|record[ _]+was[ _]+lost",
     re.IGNORECASE,
 )
 

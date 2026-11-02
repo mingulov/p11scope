@@ -31,7 +31,7 @@ import key_operations_checks as checks  # noqa: E402
 FAKE_OBSERVER = """#!/bin/sh
 # Fake observer: seal line, self-stop after FAKE_OBSERVE_S, canned doc.
 # KEYOPS_SELFTEST_SCENARIO: clean | ring-loss | loss-gap | dirty-stop |
-# oo-populated (each: unavailable oo except oo-populated).
+# oo-populated | garbage-doc (each: unavailable oo except oo-populated).
 out=""
 prev=""
 for arg in "$@"; do
@@ -60,6 +60,9 @@ case $scenario in
     oo-populated)
         status=populated
         reason="rev 1" ;;
+    garbage-doc)
+        echo "NOT JSON{{{" > "$out"
+        exit "${FAKE_OBS_EXIT:-0}" ;;
 esac
 if [ "$scenario" = dirty-stop ]; then
     echo "p11scope: cleanup incomplete, 3 links uncertain" >&2
@@ -249,6 +252,30 @@ class SystemScriptTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("loss gap", rows["churn-on"]["detail"])
 
+    def test_corrupt_observer_doc_is_failed_row(self):
+        proc, outdir, rows = self.run_script("garbage-doc", "clean")
+        self.assertEqual(proc.returncode, 1)
+        row = rows["churn-on-ledger"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("missing or unparsable", row["detail"])
+        # The harness records the row and continues: every row lands.
+        self.assertEqual(set(rows),
+                         {"churn-on", "churn-twin", "churn-on-ledger"})
+
+    def test_nonzero_exit_is_not_the_pinned_signature(self):
+        proc, outdir, rows = self.run_script(
+            "clean", "clean", extra_env={"FAKE_OBS_EXIT": "1"})
+        self.assertEqual(proc.returncode, 1)
+        row = rows["churn-on-ledger"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("not the pinned signature", row["detail"])
+
+    def test_sudo_preserves_token_conf(self):
+        text = SCRIPT.read_text()
+        self.assertIn('SUDO="sudo -n --preserve-env=SOFTHSM2_CONF"', text)
+
     def test_incomplete_stop_fails(self):
         proc, outdir, rows = self.run_script("dirty-stop", "clean")
         self.assertEqual(proc.returncode, 1)
@@ -330,14 +357,48 @@ class CheckHelperTests(unittest.TestCase):
         ok, _ = checks.check_no_loss_gap(self.doc(gaps=[gap]))
         self.assertFalse(ok)
 
+    def test_real_loss_subjects_match(self):
+        for subject in ("semantic capture loss", "semantic calls lost",
+                        "native count refresh loss",
+                        "leader task link loss",
+                        "semantic batch dropped without lane authority"):
+            gap = {"subject": subject, "reason": "cell pressure"}
+            ok, detail = checks.check_no_loss_gap(self.doc(gaps=[gap]))
+            self.assertFalse(ok, subject)
+            self.assertIn("loss gap", detail)
+
+    def test_real_loss_reasons_match(self):
+        reasons = (
+            # src/attach/inventory/capture.rs lifecycle-ring rule.
+            "the lifecycle ring lost records (DISCOVERY ring loss 6 -> 8): "
+            "2 may be among them",
+            # caller_registry.rs capture-loss note.
+            "EVENTS ring lost 4 records",
+            # capture.rs short-record lifecycle loss.
+            "a lifecycle record was lost: short DISCOVERY record",
+        )
+        for reason in reasons:
+            gap = {"subject": "capture discovery", "reason": reason}
+            ok, detail = checks.check_no_loss_gap(self.doc(gaps=[gap]))
+            self.assertFalse(ok, reason)
+            self.assertIn("loss gap", detail)
+
     def test_benign_gaps_never_match(self):
         benign = [
             {"subject": "native capture scope custody unproven",
              "reason": "PID custody lost: the PID target exited"},
+            {"subject": "native capture scope custody unproven",
+             "reason": "PID custody was lost: the target exited"},
             {"subject": "first-burst shed",
              "reason": "predates the semantic lane; shed 12"},
             {"subject": "inventory capture failed",
              "reason": "the process could not be read; unknown, not absent"},
+            {"subject": "native owner lost",
+             "reason": "scan failed: owner unreadable"},
+            {"subject": "semantic calls unrouted",
+             "reason": "1 calls shed without a route (pending=1)"},
+            {"subject": "semantic batch refused for a foreign domain",
+             "reason": "domain ended before the batch"},
         ]
         ok, _ = checks.check_no_loss_gap(self.doc(gaps=benign))
         self.assertTrue(ok)

@@ -4121,7 +4121,7 @@ impl AttestedSemanticLane {
     /// before the first publication request. This performs no EVENTS/H0 work.
     pub(crate) fn initialize_joint(
         &mut self,
-        coordinator: &InventoryCoordinator<OsProcessSource>,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
     ) -> Result<(), SemanticRefusal> {
         #[cfg(test)]
         {
@@ -4155,6 +4155,7 @@ impl AttestedSemanticLane {
                 &producers,
                 &coordinator.registry().semantic_storage_reserver(),
             )?);
+            coordinator.note_journal_linked(producers.journal_linked());
         }
         Ok(())
     }

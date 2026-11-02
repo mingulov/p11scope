@@ -4252,7 +4252,7 @@ fn privileged_joint_driver_live_finish_begin_poll_wound_down_lp64() -> Result<()
         !lane.has_joint_machine(),
         "no machine before initialization"
     );
-    lane.initialize_joint(&coordinator)
+    lane.initialize_joint(&mut coordinator)
         .map_err(|refusal| anyhow::anyhow!("the joint machine initializes: {refusal}"))?;
     ensure!(lane.has_joint_machine(), "the machine initializes live");
     eprintln!("JOINT_LIVE attach=ok machine=ok");

@@ -220,6 +220,19 @@ earlier failed exact-count/final-drain run remains a historical failure.
 Longer runs (4 h, 24 h) remain unqualified. Startup and stop figures are
 declared per kernel, not a product guarantee.
 
+At high call rates the semantic lane can lose EVENTS records faster
+than it drains them: when the kernel ring is full it refuses new
+records (counted in `EVIDENCE_RING_LOSS`, never silently
+overwritten), and the observer discloses the cumulative loss in a
+`native capture events lost` gap with exact counts on the stop line
+(`lost`) and in `observation.semantic_capture.events_lost`. The
+counter counts records, not calls: at system/cgroup scope a refused
+FORK marker counts too. Prompt saturated-tick commits apply to
+legacy lanes only; joint-machine lanes service the machine instead
+and disclose loss at each publish. Measured ceiling: see release
+re-measure. TODO(controller): fill in the release-observer sustained
+rate ceiling after the joint-keepup campaign.
+
 In long system-wide runs, a live publication can rarely stop making
 progress. After 6 seconds without progress, p11scope abandons that
 publication with a named gap and keeps running, and the report marks

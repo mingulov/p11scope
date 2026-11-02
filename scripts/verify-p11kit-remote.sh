@@ -11,8 +11,13 @@
 # Layout: a SoftHSM token, a user-owned `p11-kit server` on the default
 # socket, and `pkcs11-tool -O --login` under `p11scope run --pause auto`.
 # Oracle: the same workload against libsofthsm2.so directly. Twins: a
-# provider+closure capture (`trust list`), and the remote workload with
-# `--exclude-module` (excluded to 0, reported "excluded by you").
+# provider+closure capture (`trust list`) in two halves — twin 1 pins the
+# template prefix present with any count (stable under load, green even
+# when starved), twin 1b re-runs the workload until the trust backend is
+# admitted with a substantial count or all N attempts stay tiny
+# (systematic starvation fails, one loader-timing flake does not) — and
+# the remote workload with `--exclude-module` (excluded to 0, reported
+# "excluded by you").
 #
 # Needs root for the observer (sudo -n), plus p11-kit, opensc (pkcs11-tool),
 # softhsm2 and trust on PATH. Provider paths are probed (Debian and Fedora
@@ -293,7 +298,9 @@ def main(binary, work, keep):
         print("remote is direct minus C_GetFunctionList: the client entry point "
               "is served from its own code, never a closure slot")
 
-        # Twin 1: provider + closure array together.
+        # Twin 1: provider + closure array together. Stable by design:
+        # the template prefix is present with any count, green even when
+        # the backend is starved — twin 1b below guards the admission.
         trust_doc, _ = capture_until_counted(
             binary, conf, work, "trust",
             lambda out: ["run", "--pause", "auto", "-o", str(out),
@@ -308,6 +315,37 @@ def main(binary, work, keep):
         results["trust"] = {"total": trust_total, "prefix": trust_prefix}
         print("trust twin: %d calls, libp11-kit prefix %d of %d"
               % (trust_total, *trust_prefix))
+
+        # Twin 1b: the trust backend must be ADMITTED, not only prefixed.
+        # Twin 1 passes even when starved (7 calls locally, 11 on Fedora);
+        # this loop fails only if the backend is never admitted with a
+        # substantial count across N attempts. Substantial is 100 calls:
+        # starved runs count only the closure templates (~7/~11) while
+        # healthy runs count the backend (~744 locally, ~3184 on Fedora),
+        # so any attempt at or above 100 proves admission without
+        # asserting an exact total under load. One loader-timing flake
+        # stays green; systematic starvation fails.
+        admission_totals = []
+        for attempt in range(1, 6):
+            tag = "trust-adm-try%d" % attempt
+            run_observer(
+                binary, conf, work, tag,
+                ["run", "--pause", "auto", "-o", str(work / (tag + ".json")),
+                 "--", "trust", "list", "--filter=ca-anchors"],
+            )
+            doc = json.loads((work / (tag + ".json")).read_text())
+            total, _ = doc_totals(doc)
+            admission_totals.append(total)
+            print("trust admission try%d: %d calls%s" % (
+                attempt, total,
+                " %s" % race_flags(doc) if race_flags(doc) else "",
+            ))
+        best = max(admission_totals)
+        require(best >= 100,
+                "trust backend never admitted in 5 attempts: %r"
+                % (admission_totals,))
+        results["trust_admission"] = {"attempts": admission_totals, "best": best}
+        print("trust admission twin: best of 5 is %d calls" % best)
 
         # Twin 2: the remote workload excluded to 0, never silent. No
         # --module: discovery stays automatic and the exclusion removes

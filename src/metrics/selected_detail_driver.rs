@@ -6379,14 +6379,18 @@ mod tests {
     }
 
     #[test]
-    fn k0_exec_at_or_before_selection_stamp_ignored() {
-        // An exec stamped at or before the selection read's monotonic
-        // stamp is outside the window and is ignored: the child's own
-        // startup exec happens before the window opens. Only a later
-        // exec voids.
+    fn k0_exec_before_selection_stamp_ignored() {
+        // The selection stamp is the selection read's start (window
+        // 10→20 here): the read stamps `started` before any bank access
+        // and `finished` after it, so an exec between the selected
+        // slot's read and the read's end could mix old- and new-image
+        // calls. Only an exec strictly before the start is outside the
+        // window (the owned child's startup exec); a tie at the start,
+        // an exec inside the read and any later exec void.
         for (label, hook_ts, expect_void) in [
-            ("before", 15, false),
-            ("at", 20, false),
+            ("before", 9, false),
+            ("at-start", 10, true),
+            ("inside", 15, true),
             ("after", 21, true),
         ] {
             let pool = test_pool();
@@ -6450,12 +6454,15 @@ mod tests {
     }
 
     #[test]
-    fn k0_tail_exec_at_or_before_selection_stamp_ignored() {
-        // A tail EXEC stamped at or before the selection read is outside
-        // the window and is ignored. Only a later tail EXEC voids.
+    fn k0_tail_exec_before_selection_stamp_ignored() {
+        // A tail EXEC stamped strictly before the selection read's start
+        // (window 10→20 here) is outside the window and is ignored. A
+        // tie at the start, an EXEC inside the read and any later tail
+        // EXEC void.
         for (label, hook_ts, expect_void) in [
-            ("before", 15, false),
-            ("at", 20, false),
+            ("before", 9, false),
+            ("at-start", 10, true),
+            ("inside", 15, true),
             ("after", 21, true),
         ] {
             let pool = test_pool();

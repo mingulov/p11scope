@@ -4027,3 +4027,37 @@ fn object_journal_end_writer_refuses_unknown_flags_without_writing() {
         }
     }
 }
+
+/// Journal READY writer: the production journal object carries the READY
+/// exec writer (`p11_instance_exec_birth`) beside the DIRTY gap writer and
+/// the control map, so a post-closure exec in an opted-in
+/// `--key-operations` session publishes READY. The exec root stays.
+#[test]
+fn object_journal_exec_birth_present_in_journal_object() {
+    if !expected_journal_selected() {
+        eprintln!(
+            "journal not selected in this build (P11SCOPE_JOURNAL=0, or a SMALL, WIDE, \
+             unsafe, proof or counter build): no journal ELF to check"
+        );
+        return;
+    }
+    let object =
+        aya_obj::Object::parse(p11scope::EBPF_JOURNAL_OBJECT).expect("parse journal object");
+    for global in ["p11_instance_exec_birth", "p11_instance_scope_gap"] {
+        assert!(
+            object
+                .functions
+                .values()
+                .any(|function| function.name == global),
+            "the journal object must carry {global} for opted-in births"
+        );
+    }
+    assert!(
+        object.maps.contains_key("JOURNAL_MARKER_CTL"),
+        "the journal object must carry the marker control map"
+    );
+    assert!(
+        object.programs.contains_key("sched_process_exec"),
+        "the journal object must retain its exec root"
+    );
+}

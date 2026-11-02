@@ -154,6 +154,9 @@ attach::instance_tests::privileged_journal_marker_nonleader_exec_creates_fresh_r
 attach::instance_tests::privileged_journal_marker_ordinary_capture_mints_no_birth
 attach::instance_tests::privileged_journal_marker_pid_outsider_stays_unobserved
 attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties
+# Journal READY cell: post-closure exec publishes READY in a journal-object
+# session; on builds that omit the journal it asserts the finite refusal.
+attach::instance_tests::privileged_journal_ready_exec_after_closure_publishes_ready
 # H6 observer mapping interactions: owned idle target and genuine external
 # mutation control; distinguish ordinary scans from System identity anchors.
 attach::instance_tests::privileged_inventory_worker_scan_preserves_watched_instance

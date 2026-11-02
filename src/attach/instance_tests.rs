@@ -341,6 +341,92 @@ impl Harness {
         Self::start_with_scope(plan, scope, pins, BackendSelection::Singles)
     }
 
+    /// Journal-object twin of [`Harness::start`]: the same plan, PID scope
+    /// and checks, but the Session loads the production journal object
+    /// (the `--key-operations` lane) instead of Detailed. Refuses with the
+    /// finite build reason when this build omits the journal. Row reads
+    /// only; the journal roots emit linked records, not Detailed events,
+    /// so call pumping stays with the ordinary harness.
+    fn start_journal(plan: &AttachPlan, pid: u32, pins: &PinnedObjects) -> Result<Self> {
+        Self::start_journal_with_scope(plan, &Scope::Pid(pid), pins)
+    }
+
+    /// Cgroup-scoped twin of [`Harness::start_journal`].
+    fn start_journal_cgroup(
+        plan: &AttachPlan,
+        scope: &Scope,
+        pins: &PinnedObjects,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(scope, Scope::Cgroup { .. }),
+            "start_journal_cgroup needs a cgroup scope"
+        );
+        Self::start_journal_with_scope(plan, scope, pins)
+    }
+
+    fn start_journal_with_scope(
+        plan: &AttachPlan,
+        scope: &Scope,
+        pins: &PinnedObjects,
+    ) -> Result<Self> {
+        let spec = super::journal::JournalSpec;
+        spec.prepare().map_err(anyhow::Error::msg)?;
+        let session = Session::start_with_selected(
+            plan,
+            scope,
+            pins,
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            BackendSelection::Singles,
+            None,
+            None,
+            Some(&spec),
+            false,
+            super::require_multi_capable_host(),
+            || crate::uretprobe_hazard::admit(None, false),
+        )?;
+        ensure!(
+            session.attach_failures().is_empty(),
+            "attach failures: {:?}",
+            session.attach_failures()
+        );
+        let tracking = session.instance_tracking();
+        ensure!(
+            tracking.refused().is_none(),
+            "instance tracking refused: {:?}",
+            tracking.refused()
+        );
+        let object = plan.slots[0].object;
+        let watched = tracking
+            .watched(object)
+            .with_context(|| format!("not watched: {:?}", tracking.watch_refusal(object)))?
+            .clone();
+        let offsets = plan
+            .slots
+            .iter()
+            .map(|slot| (slot.index, slot.file_offset))
+            .collect();
+        let capture = SemanticCapture::new(&session, TickLimits::default())?;
+        Ok(Self {
+            session,
+            capture,
+            file_slot: watched.file_slot,
+
+            offsets,
+
+            routed: Vec::new(),
+            images: Vec::new(),
+            retired_images: Vec::new(),
+            retired_instances: Vec::new(),
+            retired_tasks: Vec::new(),
+            misses: 0,
+            scan: ScanStats::default(),
+            events: 0,
+        })
+    }
+
     fn start_with_scope(
         plan: &AttachPlan,
         scope: &Scope,
@@ -4131,6 +4217,147 @@ fn privileged_journal_marker_ordinary_capture_mints_no_birth() -> Result<()> {
     ensure!(harness.false_joins().is_empty());
     ensure!(counters.faults == 0 && harness.misses == 0);
     ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
+/// Journal READY writer: in a `--key-operations` (journal-object) session,
+/// an exec before closure publishes nothing (healthy twin: the pre-closure
+/// exec stays unborn with word 0 and no admission); the first exec after
+/// the mint publishes READY with the minted generation and one admission,
+/// so the exec-born candidate is born instead of refusing with
+/// `joint_birth_native_MarkerNotReady`. A DIRTY word stays DIRTY across a
+/// later in-scope exec (failure twin, cgroup phase). On builds that omit
+/// the journal the cell asserts the finite refusal instead.
+#[test]
+#[ignore = "privileged: journal READY exec after closure publishes READY"]
+fn privileged_journal_ready_exec_after_closure_publishes_ready() -> Result<()> {
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        ensure!(
+            crate::EBPF_JOURNAL_OBJECT.is_empty(),
+            "an omitted build must embed no journal bytes"
+        );
+        let spec = super::journal::JournalSpec;
+        let error = spec
+            .prepare()
+            .err()
+            .context("the omitted build refuses journal preparation")?;
+        ensure!(
+            format!("{error:#}").contains("journal-pair-unavailable-in-build"),
+            "the omitted build refuses with its finite reason: {error:#}"
+        );
+        eprintln!("JOURNAL_READY journal=inapplicable");
+        return Ok(());
+    }
+    // Phase 1 (PID scope): a pre-closure exec stays unborn; the first
+    // post-closure exec publishes READY with the minted generation.
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let harness = Harness::start_journal(&plan, pid, &pins)?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == 0,
+        "a fresh journal session must not have minted a closure"
+    );
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let pre = proc_record_of(&harness, &target)?;
+    ensure!(
+        marker_word_of(&pre) == 0,
+        "a pre-closure exec must leave word 0 or no row: {}",
+        marker_summary(&pre)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 0 && control.failed == 0,
+        "a pre-closure exec must spend nothing: {control:?}"
+    );
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    ensure!(
+        harness.session.instance_maps().attach_cell()? == minted,
+        "the mint must land in the attach cell"
+    );
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "a post-closure journal exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "one exec, one admission: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "JOURNAL_READY exec={exec} minted={minted} control={control:?} counters={counters:?}"
+    );
+    ensure!(counters.faults == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    drop(harness);
+    // Phase 2 (cgroup scope): DIRTY stays DIRTY across an in-scope exec.
+    let CmdSetup {
+        _directory: _directory2,
+        provider: provider2,
+        target: mut target2,
+    } = spawn_cmd_target()?;
+    let pid2 = target2.pid();
+    let home = current_cgroup(pid2)?;
+    let group = MarkerCgroup::create("journal-ready-dirty")?;
+    group.move_in(pid2)?;
+    let scope = crate::scope::cgroup(&group.path)?;
+    let (_view2, pins2, plan2, _key2) = pin_and_plan(pid2, &provider2, &["C_GetSlotInfo"])?;
+    let harness2 = Harness::start_journal_cgroup(&plan2, &scope, &pins2)?;
+    let minted2 = harness2.session.instance_maps().mint_attach_generation()?;
+    let ready = target2.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness2, &target2)?;
+    let _exec2 = ready_exec_of(&row, "the in-scope journal exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted2),
+        "READY must name the minted closure: {} minted {minted2}",
+        marker_summary(&row)
+    );
+    move_process_to(pid2, &home)?;
+    target2.command(b'c')?;
+    let dirtied = proc_record_of(&harness2, &target2)?;
+    ensure!(
+        marker_word_of(&dirtied) == journal_marker::MARKER_DIRTY,
+        "an out-of-cgroup call must dirty: {}",
+        marker_summary(&dirtied)
+    );
+    let control = admission_of(&harness2)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "dirtying READY charges nothing: {control:?}"
+    );
+    group.move_in(pid2)?;
+    let ready = target2.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let kept = proc_record_of(&harness2, &target2)?;
+    ensure!(
+        marker_word_of(&kept) == journal_marker::MARKER_DIRTY,
+        "an in-scope exec must not clear DIRTY: {}",
+        marker_summary(&kept)
+    );
+    let control = admission_of(&harness2)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "a DIRTY exec spends nothing: {control:?}"
+    );
+    let counters = harness2.session.instance_maps().counters()?;
+    eprintln!("JOURNAL_READY_DIRTY minted={minted2} control={control:?} counters={counters:?}");
+    ensure!(counters.faults == 0);
+    ensure!(harness2.session.instance_maps().sticky()? == 0);
+    drop(harness2);
+    move_process_to(pid2, &home)?;
+    std::fs::remove_dir(&group.path).context("owned cgroup cleanup")?;
     Ok(())
 }
 

@@ -280,6 +280,12 @@
     },
     {
       "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_ready_exec_after_closure_publishes_ready",
+      "reason": "privileged: journal READY exec after closure publishes READY",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_inventory_worker_scan_preserves_watched_instance",
       "reason": "privileged: loads BPF, attaches fentry hooks and uprobes",
       "cell": "privileged"

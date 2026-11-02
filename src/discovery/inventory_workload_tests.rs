@@ -3037,6 +3037,8 @@ mod c1b {
             skipped: Vec::new(),
             notes: Vec::new(),
             explanation: None,
+            excluded: Vec::new(),
+            exclude_inputs: Vec::new(),
             stage_timings: crate::timing::StageTimings::new(),
         }
     }

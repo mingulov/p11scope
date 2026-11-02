@@ -1095,6 +1095,14 @@ pub(crate) struct Catalog {
     pub skipped: Vec<PidGap>,
     pub notes: Vec<PidGap>,
     pub explanation: Option<String>,
+    /// Files skipped by `--exclude-module` during this collection, one
+    /// record per (file, process). Consumers aggregate and report these;
+    /// an exclusion that matched nothing is reported from the inputs.
+    pub excluded: Vec<crate::discovery::scan::ExcludedRecord>,
+    /// The `--exclude-module` inputs this collection ran with, drained
+    /// from the same pass budget as `excluded`. Renderers report inputs
+    /// that matched nothing from these, never silently.
+    pub exclude_inputs: Vec<PathBuf>,
     /// Per-stage wall time of this collection (sweep, select, deep scan,
     /// confirm, assemble): the system-scale cost measurement. Never
     /// rendered in the catalog document; `P11SCOPE_STAGE_TIMINGS=1` prints
@@ -1974,6 +1982,10 @@ fn assemble(
     policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
 ) -> Catalog {
+    // `--exclude-module` records ride the pass budget, which `Collection`
+    // owns end to end; drain them before the moves below consume it.
+    let excluded = collection.budget.excluded().to_vec();
+    let exclude_inputs = collection.budget.excludes().to_vec();
     let Bound {
         aggregate,
         reconciled,
@@ -2441,6 +2453,8 @@ fn assemble(
         skipped,
         notes,
         explanation,
+        excluded,
+        exclude_inputs,
         stage_timings: StageTimings::new(),
     }
 }
@@ -2772,6 +2786,17 @@ fn render_json(catalog: &Catalog) -> serde_json::Value {
     if let Some(explanation) = &catalog.explanation {
         document["explanation"] = serde_json::Value::String(explanation.clone());
     }
+    // Additive (v0.6.0): files skipped by `--exclude-module`, a declared
+    // operator choice, never a loss. Omitted when empty.
+    let (excluded_modules, unmatched_excludes) =
+        crate::render::aggregate_excluded(&catalog.excluded, &catalog.exclude_inputs);
+    if !excluded_modules.is_empty() {
+        document["excluded_modules"] = serde_json::to_value(&excluded_modules).unwrap_or_default();
+    }
+    if !unmatched_excludes.is_empty() {
+        document["unmatched_excludes"] =
+            serde_json::to_value(&unmatched_excludes).unwrap_or_default();
+    }
     document
 }
 
@@ -2951,6 +2976,7 @@ fn render_text(catalog: &Catalog) -> String {
     render_process_summary(&mut out, catalog);
     render_gaps(&mut out, "skipped", &catalog.skipped);
     render_gaps(&mut out, "notes", &catalog.notes);
+    render_excluded(&mut out, catalog);
     if let Some(explanation) = &catalog.explanation {
         let _ = writeln!(out, "{explanation}");
     }
@@ -3194,6 +3220,39 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap]) {
                 );
             }
         }
+    }
+}
+
+/// Files skipped by `--exclude-module`, never silent: each with its path,
+/// identity, and mapping process count, plus any inputs that matched
+/// nothing. Same wording as `inspect --pid` and inventory.
+fn render_excluded(out: &mut String, catalog: &Catalog) {
+    let (excluded, unmatched) =
+        crate::render::aggregate_excluded(&catalog.excluded, &catalog.exclude_inputs);
+    if !excluded.is_empty() {
+        let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
+        for item in &excluded {
+            let _ = writeln!(
+                out,
+                "  {}: excluded by you (device {} inode {}, {} processes mapped it); calls into this file were not observed",
+                crate::render::escape_controls(&item.path),
+                item.dev,
+                item.ino,
+                item.processes
+            );
+        }
+    }
+    if !unmatched.is_empty() {
+        let _ = writeln!(
+            out,
+            "Unmatched exclusions ({}): {}",
+            unmatched.len(),
+            unmatched
+                .iter()
+                .map(|input| crate::render::escape_controls(input))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 }
 
@@ -5904,9 +5963,51 @@ mod tests {
             },
             skipped: Vec::new(),
             notes: Vec::new(),
+            excluded: Vec::new(),
+            exclude_inputs: Vec::new(),
             explanation: None,
             stage_timings: StageTimings::new(),
         }
+    }
+
+    #[test]
+    fn system_catalog_reports_excluded_files_and_unmatched_inputs() {
+        let mut catalog = catalog_with(Vec::new());
+        catalog.excluded = vec![crate::discovery::scan::ExcludedRecord {
+            pid: 100,
+            path: "/opt/libp11-kit.so.0.4.8".into(),
+            dev: 42,
+            ino: 1001,
+            via: PathBuf::from("libp11-kit.so.0"),
+        }];
+        catalog.exclude_inputs = vec![
+            PathBuf::from("libp11-kit.so.0"),
+            PathBuf::from("libnothing.so"),
+        ];
+        let text = render_text(&catalog);
+        assert!(text.contains("Excluded by you (1 files):"), "{text}");
+        assert!(
+            text.contains(
+                "/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 1 processes mapped it)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Unmatched exclusions (1): libnothing.so"),
+            "{text}"
+        );
+        let document = render_json(&catalog);
+        assert_eq!(
+            document["excluded_modules"][0]["path"],
+            "/opt/libp11-kit.so.0.4.8"
+        );
+        assert_eq!(document["excluded_modules"][0]["processes"], 1);
+        assert_eq!(document["unmatched_excludes"][0], "libnothing.so");
+        // Silent when no exclusions ran: no empty sections.
+        let bare = catalog_with(Vec::new());
+        assert!(!render_text(&bare).contains("Excluded by you"));
+        assert!(render_json(&bare).get("excluded_modules").is_none());
+        assert!(render_json(&bare).get("unmatched_excludes").is_none());
     }
 
     mod c1b {

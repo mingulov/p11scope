@@ -4275,10 +4275,13 @@ fn task4_record_registration(
     // optionally (`InstanceTracking::start`); the census classifies their
     // links as an `instance` role and cross-checks the kernel-observed
     // count against the userspace-retained hook count, so a leaked or
-    // missing hook trips the census in either direction.
-    let instance: BTreeMap<_, _> = crate::attach::INSTANCE_PROGRAMS
+    // missing hook trips the census in either direction. The session's
+    // active set selects the exec-release variant for this kernel.
+    let instance: BTreeMap<_, _> = session
+        .instance
+        .active_program_names()
         .into_iter()
-        .map(|(name, _)| -> Result<_> {
+        .map(|name| -> Result<_> {
             Ok((session.ebpf.program(name).context(name)?.info()?.id(), name))
         })
         .collect::<Result<_>>()?;
@@ -4418,9 +4421,10 @@ fn task4_record_registration(
     // Hook attach is all-or-nothing (`InstanceTracking::start` detaches
     // every hook when any attach fails), so an attached session shows all
     // four instance programs exactly once; a refused session shows none.
-    let expected_instance: BTreeSet<_> = crate::attach::INSTANCE_PROGRAMS
-        .iter()
-        .map(|(name, _)| *name)
+    let expected_instance: BTreeSet<_> = session
+        .instance
+        .active_program_names()
+        .into_iter()
         .collect();
     ensure!(
         role_counts == [n, n, instance_expected]
@@ -4537,10 +4541,30 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
         let mut role_counts = [0usize; 3];
         let mut lifecycle = BTreeMap::new();
         let mut instance = BTreeMap::new();
-        let instance_names: BTreeSet<_> = crate::attach::INSTANCE_PROGRAMS
+        // The replay carries no kernel release, so it accepts exactly one of
+        // the four complete hook sets (one program per variant slot).
+        let hook_set = |copy, exec| {
+            crate::attach::active_instance_programs(crate::attach::HookTargets { copy, exec })
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<BTreeSet<_>>()
+        };
+        let legacy_names: BTreeSet<_> = crate::attach::INSTANCE_PROGRAMS
             .iter()
             .map(|(name, _)| *name)
             .collect();
+        let mmap_names = hook_set(
+            crate::attach::CopyVmaTarget::Legacy,
+            crate::attach::ExecReleaseTarget::ExecMmap,
+        );
+        let ret_names = hook_set(
+            crate::attach::CopyVmaTarget::FuncRet,
+            crate::attach::ExecReleaseTarget::ExecMmRelease,
+        );
+        let ret_mmap_names = hook_set(
+            crate::attach::CopyVmaTarget::FuncRet,
+            crate::attach::ExecReleaseTarget::ExecMmap,
+        );
         for (position, row) in kernel_rows.iter().enumerate() {
             let id = row["link_id"].as_u64().context("kernel link ID")?;
             let program_id = row["program_id"].as_u64().context("kernel program ID")?;
@@ -4552,7 +4576,11 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
                 ("entry", "p11_entry")
             } else {
                 let name = row["program"].as_str().context("non-static program")?;
-                if instance_names.contains(name) {
+                if legacy_names.contains(name)
+                    || mmap_names.contains(name)
+                    || ret_names.contains(name)
+                    || ret_mmap_names.contains(name)
+                {
                     ensure!(instance.insert(name, program_id).is_none());
                     role_counts[2] += 1;
                     ("instance", name)
@@ -4587,9 +4615,10 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
             );
         }
         // Hook attach is all-or-nothing, so a group carries zero or four
-        // instance rows naming the full hook set exactly once; the kernel
+        // instance rows naming one full hook set exactly once; the kernel
         // tail length is exact, never a lower bound.
         let instance_count = role_counts[2];
+        let observed_instance: BTreeSet<_> = instance.keys().copied().collect();
         ensure!(
             role_counts[0] == n
                 && role_counts[1] == n
@@ -4598,7 +4627,10 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
                     == BTreeSet::from(["sched_process_exec", "sched_process_exit", "task_newtask"])
                 && (instance_count == 0 || instance_count == 4)
                 && (instance_count == 0
-                    || instance.keys().copied().collect::<BTreeSet<_>>() == instance_names)
+                    || observed_instance == legacy_names
+                    || observed_instance == mmap_names
+                    || observed_instance == ret_names
+                    || observed_instance == ret_mmap_names)
         );
         let group_programs: BTreeSet<_> = program_ids
             .values()
@@ -4872,6 +4904,45 @@ fn task4_detailed_registration_accepts_instance_tail_and_rejects_mistakes() -> R
     let mut changed = identity.clone();
     changed[hooked.len()]["session_generation"] = serde_json::json!(1);
     assert!(task4_replay_registration(&encode(&changed)?, &offsets, "second_attached").is_err());
+    // The 7.3+ hook set swaps only the exec-release program: accepted.
+    let mut mmap = hooked.clone();
+    mmap[14]["program"] = serde_json::json!("p11_image_mmap_release");
+    task4_replay_registration(&encode(&mmap)?, &offsets, "attached")?;
+    // Both variants at once (five rows): rejected.
+    let mut both = mmap.clone();
+    let mut extra = mmap[14].clone();
+    extra["program"] = serde_json::json!("p11_image_exec_release");
+    extra["position"] = serde_json::json!(both.len());
+    extra["link_id"] = serde_json::json!(both.len() as u64 + 100);
+    extra["program_id"] = serde_json::json!(both.len() as u64 + 21);
+    both.push(extra);
+    assert!(task4_replay_registration(&encode(&both)?, &offsets, "attached").is_err());
+    // Four rows mixing both variants for a stable hook: rejected.
+    let mut mixed = hooked.clone();
+    mixed[11]["program"] = serde_json::json!("p11_image_mmap_release");
+    assert!(task4_replay_registration(&encode(&mixed)?, &offsets, "attached").is_err());
+    // The ret copy set swaps only the copy program: accepted, alone and
+    // with the 7.3+ exec-release program.
+    for exec in ["p11_image_exec_release", "p11_image_mmap_release"] {
+        let mut ret = hooked.clone();
+        ret[13]["program"] = serde_json::json!("p11_inst_vma_retcopy");
+        ret[14]["program"] = serde_json::json!(exec);
+        task4_replay_registration(&encode(&ret)?, &offsets, "attached")?;
+    }
+    // Both copy variants at once (five rows): rejected.
+    let mut both_copy = hooked.clone();
+    both_copy[13]["program"] = serde_json::json!("p11_inst_vma_retcopy");
+    let mut extra_copy = hooked[13].clone();
+    extra_copy["program"] = serde_json::json!("p11_inst_vma_copy");
+    extra_copy["position"] = serde_json::json!(both_copy.len());
+    extra_copy["link_id"] = serde_json::json!(both_copy.len() as u64 + 100);
+    extra_copy["program_id"] = serde_json::json!(both_copy.len() as u64 + 21);
+    both_copy.push(extra_copy);
+    assert!(task4_replay_registration(&encode(&both_copy)?, &offsets, "attached").is_err());
+    // Four rows with an exec variant in the copy slot: rejected.
+    let mut mixed_copy = hooked.clone();
+    mixed_copy[13]["program"] = serde_json::json!("p11_image_mmap_release");
+    assert!(task4_replay_registration(&encode(&mixed_copy)?, &offsets, "attached").is_err());
     Ok(())
 }
 

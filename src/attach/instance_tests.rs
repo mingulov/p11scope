@@ -272,15 +272,18 @@ fn enable_bpf_stats() -> Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
 }
 
-fn hook_runs(harness: &Harness, program: &str) -> Result<u64> {
-    Ok(harness
-        .session
-        .instance_hook_stats()?
-        .iter()
-        .find(|(name, _)| *name == program)
-        .with_context(|| format!("hook {program}"))?
-        .1
-        .run_cnt)
+/// Run count of the resolved `copy_vma` hook: exactly one of the two slots
+/// is active (fixed-slot through the 5-argument shape, `bpf_get_func_ret`
+/// on the 6/7-argument shapes), and the wrong slot must never fire.
+fn copy_hook_runs(harness: &Harness) -> Result<u64> {
+    let mut runs = None;
+    for (name, stats) in harness.session.instance_hook_stats()? {
+        if name == "p11_inst_vma_copy" || name == super::COPY_VMA_RET_PROGRAM {
+            ensure!(runs.is_none(), "both copy_vma hooks are active");
+            runs = Some(stats.run_cnt);
+        }
+    }
+    runs.context("neither copy_vma hook is active")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2067,9 +2070,9 @@ fn privileged_instance_routing_separates_reload_sibling_and_mutation() -> Result
     let c = single_join(&pump_until(&mut harness, &target, 1)?)?;
     ensure!(c != b, "extra provider mapping kept the instance");
     // mremap of a provider mapping reaches the copy_vma fexit hook.
-    let copies = hook_runs(&harness, "p11_inst_vma_copy")?;
+    let copies = copy_hook_runs(&harness)?;
     target.command(b'M')?;
-    let copied = hook_runs(&harness, "p11_inst_vma_copy")? - copies;
+    let copied = copy_hook_runs(&harness)? - copies;
     ensure!(copied >= 1, "mremap did not reach the copy_vma hook");
     target.command(b'c')?;
     let moved = single_join(&pump_until(&mut harness, &target, 1)?)?;
@@ -2736,10 +2739,10 @@ fn privileged_instance_mremap_dontunmap_keeps_both_and_renews() -> Result<()> {
     target.command(b'p')?;
     let b = call(&mut harness, &mut target)?;
     ensure!(b != a, "extra provider mapping kept the instance");
-    let copies = hook_runs(&harness, "p11_inst_vma_copy")?;
+    let copies = copy_hook_runs(&harness)?;
     let moved = target.command(b'U')?;
     ensure!(moved == "PUREMOVE", "DONTUNMAP dropped a mapping: {moved}");
-    let copied = hook_runs(&harness, "p11_inst_vma_copy")? - copies;
+    let copied = copy_hook_runs(&harness)? - copies;
     ensure!(
         copied >= 1,
         "DONTUNMAP move did not reach the copy_vma hook"

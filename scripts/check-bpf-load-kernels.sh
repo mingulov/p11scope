@@ -8,7 +8,7 @@
 # OBSERVER is the prebuilt observer under test, PROBE the verifier-stats
 # probe built by `measure-verifier-headroom.py build`, OUTDIR a directory
 # under /home/user/.cache/p11scope-vng/<tag>/ shared with the guests.
-# Default kernels: v6.6.157 v6.12.111 v6.18.58.
+# Default kernels: v6.6.157 v6.12.111 v6.18.58 v7.3.1.
 # --budgets defaults to the checked-in tests/bpf-verifier-budgets.json
 # when that file exists, so a budgeted program with no probe row FAILs
 # without any flag. --counter-budgets defaults to the checked-in
@@ -116,7 +116,7 @@ PROBE=$2
 OUTDIR=$3
 shift 3
 if [ $# -eq 0 ]; then
-    set -- v6.6.157 v6.12.111 v6.18.58
+    set -- v6.6.157 v6.12.111 v6.18.58 v7.3.1
 fi
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPORT="$SCRIPT_DIR/bpf-load-report.py"

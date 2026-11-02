@@ -289,6 +289,17 @@ static long probe(void *dst, u32 size, const void *src)
 static u64 tgid(void) { return pid_tgid; }
 static void *task(void) { return current_task; }
 
+/* Scripted bpf_get_func_ret: the ret-based copy hook reads the created
+ * VMA through the helper on any arity, never a fixed slot. */
+static u64 func_ret_value;
+static unsigned func_ret_calls;
+static u64 func_ret(void *ctx)
+{
+    (void)ctx;
+    func_ret_calls++;
+    return func_ret_value;
+}
+
 static void reset(void)
 {
     memset(g_epoch, 0, sizeof(g_epoch));
@@ -333,6 +344,8 @@ static void reset(void)
     image_entry_ok = 1;
     stop_gate_cell = 0;
     root_calls = scope_calls = identity_calls = emit_calls = 0;
+    func_ret_value = 0;
+    func_ret_calls = 0;
 }
 
 static void map_hook(struct vm_area_struct___p11inst *v)
@@ -352,6 +365,15 @@ static void copy_hook(struct vm_area_struct___p11inst *created)
     /* fexit context: five arguments, then the returned new VMA. */
     u64 ctx[6] = { 0xdead, 1, 2, 3, 4, (u64)(unsigned long)created };
     assert(p11_inst_vma_copy(ctx) == 0);
+}
+
+static void copy_ret_hook(struct vm_area_struct___p11inst *created)
+{
+    /* The ret-based hook ignores every fixed slot: the created VMA
+     * arrives through the scripted helper, whatever the arity. */
+    u64 ctx[8] = { 0xdead, 1, 2, 3, 4, 5, 6, 7 };
+    func_ret_value = (u64)(unsigned long)created;
+    assert(p11_inst_vma_retcopy(ctx) == 0);
 }
 
 /* The stamp as the return half writes it into a reserved record tail. */
@@ -848,6 +870,7 @@ int main(int argc, char **argv)
     inst_probe_read_kernel = probe;
     inst_storage_get = storage;
     inst_current_task = task;
+    inst_get_func_ret = func_ret;
     leader.group_leader = &leader;
     leader.mm = &mm;
     if (argc != 1) {
@@ -890,6 +913,19 @@ int main(int argc, char **argv)
     assert(records[0].epoch[0] == 3 && counters.local_bumps == 3 && counters.watched_hits == 3);
     copy_hook(0); /* copy_vma failed: nothing was created */
     assert(records[0].epoch[0] == 3 && counters.watched_hits == 3);
+    assert(!g_epoch[5] && !gen[INST_GEN_FAULT]);
+
+    /* The ret-based copy hook notes the helper-returned VMA exactly like
+     * the fixed-slot hook, reading no fixed slot (all slots are junk). */
+    reset();
+    map_hook(&vma);
+    copy_ret_hook(&vma);
+    assert(func_ret_calls == 1);
+    assert(records[0].slot_plus1[0] == 6 && records[0].epoch[0] == 2);
+    assert(counters.local_bumps == 2 && counters.watched_hits == 2);
+    copy_ret_hook(0); /* copy_vma failed: nothing was created */
+    assert(func_ret_calls == 2);
+    assert(records[0].epoch[0] == 2 && counters.watched_hits == 2);
     assert(!g_epoch[5] && !gen[INST_GEN_FAULT]);
 
     /* Teardown (mm_users == 0): skipped, never a bump. */

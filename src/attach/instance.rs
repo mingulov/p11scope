@@ -2,7 +2,10 @@
 //! Task 3 Stage A: the Session side of the load-instance continuity witness.
 //!
 //! - Loads the four native continuity hooks (`uprobe_mmap`, `uprobe_munmap`,
-//!   `copy_vma`, `exec_mm_release`) before deferred policy freezes, and attaches
+//!   `copy_vma` (fixed-slot through the 5-argument shape, `bpf_get_func_ret`
+//!   on the 6/7-argument shapes), and the exec-release hook:
+//!   `exec_mm_release` through 7.2, `exec_mmap` from 7.3) before deferred
+//!   policy freezes, and attaches
 //!   them after all freezes and mandatory lifecycle links. Any
 //!   load or attach failure leaves the capture running with instance routing
 //!   **refused** and a named reason; it never degrades the proof. An LTO
@@ -51,36 +54,135 @@ pub(crate) const INSTANCE_PROGRAMS: [(&str, &str); 4] = [
 ];
 
 /// Hooks attached as fexit; every other instance hook is fentry.
-const EXIT_PROGRAMS: [&str; 1] = ["p11_inst_vma_copy"];
+const EXIT_PROGRAMS: [&str; 3] = [
+    "p11_inst_vma_copy",
+    COPY_VMA_RET_PROGRAM,
+    EXEC_RELEASE_MMAP_PROGRAM,
+];
+
+/// The 7.3+ exec-release hook program and its kernel attach target. Kernels
+/// through 7.2 carry `exec_mm_release`; 7.3 removed it, merging exit and exec
+/// release into `mm_exit_exec_release`. That merged function also fires on
+/// thread exit, where poisoning live continuity would be wrong, so newer
+/// kernels hook the success-gated `exec_mmap` exit instead.
+pub(crate) const EXEC_RELEASE_MMAP_PROGRAM: &str = "p11_image_mmap_release";
+const EXEC_RELEASE_MMAP_TARGET: &str = "exec_mmap";
+
+/// Which kernel hook carries exec-release invalidation on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecReleaseTarget {
+    ExecMmRelease,
+    ExecMmap,
+}
+
+/// The 6/7-argument `copy_vma` hook program. Kernels through the 5-argument
+/// shape keep `p11_inst_vma_copy`, which reads the returned new VMA from
+/// the fixed fexit slot; newer kernels (6.18.58+ backports, 7.3+) pass
+/// more arguments, so the return slot moves and the hook reads it through
+/// `bpf_get_func_ret` instead.
+pub(crate) const COPY_VMA_RET_PROGRAM: &str = "p11_inst_vma_retcopy";
+
+/// Which `copy_vma` prototype the host kernel carries: the 5-argument
+/// legacy shape or the 6/7-argument extended shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyVmaTarget {
+    Legacy,
+    FuncRet,
+}
+
+/// The resolved kernel hook set: one `copy_vma` slot, one exec-release slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HookTargets {
+    pub(crate) copy: CopyVmaTarget,
+    pub(crate) exec: ExecReleaseTarget,
+}
+
+/// The four instance-hook (program, target) triples for resolved targets.
+/// The legacy set is [`INSTANCE_PROGRAMS`]; each variant slot swaps only
+/// its own program, so four sets exist (two slots of two).
+pub(crate) fn active_instance_programs(targets: HookTargets) -> [(&'static str, &'static str); 4] {
+    let copy = match targets.copy {
+        CopyVmaTarget::Legacy => INSTANCE_PROGRAMS[2],
+        CopyVmaTarget::FuncRet => (COPY_VMA_RET_PROGRAM, "copy_vma"),
+    };
+    let exec = match targets.exec {
+        ExecReleaseTarget::ExecMmRelease => INSTANCE_PROGRAMS[3],
+        ExecReleaseTarget::ExecMmap => (EXEC_RELEASE_MMAP_PROGRAM, EXEC_RELEASE_MMAP_TARGET),
+    };
+    [INSTANCE_PROGRAMS[0], INSTANCE_PROGRAMS[1], copy, exec]
+}
+
+/// Resolve the exec-release hook from the host BTF: the exact legacy
+/// prototype wins when present, keeping older kernels byte-identical;
+/// otherwise the exact exec_mmap shape selects the 7.3+ hook. Kernels
+/// with neither refuse with the legacy message.
+fn resolve_exec_release_target(
+    host: &super::host_btf::HostBtf,
+    btf: &Btf,
+) -> Result<ExecReleaseTarget> {
+    let raw = host
+        .original_bytes_for(btf)
+        .context("instance hook BTF differs from cached host BTF")?;
+    if exec_release_proto_is_exact(raw) {
+        return Ok(ExecReleaseTarget::ExecMmRelease);
+    }
+    if exec_mmap_proto_is_exact(raw) {
+        return Ok(ExecReleaseTarget::ExecMmap);
+    }
+    validate_exec_release_proto(host, btf)?;
+    unreachable!("the legacy probe failed above, so this validation cannot succeed");
+}
+
+/// Resolve the `copy_vma` hook from the host BTF: the exact 5-argument
+/// legacy prototype keeps the fixed-slot program; the exact 6/7-argument
+/// extended shapes select the `bpf_get_func_ret` program. Anything else
+/// refuses with the named shapes.
+fn resolve_copy_vma_target(host: &super::host_btf::HostBtf, btf: &Btf) -> Result<CopyVmaTarget> {
+    let raw = host
+        .original_bytes_for(btf)
+        .context("instance hook BTF differs from cached host BTF")?;
+    if let Some(kind) = copy_vma_proto_kind(raw) {
+        return Ok(kind);
+    }
+    validate_copy_vma_proto(host, btf)?;
+    bail!(
+        "no exact copy_vma hook: copy_vma must be struct vm_area_struct *(vmap, addr, len, pgoff[, anon_pgoff], need_rmap_locks[, keep_source])"
+    );
+}
 
 /// Only the loader constructs this token. It stays inside one Session's
 /// preparation/activation path and is consumed by attachment.
 struct LoadedInstancePrograms {
     program_ids: BTreeMap<&'static str, u32>,
+    targets: HookTargets,
 }
 
 fn load_instance_programs_with<S>(
     state: &mut S,
+    targets: HookTargets,
     mut load: impl FnMut(&mut S, &'static str, &'static str) -> Result<u32>,
 ) -> Result<LoadedInstancePrograms> {
     let mut program_ids = BTreeMap::new();
-    for (program, target) in INSTANCE_PROGRAMS {
-        let id = load(state, program, target)?;
+    for (program, hook_target) in active_instance_programs(targets) {
+        let id = load(state, program, hook_target)?;
         ensure!(
             id != 0 && !program_ids.values().any(|existing| *existing == id),
             "loaded image hook program IDs unavailable or collide"
         );
         program_ids.insert(program, id);
     }
-    Ok(LoadedInstancePrograms { program_ids })
+    Ok(LoadedInstancePrograms {
+        program_ids,
+        targets,
+    })
 }
 
 fn attach_loaded_instance_programs_with<S>(
-    _loaded: LoadedInstancePrograms,
+    loaded: LoadedInstancePrograms,
     state: &mut S,
     mut attach: impl FnMut(&mut S, &'static str, &'static str) -> Result<()>,
 ) -> Result<()> {
-    for (program, target) in INSTANCE_PROGRAMS {
+    for (program, target) in active_instance_programs(loaded.targets) {
         attach(state, program, target)?;
     }
     Ok(())
@@ -176,6 +278,8 @@ pub(crate) struct HookStats {
 pub(crate) struct InstanceTracking {
     /// `None` while active; the refusal reason otherwise.
     refused: Option<String>,
+    /// The resolved hook targets; `None` until hooks attach.
+    active_targets: Option<HookTargets>,
     links: Vec<(&'static str, HookLink)>,
     watched: BTreeMap<PinnedObjectId, Result<WatchedFile, String>>,
     keys: BTreeMap<InstanceFileKey, u32>,
@@ -435,8 +539,10 @@ impl InstanceTracking {
     fn load_hooks(ebpf: &mut Ebpf, btf: &Btf) -> Result<LoadedInstancePrograms> {
         let host =
             super::host_btf::shared().context("loading required vmlinux BTF for instance hooks")?;
-        validate_exec_release_proto(host, btf)?;
-        load_instance_programs_with(ebpf, |ebpf, program, target| {
+        let exec = resolve_exec_release_target(host, btf)?;
+        let copy = resolve_copy_vma_target(host, btf)?;
+        let targets = HookTargets { copy, exec };
+        load_instance_programs_with(ebpf, targets, |ebpf, program, target| {
             let hook = ebpf
                 .program_mut(program)
                 .with_context(|| format!("program {program} missing from object"))?;
@@ -458,6 +564,7 @@ impl InstanceTracking {
     }
 
     fn attach_hooks(&mut self, ebpf: &mut Ebpf, loaded: LoadedInstancePrograms) -> Result<()> {
+        self.active_targets = Some(loaded.targets);
         attach_loaded_instance_programs_with(loaded, ebpf, |ebpf, program, target| {
             let hook = ebpf
                 .program_mut(program)
@@ -585,18 +692,28 @@ impl InstanceTracking {
         ))
     }
 
+    /// The active instance-hook program names: the legacy set until hooks
+    /// attach, the resolved set after.
+    pub(crate) fn active_program_names(&self) -> [&'static str; 4] {
+        let triples = active_instance_programs(self.active_targets.unwrap_or(HookTargets {
+            copy: CopyVmaTarget::Legacy,
+            exec: ExecReleaseTarget::ExecMmRelease,
+        }));
+        [triples[0].0, triples[1].0, triples[2].0, triples[3].0]
+    }
+
     /// The hook programs' statistics, summed. `run_time_ns`/`run_cnt` need
     /// `kernel.bpf_stats_enabled`; `recursion_misses` is always counted.
     pub(crate) fn hook_stats(&self, ebpf: &Ebpf) -> Result<Vec<(&'static str, HookStats)>> {
-        INSTANCE_PROGRAMS
-            .iter()
-            .map(|(program, _)| {
+        self.active_program_names()
+            .into_iter()
+            .map(|program| {
                 let fd = ebpf
                     .program(program)
                     .with_context(|| format!("program {program}"))?
                     .fd()
                     .with_context(|| format!("program {program} fd"))?;
-                Ok((*program, prog_stats(fd.as_fd())?))
+                Ok((program, prog_stats(fd.as_fd())?))
             })
             .collect()
     }
@@ -611,6 +728,20 @@ fn validate_exec_release_proto(host: &super::host_btf::HostBtf, btf: &Btf) -> Re
     ensure!(
         exec_release_proto_is_exact(raw),
         "exec_mm_release must be void(task_struct *, mm_struct *)"
+    );
+    Ok(())
+}
+
+/// Verify the actual `copy_vma` BTF prototype rather than accepting the
+/// function name alone: exactly one `copy_vma` with the exact 5-argument
+/// legacy or 6/7-argument extended shape.
+fn validate_copy_vma_proto(host: &super::host_btf::HostBtf, btf: &Btf) -> Result<()> {
+    let raw = host
+        .original_bytes_for(btf)
+        .context("instance hook BTF differs from cached host BTF")?;
+    ensure!(
+        copy_vma_proto_kind(raw).is_some(),
+        "no exact copy_vma hook: copy_vma must be struct vm_area_struct *(vmap, addr, len, pgoff[, anon_pgoff], need_rmap_locks[, keep_source])"
     );
     Ok(())
 }
@@ -692,6 +823,250 @@ fn exec_release_proto_is_exact(raw: &[u8]) -> bool {
         Some(pointee(word(proto, 16)?, b"task_struct")? && pointee(word(proto, 24)?, b"mm_struct")?)
     };
     checked().unwrap_or(false)
+}
+
+/// Whether the host BTF carries exactly one `exec_mmap` with the exact
+/// int(linux_binprm *) prototype the 7.3+ hook needs: one argument, so the
+/// fexit return slot is ctx[1], and an integer return, so zero means the new
+/// mm installed. Mirrors [`exec_release_proto_is_exact`]; the legacy parser
+/// is untouched so its pinned behavior cannot drift.
+fn exec_mmap_proto_is_exact(raw: &[u8]) -> bool {
+    let word = |bytes: &[u8], at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    let checked = || -> Option<bool> {
+        if raw.get(..4)? != [0x9f, 0xeb, 1, 0] {
+            return Some(false);
+        }
+        let header = word(raw, 4)? as usize;
+        if header < 24 {
+            return Some(false);
+        }
+        let type_start = header.checked_add(word(raw, 8)? as usize)?;
+        let type_end = type_start.checked_add(word(raw, 12)? as usize)?;
+        let string_start = header.checked_add(word(raw, 16)? as usize)?;
+        let string_end = string_start.checked_add(word(raw, 20)? as usize)?;
+        let types = raw.get(type_start..type_end)?;
+        let strings = raw.get(string_start..string_end)?;
+        let name = |offset: u32| -> Option<&[u8]> {
+            let tail = strings.get(offset as usize..)?;
+            Some(&tail[..tail.iter().position(|byte| *byte == 0)?])
+        };
+        let mut nodes = vec![&[][..]];
+        let mut cursor = 0usize;
+        while cursor < types.len() {
+            let record = types.get(cursor..)?;
+            let info = word(record, 4)?;
+            let kind = (info >> 24) & 31;
+            let count = (info & 65535) as usize;
+            let extra = match kind {
+                0 | 2 | 7 | 8 | 9 | 10 | 11 | 12 | 16 | 18 => 0,
+                1 | 14 | 17 => 4,
+                3 => 12,
+                4 | 5 | 15 | 19 => count.checked_mul(12)?,
+                6 | 13 => count.checked_mul(8)?,
+                _ => return Some(false),
+            };
+            let length = 12usize.checked_add(extra)?;
+            nodes.push(record.get(..length)?);
+            cursor = cursor.checked_add(length)?;
+        }
+        let resolve = |mut id: u32| -> Option<&[u8]> {
+            for _ in 0..32 {
+                let node = *nodes.get(id as usize)?;
+                let kind = (word(node, 4)? >> 24) & 31;
+                if !matches!(kind, 8 | 9 | 10 | 11 | 18) {
+                    return Some(node);
+                }
+                id = word(node, 8)?;
+            }
+            None
+        };
+        let pointee = |id: u32, wanted: &[u8]| -> Option<bool> {
+            let pointer = resolve(id)?;
+            if (word(pointer, 4)? >> 24) & 31 != 2 {
+                return Some(false);
+            }
+            let target = resolve(word(pointer, 8)?)?;
+            Some((word(target, 4)? >> 24) & 31 == 4 && name(word(target, 0)?)? == wanted)
+        };
+        let mut functions = nodes.iter().skip(1).filter(|node| {
+            word(node, 4).is_some_and(|info| (info >> 24) & 31 == 12)
+                && word(node, 0).and_then(name) == Some(b"exec_mmap".as_slice())
+        });
+        let function = functions.next()?;
+        if functions.next().is_some() {
+            return Some(false);
+        }
+        let proto = resolve(word(function, 8)?)?;
+        if word(proto, 4)? != (13 << 24 | 1) {
+            return Some(false);
+        }
+        let ret = resolve(word(proto, 8)?)?;
+        if (word(ret, 4)? >> 24) & 31 != 1 {
+            return Some(false);
+        }
+        pointee(word(proto, 16)?, b"linux_binprm")
+    };
+    checked().unwrap_or(false)
+}
+
+/// Which exact `copy_vma` prototype the host BTF carries, if any: the
+/// 5-argument legacy shape (fixed fexit slot `ctx[5]`) or the 6/7-argument
+/// extended shape (`keep_source` backported to 6.18.58+ stable heads,
+/// `anon_pgoff` from 7.3; the return slot moves, so the hook reads it
+/// through `bpf_get_func_ret`). All three spell the return as
+/// `struct vm_area_struct *`, `vmap` as a double pointer to it, the
+/// offsets as 8-byte unsigned (`pgoff_t`), `need_rmap_locks` as `bool *`
+/// and `keep_source` as `bool`. Mirrors [`exec_mmap_proto_is_exact`];
+/// the exec parsers are untouched so their pinned behavior cannot drift.
+fn copy_vma_proto_kind(raw: &[u8]) -> Option<CopyVmaTarget> {
+    let word = |bytes: &[u8], at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    let checked = || -> Option<Option<CopyVmaTarget>> {
+        if raw.get(..4)? != [0x9f, 0xeb, 1, 0] {
+            return Some(None);
+        }
+        let header = word(raw, 4)? as usize;
+        if header < 24 {
+            return Some(None);
+        }
+        let type_start = header.checked_add(word(raw, 8)? as usize)?;
+        let type_end = type_start.checked_add(word(raw, 12)? as usize)?;
+        let string_start = header.checked_add(word(raw, 16)? as usize)?;
+        let string_end = string_start.checked_add(word(raw, 20)? as usize)?;
+        let types = raw.get(type_start..type_end)?;
+        let strings = raw.get(string_start..string_end)?;
+        let name = |offset: u32| -> Option<&[u8]> {
+            let tail = strings.get(offset as usize..)?;
+            Some(&tail[..tail.iter().position(|byte| *byte == 0)?])
+        };
+        let mut nodes = vec![&[][..]];
+        let mut cursor = 0usize;
+        while cursor < types.len() {
+            let record = types.get(cursor..)?;
+            let info = word(record, 4)?;
+            let kind = (info >> 24) & 31;
+            let count = (info & 65535) as usize;
+            let extra = match kind {
+                0 | 2 | 7 | 8 | 9 | 10 | 11 | 12 | 16 | 18 => 0,
+                1 | 14 | 17 => 4,
+                3 => 12,
+                4 | 5 | 15 | 19 => count.checked_mul(12)?,
+                6 | 13 => count.checked_mul(8)?,
+                _ => return Some(None),
+            };
+            let length = 12usize.checked_add(extra)?;
+            nodes.push(record.get(..length)?);
+            cursor = cursor.checked_add(length)?;
+        }
+        let resolve = |mut id: u32| -> Option<&[u8]> {
+            for _ in 0..32 {
+                let node = *nodes.get(id as usize)?;
+                let kind = (word(node, 4)? >> 24) & 31;
+                if !matches!(kind, 8 | 9 | 10 | 11 | 18) {
+                    return Some(node);
+                }
+                id = word(node, 8)?;
+            }
+            None
+        };
+        let kind_of = |node: &[u8]| -> Option<u32> { Some((word(node, 4)? >> 24) & 31) };
+        // An 8-byte unsigned offset (`pgoff_t`): INT, no encoding, 64 bits.
+        let ulong = |id: u32| -> Option<bool> {
+            let node = resolve(id)?;
+            Some(kind_of(node)? == 1 && word(node, 8)? == 8 && word(node, 12)? == 0x0000_0040)
+        };
+        // A kernel `bool` (through the `bool` typedef or spelled `_Bool`
+        // directly): 1-byte BOOL-encoded INT, never a plain char.
+        let boolean = |id: u32| -> Option<bool> {
+            let node = resolve(id)?;
+            Some(kind_of(node)? == 1 && word(node, 8)? == 1 && word(node, 12)? == 0x0400_0008)
+        };
+        let vma_pointee = |id: u32| -> Option<bool> {
+            let pointer = resolve(id)?;
+            if kind_of(pointer)? != 2 {
+                return Some(false);
+            }
+            let target = resolve(word(pointer, 8)?)?;
+            Some(kind_of(target)? == 4 && name(word(target, 0)?)? == b"vm_area_struct")
+        };
+        let vma_double_pointee = |id: u32| -> Option<bool> {
+            let outer = resolve(id)?;
+            if kind_of(outer)? != 2 {
+                return Some(false);
+            }
+            vma_pointee(word(outer, 8)?)
+        };
+        let bool_pointee = |id: u32| -> Option<bool> {
+            let pointer = resolve(id)?;
+            if kind_of(pointer)? != 2 {
+                return Some(false);
+            }
+            boolean(word(pointer, 8)?)
+        };
+        let mut functions = nodes.iter().skip(1).filter(|node| {
+            word(node, 4).is_some_and(|info| (info >> 24) & 31 == 12)
+                && word(node, 0).and_then(name) == Some(b"copy_vma".as_slice())
+        });
+        let function = functions.next()?;
+        if functions.next().is_some() {
+            return Some(None);
+        }
+        let proto = resolve(word(function, 8)?)?;
+        let arity = word(proto, 4)?;
+        let count = (arity & 65535) as usize;
+        if (arity >> 24) & 31 != 13 || !matches!(count, 5 | 6 | 7) {
+            return Some(None);
+        }
+        if !vma_pointee(word(proto, 8)?)? {
+            return Some(None);
+        }
+        let arg = |index: usize| -> Option<u32> { word(proto, 16 + index.checked_mul(8)?) };
+        if !vma_double_pointee(arg(0)?)? {
+            return Some(None);
+        }
+        // (addr, len, pgoff) are always next; the 7-argument shape adds
+        // anon_pgoff, then need_rmap_locks, then the by-value keep_source
+        // on the extended shapes only.
+        let mut next = 1;
+        for _ in 0..3 {
+            if !ulong(arg(next)?)? {
+                return Some(None);
+            }
+            next += 1;
+        }
+        if count == 7 {
+            if !ulong(arg(next)?)? {
+                return Some(None);
+            }
+            next += 1;
+        }
+        if !bool_pointee(arg(next)?)? {
+            return Some(None);
+        }
+        next += 1;
+        if count >= 6 {
+            if !boolean(arg(next)?)? {
+                return Some(None);
+            }
+            next += 1;
+        }
+        if next != count {
+            return Some(None);
+        }
+        Some(if count == 5 {
+            Some(CopyVmaTarget::Legacy)
+        } else {
+            Some(CopyVmaTarget::FuncRet)
+        })
+    };
+    checked().unwrap_or(None)
 }
 
 /// The calibration protocol: arm `INSTANCE_CALIB` with this thread, map one
@@ -1832,12 +2207,18 @@ fn validate_hook_health_with(
     );
     let mut ids = BTreeMap::new();
     for (name, stats) in read_stats()? {
+        // A load baseline names the active hook set (legacy or 7.3+);
+        // without one only the legacy names validate.
+        let known = match expected {
+            Some(baseline) => baseline.contains_key(name),
+            None => INSTANCE_PROGRAMS
+                .iter()
+                .any(|(required, _)| *required == name),
+        };
         ensure!(
             stats.program_id != 0
                 && stats.recursion_misses == 0
-                && INSTANCE_PROGRAMS
-                    .iter()
-                    .any(|(required, _)| *required == name)
+                && known
                 && ids.insert(name, stats.program_id).is_none(),
             "image hook identity/statistics unavailable"
         );
@@ -2055,10 +2436,18 @@ mod tests {
     }
 
     fn healthy_hook_stats() -> Vec<(&'static str, super::HookStats)> {
-        super::INSTANCE_PROGRAMS
+        let names: Vec<&'static str> = super::INSTANCE_PROGRAMS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        healthy_hook_stats_for(&names)
+    }
+
+    fn healthy_hook_stats_for(names: &[&'static str]) -> Vec<(&'static str, super::HookStats)> {
+        names
             .iter()
             .enumerate()
-            .map(|(index, (name, _))| {
+            .map(|(index, name)| {
                 let mut info = super::ProgInfoPrefix {
                     head: [0; 192],
                     run_time_ns: 0,
@@ -2069,6 +2458,72 @@ mod tests {
                 (*name, super::decode_prog_stats(&info, 216).unwrap())
             })
             .collect()
+    }
+
+    #[test]
+    fn hook_health_accepts_the_resolved_mmap_set() {
+        let names: Vec<&'static str> = super::active_instance_programs(super::HookTargets {
+            copy: super::CopyVmaTarget::Legacy,
+            exec: super::ExecReleaseTarget::ExecMmap,
+        })
+        .iter()
+        .map(|(program, _)| *program)
+        .collect();
+        assert_eq!(names[3], super::EXEC_RELEASE_MMAP_PROGRAM);
+        let stats = healthy_hook_stats_for(&names);
+        let expected = stats
+            .iter()
+            .map(|(name, stats)| (*name, stats.program_id))
+            .collect();
+        super::validate_hook_health_with(4, Some(&expected), || Ok("1".into()), || Ok(stats))
+            .expect("the resolved mmap set validates against its load baseline");
+    }
+
+    #[test]
+    fn hook_health_accepts_every_resolved_hook_set() {
+        use super::{CopyVmaTarget, ExecReleaseTarget, HookTargets};
+        for copy in [CopyVmaTarget::Legacy, CopyVmaTarget::FuncRet] {
+            for exec in [
+                ExecReleaseTarget::ExecMmRelease,
+                ExecReleaseTarget::ExecMmap,
+            ] {
+                let names: Vec<&'static str> =
+                    super::active_instance_programs(HookTargets { copy, exec })
+                        .iter()
+                        .map(|(program, _)| *program)
+                        .collect();
+                assert_eq!(
+                    names[2],
+                    if copy == CopyVmaTarget::FuncRet {
+                        super::COPY_VMA_RET_PROGRAM
+                    } else {
+                        "p11_inst_vma_copy"
+                    }
+                );
+                assert_eq!(
+                    names[3],
+                    if exec == ExecReleaseTarget::ExecMmap {
+                        super::EXEC_RELEASE_MMAP_PROGRAM
+                    } else {
+                        "p11_image_exec_release"
+                    }
+                );
+                let stats = healthy_hook_stats_for(&names);
+                let expected = stats
+                    .iter()
+                    .map(|(name, stats)| (*name, stats.program_id))
+                    .collect();
+                super::validate_hook_health_with(
+                    4,
+                    Some(&expected),
+                    || Ok("1".into()),
+                    || Ok(stats),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("the resolved {copy:?}/{exec:?} set validates: {error:#}")
+                });
+            }
+        }
     }
 
     #[test]
@@ -2179,15 +2634,22 @@ mod tests {
             let coverage = super::super::image_query::CoverageControl::test_owner(false);
             let mut calls = Vec::new();
             let mut loaded_count = 0;
-            let prepared = super::load_instance_programs_with(&mut calls, |calls, program, _| {
-                assert!(calls.iter().all(|(operation, _)| *operation == "load"));
-                calls.push(("load", program));
-                if loaded_count == fail {
-                    anyhow::bail!("owned load refusal: {program}");
-                }
-                loaded_count += 1;
-                Ok(loaded_count as u32)
-            });
+            let prepared = super::load_instance_programs_with(
+                &mut calls,
+                super::HookTargets {
+                    copy: super::CopyVmaTarget::Legacy,
+                    exec: super::ExecReleaseTarget::ExecMmRelease,
+                },
+                |calls, program, _| {
+                    assert!(calls.iter().all(|(operation, _)| *operation == "load"));
+                    calls.push(("load", program));
+                    if loaded_count == fail {
+                        anyhow::bail!("owned load refusal: {program}");
+                    }
+                    loaded_count += 1;
+                    Ok(loaded_count as u32)
+                },
+            );
             assert!(!coverage.enabled());
             let health_called = std::cell::Cell::new(false);
             let result = super::activate_image_coverage_with(&coverage, None, || {
@@ -2232,10 +2694,17 @@ mod tests {
     fn loaded_hook_identity_change_refuses_activation_before_enable() {
         let coverage = super::super::image_query::CoverageControl::test_owner(false);
         let mut next = 0;
-        let loaded = super::load_instance_programs_with(&mut next, |next, _, _| {
-            *next += 1;
-            Ok(*next)
-        })
+        let loaded = super::load_instance_programs_with(
+            &mut next,
+            super::HookTargets {
+                copy: super::CopyVmaTarget::Legacy,
+                exec: super::ExecReleaseTarget::ExecMmRelease,
+            },
+            |next, _, _| {
+                *next += 1;
+                Ok(*next)
+            },
+        )
         .unwrap();
         let expected = loaded.program_ids.clone();
         let result = super::activate_image_coverage_with(&coverage, None, || {
@@ -2368,6 +2837,132 @@ mod tests {
         bytes
     }
 
+    /// BTF blob carrying both exec-release hook families: the legacy
+    /// `exec_mm_release` void(task_struct *, mm_struct *) shape and the 7.3+
+    /// `exec_mmap` int(linux_binprm *) shape. The flags select which FUNC
+    /// records exist; shared types are always present with stable ids.
+    fn exec_hook_btf_fixture(
+        with_legacy: bool,
+        with_mmap: bool,
+        header_len: u32,
+        string_gap: usize,
+    ) -> Vec<u8> {
+        let strings = b"\0task_struct\0mm_struct\0linux_binprm\0exec_mm_release\0exec_mmap\0int\0";
+        let words = [
+            1,
+            4 << 24,
+            1, // task_struct
+            0,
+            2 << 24,
+            1, // pointer to task
+            13,
+            4 << 24,
+            1, // mm_struct
+            0,
+            2 << 24,
+            3, // pointer to mm
+            0,
+            (13 << 24) | 2,
+            0,
+            0,
+            2,
+            0,
+            4, // two-argument void proto
+            23,
+            4 << 24,
+            1, // linux_binprm
+            0,
+            2 << 24,
+            6, // pointer to bprm
+            62,
+            1 << 24,
+            4,
+            0x0100_0020, // signed 32-bit int
+            0,
+            (13 << 24) | 1,
+            8,
+            0,
+            7, // one-argument int proto
+        ];
+        let mut types: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        if with_legacy {
+            for word in [36u32, (12 << 24) | 1, 5] {
+                types.extend(word.to_le_bytes());
+            }
+        }
+        if with_mmap {
+            for word in [52u32, (12 << 24) | 1, 9] {
+                types.extend(word.to_le_bytes());
+            }
+        }
+        let mut bytes = vec![0x9f, 0xeb, 1, 0];
+        for word in [
+            header_len,
+            0,
+            types.len() as u32,
+            types.len() as u32 + string_gap as u32,
+            strings.len() as u32,
+        ] {
+            bytes.extend(word.to_le_bytes());
+        }
+        bytes.resize(header_len as usize, 0xa5);
+        bytes.extend(types);
+        bytes.resize(bytes.len() + string_gap, 0x5a);
+        bytes.extend(strings);
+        bytes
+    }
+
+    fn resolve_fixture(bytes: Vec<u8>) -> Result<super::ExecReleaseTarget, String> {
+        use super::super::host_btf;
+        let cell = std::sync::OnceLock::new();
+        let host = host_btf::cached(&cell, || Ok(bytes)).map_err(|error| error.to_string())?;
+        super::resolve_exec_release_target(host, host.btf()).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn resolver_prefers_legacy_when_present() {
+        for (legacy, mmap) in [(true, false), (true, true)] {
+            let bytes = exec_hook_btf_fixture(legacy, mmap, 24, 0);
+            assert_eq!(
+                resolve_fixture(bytes).unwrap(),
+                super::ExecReleaseTarget::ExecMmRelease
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_selects_mmap_without_legacy() {
+        let bytes = exec_hook_btf_fixture(false, true, 24, 0);
+        assert_eq!(
+            resolve_fixture(bytes).unwrap(),
+            super::ExecReleaseTarget::ExecMmap
+        );
+    }
+
+    #[test]
+    fn resolver_refuses_without_either_hook() {
+        let bytes = exec_hook_btf_fixture(false, false, 24, 0);
+        assert_eq!(
+            resolve_fixture(bytes).unwrap_err(),
+            "exec_mm_release must be void(task_struct *, mm_struct *)"
+        );
+    }
+
+    #[test]
+    fn resolver_rejects_foreign_parse() {
+        use super::super::host_btf;
+        let bytes = exec_hook_btf_fixture(true, false, 24, 0);
+        let foreign = aya::Btf::parse(&bytes, aya::Endianness::default()).unwrap();
+        let cell = std::sync::OnceLock::new();
+        let host = host_btf::cached(&cell, || Ok(bytes)).unwrap();
+        assert_eq!(
+            super::resolve_exec_release_target(host, &foreign)
+                .unwrap_err()
+                .to_string(),
+            "instance hook BTF differs from cached host BTF"
+        );
+    }
+
     #[test]
     fn image_hook_requires_the_exact_exec_release_prototype() {
         let bytes = exec_release_btf_fixture(24, 0);
@@ -2452,6 +3047,265 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn image_hook_requires_the_exact_exec_mmap_prototype() {
+        for (header, gap) in [(24, 0), (32, 0), (24, 7), (32, 7)] {
+            let bytes = exec_hook_btf_fixture(false, true, header, gap);
+            assert!(
+                super::exec_mmap_proto_is_exact(&bytes),
+                "header {header} gap {gap}"
+            );
+        }
+        assert!(!super::exec_mmap_proto_is_exact(&exec_hook_btf_fixture(
+            true, false, 24, 0
+        )));
+        assert!(super::exec_mmap_proto_is_exact(&exec_hook_btf_fixture(
+            true, true, 24, 0
+        )));
+        let bytes = exec_hook_btf_fixture(false, true, 24, 0);
+        let mut wrong_return = bytes.clone();
+        wrong_return[148..152].copy_from_slice(&0u32.to_le_bytes());
+        assert!(!super::exec_mmap_proto_is_exact(&wrong_return));
+        let mut wrong_argument = bytes.clone();
+        wrong_argument[156..160].copy_from_slice(&4u32.to_le_bytes());
+        assert!(!super::exec_mmap_proto_is_exact(&wrong_argument));
+        let mut wrong_arity = bytes.clone();
+        wrong_arity[144..148].copy_from_slice(&((13u32 << 24) | 2).to_le_bytes());
+        assert!(!super::exec_mmap_proto_is_exact(&wrong_arity));
+        let type_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let type_end = 24 + type_len as usize;
+        let mut duplicate = bytes.clone();
+        duplicate.splice(
+            type_end..type_end,
+            bytes[type_end - 12..type_end].iter().copied(),
+        );
+        duplicate[12..16].copy_from_slice(&(type_len + 12).to_le_bytes());
+        duplicate[16..20].copy_from_slice(&(type_len + 12).to_le_bytes());
+        assert!(!super::exec_mmap_proto_is_exact(&duplicate));
+        for truncated in 0..bytes.len() {
+            assert!(
+                !super::exec_mmap_proto_is_exact(&bytes[..truncated]),
+                "truncated at {truncated}"
+            );
+        }
+    }
+
+    /// BTF blob carrying one `copy_vma` with the requested arity's exact
+    /// shape: 5 legacy `(vmap, addr, len, pgoff, need_rmap_locks)`, 6 with
+    /// `keep_source`, 7 with `anon_pgoff` too. Type ids are stable: 1
+    /// STRUCT vm_area_struct, 2 PTR to it (the return), 3 PTR to 2
+    /// (`vmap`), 4 INT `long unsigned int`, 5 INT `_Bool`, 6 TYPEDEF
+    /// `bool`, 7 PTR to 6 (`need_rmap_locks`), 8 the FUNC_PROTO, 9 the
+    /// FUNC. Ids 1-7 occupy 23 words (92 bytes), so the proto starts at
+    /// header + 92 with the return at +8 and argument `i`'s type at
+    /// +16+8i.
+    fn copy_vma_btf_fixture(arity: u32, header_len: u32, string_gap: usize) -> Vec<u8> {
+        let strings = b"\0vm_area_struct\0copy_vma\0long unsigned int\0bool\0_Bool\0";
+        let args: &[u32] = match arity {
+            5 => &[3, 4, 4, 4, 7],
+            6 => &[3, 4, 4, 4, 7, 6],
+            7 => &[3, 4, 4, 4, 4, 7, 6],
+            _ => panic!("copy_vma fixture arity must be 5, 6 or 7"),
+        };
+        let words = [
+            1,
+            4 << 24,
+            1, // STRUCT vm_area_struct
+            0,
+            2 << 24,
+            1, // PTR to it (the return)
+            0,
+            2 << 24,
+            2, // PTR to that (vmap)
+            25,
+            1 << 24,
+            8,
+            0x0000_0040, // INT long unsigned int
+            48,
+            1 << 24,
+            1,
+            0x0400_0008, // INT _Bool
+            43,
+            8 << 24,
+            5, // TYPEDEF bool
+            0,
+            2 << 24,
+            6, // PTR to bool (need_rmap_locks)
+            0,
+            (13 << 24) | arity,
+            2, // FUNC_PROTO returning id 2
+        ];
+        let mut types: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        for arg in args {
+            types.extend(0u32.to_le_bytes());
+            types.extend(arg.to_le_bytes());
+        }
+        for word in [16u32, (12 << 24) | 1, 8] {
+            types.extend(word.to_le_bytes());
+        }
+        let mut bytes = vec![0x9f, 0xeb, 1, 0];
+        for word in [
+            header_len,
+            0,
+            types.len() as u32,
+            types.len() as u32 + string_gap as u32,
+            strings.len() as u32,
+        ] {
+            bytes.extend(word.to_le_bytes());
+        }
+        bytes.resize(header_len as usize, 0xa5);
+        bytes.extend(types);
+        bytes.resize(bytes.len() + string_gap, 0x5a);
+        bytes.extend(strings);
+        bytes
+    }
+
+    fn resolve_copy_fixture(bytes: Vec<u8>) -> Result<super::CopyVmaTarget, String> {
+        use super::super::host_btf;
+        let cell = std::sync::OnceLock::new();
+        let host = host_btf::cached(&cell, || Ok(bytes)).map_err(|error| error.to_string())?;
+        super::resolve_copy_vma_target(host, host.btf()).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn copy_hook_requires_the_exact_legacy_prototype() {
+        for (header, gap) in [(24, 0), (32, 0), (24, 7), (32, 7)] {
+            let bytes = copy_vma_btf_fixture(5, header, gap);
+            assert_eq!(
+                super::copy_vma_proto_kind(&bytes),
+                Some(super::CopyVmaTarget::Legacy),
+                "header {header} gap {gap}"
+            );
+        }
+        let bytes = copy_vma_btf_fixture(5, 24, 0);
+        // Proto at header + 92: return +8, argument types +16+8i.
+        let proto = 24 + 92;
+        let mut wrong_return = bytes.clone();
+        wrong_return[proto + 8..proto + 12].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(super::copy_vma_proto_kind(&wrong_return), None);
+        let mut wrong_vmap = bytes.clone();
+        wrong_vmap[proto + 16..proto + 20].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(super::copy_vma_proto_kind(&wrong_vmap), None);
+        let mut wrong_offset = bytes.clone();
+        wrong_offset[proto + 24..proto + 28].copy_from_slice(&6u32.to_le_bytes());
+        assert_eq!(super::copy_vma_proto_kind(&wrong_offset), None);
+        let mut wrong_locks = bytes.clone();
+        wrong_locks[proto + 48..proto + 52].copy_from_slice(&6u32.to_le_bytes());
+        assert_eq!(super::copy_vma_proto_kind(&wrong_locks), None);
+        let mut wrong_arity = bytes.clone();
+        wrong_arity[proto + 4..proto + 8].copy_from_slice(&((13u32 << 24) | 4).to_le_bytes());
+        assert_eq!(super::copy_vma_proto_kind(&wrong_arity), None);
+        let type_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let type_end = 24 + type_len as usize;
+        let mut duplicate = bytes.clone();
+        duplicate.splice(
+            type_end..type_end,
+            bytes[type_end - 12..type_end].iter().copied(),
+        );
+        duplicate[12..16].copy_from_slice(&(type_len + 12).to_le_bytes());
+        duplicate[16..20].copy_from_slice(&(type_len + 12).to_le_bytes());
+        assert_eq!(super::copy_vma_proto_kind(&duplicate), None);
+        for truncated in 0..bytes.len() {
+            assert_eq!(
+                super::copy_vma_proto_kind(&bytes[..truncated]),
+                None,
+                "truncated at {truncated}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_hook_requires_the_exact_extended_prototype() {
+        for arity in [6, 7] {
+            for (header, gap) in [(24, 0), (32, 0), (24, 7), (32, 7)] {
+                let bytes = copy_vma_btf_fixture(arity, header, gap);
+                assert_eq!(
+                    super::copy_vma_proto_kind(&bytes),
+                    Some(super::CopyVmaTarget::FuncRet),
+                    "arity {arity} header {header} gap {gap}"
+                );
+            }
+        }
+        // The 6-argument shape with a non-bool keep_source is neither shape.
+        let six = copy_vma_btf_fixture(6, 24, 0);
+        let proto = 24 + 92;
+        let mut wrong_keep = six.clone();
+        wrong_keep[proto + 56..proto + 60].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(super::copy_vma_proto_kind(&wrong_keep), None);
+        // The 7-argument shape with a non-offset anon_pgoff is neither shape.
+        let seven = copy_vma_btf_fixture(7, 24, 0);
+        let mut wrong_anon = seven.clone();
+        wrong_anon[proto + 48..proto + 52].copy_from_slice(&6u32.to_le_bytes());
+        assert_eq!(super::copy_vma_proto_kind(&wrong_anon), None);
+        // A void return is neither shape.
+        let mut wrong_return = seven.clone();
+        wrong_return[proto + 8..proto + 12].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(super::copy_vma_proto_kind(&wrong_return), None);
+        // An 8-argument spelling is neither shape.
+        let mut wrong_arity = seven.clone();
+        wrong_arity[proto + 4..proto + 8].copy_from_slice(&((13u32 << 24) | 8).to_le_bytes());
+        assert_eq!(super::copy_vma_proto_kind(&wrong_arity), None);
+        for truncated in 0..six.len() {
+            assert_eq!(
+                super::copy_vma_proto_kind(&six[..truncated]),
+                None,
+                "six truncated at {truncated}"
+            );
+        }
+        for truncated in 0..seven.len() {
+            assert_eq!(
+                super::copy_vma_proto_kind(&seven[..truncated]),
+                None,
+                "seven truncated at {truncated}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_resolver_selects_legacy_on_five_arguments() {
+        let bytes = copy_vma_btf_fixture(5, 24, 0);
+        assert_eq!(
+            resolve_copy_fixture(bytes).unwrap(),
+            super::CopyVmaTarget::Legacy
+        );
+    }
+
+    #[test]
+    fn copy_resolver_selects_ret_on_six_or_seven_arguments() {
+        for arity in [6, 7] {
+            let bytes = copy_vma_btf_fixture(arity, 24, 0);
+            assert_eq!(
+                resolve_copy_fixture(bytes).unwrap(),
+                super::CopyVmaTarget::FuncRet,
+                "arity {arity}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_resolver_refuses_without_either_shape() {
+        let bytes = exec_hook_btf_fixture(false, false, 24, 0);
+        assert_eq!(
+            resolve_copy_fixture(bytes).unwrap_err(),
+            "no exact copy_vma hook: copy_vma must be struct vm_area_struct *(vmap, addr, len, pgoff[, anon_pgoff], need_rmap_locks[, keep_source])"
+        );
+    }
+
+    #[test]
+    fn copy_resolver_rejects_foreign_parse() {
+        use super::super::host_btf;
+        let bytes = copy_vma_btf_fixture(5, 24, 0);
+        let foreign = aya::Btf::parse(&bytes, aya::Endianness::default()).unwrap();
+        let cell = std::sync::OnceLock::new();
+        let host = host_btf::cached(&cell, || Ok(bytes)).unwrap();
+        assert_eq!(
+            super::resolve_copy_vma_target(host, &foreign)
+                .unwrap_err()
+                .to_string(),
+            "instance hook BTF differs from cached host BTF"
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ tolerated as idle and contribute nothing). Refusal diagnostics name only
 frozen labels and counts; unknown product strings are never echoed.
 
 With `--s1` the current Inventory topology proves 68 physical entries separately
-from one owned instance child's 65 reducer-admitted API observations, operations and
+from one owned instance child's 66 reducer-admitted API observations, operations and
 mechanisms. The parent deliberately withholds its semantic summary. Only the
 exact stopped disclosure {capture_stopped, semantic_loss} is accepted beside
 proven terminal drain and the fixed ledger/child counts; the disclosure remains
@@ -159,16 +159,19 @@ EXPECTED_STARTED = {"sign": 10, "verify": 12}
 # rows: C_Sign runs 9 times (8 OK, 1 BUFFER_TOO_SMALL retry probe), C_Verify
 # 12 times (10 OK, 2 SIGNATURE_INVALID). The 31/24/13 split counts workload
 # calls by operation category (operation 0 is setup). The edge numbers follow
-# the S1 reducer rules: operations.calls counts the 65 gated calls (68 minus
-# the 3 COUNT_ONLY setup calls), started counts the 22 OK inits plus the
-# GenerateKeyPair direct call, and mechanism 0x40 carries the 55 attributed
-# sign/verify calls with 3 errors.
+# the S1 reducer rules: operations.calls counts the 66 gated calls (68 minus
+# the 2 COUNT_ONLY setup calls, C_GetFunctionList and C_GetSlotList),
+# started counts the 22 OK inits plus the GenerateKeyPair direct call, and
+# mechanism 0x40 carries the 55 attributed sign/verify calls with 3 errors.
+# C_Initialize is admitted since b638ef892 (Owner P4, 2026-10-30, "model
+# C_Initialize eras"): the era model consumes its S1 admission, so the
+# Oct-26 pin of 65 (with C_Initialize COUNT_ONLY-gated) is stale.
 S1_STATUS = "unavailable"
 S1_REASON = "journal_unavailable"
 S1_CALL_SPLIT = {"sign": 31, "verify": 24, "setup": 13}
 S1_PER_FUNCTION = {"C_Sign": {0x0: 8, 0x150: 1},
                    "C_Verify": {0x0: 10, 0xC0: 2}}
-S1_OPERATIONS = {"calls": 65, "started": 23, "completed": 21, "cancelled": 0,
+S1_OPERATIONS = {"calls": 66, "started": 23, "completed": 21, "cancelled": 0,
                  "failed": 2, "unknown": 0, "orphans": 0, "dropped": 0}
 # Published counterexamples cannot be erased by the R59 stopped-child pair.
 # These are existing producer subjects, not a substring/unknown-text policy.
@@ -799,7 +802,7 @@ def _check_s1_current_gaps(doc, caller, module, pid):
                  "published S1 loss or retirement contradicts the stopped exception")
         _require(gap["subject"] != "semantic input refused" or gap["reason"] == "slot",
                  "S1 semantic input refusal is not the fixed count-only setup")
-        # Repeats mix call and admission pushes. They never derive 65/68 or
+        # Repeats mix call and admission pushes. They never derive 66/68 or
         # replace the independent ledger/API/stop-accounting denominators.
 
 
@@ -857,7 +860,7 @@ def _s1_current_child(doc):
              and returns.get("saturated") is False
              and _u64(returns.get("historical_only_returns"))
              and returns["historical_only_returns"] == 0,
-             "S1 child API returns are not exactly 65 current observations")
+             "S1 child API returns are not exactly 66 current observations")
 
     observation = doc.get("observation")
     _require(type(observation) is dict and observation.get("lane") == "native",

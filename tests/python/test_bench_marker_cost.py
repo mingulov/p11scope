@@ -155,6 +155,17 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("unhealthy median=0", table)
         self.assertIn("total=0", table)
 
+    def test_armed_arm_labeled_gated_read_only(self):
+        with tempfile.TemporaryDirectory(
+                prefix="p11scope-markercost-armed-note-") as work:
+            directory = Path(work)
+            log_path, man_path = campaign_fixture(directory)
+            manifest, samples = ANALYZER.verify(str(log_path), str(man_path))
+            table = ANALYZER.render(manifest, samples)
+        self.assertIn("gated read only", table)
+        self.assertIn("lane journal-ready", table)
+        self.assertIn("no production session writes READY", table)
+
     def test_truncated_log_fails(self):
         with tempfile.TemporaryDirectory(
                 prefix="p11scope-markercost-truncated-") as work:
@@ -206,6 +217,47 @@ class AnalyzerTests(unittest.TestCase):
         proc = subprocess.run([sys.executable, "-I", str(ANALYZE)],
                               capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 2)
+
+    def test_journal_pair_prog_verifies(self):
+        def use_journal(lines):
+            out = []
+            for line in lines:
+                if (line.startswith("SAMPLE cell=call-rate")
+                        and " arm=on-armed " in line):
+                    line = line.replace("bpf_prog=p11_entry",
+                                        "bpf_prog=p11_journal_pair")
+                out.append(line)
+            return out
+
+        with tempfile.TemporaryDirectory(
+                prefix="p11scope-markercost-journal-") as work:
+            directory = Path(work)
+            log_path, man_path = campaign_fixture(directory, mutate=use_journal)
+            manifest, samples = ANALYZER.verify(str(log_path), str(man_path))
+            table = ANALYZER.render(manifest, samples)
+        armed = [s for s in samples
+                 if s["cell"] == "call-rate" and s["arm"] == "on-armed"]
+        self.assertTrue(armed)
+        for sample in armed:
+            self.assertEqual(sample["bpf_prog"], "p11_journal_pair")
+        self.assertIn("bpf p11_journal_pair", table)
+
+    def test_unknown_bpf_prog_fails(self):
+        def use_unknown(lines):
+            # The none arm's prog is unchecked; poison a profile arm.
+            return [
+                line.replace("bpf_prog=p11_entry",
+                             "bpf_prog=p11_mystery", 1)
+                if line.startswith("SAMPLE cell=call-rate")
+                and " arm=off-profile " in line else line
+                for line in lines]
+
+        with tempfile.TemporaryDirectory(
+                prefix="p11scope-markercost-unknownprog-") as work:
+            directory = Path(work)
+            log_path, man_path = campaign_fixture(directory, mutate=use_unknown)
+            with self.assertRaises(ANALYZER.CampaignError):
+                ANALYZER.verify(str(log_path), str(man_path))
 
 
 if __name__ == "__main__":

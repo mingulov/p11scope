@@ -15,7 +15,7 @@ fixtures (6.08 phase 1) pin the RSA-cell boundary: extended keyed
 populations stay refused until the 6.06/6.07 linked contract lands.
 
 S1 twins preserve historical observed-parent comparisons and the current
-physical 68/instance 65 topology, including the actual stopped-child disclosure.
+physical 68/instance 66 topology, including the actual stopped-child disclosure.
 They keep the exact operation/mechanism ledger denominator and unavailable
 journal guard. Lifetime EVENTS and actual stop accounting remain separate
 live-controller receipts, never invented Inventory fields.
@@ -651,11 +651,12 @@ class ObservedRsaTests(unittest.TestCase):
 # feed). Every number below is derived from the ledger workload
 # (test_key_operation_ledger.application_rows: 68 calls) and the S1 reducer
 # rules (src/semantics_edge.rs attribution, src/kinds.rs descriptors):
-# 68 entries on the edge; operations calls 65 (68 minus the 3 COUNT_ONLY
-# setup calls), started 23 (22 OK inits + the GenerateKeyPair direct call),
-# completed 21, failed 2; mechanism 0x40 with 55 attributed sign/verify
-# calls, 3 errors, 6 functions and returns {OK, SIGNATURE_INVALID,
-# BUFFER_TOO_SMALL}; mechanism 0x0 with the single keygen call.
+# 68 entries on the edge; operations calls 66 (68 minus the 2 COUNT_ONLY
+# setup calls, C_GetFunctionList and C_GetSlotList), started 23 (22 OK inits
+# + the GenerateKeyPair direct call), completed 21, failed 2; mechanism 0x40
+# with 55 attributed sign/verify calls, 3 errors, 6 functions and returns
+# {OK, SIGNATURE_INVALID, BUFFER_TOO_SMALL}; mechanism 0x0 with the single
+# keygen call. C_Initialize is admitted since b638ef892 (Owner P4).
 S1_RSA_FUNCTIONS = ("C_Sign", "C_SignFinal", "C_SignInit", "C_SignUpdate",
                     "C_Verify", "C_VerifyInit")
 S1_RSA_RETURNS = ((0, "CKR_OK"), (0xC0, "CKR_SIGNATURE_INVALID"),
@@ -678,7 +679,7 @@ def s1_section(status="unavailable", reason="journal_unavailable"):
                 "allocation_refused": False, "refusal_reason": "none"}}
 
 
-def s1_operations(calls=65, started=23, completed=21, cancelled=0, failed=2,
+def s1_operations(calls=66, started=23, completed=21, cancelled=0, failed=2,
                   unknown=0, orphans=0, dropped=0, active=None):
     return {"calls": calls, "started": started, "completed": completed,
             "cancelled": cancelled, "failed": failed, "unknown": unknown,
@@ -736,16 +737,16 @@ def s1_rsa_mechanisms(doc):
 def s1_current_doc():
     """Current b58 held-RSA capture shape, hand-built from the actual receipt.
 
-    Physical 68 and semantic 65 remain separate; the three COUNT_ONLY setup
+    Physical 68 and semantic 66 remain separate; the two COUNT_ONLY setup
     calls are not semantic API observations. The stopped instance retains its
-    own 65/23/21/2 and 1+55 mechanism facts while the parent withholds a summary.
+    own 66/23/21/2 and 1+55 mechanism facts while the parent withholds a summary.
     """
     doc = s1_doc()
     edge = doc["edges"][0]
     child = {"caller": "c0", "module": "m0", "instance": "i0",
              "entries": {"unit": "api_entries", "count": None,
                          "observation": "unavailable"},
-             "api_returns": {"unit": "api_returns", "count": 65,
+             "api_returns": {"unit": "api_returns", "count": 66,
                              "saturated": False, "historical_only_returns": 0},
              "semantics": "observed", "operations": edge["operations"],
              "mechanisms": edge["mechanisms"],
@@ -769,7 +770,7 @@ def s1_current_doc():
                       "reason": "joint_journal_unavailable", "caller": None,
                       "module": None, "pid": None, "repeats": 1},
                      {"subject": "semantic input refused", "reason": "slot",
-                      "caller": "c0", "module": None, "pid": None, "repeats": 3},
+                      "caller": "c0", "module": None, "pid": None, "repeats": 2},
                      {"subject": "physical provider use preceded first observed semantic registration",
                       "reason": "before_semantic_boundary", "caller": "c0",
                       "module": "m0", "pid": None, "repeats": 1}],
@@ -791,9 +792,9 @@ class CurrentS1ModeTests(unittest.TestCase):
         result = self.check(doc)
         self.assertTrue(result["match"])
         self.assertEqual(result["observed"]["entries"], 68)
-        self.assertEqual(result["observed"]["operations"]["calls"], 65)
+        self.assertEqual(result["observed"]["operations"]["calls"], 66)
         self.assertEqual(result["observed"]["semantic_source"], {
-            "caller": "c0", "module": "m0", "instance": "i0", "api_returns": 65,
+            "caller": "c0", "module": "m0", "instance": "i0", "api_returns": 66,
             "coverage": {"lossy": True, "reasons": ["capture_stopped", "semantic_loss"]}})
         self.assertIsNone(doc["edges"][0]["operations"])
         self.assertIsNone(doc["edges"][0]["mechanisms"])
@@ -1051,7 +1052,7 @@ class CurrentS1ModeTests(unittest.TestCase):
             observer.write_text(json.dumps(doc))
             result = subprocess.run(command, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout)["observed"]["semantic_source"]["api_returns"], 65)
+            self.assertEqual(json.loads(result.stdout)["observed"]["semantic_source"]["api_returns"], 66)
             doc["semantic_edges"][0]["coverage"]["reasons"].append("task_retired")
             observer.write_text(json.dumps(doc))
             result = subprocess.run(command, capture_output=True, text=True, timeout=10)
@@ -1085,7 +1086,7 @@ class S1ModeTests(unittest.TestCase):
         seen = result.get("observed", {})
         self.assertEqual(seen.get("entries"), 68)
         self.assertEqual(seen.get("operations"),
-                         {"calls": 65, "started": 23, "completed": 21,
+                         {"calls": 66, "started": 23, "completed": 21,
                           "cancelled": 0, "failed": 2, "unknown": 0,
                           "orphans": 0, "dropped": 0, "active": 0})
         self.assertEqual(seen.get("mechanisms"),
@@ -1124,7 +1125,7 @@ class S1ModeTests(unittest.TestCase):
             seen = result.get("observed", {})
             self.assertEqual(seen.get("entries"), 68)
             self.assertEqual(seen.get("operations"),
-                             {"calls": 65, "started": 23, "completed": 21,
+                             {"calls": 66, "started": 23, "completed": 21,
                               "cancelled": 0, "failed": 2, "unknown": 0,
                               "orphans": 0, "dropped": 0, "active": 0})
         with self.subTest("absent content"):
@@ -1458,7 +1459,7 @@ class S1ModeTests(unittest.TestCase):
             ("operations failed short", operations_failed_short,
              ["S1 operations failed 1", "expected 2"]),
             ("operations calls short", operations_calls_short,
-             ["S1 operations calls 64", "expected 65"]),
+             ["S1 operations calls 64", "expected 66"]),
             ("operations started short", operations_started_short,
              ["S1 operations started 22", "expected 23"]),
             ("operations orphan", operations_orphan,

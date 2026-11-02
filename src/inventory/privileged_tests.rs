@@ -5003,6 +5003,187 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
     Ok(())
 }
 
+/// Healthy linked control: the same linked flow as the fault twin
+/// without the staged fault, through the audited batch. The pump serves
+/// instead of refusing, the audited batch carries no CoverageFailed, and
+/// the script's calls route normally (none to CoverageFault). That is
+/// the negative control that makes the fault twin's CoverageFailed
+/// interpretable. Root BPF lane, serial.
+///
+/// The control ends at the batch: past the audit, any further machine
+/// advance on the clean lane deterministically latches `Unavailable`
+/// (4/4: three driver-hook services plus one commit poll), while the
+/// faulted lane advances, publishes and finishes unlatched. That
+/// divergence is a product-behavior question for the linked-lane owners
+/// (H0 guard semantics on clean linked lanes), not part of this control.
+#[test]
+#[ignore = "privileged: healthy linked control routes normally without CoverageFailed"]
+fn privileged_key_operations_linked_healthy_routes_without_coverage_failed() -> Result<()> {
+    use crate::discovery::instances::{Route, UnknownReason};
+    use crate::semantic_capture::{InvalidationScope, TickOutcome};
+    use anyhow::Context as _;
+    use std::time::{Duration, Instant};
+    let workload = JointWorkload::build()?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-healthy-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-healthy-held.dr37.json",
+    )?;
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        return refuse_linked_without_journal(
+            &mut coordinator,
+            vec![manifest_soft, manifest_held],
+            "KEY_OPS_HEALTHY",
+        );
+    }
+    let mut lane =
+        start_joint_lane_with_journal(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    // No staged fault: the pump serves on the running capture.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pumped = lane.service_linked_live_discovery(64, deadline);
+    ensure!(pumped.is_ok(), "a healthy live pump serves: {pumped:?}");
+    ensure!(lane.has_joint_machine(), "no latch: machine installed");
+    ensure!(
+        lane.joint_disposition_reason().is_none(),
+        "no disposition on the healthy lane: {:?}",
+        lane.joint_disposition_reason()
+    );
+    ensure!(lane.is_live(), "the lane stays live");
+    // The same post-seal provider calls as the fault twin: a gated
+    // script process maps first, then runs its calls right before the
+    // audit drive, so the next audited batch carries them.
+    let go = workload.path("keyops-healthy-go");
+    let go_arg = go.to_str().context("go path")?.to_string();
+    let soft_arg = workload
+        .soft_copy
+        .to_str()
+        .context("soft-copy path")?
+        .to_string();
+    let process = workload.spawn(
+        "healthy",
+        &[
+            "b", "--cell", "C", "--module", &soft_arg, "--go", &go_arg, "--iters", "2", "--hold",
+        ],
+        &[],
+    )?;
+    drive_until_mapped(&mut coordinator, &[process.pid()])?;
+    std::fs::write(&go, b"")?;
+    process.wait_for("DONE ", Duration::from_secs(60))?;
+    let (_by_fn, total, bad) = ledger_calls(&process.out)?;
+    ensure!(
+        bad == 0,
+        "the healthy script never fails: {:?}",
+        process.lines()
+    );
+    ensure!(total > 0, "the script made healthy provider calls");
+    // Drive the begun transaction one machine step at a time until
+    // the audited batch stages, then assert the healthy shape on it
+    // directly: no CoverageFailed, nothing to CoverageFault, and the
+    // script's calls joined normally.
+    lane.begin_joint_commit(true).map_err(|refusal| {
+        let reason = match refusal {
+            crate::inventory_semantics::JointCommitRefusal::NotInitialized => "not initialized",
+            crate::inventory_semantics::JointCommitRefusal::OutstandingRequest => {
+                "outstanding request"
+            }
+            crate::inventory_semantics::JointCommitRefusal::DispositionRequired => {
+                "disposition required"
+            }
+        };
+        anyhow::anyhow!("keyops-healthy: begin refused: {reason}")
+    })?;
+    let audit_started = Instant::now();
+    let (outcome_count, covfault_calls, joined_calls) = loop {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        lane.service_joint(
+            &mut coordinator,
+            crate::inventory_semantics::JointServiceMode::Running,
+            &mut budget,
+        )
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "keyops-healthy: audit service refused: {reason} disposition={:?} waiters={:?}",
+                lane.joint_disposition_reason(),
+                lane.joint_stuck_diagnostic_for_test(),
+            )
+        })?;
+        if let Some(batch) = coordinator.pending_semantic_batch_for_test() {
+            let outcomes = batch.outcomes();
+            ensure!(
+                !outcomes.iter().any(|outcome| matches!(
+                    outcome,
+                    TickOutcome::Invalidation(loss)
+                        if matches!(loss.scope(), InvalidationScope::CoverageFailed)
+                )),
+                "the healthy audited batch carries no CoverageFailed ({} outcomes)",
+                outcomes.len()
+            );
+            let covfault = outcomes
+                .iter()
+                .filter(|outcome| {
+                    matches!(
+                        outcome,
+                        TickOutcome::Call(call)
+                            if matches!(call.route(), Route::Unknown(UnknownReason::CoverageFault))
+                    )
+                })
+                .count();
+            let joined = outcomes
+                .iter()
+                .filter(|outcome| {
+                    matches!(
+                        outcome,
+                        TickOutcome::Call(call) if matches!(call.route(), Route::Joined(_))
+                    )
+                })
+                .count();
+            eprintln!(
+                "KEY_OPS_HEALTHY_COVERAGE total={total} covfault={covfault} joined={joined} outcomes={}",
+                outcomes.len()
+            );
+            ensure!(
+                covfault == 0,
+                "no healthy call routes to CoverageFault ({} outcomes)",
+                outcomes.len()
+            );
+            ensure!(
+                u64::try_from(joined).unwrap_or(u64::MAX) >= total,
+                "the script's calls route normally: joined {joined} >= total {total}"
+            );
+            break (outcomes.len(), covfault, joined);
+        }
+        ensure!(
+            audit_started.elapsed() < Duration::from_secs(120),
+            "keyops-healthy: no audited batch after 120 s; stuck audit={:?} h3={:?} waiters={:?}",
+            lane.joint_audit_diagnostic_for_test(),
+            coordinator.reference_h3_audit_state(),
+            lane.joint_stuck_diagnostic_for_test(),
+        );
+    };
+    ensure!(
+        lane.joint_disposition_reason().is_none(),
+        "the audited machine latches nothing: {:?}",
+        lane.joint_disposition_reason()
+    );
+    eprintln!(
+        "KEY_OPS_HEALTHY served=true latched=false outcomes={outcome_count} \
+         covfault={covfault_calls} joined={joined_calls}"
+    );
+    Ok(())
+}
+
 /// Marker gate: an ordinary live seal publishes no attach
 /// generation (0, cell untouched), while a journal live seal mints
 /// one (>= 1). Root BPF lane, serial.

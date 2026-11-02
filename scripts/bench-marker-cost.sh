@@ -5,7 +5,9 @@
 # Method: two self-measured workloads run beside a live observer under
 # four arms — no observer (none), the off build profiling (off-profile),
 # the on build profiling with the marker disarmed (on-profile), and the
-# on build with --key-operations armed (on-armed):
+# on build with --key-operations armed (on-armed; gated read only at
+# this revision — no production session writes READY, so the cost table
+# labels it honestly instead of claiming an armed-marker cost):
 #   exec-storm: scripts/fixtures/exec-storm.c fork+execs /bin/true
 #     EXEC_OPS times (default 2000), CLOCK_MONOTONIC around the loop.
 #     Measure: wall ns per exec, workload-side.
@@ -17,10 +19,16 @@
 # BPF run-time deltas (kernel.bpf_stats_enabled, set for the campaign,
 # re-asserted per sample against concurrent cells, restored after)
 # corroborate independently: the sched_process_exec total beside
-# exec-storm, the p11_entry total beside call-rate. A sample whose
-# hook program is present must show at least one hook event per workload
-# op (a zero delta would certify unattached hooks); absence is recorded
-# per arm and reported, never silently treated as zero cost.
+# exec-storm, the p11_entry total beside call-rate, except the armed
+# call-rate arm reads the sealed journal pair (p11_entry_journal plus
+# p11_return_journal, summed as p11_journal_pair, with ordinary
+# p11_entry fallback when the pair is absent). A before-read over
+# attached-but-idle hooks is 0/0 (bpftool omits zero counters with
+# stats on); after the workload the window must show positive run time
+# and at least one hook event per op, else the sample fails (a zero
+# delta would certify unattached hooks). A hook program that is not
+# loaded at all records absent per arm and is reported, never read
+# as zero.
 #
 # Arms run ABBA across rounds (odd rounds forward, even rounds
 # reversed), so linear host drift cannot masquerade as an arm
@@ -54,7 +62,9 @@
 # ROUNDS (default 2), EXEC_OPS, CALL_RATE, CALL_DURATION, MAX_LOAD1,
 # COOLDOWN, DURATION (default 120: observer backstop per sample),
 # ATTACH_TIMEOUT_S (default 120), MODULE (default the system SoftHSM2),
-# LOCK, TMPDIR (disk filesystem; the campaign keeps per-sample evidence
+# LOCK, P11SCOPE_BENCH_COMMIT (the source commit; required outside a
+# git repo, where the tree records unknown-no-git),
+# TMPDIR (disk filesystem; the campaign keeps per-sample evidence
 # under a private work dir and copies the log, manifest and cost table
 # to OUTDIR at the end).
 #
@@ -148,6 +158,184 @@ for r in range(1, int(sys.argv[2]) + 1):
 EOF
 }
 
+# bpf_parse_totals PROG STATS: read `bpftool -j prog show` JSON on
+# stdin, print "<run_time_ns> <run_cnt>" summed over every program
+# named PROG (or its 15-byte kernel truncation). Exit 0 on a reading;
+# exit 4 with "absent" when no program matches (a miss is recorded
+# absence, never a zero); exit 1 on any corrupt read. With stats on,
+# a matched program whose counters are omitted reads as zero: bpftool
+# omits run_time_ns/run_cnt until the program first runs, so a
+# before-read over attached-but-idle hooks is 0/0, not a failure.
+bpf_parse_totals() {
+    python3 -I -c '
+import json, sys
+want, stats = sys.argv[1], sys.argv[2]
+try:
+    progs = json.load(sys.stdin)
+except Exception as exc:
+    sys.exit(f"bpftool output is not JSON with stats={stats}: {exc}")
+if type(progs) is not list:
+    sys.exit(f"bpftool output is not a prog list with stats={stats}")
+total_ns = total_cnt = 0
+found = False
+for prog in progs:
+    if type(prog) is not dict:
+        continue
+    name = prog.get("name", "")
+    if name != want and name != want[:15]:
+        continue
+    found = True
+    row = []
+    for field in ("run_time_ns", "run_cnt"):
+        value = prog.get(field)
+        if value is None and stats == "1":
+            value = 0
+        if type(value) is not int or value < 0:
+            if value is None:
+                sys.exit(f"prog {name!r} has no {field} with stats={stats}"
+                         f" (a concurrent cell may have restored stats=0 or unloaded it)")
+            sys.exit(f"prog {name!r} has invalid {field} {value!r} with stats={stats}")
+        row.append(value)
+    total_ns += row[0]
+    total_cnt += row[1]
+if not found:
+    print("absent")
+    sys.exit(4)
+print(total_ns, total_cnt)
+' "$1" "$2"
+}
+
+# bpf_parse_armed_call_rate STATS: read `bpftool -j prog show` JSON on
+# stdin, print "<prog> <run_time_ns> <run_cnt>" for the armed call-rate
+# arm. Prefers the journal pair (p11_entry_journal + p11_return_journal,
+# each with 15-byte truncation, all twins summed) as p11_journal_pair;
+# falls back to ordinary p11_entry when the pair is absent. Exit 0 on a
+# reading; exit 4 with "absent" when neither pair nor ordinary matches;
+# exit 1 on corrupt input or a one-sided pair (entry without return or
+# vice versa: incomplete hooks, never absence or fallback).
+bpf_parse_armed_call_rate() {
+    python3 -I -c '
+import json, sys
+stats = sys.argv[1]
+try:
+    progs = json.load(sys.stdin)
+except Exception as exc:
+    sys.exit(f"bpftool output is not JSON with stats={stats}: {exc}")
+if type(progs) is not list:
+    sys.exit(f"bpftool output is not a prog list with stats={stats}")
+
+
+def read_counters(prog, want):
+    name = prog.get("name", "")
+    if name != want and name != want[:15]:
+        return None
+    row = []
+    for field in ("run_time_ns", "run_cnt"):
+        value = prog.get(field)
+        if value is None and stats == "1":
+            value = 0
+        if type(value) is not int or value < 0:
+            if value is None:
+                sys.exit(f"prog {name!r} has no {field} with stats={stats}"
+                         f" (a concurrent cell may have restored stats=0 or unloaded it)")
+            sys.exit(f"prog {name!r} has invalid {field} {value!r} with stats={stats}")
+        row.append(value)
+    return row
+
+
+entry_ns = entry_cnt = return_ns = return_cnt = 0
+entry_found = return_found = ordinary_found = False
+ordinary_ns = ordinary_cnt = 0
+for prog in progs:
+    if type(prog) is not dict:
+        continue
+    row = read_counters(prog, "p11_entry_journal")
+    if row is not None:
+        entry_found = True
+        entry_ns += row[0]
+        entry_cnt += row[1]
+        continue
+    row = read_counters(prog, "p11_return_journal")
+    if row is not None:
+        return_found = True
+        return_ns += row[0]
+        return_cnt += row[1]
+        continue
+    row = read_counters(prog, "p11_entry")
+    if row is not None:
+        ordinary_found = True
+        ordinary_ns += row[0]
+        ordinary_cnt += row[1]
+if entry_found or return_found:
+    if not (entry_found and return_found):
+        sys.exit("one-sided journal pair: entry_found=%s return_found=%s" % (entry_found, return_found))
+    print("p11_journal_pair", entry_ns + return_ns, entry_cnt + return_cnt)
+elif ordinary_found:
+    print("p11_entry", ordinary_ns, ordinary_cnt)
+else:
+    print("absent")
+    sys.exit(4)
+' "$1"
+}
+
+# bpf_delta BEFORE AFTER OPS ARM: print the "<ns> <cnt>" window delta.
+# Fail on backwards counters or a vacuous window: zero hook run time,
+# or fewer than one event per op, means unattached hooks, which must
+# fail the sample rather than certify zero cost.
+bpf_delta() {
+    bd_ns0=${1% *} bd_cnt0=${1#* }
+    bd_ns1=${2% *} bd_cnt1=${2#* }
+    [ "$bd_ns1" -ge "$bd_ns0" ] && [ "$bd_cnt1" -ge "$bd_cnt0" ] || {
+        echo "bpf counters went backwards" >&2
+        return 1
+    }
+    bd_ns=$((bd_ns1 - bd_ns0)) bd_cnt=$((bd_cnt1 - bd_cnt0))
+    [ "$bd_ns" -gt 0 ] || {
+        echo "$4 sample ran $3 ops with zero hook run time" >&2
+        return 1
+    }
+    [ "$bd_cnt" -ge "$3" ] || {
+        echo "$4 sample ran $3 ops with $bd_cnt hook events (< 1/op)" >&2
+        return 1
+    }
+    echo "$bd_ns $bd_cnt"
+}
+
+# bpf_check_prog_stable BEFORE_PROG AFTER_PROG: fail when the armed
+# call-rate reader flips programs mid-window (p11_journal_pair vs
+# p11_entry). A flip means the before/after counters come from
+# different hooks, so the sample must fail rather than mix them.
+bpf_check_prog_stable() {
+    if [ "$1" != "$2" ]; then
+        echo "bpf prog changed mid-sample: $1 vs $2" >&2
+        return 1
+    fi
+}
+
+# resolve_commit: set COMMIT and TREE_STATUS. P11SCOPE_BENCH_COMMIT
+# wins when set (required outside a git repo, e.g. the Fedora rsync
+# mirror); otherwise the commit comes from git. Outside a repo the
+# tree reads unknown-no-git. Returns nonzero when neither source works.
+resolve_commit() {
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        rc_git=1
+    else
+        rc_git=
+    fi
+    if [ -n "${P11SCOPE_BENCH_COMMIT-}" ]; then
+        COMMIT=$P11SCOPE_BENCH_COMMIT
+    elif [ -n "$rc_git" ]; then
+        COMMIT=$(git rev-parse HEAD) || return 1
+    else
+        return 1
+    fi
+    if [ -n "$rc_git" ]; then
+        TREE_STATUS=$(git status --porcelain -- . ':!target' | head -n 20 | tr '\n' ';')
+    else
+        TREE_STATUS=unknown-no-git
+    fi
+}
+
 if [ "${1-}" = "--dry-run" ]; then
     [ "$#" -eq 1 ] || { echo "usage: $0 [--self-test|--dry-run]" >&2; exit 2; }
     for knob in ROUNDS EXEC_OPS CALL_DURATION DURATION; do
@@ -183,6 +371,7 @@ if [ "${1-}" = "--self-test" ]; then
     trap 'rm -rf "$SELF_TEST_WORK"' EXIT INT TERM
     command -v gcc >/dev/null || { echo "self-test: gcc required" >&2; exit 1; }
     command -v python3 >/dev/null || { echo "self-test: python3 required" >&2; exit 1; }
+    command -v git >/dev/null || { echo "self-test: git required" >&2; exit 1; }
     gcc -O2 -Wall -Wextra -Werror -o "$SELF_TEST_WORK/exec-storm" \
         "$FIX/exec-storm.c" \
         || { echo "self-test: exec-storm does not compile" >&2; exit 1; }
@@ -223,6 +412,173 @@ EOF
         || { echo "self-test: analyzer self-test failed" >&2; exit 1; }
     sh "$0" --dry-run >/dev/null \
         || { echo "self-test: dry-run failed" >&2; exit 1; }
+    # bpf_parse_totals twins: bpftool omits zero counters, so with
+    # stats on an attached-but-idle program reads 0/0; a program that
+    # is not loaded reports absent (exit 4, never 0/0); stats off or a
+    # non-integer counter fails the read.
+    BPT_OUT=$(echo '[{"name": "p11_entry"}]' | bpf_parse_totals p11_entry 1) \
+        || { echo "self-test: absent counters misread" >&2; exit 1; }
+    [ "$BPT_OUT" = "0 0" ] \
+        || { echo "self-test: absent counters gave $BPT_OUT" >&2; exit 1; }
+    BPT_OUT=$(echo '[{"name": "p11_entry", "run_time_ns": 107, "run_cnt": 2006}]' \
+        | bpf_parse_totals p11_entry 1) \
+        || { echo "self-test: present counters misread" >&2; exit 1; }
+    [ "$BPT_OUT" = "107 2006" ] \
+        || { echo "self-test: present counters gave $BPT_OUT" >&2; exit 1; }
+    BPT_OUT=$(echo '[{"name": "sched_process_e", "run_time_ns": 100, "run_cnt": 2007}, {"name": "sched_process_e", "run_time_ns": 120, "run_cnt": 2007}]' \
+        | bpf_parse_totals sched_process_exec 1) \
+        || { echo "self-test: twin programs misread" >&2; exit 1; }
+    [ "$BPT_OUT" = "220 4014" ] \
+        || { echo "self-test: twin programs gave $BPT_OUT" >&2; exit 1; }
+    BPT_OUT=$(echo '[{"name": "p11_entry", "run_time_ns": 50, "run_cnt": 9}, {"name": "p11_entry"}]' \
+        | bpf_parse_totals p11_entry 1) \
+        || { echo "self-test: mixed counters misread" >&2; exit 1; }
+    [ "$BPT_OUT" = "50 9" ] \
+        || { echo "self-test: mixed counters gave $BPT_OUT" >&2; exit 1; }
+    if echo '[{"name": "p11_entry"}]' | bpf_parse_totals p11_entry 0 >/dev/null 2>&1; then
+        echo "self-test: stats-off read accepted" >&2; exit 1
+    fi
+    BPT_RC=0
+    echo '[]' | bpf_parse_totals p11_entry 1 >"$SELF_TEST_WORK/bpt.out" 2>/dev/null || BPT_RC=$?
+    [ "$BPT_RC" -eq 4 ] \
+        || { echo "self-test: missing program exit $BPT_RC" >&2; exit 1; }
+    [ "$(cat "$SELF_TEST_WORK/bpt.out")" = "absent" ] \
+        || { echo "self-test: missing program gave $(cat "$SELF_TEST_WORK/bpt.out")" >&2; exit 1; }
+    BPT_RC=0
+    echo '[{"name": "other", "run_time_ns": 1, "run_cnt": 1}]' | bpf_parse_totals p11_entry 1 >/dev/null 2>&1 || BPT_RC=$?
+    [ "$BPT_RC" -eq 4 ] \
+        || { echo "self-test: wrong-program exit $BPT_RC" >&2; exit 1; }
+    if echo '[{"name": "p11_entry", "run_time_ns": "107", "run_cnt": 5}]' | bpf_parse_totals p11_entry 1 >/dev/null 2>&1; then
+        echo "self-test: non-integer counter accepted" >&2; exit 1
+    fi
+    if echo '[{"name": "p11_entry", "run_time_ns": -1, "run_cnt": 5}]' | bpf_parse_totals p11_entry 1 >/dev/null 2>&1; then
+        echo "self-test: negative counter accepted" >&2; exit 1
+    fi
+    if echo 'not json' | bpf_parse_totals p11_entry 1 >/dev/null 2>&1; then
+        echo "self-test: non-JSON accepted" >&2; exit 1
+    fi
+    # bpf_parse_armed_call_rate twins: the sealed journal lane loads the
+    # journal pair, not ordinary entry. The armed call-rate reader prefers
+    # the pair (summed, each with 15-byte truncation) and falls back to
+    # ordinary entry when the pair is absent. A one-sided pair fails.
+    BPA_OUT=$(echo '[{"name": "p11_entry_journal", "run_time_ns": 100, "run_cnt": 1000}, {"name": "p11_return_journal", "run_time_ns": 120, "run_cnt": 1000}]' \
+        | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: journal pair misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_journal_pair 220 2000" ] \
+        || { echo "self-test: journal pair gave $BPA_OUT" >&2; exit 1; }
+    BPA_OUT=$(echo '[{"name": "p11_entry_journ", "run_time_ns": 50, "run_cnt": 500}, {"name": "p11_return_jour", "run_time_ns": 60, "run_cnt": 500}]' \
+        | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: truncated journal pair misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_journal_pair 110 1000" ] \
+        || { echo "self-test: truncated pair gave $BPA_OUT" >&2; exit 1; }
+    BPA_OUT=$(echo '[{"name": "p11_entry_journal"}, {"name": "p11_return_journal"}]' | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: idle journal pair misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_journal_pair 0 0" ] \
+        || { echo "self-test: idle pair gave $BPA_OUT" >&2; exit 1; }
+    BPA_OUT=$(echo '[{"name": "p11_entry_journal", "run_time_ns": 100, "run_cnt": 1000}, {"name": "p11_entry_journal", "run_time_ns": 100, "run_cnt": 1000}, {"name": "p11_return_journal", "run_time_ns": 120, "run_cnt": 1000}]' \
+        | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: twin journal entry misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_journal_pair 320 3000" ] \
+        || { echo "self-test: twin journal gave $BPA_OUT" >&2; exit 1; }
+    BPA_OUT=$(echo '[{"name": "p11_entry", "run_time_ns": 200, "run_cnt": 1500}]' | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: ordinary fallback misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_entry 200 1500" ] \
+        || { echo "self-test: fallback gave $BPA_OUT" >&2; exit 1; }
+    BPA_OUT=$(echo '[{"name": "p11_entry"}]' | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: idle fallback misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_entry 0 0" ] \
+        || { echo "self-test: idle fallback gave $BPA_OUT" >&2; exit 1; }
+    BPA_RC=0
+    echo '[]' | bpf_parse_armed_call_rate 1 >"$SELF_TEST_WORK/bpa.out" 2>/dev/null || BPA_RC=$?
+    [ "$BPA_RC" -eq 4 ] \
+        || { echo "self-test: armed missing exit $BPA_RC" >&2; exit 1; }
+    [ "$(cat "$SELF_TEST_WORK/bpa.out")" = "absent" ] \
+        || { echo "self-test: armed missing gave $(cat "$SELF_TEST_WORK/bpa.out")" >&2; exit 1; }
+    BPA_RC=0
+    echo '[{"name": "other", "run_time_ns": 1, "run_cnt": 1}]' | bpf_parse_armed_call_rate 1 >/dev/null 2>&1 || BPA_RC=$?
+    [ "$BPA_RC" -eq 4 ] \
+        || { echo "self-test: armed wrong-program exit $BPA_RC" >&2; exit 1; }
+    BPA_RC=0
+    echo '[{"name": "p11_entry_journal", "run_time_ns": 100, "run_cnt": 1000}]' | bpf_parse_armed_call_rate 1 >/dev/null 2>&1 || BPA_RC=$?
+    [ "$BPA_RC" -eq 1 ] \
+        || { echo "self-test: one-sided pair exit $BPA_RC" >&2; exit 1; }
+    if echo '[{"name": "p11_entry_journal"}]' | bpf_parse_armed_call_rate 0 >/dev/null 2>&1; then
+        echo "self-test: armed stats-off read accepted" >&2; exit 1
+    fi
+    if echo '[{"name": "p11_entry_journal", "run_time_ns": "100", "run_cnt": 5}, {"name": "p11_return_journal", "run_time_ns": 120, "run_cnt": 5}]' | bpf_parse_armed_call_rate 1 >/dev/null 2>&1; then
+        echo "self-test: armed non-integer accepted" >&2; exit 1
+    fi
+    if echo 'not json' | bpf_parse_armed_call_rate 1 >/dev/null 2>&1; then
+        echo "self-test: armed non-JSON accepted" >&2; exit 1
+    fi
+    # bpf_delta twins: the after-read gate. A vacuous window (no hook
+    # run time, or fewer than one event per op) fails the sample.
+    BPD_OUT=$(bpf_delta "0 0" "50000 2006" 2000 test) \
+        || { echo "self-test: healthy delta refused" >&2; exit 1; }
+    [ "$BPD_OUT" = "50000 2006" ] \
+        || { echo "self-test: bad delta $BPD_OUT" >&2; exit 1; }
+    BPD_OUT=$(bpf_delta "100 10" "300 2010" 2000 test) \
+        || { echo "self-test: nonzero-base delta refused" >&2; exit 1; }
+    [ "$BPD_OUT" = "200 2000" ] \
+        || { echo "self-test: bad nonzero-base delta $BPD_OUT" >&2; exit 1; }
+    if bpf_delta "0 0" "0 0" 2000 test >/dev/null 2>&1; then
+        echo "self-test: vacuous delta accepted" >&2; exit 1
+    fi
+    if bpf_delta "0 0" "0 2000" 2000 test >/dev/null 2>&1; then
+        echo "self-test: zero-time delta accepted" >&2; exit 1
+    fi
+    if bpf_delta "100 10" "200 20" 2000 test >/dev/null 2>&1; then
+        echo "self-test: short-count delta accepted" >&2; exit 1
+    fi
+    if bpf_delta "200 2010" "100 10" 2000 test >/dev/null 2>&1; then
+        echo "self-test: backwards delta accepted" >&2; exit 1
+    fi
+    # bpf_check_prog_stable twins: the mid-window guard. A stable
+    # program passes; a flip fails the sample with the same message.
+    bpf_check_prog_stable p11_journal_pair p11_journal_pair >/dev/null \
+        || { echo "self-test: stable prog refused" >&2; exit 1; }
+    if bpf_check_prog_stable p11_journal_pair p11_entry >/dev/null 2>&1; then
+        echo "self-test: changed prog accepted" >&2; exit 1
+    fi
+    BCS_OUT=$(bpf_check_prog_stable p11_journal_pair p11_entry 2>&1 >/dev/null || true)
+    case $BCS_OUT in *"changed mid-sample"*) : ;; *)
+        echo "self-test: bad prog-change message: $BCS_OUT" >&2; exit 1 ;;
+    esac
+    # resolve_commit twins: outside a repo the env commit is required
+    # and the tree reads unknown-no-git; inside a repo git stays.
+    RC_DIR=$(mktemp -d "$SELF_TEST_WORK/norepo-XXXXXX") \
+        || { echo "self-test: mktemp failed" >&2; exit 1; }
+    RC_OUT=$(cd "$RC_DIR" || exit 1; export GIT_CEILING_DIRECTORIES="$RC_DIR"; P11SCOPE_BENCH_COMMIT=deadbeef1234; export P11SCOPE_BENCH_COMMIT; resolve_commit || exit 1; printf '%s|%s' "$COMMIT" "$TREE_STATUS") \
+        || { echo "self-test: env commit refused outside a repo" >&2; exit 1; }
+    [ "$RC_OUT" = "deadbeef1234|unknown-no-git" ] \
+        || { echo "self-test: bad env resolve $RC_OUT" >&2; exit 1; }
+    if RC_OUT=$(cd "$RC_DIR" || exit 1; export GIT_CEILING_DIRECTORIES="$RC_DIR"; unset P11SCOPE_BENCH_COMMIT; resolve_commit); then
+        echo "self-test: missing commit accepted outside a repo" >&2; exit 1
+    fi
+    RC_REPO=$(mktemp -d "$SELF_TEST_WORK/repo-XXXXXX") \
+        || { echo "self-test: mktemp failed" >&2; exit 1; }
+    git -c init.defaultBranch=main init -q "$RC_REPO" \
+        || { echo "self-test: git init failed" >&2; exit 1; }
+    git -C "$RC_REPO" -c user.email=selftest@example -c user.name=selftest -c commit.gpgsign=false commit -q --allow-empty -m test \
+        || { echo "self-test: git commit failed" >&2; exit 1; }
+    RC_SHA=$(git -C "$RC_REPO" rev-parse HEAD) \
+        || { echo "self-test: git rev-parse failed" >&2; exit 1; }
+    RC_OUT=$(cd "$RC_REPO" || exit 1; unset P11SCOPE_BENCH_COMMIT; resolve_commit || exit 1; printf '%s|%s' "$COMMIT" "$TREE_STATUS") \
+        || { echo "self-test: git resolve failed" >&2; exit 1; }
+    [ "$RC_OUT" = "$RC_SHA|" ] \
+        || { echo "self-test: bad git resolve $RC_OUT" >&2; exit 1; }
+    echo dirty > "$RC_REPO/dirty.txt" \
+        || { echo "self-test: dirty write failed" >&2; exit 1; }
+    RC_OUT=$(cd "$RC_REPO" || exit 1; unset P11SCOPE_BENCH_COMMIT; resolve_commit || exit 1; printf '%s' "$TREE_STATUS") \
+        || { echo "self-test: dirty resolve failed" >&2; exit 1; }
+    case $RC_OUT in *"dirty.txt"*) : ;; *)
+        echo "self-test: dirty tree gave $RC_OUT" >&2; exit 1 ;;
+    esac
+    RC_OUT=$(cd "$RC_REPO" || exit 1; P11SCOPE_BENCH_COMMIT=envwins123; export P11SCOPE_BENCH_COMMIT; resolve_commit || exit 1; printf '%s|%s' "$COMMIT" "$TREE_STATUS") \
+        || { echo "self-test: env-over-repo resolve failed" >&2; exit 1; }
+    case $RC_OUT in "envwins123|"*"dirty.txt"*) : ;; *)
+        echo "self-test: env-over-repo gave $RC_OUT" >&2; exit 1 ;;
+    esac
     echo "bench-marker-cost self-test: OK"
     exit 0
 fi
@@ -419,6 +775,8 @@ wait_for_first_pass() {
 # program whose name is PROG or its 15-byte kernel truncation, or
 # "absent" when none is loaded. Sums (never picks one): with uprobe_multi
 # there is one program per hook anyway, and a sum cannot hide a twin.
+# A "0 0" reading means attached-but-idle with stats on (bpftool omits
+# zero counters); it is not absence.
 bpf_totals() {
     bpf_json=$(sudo -n bpftool -j prog show 2>"$WORK/bpftool.stderr")
     bpf_rc=$?
@@ -428,41 +786,42 @@ bpf_totals() {
         echo "bpf_stats_enabled=$(cat /proc/sys/kernel/bpf_stats_enabled 2>/dev/null)" >&2
         return 1
     fi
-    printf '%s' "$bpf_json" | python3 -I -c '
-import json, sys
-want = sys.argv[1]
-try:
-    with open("/proc/sys/kernel/bpf_stats_enabled", encoding="utf-8") as handle:
-        stats = handle.read().strip()
-except OSError:
-    stats = "unknown"
-try:
-    progs = json.load(sys.stdin)
-except Exception as exc:
-    sys.exit(f"bpftool output is not JSON with stats={stats}: {exc}")
-if type(progs) is not list:
-    sys.exit(f"bpftool output is not a prog list with stats={stats}")
-total_ns = total_cnt = 0
-found = False
-for prog in progs:
-    if type(prog) is not dict:
-        continue
-    name = prog.get("name", "")
-    if name != want and name != want[:15]:
-        continue
-    found = True
-    for field in ("run_time_ns", "run_cnt"):
-        value = prog.get(field)
-        if type(value) is not int or value < 0:
-            sys.exit(f"prog {name!r} has no integer {field} with stats={stats}"
-                     f" (a concurrent cell may have restored stats=0 or unloaded it)")
-    total_ns += prog["run_time_ns"]
-    total_cnt += prog["run_cnt"]
-if not found:
-    print("absent")
-else:
-    print(total_ns, total_cnt)
-' "$1"
+    bpf_stats=$(cat /proc/sys/kernel/bpf_stats_enabled 2>/dev/null || echo unknown)
+    if bpf_out=$(printf '%s' "$bpf_json" | bpf_parse_totals "$1" "$bpf_stats"); then
+        printf '%s\n' "$bpf_out"
+    else
+        bpf_rc=$?
+        if [ "$bpf_rc" -eq 4 ]; then
+            printf '%s\n' "$bpf_out"
+            return 0
+        fi
+        return 1
+    fi
+}
+
+# bpf_totals_armed_call_rate: "<prog> <run_time_ns> <run_cnt>" for the
+# armed call-rate arm (journal pair preferred, ordinary fallback), or
+# "absent" when neither is loaded. See bpf_parse_armed_call_rate.
+bpf_totals_armed_call_rate() {
+    bpf_json=$(sudo -n bpftool -j prog show 2>"$WORK/bpftool.stderr")
+    bpf_rc=$?
+    if [ "$bpf_rc" -ne 0 ] || [ -z "$bpf_json" ]; then
+        echo "bpftool prog show failed (exit $bpf_rc):" >&2
+        tail -n 3 "$WORK/bpftool.stderr" >&2 2>/dev/null || true
+        echo "bpf_stats_enabled=$(cat /proc/sys/kernel/bpf_stats_enabled 2>/dev/null)" >&2
+        return 1
+    fi
+    bpf_stats=$(cat /proc/sys/kernel/bpf_stats_enabled 2>/dev/null || echo unknown)
+    if bpf_out=$(printf '%s' "$bpf_json" | bpf_parse_armed_call_rate "$bpf_stats"); then
+        printf '%s\n' "$bpf_out"
+    else
+        bpf_rc=$?
+        if [ "$bpf_rc" -eq 4 ]; then
+            printf '%s\n' "$bpf_out"
+            return 0
+        fi
+        return 1
+    fi
 }
 
 if [ -n "$MODULE" ]; then
@@ -506,10 +865,9 @@ echo "=== discover ==="
 echo "=== machine ==="
 KERNEL=$(uname -r)
 CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
-COMMIT=$(git rev-parse HEAD)
+resolve_commit || die "no git repo in $PWD: set P11SCOPE_BENCH_COMMIT to the built commit"
 ON_SHA=$(sha256sum "$ON_OBSERVER" | cut -d' ' -f1)
 OFF_SHA=$(sha256sum "$OFF_OBSERVER" | cut -d' ' -f1)
-TREE_STATUS=$(git status --porcelain -- . ':!target' | head -n 20 | tr '\n' ';')
 echo "kernel: $KERNEL"
 echo "cpu: $CPU"
 echo "commit: $COMMIT"
@@ -586,6 +944,10 @@ run_sample() {
         exec-storm) rs_prog=sched_process_exec ;;
         call-rate) rs_prog=p11_entry ;;
     esac
+    rs_armed_call_rate=no
+    if [ "$rs_cell" = call-rate ] && [ "$rs_arm" = on-armed ]; then
+        rs_armed_call_rate=yes
+    fi
     SAMPLE_SEQ=$((SAMPLE_SEQ + 1))
     S=$WORK/sample-$(printf '%03d' "$SAMPLE_SEQ")-$rs_cell-$rs_arm-r$rs_round
     mkdir -p "$S" && chmod 0700 "$S" || die "sample dir"
@@ -644,7 +1006,11 @@ run_sample() {
         # exclusive host the real numbers come from).
         sudo -n sysctl -w kernel.bpf_stats_enabled=1 >/dev/null 2>&1 \
             || { echo "bpf stats re-assert failed" >&2; return 1; }
-        rs_bpf_before=$(bpf_totals "$rs_prog") || { echo "bpf before-read failed" >&2; return 1; }
+        if [ "$rs_armed_call_rate" = yes ]; then
+            rs_bpf_before=$(bpf_totals_armed_call_rate) || { echo "bpf before-read failed" >&2; return 1; }
+        else
+            rs_bpf_before=$(bpf_totals "$rs_prog") || { echo "bpf before-read failed" >&2; return 1; }
+        fi
     else
         rs_bpf_before=none
     fi
@@ -663,20 +1029,29 @@ run_sample() {
             ;;
     esac
     if [ "$rs_arm" != none ]; then
-        rs_bpf_after=$(bpf_totals "$rs_prog") || { echo "bpf after-read failed" >&2; return 1; }
-        if [ "$rs_bpf_before" = absent ] || [ "$rs_bpf_after" = absent ]; then
-            rs_bpf_ns=absent rs_bpf_cnt=absent
+        if [ "$rs_armed_call_rate" = yes ]; then
+            rs_bpf_after=$(bpf_totals_armed_call_rate) || { echo "bpf after-read failed" >&2; return 1; }
+            if [ "$rs_bpf_before" = absent ] || [ "$rs_bpf_after" = absent ]; then
+                rs_prog=p11_journal_pair
+                rs_bpf_ns=absent rs_bpf_cnt=absent
+            else
+                rs_prog_before=${rs_bpf_before%% *}
+                rs_rest_before=${rs_bpf_before#* }
+                rs_prog_after=${rs_bpf_after%% *}
+                rs_rest_after=${rs_bpf_after#* }
+                bpf_check_prog_stable "$rs_prog_before" "$rs_prog_after" || return 1
+                rs_prog=$rs_prog_before
+                rs_bpf=$(bpf_delta "$rs_rest_before" "$rs_rest_after" "$rs_ops" "$rs_arm") || return 1
+                rs_bpf_ns=${rs_bpf% *} rs_bpf_cnt=${rs_bpf#* }
+            fi
         else
-            rs_bns0=${rs_bpf_before% *} rs_bcnt0=${rs_bpf_before#* }
-            rs_bns1=${rs_bpf_after% *} rs_bcnt1=${rs_bpf_after#* }
-            [ "$rs_bns1" -ge "$rs_bns0" ] && [ "$rs_bcnt1" -ge "$rs_bcnt0" ] \
-                || { echo "bpf counters went backwards" >&2; return 1; }
-            rs_bpf_ns=$((rs_bns1 - rs_bns0)) rs_bpf_cnt=$((rs_bcnt1 - rs_bcnt0))
-            # A zero delta would certify unattached hooks: the workload ran
-            # rs_ops ops through a present hook, so require at least one
-            # event per op and positive run time.
-            [ "$rs_bpf_ns" -gt 0 ] || { echo "$rs_arm sample ran $rs_ops ops with zero hook run time" >&2; return 1; }
-            [ "$rs_bpf_cnt" -ge "$rs_ops" ] || { echo "$rs_arm sample ran $rs_ops ops with $rs_bpf_cnt hook events (< 1/op)" >&2; return 1; }
+            rs_bpf_after=$(bpf_totals "$rs_prog") || { echo "bpf after-read failed" >&2; return 1; }
+            if [ "$rs_bpf_before" = absent ] || [ "$rs_bpf_after" = absent ]; then
+                rs_bpf_ns=absent rs_bpf_cnt=absent
+            else
+                rs_bpf=$(bpf_delta "$rs_bpf_before" "$rs_bpf_after" "$rs_ops" "$rs_arm") || return 1
+                rs_bpf_ns=${rs_bpf% *} rs_bpf_cnt=${rs_bpf#* }
+            fi
         fi
         kill -INT "$SPID" 2>/dev/null || true
         if wait "$SPID"; then SPID=; else rs_status=$?; SPID=; echo "observer exited $rs_status" >&2; return 1; fi

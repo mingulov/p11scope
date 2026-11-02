@@ -3703,6 +3703,19 @@ impl CallerRegistry {
             .collect()
     }
 
+    /// Staged gaps awaiting the next commit, in stage order, with their
+    /// caller attribution: for twins that pin whom a disclosure names.
+    #[cfg(test)]
+    pub(crate) fn staged_gaps_for_test(&self) -> Vec<RegistryGap> {
+        self.staged
+            .iter()
+            .filter_map(|staged| match staged {
+                Mutation::RecordGap { gap } => Some(gap.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Stage one gap for the module `key` names, resolving the ID at
     /// publication (F3-04): `record_gap` resolves eagerly against the
     /// committed snapshot, which misses a first-discovered module whose

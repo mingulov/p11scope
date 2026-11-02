@@ -14709,26 +14709,35 @@ fn joint_original_loss_fans_out_before_ack() {
         && feed.reduced == 1
         && feed.staged == 0
         && feed.disposed == 1));
-    // Fail-visible: every Joint feed this loss ended names the seal
-    // failure (staged for the next publication), so `authority_lost`
-    // never stands without a cause.
-    let named = fixture
+    // Fail-visible: every caller whose Joint feed this loss ended names
+    // the seal failure (staged for the next publication), so
+    // `authority_lost` never stands without a cause. The gap carries
+    // its caller: a caller-less or misattributed gap fails here.
+    let mut degraded: Vec<_> = fixture
+        .feeds()
+        .iter()
+        .map(|feed| Some(feed.caller))
+        .collect();
+    degraded.sort();
+    let mut named: Vec<_> = fixture
         .scene
         .real
         .scene
         .coordinator
         .registry()
-        .staged_scope_gaps_for_test()
+        .staged_gaps_for_test()
         .into_iter()
-        .filter(|(subject, reason)| {
-            subject == "Joint key operations unavailable; retained S1"
-                && reason == "joint_seal_H3Loss_history_loss"
+        .filter(|gap| {
+            gap.subject == "Joint key operations unavailable; retained S1"
+                && gap.reason == "joint_seal_H3Loss_history_loss"
         })
-        .count();
+        .map(|gap| gap.caller)
+        .collect();
+    named.sort();
+    assert_eq!(degraded.len(), 2, "both Joint feeds ended");
     assert_eq!(
-        named,
-        fixture.feeds().len(),
-        "each ended Joint feed names its seal loss"
+        named, degraded,
+        "each ended Joint feed names its seal loss under its own caller"
     );
     {
         let mut ports = fixture

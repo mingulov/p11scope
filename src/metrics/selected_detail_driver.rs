@@ -1024,8 +1024,7 @@ pub(super) fn open_k0_window_with_losses(
         }
     };
     // The selection read's monotonic stamp: lifecycle at or before it
-    // is outside the window (STUB: stored but not yet bounding; the
-    // close still voids on every exec until the bound lands).
+    // is outside the window.
     let selection_stamp = match &before {
         Ok(read) => read.view().window.map(|window| window.finished_ns),
         Err(_) => None,

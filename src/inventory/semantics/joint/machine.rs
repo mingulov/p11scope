@@ -2705,7 +2705,33 @@ impl LiveJointMachine {
                         && !failed
                         && !requested
                         && original.attempted < RAW_CAPACITY;
-                    if !unrequested_empty && !needs_first_end {
+                    // Pre-grant extension on a linked lane: a quantum with
+                    // an in-flight journaled START, or with only count-only
+                    // setup calls among its H0 records, stays open for the
+                    // late rows — within the capacity, table and wall-time
+                    // bounds, and never past a failed collection, a
+                    // request, or Q.
+                    #[cfg(test)]
+                    let posed_pregrant_timeout = self.pose_pregrant_close_timeout;
+                    #[cfg(not(test))]
+                    let posed_pregrant_timeout = false;
+                    let pregrant_timed_out = || {
+                        posed_pregrant_timeout
+                            || original.pregrant_first_poll.is_none_or(|since| {
+                                Instant::now().duration_since(since) >= PREGRANT_CLOSE_TIMEOUT
+                            })
+                    };
+                    let pregrant_extend = self.grant.is_none()
+                        && self.producers.journal_linked()
+                        && !failed
+                        && !requested
+                        && original.attempted < RAW_CAPACITY
+                        && original.raw.pending_h0_records() < MAX_PENDING
+                        && !original.raw.begin_table_full_or_refused()
+                        && (original.raw.has_open_affecting_start()
+                            || original.raw.h0_records_all_count_only(lane.subset().plan()))
+                        && !pregrant_timed_out();
+                    if !unrequested_empty && !needs_first_end && !pregrant_extend {
                         // A requested transaction must not bind on a stale
                         // no-backlog poll: rows may have landed since idle
                         // services last pulled. The finish's first advance

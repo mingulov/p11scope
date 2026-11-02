@@ -3020,6 +3020,7 @@ fn joint_pregrant_skewed_end_joins_one_quantum() {
         scene.machine.retained_drain_grant_for_test().is_some(),
         "the bind mints the grant"
     );
+    scene.published();
     assert!(
         scene
             .scene
@@ -3030,7 +3031,6 @@ fn joint_pregrant_skewed_end_joins_one_quantum() {
             .journal_linked(),
         "the birth path latches the linked lane"
     );
-    scene.published();
     assert!(
         bind_probe_outcome(&mut scene, &input).is_ok(),
         "the image stays untainted"
@@ -3217,13 +3217,16 @@ fn joint_pregrant_pending_capacity_closes_during_extension() {
 }
 
 /// A filled BEGIN table closes an extending quantum even with a
-/// thousand open STARTs and no H0 record at all.
+/// thousand open STARTs: the setup record keeps the no-H0 hold out
+/// of the way, so only the table bound can close it.
 #[test]
 fn joint_pregrant_begin_table_full_closes_during_extension() {
     use crate::semantics_objects::journal::tests::{begin_bytes, function_id};
     let mut scene = pregrant_scene();
     publish_empty_first_quantum(&mut scene);
     scene.scene.drain.source_mut().bound = 4_096;
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
     for (chunk, threads) in [1..=400, 401..=800].into_iter().enumerate() {
         for thread in threads {
             let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);

@@ -991,7 +991,8 @@ class CurrentS1ModeTests(unittest.TestCase):
         subjects = ("semantic capture loss", "native capture lifecycle evidence lost",
                         "native capture retirement unsettled", "joint machine unavailable",
                         "native capture scope custody unproven", "native capture refused an extend",
-                        "rejected demoted count", "semantic admission refused")
+                        "rejected demoted count", "semantic admission refused",
+                        "native capture events lost", "native capture events loss unknown")
         cases = [(subject, "coverage_fault") for subject in subjects]
         cases += [("semantic capture loss", "joint_journal_unavailable"),
                   ("semantic input refused", "binding"), ("other", "joint machine unavailable")]

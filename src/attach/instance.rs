@@ -1204,13 +1204,11 @@ fn birth_rows_pidfd(
     pin.pidfd().map_err(|_| BirthRowError::Unreadable)
 }
 
-#[allow(dead_code)] // No Session-loop wire until live activation; tests drive fixtures.
 pub(crate) struct LiveBirthRows<'m> {
     maps: &'m InstanceMaps<'m>,
     pin: std::sync::Arc<crate::process::PidPin>,
 }
 
-#[allow(dead_code)] // As above.
 impl<'m> LiveBirthRows<'m> {
     pub(crate) fn over(
         maps: &'m InstanceMaps<'m>,
@@ -1294,7 +1292,6 @@ fn marker_control_verdict(
     }
 }
 
-#[allow(dead_code)] // As above.
 impl BirthRowReader for LiveBirthRows<'_> {
     fn read_marker_row(&mut self) -> std::result::Result<InstanceRecord, BirthRowError> {
         let pidfd = birth_rows_pidfd(&self.pin)?;

@@ -1344,6 +1344,19 @@ fn k0_broad_read(
     }
 }
 
+/// K0-comparable discovery losses: the live total minus the
+/// exit-ended loader-scan truncations, which prove their process
+/// exited and are not discovery loss. Production snapshots both ends
+/// of the window through this (contract §5 step 1 voids on growth of
+/// real loss only), so a short `run` child that exits before its
+/// provider load is processed leaves exit-only growth that renders
+/// instead of voiding.
+pub(crate) fn k0_comparable_losses(facts: &crate::render::CaptureFacts) -> [u64; 4] {
+    let mut losses = facts.discovery_losses();
+    losses[3] = losses[3].saturating_sub(facts.exit_ended_truncations());
+    losses
+}
+
 /// Production K0 open inside `capture_profile`: the selection-time
 /// broad read plus the shared open body. Plain budget numbers cross
 /// the metrics boundary (the limits type stays metrics-internal).

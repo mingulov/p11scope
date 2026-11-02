@@ -610,6 +610,15 @@ pub struct Engine {
     /// Batch-tail publications skipped as provably redundant (same proof).
     tail_skips: u64,
     discovery_truncated: u64,
+    /// Loader-scan truncations settled at a proven process exit (a
+    /// subset of `discovery_truncated`): the scan's process ended
+    /// before the scan resolved. K0's truncation-growth rule
+    /// subtracts this from the total, so a short child that exits
+    /// before its provider load is processed leaves no voiding
+    /// growth. In cgroup and system scopes a scope departure settles
+    /// here too, but K0 refuses those scopes by name, so no consumer
+    /// reads it there.
+    exit_ended_truncations: u64,
     pending_rejected_keys: BTreeSet<ObjectKey>,
     pending_retirements: BTreeSet<ProcessViewId>,
     retirement_intents: PendingViewRetirements,
@@ -9989,6 +9998,7 @@ impl Engine {
             tail_publishes: 0,
             tail_skips: 0,
             discovery_truncated: 0,
+            exit_ended_truncations: 0,
             pending_rejected_keys: BTreeSet::new(),
             pending_retirements: BTreeSet::new(),
             retirement_intents: PendingViewRetirements::new(),
@@ -10990,6 +11000,9 @@ impl Engine {
                 .saturating_add(self.malformed_discovery)
                 .saturating_add(self.loader_registry.discovery_truncated())
                 .saturating_add(self.loader_registry.context_failures()),
+            // The exit-ended subset of the engine's own truncation
+            // count above: K0 subtracts it from the total.
+            exit_ended_truncations: self.exit_ended_truncations,
         }
     }
 
@@ -12401,13 +12414,19 @@ impl Engine {
         self.mark_live_loss("live loader memory discovery", reason);
     }
 
-    /// A deferred scan whose process provably exited before the loader
-    /// transaction's RT_CONSISTENT. It stays a counted truncation, but not a
-    /// causal-timing loss: dlopen relocates and initializes an object only
-    /// after RT_CONSISTENT, so an object announced by RT_ADD in a process
-    /// that ended first never ran, and RT_DELETE introduces nothing (GT-4).
+    /// A deferred scan whose process provably exited before the scan
+    /// resolved. It stays a counted truncation (GT-4: the scan's table
+    /// was never published), but not a causal-timing loss: the exit
+    /// ended the loader observation the scan belonged to, so no later
+    /// timing proof can still need it. Exit is read at settle time —
+    /// the process may well have run (a short `run` child signs and
+    /// exits; only its scan outlived it) — and each such truncation is
+    /// also counted apart as exit-only, so K0's truncation-growth rule
+    /// can ignore growth the exiting process explains without hiding
+    /// real discovery loss.
     fn record_pending_loader_scan_end(&mut self, reason: &str) {
         self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
         self.mark_partial("live loader memory discovery", reason);
     }
 

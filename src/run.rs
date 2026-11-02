@@ -5379,7 +5379,7 @@ fn capture_profile(
             engine.plan(),
             engine.pinned(),
             session.pid_lifecycle_facts(),
-            engine.capture_facts().discovery_losses(),
+            metrics::selected_detail_driver::k0_comparable_losses(&engine.capture_facts()),
             owned.is_some(),
             &mut selection_ledger,
         );
@@ -6276,7 +6276,8 @@ fn capture_profile(
             let ledger = selection_ledger
                 .as_mut()
                 .expect("a K0 window implies a staged selection");
-            let after_losses = context.0.capture_facts().discovery_losses();
+            let after_losses =
+                metrics::selected_detail_driver::k0_comparable_losses(&context.0.capture_facts());
             metrics::selected_detail_driver::close_k0_production(
                 k0,
                 context.1,
@@ -14280,8 +14281,11 @@ mod tests {
             .split_once("fn run_terminal(")
             .expect("run_terminal")
             .1;
+        // The binding spans two lines in production; the pin below
+        // matches its head (production precedes the tests module, so
+        // the first match is the production site, not this string).
         let close_binding = terminal_fn
-            .find("let after_losses = ")
+            .find("let after_losses =")
             .expect("K0 close binding");
         let close_call = &terminal_fn[close_binding..];
         let close_losses = close_call

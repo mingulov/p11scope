@@ -3,6 +3,7 @@
 
 use super::super::activation::validate_capture_activation;
 use super::*;
+use crate::fixture_guard::DieWithParent as _;
 use std::sync::{Arc, Weak};
 
 fn accepts_cgroup(backend: AttachBackend) {
@@ -206,6 +207,7 @@ impl RetiringCapture {
             .env(CHILD, test_name)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);

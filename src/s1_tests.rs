@@ -11,6 +11,7 @@
 
 use crate::discovery::caller_registry::{CallerId, ModuleInfo, ModuleKey, RegistryLimits};
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
+use crate::fixture_guard::DieWithParent as _;
 use crate::inventory_dashboard::{DashboardState, DetailPage, Viewport, render_frame};
 use crate::inventory_events::{EventWriter, emit_snapshot_as_events};
 use crate::inventory_present::{Presentation, render_snapshot};
@@ -831,6 +832,7 @@ fn d2_same_file_double_load_with_scan_evidence_forces_unknown_with_named_gap() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .die_with_parent()
         .spawn()
         .expect("start the owned double-loader");
     // Bounded READY read: the loader acks or the test fails loud.

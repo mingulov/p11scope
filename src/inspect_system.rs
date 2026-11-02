@@ -5186,6 +5186,7 @@ mod tests {
 
     mod application {
         use super::*;
+        use crate::fixture_guard::DieWithParent as _;
         use crate::inspect_identity::{
             InspectApplicationResult, InspectIdentityUnknown, InspectImageReader,
             ProcessViewImageReader, application_from_confirmed_member, application_json,
@@ -5201,6 +5202,7 @@ mod tests {
                     .args(["-c", "printf 'ready\\n'; read trigger; exec /bin/sleep 30"])
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
+                    .die_with_parent()
                     .spawn()
                     .unwrap();
                 let mut ready = String::new();
@@ -7352,6 +7354,7 @@ mod d3a_adapter_tests {
         AttributionLoss, ConfirmIo, FdLease, KnownKeyIndex, ObjectChecks, OsConfirmIo, ProofTrace,
         ReservationOwner, SegmentPolicy,
     };
+    use crate::fixture_guard::DieWithParent as _;
     use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
     use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::sync::{Arc, Mutex};
@@ -7451,6 +7454,7 @@ mod d3a_adapter_tests {
         let child = Child(
             std::process::Command::new("sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );

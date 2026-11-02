@@ -4,6 +4,7 @@
 //! measurements. No result below declares an aggregate admission limit.
 
 use super::*;
+use crate::fixture_guard::DieWithParent as _;
 use std::mem::size_of;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -233,6 +234,7 @@ pub(crate) fn run_child(test: &str, profile: &str) -> serde_json::Value {
         .env("P11SCOPE_S1_RESOURCE_PROFILE", profile)
         .stdout(Stdio::from(output.try_clone().unwrap()))
         .stderr(Stdio::from(output.try_clone().unwrap()))
+        .die_with_parent()
         .spawn()
         .unwrap();
     let mut child = OwnedProbeChild(child);

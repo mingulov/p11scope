@@ -222,6 +222,7 @@ pub(crate) fn application_json(result: &InspectApplicationResult) -> serde_json:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_guard::DieWithParent as _;
 
     // Mutations caught: accepting unequal file metadata/path/start-time, naming
     // missing samples, and treating pidfd liveness as executable validation.
@@ -509,6 +510,7 @@ mod tests {
         let mut child = BirthChild(
             std::process::Command::new("sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );

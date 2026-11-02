@@ -2,6 +2,7 @@
 //! The capture loops' actual cancellation diagnostic over real stderr pipes.
 
 use super::*;
+use crate::fixture_guard::DieWithParent as _;
 use std::io::Read as _;
 use std::process::{Command, Stdio};
 
@@ -101,6 +102,7 @@ fn live_loop_cancel_marker_does_not_wait_for_full_stderr_pipe() {
         "blocked",
     )
     .stderr(Stdio::from(writer))
+    .die_with_parent()
     .spawn()
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);

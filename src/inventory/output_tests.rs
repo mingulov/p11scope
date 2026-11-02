@@ -1,6 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::*;
+use crate::fixture_guard::DieWithParent as _;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Read;
@@ -403,6 +404,7 @@ fn owned_cell(test: &str, cell: &str, body: impl FnOnce()) {
             .args(["--exact", test, "--test-threads=1", "--nocapture"])
             .env(CHILD_CELL, cell)
             .stdin(std::process::Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -866,6 +868,7 @@ fn fd_counts_after_success_error_and_cancel() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );

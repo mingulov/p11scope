@@ -7,6 +7,7 @@
 use super::super::activation::privileged_tests::{OwnedFixture, spawn_with_pid};
 use super::*;
 use crate::discovery::inventory_attach_set::tests as fx;
+use crate::fixture_guard::DieWithParent as _;
 use crate::plan::AdmissionPolicy;
 use anyhow::ensure;
 use std::time::Duration;
@@ -301,7 +302,10 @@ fn multi_pid_refused_where_unproven(tag: &str) -> Result<bool> {
     let Err(reason) = crate::attach::kernel_multi_pid_filter() else {
         return Ok(false);
     };
-    let mut target = std::process::Command::new("sleep").arg("30").spawn()?;
+    let mut target = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()?;
     let pin = PidPin::open(target.id()).map_err(anyhow::Error::msg);
     let refused = pin.map(|pin| prepare_on(CaptureScope::Pid(pin), AttachBackend::Multi));
     let _ = target.kill();
@@ -1100,6 +1104,7 @@ impl LineChild {
         let mut child = std::process::Command::new(path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .die_with_parent()
             .spawn()?;
         let input = child.stdin.take().context("stdin")?;
         let output = std::io::BufReader::new(child.stdout.take().context("stdout")?);
@@ -1261,7 +1266,10 @@ fn privileged_inventory_capture_stop_before_activation_repolls_custody_lp64() ->
     // C5.2 review fix 4: `begin_stop` from Prepared keeps the prepared PID
     // pin, so retiring and retired reads report custody as of their own
     // poll (held while the target lives, lost after it exits).
-    let mut target = std::process::Command::new("sleep").arg("30").spawn()?;
+    let mut target = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()?;
     let pid = target.id();
     let pin = PidPin::open(pid).map_err(anyhow::Error::msg)?;
     let capture = prepare(CaptureScope::Pid(pin))?;

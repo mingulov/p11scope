@@ -2,6 +2,7 @@
 //! Actual cold group fixtures: the first view opens after the leader is Z.
 
 use super::*;
+use crate::fixture_guard::DieWithParent as _;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -48,6 +49,7 @@ impl ColdLeaderSubject {
             .arg(workers.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let input = child.stdin.take().unwrap();

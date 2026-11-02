@@ -848,6 +848,7 @@ impl CounterSource for NativeSource<'_> {
 mod tests {
     use super::*;
     use crate::discovery::identity::PinnedObjectId;
+    use crate::fixture_guard::DieWithParent as _;
     use crate::metrics::KernelEvidence;
     use crate::metrics::counter_collector::{
         CounterCell, CounterCollector, CounterField, CounterHealth, CounterIssue, CounterLimits,
@@ -2533,6 +2534,7 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let mut fixture = OwnedFixture(child);
@@ -3011,6 +3013,7 @@ mod tests {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
+                .die_with_parent()
                 .spawn()
                 .unwrap();
             Self::from_child(child)
@@ -4444,6 +4447,7 @@ mod tests {
             .args(["-c", "printf 'READY 1 8192\n'; IFS= read -r unused"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let mut fixture = GrowthDriver::from_child(child);
@@ -5460,6 +5464,7 @@ mod tests {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );

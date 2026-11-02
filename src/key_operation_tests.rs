@@ -6,6 +6,7 @@
 //! H8 seal ingress, real `Presentation`); reference model constructors
 //! appear only where the brief's algorithm twins require them.
 
+use crate::fixture_guard::DieWithParent as _;
 use crate::semantics_edge::{
     EdgeSemantics, EffectOrigin, OpState, OperationEffect, OperationOutcome, SemanticCall,
 };
@@ -13977,6 +13978,7 @@ fn run_rsa_ledger() -> Vec<serde_json::Value> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .die_with_parent()
         .spawn()
         .expect("spawn rsa-ledger");
     use std::io::Write as _;

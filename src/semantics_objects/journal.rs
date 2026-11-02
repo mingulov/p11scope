@@ -6222,6 +6222,7 @@ pub(crate) mod tests {
         CallFacts, EntryIp, EpochReading, InstanceId, InstanceRouter, MapRange, Route,
         RouterLimits, StableObservation,
     };
+    use crate::fixture_guard::DieWithParent as _;
     use crate::inventory_semantics::AttestedSubset;
     use crate::semantic_capture::{Endpoint, RoutedCall};
     use p11scope_ebpf_common::instance::STAMP_VALID;
@@ -7786,6 +7787,7 @@ pub(crate) mod tests {
             // binding holds, and the drop above reaps every spawn.
             let child = std::process::Command::new("/bin/sleep")
                 .arg("120")
+                .die_with_parent()
                 .spawn()
                 .unwrap();
             let pid = child.id();
@@ -13252,6 +13254,7 @@ pub(crate) mod tests {
         ] {
             let child = std::process::Command::new("/bin/sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .unwrap();
             crossed.push(

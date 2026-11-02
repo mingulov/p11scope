@@ -6,6 +6,7 @@ use super::super::activation::InventoryAttachRequest;
 use super::super::callers::{BatchToken, BatchUnsupported, CallerBatchStep, CallerUseIo};
 use super::*;
 use crate::discovery::inventory_attach_set::tests as fx;
+use crate::fixture_guard::DieWithParent as _;
 use crate::plan::AdmissionPolicy;
 use p11scope_ebpf_common::inventory_callers::CALLER_ENTRY_COUNT_SATURATED;
 use std::path::PathBuf;
@@ -1582,6 +1583,7 @@ fn original_pid_exit_fact_requires_the_retained_pidfd_and_exact_scope() {
     let mut child = OwnedChild(
         std::process::Command::new("/bin/sleep")
             .arg("60")
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -1999,6 +2001,7 @@ impl PinnedChild {
         Self(
             std::process::Command::new("sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .expect("spawn sleep"),
         )

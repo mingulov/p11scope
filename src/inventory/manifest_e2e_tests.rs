@@ -17,6 +17,7 @@
 //! a populated S1 edge. Prints SCALE2_E2E lines.
 
 use super::*;
+use crate::fixture_guard::DieWithParent as _;
 use anyhow::ensure;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -195,6 +196,7 @@ impl E2eWorkload {
             .stdin(Stdio::null())
             .stdout(private_log(out)?)
             .stderr(private_log(&stderr)?)
+            .die_with_parent()
             .spawn()
             .context("spawning ledger")?;
         Ok(E2eProcess {
@@ -546,6 +548,7 @@ fn privileged_inventory_system_manifest_e2e_softhsm_edges_lp64() -> Result<()> {
         .stdin(Stdio::null())
         .stdout(observer_log.try_clone()?)
         .stderr(observer_log)
+        .die_with_parent()
         .spawn()
         .context("spawning observer")?;
     println!("MAN1_E2E observer spawned pid={}", child.id());
@@ -952,6 +955,7 @@ fn build_capacity_tail(directory: &Path, endpoints: usize) -> Result<(PathBuf, P
         .stdin(Stdio::null())
         .stdout(private_log(&out)?)
         .stderr(private_log(&stderr)?)
+        .die_with_parent()
         .spawn()
         .context("spawning the capacity-tail helper")?;
     let mut helper = E2eProcess { child, out, stderr };
@@ -1087,6 +1091,7 @@ impl ScaleHolder {
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(out)?)
             .stderr(std::fs::File::create(&err)?)
+            .die_with_parent()
             .spawn()
             .context("spawning holder")?;
         Ok(Self {
@@ -1310,6 +1315,7 @@ fn privileged_inventory_system_manifest_scale4097_softsm_edges_lp64() -> Result<
         .stdin(Stdio::null())
         .stdout(observer_log.try_clone()?)
         .stderr(observer_log);
+    command.die_with_parent();
     let mut child = command.spawn().context("spawning observer")?;
     println!("SCALE2_E2E observer spawned pid={}", child.id());
     let gate_deadline = Instant::now() + Duration::from_secs(180);

@@ -25,6 +25,7 @@
 //! That is acceptable for a proof-only object: it never loads outside
 //! these tests.
 
+use crate::fixture_guard::DieWithParent as _;
 use sha2::Digest as _;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -2251,6 +2252,7 @@ impl BankProofDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -5022,6 +5024,7 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .expect("spawn one short controlled child");
         let stdin = child.stdin.take().expect("piped stdin");
@@ -5284,6 +5287,7 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .die_with_parent()
             .spawn()
             .expect("spawn hold");
         let mut line = String::new();

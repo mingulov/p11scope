@@ -2009,13 +2009,32 @@ fn ab_is_edge_of(line: &serde_json::Value, pid: u32, inode: u64) -> bool {
 /// scanning and the eager call then ran before the attach, uncounted.
 /// `unknown` (e.g. `not_attached`) never opens the gate.
 fn ab_edge_armed(lines: &[serde_json::Value], pid: u32, inode: u64) -> bool {
+    ab_edge_published_in(lines, pid, inode, &["watched_no_use", "counted"])
+}
+
+/// Whether the stream carries a record of `pid`'s edge to the module
+/// with `inode` in one of `states`.
+fn ab_edge_published_in(
+    lines: &[serde_json::Value],
+    pid: u32,
+    inode: u64,
+    states: &[&str],
+) -> bool {
     lines.iter().any(|line| {
         ab_is_edge_of(line, pid, inode)
-            && matches!(
-                line["event"]["entries"]["coverage"]["state"].as_str(),
-                Some("watched_no_use" | "counted")
-            )
+            && line["event"]["entries"]["coverage"]["state"]
+                .as_str()
+                .is_some_and(|state| states.contains(&state))
     })
+}
+
+/// B's pre-init readiness witness (the end of its quarantine): B's edge
+/// is published watched but unused — attached, so its `C_Initialize`
+/// will be counted — and A's first count is already published, so A
+/// counts strictly before B by construction, not by a timing margin.
+fn ab_pre_init_ready(lines: &[serde_json::Value], pid: u32, a_inode: u64, b_inode: u64) -> bool {
+    ab_edge_published_in(lines, pid, b_inode, &["watched_no_use"])
+        && ab_edge_published_in(lines, pid, a_inode, &["counted"])
 }
 
 /// Gate2's readiness witness: the stream already shows B's first count
@@ -2085,6 +2104,82 @@ fn ab_gate1_opens_only_on_our_attached_edge() {
         lines.push(ab_witness_edge(6, pid, a, state, 0));
         assert!(ab_edge_armed(&lines, pid, a), "{state}");
     }
+}
+
+/// The pre-init twin: B watched but unused AND A counted, both for OUR
+/// pid. Either half alone, B merely `not_attached`, B already counted,
+/// or A counted under another pid holds the gate.
+#[test]
+fn ab_pre_init_opens_only_when_b_is_watched_and_a_counted() {
+    let (pid, a, b) = (41, 7, 8);
+    let b_watched = ab_witness_edge(1, pid, b, "watched_no_use", 0);
+    let a_counted = ab_witness_edge(2, pid, a, "counted", 10);
+    assert!(!ab_pre_init_ready(&[], pid, a, b));
+    assert!(!ab_pre_init_ready(
+        std::slice::from_ref(&b_watched),
+        pid,
+        a,
+        b
+    ));
+    assert!(!ab_pre_init_ready(
+        std::slice::from_ref(&a_counted),
+        pid,
+        a,
+        b
+    ));
+    assert!(!ab_pre_init_ready(
+        &[ab_witness_edge(1, pid, b, "unknown", 0), a_counted.clone()],
+        pid,
+        a,
+        b
+    ));
+    assert!(!ab_pre_init_ready(
+        &[ab_witness_edge(1, pid, b, "counted", 1), a_counted.clone()],
+        pid,
+        a,
+        b
+    ));
+    assert!(!ab_pre_init_ready(
+        &[
+            b_watched.clone(),
+            ab_witness_edge(2, pid + 1, a, "counted", 10)
+        ],
+        pid,
+        a,
+        b
+    ));
+    assert!(!ab_pre_init_ready(
+        &[
+            b_watched.clone(),
+            ab_witness_edge(2, pid, a, "watched_no_use", 0)
+        ],
+        pid,
+        a,
+        b
+    ));
+    assert!(ab_pre_init_ready(&[b_watched, a_counted], pid, a, b));
+}
+
+/// The file-level twin of [`ab_gate_lines`]: only `edge_observed` and
+/// `pass_committed` records come back, in order; an unrelated record and
+/// a torn last line (still being written) are skipped, and a missing
+/// log reads empty.
+#[test]
+fn ab_gate_lines_keeps_only_complete_edge_and_commit_records() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let events = dir.path().join("system.jsonl");
+    assert!(ab_gate_lines(&events).is_empty());
+    let edge = ab_witness_edge(2, 41, 7, "watched_no_use", 0);
+    let commit = ab_witness_commit(3);
+    std::fs::write(
+        &events,
+        format!(
+            "{{\"kind\": \"started\", \"seq\": 1, \"event\": {{}}}}\n{edge}\n{commit}\n\
+             {{\"kind\": \"edge_observed\", \"seq\": 4, \"event\": {{\"caller\": \"c41\""
+        ),
+    )?;
+    assert_eq!(ab_gate_lines(&events), vec![edge, commit]);
+    Ok(())
 }
 
 /// The gate2 twin: B's first count must reappear unchanged after a
@@ -2366,10 +2461,12 @@ fn ab_idle_hold_requires_two_unchanged_records_across_a_commit() {
 /// the observer published A as attached for it (the post-gate1 eager
 /// call, caching the caller), then maps provider B — a second provider
 /// instance — strictly after capture starts. B sits mapped-but-idle
-/// through a quarantine, publishes exactly one counted call
-/// (`C_Initialize`), stays idle until the stream shows that count held
-/// across an idle commit, then runs the rest. Both gates open on these
-/// published readiness witnesses, never on a fixed delay. The stream
+/// through a quarantine that ends once the stream shows B watched but
+/// unused and A's first count published, publishes exactly one counted
+/// call (`C_Initialize`), stays idle until the stream shows that count
+/// held across an idle commit, then runs the rest. All three gates open
+/// on these published readiness witnesses, never on a fixed delay. The
+/// stream
 /// must show B discovered after its gate with A
 /// already counted (P3's cached-caller sequence), B's first counted record
 /// (published before gate2) at exactly that one call, an unchanged counted
@@ -2385,8 +2482,10 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
     std::fs::copy(softhsm(), &b_path)?;
     let gate = workload.path("gate");
     let gate2 = workload.path("gate2");
+    let pre_init = workload.path("pre-init");
     let gate_arg = gate.to_str().context("gate path")?.to_string();
     let gate2_arg = gate2.to_str().context("gate2 path")?.to_string();
+    let pre_init_arg = pre_init.to_str().context("pre-init gate path")?.to_string();
     let b_arg = b_path.to_str().context("B path")?.to_string();
     let ab = workload.spawn(
         "AB",
@@ -2404,10 +2503,10 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
             "1",
             "--gate",
             &gate_arg,
-            "--delay-ms",
-            "5000",
             "--single-call",
             "1",
+            "--pre-init-gate",
+            &pre_init_arg,
             "--gate2",
             &gate2_arg,
             "--hold",
@@ -2428,6 +2527,7 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
     let started = Instant::now();
     let started_ns = monotonic_ns();
     let gate1_ns = Cell::new(0u64);
+    let pre_init_ns = Cell::new(0u64);
     let gate2_ns = Cell::new(0u64);
     let done_at = RefCell::new(None::<Instant>);
     let events = workload.path("system.jsonl");
@@ -2435,9 +2535,12 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
         // Readiness witnesses instead of fixed delays (polled every
         // service tick: no sleep). Gate1 opens only once the observer
         // published this caller's A edge as attached: the eager call
-        // then runs after A's attach, so it is counted. Gate2 opens only
-        // once the stream shows B's first count held unchanged across a
-        // distinct idle commit.
+        // then runs after A's attach, so it is counted. B's quarantine
+        // ends only once the stream shows B watched but unused and A's
+        // first count published: B's `C_Initialize` is then counted, and
+        // A-before-B is structural. Gate2 opens only once the stream
+        // shows B's first count held unchanged across a distinct idle
+        // commit.
         if gate1_ns.get() == 0 || gate2_ns.get() == 0 {
             let lines = ab_gate_lines(&events);
             if gate1_ns.get() == 0 && ab_edge_armed(&lines, ab_pid, a_inode) {
@@ -2445,6 +2548,13 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
                 gate1_ns.set(monotonic_ns());
             }
             if gate1_ns.get() != 0
+                && pre_init_ns.get() == 0
+                && ab_pre_init_ready(&lines, ab_pid, a_inode, b_inode)
+            {
+                let _ = std::fs::write(&pre_init, b"");
+                pre_init_ns.set(monotonic_ns());
+            }
+            if pre_init_ns.get() != 0
                 && gate2_ns.get() == 0
                 && ab_first_count_held_idle(&lines, ab_pid, b_inode)
             {
@@ -2463,6 +2573,7 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
     let modules = vec![PathBuf::from(softhsm()), b_path.clone()];
     let (document, stream) = run_product_modules(InspectScope::System, &modules, &events, &stop)?;
     ensure!(gate1_ns.get() != 0, "gate1 never opened");
+    ensure!(pre_init_ns.get() != 0, "B's pre-init gate never opened");
     ensure!(gate2_ns.get() != 0, "gate2 never opened");
     ensure!(done_at.borrow().is_some(), "the AB ledger never finished");
     ensure!(
@@ -2723,6 +2834,16 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
         a_first_counted.at_ns,
         gate1_ns.get()
     );
+    // The quarantine's own premise, re-checked from the stream: A's
+    // first count was published before B's pre-init gate opened, and B
+    // first counted only after it.
+    ensure!(
+        a_first_counted.at_ns < pre_init_ns.get() && pre_init_ns.get() < first_counted.at_ns,
+        "A first counted at {}, B's pre-init gate opened at {}, B first counted at {}",
+        a_first_counted.at_ns,
+        pre_init_ns.get(),
+        first_counted.at_ns
+    );
     ensure!(
         a_first_counted.at_ns < first_counted.at_ns,
         "A first counted at {}, B first counted at {}: the cached-caller premise needs A first \
@@ -2763,12 +2884,13 @@ fn privileged_native_lane_system_ab_first_count_lp64() -> Result<()> {
     );
     ensure!(stream_ended(&stream), "the stream did not end");
     eprintln!(
-        "C51_AB pid={} passes={} gate1_after_start_ms={} gate2_after_gate1_ms={} a_final={} \
-         b_first={} b_final={} witnesses={witnesses}",
+        "C51_AB pid={} passes={} gate1_after_start_ms={} pre_init_after_gate1_ms={} \
+         gate2_after_pre_init_ms={} a_final={} b_first={} b_final={} witnesses={witnesses}",
         ab.pid(),
         document["observation"]["passes"],
         gate1_ns.get().saturating_sub(started_ns) / 1_000_000,
-        gate2_ns.get().saturating_sub(gate1_ns.get()) / 1_000_000,
+        pre_init_ns.get().saturating_sub(gate1_ns.get()) / 1_000_000,
+        gate2_ns.get().saturating_sub(pre_init_ns.get()) / 1_000_000,
         edge_a["entries"]["count"],
         first_counted.count,
         edge_b["entries"]["count"],

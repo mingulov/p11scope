@@ -200,7 +200,7 @@ class BpfKernelsContractTests(unittest.TestCase):
 
     def test_active_positives_and_one_combined_stock_refusal_are_separate(self):
         self.assertEqual(matrix_kernels(self.bpf),
-                         ["v6.6.157", "v6.12.111", "v6.18.58"])
+                         ["v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1"])
         controls = re.findall(r"- kernel: (v[0-9.]+)\n\s+refusal_control: true", self.bpf)
         self.assertEqual(controls, ["v6.1.188"])
         self.assertEqual(self.bpf.count("scripts/check-multi-host-refusal.py"), 1)

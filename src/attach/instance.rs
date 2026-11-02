@@ -1316,9 +1316,9 @@ impl BirthRowReader for LiveBirthRows<'_> {
 /// issuance token drops with the take (the grant was issued at
 /// attestation). Compiled into production builds but constructed only by
 /// tests: the live seal checks births through `observe_retained_birth`
-/// in `semantic_capture`. No live exec-marker birth can succeed at this
-/// revision anyway: the only object that publishes a generation (the
-/// journal object, under `--key-operations`) has no READY writer.
+/// in `semantic_capture`. Live exec-marker births succeed in opted-in
+/// `--key-operations` sessions, where the journal object publishes both
+/// the generation and the READY writer.
 #[allow(dead_code)] // Production-compiled, test-constructed (see above).
 pub(crate) struct ExecBirthSource<'a, R> {
     rows: R,

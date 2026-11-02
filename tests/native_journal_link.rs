@@ -19,12 +19,13 @@ fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 const OUTPUT: &str = "journal-proof-v1/p11scope-ebpf-journal-proof-v1";
-const PRODUCERS: [&str; 6] = [
+const PRODUCERS: [&str; 7] = [
     "p11_journal_begin",
     "p11_journal_returning",
     "p11_journal_settle_prepare",
     "p11_journal_settle_finish",
     "p11_owner_start_remove_reason",
+    "p11_instance_exec_birth",
     "p11_instance_scope_gap",
 ];
 
@@ -280,7 +281,6 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
         assert!(functions.contains(name), "missing real native {name}");
     }
     for forbidden in [
-        "p11_instance_exec_birth",
         "p11_journal_marker_publish",
         "p11_journal_combined_entry",
         "p11_journal_combined_return",
@@ -352,6 +352,7 @@ expected = {
     'p11_journal_settle_prepare': (4, (('ptr', 16), ('int', 4), ('ptr', 72))),
     'p11_journal_settle_finish': (4, (('ptr', 72), ('int', 4))),
     'p11_owner_start_remove_reason': (8, (('ptr', 16), ('int', 4), ('int', 4))),
+    'p11_instance_exec_birth': (4, ()),
     'p11_instance_scope_gap': (4, ()),
 }
 for name, (result_size, arguments) in expected.items():
@@ -369,7 +370,7 @@ for name, (result_size, arguments) in expected.items():
             assert btf.resolve(node[2])[0] == 4 and btf.size(node[2]) == size, name + ' pointee'
         else:
             assert node[0] == 1 and node[2] == size, name + ' scalar argument'
-print('six actual native producer/loss BTF signatures verified')
+print('seven actual native producer/loss BTF signatures verified')
 "#,
         ])
         .arg(&path)
@@ -439,8 +440,22 @@ fn journal_proof_never_enters_ordinary_objects_or_loader_sources() {
         } else {
             assert!(!gap, "ordinary object selected p11_instance_scope_gap");
         }
+        let birth = object
+            .functions
+            .values()
+            .any(|function| function.name == "p11_instance_exec_birth");
+        if marker && index == 0 {
+            assert!(
+                birth,
+                "marker-enabled Detailed object lost p11_instance_exec_birth"
+            );
+        } else {
+            assert!(!birth, "ordinary object selected p11_instance_exec_birth");
+        }
         assert!(!object.functions.values().any(|function| {
-            function.name != "p11_instance_scope_gap" && PRODUCERS.contains(&function.name.as_str())
+            function.name != "p11_instance_scope_gap"
+                && function.name != "p11_instance_exec_birth"
+                && PRODUCERS.contains(&function.name.as_str())
         }));
     }
     let mut pending = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
@@ -846,7 +861,6 @@ fn journal_production_elf_replaces_pair_and_retains_shapes() {
         assert!(functions.contains(name), "missing real native {name}");
     }
     for forbidden in [
-        "p11_instance_exec_birth",
         "p11_journal_marker_publish",
         "p11_journal_combined_entry",
         "p11_journal_combined_return",

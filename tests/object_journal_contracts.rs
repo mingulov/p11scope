@@ -1677,6 +1677,7 @@ fn object_journal_marker_calls_and_declarations_share_the_gate() {
     let mut calls = 0;
     let mut declarations = 0;
     let mut private_gap_calls = 0;
+    let mut combined_birth_calls = 0;
     let mut region_calls = std::collections::BTreeMap::new();
     for (index, line) in lines.iter().enumerate() {
         let line = line.trim();
@@ -1691,20 +1692,32 @@ fn object_journal_marker_calls_and_declarations_share_the_gate() {
             let combined = prefix.iter().any(|line| {
                 line.trim() == "#[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]"
             });
-            if line.starts_with("fn p11_instance_scope_gap(") {
-                assert!(combined, "gap declaration needs both private selectors");
+            if line.starts_with("fn p11_instance_scope_gap(")
+                || line.starts_with("fn p11_instance_exec_birth(")
+            {
+                assert!(combined, "marker declaration needs both private selectors");
             } else if combined {
-                assert_eq!(
-                    line, "p11_instance_scope_gap();",
-                    "private selector cannot enable birth"
-                );
-                assert!(
-                    prefix
-                        .iter()
-                        .any(|line| line.contains("JOURNAL || cfg!(p11scope_birth_marker)")),
-                    "ordinary specialization must retain its birth-only gate"
-                );
-                private_gap_calls += 1;
+                if line == "p11_instance_scope_gap();" {
+                    assert!(
+                        prefix
+                            .iter()
+                            .any(|line| line.contains("JOURNAL || cfg!(p11scope_birth_marker)")),
+                        "ordinary specialization must retain its birth-only gate"
+                    );
+                    private_gap_calls += 1;
+                } else {
+                    assert_eq!(
+                        line, "p11_instance_exec_birth();",
+                        "combined gate enables only the two marker calls"
+                    );
+                    assert!(
+                        !prefix
+                            .iter()
+                            .any(|line| line.contains("JOURNAL || cfg!(p11scope_birth_marker)")),
+                        "the exec-root birth call is compile-time gated, never runtime gated"
+                    );
+                    combined_birth_calls += 1;
+                }
             } else {
                 assert!(
                     prefix
@@ -1737,6 +1750,7 @@ fn object_journal_marker_calls_and_declarations_share_the_gate() {
     assert_eq!(calls, 16);
     assert_eq!(declarations, 2);
     assert_eq!(private_gap_calls, 10);
+    assert_eq!(combined_birth_calls, 1);
 }
 
 /// H8-D marker drop arms: every silent in-scope drop arm calls the scope
@@ -2393,7 +2407,7 @@ fn object_journal_variant_inventory_policy_cases_are_driven() {
             "JournalMarkerInventoryTests.test_release_detailed_marker_presence_accepts",
             "JournalMarkerInventoryTests.test_release_diagnostic_and_wide_variants_forbid_marker",
             "JournalMarkerInventoryTests.test_journal_variant_accepts_frozen_inventory",
-            "JournalMarkerInventoryTests.test_journal_variant_refuses_birth_and_missing_gap",
+            "JournalMarkerInventoryTests.test_journal_variant_requires_birth_gap_and_map",
             "JournalMarkerInventoryTests.test_journal_variant_refuses_inventory_map_and_drift",
         ])
         .output()

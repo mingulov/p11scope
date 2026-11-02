@@ -58,7 +58,7 @@ struct task_struct___p11inst {
     unsigned int flags;
 #ifdef P11SCOPE_JOURNAL_MARKER
     /* H8-D birth marker: the leader's exec generation, read at exec
-     * only. Detailed-only so counter bitcode stays identical. */
+     * only. Detailed/journal only, so counter bytes stay identical. */
     u64 self_exec_id;
 #endif
 } INST_BTF;
@@ -590,8 +590,8 @@ static INST_INLINE void marker_latch(struct journal_admission_control *ctl)
 #endif
 
 #ifdef P11SCOPE_JOURNAL_MARKER
-/* H8-D post-attach birth marker, exec half (Detailed only): publish
- * READY(self_exec_id) on the leader's PROC_EPOCH row after closure.
+/* H8-D post-attach birth marker, exec half (Detailed/journal):
+ * publish READY(self_exec_id) after closure on the leader row.
  * p11_instance_exec stays unchanged and runs first; this only marks.
  * Returns 1 when the marker is READY for this exec, 0 when gated,
  * sticky-DIRTY, latched, or left rowless by a task-storage NULL.
@@ -674,9 +674,9 @@ latch:
 #endif
 
 #if defined(P11SCOPE_JOURNAL_MARKER) || defined(P11SCOPE_JOURNAL_GAP)
-/* H8-D scope gap (Detailed only): a watched call refused for scope or
- * ABI dirties the leader's marker, so a later exec cannot claim the
- * uncaptured prefix as born. Reads no argument, user memory, path,
+/* H8-D scope gap (Detailed and journal): a watched call refused for
+ * scope or ABI dirties the leader's marker, so a later exec cannot
+ * claim the uncaptured prefix as born. Reads no argument, user memory, path,
  * name, or exec ID. Returns 1 when the row is DIRTY at return
  * (marked, or already), 0 when gated, latched, or failed. Gap
  * failures latch and fault; later gaps no-op on the latch without

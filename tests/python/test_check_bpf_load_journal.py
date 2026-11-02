@@ -632,6 +632,24 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 77, result.stdout)
         self.assertIn("cc not on PATH", result.stderr)
 
+    def test_missing_vng_exits_77(self):
+        # vng is a prerequisite like cc: only dirname is on PATH,
+        # so the gate reaches the vng check first and exits 77.
+        out = self.work / "out"
+        out.mkdir()
+        minbin = self.work / "minbin"
+        minbin.mkdir()
+        real_dirname = shutil.which("dirname")
+        self.assertIsNotNone(real_dirname)
+        (minbin / "dirname").symlink_to(real_dirname)
+        env = {**os.environ, "PATH": str(minbin)}
+        result = subprocess.run(
+            [str(SCRIPT), str(self.bin / "observer"), str(self.probe),
+             str(self.manifest), str(out), KERNEL],
+            capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(result.returncode, 77, result.stdout)
+        self.assertIn("vng not on PATH", result.stderr)
+
 
 class ScriptContractTests(unittest.TestCase):
     """Pin the gate's wiring (verdicts are proved by the fake guests)."""

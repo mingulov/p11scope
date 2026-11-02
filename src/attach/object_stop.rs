@@ -215,7 +215,7 @@ mod tests {
         reason: ClassifiedReason,
     }
 
-    /// Pinned 11-row table: every capture-object program outside the
+    /// Pinned 12-row table: every capture-object program outside the
     /// 17-program source scan, with the object(s) holding it, its section
     /// kind and why it needs no gate. A new program fails closed.
     const CLASSIFIED: &[ClassifiedRow] = &[
@@ -257,6 +257,14 @@ mod tests {
             kind: ClassifiedKind::FEntry,
             source_file: "image_identity_query.c",
             section_or_attr: "fentry/exec_mm_release",
+            reason: ClassifiedReason::NegativeOnly,
+        },
+        ClassifiedRow {
+            name: "p11_image_mmap_release",
+            objects: &[ClassifiedObject::Detailed],
+            kind: ClassifiedKind::FExit,
+            source_file: "image_identity_query.c",
+            section_or_attr: "fexit/exec_mmap",
             reason: ClassifiedReason::NegativeOnly,
         },
         ClassifiedRow {
@@ -660,7 +668,7 @@ mod tests {
             .iter()
             .map(|program| program.name.clone())
             .collect();
-        assert_eq!(CLASSIFIED.len(), 11, "the classified table pins 11 rows");
+        assert_eq!(CLASSIFIED.len(), 12, "the classified table pins 12 rows");
         for row in CLASSIFIED {
             assert!(
                 !scanned.contains(row.name),
@@ -673,9 +681,9 @@ mod tests {
             );
         }
         #[cfg(feature = "unsafe-unvalidated-metadata")]
-        let detailed_expected = 25;
+        let detailed_expected = 26;
         #[cfg(not(feature = "unsafe-unvalidated-metadata"))]
-        let detailed_expected = 20;
+        let detailed_expected = 21;
         let objects = [
             (
                 ClassifiedObject::Detailed,
@@ -762,7 +770,7 @@ mod tests {
 
     #[test]
     fn capture_native_programs_match_classified_gate() {
-        // The 9 C rows: scan every classified C source, then compare
+        // The 10 C rows: scan every classified C source, then compare
         // (name, file, section) triples against the pinned table exactly.
         let mut found = Vec::new();
         for (file, source) in NATIVE_C_SOURCES {
@@ -782,7 +790,7 @@ mod tests {
             .collect();
         actual.sort_unstable();
         eprintln!("scanned C programs ({}): {actual:?}", actual.len());
-        assert_eq!(actual, expected, "the C sources hold exactly the 9 C rows");
+        assert_eq!(actual, expected, "the C sources hold exactly the 10 C rows");
         let body_of = |name: &str| {
             found
                 .iter()

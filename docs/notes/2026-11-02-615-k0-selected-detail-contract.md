@@ -82,9 +82,10 @@ always renders (possibly empty).
 ## 5. What voids the detail (checked in this order, first hit wins)
 
 1. Unclean close boundary ⇒ `broad_stopping` (quiescence unproven, post-Q
-   discovery consumed blind, the quiesce-error path, or discovery
-   truncation growing inside the window — including a terminal drain
-   that stopped at its allowance).
+   discovery consumed blind, the quiesce-error path, or real discovery
+   truncation growing inside the window — the total minus the
+   exit-ended scan count, including a terminal drain that stopped at
+   its allowance).
 2. The slot's retirement: the close plan no longer publishes the selected
    slot index with the identical `{object, file_offset}` key ⇒
    `not_published` (the word's documented meaning covers retired rows).
@@ -109,12 +110,15 @@ always renders (possibly empty).
      zero-timestamp exit still voids as `promotion_caller_changed`.
      Live cells: a `--pid` target exiting in the window renders the
      calls before the exit, and so does an owned `run` child that
-     exits a few seconds after loading. Known issue: a process that
-     exits before the observer processes its provider-load records
-     makes the engine count an exit-ended loader-scan truncation
-     (`record_pending_loader_scan_end`); step 1's truncation-growth
-     rule then voids as `broad_stopping`. Separating that count from
-     real discovery loss is an engine change, post-v0.6.0.
+     exits a few seconds after loading. Exit-ended loader-scan
+     truncations (`record_pending_loader_scan_end`, counted apart as
+     exit-only) do not void: step 1 compares the total minus that
+     count, so the immediate-exit shape renders whenever its loader
+     fallout is exit-only. Loader records that arrive after the view
+     retires still reject as real truncation and void as
+     `broad_stopping`, so an immediate exit voids intermittently (3
+     of 13 local runs); the delayed-exit cell pins the deterministic
+     shape.
 4. Capture loss/overflow in the window, via the close read and the
    collector: failed close read ⇒ `quarantined` / `budget` / else
    `broad_plan_topology`; collector `Unavailable` (saturated, contended,

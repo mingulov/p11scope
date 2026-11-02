@@ -469,9 +469,7 @@ with --counter-mode on profile or run. The name must resolve to exactly one broa
 it resolves once at start, and a provider loaded after start needs --prearm-module <provider.so> (with run, usually required). An unknown or ambiguous name refuses by name and the
 capture continues aggregate-only. The detail is the function's own broad-counter cells between selection and close; if the
 watched process replaces itself (exec) in between, the detail is withheld with a named reason, a leader exit that is the
-last lifecycle record ends the window cleanly (known issue: a process that exits before its provider load is processed, such
-as a run child that exits at once, withholds it as broad_stopping), and --cgroup/--system refuse the selection by name
-(no single process to detail).
+last lifecycle record ends the window cleanly, and --cgroup/--system refuse the selection by name (no single process to detail).
 The selection attempt is recorded in the report's additive selected_detail ledger; aggregate and detail counts are never summed.
 Provider identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
@@ -507,9 +505,8 @@ Aggregate across the selected scope; counts are not per application.
 detail while aggregate counters continue; the name must resolve to exactly one broad slot, once at
 start (a provider loaded after start needs --prearm-module <provider.so>). The detail is the function's
 own broad-counter cells between selection and close; an exec of the watched process in between withholds it with a named
-reason, a leader exit that is the last lifecycle record ends the window cleanly (known issue: an
-exit before the provider load is processed withholds it as broad_stopping), and --cgroup/--system
-refuse by name.
+reason, a leader exit that is the last lifecycle record ends the window cleanly, and
+--cgroup/--system refuse by name.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
 --track-short-lived (default off) is extensive mode: the kernel records exec-time
 executable identity and unmatched exits classify into STATIC HINT linkage classes.
@@ -561,9 +558,7 @@ Profile and metrics counts are aggregate, not per application; --trace selects c
 detail while aggregate counters continue; the name must resolve to exactly one broad slot, once at
 start (a provider loaded after start needs --prearm-module <provider.so>; with run it is usually
 required). The detail is the function's own broad-counter cells between selection and close; an exec of the owned child in between withholds it with a named reason
-while a leader exit that is the last lifecycle record ends the window cleanly. Known issue: a child that
-exits before its provider load is processed (it loads and exits at once) withholds the detail as
-broad_stopping; a child that runs on for a few seconds after loading is unaffected.
+while a leader exit that is the last lifecycle record ends the window cleanly.
 --pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --track-short-lived (default off) is extensive mode: the kernel records exec-time
@@ -4246,14 +4241,14 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        // 9463 / 0xa3f823915c8b8ba7 (exit-before-load known issue,
-        // merged over inventory `--key-operations`): USAGE diff vs the
-        // 9317/0xdfb3f736aedb0b7f pin is exactly the known-issue clause
-        // after the leader-exit sentence of the `--select-endpoint`
-        // flag paragraph; no other drift. Pair measured by the
+        // 9317 / 0xdfb3f736aedb0b7f (exit-only split, merged over
+        // inventory `--key-operations`): the known-issue clause is gone,
+        // restoring the pre-disclosure bytes exactly. USAGE diff vs the
+        // 9463/0xa3f823915c8b8ba7 pin is exactly that removal with its
+        // line wrap restored; no other drift. Pair measured by the
         // usage-pin extractor, which reproduces the 8794, 8851 and 9060 pins.
-        assert_eq!(USAGE.len(), 9463);
-        assert_eq!(hash, 0xa3f823915c8b8ba7);
+        assert_eq!(USAGE.len(), 9317);
+        assert_eq!(hash, 0xdfb3f736aedb0b7f);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

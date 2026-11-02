@@ -2332,6 +2332,10 @@ fn object_journal_marker_wired_detailed_only() {
 #[test]
 fn object_journal_elf_matches_detailed_attribute_capture() {
     if !expected_journal_selected() {
+        eprintln!(
+            "journal not selected in this build (P11SCOPE_JOURNAL=0, or a SMALL, WIDE, \
+             unsafe, proof or counter build): no journal ELF to compare"
+        );
         return;
     }
     let journal = std::path::Path::new(env!("OUT_DIR")).join("journal-v1/p11scope-ebpf-journal-v1");

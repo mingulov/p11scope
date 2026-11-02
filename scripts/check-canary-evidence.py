@@ -2721,6 +2721,9 @@ def main(argv=None):
             name for name, definition in BPF_MAP_DEFS["UNSAFE_MAPS"].items()
             if definition["type"] == RINGBUF
         }, "a new owned ringbuf needs its exact record length here"
+        # The marker map must be in the default policy, or the subtraction
+        # below would hold vacuously.
+        assert "JOURNAL_MARKER_CTL" in SAFE_MAPS, "default policy lacks the marker map"
         assert SAFE_MAPS and FEATURE_MAPS == (SAFE_MAPS - {"JOURNAL_MARKER_CTL"}) | {"ATTR_BOOL_BITS", "PAIR_CALLS"}
         assert {
             "COUNTERS", "DISCOVERY", "DISCOVERY_STATE", "PAUSE_PIDS",

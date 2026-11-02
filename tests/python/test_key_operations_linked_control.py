@@ -42,7 +42,7 @@ FAKE_OBSERVER = """#!/usr/bin/env python3
 # Fake observer: seal line on stderr, canned doc on -o, SIGINT-stop.
 # KEYOPS_SELFTEST_SCENARIO: populated | unavailable | unavailable-empty |
 # unavailable-bootstrap | unavailable-bootstrap-gaps | diag-gaps-16 |
-# garbage-doc | accept-with-token |
+# diag-gaps-unreadable | garbage-doc | accept-with-token |
 # refuse-CODE:MESSAGE | die-at-3 | exit-0-silent
 # Python (not shell): an async-launched bourne shell cannot trap SIGINT
 # back from the inherited ignore, while sigaction always can.
@@ -77,7 +77,8 @@ DOCS = {"populated": ("populated", "rev 1"),
         "unavailable-empty": ("unavailable", ""),
         "unavailable-bootstrap": ("unavailable", "bootstrap_unavailable"),
         "unavailable-bootstrap-gaps": ("unavailable", "bootstrap_unavailable"),
-        "diag-gaps-16": ("unavailable", "journal_unavailable")}
+        "diag-gaps-16": ("unavailable", "journal_unavailable"),
+        "diag-gaps-unreadable": ("unavailable", "journal_unavailable")}
 status, reason = DOCS.get(scenario, ("unavailable", "journal_unavailable"))
 
 
@@ -88,6 +89,8 @@ def gaps_json():
     if scenario == "diag-gaps-16":
         return ('[{"subject": "semantic admission refused", '
                 '"reason": "semantic_unavailable:no_receipt", "repeats": 16}]')
+    if scenario == "diag-gaps-unreadable":
+        return '5'
     return '[]'
 
 
@@ -350,6 +353,44 @@ class LinkedControlTests(unittest.TestCase):
         self.assertIn("bootstrap_unavailable", pid_row["detail"])
         self.assertIn("while no Joint feed exists", pid_row["detail"])
 
+    def test_pid_populated_pass_nonzero_exit_is_failed(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "populated", "linked-pid": "populated"},
+            extra_env={"FAKE_OBS_EXIT": "1"})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
+        pid_row = rows["linked-pid"]
+        self.assertEqual((pid_row["pass"], pid_row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("not the pinned signature", pid_row["detail"])
+        sys_row = rows["linked-system"]
+        self.assertEqual((sys_row["pass"], sys_row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("not the pinned signature", sys_row["detail"])
+
+    def test_pid_populated_refusal_is_failed(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "populated", "linked-pid": "populated"},
+            extra_env={"FAKE_EXIT": "1",
+                       "FAKE_TEXT": "refused: pid shape text"})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
+        pid_row = rows["linked-pid"]
+        self.assertEqual((pid_row["pass"], pid_row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("oracle refused", pid_row["detail"])
+        self.assertIn("pid shape text", pid_row["detail"])
+
+    def test_pid_populated_refusal_nonzero_exit_is_failed_with_text(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "populated", "linked-pid": "populated"},
+            extra_env={"FAKE_EXIT": "1",
+                       "FAKE_TEXT": "refused: pid exit1 text",
+                       "FAKE_OBS_EXIT": "1"})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
+        pid_row = rows["linked-pid"]
+        self.assertEqual((pid_row["pass"], pid_row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("pid exit1 text", pid_row["detail"])
+
     def test_nonzero_exit_is_not_the_pinned_signature(self):
         proc, outdir, rows = self.run_script(
             {"linked-system": "unavailable", "linked-pid": "populated"},
@@ -430,6 +471,16 @@ class LinkedControlTests(unittest.TestCase):
                          (False, "failed"))
         self.assertIn("66 current observations", row["detail"])
 
+    def test_flag_off_s1_forces_settle_zero(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "populated", "linked-pid": "populated"},
+            extra_env={"SETTLE_S": "10"})
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        row = rows["flag-off-s1"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (True, "qualified"))
+        self.assertIn("settle 0", row["detail"])
+
     def test_settle10_diagnostic_reports_gaps_as_known_issue(self):
         proc, outdir, rows = self.run_script(
             {"linked-system": "populated", "linked-pid": "populated",
@@ -465,6 +516,16 @@ class LinkedControlTests(unittest.TestCase):
         self.assertEqual((diag["pass"], diag["qualification"]),
                          (False, "failed"))
         self.assertIn("flow failed", diag["detail"])
+
+    def test_settle10_unreadable_gaps_is_failed(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "populated", "linked-pid": "populated",
+             "flag-off-s1-settle10": "diag-gaps-unreadable"})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
+        diag = rows["flag-off-s1-settle10"]
+        self.assertEqual((diag["pass"], diag["qualification"]),
+                         (False, "failed"))
+        self.assertIn("unreadable", diag["detail"])
 
     def test_no_manifest_refusal_and_off_nonqualifying(self):
         proc, outdir, rows = self.run_script(
@@ -619,10 +680,23 @@ class LinkedControlTests(unittest.TestCase):
                 pass
 
         # Premise: an async child ignores SIGINT, so its trap stays dead.
+        # Dash installs the ignore post-fork; poll for it briefly instead
+        # of a single read that can catch mid-setup (SigIgn 0000/0004).
         proc, pid = launch(f'"{stub}"')
         try:
-            with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
-                status = handle.read()
+            deadline = time_mod.time() + 5
+            status = ""
+            while True:
+                try:
+                    with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
+                        status = handle.read()
+                except FileNotFoundError:
+                    break
+                if "SigIgn:\t0000000000000006" in status:
+                    break
+                if time_mod.time() >= deadline:
+                    break
+                time_mod.sleep(0.05)
             self.assertIn("SigIgn:\t0000000000000006", status)
             os.kill(pid, sig_mod.SIGINT)
             time_mod.sleep(1)
@@ -635,18 +709,21 @@ class LinkedControlTests(unittest.TestCase):
             close_held(proc)
             proc.communicate(timeout=10)
         # With the helper, an async exec target observes default
-        # SIGINT/SIGQUIT and its handler fires. A Python target: it reads
+        # SIGINT/SIGQUIT and its handler fires. A Python target: it captures
         # its own entry mask before installing anything, so the mask
-        # assertion below is the helper's doing, not self-restore.
+        # assertion below is the helper's doing, not self-restore; the
+        # handler is installed before ENTRYMASK is printed so the SIGINT
+        # below always lands on the handler instead of the default.
         target = self.directory / "trap-target.py"
         target.write_text(
             "#!/usr/bin/env python3\n"
             "import signal, sys, time\n"
             "mask = open('/proc/self/status').read()\n"
             "line = next(l for l in mask.splitlines() if l.startswith('SigIgn:'))\n"
-            "print('ENTRYMASK', line.split()[1], flush=True)\n"
+            "entry = line.split()[1]\n"
             "signal.signal(signal.SIGINT,\n"
             "              lambda s, f: (print('TRAPPED'), sys.exit(0)))\n"
+            "print('ENTRYMASK', entry, flush=True)\n"
             "time.sleep(30)\n")
         target.chmod(0o755)
         proc = subprocess.Popen(

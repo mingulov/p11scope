@@ -3172,6 +3172,10 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// C_AsyncGetID with a null output pointer set ASYNC_VALUE_UNREADABLE
 /// with one evidence bump, plus their comment lines): 144520 B,
 /// measured with this same lexer on the integrated source.
+/// Re-baselined for the journal READY writer: the exec-root birth call
+/// and its declaration widened to the combined
+/// `any(p11scope_birth_marker, p11scope_journal_roots)` cfg, +58 stripped
+/// B: 144578 B, measured with this same lexer on the integrated source.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3181,8 +3185,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            144520,
-            "b95e25da1090ecb50a1d4ee37487b301bcf0c8bee3f963d975d83c8ba7d676e2"
+            144578,
+            "340dc418e9ec9740da866264f3add2f7a47f0cf3eacab6dfdcca2e022d938667"
         ),
         "stripped BPF dump must stay byte-identical"
     );

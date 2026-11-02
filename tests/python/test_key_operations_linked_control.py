@@ -276,6 +276,18 @@ class LinkedControlTests(unittest.TestCase):
         self.assertEqual((row["pass"], row["qualification"]), (False, "failed"))
         self.assertIn("s1 topology mismatch", row["detail"])
 
+    def test_s1_count_drift_is_expected_failure(self):
+        proc, outdir, rows = self.run_script(
+            {}, extra_env={"FAKE_S1_EXIT": "1",
+                           "FAKE_S1_TEXT": ("S1 child API returns are not exactly"
+                                            " 65 current observations")})
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        row = rows["flag-off-s1"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (True, "expected-failure"))
+        self.assertIn("S1 shape drift", row["detail"])
+        self.assertIn("api_returns=?", row["detail"])
+
     def test_no_manifest_refusal_and_off_nonqualifying(self):
         proc, outdir, rows = self.run_script(
             {"flag-without-manifest": "refuse-2:p11scope: need a manifest"},

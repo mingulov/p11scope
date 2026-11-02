@@ -901,6 +901,20 @@ class BrowserCells(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self._pinbound_rig(stats, self._pinbound_timeout_facts())
 
+    def test_pinbound_rejects_refusal_without_cert_request(self):
+        """Twin: a refusal without CertificateRequest progress must fail the cell.
+
+        The server ties a refusal to an observed outbound
+        CertificateRequest on the same connection; the assertion must
+        enforce that tie fail-closed (symmetric with the stall leg),
+        so a refusal without that proof never witnesses selection.
+        """
+        stats = self._pinbound_stats(
+            client_hello_complete=1, client_cert_alerts=1, cert_refusals=1,
+            cert_requests_sent=0)
+        with self.assertRaises(AssertionError):
+            self._pinbound_rig(stats, self._pinbound_timeout_facts())
+
     def test_pinbound_rig_healthy_accepted(self):
         """Guard: the rig passes with a boundary witness (no over-reject)."""
         self._pinbound_rig(
@@ -1628,6 +1642,33 @@ class BrowserS1Oracle(unittest.TestCase):
         violations = attach_cells_with_opened_floor(
             Path(__file__).read_text())
         self.assertEqual(violations, [])
+
+    def test_attach_cells_flag_non_literal_s1(self):
+        """Twin: a non-literal s1= in an attach cell must be flagged.
+
+        The window guard cannot prove a floor-free s1 from a name, a
+        call, or an unpacking, so each must be a violation rather
+        than a silent bypass.
+        """
+        template = (
+            "import unittest\n"
+            "\n"
+            "class BrowserCells(unittest.TestCase):\n"
+            '    @gate("firefox")\n'
+            "    def test_probe_cell(self):\n"
+            "        cells.attach_drive(\"PROBE\", \"firefox\", work, url, flow, lib)\n"
+            "        self.check_report(result, store, s1=%s)\n"
+        )
+        for expr in ("FLOOR_S1", "dict()", "{**BASE}"):
+            with self.subTest(s1=expr):
+                self.assertEqual(
+                    attach_cells_with_opened_floor(template % expr),
+                    ["test_probe_cell"])
+        self.assertEqual(
+            attach_cells_with_opened_floor(template % "{}"), [])
+        self.assertEqual(
+            attach_cells_with_opened_floor(template % '{"sessions_opened_min": 1}'),
+            ["test_probe_cell"])
 
 
 if __name__ == "__main__":

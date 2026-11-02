@@ -2721,7 +2721,7 @@ def main(argv=None):
             name for name, definition in BPF_MAP_DEFS["UNSAFE_MAPS"].items()
             if definition["type"] == RINGBUF
         }, "a new owned ringbuf needs its exact record length here"
-        assert SAFE_MAPS and FEATURE_MAPS == SAFE_MAPS | {"ATTR_BOOL_BITS", "PAIR_CALLS"}
+        assert SAFE_MAPS and FEATURE_MAPS == (SAFE_MAPS - {"JOURNAL_MARKER_CTL"}) | {"ATTR_BOOL_BITS", "PAIR_CALLS"}
         assert {
             "COUNTERS", "DISCOVERY", "DISCOVERY_STATE", "PAUSE_PIDS",
             "TASK_COOKIE", "COOKIE_CTL", "THREAD_OWNER", "OWNER_CTL",

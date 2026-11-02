@@ -12402,11 +12402,13 @@ impl Engine {
         counters.object_skips
     }
 
-    fn publish_current_capture_facts(&mut self) -> Result<()> {
-        // A failed or staged publication cannot keep an earlier planning
-        // proof alive. Successful stationary loader finalization may reseed.
-        self.loader_plan_cache = None;
+    /// Records the capture's object skips into the committed plan, reporting
+    /// whether the plan's skip list changed. Deferred publication shares
+    /// this with the full path: a changed list means the merge would fold
+    /// newly visible loss, so the commit must publish.
+    fn record_publication_skips(&mut self) -> bool {
         let skips_start = crate::attach::monotonic_ns();
+        let before = self.plan.skipped.clone();
         record_object_skips(&mut self.plan, &self.counters.object_skips);
         self.stage_timings.span(
             crate::timing::StageKind::Projection,
@@ -12414,6 +12416,21 @@ impl Engine {
             skips_start,
             crate::attach::monotonic_ns(),
         );
+        self.plan.skipped != before
+    }
+
+    fn publish_current_capture_facts(&mut self) -> Result<()> {
+        // A failed or staged publication cannot keep an earlier planning
+        // proof alive. Successful stationary loader finalization may reseed.
+        self.loader_plan_cache = None;
+        self.record_publication_skips();
+        self.merge_and_project_capture_facts()
+    }
+
+    /// Merges committed state into the capture history and projects it onto
+    /// the plan and discovery evidence. Deferred publication skips this when
+    /// its gate proves the merge a no-op; every other path runs it.
+    fn merge_and_project_capture_facts(&mut self) -> Result<()> {
         let merge_start = crate::attach::monotonic_ns();
         let merged = self.capture_facts.merge_current(
             &self.plan,
@@ -12970,17 +12987,26 @@ impl Engine {
             .is_some_and(|candidate_loader| {
                 loader_pins.exactly_matches(local_loader, &candidate_pins, candidate_loader)
             });
-        // Probe on a disposable clone: fallback retains the original exact
-        // loader restoration and global canonicalization path unchanged.
+        // Canonicalize the candidate pins directly instead of a probe
+        // clone. With no folds the canonicalizer is the identity (empty
+        // remaps mutate nothing), so the stationary path below commits
+        // exactly what the probe would have approved; with folds the miss
+        // path re-canonicalizes idempotently, and the lost skips join the
+        // derivation inputs so the same skips record in the same order.
         let stationary = if skipped.is_empty() && had_exact_loader {
-            let mut probe = candidate_pins.clone();
-            let (folds, lost) = canonicalize_scanned_overlays(&mut probe);
-            probe
+            let (folds, lost) = canonicalize_scanned_overlays(&mut candidate_pins);
+            let clean = folds == 0 && lost.is_empty();
+            skipped.extend(lost);
+            candidate_pins
                 .id_for_scanned(loader_module, loader_module.key, &loader_module.path)
                 .is_some_and(|loader| {
-                    folds == 0
-                        && lost.is_empty()
-                        && self.loader_inputs_are_stationary(view, loader_module, &probe, loader)
+                    clean
+                        && self.loader_inputs_are_stationary(
+                            view,
+                            loader_module,
+                            &candidate_pins,
+                            loader,
+                        )
                 })
         } else {
             false
@@ -13021,7 +13047,14 @@ impl Engine {
                 manifest_selection_admissions: Vec::new(),
                 // No manifest/selection admission can use rollback inventory.
                 manifest_inventory_slots: BTreeMap::new(),
-                loader_plan_proof: None,
+                // The cache hit implies stationary, and this literal
+                // constructs every proof conjunct: the delta is built
+                // empty, modules/corroboration/tables are clones of `Eq`
+                // types (reflexive), and stationary's empty
+                // manifest-fallback and selection-claim requirements match
+                // the empty constructed maps. Attach the proof (always
+                // `Some` here) without re-walking the structures.
+                loader_plan_proof: proof,
                 exec_preservations: Vec::new(),
                 exec_completions: Vec::new(),
                 built_by_full_rebuild: false,
@@ -13033,19 +13066,20 @@ impl Engine {
                 .iter()
                 .map(|module| module.scanned.clone())
                 .collect();
-            self.live_candidate(candidate_pins, raw_modules, skipped)?
+            let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+            if candidate.delta.new.is_empty()
+                && candidate.delta.replace.is_empty()
+                && candidate.delta.retire.is_empty()
+                && candidate.modules == self.modules
+                && candidate.corroboration == self.counters.corroboration
+                && candidate.manifest_fallbacks == self.counters.manifest_fallbacks
+                && candidate.selection_claims == self.selection_claims
+                && candidate.selection_tables == self.selection_tables
+            {
+                candidate.loader_plan_proof = proof;
+            }
+            candidate
         };
-        if candidate.delta.new.is_empty()
-            && candidate.delta.replace.is_empty()
-            && candidate.delta.retire.is_empty()
-            && candidate.modules == self.modules
-            && candidate.corroboration == self.counters.corroboration
-            && candidate.manifest_fallbacks == self.counters.manifest_fallbacks
-            && candidate.selection_claims == self.selection_claims
-            && candidate.selection_tables == self.selection_tables
-        {
-            candidate.loader_plan_proof = proof;
-        }
         candidate.views.insert(view);
         let loader = candidate
             .pinned
@@ -14337,6 +14371,25 @@ impl Engine {
             })
     }
 
+    /// Deferral pin identity: every committed pin must be present and
+    /// identical (identity plus sources) in the candidate. Candidate
+    /// extras are ignored: the loader derivation retains pins the
+    /// committed store never holds (its loader pin), and extras are
+    /// merge-invisible — the merge folds only plan-referenced pins,
+    /// every one of which the last merge read from the committed
+    /// store, and the plan itself is compared identical separately.
+    /// Store-level flags stay whole-store: an extra that flips
+    /// overlay uncertainty or rejects a key still publishes.
+    fn pins_match_for_deferral(candidate: &PinnedObjects, committed: &PinnedObjects) -> bool {
+        candidate.has_overlay_uncertainty() == committed.has_overlay_uncertainty()
+            && candidate.newly_rejected_keys(committed).is_empty()
+            && committed.newly_rejected_keys(candidate).is_empty()
+            && committed.pinned().all(|pin| {
+                candidate.exactly_matches(pin.id, committed, pin.id)
+                    && candidate.sources(pin.id) == committed.sources(pin.id)
+            })
+    }
+
     /// The one complete finalization for a candidate whose links were already
     /// mutated. It never short-circuits and never returns: a lost generation
     /// downgrades the disposition and cleans up, it does not unwind.
@@ -14372,6 +14425,14 @@ impl Engine {
             .loader_plan_proof
             .take()
             .map(|proof| (proof, candidate.plan.clone()));
+        // Publication-deferral leg 1: nothing dirtied the merge inputs
+        // between the last merge and this commit. Every merge-input
+        // mutation (scans, loss markers, evictions, selection recording,
+        // counter pushes, snapshot restores) bumps the revision, so
+        // equality with the last published revision proves the inputs
+        // below are still what that merge folded. Snapshotted at entry:
+        // this commit's own dirty must not satisfy its own gate.
+        let revision_before_commit = self.facts_revision;
         let selection_pending = candidate.selection_admission.take();
         outcome.stale_views = stale_process_views(&self.views, extra_views, &candidate.views);
         let retired = !outcome.stale_views.is_empty();
@@ -14696,23 +14757,62 @@ impl Engine {
         }
         let withdrew = candidate.plan.slots.len() != slots_before_withdraw;
         record_object_skips(&mut candidate.plan, &self.counters.object_skips);
-        outcome.changed |= candidate.plan != self.plan;
+        let plan_reproduced = candidate.plan == self.plan;
+        outcome.changed |= !plan_reproduced;
+        // Publication-deferral leg 2: this commit reproduces every merge
+        // input it installs, compared after all finalize mutations
+        // (retirement, selection, manifest rollback, withdrawal and the
+        // counter fold above) so none of them can escape the gate. The
+        // plan comparison is full equality, synced fields included.
+        // The deep comparisons are shared with the stability check
+        // below; each side's provenance short-circuits first so plain
+        // inventory candidates skip them entirely.
+        let stabilizes_provenance = candidate.built_by_full_rebuild
+            && !withdrew
+            && candidate.plan.matches_for_stability(&self.plan);
+        let commit_provenance = loader_plan.is_some();
+        let (
+            modules_reproduced,
+            corroboration_reproduced,
+            fallbacks_reproduced,
+            claims_reproduced,
+            tables_reproduced,
+        ) = if stabilizes_provenance || commit_provenance {
+            (
+                candidate.modules == self.modules,
+                candidate.corroboration == self.counters.corroboration,
+                candidate.manifest_fallbacks == self.counters.manifest_fallbacks,
+                candidate.selection_claims == self.selection_claims,
+                candidate.selection_tables == self.selection_tables,
+            )
+        } else {
+            (false, false, false, false, false)
+        };
+        // The pin walks differ: stability needs the whole store to
+        // match, deferral only the committed pins (the derivation
+        // retains merge-invisible extras). Each runs under its own
+        // provenance so neither side pays for the other.
+        let pins_reproduced =
+            commit_provenance && Self::pins_match_for_deferral(&candidate.pinned, &self.pinned);
+        let commit_reproduced = commit_provenance
+            && plan_reproduced
+            && modules_reproduced
+            && corroboration_reproduced
+            && fallbacks_reproduced
+            && claims_reproduced
+            && tables_reproduced
+            && pins_reproduced;
         // Committing a full rebuild with no post-build withdrawal installs
         // rebuild output only when the candidate actually converged: the
         // rebuild reads committed-plan reuse state, so a commit can move it
         // (surfaces, ordinals) and the next rebuild may differ. Verify by
         // comparison instead of assuming a fixpoint.
-        // The provenance flags short-circuit first: loader, cached and
-        // withdrawn candidates can never stabilize, so the deep comparisons
-        // below (plan clones, pin walks) are skipped for them.
-        let stabilizes = candidate.built_by_full_rebuild
-            && !withdrew
-            && candidate.plan.matches_for_stability(&self.plan)
-            && candidate.modules == self.modules
-            && candidate.corroboration == self.counters.corroboration
-            && candidate.manifest_fallbacks == self.counters.manifest_fallbacks
-            && candidate.selection_claims == self.selection_claims
-            && candidate.selection_tables == self.selection_tables
+        let stabilizes = stabilizes_provenance
+            && modules_reproduced
+            && corroboration_reproduced
+            && fallbacks_reproduced
+            && claims_reproduced
+            && tables_reproduced
             && Self::pins_match_for_stability(&candidate.pinned, &self.pinned);
         self.pinned = candidate.pinned;
         self.modules = candidate.modules;
@@ -14736,7 +14836,49 @@ impl Engine {
         self.selection_claims = candidate.selection_claims;
         self.selection_tables = candidate.selection_tables;
         self.plan_rebuild_stable = stabilizes;
-        let publication = self.publish_current_capture_facts();
+        // Publication deferral: a proved loader transaction whose commit
+        // reproduces every merge input it installs (leg 2 above), with
+        // nothing else dirtied since the last merge (leg 1: the revision
+        // is still what that merge published), leaves the post-commit
+        // merge inputs identical to the last merge's. The merge folds are
+        // idempotent on identical inputs, so the merge and projection are
+        // redundant with the batch tail's. With nothing retired or
+        // unpublished, its links attached, merge inputs resolvable and no
+        // newly recorded loss, invalidate the planning proof and mark the
+        // revision published exactly as a no-op merge would. Anything else
+        // publishes per commit, and skip recording runs on both paths.
+        let skips_changed = self.record_publication_skips();
+        #[cfg(not(test))]
+        let deferral_disabled = false;
+        #[cfg(test)]
+        let deferral_disabled = self.publish_deferral_disabled();
+        let defer_publication = commit_reproduced
+            && revision_before_commit == self.published_facts_revision
+            && self.capture_facts.staged.is_none()
+            && outcome.stale_views.is_empty()
+            && outcome.unpublished_views.is_empty()
+            && new_targets_attached
+            && !skips_changed
+            && self
+                .capture_facts
+                .resolve_merge_inputs(
+                    &self.plan,
+                    &self.pinned,
+                    &self.modules,
+                    &self.manifests,
+                    &self.manifest_ordinals,
+                )
+                .is_ok()
+            && !deferral_disabled;
+        // A failed or staged publication cannot keep an earlier planning
+        // proof alive. Successful stationary loader finalization may reseed.
+        self.loader_plan_cache = None;
+        let publication = if defer_publication {
+            self.published_facts_revision = self.facts_revision;
+            Ok(())
+        } else {
+            self.merge_and_project_capture_facts()
+        };
         outcome.disposition = candidate_publication_disposition(retired, &publication);
         if publication.is_err() {
             // The preflight proved this for the whole candidate, so only the

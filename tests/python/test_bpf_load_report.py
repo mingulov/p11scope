@@ -462,6 +462,46 @@ class ReportTests(unittest.TestCase):
         self.assertIn("detailed/p11_entry", result.stdout)
         self.assertIn("no budget", result.stdout)
 
+    def test_detailed_gate1_selects_detailed_groups(self):
+        # The gate-1 Detailed object carries the same unique roots, so
+        # --object detailed-gate1 scores exactly the Detailed BTF
+        # groups; only the budget-key prefix differs.
+        loads = self.mixed_doctor_loads()
+        budgets = self.write_budgets({
+            "detailed-gate1/p11_image_query": {KERNEL: 512},
+            "detailed-gate1/interface_entry": {KERNEL: 95853},
+            "detailed-gate1/interface_return": {KERNEL: 863427},
+            "detailed-gate1/interface_list_worker": {KERNEL: 606073},
+        })
+        result = self.run_report(self.write_loads("doctor.jsonl", loads),
+                                 budgets=budgets,
+                                 object_name="detailed-gate1")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("detailed-gate1/interface_entry", result.stdout)
+        self.assertIn("83350", result.stdout)
+        self.assertNotIn("84937", result.stdout)
+        self.assertNotIn("p11_usage_entry", result.stdout)
+
+    def test_detailed_gate1_missing_program_is_not_masked(self):
+        # A Detailed program the gate-1 object stopped loading FAILs
+        # missing under detailed-gate1/*, not silently covered by the
+        # Inventory copy of the same root.
+        loads = self.mixed_doctor_loads(drop_detailed_worker=True)
+        budgets = self.write_budgets({
+            "detailed-gate1/p11_image_query": {KERNEL: 512},
+            "detailed-gate1/interface_entry": {KERNEL: 95853},
+            "detailed-gate1/interface_return": {KERNEL: 863427},
+            "detailed-gate1/interface_list_worker": {KERNEL: 606073},
+        })
+        result = self.run_report(self.write_loads("doctor.jsonl", loads),
+                                 budgets=budgets,
+                                 object_name="detailed-gate1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("detailed-gate1/interface_list_worker", result.stdout)
+        self.assertIn("missing from probe rows", result.stdout)
+
     def test_driver_anchors_guest_release_on_version_boundary(self):
         # The release check must accept the exact version or a `-`-suffixed
         # release only; a bare prefix also matches a different kernel

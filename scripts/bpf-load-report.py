@@ -306,6 +306,9 @@ def select_object_loads(parsed_loads, object_name, group_errors):
     sits in Inventory's program set; counter objects always carry
     their bank roots and journal objects always carry their pair, so
     shared-only groups never belong to them.
+    "detailed-gate1" selects exactly the Detailed groups (the gate-1
+    object carries the same unique roots); only the budget-key prefix
+    differs.
     """
     unresolved = [entry for entry in parsed_loads
                   if entry["root"] == "unresolved"]
@@ -316,6 +319,7 @@ def select_object_loads(parsed_loads, object_name, group_errors):
         by_btf.setdefault(entry["btf_id"], []).append(entry)
     selected = list(unresolved)
     want_counter = object_name.startswith("counter-")
+    want_detailed = object_name in ("detailed", "detailed-gate1")
     for btf_id in sorted(by_btf):
         entries = by_btf[btf_id]
         if btf_id == 0:
@@ -341,11 +345,11 @@ def select_object_loads(parsed_loads, object_name, group_errors):
             if want_counter:
                 selected.extend(entries)
         elif assigned == "detailed":
-            if object_name == "detailed":
+            if want_detailed:
                 selected.extend(entries)
         else:
             roots = {entry["root"] for entry in entries}
-            if object_name == "detailed":
+            if want_detailed:
                 selected.extend(entries)
             elif object_name == "inventory" and roots <= INVENTORY_PROGRAMS:
                 selected.extend(entries)

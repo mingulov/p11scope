@@ -301,6 +301,9 @@ def gate_loss_accounting(evidence):
     if collected != joined + shed:
         return False, (f"semantic counts do not conserve: collected={collected} "
                        f"joined={joined} shed={shed}")
+    if "native capture events loss unknown" in subjects:
+        return False, ("events loss unknown: the ring-loss counter could not be "
+                       "read, counts cannot be checked")
     named = []
 
     def needs(count, words, label):
@@ -313,7 +316,7 @@ def gate_loss_accounting(evidence):
     for missing in (
             needs(shed, ("semantic", "shed"), "shed"),
             needs(refused, ("admission", "refus"), "refused"),
-            needs(unrouted, ("unrout", "events lost"), "unrouted_returns"),
+            needs(unrouted, ("unrout",), "unrouted_returns"),
             needs(lost, ("events lost",), "events_lost"),
             needs(refused_total + refused_endpoints,
                   ("admission", "refus", "budget", "exhaust"),

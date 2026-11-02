@@ -7121,12 +7121,17 @@ fn retained_views_survive_ordinary_rotation_passes() {
         engine.counters.object_skips
     );
 
+    // Cadence 2: pass 2 reconciles and may rotate for unscanned pids;
+    // pass 3 is the next ordinary pass. Rotation behavior itself is
+    // pinned by the rarity and cursor tests; here only the cap fill is.
     refresh_inventory_once(&mut engine);
+    assert_eq!(engine.views.len(), 2, "the reconcile keeps the cap full");
+    let after_reconcile: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     refresh_inventory_once(&mut engine);
     let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     assert!(
-        after_first.iter().all(|pid| kept.contains(pid)),
-        "later ordinary passes displace nothing: {after_first:?} -> {kept:?}"
+        after_reconcile.iter().all(|pid| kept.contains(pid)),
+        "later ordinary passes displace nothing: {after_reconcile:?} -> {kept:?}"
     );
     assert_eq!(kept.len(), 2, "the cap stays full without churn");
 
@@ -7143,7 +7148,8 @@ fn retained_views_survive_ordinary_rotation_passes() {
 /// rotates one out for the rarity-selected newcomer (ordinary passes still
 /// displace nothing); the second reconcile admits forward, never churning
 /// the cooling evictee back in.
-/// (Mandated semantic change: pass 4 used to select 0 into zero free slots.)
+/// (Mandated semantic change: the first reconcile used to select 0 into
+/// zero free slots.)
 #[test]
 fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     struct ChildrenGuard(Vec<std::process::Child>);
@@ -7215,7 +7221,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     // individual, and the representatives move), so retry for an agreeing
     // lowest-first discovery. A deterministically broken selection never
     // agrees and still fails on the last attempt (Task-2 retry idiom).
-    // Refresh-time reads are safe: the children settled long before pass 4.
+    // Refresh-time reads are safe: the children settled long before pass 2.
     let mut agreed = None;
     for _ in 0..50 {
         let candidate =
@@ -7251,19 +7257,12 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     let mut pass1_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     pass1_views.sort_unstable();
     assert_eq!(pass1_views, pids[..2]);
-    for pass in 2..=3 {
-        let before = engine.budget.attempted_io_bytes();
-        refresh_inventory_once(&mut engine);
-        assert_eq!(
-            engine.budget.attempted_io_bytes() - before,
-            0,
-            "ordinary pass {pass} charges nothing"
-        );
-    }
 
-    // Pass 4 reconciles: the slice re-reads every enumerated maps file,
+    // Cadence 2: reconciles land on the even passes; the slice, rarity
+    // and cursor pins below are unchanged, only their passes move.
+    // Pass 2 reconciles: the slice re-reads every enumerated maps file,
     // rarity selection runs over the slice, and the cursor parks at the end.
-    let polls_before_pass4 = engine.polling_rescans_queued;
+    let polls_before_pass2 = engine.polling_rescans_queued;
     let before = engine.budget.attempted_io_bytes();
     refresh_inventory_once(&mut engine);
     let pass4 = engine.budget.attempted_io_bytes() - before;
@@ -7286,12 +7285,12 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     // two slots, so the grouped path takes the group representative (lowest
     // pid) and rotation evicts the lowest retained pid for it. Both evidence
     // records are categorical counts.
-    let mut pass4_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
-    pass4_views.sort_unstable();
+    let mut pass2_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    pass2_views.sort_unstable();
     assert_eq!(
-        pass4_views,
+        pass2_views,
         vec![pids[1], pids[2]],
-        "pass 4 rotates the lowest retained pid out for the group representative"
+        "pass 2 rotates the lowest retained pid out for the group representative"
     );
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
@@ -7315,7 +7314,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     // Queuing a poll is internal evidence, not a published loss (F1): the
     // fruitless rescan publishes no skip of its own.
     assert_eq!(
-        engine.polling_rescans_queued - polls_before_pass4,
+        engine.polling_rescans_queued - polls_before_pass2,
         1,
         "the surviving retained view polls"
     );
@@ -7338,21 +7337,19 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
         engine.counters.object_skips
     );
 
-    // Passes 5-7 are ordinary again: they charge nothing and displace
-    // nothing; pass 8 reconciles and re-reads — maps bytes are never
+    // Pass 3 is ordinary again: it charges nothing and displaces
+    // nothing; pass 4 reconciles and re-reads — maps bytes are never
     // served from a cache.
-    for pass in 5..=7 {
-        let before = engine.budget.attempted_io_bytes();
-        refresh_inventory_once(&mut engine);
-        assert_eq!(
-            engine.budget.attempted_io_bytes() - before,
-            0,
-            "ordinary pass {pass} charges nothing"
-        );
-        let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
-        kept.sort_unstable();
-        assert_eq!(kept, pass4_views, "ordinary pass {pass} displaces nothing");
-    }
+    let before = engine.budget.attempted_io_bytes();
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.budget.attempted_io_bytes() - before,
+        0,
+        "ordinary pass 3 charges nothing"
+    );
+    let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    kept.sort_unstable();
+    assert_eq!(kept, pass2_views, "ordinary pass 3 displaces nothing");
     let before = engine.budget.attempted_io_bytes();
     refresh_inventory_once(&mut engine);
     assert!(
@@ -7362,12 +7359,12 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     // The second sweep admits forward: the cooled-out evictee sits out, so
     // the remaining two unknowns fit the two slots exactly (identity, not
     // grouping) and both rotate in — neither is the just-evicted lowest pid.
-    let mut pass8_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
-    pass8_views.sort_unstable();
+    let mut pass4b_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    pass4b_views.sort_unstable();
     assert_eq!(
-        pass8_views,
+        pass4b_views,
         vec![pids[3], pids[4]],
-        "pass 8 walks forward past the cooling evictee"
+        "pass 4 walks forward past the cooling evictee"
     );
 
     for child in &mut children.0 {
@@ -7477,15 +7474,15 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     engine.scheduler.set_quantum_ns_for_test(u64::MAX);
     engine.scheduler.set_slice_pids_for_test(2);
 
-    for _ in 0..3 {
-        refresh_inventory_once(&mut engine);
-    }
+    // Cadence 2: one ordinary pass between reconciles; sweeps land on
+    // passes 2, 4 and 6. Slice, cursor and rotation pins are unchanged.
+    refresh_inventory_once(&mut engine);
     // The cap is full with the two lowest pids after the ordinary passes.
     let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     kept.sort_unstable();
     assert_eq!(kept, pids[..2]);
 
-    // Pass 4: first slice covers the two lowest pids, both retained.
+    // Pass 2: first slice covers the two lowest pids, both retained.
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.scheduler.cursor_for_test(), Some(pids[1]));
     assert!(
@@ -7535,10 +7532,8 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
         engine.counters.object_skips
     );
 
-    // Pass 8: next slice covers the following two pids, neither retained.
-    for _ in 0..3 {
-        refresh_inventory_once(&mut engine);
-    }
+    // Pass 4: next slice covers the following two pids, neither retained.
+    refresh_inventory_once(&mut engine);
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.scheduler.cursor_for_test(), Some(pids[3]));
     assert!(
@@ -7556,14 +7551,12 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     assert_eq!(
         kept,
         vec![pids[2], pids[3]],
-        "pass 8 rotates both unknowns in for both lowest retained pids"
+        "pass 4 rotates both unknowns in for both lowest retained pids"
     );
 
-    // Pass 12: the slice wraps past the end to the lowest pid — which
-    // rotation moved on from at pass 8, so nothing there revalidates.
-    for _ in 0..3 {
-        refresh_inventory_once(&mut engine);
-    }
+    // Pass 6: the slice wraps past the end to the lowest pid — which
+    // rotation moved on from at pass 4, so nothing there revalidates.
+    refresh_inventory_once(&mut engine);
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.scheduler.cursor_for_test(), Some(pids[0]));
     assert!(
@@ -7894,29 +7887,23 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     // A third member arrives after admission with no lifecycle event: the
     // ordinary tick keeps the admitted views and defers the newcomer with
     // an exact gap instead of attempting an allocation it cannot fill.
+    // Cadence 2: the exhaustion scenario below runs on pass 1 (ordinary),
+    // so the refresh queues before the first tick; pass 2 reconciles and
+    // would admit via eviction instead of exhausting.
     let newcomer = std::process::id();
     pids.push(newcomer);
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
-    refresh_inventory_once(&mut engine);
-
-    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
-    assert_eq!(kept, admitted, "deferral keeps the admitted views");
-    assert!(
-        engine.counters.object_skips.iter().any(|skip| {
-            skip.reason
-                == "3 processes in scope; live discovery deferred 1 unscanned processes to the periodic reconciliation sweep (limit 2)"
-        }),
-        "arrival without an event publishes the exact deferral gap: {:?}",
-        engine.counters.object_skips
-    );
-
-    // A queued lifecycle refresh for the newcomer attempts admission and
-    // exhausts: the standard skip names the effective value, the request
-    // stays queued for a later pass, and nothing is displaced.
     engine.request_refresh(newcomer, None);
     refresh_inventory_once(&mut engine);
 
+    // The queued lifecycle refresh attempts admission on the same
+    // ordinary tick and exhausts: the standard skip names the effective
+    // value, the request stays queued for a later pass, and nothing is
+    // displaced. (The arrival-without-request deferral gap this tick
+    // used to assert first is pinned by
+    // retained_views_survive_ordinary_rotation_passes; a queued request
+    // attempts instead of deferring.)
     let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     assert_eq!(kept, admitted, "exhaustion keeps the admitted views");
     assert!(
@@ -33278,14 +33265,13 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
     engine.budget.set_deadline(Some(0));
 
     // Ordinary frames cannot reach the newcomer (no free slots); the queued
-    // request survives them.
-    for frame in 1..=3 {
-        refresh_inventory_once(&mut engine);
-        assert!(
-            !engine.views.iter().any(|view| view.pid() == newcomer),
-            "frame {frame}: no slot means no attempt yet"
-        );
-    }
+    // request survives them. Cadence 2: only frame 1 is ordinary before
+    // the frame-2 reconcile.
+    refresh_inventory_once(&mut engine);
+    assert!(
+        !engine.views.iter().any(|view| view.pid() == newcomer),
+        "frame 1: no slot means no attempt yet"
+    );
     assert!(
         engine.refresh_requested.contains_key(&newcomer),
         "the queued request survives the ordinary frames"
@@ -33346,7 +33332,7 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
 
     // Clearing cancellation lets the queued request recover the actual child.
     engine.budget.set_deadline(None);
-    for _ in 5..=8 {
+    for _ in 3..=4 {
         refresh_inventory_once(&mut engine);
     }
     let newcomer_view = engine
@@ -33435,13 +33421,16 @@ fn per_tick_accounting_measures_deep_scans_hooks_and_maps_separately() {
     pids.push(newcomer);
     e06_write_listing(scope_dir.path(), &pids);
 
-    for frame in 1..=3 {
+    // Cadence 2: reconciles land on the even frames; the odd frames stay
+    // quiet. The per-frame work pins below are unchanged, only their
+    // frames move.
+    let quiet_frame = |engine: &mut Engine, frame: u32| {
         let (scans, arms, bytes) = (
             engine.deep_scans,
             engine.loader_arms,
             engine.budget.attempted_io_bytes(),
         );
-        refresh_inventory_once(&mut engine);
+        refresh_inventory_once(engine);
         assert_eq!(
             (engine.deep_scans - scans, engine.loader_arms - arms),
             (0, 0),
@@ -33452,8 +33441,8 @@ fn per_tick_accounting_measures_deep_scans_hooks_and_maps_separately() {
             0,
             "ordinary full frame {frame} reads no maps either"
         );
-    }
-
+    };
+    quiet_frame(&mut engine, 1);
     let (scans, arms, bytes) = (
         engine.deep_scans,
         engine.loader_arms,
@@ -33484,25 +33473,7 @@ fn per_tick_accounting_measures_deep_scans_hooks_and_maps_separately() {
             .any(|module| module.path.ends_with("acct-unique.so")),
         "the newcomer provider is admitted on the reconcile"
     );
-
-    for frame in 5..=7 {
-        let (scans, arms, bytes) = (
-            engine.deep_scans,
-            engine.loader_arms,
-            engine.budget.attempted_io_bytes(),
-        );
-        refresh_inventory_once(&mut engine);
-        assert_eq!(
-            (
-                engine.deep_scans - scans,
-                engine.loader_arms - arms,
-                engine.budget.attempted_io_bytes() - bytes
-            ),
-            (0, 0, 0),
-            "ordinary frame {frame} is quiet again"
-        );
-    }
-
+    quiet_frame(&mut engine, 3);
     let (scans, arms, bytes) = (
         engine.deep_scans,
         engine.loader_arms,
@@ -33519,6 +33490,7 @@ fn per_tick_accounting_measures_deep_scans_hooks_and_maps_separately() {
         0,
         "nothing newly armable appears"
     );
+    quiet_frame(&mut engine, 5);
     assert!(
         engine.budget.attempted_io_bytes() - bytes > 0,
         "maps are re-read every reconcile"

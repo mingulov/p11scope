@@ -697,7 +697,7 @@ mod tests {
     fn eviction_cooldown_expires_after_configured_sweeps() {
         let mut scheduler = DiscoveryScheduler::new();
         scheduler.set_cooldown_sweeps_for_test(2);
-        for _ in 0..4 {
+        for _ in 0..2 {
             scheduler.begin_over_cap_pass();
         }
         assert_eq!(scheduler.reconcile_sweeps_for_test(), 1);
@@ -706,11 +706,9 @@ mod tests {
         assert!(scheduler.is_stale(7));
         assert_eq!(scheduler.cooling_for_test(), vec![7]);
         assert_eq!(scheduler.cooling_len(), 1);
-        for _ in 0..3 {
-            scheduler.begin_over_cap_pass();
-        }
+        scheduler.begin_over_cap_pass();
         assert!(scheduler.cooling_down(7), "ordinary passes age nothing");
-        for _ in 0..4 {
+        for _ in 0..2 {
             scheduler.begin_over_cap_pass();
         }
         assert_eq!(scheduler.reconcile_sweeps_for_test(), 2);
@@ -718,7 +716,7 @@ mod tests {
             scheduler.cooling_down(7),
             "one elapsed sweep is still cooling"
         );
-        for _ in 0..4 {
+        for _ in 0..2 {
             scheduler.begin_over_cap_pass();
         }
         assert_eq!(scheduler.reconcile_sweeps_for_test(), 3);

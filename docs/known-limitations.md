@@ -151,7 +151,9 @@ analysis, the gate prints only the percentage), paired-median total
 Absolute times are not comparable across campaigns, only
 within-campaign ratios are. These are measured costs for that workload, not
 bounds for every host. The default `--identity-backend auto` uses kernel
-identity where available. Further userspace speed work is planned for 0.5.x.
+identity where available. Further userspace speed work is unscheduled: the
+measured cost stands as disclosed until feasibility measurements identify
+removable work.
 
 On some overlayfs setups before Linux 6.8, p11scope may be unable to
 prove how a provider file appears in /proc maps: the opened file and
@@ -160,6 +162,35 @@ check that reconciles them can come back inconclusive. The provider
 pin then carries the note `provider's maps rendering unproven;
 callers mapping it may stay unbound`, and callers mapping that provider
 may stay unbound. This key split does not happen on Linux 6.8 and later.
+
+File identity on some filesystems has known edge cases, found by a
+dedicated test study on 2026-11-03 (Linux 7.0) and not yet covered by
+automated tests:
+
+- Btrfs: p11scope caches what it learned from inspecting a provider file,
+  keyed by the device and inode number shown in /proc maps, file size and
+  change time. That key does not include the Btrfs subvolume. Two different
+  files in two subvolumes created back to back matched on the whole key in
+  39 of 40 tries, so a later scan could reuse one file's inspection results
+  for another. This was reproduced at the file level only, not yet through a
+  full p11scope capture.
+- Btrfs snapshots keep the inode number, size, change time and content, and
+  a deleted subvolume's device number is reused at once by the next
+  subvolume or by an unrelated tmpfs or FUSE mount. An identity kept after
+  its file is released can therefore name a different file.
+- FUSE filesystems, and tmpfs mounted with `inode32`, can show two live
+  files with different content under identical identity values, including
+  the `/proc/<pid>/map_files` identity. File sweeps refuse FUSE, but other
+  identity checks do not yet, and none of them treat `inode32` tmpfs as
+  non-unique.
+- The overlay copy-up case described above also reproduces on Linux 7.0.
+- XFS, EROFS, squashfs, FUSE, `inode32` tmpfs, Btrfs snapshots, device
+  number reuse and same-path files in different mount namespaces are not
+  exercised by automated tests yet.
+
+These are edge cases for typical desktop and server systems. A fix for the
+Btrfs cache key, a non-unique-inode refusal on every identity check, and a
+filesystem test matrix in CI are planned for 0.7.0.
 
 Provider function tables can contain NULLs, unusable entries or fewer readable
 words than their version label suggests. Discovery retains usable targets
@@ -270,6 +301,8 @@ admission, absence, or call (R57).
   misattribution, and for a late provider's unwatched window.
 - Tracking short-lived processes that exit before their first binding.
 - Parallel BPF program loading for faster startup.
+- File identity edge cases on Btrfs subvolumes and snapshots, FUSE and
+  `inode32` tmpfs, with a filesystem test matrix in CI (0.7.0).
 - Post-quantum key details, cluster aggregation, telemetry,
   enforcement, AArch64, extra capture fields and syscall/network
   correlation.

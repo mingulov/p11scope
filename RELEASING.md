@@ -194,9 +194,11 @@ official builder. FULL and P0 upload independently as
 `release-preview-public-assets` and `release-preview-public-assets-p0` in this
 separate run; a P0 failure does not withhold successful FULL assets. Both
 required mode results still need to pass for a release. No private receipts,
-capture or logs are uploaded. This new producer is **not yet accepted by the
-Docker runtime artifact downloader**; that consumer needs explicit integration
-and acceptance before using these run IDs.
+capture or logs are uploaded. The Docker runtime artifact downloader
+(`scripts/download-runtime-observer.py`, through the `docker-runtime`
+workflow's `preview_run_id`) accepts these run IDs: a completed exact-source
+`package-preview` dispatch whose `validate` and `package-full` gates succeeded
+supplies the FULL `release-preview-public-assets` artifact.
 
 The preview workflow passes a version-neutral `source.tar.gz` from the exporter
 to the packager. The packager validates the archive's recorded revision and

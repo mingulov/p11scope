@@ -1475,37 +1475,37 @@
     {
       "file": "src/attach/async_value_flags_tests.rs",
       "path": "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
-      "reason": "WU-7c P1; privileged: OK C_AsyncGetID with NULL output sets ASYNC_VALUE_UNREADABLE (LP64)",
+      "reason": "privileged: OK C_AsyncGetID with NULL output sets ASYNC_VALUE_UNREADABLE (LP64)",
       "cell": "privileged"
     },
     {
       "file": "src/attach/async_value_flags_tests.rs",
       "path": "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
-      "reason": "WU-7c P1; privileged: OK C_AsyncGetID with NULL output sets ASYNC_VALUE_UNREADABLE (ia32)",
+      "reason": "privileged: OK C_AsyncGetID with NULL output sets ASYNC_VALUE_UNREADABLE (ia32)",
       "cell": "privileged"
     },
     {
       "file": "src/attach/async_value_flags_tests.rs",
       "path": "attach::async_value_flags_tests::privileged_async_getid_valid_output_reads_id_lp64",
-      "reason": "WU-7c P1; privileged: OK C_AsyncGetID with a valid output reads the id with no flag (LP64)",
+      "reason": "privileged: OK C_AsyncGetID with a valid output reads the id with no flag (LP64)",
       "cell": "privileged"
     },
     {
       "file": "src/attach/async_value_flags_tests.rs",
       "path": "attach::async_value_flags_tests::privileged_async_getid_valid_output_reads_id_ia32",
-      "reason": "WU-7c P1; privileged: OK C_AsyncGetID with a valid output reads the id with no flag (ia32)",
+      "reason": "privileged: OK C_AsyncGetID with a valid output reads the id with no flag (ia32)",
       "cell": "privileged"
     },
     {
       "file": "src/attach/async_value_flags_tests.rs",
       "path": "attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_lp64",
-      "reason": "WU-7c P1; privileged: C_AsyncJoin carries the detached id with no flag and the op completes (LP64)",
+      "reason": "privileged: C_AsyncJoin carries the detached id with no flag and the op completes (LP64)",
       "cell": "privileged"
     },
     {
       "file": "src/attach/async_value_flags_tests.rs",
       "path": "attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_ia32",
-      "reason": "WU-7c P1; privileged: C_AsyncJoin carries the detached id with no flag and the op completes (ia32)",
+      "reason": "privileged: C_AsyncJoin carries the detached id with no flag and the op completes (ia32)",
       "cell": "privileged"
     }
   ]

@@ -301,6 +301,17 @@ bpf_delta() {
     echo "$bd_ns $bd_cnt"
 }
 
+# bpf_check_prog_stable BEFORE_PROG AFTER_PROG: fail when the armed
+# call-rate reader flips programs mid-window (p11_journal_pair vs
+# p11_entry). A flip means the before/after counters come from
+# different hooks, so the sample must fail rather than mix them.
+bpf_check_prog_stable() {
+    if [ "$1" != "$2" ]; then
+        echo "bpf prog changed mid-sample: $1 vs $2" >&2
+        return 1
+    fi
+}
+
 # resolve_commit: set COMMIT and TREE_STATUS. P11SCOPE_BENCH_COMMIT
 # wins when set (required outside a git repo, e.g. the Fedora rsync
 # mirror); otherwise the commit comes from git. Outside a repo the
@@ -1028,10 +1039,7 @@ run_sample() {
                 rs_rest_before=${rs_bpf_before#* }
                 rs_prog_after=${rs_bpf_after%% *}
                 rs_rest_after=${rs_bpf_after#* }
-                if [ "$rs_prog_before" != "$rs_prog_after" ]; then
-                    echo "bpf prog changed mid-sample: $rs_prog_before vs $rs_prog_after" >&2
-                    return 1
-                fi
+                bpf_check_prog_stable "$rs_prog_before" "$rs_prog_after" || return 1
                 rs_prog=$rs_prog_before
                 rs_bpf=$(bpf_delta "$rs_rest_before" "$rs_rest_after" "$rs_ops" "$rs_arm") || return 1
                 rs_bpf_ns=${rs_bpf% *} rs_bpf_cnt=${rs_bpf#* }

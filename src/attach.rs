@@ -10554,9 +10554,7 @@ mod tests {
     fn pid_start_tick_detailed_marker_absent_refuses() {
         // I4: a marker Detailed object without the map is a stale
         // build; the session refuses instead of binding blind.
-        assert!(
-            super::pid_start_tick_verdict(false, super::StaticRoots::Detailed, true).is_err()
-        );
+        assert!(super::pid_start_tick_verdict(false, super::StaticRoots::Detailed, true).is_err());
     }
 
     #[test]
@@ -10571,9 +10569,7 @@ mod tests {
     fn pid_start_tick_detailed_marker_off_present_refuses() {
         // I4: a marker-off Detailed object carrying the map is a stale
         // build; the session refuses instead of trusting it.
-        assert!(
-            super::pid_start_tick_verdict(true, super::StaticRoots::Detailed, false).is_err()
-        );
+        assert!(super::pid_start_tick_verdict(true, super::StaticRoots::Detailed, false).is_err());
     }
 
     #[test]

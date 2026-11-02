@@ -132,6 +132,7 @@ RUN = [
     ("test_prepared_dependency_tools.py", []),
     ("test_public_cli_oracle.py", []),
     ("test_python_suite_registry.py", []),
+    ("test_qualify_inventory_judge.py", []),
     ("test_release_matrix_contract.py", []),
     ("test_release_build_jobs.py", []),
     ("test_release_notices.py", []),

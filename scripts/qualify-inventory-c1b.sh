@@ -357,6 +357,16 @@ for cell in cells:
     capped = [g for g in gaps if g["subject"] == "discovery capped"]
     scan = inspect.get("scan", {})
     print(f"  inspect scan: { {k: scan.get(k) for k in ('status', 'enumerated', 'limit', 'deep_scanned', 'maps_matched', 'unexamined', 'unexamined_objects', 'snapshots_unavailable')} }")
+    if scan.get("status") == "partial":
+        skipped = inspect.get("skipped") or []
+        print(f"  inspect skipped ({len(skipped)}): {[(entry.get('pid'), entry.get('subject'), (entry.get('reason') or '')[:160]) for entry in skipped[:25]]}")
+        members = inspect.get("processes") or []
+        tally = {}
+        for member in members:
+            tally[member.get("status")] = tally.get(member.get("status"), 0) + 1
+        print(f"  inspect member statuses: {tally}")
+        blamed = [(member.get("pid"), member.get("status"), (member.get("reason") or "")[:160]) for member in members if member.get("status") not in ("scanned", "maps_matched", "exited")]
+        print(f"  inspect unattributed members ({len(blamed)}): {blamed[:25]}")
     print(f"  losses: {scan.get('attribution_losses')}")
     last = [l for l in (obs / f"{cell}.stderr").read_text().splitlines() if "maps-matched" in l]
     print(f"  last pass: {last[-1] if last else 'none'}")

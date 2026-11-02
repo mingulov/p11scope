@@ -697,13 +697,21 @@ fn pid_start_tick_verdict(present: bool, roots: StaticRoots, expected: bool) -> 
     }
 }
 
-/// I4: requires `PID_START_TICK` exactly when this build enabled the
-/// birth marker on Detailed roots, and validates its exact metadata.
-/// A present map always validates exactly; absence is decided by the
-/// verdict above.
-fn validate_pid_start_tick_map(ebpf: &Ebpf, roots: StaticRoots) -> Result<()> {
+/// I4: whether a Detailed-roots session's object carries the PID
+/// witness. The journal object always runs the exec birth, so it always
+/// carries the map; the Detailed object carries it exactly in marker
+/// builds.
+fn pid_witness_expected(journal: bool, marker_build: bool) -> bool {
+    journal || marker_build
+}
+
+/// I4: requires `PID_START_TICK` exactly where the session's object runs
+/// the exec birth (every journal object; the Detailed object of marker
+/// builds), and validates its exact metadata. A present map always
+/// validates exactly; absence is decided by the verdict above.
+fn validate_pid_start_tick_map(ebpf: &Ebpf, roots: StaticRoots, journal: bool) -> Result<()> {
     const NAME: &str = "PID_START_TICK";
-    let expected = cfg!(p11scope_birth_marker);
+    let expected = pid_witness_expected(journal, cfg!(p11scope_birth_marker));
     let map = ebpf.map(NAME);
     pid_start_tick_verdict(map.is_some(), roots, expected)?;
     if let Some(map) = map {
@@ -7064,7 +7072,7 @@ impl Session {
                 SessionPreparation::ValidatePolicy => {
                     validate_policy_maps(&ebpf, object_has_unsafe)
                         .context("validating exact policy-map metadata")?;
-                    validate_pid_start_tick_map(&ebpf, roots)
+                    validate_pid_start_tick_map(&ebpf, roots, journal)
                         .context("validating exact PID witness map metadata")?;
                     if journal {
                         journal::validate_journal_maps(&ebpf)
@@ -7195,10 +7203,13 @@ impl Session {
                 SessionPreparation::FreezePublished => {
                     freeze_published_maps(&ebpf).context("freezing published policy maps")?;
                     // I4: the witness content publishes at PublishScope
-                    // above; freeze it with the published maps exactly when
-                    // this build binds births. Validation already required
-                    // the map here, so a miss errors loudly.
-                    if roots == StaticRoots::Detailed && cfg!(p11scope_birth_marker) {
+                    // above; freeze it with the published maps exactly where
+                    // the object binds births (the journal object, or a
+                    // marker build's Detailed object). Validation already
+                    // required the map here, so a miss errors loudly.
+                    if roots == StaticRoots::Detailed
+                        && pid_witness_expected(journal, cfg!(p11scope_birth_marker))
+                    {
                         let map = ebpf.map("PID_START_TICK").context("PID_START_TICK map")?;
                         freeze_map("PID_START_TICK", map)?;
                     }
@@ -10597,6 +10608,18 @@ mod tests {
                 "counter banks with the map refuse (marker {expected})"
             );
         }
+    }
+
+    #[test]
+    fn pid_witness_is_expected_for_every_journal_session() {
+        // I4: the journal object runs the exec birth in every build, so
+        // a journal session requires and freezes the witness even when
+        // the Detailed marker is compiled out; an ordinary session
+        // follows the marker build selection.
+        assert!(super::pid_witness_expected(true, false));
+        assert!(super::pid_witness_expected(true, true));
+        assert!(super::pid_witness_expected(false, true));
+        assert!(!super::pid_witness_expected(false, false));
     }
 
     #[test]

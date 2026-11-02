@@ -1389,6 +1389,14 @@ The doctor runs the real embedded BPF object/map/program inventory and drops a
 temporary session after preflighting exec/exit lifecycle links and every
 requested PID/cgroup scope. T3/T4 come only from those observed operations;
 they are never inferred from uid, seccomp mode, sysctls, or capabilities.
+On a host without `uprobe_multi` (its row fails as unavailable or unproven,
+for example Linux 6.1), live capture refuses before loading any capture
+program, so doctor skips those loads: `BPF map create`, `uprobe attach (self)`,
+`uretprobe vs seccomp`, `host program preflight`, `inventory program preflight`,
+`lifecycle preflight` and a requested `scope preflight` read `n/a` with
+`skipped: uprobe-multi-required`, and the verdict stays `capture unavailable`.
+A permission or policy denial of the `uprobe_multi` probe still runs them, so
+their rows name the denied operation.
 `CAP_DAC_READ_SEARCH`, `CAP_SYS_PTRACE`, `CAP_SYS_ADMIN`,
 `CAP_PERFMON`, `CAP_BPF`, and `CAP_CHECKPOINT_RESTORE` are diagnostic rows
 for the tier. One inventory proof does depend on them: `inventory --system`

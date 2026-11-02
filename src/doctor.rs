@@ -196,8 +196,20 @@ fn probe_with_host(
         pid_namespace_check(crate::pidns::numbering(), pid.is_some()),
         object_capture_check(),
     ];
-    checks.extend(bpf_checks(host));
-    let attach_preflight = attach_preflight_checks(pid, cgroup);
+    let loads_capture = capture_loads_assessed(host);
+    checks.extend(if loads_capture {
+        bpf_checks(host)
+    } else {
+        premulti_bpf_checks(host)
+    });
+    let attach_preflight = if loads_capture {
+        attach_preflight_checks(pid, cgroup)
+    } else {
+        premulti_preflight_checks(
+            pid.is_some() || cgroup.is_some(),
+            journal_pair_check(crate::attach::journal_pair_preflight()),
+        )
+    };
     let capture_lane = !checks
         .iter()
         .chain(attach_preflight.iter())
@@ -225,6 +237,62 @@ fn probe_with_host(
     });
     checks.extend(attach_preflight);
     checks
+}
+
+/// The required uprobe-multi self-link row.
+const UPROBE_MULTI_ROW: &str = "uprobe-multi attach (own libc)";
+
+/// Detail of every capture-object check that doctor skips on a host
+/// without uprobe-multi. Live capture refuses there before loading any
+/// capture program, so test-loading them would only cost verifier time
+/// (minutes on 6.1) and could not change the verdict.
+const SKIPPED_WITHOUT_MULTI: &str = "skipped: uprobe-multi-required (live capture needs uprobe-multi; this check loads capture programs)";
+
+/// Whether doctor test-loads the capture objects. Only a proven Multi
+/// host, or a permission/policy denial of the Multi probe, loads them: a
+/// denied host may support Multi with more privilege, and the failed
+/// loads then name the denied operation and its origin. A host where
+/// Multi is unavailable or unproven skips them; its uprobe-multi row
+/// still fails, so the verdict stays "capture unavailable".
+fn capture_loads_assessed(host: crate::attach::MultiHostVerdict) -> bool {
+    match host {
+        Ok(_) => true,
+        Err(refusal) => refusal.is_denied(),
+    }
+}
+
+fn skipped_without_multi(name: &str) -> Check {
+    Check {
+        name: name.into(),
+        status: Status::NotApplicable(SKIPPED_WITHOUT_MULTI.into()),
+    }
+}
+
+/// The `bpf_checks` rows on a host without uprobe-multi: the same rows,
+/// with the capture-object loads skipped and the failing Multi row kept.
+fn premulti_bpf_checks(host: crate::attach::MultiHostVerdict) -> Vec<Check> {
+    vec![
+        skipped_without_multi("BPF map create"),
+        skipped_without_multi(UPROBE_ATTACH_SELF_ROW),
+        skipped_without_multi("uretprobe vs seccomp"),
+        uprobe_multi_check(host),
+    ]
+}
+
+/// The `attach_preflight_checks` rows on a host without uprobe-multi. The
+/// journal row only parses the embedded object, so it is still reported.
+fn premulti_preflight_checks(scope_requested: bool, journal: Check) -> Vec<Check> {
+    vec![
+        skipped_without_multi("host program preflight"),
+        skipped_without_multi(INVENTORY_PREFLIGHT_ROW),
+        journal,
+        skipped_without_multi("lifecycle preflight"),
+        if scope_requested {
+            skipped_without_multi("scope preflight")
+        } else {
+            not_applicable("scope preflight", "no requested scope")
+        },
+    ]
 }
 
 /// Name of the inventory-object load row: load-and-release through the
@@ -941,7 +1009,7 @@ fn attach_self_probe(session: &mut crate::attach::Session) -> Result<(), String>
 /// It does not measure entry or return delivery.
 fn uprobe_multi_check(host: crate::attach::MultiHostVerdict) -> Check {
     Check {
-        name: "uprobe-multi attach (own libc)".to_string(),
+        name: UPROBE_MULTI_ROW.to_string(),
         status: match host {
             Ok(_) => Status::Ok(
                 "scratch program loaded; self-link attached and detached (delivery unmeasured)"
@@ -1625,6 +1693,16 @@ pub fn summary(checks: &[Check], extra_strict: bool) -> String {
 
 fn next_step(check: &Check) -> String {
     let detail = status_detail(&check.status);
+    // A host without Multi (not a permission denial, which keeps the
+    // privilege advice below): capture-object checks were skipped.
+    if check.name == UPROBE_MULTI_ROW
+        && detail.starts_with("uprobe-multi-required")
+        && !detail.contains("denied")
+    {
+        return "use a host with uprobe-multi (normally Linux 6.6+) for live capture; \
+                p11scope inspect --pid <PID> works here without live capture"
+            .into();
+    }
     // These suffixes come from the existing independent EPERM classifier.
     // Seccomp mode or CapEff alone must never select a causal recommendation.
     if detail.ends_with("(origin: controlled seccomp denial)") {
@@ -2045,6 +2123,115 @@ mod tests {
         );
         assert!(line.contains("counter-mode-unavailable-on-kernel"));
         assert!(!line.contains("uprobe-multi-required"));
+    }
+
+    /// Twin of `doctor_loads_capture_objects_on_a_multi_or_denied_host`: a
+    /// host where Multi is unavailable or unproven (6.1 refuses the
+    /// scratch load with EINVAL) skips every capture-object load with the
+    /// named token, keeps the same rows, and never reads as ready.
+    #[test]
+    fn doctor_skips_capture_loads_without_multi_and_stays_not_ready() {
+        use crate::attach::{MultiHostRefusal, MultiHostStage};
+        for (stage, errno) in [
+            (MultiHostStage::ProgramLoad, Some(libc::EINVAL)),
+            (MultiHostStage::SelfLink, Some(libc::EOPNOTSUPP)),
+            (MultiHostStage::SelfLink, Some(libc::ENOSYS)),
+            (MultiHostStage::Anchor, None),
+        ] {
+            let refusal = MultiHostRefusal::for_test(stage, errno);
+            assert!(!capture_loads_assessed(Err(refusal)), "{refusal}");
+            let bpf = premulti_bpf_checks(Err(refusal));
+            let healthy = bpf_checks_with_seccomp(
+                Ok(()),
+                |_| Ok(()),
+                || not_applicable("uretprobe vs seccomp", "controlled"),
+                || uprobe_multi_check(Err(refusal)),
+            );
+            let names = |rows: &[Check]| rows.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+            assert_eq!(
+                names(&bpf),
+                names(&healthy),
+                "same rows as the loading path"
+            );
+            let preflight = premulti_preflight_checks(
+                true,
+                journal_pair_check(crate::attach::JournalPairPreflight::Available),
+            );
+            assert_eq!(
+                names(&preflight),
+                [
+                    "host program preflight",
+                    INVENTORY_PREFLIGHT_ROW,
+                    JOURNAL_PAIR_ROW,
+                    "lifecycle preflight",
+                    "scope preflight",
+                ]
+            );
+            for check in bpf.iter().chain(&preflight) {
+                match check.name.as_str() {
+                    UPROBE_MULTI_ROW => {
+                        assert_eq!(check.status, Status::Fail(refusal.to_string()));
+                    }
+                    JOURNAL_PAIR_ROW => {
+                        assert_eq!(check.status, Status::Ok("available".into()));
+                    }
+                    _ => {
+                        let Status::NotApplicable(detail) = &check.status else {
+                            panic!("{} must be skipped: {:?}", check.name, check.status)
+                        };
+                        assert!(detail.contains("uprobe-multi-required"), "{detail}");
+                    }
+                }
+            }
+            let unscoped = premulti_preflight_checks(
+                false,
+                journal_pair_check(crate::attach::JournalPairPreflight::Available),
+            );
+            assert_eq!(
+                unscoped.last().unwrap().status,
+                Status::NotApplicable("no requested scope".into())
+            );
+            let mut checks = vec![Check {
+                name: "kernel release".into(),
+                status: Status::Ok("6.1.188".into()),
+            }];
+            checks.extend(bpf);
+            checks.extend(preflight);
+            assert_eq!(verdict(&checks), 1, "{refusal}");
+            assert_eq!(capability_tier(&checks).tier, CapabilityTier::T0);
+            let text = render(&checks);
+            assert_eq!(
+                text.lines().next(),
+                Some("Doctor: requested lane unavailable."),
+                "{text}"
+            );
+            assert!(
+                verdict_line(&checks).contains("capture unavailable"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Next: use a host with uprobe-multi"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_loads_capture_objects_on_a_multi_or_denied_host() {
+        use crate::attach::{MultiCapableHost, MultiHostRefusal, MultiHostStage};
+        assert!(capture_loads_assessed(Ok(MultiCapableHost::for_test())));
+        for (stage, errno) in [
+            (MultiHostStage::ProgramLoad, libc::EPERM),
+            (MultiHostStage::SelfLink, libc::EPERM),
+            (MultiHostStage::SelfLink, libc::EACCES),
+        ] {
+            let refusal = MultiHostRefusal::for_test(stage, Some(errno));
+            assert!(refusal.is_denied(), "{refusal}");
+            assert!(capture_loads_assessed(Err(refusal)), "{refusal}");
+            // A denial keeps the privilege guidance, not the kernel advice.
+            let next = next_step(&uprobe_multi_check(Err(refusal)));
+            assert!(!next.contains("Linux 6.6"), "{next}");
+        }
     }
 
     #[test]

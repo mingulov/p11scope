@@ -57,6 +57,12 @@ impl MultiHostRefusal {
     pub(crate) fn for_test(stage: MultiHostStage, errno: Option<i32>) -> Self {
         Self::at(stage, errno)
     }
+
+    /// A permission or policy denial: the kernel may support Multi with
+    /// more privilege, so the denied operation itself is worth reporting.
+    pub(crate) fn is_denied(&self) -> bool {
+        self.cause == MultiHostCause::Denied
+    }
 }
 
 impl std::fmt::Display for MultiHostRefusal {

@@ -16,6 +16,10 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Fixed
 
+- `doctor` no longer spends minutes test-loading capture programs on kernels
+  without uprobe_multi (for example Linux 6.1, where it took about 4 minutes).
+  Live capture refuses there anyway, so those checks now read
+  `skipped: uprobe-multi-required` and the verdict stays capture unavailable.
 - DONTUNMAP moves missed on kernels with the 6-argument copy_vma (affects
   0.5.0: 6.18.58 and current 6.6/6.12/7.2 stable heads). The move hook read
   a fixed argument slot, so an `MREMAP_DONTUNMAP` move of a watched provider

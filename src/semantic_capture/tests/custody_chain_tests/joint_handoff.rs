@@ -879,3 +879,90 @@ fn joint_prepared_key_binding_alone_does_not_claim_original() {
     fixture.finish(1, 1);
     assert_eq!(operation_edge_rows(&fixture.real.scene)[0].0, Some(1));
 }
+
+/// One modeled call as a bare ordinary row: the END payload of a
+/// shaped pair, without its journal BEGIN. A drain fed only these
+/// rows stages no journal opens: the feed-less session shape.
+fn push_bare_sign_init(fixture: &mut JointScene, pid: u32, sequence: u64) {
+    let (_, end) = fixture.encoded(pid, 0, "C_SignInit", sequence);
+    let payload = match decode_journal_record(&end, &publish_object_descriptors()) {
+        Some(JournalRecord::End(end)) => end.payload_base(),
+        other => panic!("the shaped END decodes: {other:?}"),
+    };
+    fixture
+        .drain
+        .source_mut()
+        .push_record(record_bytes(&payload));
+}
+
+/// Feed-less bench: an unlinked session (no journal BEGIN feed) over
+/// bare ordinary rows. Past the 2048-entry claim store the per-claim
+/// cost must stay flat: no prune work is billed and no claim is
+/// refused, because a session that can never stage a BEGIN can never
+/// consume a fingerprint claim.
+#[test]
+fn joint_keepup_feedless_claim_cost_flat_past_cap() {
+    const PER_QUANTUM: usize = 64;
+    const QUANTA: usize = 33;
+    const TOTAL: usize = PER_QUANTUM * QUANTA;
+    assert!(TOTAL > 2_048, "the bench must cross the claim cap");
+    let mut fixture = JointScene::new(1);
+    let events = fixture.drain.consumption_cut().unwrap().events().clone();
+    fixture.producers =
+        SessionDrainProducers::test_pair_unlinked(fixture.real.lane.domain(), events);
+    assert!(
+        !fixture.producers.journal_linked(),
+        "the bench session links no journal producer"
+    );
+    let pid = std::process::id();
+    fixture.bind(pid, image(7), &[0]);
+    let mut sequence = 0u64;
+    let mut total_ok = 0usize;
+    let mut total_err = 0usize;
+    for _ in 0..QUANTA {
+        // The scripted drain counts takes against its bound for the
+        // whole scene, not per quantum: cover this quantum's rows.
+        fixture.drain.source_mut().bound += PER_QUANTUM;
+        for _ in 0..PER_QUANTUM {
+            sequence += 1;
+            push_bare_sign_init(&mut fixture, pid, sequence);
+        }
+        let raw = fixture.prepare(PER_QUANTUM);
+        let (ingested, _) = fixture.ingest(raw);
+        {
+            let coordinator = &mut fixture.real.scene.coordinator;
+            while let Some((_, claim)) = coordinator
+                .claim_next_prepared_admission(&fixture.producers, &ingested)
+                .unwrap()
+            {
+                if claim.is_ok() {
+                    total_ok += 1;
+                } else {
+                    total_err += 1;
+                }
+            }
+        }
+        fixture.finish(PER_QUANTUM, sequence);
+    }
+    assert_eq!(total_ok + total_err, TOTAL, "every modeled call is claimed");
+    assert_eq!(
+        total_err, 0,
+        "feed-less claims are never billed past the cap"
+    );
+    assert_eq!(total_ok, TOTAL);
+    let adapter = fixture.real.scene.coordinator.joint_capture().adapter();
+    assert!(
+        adapter.retained_starts_for_test().is_empty(),
+        "bare rows stage no journal BEGINs"
+    );
+    assert_eq!(
+        adapter.invocation_claims_for_test().0,
+        0,
+        "no claim-store growth without a feed"
+    );
+    assert_eq!(
+        adapter.test_claim_costs_for_test(),
+        (0, 0, 0),
+        "no fingerprint-claim work without a feed"
+    );
+}

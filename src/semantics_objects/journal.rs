@@ -14363,6 +14363,112 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn joint_keepup_lost_begin_claims_cleared_by_loss_void() {
+        // A claim whose BEGIN never arrives (ring loss) is never
+        // consumed, but it cannot pile up across seals: clean seals
+        // leave the orphan count flat, and the collection that
+        // observes the loss voids staged state including every claim.
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        const PAIRED: usize = 64;
+        const ORPHANS: usize = 32;
+        for thread in 1..=PAIRED as u64 {
+            let begin = begin_bytes(thread, 1, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        }
+        let proof = scene.attest_calls(PAIRED);
+        scene.prepare_claims();
+        for thread in 0..ORPHANS as u64 {
+            let admitted = keepup_admit_fresh(&mut scene, 100_001 + thread);
+            scene
+                .adapter
+                .attest_key(&admitted)
+                .expect("orphan claim files");
+        }
+        assert_eq!(scene.adapter.claim_counts, PAIRED + ORPHANS);
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("clean seal succeeds");
+        assert_eq!(
+            scene.adapter.claim_counts, ORPHANS,
+            "paired claims convert; orphans persist across a clean seal"
+        );
+        // A second clean generation converts without touching orphans:
+        // no growth without new loss.
+        for thread in (PAIRED + 1) as u64..=(2 * PAIRED) as u64 {
+            let begin = begin_bytes(thread, 1, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        }
+        for _ in 0..PAIRED {
+            scene.attest();
+        }
+        scene.prepare_claims();
+        assert_eq!(scene.adapter.claim_counts, PAIRED + ORPHANS);
+        scene.seal(&bootstrap).expect("second clean seal succeeds");
+        assert_eq!(
+            scene.adapter.claim_counts, ORPHANS,
+            "orphan count stays flat across clean seals"
+        );
+        // The collection that observes the ring loss voids everything
+        // staged, orphans included.
+        scene.bind_session_drain();
+        let begin = begin_bytes(2 * PAIRED as u64 + 1, 1, create, 0);
+        let mut script = BusyScript::new(vec![begin.to_vec()]);
+        script.discard_bump = Some((1, ORPHANS as u64));
+        let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
+        let fault = ScriptedFaultCell::steady(7);
+        let collection = scene.adapter.collect_from_drain(
+            &mut drain,
+            &scene.descriptors,
+            None,
+            &fault,
+            scene.fixture.h0_allocated_below(),
+        );
+        assert_eq!(collection.discarded_delta, ORPHANS as u64);
+        let failure = scene
+            .seal_collected(&bootstrap, &collection)
+            .expect_err("observed loss voids the seal");
+        assert_eq!(failure.gap, JournalGap::Discarded);
+        assert_eq!(
+            scene.adapter.claim_counts, 0,
+            "the loss void disposes every claim, orphans included"
+        );
+        assert!(
+            scene.adapter.claims.is_empty(),
+            "no orphan fingerprint survives the void"
+        );
+    }
+
+    #[test]
+    fn joint_keepup_sync_return_lost_abandon_consumes_its_claim() {
+        // A sync-return-result-lost abandonment loses the outcome, not
+        // the BEGIN: the begin still converts under its claim, so no
+        // orphan is left behind.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let proof = scene.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        scene.ingest_ordinary(ordinary_for(&begin, 0));
+        // The fence sits strictly above the corroborated bound, so the
+        // frontier must cover it: one pad record.
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        scene.prepare_claims();
+        assert_eq!(scene.adapter.claim_counts, 1);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("corroborated bound seals");
+        assert!(success.prefix.settled().iter().any(|call| call.abandoned));
+        assert_eq!(
+            scene.adapter.claim_counts, 0,
+            "the abandoned call's claim converted with its begin"
+        );
+    }
+
+    #[test]
     fn joint_keepup_phase_trace_records_claim_samples() {
         let mut scene = Scene::new(image_default());
         let create = function_id("C_CreateObject");

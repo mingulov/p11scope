@@ -306,6 +306,18 @@ u32 p11_image_bank_select(void)
     bank = select->bank;
     if (bank >= IMAGE_BANK_SLOTS)
         return IMAGE_BANK_NO_SLOT;
+    /* Normalize once: the check above excludes bank >= 2, but under
+     * register pressure the compiler spills bank and reloads it after
+     * the check, and the reloaded value is unbounded (6.6 task_newtask:
+     * math on an unbounded register at the prepared address). The
+     * barrier keeps the mask (without it clang folds `bank & 1` using
+     * the dominating check, the counter-bank clamp precedent), and the
+     * masked value is what spills, so every reload is umax=1 and the
+     * raw index below verifies in every inlining context. Per-use
+     * masks or branch-per-bank forms also verify but grow the link
+     * frame past the 512 chain. */
+    __asm__ volatile("" : "+r"(bank));
+    bank &= (IMAGE_BANK_SLOTS - 1);
     if (!select->prepared[bank])
         return IMAGE_BANK_NO_SLOT;
     return (u32)bank;
@@ -326,6 +338,11 @@ u32 p11_image_bank_cut(u64 target)
 
     if (target >= IMAGE_BANK_SLOTS)
         return IMAGE_BANK_NO_SLOT;
+    /* Normalize once, as in the select leaf: every later use of target
+     * (the prepared index, the CAS, the return) sees the masked value,
+     * so every spill and reload stays umax=1. */
+    __asm__ volatile("" : "+r"(target));
+    target &= (IMAGE_BANK_SLOTS - 1);
     select = bank_select_word();
     if (!select)
         return IMAGE_BANK_NO_SLOT;
@@ -384,6 +401,25 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
         result.status = COOKIE_STATUS_BAD_CONFIG;
         return result;
     }
+    /* Explicit check on THIS lookup: the bank-valid path dereferences
+     * this pointer, and the verifier cannot correlate it with the
+     * separate lookup inside p11_image_bank_select above (same
+     * map/key, but a different result register). Old kernels reject
+     * the unchecked arithmetic (6.6: R8 map_value_or_null at the
+     * fold-counter address). Same-map/same-key lookups always agree,
+     * so this only fails closed with the bank-invalid status on a
+     * state that cannot occur. */
+    if (!select) {
+        result.status = COOKIE_STATUS_BAD_CONFIG;
+        return result;
+    }
+    /* Normalize once, as in the select leaf: bank is 0/1 here, and the
+     * masked value is what spills, so incarnation[bank] below and the
+     * source/other values derived from bank stay umax=1 through every
+     * reload. Later `bank = other` stores a compare-selected 0/1,
+     * bounded by construction. */
+    __asm__ volatile("" : "+r"(bank));
+    bank &= (IMAGE_BANK_SLOTS - 1);
     /* Lifecycle help is unconditional: a corrupt current bank never
      * blocks another bank's fold or re-prepare. */
     identity_help_fold(select);

@@ -3707,8 +3707,8 @@ impl JournalAdapter {
             exec: image.exec_id,
             router: router.get(),
         };
-        if !self.keys.contains_key(&key) {
-            self.keys.insert(key, JournalDomainState::default());
+        if let std::collections::btree_map::Entry::Vacant(vacant) = self.keys.entry(key) {
+            vacant.insert(JournalDomainState::default());
             self.image_keys
                 .entry((key.cookie, key.exec))
                 .or_default()

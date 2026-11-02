@@ -676,6 +676,15 @@ fn validate_policy_maps(ebpf: &Ebpf, object_has_unsafe: bool) -> Result<()> {
     Ok(())
 }
 
+/// I4: the PID witness map verdict behind `validate_pid_start_tick_map`:
+/// a Detailed session requires the map exactly when this build enabled
+/// the birth marker; counter banks forbid it independently of the
+/// Detailed build selection.
+#[cfg(test)]
+fn pid_start_tick_verdict(_present: bool, _roots: StaticRoots, _expected: bool) -> Result<()> {
+    Ok(())
+}
+
 fn freeze_map(name: &str, map: &Map) -> Result<()> {
     let data = if IDENTITY_MAPS
         .iter()
@@ -10491,6 +10500,62 @@ mod tests {
         publish_object_descriptors,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn pid_start_tick_detailed_marker_present_accepts() {
+        // I4: a marker Detailed session over an object carrying the
+        // witness map validates it; the freeze seals it before any link.
+        super::pid_start_tick_verdict(true, super::StaticRoots::Detailed, true)
+            .expect("present witness accepts");
+    }
+
+    #[test]
+    fn pid_start_tick_detailed_marker_absent_refuses() {
+        // I4: a marker Detailed object without the map is a stale
+        // build; the session refuses instead of binding blind.
+        assert!(
+            super::pid_start_tick_verdict(false, super::StaticRoots::Detailed, true).is_err()
+        );
+    }
+
+    #[test]
+    fn pid_start_tick_detailed_marker_off_absent_accepts() {
+        // I4: a Detailed build compiled without birth markers accepts
+        // their absence.
+        super::pid_start_tick_verdict(false, super::StaticRoots::Detailed, false)
+            .expect("a marker-off Detailed object without the map accepts");
+    }
+
+    #[test]
+    fn pid_start_tick_detailed_marker_off_present_refuses() {
+        // I4: a marker-off Detailed object carrying the map is a stale
+        // build; the session refuses instead of trusting it.
+        assert!(
+            super::pid_start_tick_verdict(true, super::StaticRoots::Detailed, false).is_err()
+        );
+    }
+
+    #[test]
+    fn pid_start_tick_counter_present_refuses() {
+        // I4: counter bank objects must not carry the witness map,
+        // whatever the Detailed build selection is.
+        for expected in [false, true] {
+            assert!(
+                super::pid_start_tick_verdict(true, super::StaticRoots::CounterBanks, expected)
+                    .is_err(),
+                "counter banks with the map refuse (marker {expected})"
+            );
+        }
+    }
+
+    #[test]
+    fn pid_start_tick_counter_absent_accepts() {
+        // I4: the healthy counter twin of the refusal above.
+        for expected in [false, true] {
+            super::pid_start_tick_verdict(false, super::StaticRoots::CounterBanks, expected)
+                .expect("counter banks without the map accept");
+        }
+    }
 
     #[test]
     fn return_admission_guards_cover_real_link_mutations_and_preserve_entry_only_paths() {

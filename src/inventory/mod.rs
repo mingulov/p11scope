@@ -11790,6 +11790,7 @@ mod tests {
             receipt_free: bool,
             saturated: bool,
             ring_loss: std::collections::VecDeque<u64>,
+            ring_loss_fail: std::collections::VecDeque<bool>,
         }
 
         impl StubLaneIo {
@@ -11815,6 +11816,7 @@ mod tests {
                     receipt_free: false,
                     saturated: false,
                     ring_loss: std::collections::VecDeque::new(),
+                    ring_loss_fail: std::collections::VecDeque::new(),
                 }
             }
         }
@@ -11902,6 +11904,10 @@ mod tests {
 
             fn events_ring_loss(&mut self) -> Option<u64> {
                 self.ring_loss.pop_front()
+            }
+
+            fn events_ring_loss_fails(&mut self) -> bool {
+                self.ring_loss_fail.pop_front().unwrap_or(false)
             }
 
             fn collection_saturated(&self) -> bool {
@@ -12262,6 +12268,127 @@ mod tests {
                 "rises coalesce onto one gap row"
             );
             assert_eq!(lane_counts(&driver), (12, 12));
+        }
+
+        #[test]
+        fn events_ring_loss_read_failure_discloses_unknown_gap_once() {
+            let mut scene = driver_scene(2);
+            scene.stub.receipt_free = true;
+            // Two failed reads, then a successful read of 5: the
+            // failures disclose one unknown gap, the success the
+            // usual named loss.
+            scene.stub.ring_loss_fail = std::collections::VecDeque::from([true, true, false]);
+            scene.stub.ring_loss = std::collections::VecDeque::from([5]);
+            scene.lane.install_test_io(Box::new(scene.stub));
+            let mut driver = ClassicDriver {
+                coordinator: &mut scene.coordinator,
+                inventory_scope: None,
+                scope: InventoryRunScope::Pid(std::process::id()),
+                cgroup: None,
+                max_scan_pids: None,
+                guard: UnavailableImageGuard,
+                deadline: None,
+                attach_backend: crate::attach::BackendSelection::Auto,
+                identity: None,
+                display: None,
+                semantic: Some(scene.lane),
+                semantic_staged: false,
+                seated_summary: None,
+                second_signal: None,
+                lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+                completion_source: None,
+                pending_install: None,
+                installed_promotion: None,
+                retiring: None,
+                joint_finish: JointFinishDriver::NotBegun,
+                stop_requested: false,
+                joint_first_error: None,
+                suspended: false,
+                joint_commit_pending: false,
+                joint_tick_refusal: None,
+                joint_commit_retries: 0,
+                #[cfg(test)]
+                terminal_seq_calls: 0,
+                #[cfg(test)]
+                reclaim_calls: Vec::new(),
+                #[cfg(test)]
+                joint_begin_calls: 0,
+                #[cfg(test)]
+                joint_step_calls: 0,
+                #[cfg(test)]
+                joint_commit_polls: 0,
+                #[cfg(test)]
+                take_promotion_work_calls: 0,
+                #[cfg(test)]
+                drive_pending_install_calls: 0,
+                #[cfg(test)]
+                service_caller_metadata_calls: 0,
+                #[cfg(test)]
+                commit_calls: 0,
+            };
+            let gaps_by_subject = |driver: &ClassicDriver<'_>, subject: &str| {
+                driver
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .zip(driver.coordinator.registry().gap_repeats().iter())
+                    .filter(|(gap, _)| gap.subject == subject)
+                    .map(|(gap, repeats)| (gap.reason.clone(), *repeats))
+                    .collect::<Vec<_>>()
+            };
+            // The first tick stages without committing: nothing disclosed.
+            driver.on_tick();
+            assert!(driver.semantic_staged, "the first tick stages");
+            assert!(gaps_by_subject(&driver, "native capture events loss unknown").is_empty());
+            // The first failed read discloses one unknown gap, and no
+            // counted loss (the counter never answered).
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(
+                gaps_by_subject(&driver, "native capture events loss unknown"),
+                [(
+                    "the EVENTS ring-loss counter could not be read; kernel loss past this point is uncounted"
+                        .to_string(),
+                    1
+                )],
+                "a failed read discloses one unknown gap"
+            );
+            assert!(gaps_by_subject(&driver, "native capture events lost").is_empty());
+            // A repeat failure discloses nothing new.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(
+                gaps_by_subject(&driver, "native capture events loss unknown").len(),
+                1
+            );
+            assert_eq!(
+                gaps_by_subject(&driver, "native capture events loss unknown")[0].1,
+                1,
+                "repeat failures never re-record the unknown gap"
+            );
+            // The successful read discloses the usual named loss.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(
+                gaps_by_subject(&driver, "native capture events lost").len(),
+                1,
+                "a later success still discloses its rise"
+            );
+            let lane = driver.semantic.as_ref().unwrap();
+            assert_eq!(
+                (
+                    lane.shed_calls_disclosed(),
+                    lane.semantic_summary().unrouted_returns
+                ),
+                (5, 5)
+            );
         }
 
         #[test]

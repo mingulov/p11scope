@@ -734,6 +734,13 @@ pub(crate) trait LaneTestIo {
     fn events_ring_loss(&mut self) -> Option<u64> {
         None
     }
+    /// Scripted EVENTS ring-loss read failure (models a failed
+    /// EVIDENCE counter read). False unless the script poses one;
+    /// distinct from `events_ring_loss` returning None, which models
+    /// no readable counter at all.
+    fn events_ring_loss_fails(&mut self) -> bool {
+        false
+    }
     /// Scripted collection saturation: the scripted tick stopped at
     /// its record quantum with more possibly waiting.
     fn collection_saturated(&self) -> bool {

@@ -209,7 +209,8 @@ map_verdict() {
         return 0
     fi
     case "$reason" in
-        *"not the Joint marker populated"*|*"joint_journal_unavailable"*)
+        *"reason journal_unavailable, not the Joint marker"*|\
+*"joint_journal_unavailable"*)
             printf 'false|expected-failure|%s\n' "$EXPECTED_WU2"
             return 0
             ;;
@@ -221,9 +222,15 @@ map_verdict() {
             fi
             return 0
             ;;
+        *"loss gap"*|*"R59 stopped disclosure"*)
+            # A counted loss is a real result, never a skip: fail it
+            # at any load, ahead of the load-judged arm below.
+            printf 'false|failed|\n'
+            return 0
+            ;;
         *"unreadable events"*|*"unreadable ledger"*|*"unreadable inventory"*|\
-*"event stream incomplete"*|*"missing or duplicate"*|*"not unique"*|\
-*"not the exact"*|*"not complete"*|*"no ledgers emitted"*|\
+*"event stream incomplete"*|*"missing or duplicate"*|\
+*"withheld semantic summary"*|*"not complete"*|*"no ledgers emitted"*|\
 *"never published"*|*"never printed"*|*"never became"*|\
 *"no admission pass"*|*"no binding pass"*|*"not held"*|\
 *" rc="*|*"chmod failed"*)

@@ -118,6 +118,7 @@ LOSS_GAP_SUBJECTS = frozenset({
     "semantic capture loss",
     "native capture lifecycle evidence lost",
     "native capture retirement unsettled",
+    "native capture events lost",
     "joint machine unavailable",
     "native capture scope custody unproven",
     "native capture refused an extend",
@@ -149,6 +150,14 @@ DESTROY_FUNCTIONS = frozenset({"C_DestroyObject"})
 JOINT_MECHANISMS = {
     0x251: ("CKM_SHA256_HMAC", ["sign"]),
     0x350: ("CKM_GENERIC_SECRET_KEY_GEN", ["generate_key"]),
+}
+# Pinned per-row evidence for the --joint pair: the sign row carries
+# exactly the HMAC sign calls, the keygen row exactly the key
+# creation. A cross-row swap keeps every total but mis-attributes the
+# work, so it is refused, never averaged away.
+JOINT_MECHANISM_FUNCTIONS = {
+    0x251: frozenset({"C_SignInit", "C_Sign"}),
+    0x350: frozenset({"C_GenerateKey"}),
 }
 # The unlinked-lane marker: tolerated (never gated) in S1 mode, and
 # refused everywhere in --joint mode.
@@ -646,6 +655,12 @@ def check_conservation(view, selected, joint=False):
             row_rvs.add(entry["rv"])
             observed_rvs.add(entry["rv"])
         observed_fns.update(functions)
+        if joint:
+            pinned = JOINT_MECHANISM_FUNCTIONS[mechanism]
+            _require(set(functions) == pinned,
+                     f"mechanism {mechanism:#x} evidence "
+                     f"{sorted(functions)} is not the pinned "
+                     f"{sorted(pinned)} set")
     exempt = TEARDOWN_FUNCTIONS
     if joint:
         exempt = exempt | SETUP_FUNCTIONS | DESTROY_FUNCTIONS
@@ -666,6 +681,10 @@ def check_conservation(view, selected, joint=False):
     extra_rv = sorted(observed_rvs - hot_rvs)
     if extra_rv:
         raise S1Error(f"observed rv {extra_rv[0]} absent from ledger")
+    if joint:
+        _require(ids == set(JOINT_MECHANISMS),
+                 "joint conservation needs exactly the pinned 0x251 "
+                 "sign and 0x350 keygen rows")
     checked = []
     for row in mechanisms:
         functions = row["evidence"]["functions"]
@@ -1079,19 +1098,19 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.min_rate < 0:
         parser.error("--min-rate must be >= 0")
+    name = "joint-throughput" if args.joint else "s1-throughput"
     try:
         result = compare(args.ledger, args.events, args.inventory,
                          args.min_rate, joint=args.joint)
     except S1Error as error:
         print(json.dumps({"verdict": "fail", "reason": str(error)},
                          sort_keys=True))
-        name = "joint-throughput" if args.joint else "s1-throughput"
         print(f"{name} refused: {error}", file=sys.stderr)
         return 1
     except (OSError, UnicodeError):
         print(json.dumps({"verdict": "fail",
                           "reason": "unreadable input"}, sort_keys=True))
-        print("s1-throughput refused: unreadable input", file=sys.stderr)
+        print(f"{name} refused: unreadable input", file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True))
     return 0

@@ -4408,19 +4408,21 @@ fn capture_return_facts<const DEFER_ROUTING: bool>(
         }
     }
     let mut async_value = start.async_value;
-    if accounting.rv == 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
-        // An OK GetID with a null output pointer produced no id: mark the
-        // value unreadable instead of leaving a valid-looking default.
-        if start.out_ptr == 0 {
-            capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
-            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-        } else {
-            match read_word(start.out_ptr, layout) {
-                Ok(value) => async_value = value,
-                Err(_) => {
-                    capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
-                    bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-                }
+    // An OK GetID with a null output pointer produced no id: mark the
+    // value unreadable instead of leaving a valid-looking default.
+    if accounting.rv == 0
+        && semantics.lifecycle == lifecycle::ASYNC_GET_ID
+        && start.out_ptr == 0
+    {
+        capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+    }
+    if accounting.rv == 0 && start.out_ptr != 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
+        match read_word(start.out_ptr, layout) {
+            Ok(value) => async_value = value,
+            Err(_) => {
+                capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+                bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
             }
         }
     }

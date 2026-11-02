@@ -7905,7 +7905,9 @@ mod tests {
     /// `run --pause auto -- sh -c '…'` without `exec`: the provider loads in
     /// a grandchild outside PID scope, which the pause cannot cover. The run
     /// stays honest: the workload succeeds invisibly, zero calls are
-    /// observed, and the report is PARTIAL with no silent success.
+    /// observed, and the report is PARTIAL with no silent success. The
+    /// background `& wait` form forces the fork on every shell: some shells
+    /// replace themselves with a lone `sh -c` command instead of forking.
     #[test]
     #[ignore = "privileged: run --pause auto through a forking sh wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
     fn privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64() {
@@ -7923,7 +7925,7 @@ mod tests {
             wrapper_total_calls(&direct_doc) > 0,
             "the oracle proves the token can produce calls"
         );
-        let script = format!("/usr/bin/pkcs11-tool --module {module} -O --login --pin 1234");
+        let script = format!("/usr/bin/pkcs11-tool --module {module} -O --login --pin 1234 & wait");
         let wrapped = vec![
             std::ffi::OsString::from("/bin/sh"),
             std::ffi::OsString::from("-c"),

@@ -2,7 +2,8 @@
 //! Task 3 Stage A: the Session side of the load-instance continuity witness.
 //!
 //! - Loads the four native continuity hooks (`uprobe_mmap`, `uprobe_munmap`,
-//!   `copy_vma`, `exec_mm_release`) before deferred policy freezes, and attaches
+//!   `copy_vma`, and the exec-release hook: `exec_mm_release` through 7.2,
+//!   `exec_mmap` from 7.3) before deferred policy freezes, and attaches
 //!   them after all freezes and mandatory lifecycle links. Any
 //!   load or attach failure leaves the capture running with instance routing
 //!   **refused** and a named reason; it never degrades the proof. An LTO
@@ -51,7 +52,7 @@ pub(crate) const INSTANCE_PROGRAMS: [(&str, &str); 4] = [
 ];
 
 /// Hooks attached as fexit; every other instance hook is fentry.
-const EXIT_PROGRAMS: [&str; 1] = ["p11_inst_vma_copy"];
+const EXIT_PROGRAMS: [&str; 2] = ["p11_inst_vma_copy", EXEC_RELEASE_MMAP_PROGRAM];
 
 /// The 7.3+ exec-release hook program and its kernel attach target. Kernels
 /// through 7.2 carry `exec_mm_release`; 7.3 removed it, merging exit and exec
@@ -84,9 +85,9 @@ fn active_instance_programs(target: ExecReleaseTarget) -> [(&'static str, &'stat
 }
 
 /// Resolve the exec-release hook from the host BTF: the exact legacy
-/// prototype wins when present, keeping older kernels byte-identical.
-/// Only the legacy target resolves yet; kernels without it refuse
-/// exactly as before.
+/// prototype wins when present, keeping older kernels byte-identical;
+/// otherwise the exact exec_mmap shape selects the 7.3+ hook. Kernels
+/// with neither refuse with the legacy message.
 fn resolve_exec_release_target(
     host: &super::host_btf::HostBtf,
     btf: &Btf,
@@ -96,6 +97,9 @@ fn resolve_exec_release_target(
         .context("instance hook BTF differs from cached host BTF")?;
     if exec_release_proto_is_exact(raw) {
         return Ok(ExecReleaseTarget::ExecMmRelease);
+    }
+    if exec_mmap_proto_is_exact(raw) {
+        return Ok(ExecReleaseTarget::ExecMmap);
     }
     validate_exec_release_proto(host, btf)?;
     unreachable!("the legacy probe failed above, so this validation cannot succeed");
@@ -749,6 +753,94 @@ fn exec_release_proto_is_exact(raw: &[u8]) -> bool {
             return Some(false);
         }
         Some(pointee(word(proto, 16)?, b"task_struct")? && pointee(word(proto, 24)?, b"mm_struct")?)
+    };
+    checked().unwrap_or(false)
+}
+
+/// Whether the host BTF carries exactly one `exec_mmap` with the exact
+/// int(linux_binprm *) prototype the 7.3+ hook needs: one argument, so the
+/// fexit return slot is ctx[1], and an integer return, so zero means the new
+/// mm installed. Mirrors [`exec_release_proto_is_exact`]; the legacy parser
+/// is untouched so its pinned behavior cannot drift.
+fn exec_mmap_proto_is_exact(raw: &[u8]) -> bool {
+    let word = |bytes: &[u8], at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    let checked = || -> Option<bool> {
+        if raw.get(..4)? != [0x9f, 0xeb, 1, 0] {
+            return Some(false);
+        }
+        let header = word(raw, 4)? as usize;
+        if header < 24 {
+            return Some(false);
+        }
+        let type_start = header.checked_add(word(raw, 8)? as usize)?;
+        let type_end = type_start.checked_add(word(raw, 12)? as usize)?;
+        let string_start = header.checked_add(word(raw, 16)? as usize)?;
+        let string_end = string_start.checked_add(word(raw, 20)? as usize)?;
+        let types = raw.get(type_start..type_end)?;
+        let strings = raw.get(string_start..string_end)?;
+        let name = |offset: u32| -> Option<&[u8]> {
+            let tail = strings.get(offset as usize..)?;
+            Some(&tail[..tail.iter().position(|byte| *byte == 0)?])
+        };
+        let mut nodes = vec![&[][..]];
+        let mut cursor = 0usize;
+        while cursor < types.len() {
+            let record = types.get(cursor..)?;
+            let info = word(record, 4)?;
+            let kind = (info >> 24) & 31;
+            let count = (info & 65535) as usize;
+            let extra = match kind {
+                0 | 2 | 7 | 8 | 9 | 10 | 11 | 12 | 16 | 18 => 0,
+                1 | 14 | 17 => 4,
+                3 => 12,
+                4 | 5 | 15 | 19 => count.checked_mul(12)?,
+                6 | 13 => count.checked_mul(8)?,
+                _ => return Some(false),
+            };
+            let length = 12usize.checked_add(extra)?;
+            nodes.push(record.get(..length)?);
+            cursor = cursor.checked_add(length)?;
+        }
+        let resolve = |mut id: u32| -> Option<&[u8]> {
+            for _ in 0..32 {
+                let node = *nodes.get(id as usize)?;
+                let kind = (word(node, 4)? >> 24) & 31;
+                if !matches!(kind, 8 | 9 | 10 | 11 | 18) {
+                    return Some(node);
+                }
+                id = word(node, 8)?;
+            }
+            None
+        };
+        let pointee = |id: u32, wanted: &[u8]| -> Option<bool> {
+            let pointer = resolve(id)?;
+            if (word(pointer, 4)? >> 24) & 31 != 2 {
+                return Some(false);
+            }
+            let target = resolve(word(pointer, 8)?)?;
+            Some((word(target, 4)? >> 24) & 31 == 4 && name(word(target, 0)?)? == wanted)
+        };
+        let mut functions = nodes.iter().skip(1).filter(|node| {
+            word(node, 4).is_some_and(|info| (info >> 24) & 31 == 12)
+                && word(node, 0).and_then(name) == Some(b"exec_mmap".as_slice())
+        });
+        let function = functions.next()?;
+        if functions.next().is_some() {
+            return Some(false);
+        }
+        let proto = resolve(word(function, 8)?)?;
+        if word(proto, 4)? != (13 << 24 | 1) {
+            return Some(false);
+        }
+        let ret = resolve(word(proto, 8)?)?;
+        if (word(ret, 4)? >> 24) & 31 != 1 {
+            return Some(false);
+        }
+        pointee(word(proto, 16)?, b"linux_binprm")
     };
     checked().unwrap_or(false)
 }
@@ -1891,12 +1983,18 @@ fn validate_hook_health_with(
     );
     let mut ids = BTreeMap::new();
     for (name, stats) in read_stats()? {
+        // A load baseline names the active hook set (legacy or 7.3+);
+        // without one only the legacy names validate.
+        let known = match expected {
+            Some(baseline) => baseline.contains_key(name),
+            None => INSTANCE_PROGRAMS
+                .iter()
+                .any(|(required, _)| *required == name),
+        };
         ensure!(
             stats.program_id != 0
                 && stats.recursion_misses == 0
-                && INSTANCE_PROGRAMS
-                    .iter()
-                    .any(|(required, _)| *required == name)
+                && known
                 && ids.insert(name, stats.program_id).is_none(),
             "image hook identity/statistics unavailable"
         );
@@ -2114,10 +2212,18 @@ mod tests {
     }
 
     fn healthy_hook_stats() -> Vec<(&'static str, super::HookStats)> {
-        super::INSTANCE_PROGRAMS
+        let names: Vec<&'static str> = super::INSTANCE_PROGRAMS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        healthy_hook_stats_for(&names)
+    }
+
+    fn healthy_hook_stats_for(names: &[&'static str]) -> Vec<(&'static str, super::HookStats)> {
+        names
             .iter()
             .enumerate()
-            .map(|(index, (name, _))| {
+            .map(|(index, name)| {
                 let mut info = super::ProgInfoPrefix {
                     head: [0; 192],
                     run_time_ns: 0,
@@ -2128,6 +2234,23 @@ mod tests {
                 (*name, super::decode_prog_stats(&info, 216).unwrap())
             })
             .collect()
+    }
+
+    #[test]
+    fn hook_health_accepts_the_resolved_mmap_set() {
+        let names: Vec<&'static str> =
+            super::active_instance_programs(super::ExecReleaseTarget::ExecMmap)
+                .iter()
+                .map(|(program, _)| *program)
+                .collect();
+        assert_eq!(names[3], super::EXEC_RELEASE_MMAP_PROGRAM);
+        let stats = healthy_hook_stats_for(&names);
+        let expected = stats
+            .iter()
+            .map(|(name, stats)| (*name, stats.program_id))
+            .collect();
+        super::validate_hook_health_with(4, Some(&expected), || Ok("1".into()), || Ok(stats))
+            .expect("the resolved mmap set validates against its load baseline");
     }
 
     #[test]
@@ -2644,6 +2767,49 @@ mod tests {
                     "truncated at {truncated}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn image_hook_requires_the_exact_exec_mmap_prototype() {
+        for (header, gap) in [(24, 0), (32, 0), (24, 7), (32, 7)] {
+            let bytes = exec_hook_btf_fixture(false, true, header, gap);
+            assert!(
+                super::exec_mmap_proto_is_exact(&bytes),
+                "header {header} gap {gap}"
+            );
+        }
+        assert!(!super::exec_mmap_proto_is_exact(&exec_hook_btf_fixture(
+            true, false, 24, 0
+        )));
+        assert!(super::exec_mmap_proto_is_exact(&exec_hook_btf_fixture(
+            true, true, 24, 0
+        )));
+        let bytes = exec_hook_btf_fixture(false, true, 24, 0);
+        let mut wrong_return = bytes.clone();
+        wrong_return[148..152].copy_from_slice(&0u32.to_le_bytes());
+        assert!(!super::exec_mmap_proto_is_exact(&wrong_return));
+        let mut wrong_argument = bytes.clone();
+        wrong_argument[156..160].copy_from_slice(&4u32.to_le_bytes());
+        assert!(!super::exec_mmap_proto_is_exact(&wrong_argument));
+        let mut wrong_arity = bytes.clone();
+        wrong_arity[144..148].copy_from_slice(&((13u32 << 24) | 2).to_le_bytes());
+        assert!(!super::exec_mmap_proto_is_exact(&wrong_arity));
+        let type_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let type_end = 24 + type_len as usize;
+        let mut duplicate = bytes.clone();
+        duplicate.splice(
+            type_end..type_end,
+            bytes[type_end - 12..type_end].iter().copied(),
+        );
+        duplicate[12..16].copy_from_slice(&(type_len + 12).to_le_bytes());
+        duplicate[16..20].copy_from_slice(&(type_len + 12).to_le_bytes());
+        assert!(!super::exec_mmap_proto_is_exact(&duplicate));
+        for truncated in 0..bytes.len() {
+            assert!(
+                !super::exec_mmap_proto_is_exact(&bytes[..truncated]),
+                "truncated at {truncated}"
+            );
         }
     }
 

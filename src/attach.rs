@@ -7896,6 +7896,9 @@ impl Session {
         if self.has_dynamic_link(context, return_program, object, file_offset, cookie) {
             return Ok((false, None));
         }
+        // A provider export's hooks go live here: their completion dates
+        // pause thread births, stamped on every return path.
+        let _attach_window = crate::discovery::pause::hook_attach_window();
         stopped_attachment_admission(self.mutation_stopped(), "dynamic")?;
         attachment_admission(&self.detach_failures, true)?;
         let path = objects
@@ -8103,6 +8106,10 @@ impl Session {
         if !targets.is_empty() {
             self.require_return_probe_admission()?;
         }
+        // Provider hooks go live here: their completion dates pause thread
+        // births, stamped on every return path.
+        let _attach_window =
+            (!targets.is_empty()).then(crate::discovery::pause::hook_attach_window);
         if self.native_retirement.collected_blocking() && targets.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -8972,6 +8979,10 @@ impl Session {
         if !regrouped.is_empty() {
             self.require_return_probe_admission()?;
         }
+        // Surviving siblings' hooks go live again here: the rebuild counts
+        // as an attach for pause thread-birth dating.
+        let _attach_window =
+            (!regrouped.is_empty()).then(crate::discovery::pause::hook_attach_window);
         #[cfg(test)]
         if !regrouped.is_empty() {
             crate::first_use_probe::unsupported_rebuild();

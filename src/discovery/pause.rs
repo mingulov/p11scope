@@ -12,6 +12,7 @@ use p11scope_ebpf_common::{
     PAUSE_REQUESTED,
 };
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub(crate) use crate::events::DiscoveryItem;
@@ -20,6 +21,9 @@ pub(crate) use crate::events::DiscoveryItem;
 /// its hook. Crate-visible so the run loop's gate tests measure against it.
 pub(crate) const CYCLE_NS: u64 = 500_000_000;
 const SAMPLE_NS: u64 = 1_000_000;
+/// Upper bound on the first sample's settling re-samples: one per sample
+/// interval of a cycle. The cycle deadline normally ends it first.
+const MAX_SETTLE_SAMPLES: u64 = CYCLE_NS / SAMPLE_NS;
 /// Stops one arm may chain after its first (GT-4). A confirmed stop installs
 /// a successor while the child is still stopped, so the owned child's next
 /// pause-eligible event — a loader hit, a `C_GetFunctionList` /
@@ -47,6 +51,7 @@ const MSG_PAUSE_RESUME_DEADLINE: &str = "pause resume observation deadline cross
 const MSG_PAUSE_CAUSAL_DEADLINE: &str = "pause causal deadline crossed";
 const MSG_COALESCED_RECORD_DEADLINE: &str = "coalesced record crossed winner deadline";
 const MSG_UNSERVICED_AT_CLEANUP: &str = "the capture ended before a pause cycle serviced its stop";
+const MSG_TASK_SET_CHANGED: &str = "task set changed or was not entirely stopped";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PauseDiagnostic {
@@ -255,13 +260,22 @@ impl std::fmt::Display for PauseError {
 impl std::error::Error for PauseError {}
 
 /// The coordinator owns policy, not Aya. This fixed-purpose seam is also the
-/// complete failure-injection surface: one clock, task reader, discovery owner,
-/// authorization map, Engine batch application, marker, pidfd resume, and
-/// terminal detach action.
+/// complete failure-injection surface: one clock, task reader, task-start
+/// reader, hook-attach clock, discovery owner, authorization map, Engine batch
+/// application, marker, pidfd resume, and terminal detach action.
 pub(crate) trait PauseIo {
     fn now_ns(&mut self) -> Result<u64, String>;
     fn wait_one_ms(&mut self) -> Result<(), String>;
     fn task_states(&mut self, pid: u32) -> Result<BTreeMap<u32, u8>, String>;
+    /// Kernel start time of each task of `pid`, in boot-relative clock ticks
+    /// (`/proc/<pid>/task/<tid>/stat` field 22). A task absent from the map
+    /// has an unreadable start time and is never treated as covered.
+    fn task_starts(&mut self, pid: u32) -> Result<BTreeMap<u32, u64>, String>;
+    /// When the last provider hook attach completed, in `CLOCK_BOOTTIME`
+    /// nanoseconds (the start-time-tick domain). `None` when no attach has
+    /// completed or one is still in flight: then no thread born after
+    /// preflight dates as covered.
+    fn last_hook_attach_boot_ns(&mut self) -> Option<u64>;
     fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String>;
     fn arm(&mut self) -> Result<(), String>;
     fn authorization(&mut self) -> Result<Option<u64>, String>;
@@ -369,6 +383,10 @@ pub(crate) struct PauseCoordinator {
     pid: u32,
     generation: u64,
     expected_tasks: BTreeMap<u32, u8>,
+    /// Kernel start time (boot-relative ticks) of each expected task: thread
+    /// identity is the (tid, start time) pair, so a reused tid never passes
+    /// as the thread the preflight saw.
+    expected_starts: BTreeMap<u32, u64>,
     counters: PauseCounters,
     epoch: PauseEpoch,
     armed: bool,
@@ -417,26 +435,6 @@ impl TimedDequeueError {
     }
 }
 
-/// A failed stop proof: the proof itself (`Proof`, a non-lifecycle
-/// partial under `auto`) or the delivery wait's IO failure (`Lifecycle`,
-/// like every other wait in the cycle).
-enum SampleStoppedError {
-    Proof(String),
-    Lifecycle(String),
-}
-
-impl SampleStoppedError {
-    fn lifecycle(&self) -> bool {
-        matches!(self, Self::Lifecycle(_))
-    }
-
-    fn message(self) -> String {
-        match self {
-            Self::Proof(message) | Self::Lifecycle(message) => message,
-        }
-    }
-}
-
 fn clamp_deadline(slot: &mut Option<u64>, candidate: u64) -> u64 {
     let deadline = slot.map_or(candidate, |existing| existing.min(candidate));
     *slot = Some(deadline);
@@ -464,6 +462,9 @@ impl PauseCoordinator {
         let expected_tasks = io
             .task_states(child.pid())
             .map_err(|error| Self::policy_error(policy, error, true))?;
+        let task_starts = io
+            .task_starts(child.pid())
+            .map_err(|error| Self::policy_error(policy, error, true))?;
         if expected_tasks.is_empty() || !child.pin().still_the_same() {
             return Err(Self::policy_error(
                 policy,
@@ -471,12 +472,24 @@ impl PauseCoordinator {
                 true,
             ));
         }
-        Ok(Self::new(
+        let mut coordinator = Self::new(
             policy,
             child.pid(),
             child.generation().get(),
             expected_tasks,
-        ))
+        );
+        let tids: Vec<u32> = coordinator.expected_tasks.keys().copied().collect();
+        for tid in tids {
+            let Some(start) = task_starts.get(&tid).copied() else {
+                return Err(Self::policy_error(
+                    policy,
+                    format!("cannot read task {tid} start time during pause preflight"),
+                    true,
+                ));
+            };
+            coordinator.expected_starts.insert(tid, start);
+        }
+        Ok(coordinator)
     }
 
     fn new(
@@ -490,6 +503,7 @@ impl PauseCoordinator {
             pid,
             generation,
             expected_tasks,
+            expected_starts: BTreeMap::new(),
             counters: PauseCounters::default(),
             epoch: PauseEpoch::default(),
             armed: false,
@@ -520,7 +534,15 @@ impl PauseCoordinator {
         generation: u64,
         expected_tasks: BTreeMap<u32, u8>,
     ) -> Self {
-        Self::new(policy, pid, generation, expected_tasks)
+        let mut coordinator = Self::new(policy, pid, generation, expected_tasks);
+        // The scripted seam dates every unscripted task at tick zero, so the
+        // default baseline matches it; birth-dating tests overwrite this.
+        coordinator.expected_starts = coordinator
+            .expected_tasks
+            .keys()
+            .map(|tid| (*tid, 0))
+            .collect();
+        coordinator
     }
 
     #[cfg(test)]
@@ -1018,22 +1040,16 @@ impl PauseCoordinator {
             return self.fail_cycle(io, "discovery ring loss in pause epoch", false);
         }
 
-        let first_sample = match self.sample_stopped(io, deadline, true) {
+        let first_sample = match self.sample_until_stopped(io, deadline) {
             Ok(sample) => sample,
-            Err(error) => {
-                let lifecycle = error.lifecycle();
-                return self.fail_cycle(io, error.message(), lifecycle);
-            }
+            Err((error, lifecycle)) => return self.fail_cycle(io, error, lifecycle),
         };
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
         }
-        let second_sample = match self.sample_stopped(io, deadline, false) {
+        let second_sample = match self.sample_stopped(io, deadline) {
             Ok(sample) => sample,
-            Err(error) => {
-                let lifecycle = error.lifecycle();
-                return self.fail_cycle(io, error.message(), lifecycle);
-            }
+            Err(error) => return self.fail_cycle(io, error, false),
         };
         if second_sample
             .checked_sub(first_sample)
@@ -1106,9 +1122,8 @@ impl PauseCoordinator {
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
         }
-        if let Err(error) = self.sample_stopped(io, deadline, false) {
-            let lifecycle = error.lifecycle();
-            return self.fail_cycle(io, error.message(), lifecycle);
+        if let Err(error) = self.sample_stopped(io, deadline) {
+            return self.fail_cycle(io, error, false);
         }
         let marker_seen = match io.marker_seen() {
             Ok(seen) => seen,
@@ -1156,9 +1171,8 @@ impl PauseCoordinator {
             if let Err(error) = io.wait_one_ms() {
                 return self.fail_cycle(io, error, true);
             }
-            if let Err(error) = self.sample_stopped(io, deadline, false) {
-                let lifecycle = error.lifecycle();
-                return self.fail_cycle(io, error.message(), lifecycle);
+            if let Err(error) = self.sample_stopped(io, deadline) {
+                return self.fail_cycle(io, error, false);
             }
             match io.marker_seen() {
                 Ok(false) => {}
@@ -1399,54 +1413,114 @@ impl PauseCoordinator {
         self.finish_nonconfirmed(retained_error.unwrap_or_else(|| MSG_PAUSE_HELPER_REJECTED.into()))
     }
 
-    /// Proves the owned child stopped: the exact preflight task set, every
-    /// task in `T`. The helper's SIGSTOP lands asynchronously, so the
-    /// first sample waits for delivery: a matching set that is still
-    /// running waits a millisecond and samples again within the causal
-    /// deadline. Later samples never wait: a running task after the stop
-    /// landed means SIGCONT, and waiting could confirm a later re-stop
-    /// (SIGTTIN, Ctrl-Z) as the pause. A changed set, and any state
-    /// outside R/S/D/T (a zombie leader must never stall the proof), fail
-    /// at once at every sample.
-    fn sample_stopped(
-        &self,
+    /// A strict sample: every thread must already be stopped. Used once the
+    /// stop was seen complete, where a running thread means it was continued
+    /// under the stop.
+    fn sample_stopped(&mut self, io: &mut impl PauseIo, deadline: u64) -> Result<u64, String> {
+        self.sample_tasks(io, deadline, false)?
+            .ok_or_else(|| MSG_TASK_SET_CHANGED.into())
+    }
+
+    /// The stop's first sample. The helper's SIGSTOP is queued before its
+    /// record, but on a loaded host a thread can still be running or about to
+    /// be woken into the group stop when the record is serviced. Re-sample at
+    /// the existing 1 ms cadence until every thread is stopped, inside the
+    /// stop's existing deadline and never more than one cycle of samples. A
+    /// thread still not stopped then keeps today's task-set refusal; a
+    /// changed set (vanished, reused or undated thread) refuses at once.
+    /// Nothing is attached before this returns, so a thread that ran while the
+    /// stop settled only ran before the hooks changed. The error carries
+    /// whether it is a lifecycle failure (a failed wait).
+    fn sample_until_stopped(
+        &mut self,
         io: &mut impl PauseIo,
         deadline: u64,
-        wait_for_delivery: bool,
-    ) -> Result<u64, SampleStoppedError> {
-        loop {
-            let states = io
-                .task_states(self.pid)
-                .map_err(SampleStoppedError::Proof)?;
-            let now = io.now_ns().map_err(SampleStoppedError::Proof)?;
-            if now > deadline {
-                return Err(SampleStoppedError::Proof(
-                    MSG_PAUSE_CONFIRMATION_DEADLINE.into(),
-                ));
+    ) -> Result<u64, (String, bool)> {
+        for attempt in 0..=MAX_SETTLE_SAMPLES {
+            match self.sample_tasks(io, deadline, true) {
+                Ok(Some(now)) => return Ok(now),
+                Ok(None) => {}
+                Err(error) if attempt > 0 && error == MSG_PAUSE_CONFIRMATION_DEADLINE => {
+                    return Err((MSG_TASK_SET_CHANGED.into(), false));
+                }
+                Err(error) => return Err((error, false)),
             }
-            if states.keys().ne(self.expected_tasks.keys()) {
-                return Err(SampleStoppedError::Proof(
-                    "task set changed or was not entirely stopped".into(),
-                ));
-            }
-            if states.values().all(|state| *state == b'T') {
-                return Ok(now);
-            }
-            if states
-                .values()
-                .any(|state| !matches!(*state, b'R' | b'S' | b'D' | b'T'))
-            {
-                return Err(SampleStoppedError::Proof(
-                    "task state outside R/S/D/T fails without waiting".into(),
-                ));
-            }
-            if !wait_for_delivery {
-                return Err(SampleStoppedError::Proof(
-                    "task running after the first stopped sample".into(),
-                ));
-            }
-            io.wait_one_ms().map_err(SampleStoppedError::Lifecycle)?;
+            io.wait_one_ms().map_err(|error| (error, true))?;
         }
+        Err((MSG_TASK_SET_CHANGED.into(), false))
+    }
+
+    /// One task sample. `Ok(None)` (only while `settling`): the set is valid
+    /// but some thread is not stopped yet; nothing is adopted from it.
+    fn sample_tasks(
+        &mut self,
+        io: &mut impl PauseIo,
+        deadline: u64,
+        settling: bool,
+    ) -> Result<Option<u64>, String> {
+        let states = io.task_states(self.pid)?;
+        let starts = io.task_starts(self.pid)?;
+        // Read after the starts: a later read can only see a later attach.
+        let last_attach = io.last_hook_attach_boot_ns();
+        let now = io.now_ns()?;
+        if now > deadline {
+            return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
+        }
+        let births = self.covered_births(&states, &starts, last_attach)?;
+        if states.values().any(|state| *state != b'T') {
+            if settling {
+                return Ok(None);
+            }
+            return Err(MSG_TASK_SET_CHANGED.into());
+        }
+        for (tid, start) in births {
+            if let Some(state) = states.get(&tid) {
+                self.expected_tasks.insert(tid, *state);
+            }
+            self.expected_starts.insert(tid, start);
+        }
+        Ok(Some(now))
+    }
+
+    /// Threads whose floored birth is strictly after the last completed
+    /// provider hook attach (see [`birth_covered`]), which this sample may
+    /// adopt into the expected set. Uprobes are per file: once attached they
+    /// fire for every thread, so such a thread never ran with a provider
+    /// unhooked. The pause arm is
+    /// deliberately not the instant: a frame or successor re-arm is no attach.
+    /// Every other change — a missing expected tid, a reused tid (same tid,
+    /// different start time), a floored birth at or before the attach, an
+    /// unreadable start time, no recorded attach or one in flight — keeps
+    /// today's task-set refusal. An adopted thread is then held to every later
+    /// sample like a preflight thread, so this stop's own attach (which it was
+    /// verified stopped through) does not undo it.
+    fn covered_births(
+        &self,
+        states: &BTreeMap<u32, u8>,
+        starts: &BTreeMap<u32, u64>,
+        last_attach_boot_ns: Option<u64>,
+    ) -> Result<Vec<(u32, u64)>, String> {
+        for tid in self.expected_tasks.keys() {
+            if !states.contains_key(tid) {
+                return Err(MSG_TASK_SET_CHANGED.into());
+            }
+        }
+        let mut births = Vec::new();
+        for tid in states.keys() {
+            let known = self.expected_tasks.contains_key(tid);
+            match (
+                known,
+                self.expected_starts.get(tid),
+                starts.get(tid).copied(),
+            ) {
+                (true, Some(recorded), Some(start)) if start == *recorded => {}
+                (false, None, Some(start)) if birth_covered(start, last_attach_boot_ns) => {
+                    births.push((*tid, start));
+                }
+                _ => return Err(MSG_TASK_SET_CHANGED.into()),
+            }
+        }
+        Ok(births)
     }
 
     fn observe_resumed(
@@ -2159,6 +2233,14 @@ impl PauseIo for SessionPauseIo<'_> {
         read_task_states(pid)
     }
 
+    fn task_starts(&mut self, pid: u32) -> Result<BTreeMap<u32, u64>, String> {
+        read_task_starts(pid)
+    }
+
+    fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
+        last_hook_attach_boot_ns()
+    }
+
     fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
         // Shared allowance, enforced structurally: a staged pop is a
         // credit transfer and always proceeds, but a ring read needs a
@@ -2762,6 +2844,173 @@ fn parse_task_state(stat: &[u8]) -> Option<u8> {
         .flatten()
 }
 
+/// Every task of `pid` and its kernel start time in boot-relative clock ticks
+/// (`/proc/<pid>/task/<tid>/stat` field 22). A task whose `stat` file cannot
+/// be read is absent from the map: it exited mid-sample or is otherwise
+/// unreadable, and the coordinator treats an undated task as a changed set,
+/// never as covered. Only a wholesale enumeration failure, an invalid task
+/// directory, or a successfully read but unparseable line is an error.
+pub(crate) fn read_task_starts(pid: u32) -> Result<BTreeMap<u32, u64>, String> {
+    let directory = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map_err(|error| format!("cannot enumerate task starts for pid {pid}: {error}"))?;
+    let mut starts = BTreeMap::new();
+    for entry in directory {
+        let entry =
+            entry.map_err(|error| format!("cannot enumerate task for pid {pid}: {error}"))?;
+        let name = entry.file_name();
+        let tid: u32 = name
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| format!("invalid task directory for pid {pid}"))?;
+        let Ok(stat) = std::fs::read(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(start) = parse_task_start(&stat) else {
+            return Err(format!("cannot parse task {tid} start"));
+        };
+        starts.insert(tid, start);
+    }
+    Ok(starts)
+}
+
+/// Whether a thread's birth provably follows the last completed provider hook
+/// attach: `start_ticks * tick_ns > attach_ns` (ruling PT-3).
+///
+/// Why the floor alone is sound: `fs/proc/array.c` `do_task_stat` reports
+/// `nsec_to_clock_t(timens_add_boottime_ns(task->start_boottime))`.
+/// `copy_process` (`kernel/fork.c`) sets `start_boottime =
+/// ktime_get_boottime_ns()` before the task is made visible or woken, so it
+/// precedes anything the thread runs. `timens_add_boottime_ns` adds the
+/// *reader's* time-namespace boottime offset, the same offset
+/// `posix_get_boottime_timespec` (`kernel/time/posix-timers.c`) adds to this
+/// observer's own `CLOCK_BOOTTIME`, so both values share one domain. With
+/// `NSEC_PER_SEC % USER_HZ == 0` (USER_HZ 100 on x86-64), `nsec_to_clock_t`
+/// is an exact floor division, so `start_ticks * tick_ns <= birth_ns`; a
+/// truncated `tick_ns` only lowers the bound. Hence a floor strictly after
+/// the attach proves the birth is after it. Checked against the 6.6.157,
+/// 6.12.111 and 7.0.14 sources. Equality is not covered, and neither is a
+/// missing instant (none recorded or one in flight) or a saturated one.
+fn birth_covered(start_ticks: u64, last_attach_boot_ns: Option<u64>) -> bool {
+    let Some(attach) = last_attach_boot_ns else {
+        return false;
+    };
+    start_ticks.saturating_mul(clock_tick_ns()) > attach
+}
+
+fn parse_task_start(stat: &[u8]) -> Option<u64> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let tail = stat.get(close + 1..)?;
+    let field = tail
+        .split(|byte| *byte == b' ')
+        .filter(|token| !token.is_empty())
+        .nth(19)?;
+    std::str::from_utf8(field).ok()?.parse().ok()
+}
+
+/// The kernel clock tick in nanoseconds (`sysconf(_SC_CLK_TCK)`, USER_HZ),
+/// cached: start-time ticks floor births to this granularity. Falls back to
+/// USER_HZ 100 when the sysconf read fails.
+fn clock_tick_ns() -> u64 {
+    static TICK_NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TICK_NS.get_or_init(|| {
+        // SAFETY: `sysconf` takes only the name constant and returns the
+        // configured value or -1; it writes through no pointer.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let hz = if hz > 0 { hz as u64 } else { 100 };
+        1_000_000_000 / hz
+    })
+}
+
+/// `CLOCK_BOOTTIME` in nanoseconds: the clock domain of `/proc` starttime
+/// ticks (field 22 counts boot-relative ticks), so thread births date against
+/// hook attach completions without a suspend-sensitive conversion. Returns
+/// `None` exactly when the clock read fails.
+pub(crate) fn boot_ns() -> Option<u64> {
+    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `clock_gettime` initializes `timestamp` on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, timestamp.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful call above initialized `timestamp`.
+    let timestamp = unsafe { timestamp.assume_init() };
+    let seconds = u64::try_from(timestamp.tv_sec).ok()?;
+    let nanos = u64::try_from(timestamp.tv_nsec).ok()?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+/// When provider hook attaches completed, in the boot clock. Uprobes are per
+/// file, so once a provider's hooks are live they fire for every thread of
+/// every process mapping it: a thread born strictly after the last completed
+/// attach never ran with a provider unhooked. One process-wide maximum is
+/// kept, which is conservative: an attach for any provider anywhere in this
+/// observer moves the instant later, never earlier.
+pub(crate) struct HookAttachClock {
+    in_flight: AtomicU64,
+    /// Latest completion stamp; zero when none is recorded. An unreadable
+    /// boot clock at completion stamps `u64::MAX`, so nothing dates after it.
+    last_boot_ns: AtomicU64,
+}
+
+static HOOK_ATTACH_CLOCK: HookAttachClock = HookAttachClock::new();
+
+impl HookAttachClock {
+    const fn new() -> Self {
+        Self {
+            in_flight: AtomicU64::new(0),
+            last_boot_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn open(&self) -> HookAttachWindow<'_> {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        HookAttachWindow { clock: self }
+    }
+
+    fn close(&self, completed_boot_ns: Option<u64>) {
+        let stamp = completed_boot_ns.unwrap_or(u64::MAX).max(1);
+        self.last_boot_ns.fetch_max(stamp, Ordering::SeqCst);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// The latest completion, or `None` when none is recorded or an attach
+    /// is open on either side of the read.
+    fn completed(&self) -> Option<u64> {
+        if self.in_flight.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let last = self.last_boot_ns.load(Ordering::SeqCst);
+        if self.in_flight.load(Ordering::SeqCst) != 0 || last == 0 {
+            return None;
+        }
+        Some(last)
+    }
+}
+
+/// One provider hook attach in flight. Its completion is stamped when it
+/// drops, on every return path (success, error or unwind): whatever the
+/// attach made live was live by then, so the stamp is an upper bound on
+/// every hook it installed.
+pub(crate) struct HookAttachWindow<'a> {
+    clock: &'a HookAttachClock,
+}
+
+impl Drop for HookAttachWindow<'_> {
+    fn drop(&mut self) {
+        self.clock.close(boot_ns());
+    }
+}
+
+/// Opens a window around one provider hook attach (see [`HookAttachClock`]).
+pub(crate) fn hook_attach_window() -> HookAttachWindow<'static> {
+    HOOK_ATTACH_CLOCK.open()
+}
+
+/// The last completed provider hook attach in this observer, in the boot
+/// clock, or `None` when none completed yet or one is in flight.
+pub(crate) fn last_hook_attach_boot_ns() -> Option<u64> {
+    HOOK_ATTACH_CLOCK.completed()
+}
+
 pub(crate) struct TimedItem {
     before_ns: u64,
     after_ns: u64,
@@ -2843,6 +3092,12 @@ mod tests {
         /// real `/proc` read, the fake's world persists until scripted
         /// otherwise. `None` until the first staged read.
         stable_states: Option<BTreeMap<u32, u8>>,
+        starts: VecDeque<Result<BTreeMap<u32, u64>, String>>,
+        last_states: BTreeMap<u32, u8>,
+        /// Scripted last-attach instants, one per read; the last one
+        /// repeats. Default: none recorded.
+        attach_instants: VecDeque<Option<u64>>,
+        fallback_attach: Option<u64>,
         queue: VecDeque<Result<Option<DiscoveryItem>, String>>,
         authorization: Option<u64>,
         authorization_results: VecDeque<Result<Option<u64>, String>>,
@@ -2894,6 +3149,10 @@ mod tests {
                 fallback_now: 0,
                 states: VecDeque::new(),
                 stable_states: None,
+                starts: VecDeque::new(),
+                last_states: BTreeMap::new(),
+                attach_instants: VecDeque::new(),
+                fallback_attach: None,
                 queue: VecDeque::new(),
                 authorization: None,
                 authorization_results: VecDeque::new(),
@@ -2973,17 +3232,38 @@ mod tests {
         }
 
         fn task_states(&mut self, _: u32) -> Result<BTreeMap<u32, u8>, String> {
-            if let Some(states) = self.states.pop_front() {
-                if let Ok(states) = &states {
-                    self.stable_states = Some(states.clone());
+            let states = match self.states.pop_front() {
+                Some(states) => {
+                    if let Ok(states) = &states {
+                        self.stable_states = Some(states.clone());
+                    }
+                    states
                 }
-                return states;
+                None if self.resumed && !self.post_resume_all_stopped => {
+                    Ok([(41, b'R'), (42, b'T')].into_iter().collect())
+                }
+                None => Ok(self.stable_states.clone().unwrap_or_else(stopped)),
+            };
+            if let Ok(states) = &states {
+                self.last_states = states.clone();
             }
-            if self.resumed && !self.post_resume_all_stopped {
-                Ok([(41, b'R'), (42, b'T')].into_iter().collect())
-            } else {
-                Ok(self.stable_states.clone().unwrap_or_else(stopped))
+            states
+        }
+
+        fn task_starts(&mut self, _: u32) -> Result<BTreeMap<u32, u64>, String> {
+            if let Some(starts) = self.starts.pop_front() {
+                return starts;
             }
+            // Unscripted tasks date at tick zero, matching the default test
+            // baseline; a scripted birth must beat the arm by two ticks.
+            Ok(self.last_states.keys().map(|tid| (*tid, 0)).collect())
+        }
+
+        fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
+            if let Some(instant) = self.attach_instants.pop_front() {
+                self.fallback_attach = instant;
+            }
+            self.fallback_attach
         }
 
         fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
@@ -3786,6 +4066,592 @@ mod tests {
         assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
     }
 
+    /// The kernel clock tick in nanoseconds, read independently of the
+    /// coordinator: birth-dating tests script arm and birth instants against
+    /// this oracle, not against the code under test.
+    fn test_tick_ns() -> u64 {
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let hz = if hz > 0 { hz as u64 } else { 100 };
+        1_000_000_000 / hz
+    }
+
+    /// A birth-dating stop: every stopped sample shows `states` dated by
+    /// `starts`, and the last provider hook attach completed at `attach`
+    /// (`None`: none recorded, or one in flight). The confirm path takes four
+    /// stopped samples (two pre-apply, one post-apply, one post-successor-arm).
+    fn birth_dating_io(
+        states: BTreeMap<u32, u8>,
+        starts: BTreeMap<u32, u64>,
+        attach: Option<u64>,
+    ) -> FakeIo {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = attach;
+        io.states = VecDeque::from([
+            Ok(states.clone()),
+            Ok(states.clone()),
+            Ok(states.clone()),
+            Ok(states),
+        ]);
+        io.starts = VecDeque::from([
+            Ok(starts.clone()),
+            Ok(starts.clone()),
+            Ok(starts.clone()),
+            Ok(starts),
+        ]);
+        io
+    }
+
+    /// A stop whose current epoch was armed at `arm_boot_ns` (a fresh frame or
+    /// successor re-arm), with the preflight threads 41 and 42 born at tick 50.
+    /// The arm no longer dates births and the coordinator keeps no boot-clock
+    /// arm stamp; the twins still state where the arm lies, so each shows the
+    /// outcome follows the attach instant alone.
+    fn birth_dating_coordinator(arm_boot_ns: u64) -> PauseCoordinator {
+        let _ = arm_boot_ns;
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.expected_starts = [(41, 50), (42, 50)].into_iter().collect();
+        coordinator
+    }
+
+    /// Thread 43 joins the preflight threads, born at `birth_tick`.
+    fn grown_by_one(birth_tick: u64) -> (BTreeMap<u32, u8>, BTreeMap<u32, u64>) {
+        (
+            [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect(),
+            [(41, 50), (42, 50), (43, birth_tick)].into_iter().collect(),
+        )
+    }
+
+    /// Runs one stop that sees thread 43 born at `birth_tick` under an arm at
+    /// `arm_tick` and a last completed attach at `attach_tick`.
+    fn birth_dating_stop(
+        birth_tick: u64,
+        arm_tick: u64,
+        attach_tick: Option<u64>,
+    ) -> PauseCoordinator {
+        let tick = test_tick_ns();
+        let (grown, starts) = grown_by_one(birth_tick);
+        let mut io = birth_dating_io(
+            grown,
+            starts,
+            attach_tick.map(|attach| attach.saturating_mul(tick)),
+        );
+        let mut coordinator = birth_dating_coordinator(arm_tick.saturating_mul(tick));
+        coordinator.service(&mut io).unwrap();
+        coordinator
+    }
+
+    fn assert_covered(coordinator: &PauseCoordinator) {
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(
+            coordinator.expected_tasks.keys().collect::<Vec<_>>(),
+            [&41, &42, &43]
+        );
+        assert!(coordinator.expected_starts.contains_key(&43));
+    }
+
+    fn assert_partial(coordinator: &PauseCoordinator) {
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+    }
+
+    /// A thread born after the last hook attach, by more than one tick of
+    /// margin, only ever ran with the hooks in place: the stop adopts it into
+    /// the expected set and confirms instead of reporting partial.
+    #[test]
+    fn thread_born_after_last_attach_is_adopted_and_the_stop_confirms() {
+        let tick = test_tick_ns();
+        let instant = 100u64.saturating_mul(tick);
+        let grown: BTreeMap<u32, u8> = [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
+        let starts: BTreeMap<u32, u64> = [(41, 50), (42, 50), (43, 102)].into_iter().collect();
+        let mut io = birth_dating_io(grown, starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator(instant);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(
+            coordinator.expected_tasks.keys().collect::<Vec<_>>(),
+            [&41, &42, &43]
+        );
+    }
+
+    /// The OpenSC shape: worker threads born well after the provider's hooks
+    /// attached but in the same tick as (or one tick after) a fresh frame or
+    /// successor re-arm. The re-arm does not date births; the attach does, so
+    /// the threads are covered and the stop confirms.
+    #[test]
+    fn birth_after_last_attach_within_a_tick_of_a_fresh_rearm_is_covered() {
+        for birth_tick in [100, 101] {
+            let coordinator = birth_dating_stop(birth_tick, 100, Some(90));
+            assert_covered(&coordinator);
+        }
+    }
+
+    /// A thread born before the last hook attach completed might have run
+    /// provider code before that provider's hooks were live: the stop keeps
+    /// today's partial, however old the arm is.
+    #[test]
+    fn thread_born_before_last_attach_keeps_partial() {
+        assert_partial(&birth_dating_stop(99, 50, Some(100)));
+    }
+
+    /// A thread born after one provider attached (tick 90) but before a later
+    /// module's attach completed (tick 110) dates against the later attach and
+    /// keeps today's partial.
+    #[test]
+    fn later_module_attach_after_the_birth_keeps_partial() {
+        assert_partial(&birth_dating_stop(102, 50, Some(110)));
+    }
+
+    /// Runs one stop that sees thread 43 born at `birth_tick` against a last
+    /// completed attach at `attach_ns` (an old arm at tick 50).
+    fn birth_dating_stop_at(birth_tick: u64, attach_ns: u64) -> PauseCoordinator {
+        let (grown, starts) = grown_by_one(birth_tick);
+        let mut io = birth_dating_io(grown, starts, Some(attach_ns));
+        let mut coordinator = birth_dating_coordinator(50 * test_tick_ns());
+        coordinator.service(&mut io).unwrap();
+        coordinator
+    }
+
+    /// The kernel floors the birth to whole ticks, and the floor is a lower
+    /// bound on the birth (ruling PT-3): a floor at or before the attach
+    /// instant (equality included) keeps today's partial, and any floor
+    /// strictly after it is covered, even inside the attach's own tick.
+    #[test]
+    fn birth_floor_at_or_before_the_attach_keeps_partial_and_a_later_floor_is_covered() {
+        let tick = test_tick_ns();
+        for (birth_tick, attach_ns) in [
+            (99, 100 * tick),
+            (100, 100 * tick),
+            (100, 100 * tick + 1),
+            (101, 101 * tick),
+        ] {
+            let coordinator = birth_dating_stop_at(birth_tick, attach_ns);
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "floor {birth_tick} vs attach {attach_ns} must stay partial"
+            );
+            assert!(!coordinator.rearming_enabled());
+        }
+        for (birth_tick, attach_ns) in [
+            (101, 100 * tick),
+            (101, 101 * tick - 1),
+            (101, 100 * tick + tick / 4),
+        ] {
+            assert_covered(&birth_dating_stop_at(birth_tick, attach_ns));
+        }
+    }
+
+    /// An attach still in flight reports no completed instant: nothing born
+    /// after preflight dates as covered, however old the arm is.
+    #[test]
+    fn attach_in_flight_keeps_partial() {
+        let clock = HookAttachClock::new();
+        let tick = test_tick_ns();
+        let earlier = clock.open();
+        drop(earlier);
+        let completed = clock.completed().expect("a closed attach is recorded");
+        let open = clock.open();
+        let in_flight = clock.completed();
+        assert_eq!(in_flight, None, "an open attach reports no instant");
+
+        let (grown, starts) = grown_by_one(completed / tick + 1_000);
+        let mut io = birth_dating_io(grown, starts, in_flight);
+        let mut coordinator = birth_dating_coordinator(50u64.saturating_mul(tick));
+        coordinator.service(&mut io).unwrap();
+        drop(open);
+
+        assert_partial(&coordinator);
+    }
+
+    /// With no attach completion recorded, nothing born after preflight dates
+    /// as covered, however old the arm is.
+    #[test]
+    fn no_attach_instant_recorded_keeps_partial() {
+        assert_eq!(HookAttachClock::new().completed(), None);
+        assert_partial(&birth_dating_stop(102, 50, None));
+    }
+
+    /// A thread adopted before this stop's own attach was verified stopped
+    /// through that attach (the post-apply and post-arm samples require it
+    /// stopped), so the attach completing after its birth does not undo the
+    /// adoption.
+    #[test]
+    fn adopted_thread_survives_the_stops_own_attach() {
+        let tick = test_tick_ns();
+        let (grown, starts) = grown_by_one(102);
+        let mut io = birth_dating_io(grown, starts, Some(90u64.saturating_mul(tick)));
+        io.attach_instants = VecDeque::from([
+            Some(90u64.saturating_mul(tick)),
+            Some(90u64.saturating_mul(tick)),
+            Some(110u64.saturating_mul(tick)),
+            Some(110u64.saturating_mul(tick)),
+        ]);
+        let mut coordinator = birth_dating_coordinator(50u64.saturating_mul(tick));
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_covered(&coordinator);
+    }
+
+    /// A successor re-arm installed during the stop does not date births:
+    /// threads first seen after it (the post-arm sample) still date against
+    /// the last attach. A floor after the attach is covered; a floor equal to
+    /// it keeps today's partial.
+    #[test]
+    fn births_first_seen_after_a_successor_rearm_date_against_the_last_attach() {
+        let tick = test_tick_ns();
+        let preflight: BTreeMap<u32, u64> = [(41, 50), (42, 50)].into_iter().collect();
+        for (attach_tick, covered) in [(100, true), (101, true), (102, false)] {
+            let (grown, starts) = grown_by_one(102);
+            let mut io = birth_dating_io(grown.clone(), starts.clone(), Some(attach_tick * tick));
+            io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(stopped()), Ok(grown)]);
+            io.starts = VecDeque::from([
+                Ok(preflight.clone()),
+                Ok(preflight.clone()),
+                Ok(preflight.clone()),
+                Ok(starts),
+            ]);
+            let mut coordinator = birth_dating_coordinator(0);
+
+            coordinator.service(&mut io).unwrap();
+
+            if covered {
+                assert_covered(&coordinator);
+                assert!(coordinator.is_armed(), "the successor stays installed");
+            } else {
+                assert_partial(&coordinator);
+            }
+        }
+    }
+
+    /// The covered check itself (ruling PT-3): covered exactly when the
+    /// floored birth `start_tick * tick_ns` is strictly after the attach;
+    /// equality is not covered, nothing is covered without an instant, and
+    /// nothing after a saturated (unreadable-clock) instant.
+    #[test]
+    fn birth_covered_needs_an_instant_and_a_strictly_later_floor() {
+        let tick = test_tick_ns();
+        assert!(!birth_covered(102, None));
+        assert!(!birth_covered(99, Some(100 * tick)));
+        assert!(!birth_covered(100, Some(100 * tick)));
+        assert!(!birth_covered(100, Some(100 * tick + 1)));
+        assert!(birth_covered(100, Some(100 * tick - 1)));
+        assert!(birth_covered(101, Some(100 * tick)));
+        assert!(birth_covered(101, Some(100 * tick + tick / 2)));
+        assert!(!birth_covered(u64::MAX, Some(u64::MAX)));
+        assert!(!birth_covered(u64::MAX / tick, Some(u64::MAX - 1)));
+    }
+
+    /// The attach clock keeps the latest completion, stamps it in the boot
+    /// clock when the window closes, never moves backward, and fails closed
+    /// (nothing dates after it) when the boot clock was unreadable at close.
+    #[test]
+    fn hook_attach_clock_keeps_the_latest_completion_and_fails_closed() {
+        let clock = HookAttachClock::new();
+        assert_eq!(clock.completed(), None);
+
+        let before = boot_ns().expect("the boot clock reads");
+        drop(clock.open());
+        let after = boot_ns().expect("the boot clock reads");
+        let stamped = clock.completed().expect("a closed attach is recorded");
+        assert!(
+            (before..=after).contains(&stamped),
+            "{before} <= {stamped} <= {after}"
+        );
+
+        let outer = clock.open();
+        let inner = clock.open();
+        drop(inner);
+        assert_eq!(clock.completed(), None, "one attach is still in flight");
+        drop(outer);
+        assert!(clock.completed().unwrap() >= stamped);
+
+        let latest = clock.completed().unwrap();
+        let stale = clock.open();
+        std::mem::forget(stale);
+        clock.close(Some(1));
+        assert_eq!(clock.completed(), Some(latest), "an older stamp never wins");
+
+        let unreadable = clock.open();
+        std::mem::forget(unreadable);
+        clock.close(None);
+        assert_eq!(clock.completed(), Some(u64::MAX));
+    }
+
+    /// Start time has tick granularity: a floor equal to the instant (the
+    /// birth could be at it) or before it keeps today's partial.
+    #[test]
+    fn birth_at_or_before_the_attach_tick_keeps_partial() {
+        let tick = test_tick_ns();
+        let instant = 100u64.saturating_mul(tick);
+        for birth_tick in [99, 100] {
+            let grown: BTreeMap<u32, u8> =
+                [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
+            let starts: BTreeMap<u32, u64> =
+                [(41, 50), (42, 50), (43, birth_tick)].into_iter().collect();
+            let mut io = birth_dating_io(grown, starts, Some(instant));
+            let mut coordinator = birth_dating_coordinator(instant);
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "birth at tick {birth_tick} must stay partial"
+            );
+            assert!(!coordinator.rearming_enabled());
+        }
+    }
+
+    fn running_42() -> BTreeMap<u32, u8> {
+        [(41, b'T'), (42, b'R')].into_iter().collect()
+    }
+
+    fn waits(io: &FakeIo) -> usize {
+        io.events.iter().filter(|event| **event == "wait").count()
+    }
+
+    /// A stop's first sample can catch a thread the group stop has not reached
+    /// yet (a loaded host). The coordinator re-samples at the 1 ms cadence,
+    /// inside the stop's deadline, until every thread is stopped, then
+    /// confirms (ruling PT-3).
+    #[test]
+    fn first_sample_waits_for_a_running_thread_to_stop() {
+        let sleeping: BTreeMap<u32, u8> = [(41, b'S'), (42, b'T')].into_iter().collect();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.states = VecDeque::from([
+            Ok(running_42()),
+            Ok(sleeping),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+        ]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert!(coordinator.rearming_enabled());
+    }
+
+    /// The OpenSC shape under load: a newborn worker (born after the last
+    /// attach) is still running at the first sample, then stops; it is
+    /// covered and the stop confirms.
+    #[test]
+    fn covered_newborn_running_at_the_first_sample_settles_and_confirms() {
+        let tick = test_tick_ns();
+        let (grown, starts) = grown_by_one(101);
+        let mut first = grown.clone();
+        first.insert(43, b'R');
+        let mut io = birth_dating_io(grown, starts.clone(), Some(100 * tick));
+        io.states.push_front(Ok(first));
+        io.starts.push_front(Ok(starts));
+        let mut coordinator = birth_dating_coordinator(50 * tick);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_covered(&coordinator);
+    }
+
+    /// The settling is bounded by the stop's existing deadline: a thread still
+    /// running when it passes keeps today's task-set partial, after at most
+    /// one wait per millisecond of the cycle.
+    #[test]
+    fn thread_still_running_at_the_stop_deadline_keeps_partial() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.states = std::iter::repeat_with(|| Ok(running_42()))
+            .take(2_000)
+            .collect();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_partial(&coordinator);
+        assert!(
+            waits(&io) <= (CYCLE_NS / SAMPLE_NS) as usize + 2,
+            "{} waits",
+            waits(&io)
+        );
+        assert!(
+            !io.states.is_empty(),
+            "the deadline, not the script, ended it"
+        );
+    }
+
+    /// The settling sample itself: a thread still running when the deadline
+    /// passes returns today's task-set refusal (not the deadline message), a
+    /// first sample already past the deadline keeps the deadline message, and
+    /// a failed wait is a lifecycle failure.
+    #[test]
+    fn settling_sample_reports_todays_refusal_at_the_deadline() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            states: std::iter::repeat_with(|| Ok(running_42()))
+                .take(2_000)
+                .collect(),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut io, 5 * SAMPLE_NS),
+            Err((MSG_TASK_SET_CHANGED.into(), false))
+        );
+        assert!((4..=6).contains(&waits(&io)), "{} waits", waits(&io));
+
+        let mut late = FakeIo {
+            fallback_now: 10,
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut late, 5),
+            Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
+        );
+
+        let mut failing = FakeIo {
+            states: VecDeque::from([Ok(running_42())]),
+            fail_wait: true,
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut failing, CYCLE_NS),
+            Err(("wait".into(), true))
+        );
+    }
+
+    /// A thread that vanishes while the stop settles changes the task set:
+    /// today's partial, without waiting out the deadline.
+    #[test]
+    fn thread_vanishing_while_the_stop_settles_keeps_partial() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.states = VecDeque::from([
+            Ok(running_42()),
+            Ok([(41, b'T')].into_iter().collect()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+        ]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_partial(&coordinator);
+        assert!(waits(&io) < 10, "{} waits", waits(&io));
+    }
+
+    /// Only the first sample settles. Once every thread was seen stopped, a
+    /// thread seen running at the second (pre-apply) or the post-apply sample
+    /// was continued under the stop: today's partial, no re-sampling.
+    #[test]
+    fn thread_running_after_the_stop_was_seen_stopped_keeps_partial() {
+        for running_at in [1usize, 2] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            let mut states: VecDeque<_> = (0..6).map(|_| Ok(stopped())).collect();
+            states[running_at] = Ok(running_42());
+            io.states = states;
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "running at sample {running_at}"
+            );
+        }
+    }
+
+    /// A new thread whose start time cannot be read cannot be dated: the stop
+    /// keeps today's partial.
+    #[test]
+    fn thread_with_unreadable_start_keeps_partial() {
+        let tick = test_tick_ns();
+        let instant = 100u64.saturating_mul(tick);
+        let grown: BTreeMap<u32, u8> = [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
+        let starts: BTreeMap<u32, u64> = [(41, 50), (42, 50)].into_iter().collect();
+        let mut io = birth_dating_io(grown, starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator(instant);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+    }
+
+    /// Thread identity is the (tid, start time) pair: an expected tid with a
+    /// different start time is a new thread, and an older start keeps today's
+    /// partial even though the tid set is unchanged.
+    #[test]
+    fn reused_tid_with_older_start_keeps_partial() {
+        let tick = test_tick_ns();
+        let instant = 100u64.saturating_mul(tick);
+        let starts: BTreeMap<u32, u64> = [(41, 49), (42, 50)].into_iter().collect();
+        let mut io = birth_dating_io(stopped(), starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator(instant);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+    }
+
+    /// A reused tid keeps today's partial whatever its start time: even a
+    /// start well after the last attach does not adopt a tid the preflight
+    /// already knew.
+    #[test]
+    fn reused_tid_with_newer_start_keeps_partial() {
+        let tick = test_tick_ns();
+        let instant = 100u64.saturating_mul(tick);
+        let starts: BTreeMap<u32, u64> = [(41, 150), (42, 50)].into_iter().collect();
+        let mut io = birth_dating_io(stopped(), starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator(instant);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+    }
+
+    /// The start-time reader reports `/proc` field 22 and orders a real birth:
+    /// a freshly spawned process dates between two boot-clock checkpoints.
+    /// The crafted lines pin the field index (past a comm containing `)`)
+    /// and the truncation failure the sampler maps to an error.
+    #[test]
+    fn task_start_reader_reports_field_22_and_orders_a_real_birth() {
+        let line = b"123 (a)b) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20";
+        assert_eq!(parse_task_start(line), Some(19));
+        assert_eq!(parse_task_start(b"123 (a) R 1 2"), None);
+        assert_eq!(parse_task_start(b"missing delimiter"), None);
+
+        let tick = test_tick_ns();
+        let boot_before = boot_ns().expect("the boot clock reads");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let starts = read_task_starts(child.id()).expect("task starts read");
+        let boot_after = boot_ns().expect("the boot clock reads");
+        let leader = starts.get(&child.id()).copied();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let leader = leader.expect("the leader dates its own birth");
+        assert!(
+            leader.saturating_mul(tick) <= boot_after.saturating_add(tick),
+            "birth tick {leader} starts after the read"
+        );
+        assert!(
+            leader.saturating_add(1).saturating_mul(tick) > boot_before,
+            "birth tick {leader} ends before the spawn"
+        );
+    }
+
     /// The helper's SIGSTOP is asynchronous: under host load the target is
     /// still running when the first sample reads it, and the stop lands
     /// milliseconds later. The same task set reporting `R` and then `T` is
@@ -4119,7 +4985,13 @@ mod tests {
         for failure in ["tasks", "attach"] {
             let mut io = successful_io(vec![record(10, 0, false)]);
             if failure == "tasks" {
-                io.states = VecDeque::from([Ok([(41, b'R'), (42, b'T')].into_iter().collect())]);
+                // A thread that never reaches the stop: the first sample now
+                // re-samples until the stop deadline (ruling PT-3), so the
+                // ordinary task failure is one that persists through it.
+                let running: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+                io.states = std::iter::repeat_with(|| Ok(running.clone()))
+                    .take(2_000)
+                    .collect();
             } else {
                 io.fail_apply = true;
             }

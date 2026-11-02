@@ -25,6 +25,9 @@
  *   --single-call M  (mech) late module M performs only C_Initialize after the
  *                    quarantine, flushes, waits --gate2, then finishes setup;
  *                    needs a late module and --gate2                           [AB]
+ *   --pre-init-gate FILE (mech) with --single-call M: after the quarantine, wait
+ *                    for FILE before module M's C_Initialize (default -: no
+ *                    wait)                                                     [AB]
  *   --delay-ms N     sleep N ms after the gate (after a --late dlopen) before calling;
  *                    exec-chain also sleeps N ms before every exec
  *   --sleep-us N     sleep N us after every iteration (stretches a short CLI)
@@ -453,12 +456,13 @@ static void iteration(int m, CK_SESSION_HANDLE s, int phase) {
 }
 
 struct options {
-    const char *mode, *gate, *gate2, *chain;
+    const char *mode, *gate, *gate2, *pre_init_gate, *chain;
     long iters, delay_ms, sleep_us;
     int hold, late_from, single_call, h6_control, c8_warm_initial;
     unsigned long h6_deadline, h6_leg_deadline;
 };
-static struct options opt = {.gate = "-", .iters = 4, .late_from = -1, .single_call = -1};
+static struct options opt = {.gate = "-", .pre_init_gate = "-", .iters = 4, .late_from = -1,
+                             .single_call = -1};
 
 static unsigned long absolute_bound(const char *value) {
     if (!*value) die("empty H6 bound");
@@ -535,11 +539,11 @@ static void mech_generation(long iters, int gated) {
         if (opt.single_call >= 0 && opt.single_call < split) die("--single-call module is not late");
         if (opt.single_call >= 0 && (!opt.gate2 || !strcmp(opt.gate2, "-")))
             die("--single-call needs --gate2");
-        /* AB only: one eager call after the gate (post-capture, the
-         * capture started before gate1 opened) and before B maps, so
-         * the lane caches the caller through A first — P3's
-         * cached-caller sequence needs A counted before B is ever
-         * observed (round 2, F5). */
+        /* AB only: one eager call after the gate and before B maps.
+         * The harness opens gate1 only once the observer published A
+         * as attached for this caller, so the call is counted and the
+         * lane caches the caller through A first — P3's cached-caller
+         * sequence needs A counted before B is ever observed. */
         if (opt.single_call >= 0 && split > 0) {
             iteration(0, s[0], PH_MAIN);
             flush_ledger();
@@ -555,9 +559,12 @@ static void mech_generation(long iters, int gated) {
             }
         } else {
             /* Bind before the quarantine: the dlsym acquisition is
-             * pre-attach (uncounted) while C_Initialize lands post-attach. */
+             * pre-attach (uncounted) while C_Initialize lands post-attach.
+             * The quarantine ends at --pre-init-gate (the harness opens it
+             * on published readiness), after any --delay-ms. */
             for (int m = split; m < module_count; m++) bind_module(m, PH_SETUP);
             sleep_ms(opt.delay_ms);
+            wait_gate(opt.pre_init_gate);
             initialize_module(opt.single_call, PH_SETUP);
             flush_ledger();
             wait_gate(opt.gate2);
@@ -787,7 +794,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: inventory-ledger mech|map|exec-chain|held|leader-exit --cell LABEL "
                         "[--module P]... [--iters N] [--gate F|-] [--hold] [--late] [--delay-ms N] "
                         "[--sleep-us N] [--chain HOW:EXE,...] [--late-from N] [--gate2 F] "
-                        "[--single-call M]\n");
+                        "[--single-call M] [--pre-init-gate F]\n");
         return 2;
     }
     opt.mode = argv[1];
@@ -814,6 +821,7 @@ int main(int argc, char **argv) {
             opt.single_call = atoi(v);
         } else if (!strcmp(a, "--gate")) opt.gate = v;
         else if (!strcmp(a, "--gate2")) opt.gate2 = v;
+        else if (!strcmp(a, "--pre-init-gate")) opt.pre_init_gate = v;
         else if (!strcmp(a, "--delay-ms")) opt.delay_ms = atol(v);
         else if (!strcmp(a, "--sleep-us")) opt.sleep_us = atol(v);
         else if (!strcmp(a, "--chain")) opt.chain = v;
@@ -830,6 +838,10 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
     }
     if (has_space(cell)) { fprintf(stderr, "--cell must not contain whitespace or '='\n"); return 2; }
+    if (strcmp(opt.pre_init_gate, "-") && opt.single_call < 0) {
+        fprintf(stderr, "--pre-init-gate needs --single-call\n");
+        return 2;
+    }
     struct sigaction sa = {0};
     sa.sa_handler = on_signal;
     sigaction(SIGTERM, &sa, NULL);

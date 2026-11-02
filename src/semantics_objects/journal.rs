@@ -7037,7 +7037,8 @@ pub(crate) mod tests {
     #[test]
     fn object_journal_agreement_refuses_value_unreadable_elsewhere() {
         // The bit-6 allowance is GetID+OK only: a failed GetID, any
-        // other function, or a cleared bit still refuses.
+        // other function, or a cleared bit still refuses — as does bit 6
+        // beside any other change.
         let (begin, end) = producer_agreement_pair("C_AsyncGetID", |_, facts| {
             facts.rv = 5;
             facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
@@ -7051,6 +7052,21 @@ pub(crate) mod tests {
             start.capture |= capture::ASYNC_VALUE_UNREADABLE;
         });
         assert!(!producer_pair_agrees(&begin, &end), "cleared bit");
+        let (begin, end) = producer_agreement_pair("C_AsyncGetID", |_, facts| {
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE | capture::ARG_READ_FAILURE;
+        });
+        assert!(
+            !producer_pair_agrees(&begin, &end),
+            "bit beside another change"
+        );
+        let (begin, end) = producer_agreement_pair("C_AsyncGetID", |_, facts| {
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+            facts.mechanism ^= 1;
+        });
+        assert!(
+            !producer_pair_agrees(&begin, &end),
+            "bit with changed mechanism"
+        );
     }
 
     #[test]

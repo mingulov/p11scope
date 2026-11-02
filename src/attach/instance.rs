@@ -130,7 +130,9 @@ fn resolve_exec_release_target(
         return Ok(ExecReleaseTarget::ExecMmap);
     }
     validate_exec_release_proto(host, btf)?;
-    unreachable!("the legacy probe failed above, so this validation cannot succeed");
+    bail!(
+        "no exact exec-release hook: exec_mm_release must be void(task_struct *, mm_struct *) or exec_mmap must be int(linux_binprm *)"
+    );
 }
 
 /// Resolve the `copy_vma` hook from the host BTF: the exact 5-argument
@@ -727,7 +729,7 @@ fn validate_exec_release_proto(host: &super::host_btf::HostBtf, btf: &Btf) -> Re
         .context("instance hook BTF differs from cached host BTF")?;
     ensure!(
         exec_release_proto_is_exact(raw),
-        "exec_mm_release must be void(task_struct *, mm_struct *)"
+        "no exact exec-release hook: exec_mm_release must be void(task_struct *, mm_struct *) or exec_mmap must be int(linux_binprm *)"
     );
     Ok(())
 }
@@ -906,6 +908,11 @@ fn exec_mmap_proto_is_exact(raw: &[u8]) -> bool {
         }
         let ret = resolve(word(proto, 8)?)?;
         if (word(ret, 4)? >> 24) & 31 != 1 {
+            return Some(false);
+        }
+        // exec_mmap returns int: a 4-byte signed INT, so the hook's
+        // (int)ctx[1] success check reads the whole return and nothing else.
+        if word(ret, 8)? != 4 || word(ret, 12)? != 0x0100_0020 {
             return Some(false);
         }
         pointee(word(proto, 16)?, b"linux_binprm")
@@ -2944,7 +2951,7 @@ mod tests {
         let bytes = exec_hook_btf_fixture(false, false, 24, 0);
         assert_eq!(
             resolve_fixture(bytes).unwrap_err(),
-            "exec_mm_release must be void(task_struct *, mm_struct *)"
+            "no exact exec-release hook: exec_mm_release must be void(task_struct *, mm_struct *) or exec_mmap must be int(linux_binprm *)"
         );
     }
 
@@ -3010,7 +3017,7 @@ mod tests {
                 super::validate_exec_release_proto(host, host.btf())
                     .unwrap_err()
                     .to_string(),
-                "exec_mm_release must be void(task_struct *, mm_struct *)"
+                "no exact exec-release hook: exec_mm_release must be void(task_struct *, mm_struct *) or exec_mmap must be int(linux_binprm *)"
             );
         };
         let check = |bytes| {
@@ -3068,6 +3075,15 @@ mod tests {
         let mut wrong_return = bytes.clone();
         wrong_return[148..152].copy_from_slice(&0u32.to_le_bytes());
         assert!(!super::exec_mmap_proto_is_exact(&wrong_return));
+        // The return INT itself (id 8 at type + 100: name, info, size,
+        // data) must be 4-byte signed: a wider or unsigned spelling is
+        // not exec_mmap's int.
+        let mut wrong_size = bytes.clone();
+        wrong_size[132..136].copy_from_slice(&8u32.to_le_bytes());
+        assert!(!super::exec_mmap_proto_is_exact(&wrong_size));
+        let mut wrong_sign = bytes.clone();
+        wrong_sign[136..140].copy_from_slice(&0x0000_0020u32.to_le_bytes());
+        assert!(!super::exec_mmap_proto_is_exact(&wrong_sign));
         let mut wrong_argument = bytes.clone();
         wrong_argument[156..160].copy_from_slice(&4u32.to_le_bytes());
         assert!(!super::exec_mmap_proto_is_exact(&wrong_argument));

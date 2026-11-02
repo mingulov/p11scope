@@ -504,9 +504,11 @@ jobs:
           sudo bpftool version
       # Pin 55101d3c, the journal READY writer (picked 54693889) plus its
       # comment corrections: the default Detailed object differs from 6641123f
-      # only in .debug_line (comment-only edits in instance_epoch.c and
-      # journal_marker.h change their DWARF source checksums); both Inventory
-      # objects are byte-identical. The journal object, which this gate does
+      # only in debug sections (54693889 changes .debug_line through the
+      # instance_epoch.c source checksum; 55101d3c also rewraps a
+      # journal_marker.h comment, which shifts .debug_info line numbers);
+      # code, maps and size are unchanged and both Inventory objects are
+      # byte-identical. The journal object, which this gate does
       # not compare, gains p11_instance_exec_birth and its exec-root call.
       # No other BPF input changed since 6641123f.
       # Earlier pin 6641123f, the async control value flags: the default Detailed

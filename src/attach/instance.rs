@@ -53,34 +53,87 @@ pub(crate) const INSTANCE_PROGRAMS: [(&str, &str); 4] = [
 /// Hooks attached as fexit; every other instance hook is fentry.
 const EXIT_PROGRAMS: [&str; 1] = ["p11_inst_vma_copy"];
 
+/// The 7.3+ exec-release hook program and its kernel attach target. Kernels
+/// through 7.2 carry `exec_mm_release`; 7.3 removed it, merging exit and exec
+/// release into `mm_exit_exec_release`. That merged function also fires on
+/// thread exit, where poisoning live continuity would be wrong, so newer
+/// kernels hook the success-gated `exec_mmap` exit instead.
+pub(crate) const EXEC_RELEASE_MMAP_PROGRAM: &str = "p11_image_mmap_release";
+const EXEC_RELEASE_MMAP_TARGET: &str = "exec_mmap";
+
+/// Which kernel hook carries exec-release invalidation on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecReleaseTarget {
+    ExecMmRelease,
+    ExecMmap,
+}
+
+/// The four instance-hook (program, target) triples for a resolved target.
+/// The legacy set is [`INSTANCE_PROGRAMS`]; the 7.3+ set swaps only the
+/// exec-release slot.
+fn active_instance_programs(target: ExecReleaseTarget) -> [(&'static str, &'static str); 4] {
+    match target {
+        ExecReleaseTarget::ExecMmRelease => INSTANCE_PROGRAMS,
+        ExecReleaseTarget::ExecMmap => [
+            INSTANCE_PROGRAMS[0],
+            INSTANCE_PROGRAMS[1],
+            INSTANCE_PROGRAMS[2],
+            (EXEC_RELEASE_MMAP_PROGRAM, EXEC_RELEASE_MMAP_TARGET),
+        ],
+    }
+}
+
+/// Resolve the exec-release hook from the host BTF: the exact legacy
+/// prototype wins when present, keeping older kernels byte-identical.
+/// Only the legacy target resolves yet; kernels without it refuse
+/// exactly as before.
+fn resolve_exec_release_target(
+    host: &super::host_btf::HostBtf,
+    btf: &Btf,
+) -> Result<ExecReleaseTarget> {
+    let raw = host
+        .original_bytes_for(btf)
+        .context("instance hook BTF differs from cached host BTF")?;
+    if exec_release_proto_is_exact(raw) {
+        return Ok(ExecReleaseTarget::ExecMmRelease);
+    }
+    validate_exec_release_proto(host, btf)?;
+    unreachable!("the legacy probe failed above, so this validation cannot succeed");
+}
+
 /// Only the loader constructs this token. It stays inside one Session's
 /// preparation/activation path and is consumed by attachment.
 struct LoadedInstancePrograms {
     program_ids: BTreeMap<&'static str, u32>,
+    target: ExecReleaseTarget,
 }
 
 fn load_instance_programs_with<S>(
     state: &mut S,
+    target: ExecReleaseTarget,
     mut load: impl FnMut(&mut S, &'static str, &'static str) -> Result<u32>,
 ) -> Result<LoadedInstancePrograms> {
     let mut program_ids = BTreeMap::new();
-    for (program, target) in INSTANCE_PROGRAMS {
-        let id = load(state, program, target)?;
+    for (program, hook_target) in active_instance_programs(target) {
+        let id = load(state, program, hook_target)?;
         ensure!(
             id != 0 && !program_ids.values().any(|existing| *existing == id),
             "loaded image hook program IDs unavailable or collide"
         );
         program_ids.insert(program, id);
     }
-    Ok(LoadedInstancePrograms { program_ids })
+    Ok(LoadedInstancePrograms {
+        program_ids,
+        target,
+    })
 }
 
 fn attach_loaded_instance_programs_with<S>(
-    _loaded: LoadedInstancePrograms,
+    loaded: LoadedInstancePrograms,
     state: &mut S,
     mut attach: impl FnMut(&mut S, &'static str, &'static str) -> Result<()>,
 ) -> Result<()> {
-    for (program, target) in INSTANCE_PROGRAMS {
+    for (program, target) in active_instance_programs(loaded.target) {
         attach(state, program, target)?;
     }
     Ok(())
@@ -176,6 +229,8 @@ pub(crate) struct HookStats {
 pub(crate) struct InstanceTracking {
     /// `None` while active; the refusal reason otherwise.
     refused: Option<String>,
+    /// The resolved exec-release target; `None` until hooks attach.
+    active_target: Option<ExecReleaseTarget>,
     links: Vec<(&'static str, HookLink)>,
     watched: BTreeMap<PinnedObjectId, Result<WatchedFile, String>>,
     keys: BTreeMap<InstanceFileKey, u32>,
@@ -435,8 +490,8 @@ impl InstanceTracking {
     fn load_hooks(ebpf: &mut Ebpf, btf: &Btf) -> Result<LoadedInstancePrograms> {
         let host =
             super::host_btf::shared().context("loading required vmlinux BTF for instance hooks")?;
-        validate_exec_release_proto(host, btf)?;
-        load_instance_programs_with(ebpf, |ebpf, program, target| {
+        let target = resolve_exec_release_target(host, btf)?;
+        load_instance_programs_with(ebpf, target, |ebpf, program, target| {
             let hook = ebpf
                 .program_mut(program)
                 .with_context(|| format!("program {program} missing from object"))?;
@@ -458,6 +513,7 @@ impl InstanceTracking {
     }
 
     fn attach_hooks(&mut self, ebpf: &mut Ebpf, loaded: LoadedInstancePrograms) -> Result<()> {
+        self.active_target = Some(loaded.target);
         attach_loaded_instance_programs_with(loaded, ebpf, |ebpf, program, target| {
             let hook = ebpf
                 .program_mut(program)
@@ -588,17 +644,20 @@ impl InstanceTracking {
     /// The hook programs' statistics, summed. `run_time_ns`/`run_cnt` need
     /// `kernel.bpf_stats_enabled`; `recursion_misses` is always counted.
     pub(crate) fn hook_stats(&self, ebpf: &Ebpf) -> Result<Vec<(&'static str, HookStats)>> {
-        INSTANCE_PROGRAMS
-            .iter()
-            .map(|(program, _)| {
-                let fd = ebpf
-                    .program(program)
-                    .with_context(|| format!("program {program}"))?
-                    .fd()
-                    .with_context(|| format!("program {program} fd"))?;
-                Ok((*program, prog_stats(fd.as_fd())?))
-            })
-            .collect()
+        active_instance_programs(
+            self.active_target
+                .unwrap_or(ExecReleaseTarget::ExecMmRelease),
+        )
+        .into_iter()
+        .map(|(program, _)| {
+            let fd = ebpf
+                .program(program)
+                .with_context(|| format!("program {program}"))?
+                .fd()
+                .with_context(|| format!("program {program} fd"))?;
+            Ok((program, prog_stats(fd.as_fd())?))
+        })
+        .collect()
     }
 }
 
@@ -2179,15 +2238,19 @@ mod tests {
             let coverage = super::super::image_query::CoverageControl::test_owner(false);
             let mut calls = Vec::new();
             let mut loaded_count = 0;
-            let prepared = super::load_instance_programs_with(&mut calls, |calls, program, _| {
-                assert!(calls.iter().all(|(operation, _)| *operation == "load"));
-                calls.push(("load", program));
-                if loaded_count == fail {
-                    anyhow::bail!("owned load refusal: {program}");
-                }
-                loaded_count += 1;
-                Ok(loaded_count as u32)
-            });
+            let prepared = super::load_instance_programs_with(
+                &mut calls,
+                super::ExecReleaseTarget::ExecMmRelease,
+                |calls, program, _| {
+                    assert!(calls.iter().all(|(operation, _)| *operation == "load"));
+                    calls.push(("load", program));
+                    if loaded_count == fail {
+                        anyhow::bail!("owned load refusal: {program}");
+                    }
+                    loaded_count += 1;
+                    Ok(loaded_count as u32)
+                },
+            );
             assert!(!coverage.enabled());
             let health_called = std::cell::Cell::new(false);
             let result = super::activate_image_coverage_with(&coverage, None, || {
@@ -2232,10 +2295,14 @@ mod tests {
     fn loaded_hook_identity_change_refuses_activation_before_enable() {
         let coverage = super::super::image_query::CoverageControl::test_owner(false);
         let mut next = 0;
-        let loaded = super::load_instance_programs_with(&mut next, |next, _, _| {
-            *next += 1;
-            Ok(*next)
-        })
+        let loaded = super::load_instance_programs_with(
+            &mut next,
+            super::ExecReleaseTarget::ExecMmRelease,
+            |next, _, _| {
+                *next += 1;
+                Ok(*next)
+            },
+        )
         .unwrap();
         let expected = loaded.program_ids.clone();
         let result = super::activate_image_coverage_with(&coverage, None, || {
@@ -2366,6 +2433,132 @@ mod tests {
         bytes.resize(bytes.len() + string_gap, 0x5a);
         bytes.extend(strings);
         bytes
+    }
+
+    /// BTF blob carrying both exec-release hook families: the legacy
+    /// `exec_mm_release` void(task_struct *, mm_struct *) shape and the 7.3+
+    /// `exec_mmap` int(linux_binprm *) shape. The flags select which FUNC
+    /// records exist; shared types are always present with stable ids.
+    fn exec_hook_btf_fixture(
+        with_legacy: bool,
+        with_mmap: bool,
+        header_len: u32,
+        string_gap: usize,
+    ) -> Vec<u8> {
+        let strings = b"\0task_struct\0mm_struct\0linux_binprm\0exec_mm_release\0exec_mmap\0int\0";
+        let words = [
+            1,
+            4 << 24,
+            1, // task_struct
+            0,
+            2 << 24,
+            1, // pointer to task
+            13,
+            4 << 24,
+            1, // mm_struct
+            0,
+            2 << 24,
+            3, // pointer to mm
+            0,
+            (13 << 24) | 2,
+            0,
+            0,
+            2,
+            0,
+            4, // two-argument void proto
+            23,
+            4 << 24,
+            1, // linux_binprm
+            0,
+            2 << 24,
+            6, // pointer to bprm
+            62,
+            1 << 24,
+            4,
+            0x0100_0020, // signed 32-bit int
+            0,
+            (13 << 24) | 1,
+            8,
+            0,
+            7, // one-argument int proto
+        ];
+        let mut types: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        if with_legacy {
+            for word in [36u32, (12 << 24) | 1, 5] {
+                types.extend(word.to_le_bytes());
+            }
+        }
+        if with_mmap {
+            for word in [52u32, (12 << 24) | 1, 9] {
+                types.extend(word.to_le_bytes());
+            }
+        }
+        let mut bytes = vec![0x9f, 0xeb, 1, 0];
+        for word in [
+            header_len,
+            0,
+            types.len() as u32,
+            types.len() as u32 + string_gap as u32,
+            strings.len() as u32,
+        ] {
+            bytes.extend(word.to_le_bytes());
+        }
+        bytes.resize(header_len as usize, 0xa5);
+        bytes.extend(types);
+        bytes.resize(bytes.len() + string_gap, 0x5a);
+        bytes.extend(strings);
+        bytes
+    }
+
+    fn resolve_fixture(bytes: Vec<u8>) -> Result<super::ExecReleaseTarget, String> {
+        use super::super::host_btf;
+        let cell = std::sync::OnceLock::new();
+        let host = host_btf::cached(&cell, || Ok(bytes)).map_err(|error| error.to_string())?;
+        super::resolve_exec_release_target(host, host.btf()).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn resolver_prefers_legacy_when_present() {
+        for (legacy, mmap) in [(true, false), (true, true)] {
+            let bytes = exec_hook_btf_fixture(legacy, mmap, 24, 0);
+            assert_eq!(
+                resolve_fixture(bytes).unwrap(),
+                super::ExecReleaseTarget::ExecMmRelease
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_selects_mmap_without_legacy() {
+        let bytes = exec_hook_btf_fixture(false, true, 24, 0);
+        assert_eq!(
+            resolve_fixture(bytes).unwrap(),
+            super::ExecReleaseTarget::ExecMmap
+        );
+    }
+
+    #[test]
+    fn resolver_refuses_without_either_hook() {
+        let bytes = exec_hook_btf_fixture(false, false, 24, 0);
+        assert_eq!(
+            resolve_fixture(bytes).unwrap_err(),
+            "exec_mm_release must be void(task_struct *, mm_struct *)"
+        );
+    }
+
+    #[test]
+    fn resolver_rejects_foreign_parse() {
+        use super::super::host_btf;
+        let bytes = exec_hook_btf_fixture(true, false, 24, 0);
+        let foreign = aya::Btf::parse(&bytes, aya::Endianness::default()).unwrap();
+        let cell = std::sync::OnceLock::new();
+        let host = host_btf::cached(&cell, || Ok(bytes)).unwrap();
+        assert_eq!(
+            super::resolve_exec_release_target(host, &foreign)
+                .unwrap_err()
+                .to_string(),
+            "instance hook BTF differs from cached host BTF"
+        );
     }
 
     #[test]

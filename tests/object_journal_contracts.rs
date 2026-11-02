@@ -1683,7 +1683,7 @@ fn object_journal_marker_calls_and_declarations_share_the_gate() {
         let line = line.trim();
         let call = matches!(
             line,
-            "p11_instance_exec_birth();" | "p11_instance_scope_gap();"
+            "p11_instance_exec_birth(pid_scope_tgid(&scope));" | "p11_instance_scope_gap();"
         );
         let declaration = line.starts_with("fn p11_instance_exec_birth(")
             || line.starts_with("fn p11_instance_scope_gap(");
@@ -1707,7 +1707,7 @@ fn object_journal_marker_calls_and_declarations_share_the_gate() {
                     private_gap_calls += 1;
                 } else {
                     assert_eq!(
-                        line, "p11_instance_exec_birth();",
+                        line, "p11_instance_exec_birth(pid_scope_tgid(&scope));",
                         "combined gate enables only the two marker calls"
                     );
                     assert!(

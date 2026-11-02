@@ -18,6 +18,10 @@
 /* Shared loss/birth admission row. GAP alone never enables exec birth. */
 extern unsigned char JOURNAL_MARKER_CTL;
 #endif
+#ifdef P11SCOPE_JOURNAL_MARKER
+/* PID-scope birth identity witness (main.rs), published with PID_FILTER. */
+extern unsigned char PID_START_TICK;
+#endif
 
 #ifndef P11SCOPE_INSTANCE_HOST_TEST
 #define INST_BTF __attribute__((preserve_access_index))
@@ -60,6 +64,9 @@ struct task_struct___p11inst {
     /* H8-D birth marker: the leader's exec generation, read at exec
      * only. Detailed/journal only, so counter bytes stay identical. */
     u64 self_exec_id;
+    /* I4 PID-scope birth identity: the thread-group start time, read
+     * at exec only for the in-kernel admission comparison. */
+    u64 start_boottime;
 #endif
 } INST_BTF;
 
@@ -615,16 +622,48 @@ static INST_INLINE void marker_latch(struct journal_admission_control *ctl)
 #endif
 
 #ifdef P11SCOPE_JOURNAL_MARKER
+/* I4 PID-scope birth identity: PID scope admits the exec hook by tgid
+ * number, which a later process can reuse. Under PID scope (`pid_scope_tgid`
+ * nonzero) the marker births only the scope target itself: its
+ * thread-group leader's kernel start time in USER_HZ ticks
+ * (start_boottime / 10000000, the /proc/PID/stat field 22 userspace
+ * published into PID_START_TICK) must equal the published witness. Exec
+ * keeps it and de_thread exchanges it to the surviving leader, so the
+ * target's own exec matches, while a process that reused the number
+ * (born later, in another tick) does not. Cgroup and system scopes pass
+ * 0 and are unchanged. A missing entry, an unreadable task or a mismatch
+ * refuses without a latch, a charge or an exec-ID read: that process is
+ * simply never born. In-kernel comparison only; never exported. */
+static INST_INLINE u32 marker_pid_witness_matches(struct task_struct___p11inst *current,
+                                                  u32 pid_scope_tgid)
+{
+    struct task_struct___p11inst *leader;
+    u64 *expected;
+
+    if (!pid_scope_tgid)
+        return 1;
+    expected = inst_map_lookup(&PID_START_TICK, &pid_scope_tgid);
+    if (!expected || !current)
+        return 0;
+    leader = current->group_leader;
+    if (!leader)
+        return 0;
+    return *(volatile u64 *)&leader->start_boottime / 10000000ULL == *(volatile u64 *)expected;
+}
+
 /* H8-D post-attach birth marker, exec half (Detailed/journal):
  * publish READY(self_exec_id) after closure on the leader row.
  * p11_instance_exec stays unchanged and runs first; this only marks.
- * Returns 1 when the marker is READY for this exec, 0 when gated,
- * sticky-DIRTY, latched, or left rowless by a task-storage NULL.
+ * `pid_scope_tgid` is the PID scope target's tgid, 0 under cgroup and
+ * system scope (see marker_pid_witness_matches).
+ * Returns 1 when the marker is READY for this exec, 0 when gated (a
+ * PID-scope witness mismatch included), sticky-DIRTY, latched, or left
+ * rowless by a task-storage NULL.
  * Failures latch the control row and never raise the fault: no
  * provider body runs at the exec root, and a fault there would wreck
  * S1 continuity for the whole session. A storage NULL is not a
  * failure: no row means no READY, which can never birth. */
-__attribute__((noinline)) u32 p11_instance_exec_birth(void)
+__attribute__((noinline)) u32 p11_instance_exec_birth(u32 pid_scope_tgid)
 {
     struct task_struct___p11inst *current = inst_current_task();
     struct task_struct___p11inst *leader;
@@ -648,6 +687,9 @@ __attribute__((noinline)) u32 p11_instance_exec_birth(void)
     if (!ctl)
         return 0;
     if (*(volatile u64 *)&ctl->failed != 0)
+        return 0;
+    /* After the generation and control gates, before any write. */
+    if (!marker_pid_witness_matches(current, pid_scope_tgid))
         return 0;
     if (!current)
         goto latch;

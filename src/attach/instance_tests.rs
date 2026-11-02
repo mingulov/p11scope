@@ -3322,6 +3322,10 @@ fn assert_marker_absent_from_detailed() -> Result<()> {
         !object.maps.contains_key("JOURNAL_MARKER_CTL"),
         "a markerless build must not allocate the marker control map"
     );
+    ensure!(
+        !object.maps.contains_key("PID_START_TICK"),
+        "a markerless build must not allocate the PID-scope birth witness"
+    );
     for global in ["p11_instance_exec_birth", "p11_instance_scope_gap"] {
         ensure!(
             !object
@@ -4367,8 +4371,10 @@ fn privileged_journal_ready_exec_after_closure_publishes_ready() -> Result<()> {
 /// A plain process (never maps the watched provider) holding `pid`: the
 /// kernel's next PID is set through `ns_last_pid` (the CRIU technique) and
 /// the spawn retried, since other host processes may take the number first.
-/// Unlike a cmd target, `sleep` maps no watched file, so Stage A creates no
-/// row for it: any `PROC_EPOCH` row after its spawn exec is the marker's.
+/// Unlike a cmd target, `sleep` maps no watched file, so Stage A creates
+/// no row for its mappings; the spawn fork itself may still leave a plain
+/// Stage A row (a vfork child shares the mm until its exec), which the
+/// marker must never publish on.
 struct ReusedProc {
     child: Child,
     pin: Arc<PidPin>,
@@ -4429,10 +4435,12 @@ fn spawn_plain_with_pid(pid: u32) -> Result<ReusedProc> {
 
 /// Birth marker under Scope::Pid with PID reuse: PID scope admits the exec
 /// hook by number alone, so a process that later reuses the target's number
-/// reaches the marker. The marker must never create a row there: after the
-/// reused process's exec it has no `PROC_EPOCH` row and the admission row is
-/// unchanged. The target's own exec first publishes READY (positive control:
-/// PID scope still updates an existing row), spending exactly one admission.
+/// reaches the hook; the marker births it only by start-time identity. The
+/// marker must never publish there: after the reused process's exec its row
+/// stays UNPUBLISHED (or absent, when the spawn forked no row) and the
+/// admission row is unchanged. The target's own exec first publishes READY
+/// (positive control: PID scope still updates an existing row), spending
+/// exactly one admission.
 #[test]
 #[ignore = "privileged: birth marker PID reuse exec creates no row"]
 fn privileged_journal_marker_pid_reuse_exec_creates_no_row() -> Result<()> {
@@ -4473,10 +4481,17 @@ fn privileged_journal_marker_pid_reuse_exec_creates_no_row() -> Result<()> {
         .instance_maps()
         .record(reused.pin.pidfd()?)?;
     ensure!(
-        absent.is_none(),
-        "a reused PID must gain no marker row: {}",
+        marker_word_of(&absent) == 0,
+        "a reused PID must gain no marker publication: {}",
         marker_summary(&absent)
     );
+    if let Some(row) = &absent {
+        ensure!(
+            row.exec_attach_gen == minted,
+            "the exec hook stamped the reused row without birthing it: {} minted {minted}",
+            marker_summary(&absent)
+        );
+    }
     let control = admission_of(&harness)?;
     ensure!(
         control.spent == 1 && control.failed == 0,

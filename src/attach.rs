@@ -7067,6 +7067,7 @@ impl Session {
                         policy,
                         generation_token,
                         track_short_lived,
+                        crate::scope::pid_start_tick_of(scope)?,
                     )
                     .context("publishing scope and capture policy")?;
                     debug_assert!(process_creation_capture_enabled(scope, policy));

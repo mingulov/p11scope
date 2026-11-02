@@ -1444,10 +1444,10 @@ fn object_kem_native_entry_to_emission_connected() {
                         .iter()
                         .find_map(|slot| (slot.0 == index).then_some(slot.1).flatten())
                 },
-                |address| {
+                p11scope_ebpf_common::FnReader(|address, _layout| {
                     entry_reads.push(address);
                     leg.stack_cell
-                },
+                }),
             );
             if leg.loud {
                 assert!(!entry_ok, "{tag}: loud entry refuses");
@@ -1498,11 +1498,11 @@ fn object_kem_native_entry_to_emission_connected() {
                     0,
                     0,
                     true,
-                    |address| {
+                    p11scope_ebpf_common::FnReader(|address, _layout| {
                         fill_reads += 1;
                         assert_eq!(address, 0x7000, "{tag}: fill reads the cell");
                         Ok(0x777)
-                    },
+                    }),
                 );
                 assert!(fill_ok, "{tag}: return fill");
                 assert_eq!(fill_reads, leg.return_reads, "{tag}: return reads");
@@ -1783,6 +1783,30 @@ def check_leaves(data, report):
     return leaves
 
 
+# Aggregate (struct/union/array) BTF returns lower by hidden out-pointer
+# (sret): the machine arguments shift up one register against the BTF
+# prototype, and kernels that check static-subprogram arguments against
+# BTF struct types refuse the misaligned pointers (6.6 refuses p11_return
+# for exactly this when a new outline returns a tuple). New outlines must
+# return scalars; the four pre-existing sites below load on every
+# supported kernel and stay grandfathered (name prefixes; pinned
+# present so the list cannot rot silently).
+GRANDFATHERED_AGGREGATE_RETURNS = (
+    'scope_auth',
+    'take_export_state',
+    'take_selection_state',
+    'classify_derive_mechanism_3C_',
+)
+
+
+def btf_resolve(btf, tid):
+    while True:
+        node = btf.types[tid]
+        if node[0] not in (8, 9, 10, 11, 17, 18):
+            return node
+        tid = node[2]
+
+
 def check_function_abis(data, report):
     elf = checker.Elf(data)
     btf = checker.Btf(elf.sections['.BTF'][1])
@@ -1792,15 +1816,25 @@ def check_function_abis(data, report):
     expected = {'object_fill_return', 'object_emit_find', 'object_emit_get_attributes'}
     assert expected <= names, f'missing actual return wrappers: {expected - names}'
     over = []
+    agg = []
     for node in functions:
         proto = btf.types[node[2]]
         assert proto[0] == 13, f'{node[1]} missing emitted FUNC_PROTO'
         if proto[3] > 5:
             over.append((node[1], proto[3]))
+        if proto[2]:
+            ret = btf_resolve(btf, proto[2])
+            if ret[0] in (3, 4, 5) and not node[1].startswith(GRANDFATHERED_AGGREGATE_RETURNS):
+                agg.append((node[1], ret[0], ret[2]))
         if node[1] in expected:
             report.append(f'BPF ABI {node[1]}: {proto[3]} arguments')
     assert not over, f'emitted BPF functions exceed five-register ABI: {over}'
+    assert not agg, f'emitted BPF functions return aggregates by out-pointer: {agg}'
+    for prefix in GRANDFATHERED_AGGREGATE_RETURNS:
+        assert any(name.startswith(prefix) for name in names), \
+            f'grandfathered aggregate return {prefix} vanished; drop it from the list'
     report.append(f'BPF ABI: all {len(functions)} emitted functions <=5 arguments')
+    report.append('BPF ABI: no new aggregate (out-pointer) returns beyond the grandfathered four')
 
 
 def check_roots(data, report):

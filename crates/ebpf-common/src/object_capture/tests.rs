@@ -180,19 +180,19 @@ impl FakeTarget {
     }
 }
 
-fn word_reader(target: &RefCell<FakeTarget>) -> impl FnMut(u64) -> Result<u64, ()> + '_ {
-    |addr: u64| target.borrow_mut().read_word(addr)
+fn word_reader(target: &RefCell<FakeTarget>) -> impl crate::WordReader + '_ {
+    crate::FnReader(|addr: u64, _layout: LinuxLayout| target.borrow_mut().read_word(addr))
 }
 
 #[allow(clippy::type_complexity)]
 fn readers(
     target: &RefCell<FakeTarget>,
 ) -> (
-    impl FnMut(u64) -> Result<u64, ()> + '_,
+    impl crate::WordReader + '_,
     impl FnMut(u64, &mut [u8]) -> Result<(), ()> + '_,
 ) {
     (
-        |addr: u64| target.borrow_mut().read_word(addr),
+        crate::FnReader(|addr: u64, _layout: LinuxLayout| target.borrow_mut().read_word(addr)),
         |addr: u64, buf: &mut [u8]| target.borrow_mut().read_bytes(addr, buf),
     )
 }
@@ -3828,7 +3828,7 @@ fn streamed_request_header_recheck_discards_classified_value() {
             None,
             layout,
             &mut out,
-            |addr| {
+            crate::FnReader(|addr, _layout| {
                 if addr == 0x8000 {
                     seen.set(true);
                 }
@@ -3837,7 +3837,7 @@ fn streamed_request_header_recheck_discards_classified_value() {
                 } else {
                     target.borrow_mut().read_word(addr)
                 }
-            },
+            }),
             |addr, buf| target.borrow_mut().read_bytes(addr, buf),
         );
         assert!(seen.get());
@@ -4019,7 +4019,7 @@ fn streamed_get_return_entry_capacity_alias_and_race_controls() {
                 ReturnAuthority::AUTHORIZED,
                 layout,
                 &mut out,
-                |addr| {
+                crate::FnReader(|addr, _layout| {
                     if addr == 0x8000 {
                         seen.set(true);
                     }
@@ -4028,7 +4028,7 @@ fn streamed_get_return_entry_capacity_alias_and_race_controls() {
                     } else {
                         target.borrow_mut().read_word(addr)
                     }
-                },
+                }),
                 |addr, buf| target.borrow_mut().read_bytes(addr, buf),
             );
             assert_eq!(
@@ -4931,7 +4931,7 @@ fn streamed_stable_recheck_preserves_read_order_and_failure_priority() {
                     w,
                     layout,
                     &mut out,
-                    &mut |addr| {
+                    &mut crate::FnReader(|addr, _layout| {
                         let original = target.borrow_mut().read_word(addr);
                         let Some(index) = [0x4000, 0x4000 + w, 0x4000 + 2 * w]
                             .iter()
@@ -4946,7 +4946,7 @@ fn streamed_stable_recheck_preserves_read_order_and_failure_priority() {
                         } else {
                             original
                         }
-                    },
+                    }),
                     &mut |addr, bytes| target.borrow_mut().read_bytes(addr, bytes),
                 );
                 let expected = if failed != 0 {
@@ -5270,6 +5270,36 @@ fn stable_cell_kind_layout_codec_roundtrips() {
 }
 
 #[test]
+fn get_slot_layout_codec_roundtrips() {
+    for index in 0..8usize {
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let code = encode_get_slot_layout(index, layout);
+            assert_eq!(decode_get_slot_layout(code), (index, layout));
+        }
+    }
+    // Total codec: layout bit selects Ilp32, low three bits are the index.
+    assert_eq!(decode_get_slot_layout(0x1FF), (7, LinuxLayout::Ilp32));
+    assert_eq!(decode_get_slot_layout(0x100), (0, LinuxLayout::Ilp32));
+    assert_eq!(decode_get_slot_layout(7), (7, LinuxLayout::Lp64));
+    assert_eq!(decode_get_slot_layout(8), (0, LinuxLayout::Lp64));
+}
+
+#[test]
+fn get_slot_result_codec_roundtrips() {
+    for flow in [GetSlotFlow::Break, GetSlotFlow::Continue, GetSlotFlow::Done] {
+        for contributed in [0u32, 1, 0xFF, u32::MAX] {
+            let code = encode_get_slot_result(flow, contributed);
+            assert_eq!(decode_get_slot_result(code), (flow, contributed));
+        }
+    }
+    // Total codec: the unreachable tag fails closed by stopping the scan.
+    assert_eq!(
+        decode_get_slot_result(0xFFFF_FFFF_FFFF_FFFCu64 | 3),
+        (GetSlotFlow::Break, u32::MAX)
+    );
+}
+
+#[test]
 fn stable_cell_poison_inputs_publish_nothing() {
     for bad in [0u64, 7, 0xFF, 0x200, u64::MAX] {
         let reads = core::cell::Cell::new(0u32);
@@ -5279,10 +5309,10 @@ fn stable_cell_poison_inputs_publish_nothing() {
             bad,
             0x8000,
             8,
-            &mut |_| {
+            &mut crate::FnReader(|_, _| {
                 reads.set(reads.get() + 1);
                 Ok(0)
-            },
+            }),
             &mut |_, _| {
                 reads.set(reads.get() + 1);
                 Ok(())
@@ -5345,22 +5375,23 @@ fn stable_cell_packed_matches_direct() {
                                 // value_case 2 leaves the value unreadable.
                                 _ => {}
                             }
-                            let mut read_word = |addr: u64| {
-                                let original = target.borrow_mut().read_word(addr);
-                                let Some(index) = [0x4000, 0x4000 + w, 0x4000 + 2 * w]
-                                    .iter()
-                                    .position(|candidate| *candidate == addr)
-                                else {
-                                    return original;
-                                };
-                                if failed & (1 << index) != 0 {
-                                    Err(())
-                                } else if changed & (1 << index) != 0 {
-                                    Ok([SEL_KEYTYPE, 0x9000, len + 1][index])
-                                } else {
-                                    original
-                                }
-                            };
+                            let mut read_word =
+                                crate::FnReader(|addr: u64, _layout: LinuxLayout| {
+                                    let original = target.borrow_mut().read_word(addr);
+                                    let Some(index) = [0x4000, 0x4000 + w, 0x4000 + 2 * w]
+                                        .iter()
+                                        .position(|candidate| *candidate == addr)
+                                    else {
+                                        return original;
+                                    };
+                                    if failed & (1 << index) != 0 {
+                                        Err(())
+                                    } else if changed & (1 << index) != 0 {
+                                        Ok([SEL_KEYTYPE, 0x9000, len + 1][index])
+                                    } else {
+                                        original
+                                    }
+                                });
                             let mut read_bytes = |addr: u64, bytes: &mut [u8]| {
                                 target.borrow_mut().read_bytes(addr, bytes)
                             };

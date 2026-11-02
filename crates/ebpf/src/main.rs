@@ -138,7 +138,7 @@ use p11scope_ebpf_common::{
     interface_continuation_next, interface_continuation_pack, interface_continuation_unpack,
     interface_flags_class, lifecycle, normalize_target_word, read_ia32_arg_with,
     return_allows_mechanism, semantic_flags, shape, stop_gate_admit_with, target_layout_from_cs,
-    target_stack_arg_address, target_word_end, valid_config, valid_loader_cookie,
+    target_stack_arg_address, target_word_end, valid_config, valid_loader_cookie, WordReader,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -537,6 +537,19 @@ fn read_word(address: u64, layout: LinuxLayout) -> Result<u64, ()> {
         LinuxLayout::Ilp32 => unsafe { helpers::bpf_probe_read_user(address as *const u32) }
             .map(u64::from)
             .map_err(|_| ()),
+    }
+}
+
+// Zero-sized target-word reader for the shared object adapters. A plain
+// method call, not a closure: no `FnMut::call_mut` shim is instantiated,
+// so no 16-byte `Result` crosses a subprogram boundary (see `WordReader`).
+struct BpfReader;
+
+impl WordReader for BpfReader {
+    #[inline(always)]
+    #[allow(clippy::result_unit_err)]
+    fn read_word(&mut self, addr: u64, layout: LinuxLayout) -> Result<u64, ()> {
+        read_word(addr, layout)
     }
 }
 
@@ -2672,6 +2685,10 @@ fn walk_template_impl<const IS_ILP32: bool>(
     0
 }
 
+// Always inlined: a 16-byte `Result` return must never cross a BPF
+// subprogram boundary (the 7.4 verifier rejects the caller-stack
+// out-pointer in R2). The `subprog_return_shape` test enforces this.
+#[inline(always)]
 fn arg_u64(ctx: &ProbeContext, index: u8, layout: LinuxLayout) -> Result<u64, ()> {
     if layout == LinuxLayout::Ilp32 {
         let rsp = unsafe { (*ctx.regs).rsp as u64 };
@@ -2729,7 +2746,7 @@ pub extern "C" fn p11_request_cell(
             tag,
             peer_base,
             peer_count,
-            &mut |address| read_word(address, LinuxLayout::Lp64),
+            &mut BpfReader,
             &mut |address, buf| read_bytes_user(address, buf, LinuxLayout::Lp64),
         ),
         LinuxLayout::Ilp32 => request_cell_packed(
@@ -2738,7 +2755,7 @@ pub extern "C" fn p11_request_cell(
             tag,
             peer_base,
             peer_count,
-            &mut |address| read_word(address, LinuxLayout::Ilp32),
+            &mut BpfReader,
             &mut |address, buf| read_bytes_user(address, buf, LinuxLayout::Ilp32),
         ),
     }
@@ -2770,7 +2787,7 @@ pub extern "C" fn p11_stable_cell(
         ptr,
         len,
         layout,
-        &mut |address| read_word(address, layout),
+        &mut BpfReader,
         &mut |address, buf| read_bytes_user(address, buf, layout),
     );
     pack_stable_cell(status, value, write_value, contrib)
@@ -2797,7 +2814,7 @@ pub extern "C" fn p11_alias_scan(base: u64, count: u64, skip_tag: u64, ptr: u64,
             ptr,
             len,
             LinuxLayout::Lp64,
-            &mut |address| read_word(address, LinuxLayout::Lp64),
+            &mut BpfReader,
         ),
         LinuxLayout::Ilp32 => alias_scan_core(
             base,
@@ -2806,7 +2823,7 @@ pub extern "C" fn p11_alias_scan(base: u64, count: u64, skip_tag: u64, ptr: u64,
             ptr,
             len,
             LinuxLayout::Ilp32,
-            &mut |address| read_word(address, LinuxLayout::Ilp32),
+            &mut BpfReader,
         ),
     };
     pack_alias_scan(alias, flags)
@@ -2838,7 +2855,10 @@ fn capture_failure(start: &mut CallStart) {
     bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
 }
 
+// Always inlined: a 16-byte `Option` return must never cross a BPF
+// subprogram boundary (see `arg_u64`).
 #[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
 fn capture_scalar(
     ctx: &ProbeContext,
     index: u8,
@@ -3386,9 +3406,7 @@ fn object_entry_derive(
     let descriptor = side.as_ref().map_or(0, |s| s.descriptor_index);
     let row = OBJECT_DESCRIPTORS.get(descriptor);
     let mut fetch_arg = |index: u8| arg_u64(ctx, index, layout).ok();
-    adapter_derive_entry(side, descriptor, row, layout, &mut fetch_arg, |addr| {
-        read_word(addr, layout)
-    })
+    adapter_derive_entry(side, descriptor, row, layout, &mut fetch_arg, BpfReader)
 }
 
 // H7 adapters tail: T0 KEM entry acquisition (key input arg 2 plus
@@ -3426,7 +3444,7 @@ fn object_entry_kem(
         output_non_null,
         null_cancel,
         &mut fetch_arg,
-        |addr| read_word(addr, layout),
+        BpfReader,
     )
 }
 
@@ -3566,7 +3584,7 @@ fn object_entry_attributes(
         row,
         layout,
         &mut fetch_arg,
-        |addr| read_word(addr, layout),
+        BpfReader,
         |addr, buf| read_bytes_user(addr, buf, layout),
     )
 }
@@ -3591,9 +3609,7 @@ fn object_fill_return(
     };
     let descriptor = side.as_ref().map_or(0, |s| s.descriptor_index);
     let row = OBJECT_DESCRIPTORS.get(descriptor);
-    adapter_fill_return_control(side, descriptor, row, rv, mech_status, mech, gate, |addr| {
-        read_word(addr, layout)
-    })
+    adapter_fill_return_control(side, descriptor, row, rv, mech_status, mech, gate, BpfReader)
 }
 
 // Slice D emission: fill the reserved 240-byte object tail in place
@@ -3633,9 +3649,7 @@ fn object_emit_find(
     let row = OBJECT_DESCRIPTORS.get(descriptor);
     // SAFETY: `tail` is the exclusively owned reserved tail by contract.
     unsafe {
-        adapter_emit_find_control(tail, side, descriptor, row, rv, gate, |addr| {
-            read_word(addr, layout)
-        })
+        adapter_emit_find_control(tail, side, descriptor, row, rv, gate, BpfReader)
     }
 }
 
@@ -3669,7 +3683,7 @@ fn object_emit_get_attributes(
             row,
             rv,
             gate,
-            |addr| read_word(addr, layout),
+            BpfReader,
             |addr, buf| read_bytes_user(addr, buf, layout),
         )
     }
@@ -4365,6 +4379,42 @@ fn account_return(
     ReturnAccounting { now, delta, rv }
 }
 
+// C_AsyncGetID return facts. Only an OK GetID is examined: a null
+// output pointer produced no id, and an unreadable one leaves no trusted
+// id; both mark the value unreadable with exactly one evidence bump
+// (a failed entry arg read also leaves out_ptr zeroed, so that
+// unreachable corner double-counts). A readable id is written through
+// `out`; the caller's default stays otherwise. Outlined so the verifier
+// explores this branch tree once instead of at every inlined return
+// site; the scalar u32 return keeps the BTF prototype register-sized.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn async_get_id_fact(
+    out_ptr: u64,
+    rv: u64,
+    lifecycle: u8,
+    layout: LinuxLayout,
+    out: &mut u64,
+) -> u32 {
+    if rv != 0 || lifecycle != lifecycle::ASYNC_GET_ID {
+        return 0;
+    }
+    if out_ptr == 0 {
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+        return capture::ASYNC_VALUE_UNREADABLE;
+    }
+    match read_word(out_ptr, layout) {
+        Ok(value) => {
+            *out = value;
+            0
+        }
+        Err(_) => {
+            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            capture::ASYNC_VALUE_UNREADABLE
+        }
+    }
+}
+
 #[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn capture_return_facts<const DEFER_ROUTING: bool>(
@@ -4408,25 +4458,16 @@ fn capture_return_facts<const DEFER_ROUTING: bool>(
         }
     }
     let mut async_value = start.async_value;
-    // An OK GetID with a null output pointer produced no id: mark the
-    // value unreadable instead of leaving a valid-looking default.
-    // A failed entry arg read also leaves out_ptr zeroed, so that unreachable corner double-counts the evidence below.
-    if accounting.rv == 0
-        && semantics.lifecycle == lifecycle::ASYNC_GET_ID
-        && start.out_ptr == 0
-    {
-        capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
-        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-    }
-    if accounting.rv == 0 && start.out_ptr != 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
-        match read_word(start.out_ptr, layout) {
-            Ok(value) => async_value = value,
-            Err(_) => {
-                capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
-                bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-            }
-        }
-    }
+    // The GetID return facts run in one outlined helper (verified once,
+    // not at every inlined return site); the entry default stays unless
+    // a successful read overwrites it.
+    capture_flags |= async_get_id_fact(
+        start.out_ptr,
+        accounting.rv,
+        semantics.lifecycle,
+        layout,
+        &mut async_value,
+    );
 
     ReturnEventFacts {
         ts_ns: accounting.now,

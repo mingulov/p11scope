@@ -17,7 +17,7 @@ use p11scope_ebpf_common::object_wire::{
     ObjectCallWire, ObjectDescriptorWire, ObjectStart, publish_object_descriptors,
 };
 use p11scope_ebpf_common::{
-    ARG_NONE, CallStart, EventRecord, LinuxLayout, MAX_DESCRIPTORS, StartKey, capture,
+    ARG_NONE, CallStart, EventRecord, FnReader, LinuxLayout, MAX_DESCRIPTORS, StartKey, capture,
 };
 use std::{cell::Cell, ffi::CStr, process::Command};
 
@@ -332,14 +332,14 @@ fn completed(
             facts.capture_flags & capture::MECHANISM_MASK,
             facts.mechanism,
             gate,
-            |_| {
+            FnReader(|_, _| {
                 reads.set(reads.get() + 1);
                 Ok(if layout == LinuxLayout::Ilp32 {
                     0x8000_1234
                 } else {
                     0x1_8000_1234
                 })
-            },
+            }),
         );
         let side = unsafe { &*(bridge.row)(1).cast::<ObjectStart>() };
         let tail = unsafe { &mut (*record).payload.object };
@@ -353,10 +353,10 @@ fn completed(
                     Some(row),
                     facts.rv,
                     gate,
-                    |_| {
+                    FnReader(|_, _| {
                         reads.set(reads.get() + 1);
                         Ok(0)
-                    },
+                    }),
                 )
             }
             && unsafe {
@@ -367,10 +367,10 @@ fn completed(
                     Some(row),
                     facts.rv,
                     gate,
-                    |_| {
+                    FnReader(|_, _| {
                         reads.set(reads.get() + 1);
                         Ok(0)
-                    },
+                    }),
                     |_, _| {
                         reads.set(reads.get() + 1);
                         Ok(())

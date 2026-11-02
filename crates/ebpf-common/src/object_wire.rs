@@ -659,6 +659,11 @@ pub fn validate_start_marker(
 /// an address outside the target word range refuses. Arguments 8/9 have no
 /// reader: this helper takes no index, and the ordinary reader still
 /// refuses them.
+///
+/// Always inlined: a 16-byte `Option` return must never cross a BPF
+/// subprogram boundary (the 7.4 verifier rejects the caller-stack
+/// out-pointer in R2). The `subprog_return_shape` test enforces this.
+#[inline(always)]
 pub fn object_result_arg7_address(
     descriptor: &ObjectDescriptorWire,
     stack_pointer: u64,

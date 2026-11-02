@@ -36,12 +36,12 @@
 # libp11-kit-dev (a real pkcs11.h), python3, sudo, flock (util-linux),
 # time (GNU time for the sibling system script; harmless here).
 #
-# Scope note: flag-off-s1 runs under --pid, not --system. The --s1 oracle
-# path requires a pid-scoped document with exactly one callers/modules/
-# edges/instances/semantic_edges row each; a --system document carries
-# every scanned process and can never satisfy that singleton shape, on
-# any host. The workload is the same fixture; only the scope follows the
-# oracle's contract.
+# Scope note: flag-off-s1 and off-build-refusal run under --pid, not
+# --system. The --s1 oracle path requires a pid-scoped document with
+# exactly one callers/modules/edges/instances/semantic_edges row each;
+# a --system document carries every scanned process and can never
+# satisfy that singleton shape, on any host. The workload is the same
+# fixture; only the scope follows the oracle's contract.
 #
 # Self-test-only knobs (production runs leave them unset): KEYOPS_SELFTEST_*
 # (fixture/gated binaries, oracle paths, discover stub, scenario control).
@@ -242,7 +242,9 @@ fi
 export P11SCOPE_KEY_FIXTURE_PIN=1234
 export P11SCOPE_KEY_FIXTURE_TIMEOUT_MS=$FIXTURE_ALARM_MS
 
-SUDO="sudo -n"
+# The root observer must see the disposable token: stock sudoers
+# scrubs SOFTHSM2_CONF, so preserve it like the bench script does.
+SUDO="sudo -n --preserve-env=SOFTHSM2_CONF"
 [ "$SELFTEST" = 1 ] && SUDO=""
 
 # wait_for_line FILE PREFIX TIMEOUT_S: the linked-ready signal is the
@@ -455,6 +457,23 @@ flow_reason() {
     echo "${reason:-no diagnostic captured}"
 }
 
+# refused_exit: true iff the flow's observer is already dead with a
+# nonzero exit (a refused start, R-58). Never waits on a live
+# observer: a still-running observer is not a refusal. Reaps the dead
+# observer so the next cell's reap starts clean.
+refused_exit() {
+    [ -n "$OBSERVER_PID" ] || return 1
+    if kill -0 "$OBSERVER_PID" 2>/dev/null; then
+        return 1
+    fi
+    if wait "$OBSERVER_PID" 2>/dev/null; then
+        OBSERVER_PID=
+        return 1
+    fi
+    OBSERVER_PID=
+    return 0
+}
+
 # run_no_manifest_cell: the flag without --manifest. No fixture, no seal
 # wait: without a manifest there is no Detailed Session and no semantic
 # lane at all, so the seal line can never come. A startup refusal exits
@@ -522,16 +541,29 @@ run_no_manifest_cell() {
     return 0
 }
 
-# run_off_build_cell: the flag on the P11SCOPE_OFF build. Sets OFF_MODE
-# (accept|refuse) and OFF_EXIT. Returns 1 on flow failure.
+# run_off_build_cell: the flag on the P11SCOPE_OFF build. Runs under
+# --pid like flag-off-s1, so the accept branch's --s1 gate can qualify
+# (a --system document can never satisfy the singleton shape). Sets
+# OFF_MODE (accept|refuse) and OFF_EXIT. Returns 1 on flow failure.
 run_off_build_cell() {
     CELLDIR=$WORK/off-build-refusal
     reap_leftovers
     mkdir -p "$CELLDIR" && chmod 0700 "$CELLDIR" || die "cell dir $CELLDIR"
     start_seed "$CELLDIR" || die "seed failed"
     rm -f "$CELLDIR/gofile" "$CELLDIR/donefile" "$CELLDIR/stopfile"
+    python3 -I "$DRIVER" "$FIXTURE" "$PROVIDER" "$CELLDIR/ledger.jsonl" \
+        "$CELLDIR/gofile" "$CELLDIR/donefile" "$CELLDIR/stopfile" \
+        "$FIXTURE_TIMEOUT_S" > "$CELLDIR/driver.log" 2> "$CELLDIR/driver.stderr" &
+    DRIVER_PID=$!
+    end=$(( $(date +%s) + 60 ))
+    while ! grep -q "^pid=" "$CELLDIR/driver.log" 2>/dev/null; do
+        kill -0 "$DRIVER_PID" 2>/dev/null || { echo "driver died" >&2; return 1; }
+        [ "$(date +%s)" -lt "$end" ] || { echo "driver never spawned" >&2; return 1; }
+        sleep 0.1
+    done
+    fixture_pid=$(sed -n 's/^pid=//p' "$CELLDIR/driver.log" | head -n 1)
     # shellcheck disable=SC2086
-    $SUDO python3 -I "$SIGNAL_EXEC" "$P11SCOPE_OFF" inventory --system --capture native \
+    $SUDO python3 -I "$SIGNAL_EXEC" "$P11SCOPE_OFF" inventory --pid "$fixture_pid" --capture native \
         --key-operations --manifest "$MANIFEST" --duration "$DURATION" \
         -o "$CELLDIR/out.json" \
         > "$CELLDIR/observer.log" 2> "$CELLDIR/observer.stderr" &
@@ -541,11 +573,6 @@ run_off_build_cell() {
         OFF_MODE=accept
         wait_for_line "$CELLDIR/observer.stderr" "$SEAL_LINE" 120 || return 1
         sleep "$SETTLE_S"
-        python3 -I "$DRIVER" "$FIXTURE" "$PROVIDER" "$CELLDIR/ledger.jsonl" \
-            "$CELLDIR/gofile" "$CELLDIR/donefile" "$CELLDIR/stopfile" \
-            "$FIXTURE_TIMEOUT_S" > "$CELLDIR/driver.log" 2> "$CELLDIR/driver.stderr" &
-        DRIVER_PID=$!
-        sleep 2
         sync_and_release "$CELLDIR" || return 1
         stop_observer || return 1
         OFF_EXIT=$OBSERVER_STOP_EXIT
@@ -565,6 +592,9 @@ run_off_build_cell() {
         OFF_EXIT=0
         wait "$OBSERVER_PID" 2>/dev/null || OFF_EXIT=$?
         OBSERVER_PID=
+        [ -z "$DRIVER_PID" ] || kill -TERM "$DRIVER_PID" 2>/dev/null || true
+        [ -z "$DRIVER_PID" ] || wait "$DRIVER_PID" 2>/dev/null || true
+        DRIVER_PID=
         stop_seed
         copy_evidence "$CELLDIR" observer.stderr || die "evidence copy failed"
         mv "$OUTDIR/observer.stderr" "$OUTDIR/off-build-observer.stderr" || die "evidence rename failed"
@@ -591,32 +621,47 @@ if run_linked_flow "$CELLDIR" "$P11SCOPE" --system --capture native \
     mv "$OUTDIR/admit-sync.txt" "$OUTDIR/linked-system-admit-sync.txt" || die "evidence rename failed"
     if python3 -I "$LEDGER_CHECK" "$OUTDIR/linked-system-ledger.jsonl" \
             > "$OUTDIR/linked-system-ledger-check.log" 2>&1; then
-        oo_line=$(python3 -I "$CHECKS" oo "$OUTDIR/linked-system.json")
-        oo_status=${oo_line%% *}; oo_status=${oo_status#status=}
-        oo_reason=${oo_line#*reason=}
-        if [ "$oo_status" = "populated" ] || [ "$oo_status" = "available" ]; then
-            if python3 -I "$QUALIFY" "$OUTDIR/linked-system-ledger.jsonl" \
-                    "$OUTDIR/linked-system.json" \
-                    > "$OUTDIR/linked-system-oracle.log" 2>&1; then
-                row linked-system 1 qualified \
-                    "oracle compare passed on observer exit $OBSERVER_EXIT"
-            else
-                cp "$OUTDIR/linked-system.json" "$OUTDIR/linked-sample.json" || die "sample copy failed"
-                oracle_text=$(tail -n 5 "$OUTDIR/linked-system-oracle.log" | tr '\n' ';')
-                row linked-system 1 expected-failure \
-                    "OPEN-6: oracle refused the populated linked shape: $oracle_text (sample: linked-sample.json)"
-            fi
+        if ! oo_line=$(python3 -I "$CHECKS" oo "$OUTDIR/linked-system.json"); then
+            row linked-system 0 failed \
+                "observer report missing or unparsable on exit $OBSERVER_EXIT"
+            FAILURES=$((FAILURES + 1))
         else
-            if python3 -I "$QUALIFY" "$OUTDIR/linked-system-ledger.jsonl" \
-                    "$OUTDIR/linked-system.json" \
-                    > "$OUTDIR/linked-system-oracle.log" 2>&1; then
-                oracle_text=" oracle unexpectedly passed on $oo_status"
+            oo_status=${oo_line%% *}; oo_status=${oo_status#status=}
+            oo_reason=${oo_line#*reason=}
+            if [ "$OBSERVER_EXIT" -ne 0 ]; then
+                row linked-system 0 failed \
+                    "observer exit $OBSERVER_EXIT with object_observations $oo_status ($oo_reason): not the pinned signature (exit 0)"
+                FAILURES=$((FAILURES + 1))
+            elif [ "$oo_status" = "populated" ]; then
+                if python3 -I "$QUALIFY" "$OUTDIR/linked-system-ledger.jsonl" \
+                        "$OUTDIR/linked-system.json" \
+                        > "$OUTDIR/linked-system-oracle.log" 2>&1; then
+                    row linked-system 1 qualified \
+                        "oracle compare passed on observer exit $OBSERVER_EXIT"
+                else
+                    cp "$OUTDIR/linked-system.json" "$OUTDIR/linked-sample.json" || die "sample copy failed"
+                    oracle_text=$(tail -n 5 "$OUTDIR/linked-system-oracle.log" | tr '\n' ';')
+                    row linked-system 1 expected-failure \
+                        "OPEN-6: oracle refused the populated linked shape: $oracle_text (sample: linked-sample.json)"
+                fi
+            elif [ "$oo_status" = "unavailable" ] && [ "$oo_reason" = "journal_unavailable" ]; then
+                if python3 -I "$QUALIFY" "$OUTDIR/linked-system-ledger.jsonl" \
+                        "$OUTDIR/linked-system.json" \
+                        > "$OUTDIR/linked-system-oracle.log" 2>&1; then
+                    row linked-system 0 failed \
+                        "oracle unexpectedly passed on unavailable (journal_unavailable); the pinned refusal went stale"
+                    FAILURES=$((FAILURES + 1))
+                else
+                    oracle_text=" oracle: $(tail -n 3 "$OUTDIR/linked-system-oracle.log" | tr '\n' ';')"
+                    cp "$OUTDIR/linked-system.json" "$OUTDIR/linked-sample.json" || die "sample copy failed"
+                    row linked-system 1 expected-failure \
+                        "product: object_observations unavailable (journal_unavailable) on exit $OBSERVER_EXIT;$oracle_text (sample: linked-sample.json)"
+                fi
             else
-                oracle_text=" oracle: $(tail -n 3 "$OUTDIR/linked-system-oracle.log" | tr '\n' ';')"
+                row linked-system 0 failed \
+                    "object_observations $oo_status ($oo_reason) on exit $OBSERVER_EXIT: not the pinned signature (exit 0 + unavailable journal_unavailable, or a populated oracle refusal)"
+                FAILURES=$((FAILURES + 1))
             fi
-            cp "$OUTDIR/linked-system.json" "$OUTDIR/linked-sample.json" || die "sample copy failed"
-            row linked-system 1 expected-failure \
-                "product: object_observations $oo_status ($oo_reason) on exit $OBSERVER_EXIT;$oracle_text (sample: linked-sample.json)"
         fi
     else
         row linked-system 0 failed "application ledger failed validation"
@@ -625,7 +670,8 @@ if run_linked_flow "$CELLDIR" "$P11SCOPE" --system --capture native \
 else
     collect_failure_evidence "$CELLDIR" linked-system
     if grep -q "journal-pair-unavailable-in-build" \
-            "$OUTDIR/linked-system-observer.stderr" 2>/dev/null; then
+            "$OUTDIR/linked-system-observer.stderr" 2>/dev/null \
+        && [ ! -f "$CELLDIR/out.json" ] && refused_exit; then
         row linked-system 1 expected-failure \
             "flag refused at start on this build: journal-pair-unavailable-in-build (R-58; the linked comparison is unproven here)"
     else
@@ -650,30 +696,39 @@ if run_linked_flow "$CELLDIR" "$P11SCOPE" --pid-from-driver --capture native \
     mv "$OUTDIR/observer.stderr" "$OUTDIR/linked-pid-observer.stderr" || die "evidence rename failed"
     mv "$OUTDIR/driver.log" "$OUTDIR/linked-pid-driver.log" || die "evidence rename failed"
     mv "$OUTDIR/admit-sync.txt" "$OUTDIR/linked-pid-admit-sync.txt" || die "evidence rename failed"
-    oo_line=$(python3 -I "$CHECKS" oo "$OUTDIR/linked-pid.json")
-    oo_status=${oo_line%% *}; oo_status=${oo_status#status=}
-    oo_reason=${oo_line#*reason=}
-    if [ "$oo_status" = "populated" ] || [ "$oo_status" = "available" ]; then
-        if python3 -I "$QUALIFY" "$OUTDIR/linked-pid-ledger.jsonl" \
-                "$OUTDIR/linked-pid.json" \
-                > "$OUTDIR/linked-pid-oracle.log" 2>&1; then
-            row linked-pid 1 qualified \
-                "post-closure exec observed under --pid; oracle compare passed"
-        else
-            oracle_text=$(tail -n 5 "$OUTDIR/linked-pid-oracle.log" | tr '\n' ';')
-            row linked-pid 1 expected-failure \
-                "post-closure exec observed under --pid but oracle refused: $oracle_text"
-        fi
+    if ! oo_line=$(python3 -I "$CHECKS" oo "$OUTDIR/linked-pid.json"); then
+        row linked-pid 0 failed "observer report missing or unparsable"
+        FAILURES=$((FAILURES + 1))
     else
-        # The only namable pid exec'd before the seal: PID scope pins an
-        # existing process, so no post-closure birth is observable there.
-        row linked-pid 0 nonqualifying \
-            "object_observations $oo_status ($oo_reason): the named pid exec'd before the seal and PID scope pins an existing process, so a post-closure exec is unobservable"
+        oo_status=${oo_line%% *}; oo_status=${oo_status#status=}
+        oo_reason=${oo_line#*reason=}
+        if [ "$oo_status" = "populated" ]; then
+            if python3 -I "$QUALIFY" "$OUTDIR/linked-pid-ledger.jsonl" \
+                    "$OUTDIR/linked-pid.json" \
+                    > "$OUTDIR/linked-pid-oracle.log" 2>&1; then
+                row linked-pid 1 qualified \
+                    "post-closure exec observed under --pid; oracle compare passed"
+            elif [ "$OBSERVER_EXIT" -eq 0 ]; then
+                oracle_text=$(tail -n 5 "$OUTDIR/linked-pid-oracle.log" | tr '\n' ';')
+                row linked-pid 1 expected-failure \
+                    "post-closure exec observed under --pid but oracle refused: $oracle_text"
+            else
+                row linked-pid 0 failed \
+                    "observer exit $OBSERVER_EXIT with a refused populated shape: not the pinned signature (exit 0)"
+                FAILURES=$((FAILURES + 1))
+            fi
+        else
+            # The only namable pid exec'd before the seal: PID scope pins an
+            # existing process, so no post-closure birth is observable there.
+            row linked-pid 0 nonqualifying \
+                "object_observations $oo_status ($oo_reason): the named pid exec'd before the seal and PID scope pins an existing process, so a post-closure exec is unobservable"
+        fi
     fi
 else
     collect_failure_evidence "$CELLDIR" linked-pid
     if grep -q "journal-pair-unavailable-in-build" \
-            "$OUTDIR/linked-pid-observer.stderr" 2>/dev/null; then
+            "$OUTDIR/linked-pid-observer.stderr" 2>/dev/null \
+        && [ ! -f "$CELLDIR/out.json" ] && refused_exit; then
         row linked-pid 1 expected-failure \
             "flag refused at start on this build: journal-pair-unavailable-in-build (R-58; the pid comparison is unproven here)"
     else
@@ -698,20 +753,28 @@ if run_linked_flow "$CELLDIR" "$P11SCOPE" --pid-from-driver --capture native \
     mv "$OUTDIR/observer.stderr" "$OUTDIR/flag-off-s1-observer.stderr" || die "evidence rename failed"
     mv "$OUTDIR/driver.log" "$OUTDIR/flag-off-s1-driver.log" || die "evidence rename failed"
     mv "$OUTDIR/admit-sync.txt" "$OUTDIR/flag-off-s1-admit-sync.txt" || die "evidence rename failed"
-    oo_line=$(python3 -I "$CHECKS" oo "$OUTDIR/flag-off-s1.json")
-    oo_status=${oo_line%% *}; oo_status=${oo_status#status=}
-    oo_reason=${oo_line#*reason=}
-    if [ "$oo_status" = "unavailable" ] && [ -n "$oo_reason" ]; then
-        if python3 -I "$QUALIFY" --s1 "$OUTDIR/flag-off-s1-ledger.jsonl" \
-                "$OUTDIR/flag-off-s1.json" \
-                > "$OUTDIR/flag-off-s1-oracle.log" 2>&1; then
-            row flag-off-s1 1 qualified \
-                "--s1 compare passed; object_observations unavailable ($oo_reason)"
-        else
-            oracle_text=$(tail -n 5 "$OUTDIR/flag-off-s1-oracle.log" | tr '\n' ';')
-            case "$oracle_text" in
-                *"S1 child API returns are not exactly 65 current observations"*)
-                    observed=$(python3 -I -c '
+    if ! oo_line=$(python3 -I "$CHECKS" oo "$OUTDIR/flag-off-s1.json"); then
+        row flag-off-s1 0 failed "observer report missing or unparsable"
+        FAILURES=$((FAILURES + 1))
+    else
+        oo_status=${oo_line%% *}; oo_status=${oo_status#status=}
+        oo_reason=${oo_line#*reason=}
+        if [ "$oo_status" = "unavailable" ] && [ -n "$oo_reason" ]; then
+            if python3 -I "$QUALIFY" --s1 "$OUTDIR/flag-off-s1-ledger.jsonl" \
+                    "$OUTDIR/flag-off-s1.json" \
+                    > "$OUTDIR/flag-off-s1-oracle.log" 2>&1; then
+                row flag-off-s1 1 qualified \
+                    "--s1 compare passed; object_observations unavailable ($oo_reason)"
+            else
+                oracle_text=$(tail -n 5 "$OUTDIR/flag-off-s1-oracle.log" | tr '\n' ';')
+                case "$oracle_text" in
+                    *"S1 child API returns are not exactly 65 current observations"*)
+                        if [ "$OBSERVER_EXIT" -ne 0 ]; then
+                            row flag-off-s1 0 failed \
+                                "observer exit $OBSERVER_EXIT with the S1 drift text: not the pinned signature (exit 0)"
+                            FAILURES=$((FAILURES + 1))
+                        else
+                            observed=$(python3 -I -c '
 import json,sys
 try:
     doc=json.load(open(sys.argv[1]))
@@ -725,20 +788,22 @@ refused=sum(gap["repeats"] for gap in doc.get("gaps", [])
               if type(gap) is dict and gap.get("subject") == "semantic admission refused"
               and type(gap.get("repeats")) is int)
 print("api_returns=%s no_receipt_admission_gaps=%s" % (count, refused))' \
-                        "$OUTDIR/flag-off-s1.json") || observed="report unparsable"
-                    row flag-off-s1 1 expected-failure \
-                        "S1 shape drift (product/oracle adjudication): $observed; oracle pins 65 gated calls (Oct-26) and forbids admission gaps (Oct-28): $oracle_text"
-                    ;;
-                *)
-                    row flag-off-s1 0 failed "--s1 compare failed: $oracle_text"
-                    FAILURES=$((FAILURES + 1))
-                    ;;
-            esac
+                            "$OUTDIR/flag-off-s1.json") || observed="report unparsable"
+                        row flag-off-s1 1 expected-failure \
+                            "S1 shape drift (product/oracle adjudication): $observed; oracle pins 65 gated calls (Oct-26) and forbids admission gaps (Oct-28): $oracle_text"
+                        fi
+                        ;;
+                    *)
+                        row flag-off-s1 0 failed "--s1 compare failed: $oracle_text"
+                        FAILURES=$((FAILURES + 1))
+                        ;;
+                esac
+            fi
+        else
+            row flag-off-s1 0 failed \
+                "object_observations reads $oo_status ($oo_reason), want unavailable with a finite reason"
+            FAILURES=$((FAILURES + 1))
         fi
-    else
-        row flag-off-s1 0 failed \
-            "object_observations reads $oo_status ($oo_reason), want unavailable with a finite reason"
-        FAILURES=$((FAILURES + 1))
     fi
 else
     collect_failure_evidence "$CELLDIR" flag-off-s1
@@ -853,30 +918,34 @@ else
                     ;;
             esac
         else
-            oo_line=$(python3 -I "$CHECKS" oo "$OUTDIR/off-build.json")
-        oo_status=${oo_line%% *}; oo_status=${oo_status#status=}
-        oo_reason=${oo_line#*reason=}
-        stderr_text=$(cat "$OUTDIR/off-build-observer.stderr")
-        case "$stderr_text" in
-            *journal-pair-unavailable-in-build*)
-                if [ "$OFF_EXIT" -eq 0 ] && [ "$oo_status" = "unavailable" ] && [ -n "$oo_reason" ] \
-                    && python3 -I "$QUALIFY" --s1 "$OUTDIR/off-build-ledger.jsonl" \
-                        "$OUTDIR/off-build.json" \
-                        > "$OUTDIR/off-build-oracle.log" 2>&1; then
-                    row off-build-refusal 1 qualified \
-                        "finite journal-pair-unavailable-in-build disclosure with a completed S1 capture (exit $OFF_EXIT)"
-                else
-                    row off-build-refusal 0 failed \
-                        "disclosure present but no completed S1 capture: exit $OFF_EXIT, object_observations $oo_status ($oo_reason)"
-                    FAILURES=$((FAILURES + 1))
-                fi
-                ;;
-            *)
-                row off-build-refusal 0 failed \
-                    "no journal-pair-unavailable-in-build disclosure on exit $OFF_EXIT"
+            if ! oo_line=$(python3 -I "$CHECKS" oo "$OUTDIR/off-build.json"); then
+                row off-build-refusal 0 failed "observer report missing or unparsable"
                 FAILURES=$((FAILURES + 1))
-                ;;
-        esac
+            else
+                oo_status=${oo_line%% *}; oo_status=${oo_status#status=}
+                oo_reason=${oo_line#*reason=}
+                stderr_text=$(cat "$OUTDIR/off-build-observer.stderr")
+                case "$stderr_text" in
+                    *journal-pair-unavailable-in-build*)
+                        if [ "$OFF_EXIT" -eq 0 ] && [ "$oo_status" = "unavailable" ] && [ -n "$oo_reason" ] \
+                            && python3 -I "$QUALIFY" --s1 "$OUTDIR/off-build-ledger.jsonl" \
+                                "$OUTDIR/off-build.json" \
+                                > "$OUTDIR/off-build-oracle.log" 2>&1; then
+                            row off-build-refusal 1 qualified \
+                                "finite journal-pair-unavailable-in-build disclosure with a completed S1 capture (exit $OFF_EXIT)"
+                        else
+                            row off-build-refusal 0 failed \
+                                "disclosure present but no completed S1 capture: exit $OFF_EXIT, object_observations $oo_status ($oo_reason)"
+                            FAILURES=$((FAILURES + 1))
+                        fi
+                        ;;
+                    *)
+                        row off-build-refusal 0 failed \
+                            "no journal-pair-unavailable-in-build disclosure on exit $OFF_EXIT"
+                        FAILURES=$((FAILURES + 1))
+                        ;;
+                esac
+            fi
         fi
     else
         collect_failure_evidence "$CELLDIR" off-build

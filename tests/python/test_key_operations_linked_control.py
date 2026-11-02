@@ -41,7 +41,8 @@ def _restore_int_quit():
 FAKE_OBSERVER = """#!/usr/bin/env python3
 # Fake observer: seal line on stderr, canned doc on -o, SIGINT-stop.
 # KEYOPS_SELFTEST_SCENARIO: populated | unavailable | unavailable-empty |
-# accept-with-token | refuse-CODE:MESSAGE | die-at-3 | exit-0-silent
+# unavailable-bootstrap | garbage-doc | accept-with-token |
+# refuse-CODE:MESSAGE | die-at-3 | exit-0-silent
 # Python (not shell): an async-launched bourne shell cannot trap SIGINT
 # back from the inherited ignore, while sigaction always can.
 import os
@@ -72,12 +73,16 @@ sys.stderr.write("p11scope: semantic lane ready; mechanisms and API results are 
                  " from now on (key operations: planned for 0.6.0)\\n")
 sys.stderr.flush()
 DOCS = {"populated": ("populated", "rev 1"),
-        "unavailable-empty": ("unavailable", "")}
+        "unavailable-empty": ("unavailable", ""),
+        "unavailable-bootstrap": ("unavailable", "bootstrap_unavailable")}
 status, reason = DOCS.get(scenario, ("unavailable", "journal_unavailable"))
 
 
 def write_doc():
     with open(out, "w", encoding="utf-8") as handle:
+        if scenario == "garbage-doc":
+            handle.write("NOT JSON{{{\\n")
+            return
         handle.write('{"object_observations": {"status": "%s", "reason": "%s"},\\n'
                      ' "observation": {"lifecycle": {"ring_loss": 0}}, "gaps": []}\\n'
                      % (status, reason))
@@ -267,6 +272,69 @@ class LinkedControlTests(unittest.TestCase):
                          (False, "nonqualifying"))
         self.assertIn("before the seal", pid_row["detail"])
 
+    def test_corrupt_observer_doc_is_failed_row(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "garbage-doc"})
+        self.assertEqual(proc.returncode, 1)
+        row = rows["linked-system"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("missing or unparsable", row["detail"])
+        # The harness records the row and continues: later cells run.
+        self.assertEqual(set(rows), {"linked-system", "linked-pid",
+                                    "flag-off-s1", "flag-without-manifest",
+                                    "off-build-refusal"})
+
+    def test_bootstrap_reason_is_not_the_pinned_signature(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "unavailable-bootstrap"})
+        self.assertEqual(proc.returncode, 1)
+        row = rows["linked-system"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("not the pinned signature", row["detail"])
+        self.assertIn("bootstrap_unavailable", row["detail"])
+
+    def test_nonzero_exit_is_not_the_pinned_signature(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "unavailable"},
+            extra_env={"FAKE_OBS_EXIT": "1",
+                       "FAKE_S1_EXIT": "1",
+                       "FAKE_S1_TEXT": ("S1 child API returns are not exactly"
+                                        " 65 current observations")})
+        self.assertEqual(proc.returncode, 1)
+        row = rows["linked-system"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("not the pinned signature", row["detail"])
+        s1_row = rows["flag-off-s1"]
+        self.assertEqual((s1_row["pass"], s1_row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("not the pinned signature", s1_row["detail"])
+
+    def test_oracle_pass_on_unavailable_is_stale(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "unavailable"})
+        self.assertEqual(proc.returncode, 1)
+        row = rows["linked-system"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("went stale", row["detail"])
+
+    def test_refused_start_with_exit_zero_fails(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": ("refuse-0:p11scope: "
+                              "journal-pair-unavailable-in-build: off")})
+        self.assertEqual(proc.returncode, 1)
+        row = rows["linked-system"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("flow failed", row["detail"])
+
+    def test_sudo_preserves_token_conf(self):
+        text = SCRIPT.read_text()
+        self.assertIn('SUDO="sudo -n --preserve-env=SOFTHSM2_CONF"', text)
+
     def test_s1_failure_fails(self):
         proc, outdir, rows = self.run_script(
             {}, extra_env={"FAKE_S1_EXIT": "1",
@@ -280,7 +348,10 @@ class LinkedControlTests(unittest.TestCase):
         proc, outdir, rows = self.run_script(
             {}, extra_env={"FAKE_S1_EXIT": "1",
                            "FAKE_S1_TEXT": ("S1 child API returns are not exactly"
-                                            " 65 current observations")})
+                                            " 65 current observations"),
+                           "FAKE_EXIT": "1",
+                           "FAKE_TEXT": ("observer status unavailable with "
+                                         "reason journal_unavailable")})
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         row = rows["flag-off-s1"]
         self.assertEqual((row["pass"], row["qualification"]),
@@ -291,7 +362,10 @@ class LinkedControlTests(unittest.TestCase):
     def test_no_manifest_refusal_and_off_nonqualifying(self):
         proc, outdir, rows = self.run_script(
             {"flag-without-manifest": "refuse-2:p11scope: need a manifest"},
-            with_off=False)
+            with_off=False,
+            extra_env={"FAKE_EXIT": "1",
+                       "FAKE_TEXT": ("observer status unavailable with "
+                                     "reason journal_unavailable")})
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         row = rows["flag-without-manifest"]
         self.assertEqual((row["pass"], row["qualification"]), (True, "qualified"))
@@ -303,7 +377,10 @@ class LinkedControlTests(unittest.TestCase):
 
     def test_off_build_accepted_s1(self):
         proc, outdir, rows = self.run_script(
-            {"off-build-refusal": "accept-with-token"})
+            {"off-build-refusal": "accept-with-token"},
+            extra_env={"FAKE_EXIT": "1",
+                       "FAKE_TEXT": ("observer status unavailable with "
+                                     "reason journal_unavailable")})
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         row = rows["off-build-refusal"]
         self.assertEqual((row["pass"], row["qualification"]), (True, "qualified"))

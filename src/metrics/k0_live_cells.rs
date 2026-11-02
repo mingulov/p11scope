@@ -652,6 +652,8 @@ fn spawn_run_observer(
             "C_Sign",
             "--module",
             module,
+            "--prearm-module",
+            module,
             "--duration",
             &duration_secs.to_string(),
             "-o",
@@ -695,8 +697,23 @@ fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<
     // Four main-phase iterations, one clean C_Sign each; setup and
     // teardown never call C_Sign, so the window count is exactly 4.
     // The owned child maps its provider after the observer attaches,
-    // so the observer pre-arms the name with --module; the child's own
-    // startup exec precedes the window and must not void it.
+    // so the observer pre-arms the file with --prearm-module (and
+    // narrows with --module); the child's own startup exec precedes
+    // the window and must not void it.
+    // The owned child drops to the invoking user when the observer
+    // runs as root via sudo; hand the workload tree to that user so
+    // the child can read its ledger, config and token.
+    if let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
+        let status = std::process::Command::new("chown")
+            .args([
+                "-R",
+                &format!("{uid}:{gid}"),
+                workload.dir.path().to_str().context("workload path")?,
+            ])
+            .status()
+            .context("chown workload to invoking user")?;
+        ensure!(status.success(), "chown workload to {uid}:{gid}");
+    }
     let mut child = spawn_run_observer(
         observer,
         module,

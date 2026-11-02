@@ -22716,6 +22716,61 @@ fn incomplete_rescan_preserves_double_load_detection() {
     }
 }
 
+#[test]
+fn incomplete_rescan_unions_the_extension_proof() {
+    // The documented merge window: `merge_scanned_module` unions
+    // `extension_impossible` like the other monotonic observation flags. A
+    // later full-extent decode whose first failure refutes nothing (an
+    // equal 68-slot prefix failing at 92..103) cannot clear an earlier
+    // proof; only a complete rescan — which rebuilds the view's modules
+    // outright — replaces it. This needs a writable table and lasts until
+    // that rescan.
+    let module = |extension_impossible| ScannedModule {
+        mapped_identity: None,
+        double_loaded: false,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        decoder_abi: None,
+        exports: vec![],
+        tables: vec![ScannedTable {
+            version: (3, 2),
+            walk: "known_prefix",
+            entries: vec![],
+            null_entries: vec![],
+            unpinned: vec![],
+            address: 0x1000,
+            file_offset: Some(0),
+            live_return: false,
+            manifest_supported: false,
+            extension_impossible,
+        }],
+        interfaces: vec![],
+    };
+    for (retained, incoming, expected) in [
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+        (false, false, false),
+    ] {
+        let mut merged = vec![module(retained)];
+        merge_scanned_module(&mut merged, module(incoming));
+        assert_eq!(merged.len(), 1, "same module unions, not twins");
+        assert_eq!(merged[0].tables.len(), 1, "equal tables union, not twins");
+        assert_eq!(
+            merged[0].tables[0].extension_impossible, expected,
+            "retained={retained} incoming={incoming}"
+        );
+    }
+}
+
 /// Actual file-backed tables keep the fresh read and every carried word honest.
 fn self_export_table_address(index: usize) -> u64 {
     use std::sync::{
@@ -50597,6 +50652,15 @@ fn assert_scanned_module_copy_is_exact(copy: &ScannedModule, source: &ScannedMod
     }
     assert_eq!(copy.tables.capacity(), copy.tables.len());
     for (copied, original) in copy.tables.iter().zip(source.tables.iter()) {
+        // `PartialEq` ignores the monotonic observation flags (unioned by
+        // `merge_scanned_module`, not identity), so a dropped flag copy
+        // would pass the equality above: compare them explicitly.
+        assert_eq!(copied.live_return, original.live_return);
+        assert_eq!(copied.manifest_supported, original.manifest_supported);
+        assert_eq!(
+            copied.extension_impossible, original.extension_impossible,
+            "the copy must carry the extension proof flag"
+        );
         assert_eq!(copied.entries.capacity(), copied.entries.len());
         assert_eq!(copied.null_entries.capacity(), copied.null_entries.len());
         assert_eq!(copied.unpinned.capacity(), copied.unpinned.len());
@@ -50672,6 +50736,11 @@ fn scanned_module_copy_is_exact() {
             extension_impossible: false,
         });
     }
+    // The explicit flag comparison needs set flags to bite: both tables
+    // below (this one and its `wide` clone) carry every observation flag.
+    source.tables[0].live_return = true;
+    source.tables[0].manifest_supported = true;
+    source.tables[0].extension_impossible = true;
     let mut wide = source.tables[0].clone();
     wide.entries.push(ScannedEntry {
         name: "extra-entry",

@@ -13,7 +13,9 @@
 
 use super::{CaptureWorkBudget, ScanLimits, ScanRequest, scan_pid};
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::identity::{pin_scanned_objects, reconcile_scanned_modules};
+use crate::discovery::identity::{
+    PinnedObjects, ReconciledModule, pin_scanned_objects, reconcile_scanned_modules,
+};
 use crate::discovery::test_subject::OwnedMapper;
 use crate::plan::{AttachPlan, build_from_reconciled_modules};
 use p11scope_ebpf_common::SlotSemantics;
@@ -38,6 +40,10 @@ enum Variant {
     /// the table holds the resolver addresses — exactly the `st_value` of
     /// each IFUNC symbol. A resolver is not the function.
     IfuncResolvers,
+    /// Like `Agreeing`, plus a 3.x interface getter exported as an IFUNC:
+    /// no definition in the witness, but the presence bit must survive
+    /// the pin → bind chain.
+    IfuncGetter,
 }
 
 fn legacy_names() -> Vec<&'static str> {
@@ -86,6 +92,13 @@ fn source(variant: Variant) -> String {
          {{ 2, 40, {{ {} }} }};\n",
         entries.join(", ")
     ));
+    if matches!(variant, Variant::IfuncGetter) {
+        c.push_str(
+            "static unsigned long get_interface_impl(void) { return 0; }\n\
+             static void *get_interface_resolver(void) { return (void *)get_interface_impl; }\n\
+             unsigned long C_GetInterface(void) __attribute__((ifunc(\"get_interface_resolver\")));\n",
+        );
+    }
     c
 }
 
@@ -170,8 +183,9 @@ impl Loaded {
         }
     }
 
-    /// The production chain over the retained stopped child's memory.
-    fn plan(&self) -> AttachPlan {
+    /// The production scan → pin → reconcile chain over the retained
+    /// stopped child's memory.
+    fn reconciled(&self) -> (Vec<ReconciledModule>, PinnedObjects) {
         let pid = self.subject.pid();
         let hooks = HookRegistry::builtin();
         let hints = [self.path.clone()];
@@ -200,6 +214,12 @@ impl Loaded {
         assert!(skipped.is_empty(), "{skipped:?}");
         let (reconciled, _, lost) = reconcile_scanned_modules(&modules, &mut pinned);
         assert!(lost.is_empty(), "{lost:?}");
+        (reconciled, pinned)
+    }
+
+    /// The production chain over the retained stopped child's memory.
+    fn plan(&self) -> AttachPlan {
+        let (reconciled, _) = self.reconciled();
         build_from_reconciled_modules(&reconciled)
     }
 
@@ -459,6 +479,39 @@ fn ifunc_resolver_addresses_never_corroborate_a_table() {
         assert_eq!(slot.names, ["unknown"], "{slot:?}");
     }
     assert_count_only(&plan);
+}
+
+/// The witness flags ride the production pin → bind chain: the compiled
+/// fixture exports its 3.x getter as an IFUNC (no definition in the
+/// witness), yet the pinned entry and the bound module both record the
+/// presence bit. Stubbing `export_witness_flags_for` to `(false, false)`
+/// turns this red.
+#[test]
+fn an_ifunc_getter_presence_bit_survives_pin_and_bind() {
+    let loaded = Loaded::build(Variant::IfuncGetter);
+    let (reconciled, pinned) = loaded.reconciled();
+    assert_eq!(reconciled.len(), 1);
+    let module = &reconciled[0];
+    assert!(
+        !module
+            .exports
+            .iter()
+            .any(|(name, _)| name == "C_GetInterface"),
+        "an IFUNC getter leaves no definition in the witness"
+    );
+    assert_eq!(
+        pinned.export_witness_flags_for(module.object),
+        (true, false),
+        "the pinned entry records the IFUNC getter presence"
+    );
+    assert!(
+        module.getter_present,
+        "binding carries the pinned presence bit onto the module"
+    );
+    assert!(
+        !module.witness_fault,
+        "a healthy image binds without a witness fault"
+    );
 }
 
 #[test]

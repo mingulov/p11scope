@@ -6339,6 +6339,110 @@ mod tests {
         }
     }
 
+    /// A 3.2-labelled 68-slot prefix the scan proved complete: the full
+    /// declared extent was readable with the first structural failure in
+    /// `68..92`, no 3.x getter is exported, and every retained entry
+    /// agrees with its export. Every surface publisher reports it `full`.
+    fn proven_legacy_module() -> ReconciledModule {
+        use crate::discovery::scan::ScannedEntry;
+
+        let mut module = scanned_with(TEST_OBJECT, "/opt/p11.so", []);
+        module.scanned.tables[0].version = (3, 2);
+        module.scanned.tables[0].walk = "known_prefix";
+        module.scanned.tables[0].entries = (0..68)
+            .map(|ordinal| ScannedEntry {
+                name: pkcs11_module::function_name(ordinal).unwrap(),
+                object: TEST_OBJECT,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x500 + ordinal as u64 * 8,
+            })
+            .collect();
+        module.scanned.tables[0].extension_impossible = true;
+        module.entry_objects = vec![vec![module.object; 68]];
+        module.exports = (0..68)
+            .map(|ordinal| {
+                (
+                    pkcs11_module::function_name(ordinal).unwrap().to_string(),
+                    0x500 + ordinal as u64 * 8,
+                )
+            })
+            .collect();
+        module
+    }
+
+    #[test]
+    fn a_proven_legacy_prefix_is_not_semantically_incomplete() {
+        // The scan proof, the plan surface and semantic completeness agree:
+        // one proven table is `full` everywhere, never refused as an
+        // incomplete provider in one place while reported `full` in another.
+        let module = proven_legacy_module();
+        let plan = build_from_reconciled_modules(std::slice::from_ref(&module));
+        assert_eq!(plan.surfaces.len(), 1);
+        assert_eq!(plan.surfaces[0].walk, "full");
+        let claims =
+            semantic_source_claims(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert!(
+            !claims.incomplete.contains(&module.object),
+            "a proven prefix is semantically complete"
+        );
+    }
+
+    #[test]
+    fn a_proven_legacy_prefix_with_a_getter_or_a_fault_stays_semantically_incomplete() {
+        // The proof's refusals reach semantic completeness too: a getter in
+        // any symbol type, or a faulted exports walk, keeps the module in
+        // `incomplete` exactly as it keeps the surface `known_prefix`.
+        for (getter_present, witness_fault) in [(true, false), (false, true)] {
+            let mut module = proven_legacy_module();
+            module.getter_present = getter_present;
+            module.witness_fault = witness_fault;
+            let plan = build_from_reconciled_modules(std::slice::from_ref(&module));
+            assert_eq!(plan.surfaces[0].walk, "known_prefix");
+            let claims =
+                semantic_source_claims(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+            assert!(
+                claims.incomplete.contains(&module.object),
+                "getter={getter_present} fault={witness_fault} stays incomplete"
+            );
+        }
+    }
+
+    #[test]
+    fn a_proven_prefix_linked_by_an_interface_record_publishes_no_full_walk() {
+        // An interface record linking the table keeps the raw decoder walk
+        // on the table surface too: one table never publishes both `full`
+        // and `known_prefix`.
+        use crate::discovery::scan::ScannedInterface;
+
+        let mut module = proven_legacy_module();
+        module.scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table: Some(0),
+        });
+        let plan = build_from_reconciled_modules(std::slice::from_ref(&module));
+        assert_eq!(plan.surfaces.len(), 2);
+        assert!(
+            plan.surfaces
+                .iter()
+                .all(|surface| surface.walk == "known_prefix"),
+            "no surface publishes full for a linked table: {:?}",
+            plan.surfaces
+                .iter()
+                .map(|surface| &surface.walk)
+                .collect::<Vec<_>>()
+        );
+        let claims =
+            semantic_source_claims(std::slice::from_ref(&module), &[], &PinnedObjects::empty());
+        assert!(
+            claims.incomplete.contains(&module.object),
+            "a linked table stays semantically incomplete"
+        );
+    }
+
     fn pinnable_null_manifest() -> Manifest {
         let path = "/bin/true";
         let file = p11scope_manifest::identity::open_object(std::path::Path::new(path)).unwrap();

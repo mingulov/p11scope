@@ -6247,12 +6247,14 @@ pub(crate) mod tests {
         snapshot
     }
 
-    fn decode_fedora_table(snapshot: &[u8]) -> crate::discovery::scan::ScannedTable {
+    fn decode_table_with_maps(
+        snapshot: &[u8],
+        maps: &[p11scope_manifest::maps::MapEntry],
+    ) -> crate::discovery::scan::ScannedTable {
         use crate::discovery::scan::{CaptureWorkBudget, decode_exact_table};
         use p11scope_manifest::maps::MapIndex;
 
-        let maps = fedora_fixture_maps();
-        let map_index = MapIndex::new(&maps).unwrap();
+        let map_index = MapIndex::new(maps).unwrap();
         decode_exact_table(
             snapshot,
             0x7000,
@@ -6263,6 +6265,39 @@ pub(crate) mod tests {
         )
         .expect("budget must admit the table")
         .expect("the fixture table must decode")
+    }
+
+    fn decode_fedora_table(snapshot: &[u8]) -> crate::discovery::scan::ScannedTable {
+        decode_table_with_maps(snapshot, &fedora_fixture_maps())
+    }
+
+    /// The Fedora shape plus the four first-failure kinds: executable
+    /// anonymous memory, an executable `(deleted)` mapping, writable
+    /// anonymous data, and unmapped space (no range covers `0xdead000`).
+    fn structural_failure_maps() -> Vec<p11scope_manifest::maps::MapEntry> {
+        p11scope_manifest::maps::parse_maps(
+            b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n\
+              4000-5000 rw-p 00001000 08:01 7 /lib/provider.so\n\
+              7000-9000 r--p 00002000 08:01 7 /lib/provider.so\n\
+              a000-b000 r-xp 00000000 00:00 0\n\
+              c000-d000 r-xp 00000000 08:01 7 /lib/provider.so (deleted)\n\
+              e000-f000 rw-p 00000000 00:00 0\n",
+        )
+        .unwrap()
+    }
+
+    fn shaped_snapshot_with_tail(failure: u64) -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 0..69 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for slot in 69..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&failure.to_le_bytes());
+        }
+        snapshot
     }
 
     fn observation_for_decoded_table(
@@ -6502,6 +6537,128 @@ pub(crate) mod tests {
         assert_eq!(
             classes.observation.status, "exact",
             "a failure at 68 proves the prefix complete: {:?}",
+            classes.observation.causes
+        );
+        assert!(
+            classes.observation.causes.is_empty(),
+            "no observation gap: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn extension_failure_into_executable_anonymous_memory_stays_lossy() {
+        // Executable anonymous memory (JIT, trampolines) may hold a real
+        // extension the scanner cannot attach, so the failure refutes
+        // nothing and the prefix stays unproven.
+        let maps = structural_failure_maps();
+        let table = decode_table_with_maps(&shaped_snapshot_with_tail(0xa500), &maps);
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            !table.extension_impossible,
+            "executable anonymous memory is not a structural refutation"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an attachable-but-unusable extension keeps surfaces lossy: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn extension_failure_into_an_executable_deleted_mapping_stays_lossy() {
+        // An executable `(deleted)` mapping may hold real code reached
+        // through a path the scanner cannot use, so the failure refutes
+        // nothing and the prefix stays unproven.
+        let maps = structural_failure_maps();
+        let table = decode_table_with_maps(&shaped_snapshot_with_tail(0xc500), &maps);
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            !table.extension_impossible,
+            "an executable unusable path is not a structural refutation"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an attachable-but-unusable extension keeps surfaces lossy: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn extension_failure_into_writable_anonymous_data_is_exact() {
+        // Anonymous memory without execute permission cannot hold the
+        // extension, so the failure refutes the wider layouts.
+        let maps = structural_failure_maps();
+        let table = decode_table_with_maps(&shaped_snapshot_with_tail(0xe500), &maps);
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            table.extension_impossible,
+            "non-executable anonymous memory refutes the wider layouts"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "full",
+            false,
+            false,
+        );
+        assert_eq!(
+            classes.observation.status, "exact",
+            "a structural failure proves the prefix complete: {:?}",
+            classes.observation.causes
+        );
+        assert!(
+            classes.observation.causes.is_empty(),
+            "no observation gap: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn extension_failure_into_unmapped_space_is_exact() {
+        // A slot pointing nowhere cannot be a function, so the failure
+        // refutes the wider layouts.
+        let maps = structural_failure_maps();
+        let table = decode_table_with_maps(&shaped_snapshot_with_tail(0xdead000), &maps);
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            table.extension_impossible,
+            "unmapped space refutes the wider layouts"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "full",
+            false,
+            false,
+        );
+        assert_eq!(
+            classes.observation.status, "exact",
+            "a structural failure proves the prefix complete: {:?}",
             classes.observation.causes
         );
         assert!(

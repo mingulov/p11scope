@@ -783,6 +783,21 @@ fn loader_ticket_harness_bank_guard_before_zero_cell() {
     drive_tickets("guard-before-zero-cell", &["ASSERT guard_before_zero_cell"]);
 }
 
+/// W2 publication twin: gate-1 issuance without the published select
+/// word refuses BAD_CONFIG and spends nothing; the exact pinned
+/// image issues ticket 1.
+#[test]
+fn loader_ticket_harness_select_publication_issues() {
+    drive_tickets(
+        "select-publication-issues",
+        &[
+            "ASSERT unpublished_select_word_refuses_bad_config",
+            "ASSERT pinned_select_image_exact",
+            "ASSERT published_select_word_issues_ticket",
+        ],
+    );
+}
+
 /// Selection validation: unpublished, corrupt or missing SELECT
 /// refuses new issues; cut validates its target and prepared bit.
 #[test]

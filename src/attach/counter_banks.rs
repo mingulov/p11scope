@@ -10750,6 +10750,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// C1 live twin: the doctor counter preflight loads every counter
+    /// object through the production Session preparation. Gate-1 builds
+    /// once refused all three here (the build-wide gate flag applied to
+    /// gate-free counter objects) while doctor reported them available.
+    #[test]
+    #[ignore = "privileged: counter preflight loads every counter object through Session preparation"]
+    fn counter_object_preflight_loads_all_modes() {
+        assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            super::counter_object_preflight(mode)
+                .unwrap_or_else(|failure| panic!("{mode:?} preflight: {failure}"));
+        }
+    }
+
     #[test]
     fn format2_link_stage_requires_exact_extent() {
         let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024);

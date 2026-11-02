@@ -67,6 +67,7 @@ RUN = [
     ("test_e16_oracle.py", []),
     ("test_first_use_oracle.py", []),
     ("test_first_use_sweep.py", []),
+    ("test_gate0_identity.py", []),
     ("test_h4a_prepost_userspace.py", ["--self-test"]),
     ("test_canary_evidence.py", ["--target-bits", "32"]),
     ("test_canary_evidence.py", ["--target-bits", "64"]),

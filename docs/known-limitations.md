@@ -38,8 +38,9 @@ Endpoint selection (`--select-endpoint` with `--mode metrics` and
 cells between a selection-time read and the close read. It resolves
 on `--pid` and owned-`run` captures only; `--cgroup` and `--system`
 refuse by name. If the watched process replaces itself (exec) between
-the two reads, the slot retires, or the close boundary cannot be
-proven clean, the detail is withheld with a named reason while
+the two reads, the slot retires, the close boundary cannot be proven
+clean, or discovery ring loss, read failures, or truncation grow
+inside the window, the detail is withheld with a named reason while
 aggregate counts continue.
 
 A capture follows at most 256 provider loads and tracks at most

@@ -173,7 +173,7 @@ manifest, scanned function slots are count-only: use their aggregate counts,
 return values and latency. Standard names require a typed legacy return, an
 exact `"PKCS 11"` interface, an accepted manifest, or exact agreement between
 the provider's own `.dynsym` and every retained non-NULL target
-(`discovery[].tables[].linkage: "exports"`). Without name evidence, rows read `unknown#<ordinal>` in
+(`discovery[].tables[].linkage: "exports"`). `inspect` reports each table's raw decoder walk, so a 3.x-labelled prefix that `run` proves `full` still reads `known_prefix` here. Without name evidence, rows read `unknown#<ordinal>` in
 the live table and trace (`functions[].ordinals` and `functions[].target` in
 JSON), never a guessed name. Missing mechanism or session evidence does not mean
 the application used none. For those semantics, use the separate

@@ -6205,9 +6205,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode counts to -o JSON with exact workload-ledger numbers"]
+    #[ignore = "requires cc-built owned LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode counts to -o JSON with exact workload-ledger numbers"]
     fn counter_cli_profile_counts_matches_workload_ledger_lp64() {
-        counter_cli_capture_cell(CounterMode::Counts);
+        counter_cli_capture_cell_with_selection_owned(CounterMode::Counts, None);
     }
 
     #[test]

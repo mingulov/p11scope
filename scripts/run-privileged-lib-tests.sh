@@ -468,11 +468,14 @@ metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledg
 metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_ledger_lp64
 metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64
 metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64
-# K0 selected-detail live cells: the two SoftHSM ledger cells (exact
-# C_Sign detail plus the exec-in-window negative) beside the CLI-shaped
-# counts cell above. Root on a Multi-capable kernel; the ledger cells
-# also need gcc, softhsm2-util, SoftHSM2 and an observer binary
-# (P11SCOPE_E2E_OBSERVER or the p11scope sibling).
+# Counter CLI and K0 selected-detail live cells over owned cc-built
+# growth fixtures: the counts CLI cell (exact workload-ledger numbers,
+# no selection), the K0 CLI cell (live-plan resolution plus the exact
+# aggregate), and the three SoftHSM ledger cells (exact C_Sign detail,
+# the exec-in-window negative, and the owned-run positive). Root on a
+# Multi-capable kernel; the ledger cells also need gcc, softhsm2-util,
+# SoftHSM2 and an observer binary (P11SCOPE_E2E_OBSERVER or the
+# p11scope sibling).
 metrics::k0_live_cells::k0_live_detail_matches_ledger_counts_lp64
 metrics::k0_live_cells::k0_live_exec_voids_detail_counts_lp64
 metrics::k0_live_cells::k0_live_run_detail_matches_ledger_counts_lp64

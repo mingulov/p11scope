@@ -1360,7 +1360,7 @@
     {
       "file": "src/metrics/counter_reader.rs",
       "path": "metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledger_lp64",
-      "reason": "requires prebuilt LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode counts to -o JSON with exact workload-ledger numbers",
+      "reason": "requires cc-built owned LP64 growth fixtures and authorized native Multi staging as root: profile --counter-mode counts to -o JSON with exact workload-ledger numbers",
       "cell": "privileged"
     },
     {

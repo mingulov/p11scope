@@ -796,8 +796,11 @@ Limits that matter in pods:
   two or more refuse as ambiguous (narrow providers with `--module`),
   never first-match. Only `--pid` and owned-`run` scopes resolve to one
   original; `--cgroup` and `--system` refuse by name. The name
-  resolves once at start against the plan then live; a provider that
-  loads after selection needs `--module` to be selected. The detail
+  resolves once at start against the plan then live; a provider loaded
+  after start needs `--prearm-module <provider.so>` to be selected
+  (`--module` only narrows the scan). With `run` it is usually
+  required, because the owned child maps its provider after the
+  observer attaches. The detail
   is the function's own broad-counter cells between a selection-time
   read and the close read, in the measurement's own mode (counts,
   timestamps or latency cells). If the watched process replaces

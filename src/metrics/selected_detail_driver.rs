@@ -944,8 +944,8 @@ pub(crate) type K0Facts = Result<Option<LifecycleFacts>, PidContinuityRefusal>;
 /// The open K0 window: the resolved selection, the detail collector
 /// holding the selection-time read as its baseline, the
 /// selection-time witness facts, the selection-time discovery losses,
-/// the selection read's monotonic stamp (lifecycle at or before it is
-/// outside the window), and the collector limits (reused for the close
+/// the selection read's monotonic start stamp (lifecycle strictly
+/// before it is outside the window), and the collector limits (reused for the close
 /// read so both bounds share one budget).
 pub(crate) struct K0Window {
     resolved: ResolvedSelection,
@@ -1023,11 +1023,15 @@ pub(super) fn open_k0_window_with_losses(
             return None;
         }
     };
-    // The selection read's monotonic stamp: lifecycle at or before it
-    // is outside the window (STUB: stored but not yet bounding; the
-    // close still voids on every exec until the bound lands).
+    // The selection read's monotonic start stamp: lifecycle strictly
+    // before it is outside the window. The read stamps `started` before
+    // any bank access and `finished` after the last one (its bounds
+    // encompass the component reads, not an atomic snapshot), so a
+    // lifecycle record inside the read, or tied with its start, could
+    // fall between the selected slot's read and the read's end and
+    // stays inside the window.
     let selection_stamp = match &before {
-        Ok(read) => read.view().window.map(|window| window.finished_ns),
+        Ok(read) => read.view().window.map(|window| window.started_ns),
         Err(_) => None,
     };
     let mut collector = CounterCollector::new(limits, reserve);
@@ -1116,8 +1120,9 @@ pub(super) fn close_k0_window_with_losses(
 /// Scan the shutdown-tail discovery records for a lifecycle hit on
 /// the selected caller: an EXEC or a tap fault (malformed tail).
 /// PID-matched like the tap: other PIDs never hit. Records stamped
-/// at or before the selection read are outside the window and are
-/// ignored; a zero timestamp never is (clock fault, fail closed). An
+/// strictly before the selection read's start are outside the window
+/// and are ignored (a tie stays inside); a zero timestamp never is
+/// (clock fault, fail closed). An
 /// in-window EXEC voids as caller-changed whatever its case (a
 /// faulting case fails closed the same way). A leader exit never
 /// voids: the counter bank's probes are bound to the original task in
@@ -1141,7 +1146,7 @@ fn scan_k0_tail(
         }
         if record.hook_ts_ns != 0
             && let Some(stamp) = selection_stamp
-            && record.hook_ts_ns <= stamp
+            && record.hook_ts_ns < stamp
         {
             continue;
         }
@@ -1149,10 +1154,8 @@ fn scan_k0_tail(
             DISCOVERY_KIND_EXEC => {
                 return Some(Promotion(PromotionRefusal::CallerChanged));
             }
-            DISCOVERY_KIND_LEADER_EXIT => {
-                if record.hook_ts_ns == 0 {
-                    return Some(Promotion(PromotionRefusal::CallerChanged));
-                }
+            DISCOVERY_KIND_LEADER_EXIT if record.hook_ts_ns == 0 => {
+                return Some(Promotion(PromotionRefusal::CallerChanged));
             }
             _ => {}
         }
@@ -1164,12 +1167,12 @@ fn scan_k0_tail(
 /// close body plus a PID-matched scan of the discovery records that
 /// were staged during quiescence and drained in the terminal drain —
 /// the tail the pre-quiescence witness snapshot cannot see. A tail
-/// EXEC or fault voids as caller-changed, a tail leader exit as
-/// caller-retired, in the witness step's contract position (after
-/// retirement, before loss); within the step a tail change beats a
-/// witnessed break. Twins stage the tail directly; production
-/// collects it from the terminal drains.
+/// EXEC or fault voids as caller-changed in the witness step's
+/// contract position (after retirement, before loss); a tail exit ends
+/// cleanly. Twins stage the tail directly; production collects it from
+/// the terminal drains.
 #[cfg_attr(not(test), allow(dead_code))] // Zero-loss tail close for twins; production closes with its losses.
+#[allow(clippy::too_many_arguments)] // One close over all retained inputs; twins drive it directly.
 pub(super) fn close_k0_window_with_tail(
     window: K0Window,
     close_plan: &AttachPlan,
@@ -1264,12 +1267,13 @@ pub(super) fn close_k0_window_with_tail_and_losses(
         ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
         return;
     }
-    // An exec stamped at or before the selection read is outside the
-    // window (the owned child's own startup exec); only a later exec
-    // voids. A zero timestamp never is outside (fail closed).
+    // An exec stamped strictly before the selection read's start is
+    // outside the window (the owned child's own startup exec); a tie,
+    // an exec inside the read and any later exec void. A zero
+    // timestamp never is outside (fail closed).
     if after_witness.latest_exec != before.latest_exec {
         let outside = match (after_witness.latest_exec, selection_stamp) {
-            (Some(exec), Some(stamp)) => exec.hook_ts_ns != 0 && exec.hook_ts_ns <= stamp,
+            (Some(exec), Some(stamp)) => exec.hook_ts_ns != 0 && exec.hook_ts_ns < stamp,
             _ => false,
         };
         if !outside {
@@ -6382,14 +6386,18 @@ mod tests {
     }
 
     #[test]
-    fn k0_exec_at_or_before_selection_stamp_ignored() {
-        // An exec stamped at or before the selection read's monotonic
-        // stamp is outside the window and is ignored: the child's own
-        // startup exec happens before the window opens. Only a later
-        // exec voids.
+    fn k0_exec_before_selection_stamp_ignored() {
+        // The selection stamp is the selection read's start (window
+        // 10→20 here): the read stamps `started` before any bank access
+        // and `finished` after it, so an exec between the selected
+        // slot's read and the read's end could mix old- and new-image
+        // calls. Only an exec strictly before the start is outside the
+        // window (the owned child's startup exec); a tie at the start,
+        // an exec inside the read and any later exec void.
         for (label, hook_ts, expect_void) in [
-            ("before", 15, false),
-            ("at", 20, false),
+            ("before", 9, false),
+            ("at-start", 10, true),
+            ("inside", 15, true),
             ("after", 21, true),
         ] {
             let pool = test_pool();
@@ -6453,12 +6461,15 @@ mod tests {
     }
 
     #[test]
-    fn k0_tail_exec_at_or_before_selection_stamp_ignored() {
-        // A tail EXEC stamped at or before the selection read is outside
-        // the window and is ignored. Only a later tail EXEC voids.
+    fn k0_tail_exec_before_selection_stamp_ignored() {
+        // A tail EXEC stamped strictly before the selection read's start
+        // (window 10→20 here) is outside the window and is ignored. A
+        // tie at the start, an EXEC inside the read and any later tail
+        // EXEC void.
         for (label, hook_ts, expect_void) in [
-            ("before", 15, false),
-            ("at", 20, false),
+            ("before", 9, false),
+            ("at-start", 10, true),
+            ("inside", 15, true),
             ("after", 21, true),
         ] {
             let pool = test_pool();
@@ -6582,6 +6593,66 @@ mod tests {
                 .refusal,
             Some("promotion_caller_changed"),
             "a later exec after an exit still voids"
+        );
+    }
+
+    #[test]
+    fn k0_tail_zero_ts_records_void_as_changed() {
+        // A clock fault (zero timestamp) never hides inside the
+        // selection window: both zero-ts tail records must void as
+        // caller-changed even though 0 <= stamp. The exec voids on
+        // its kind; the exit voids on its zero stamp (K0-4 arm).
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let pid = resolved.original.pid();
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let tail = vec![k0_exec_record(pid, 0), k0_exit_record(pid, 0)];
+        close_k0_window_with_tail(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &tail,
+            0,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("promotion_caller_changed"),
+            "zero-ts tail records void instead of hiding in the window"
         );
     }
 }

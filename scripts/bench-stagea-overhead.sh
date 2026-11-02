@@ -12,7 +12,8 @@
 # a private temp file, so each event costs one WATCHED_FILES hash miss. The
 # churn process makes no PKCS#11 calls, so no entry/return probe fires for it:
 # the with/without arm includes four hooks (uprobe_mmap,
-# uprobe_munmap, copy_vma, exec_mm_release); mapping churn exercises the
+# uprobe_munmap, copy_vma, and the exec-release hook: exec_mm_release,
+# or exec_mmap on kernels that removed it); mapping churn exercises the
 # three mapping hooks, while the total accounts for every attached hook.
 #
 # Cells (2 arms x ROUNDS rounds of ABBA/BAAB-interleaved samples each):
@@ -350,7 +351,10 @@ import json, sys
 try:
     progs = json.load(open(sys.argv[1]))
     links = json.load(open(sys.argv[2]))
-    want = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy", "p11_image_exec_release"}
+    stable = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy"}
+    legacy = stable | {"p11_image_exec_release"}
+    exec_mmap = stable | {"p11_image_mmap_release"}
+    want = legacy | exec_mmap
     aliases = {}
     for full in want:
         for alias in {full, full[:15]}:
@@ -371,7 +375,7 @@ try:
             raise ValueError("duplicate or invalid hook program")
         found[full] = prog
         ids.add(ident)
-    if found and set(found) != want:
+    if found and set(found) != legacy and set(found) != exec_mmap:
         raise ValueError("partial hook program set")
     mode = sys.argv[3]
     if mode == "programs":
@@ -388,7 +392,7 @@ try:
             raise ValueError("required hook link missing or duplicated")
         print(len(selected))
     elif mode == "stats":
-        if set(found) != want:
+        if set(found) != legacy and set(found) != exec_mmap:
             raise ValueError("required hooks unavailable")
         totals = [0, 0]
         for prog in found.values():

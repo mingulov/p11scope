@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FEDORA_LANE = "fedora-7.2.9"
 # Older labels remain available for explicit working-backport/historical inputs;
 # their version never admits live capture. The judge requires actual host proof.
-LANES = ("5.15.221", "6.1.188", "6.6.157", "6.8.0-142-generic", "6.12.111", "6.18.58", "7.2.6", "host",
+LANES = ("5.15.221", "6.1.188", "6.6.157", "6.8.0-142-generic", "6.12.111", "6.18.58", "7.2.6", "7.3.1", "host",
          FEDORA_LANE)
 PID_TEST = "tests::the_pid_filter_probe_reaches_the_kernel"
 # Exact source registrations; only an actual candidate list establishes membership.
@@ -849,10 +849,10 @@ D4_CELLS = {
 D4_LANES = {
     "D4:overlay-6.1": ("6.1.188",),
     "D4:overlay-6.6": ("6.6.157",),
-    "D4:overlay-6.8+": ("6.8.0-142-generic", "6.12.111", "6.18.58", "7.2.6", "host",
+    "D4:overlay-6.8+": ("6.8.0-142-generic", "6.12.111", "6.18.58", "7.2.6", "7.3.1", "host",
                         FEDORA_LANE),
     "D4:ext4-inode-reuse": ("6.1.188", "6.6.157", "6.8.0-142-generic", "6.12.111", "6.18.58",
-                            "7.2.6", "host", FEDORA_LANE),
+                            "7.2.6", "7.3.1", "host", FEDORA_LANE),
 }
 D4_READY = frozenset(
     {

@@ -2999,15 +2999,15 @@ class MatrixLaneRegistration(unittest.TestCase):
     def test_contract_registers_both_lanes(self):
         self.assertEqual(CHECKER_MOD["LANES"],
                          ("5.15.221", "6.1.188", "6.6.157", "6.8.0-142-generic",
-                          "6.12.111", "6.18.58", "7.2.6", "host",
+                          "6.12.111", "6.18.58", "7.2.6", "7.3.1", "host",
                           "fedora-7.2.9"))
         lanes = CHECKER_MOD["D4_LANES"]
         self.assertEqual(lanes["D4:overlay-6.8+"],
                          ("6.8.0-142-generic", "6.12.111", "6.18.58", "7.2.6",
-                          "host", "fedora-7.2.9"))
+                          "7.3.1", "host", "fedora-7.2.9"))
         self.assertEqual(lanes["D4:ext4-inode-reuse"],
                          ("6.1.188", "6.6.157", "6.8.0-142-generic", "6.12.111",
-                          "6.18.58", "7.2.6", "host", "fedora-7.2.9"))
+                          "6.18.58", "7.2.6", "7.3.1", "host", "fedora-7.2.9"))
 
     def test_prepare_refuses_guest_disk_on_host_like_lanes(self):
         for lane, kernel, message in (
@@ -3045,11 +3045,12 @@ class MatrixLaneRegistration(unittest.TestCase):
                 self.assertEqual(execution["lane"], lane)
                 self.assertIn(LIB_A, execution["lib_tests"])
 
-    def test_dry_run_defaults_gain_618_without_fedora(self):
+    def test_dry_run_defaults_gain_731_without_fedora(self):
         result = command(str(RUNNER), "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("kernels (6):", result.stdout)
+        self.assertIn("kernels (7):", result.stdout)
         self.assertIn("v6.18.58 tag=v6.18.58", result.stdout)
+        self.assertIn("v7.3.1 tag=v7.3.1", result.stdout)
         self.assertNotIn("tag=fedora", result.stdout)
 
     def test_resolve_kernel_maps_new_names(self):
@@ -3057,7 +3058,10 @@ class MatrixLaneRegistration(unittest.TestCase):
                                ("fedora-7.2.9", "fedora-7.2.9"),
                                ("6.18", "v6.18.58"),
                                ("6.18.58", "v6.18.58"),
-                               ("v6.18.58", "v6.18.58")):
+                               ("v6.18.58", "v6.18.58"),
+                               ("7.3", "v7.3.1"),
+                               ("7.3.1", "v7.3.1"),
+                               ("v7.3.1", "v7.3.1")):
             with self.subTest(spec=spec):
                 result = command(str(RUNNER), "--dry-run", "--kernels", spec)
                 self.assertEqual(result.returncode, 0,

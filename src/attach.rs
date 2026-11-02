@@ -124,9 +124,10 @@ pub(crate) fn semantic_receipt_query_refusal_test(
 pub(crate) use instance::{AbsenceBirthSource, observe_absence_birth};
 #[allow(unused_imports)]
 pub(crate) use instance::{
-    BirthAdmissionBinding, BirthObservationRefusal, BirthRowError, BirthRowReader, ExecBirthSource,
-    HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, LiveBirthRows, SessionGrantToken,
-    WatchedFile, observe_exec_birth, observe_retained_birth,
+    BirthAdmissionBinding, BirthObservationRefusal, BirthRowError, BirthRowReader,
+    EXEC_RELEASE_MMAP_PROGRAM, ExecBirthSource, ExecReleaseTarget, HookStats, INSTANCE_PROGRAMS,
+    InstanceMaps, InstanceTracking, LiveBirthRows, SessionGrantToken, WatchedFile,
+    active_instance_programs, observe_exec_birth, observe_retained_birth,
 };
 mod cleanup_worker;
 pub mod identity_iter;

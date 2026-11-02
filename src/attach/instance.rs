@@ -64,7 +64,7 @@ const EXEC_RELEASE_MMAP_TARGET: &str = "exec_mmap";
 
 /// Which kernel hook carries exec-release invalidation on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExecReleaseTarget {
+pub(crate) enum ExecReleaseTarget {
     ExecMmRelease,
     ExecMmap,
 }
@@ -72,7 +72,9 @@ enum ExecReleaseTarget {
 /// The four instance-hook (program, target) triples for a resolved target.
 /// The legacy set is [`INSTANCE_PROGRAMS`]; the 7.3+ set swaps only the
 /// exec-release slot.
-fn active_instance_programs(target: ExecReleaseTarget) -> [(&'static str, &'static str); 4] {
+pub(crate) fn active_instance_programs(
+    target: ExecReleaseTarget,
+) -> [(&'static str, &'static str); 4] {
     match target {
         ExecReleaseTarget::ExecMmRelease => INSTANCE_PROGRAMS,
         ExecReleaseTarget::ExecMmap => [
@@ -645,23 +647,30 @@ impl InstanceTracking {
         ))
     }
 
+    /// The active instance-hook program names: the legacy set until hooks
+    /// attach, the resolved set after.
+    pub(crate) fn active_program_names(&self) -> [&'static str; 4] {
+        let triples = active_instance_programs(
+            self.active_target
+                .unwrap_or(ExecReleaseTarget::ExecMmRelease),
+        );
+        [triples[0].0, triples[1].0, triples[2].0, triples[3].0]
+    }
+
     /// The hook programs' statistics, summed. `run_time_ns`/`run_cnt` need
     /// `kernel.bpf_stats_enabled`; `recursion_misses` is always counted.
     pub(crate) fn hook_stats(&self, ebpf: &Ebpf) -> Result<Vec<(&'static str, HookStats)>> {
-        active_instance_programs(
-            self.active_target
-                .unwrap_or(ExecReleaseTarget::ExecMmRelease),
-        )
-        .into_iter()
-        .map(|(program, _)| {
-            let fd = ebpf
-                .program(program)
-                .with_context(|| format!("program {program}"))?
-                .fd()
-                .with_context(|| format!("program {program} fd"))?;
-            Ok((program, prog_stats(fd.as_fd())?))
-        })
-        .collect()
+        self.active_program_names()
+            .into_iter()
+            .map(|program| {
+                let fd = ebpf
+                    .program(program)
+                    .with_context(|| format!("program {program}"))?
+                    .fd()
+                    .with_context(|| format!("program {program} fd"))?;
+                Ok((program, prog_stats(fd.as_fd())?))
+            })
+            .collect()
     }
 }
 

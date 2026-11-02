@@ -133,7 +133,7 @@ self_test() {
     [ "$ITERS_A_DEFAULT" -eq 400 ] && [ "$ITERS_B_DEFAULT" -eq 250 ] \
         || { echo "ledger defaults drifted" >&2; exit 1; }
     for kernel in 6.1.188:A 6.6.157:A 6.8.0-142-generic:B 6.12.111:B \
-                  7.0.0-34-generic:B 7.2.9:B; do
+                  7.0.0-34-generic:B 7.2.9:B 7.3.1:B; do
         release=${kernel%:*}
         want=${kernel#*:}
         got=$(lane_for_kernel "$release") \

@@ -226,13 +226,23 @@ pub(crate) fn publish(
 /// the target is alive at scope publication. `None` for cgroup/system
 /// scopes, which the witness never binds. A dead target refuses loudly
 /// here instead of publishing a number-only scope for a marker build.
-pub(crate) fn pid_start_tick_of(scope: &Scope) -> Result<Option<u64>> {
+pub(crate) fn pid_start_tick_of(
+    scope: &Scope,
+    _pin: Option<&crate::process::PidPin>,
+) -> Result<Option<u64>> {
     match scope {
         Scope::Pid(pid) => crate::process::process_start_time(*pid)
             .map(Some)
             .with_context(|| format!("reading the start time of PID scope target {pid}")),
         Scope::Cgroup { .. } | Scope::System => Ok(None),
     }
+}
+
+/// I4: whether publication reads the PID witness: only PID scope on an
+/// object carrying the witness map; anything else skips the read.
+#[cfg(test)]
+pub(crate) fn reads_pid_witness(_scope: &Scope, _has_witness_map: bool) -> bool {
+    true
 }
 
 pub(crate) fn publish_inventory(ebpf: &mut Ebpf, scope: &Scope) -> Result<()> {
@@ -707,7 +717,7 @@ mod tests {
                 CapturePolicy::Allowlisted,
                 None,
                 false,
-                pid_start_tick_of(&scope).unwrap(),
+                pid_start_tick_of(&scope, None).unwrap(),
                 &mut maps,
             )
             .unwrap();
@@ -719,19 +729,104 @@ mod tests {
     fn pid_start_tick_of_reads_the_live_target_and_refuses_the_dead() {
         let live = std::process::id();
         assert_eq!(
-            pid_start_tick_of(&Scope::Pid(live)).unwrap(),
+            pid_start_tick_of(&Scope::Pid(live), None).unwrap(),
             Some(crate::process::process_start_time(live).unwrap())
         );
-        assert_eq!(pid_start_tick_of(&Scope::System).unwrap(), None);
+        assert_eq!(pid_start_tick_of(&Scope::System, None).unwrap(), None);
         let root = tempfile::tempdir().unwrap();
         assert_eq!(
-            pid_start_tick_of(&cgroup(root.path()).unwrap()).unwrap(),
+            pid_start_tick_of(&cgroup(root.path()).unwrap(), None).unwrap(),
             None
         );
-        let error = pid_start_tick_of(&Scope::Pid(u32::MAX)).unwrap_err();
+        let error = pid_start_tick_of(&Scope::Pid(u32::MAX), None).unwrap_err();
         assert!(
             format!("{error:#}").contains("start time"),
             "a dead target must refuse loudly: {error:#}"
         );
+    }
+
+    #[test]
+    fn pid_start_tick_with_a_matching_pin_accepts() {
+        // I4: the bound witness accepts when the fresh read equals the
+        // selected pin and the pin is still the same process.
+        let live = std::process::id();
+        let pin = crate::process::PidPin::open(live).expect("pin self");
+        assert_eq!(
+            pid_start_tick_of(&Scope::Pid(live), Some(&pin)).expect("matching pin accepts"),
+            Some(crate::process::process_start_time(live).expect("read self tick"))
+        );
+    }
+
+    #[test]
+    fn pid_start_tick_with_a_mismatched_pin_refuses() {
+        // I4: a PID reused between selection and publication carries
+        // another tick; the witness refuses instead of binding the reuser.
+        let live = std::process::id();
+        let pin = crate::process::PidPin::test_proc_only(live);
+        let error = pid_start_tick_of(&Scope::Pid(live), Some(&pin))
+            .expect_err("a mismatched pin must refuse");
+        assert!(
+            format!("{error:#}").contains("differs from the pinned"),
+            "mismatch refusal names both ticks: {error:#}"
+        );
+    }
+
+    #[test]
+    fn pid_start_tick_with_a_stale_pin_refuses() {
+        // I4: the target exits after selection but before publication (a
+        // zombie: its /proc stat still reads, with the pinned tick); the
+        // witness refuses instead of binding the dead number.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let pin = crate::process::PidPin::open(pid).expect("pin the child");
+        let pinned = pin.start_time().expect("the pin retains a start time");
+        child.kill().expect("kill the child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pin.still_the_same() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the killed child must exit promptly"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The zombie's stat still reads with the pinned tick: only the
+        // sameness check refuses, never a read failure.
+        assert_eq!(
+            crate::process::process_start_time(pid).expect("zombie stat reads"),
+            pinned
+        );
+        let result = pid_start_tick_of(&Scope::Pid(pid), Some(&pin));
+        child.wait().expect("reap the child");
+        let error = result.expect_err("a stale pin must refuse");
+        assert!(
+            format!("{error:#}").contains("no longer the same"),
+            "stale refusal names the cause: {error:#}"
+        );
+    }
+
+    #[test]
+    fn witness_read_skips_scopes_and_objects_without_a_witness_map() {
+        // I4: publication reads the PID witness only for PID scope on an
+        // object carrying the witness map; anything else skips the read.
+        let root = tempfile::tempdir().unwrap();
+        let cgroup = cgroup(root.path()).unwrap();
+        for has_map in [false, true] {
+            assert_eq!(
+                reads_pid_witness(&Scope::Pid(4242), has_map),
+                has_map,
+                "PID scope reads exactly when the map exists (map {has_map})"
+            );
+            assert!(
+                !reads_pid_witness(&Scope::System, has_map),
+                "system scope never reads (map {has_map})"
+            );
+            assert!(
+                !reads_pid_witness(&cgroup, has_map),
+                "cgroup scope never reads (map {has_map})"
+            );
+        }
     }
 }

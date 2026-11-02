@@ -397,10 +397,155 @@ fn fingerprint_matches_event(
         && fingerprint.user_type == event.user_type
 }
 
+impl CallFingerprint {
+    /// The entry-invariant part: the words a staged BEGIN already holds
+    /// exactly as the H0 return reports them.
+    pub(crate) fn identity(&self) -> CallIdentity {
+        CallIdentity {
+            image: self.image,
+            function: self.function,
+            pid_tgid: self.pid_tgid,
+            entry_ns: self.entry_ns,
+            slot: self.slot,
+            slot_id: self.slot_id,
+            flags: self.flags,
+            user_type: self.user_type,
+        }
+    }
+}
+
+/// One invocation's entry-invariant identity: image, function, physical
+/// thread, exact entry time, attested slot and the slot-id/flags/user-type
+/// words that the return path never rewrites. Physical thread plus entry
+/// time make it unique per invocation, so it keys the claim store. The
+/// return-enriched words (session, mechanism, capture) are NOT part of
+/// it: a BEGIN carries their entry-time values while the claim carries
+/// the returned ones, and the two are checked against each other by the
+/// producer's rewrite rules (`returned_words_agree`), never by equality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CallIdentity {
+    image: (u64, u64),
+    function: u32,
+    pid_tgid: u64,
+    entry_ns: u64,
+    slot: u32,
+    slot_id: u64,
+    flags: u64,
+    user_type: u32,
+}
+
+/// The entry-time words of one staged BEGIN (open or capacity-refused)
+/// that the return path may rewrite, with the descriptor and layout that
+/// decide which rewrites are legitimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EntryWords {
+    descriptor: u32,
+    session: u64,
+    session_status: u8,
+    mechanism: u64,
+    capture: u32,
+    layout: u8,
+}
+
+impl EntryWords {
+    fn of_begin(begin: &ValidatedJournalBegin) -> Self {
+        Self {
+            descriptor: begin.descriptor(),
+            session: begin.session_word(),
+            session_status: begin.session_status(),
+            mechanism: begin.entry_mechanism(),
+            capture: begin.capture(),
+            layout: begin.layout(),
+        }
+    }
+}
+
+/// The return-time words of one completed invocation (END, preserved
+/// CALL or H0 admission) that the producer may have rewritten, plus the
+/// return value that decides which rewrites it may make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReturnedWords {
+    session: u64,
+    mechanism: u64,
+    capture: u32,
+    rv: u64,
+}
+
+impl ReturnedWords {
+    fn of_event(event: &p11scope_ebpf_common::Event) -> Self {
+        Self {
+            session: event.session,
+            mechanism: event.mechanism,
+            capture: event.capture,
+            rv: event.rv,
+        }
+    }
+
+    fn of_fingerprint(fingerprint: &CallFingerprint, rv: u64) -> Self {
+        Self {
+            session: fingerprint.session,
+            mechanism: fingerprint.mechanism,
+            capture: fingerprint.capture,
+            rv,
+        }
+    }
+}
+
+/// One staged entry as attribution sees it: its identity, its entry-time
+/// words and, once staged, its END's returned words (a claim must report
+/// that same return exactly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StagedShape {
+    identity: CallIdentity,
+    entry: EntryWords,
+    end: Option<ReturnedWords>,
+}
+
+/// One admitted invocation claim. `returned` keeps the H0 admission's full
+/// return-time fingerprint and `rv` its return value: END corroboration
+/// stays exact against them, and BEGIN attribution checks them through
+/// the producer's rewrite rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AdmittedJournalClaim {
     admission: u64,
     return_ns: u64,
+    returned: CallFingerprint,
+    rv: u64,
+}
+
+/// Whether one admitted return (its full fingerprint and rv) is the
+/// return of one staged entry: the same entry-invariant identity, entry
+/// words the producer could have rewritten into these returned words, and
+/// (once the END is staged) exactly the END's own returned words.
+fn fingerprint_names_shape(shape: &StagedShape, fingerprint: &CallFingerprint, rv: u64) -> bool {
+    let returned = ReturnedWords::of_fingerprint(fingerprint, rv);
+    fingerprint.identity() == shape.identity
+        && returned_words_agree(&shape.entry, &returned)
+        && shape.end.is_none_or(|end| end == returned)
+}
+
+fn claim_names_shape(shape: &StagedShape, claim: &AdmittedJournalClaim) -> bool {
+    fingerprint_names_shape(shape, &claim.returned, claim.rv)
+}
+
+/// Whether one completed return event (END payload, preserved CALL or
+/// collected H0 original) is the return of one staged entry: exact
+/// identity including the reconstructed entry time, the producer's
+/// rewrite rules for the enriched words, and the staged END's words
+/// exactly once an END is staged.
+fn event_names_shape(shape: &StagedShape, event: &p11scope_ebpf_common::Event) -> bool {
+    let returned = ReturnedWords::of_event(event);
+    let identity = &shape.identity;
+    identity.image == (event.image.task_cookie, event.image.exec_id)
+        && identity.pid_tgid == event.pid_tgid
+        && event.duration_ns != 0
+        && Some(identity.entry_ns) == event.ts_ns.checked_sub(event.duration_ns)
+        && identity.slot == event.slot
+        && identity.slot_id == event.slot_id
+        && identity.flags == event.flags
+        && identity.user_type == event.user_type
+        && returned_words_agree(&shape.entry, &returned)
+        && shape.end.is_none_or(|end| end == returned)
 }
 
 /// One staged entry's attribution under a sealing key.
@@ -704,7 +849,61 @@ struct RefusedBegin {
     capture: u32,
     flags: u64,
     entry_ns: u64,
+    /// Entry session status and layout: they decide which return
+    /// rewrites a later CALL or claim may legitimately carry.
+    session_status: u8,
+    layout: u8,
     corroborated_return: Option<u64>,
+}
+
+impl RefusedBegin {
+    fn of_begin(cut: u64, begin: &ValidatedJournalBegin, image: (u64, u64)) -> Self {
+        Self {
+            cut,
+            image,
+            pid_tgid: begin.pid_tgid(),
+            function: begin.descriptor() - 1,
+            slot: begin.slot(),
+            session: begin.session_word(),
+            mechanism: begin.entry_mechanism(),
+            slot_id: begin.slot_id(),
+            user_type: begin.user_type(),
+            capture: begin.capture(),
+            flags: begin.call_flags(),
+            entry_ns: begin.entry_ns(),
+            session_status: begin.session_status(),
+            layout: begin.layout(),
+            corroborated_return: None,
+        }
+    }
+
+    fn identity(&self) -> CallIdentity {
+        CallIdentity {
+            image: self.image,
+            function: self.function,
+            pid_tgid: self.pid_tgid,
+            entry_ns: self.entry_ns,
+            slot: self.slot,
+            slot_id: self.slot_id,
+            flags: self.flags,
+            user_type: self.user_type,
+        }
+    }
+
+    fn shape(&self) -> StagedShape {
+        StagedShape {
+            identity: self.identity(),
+            entry: EntryWords {
+                descriptor: self.function + 1,
+                session: self.session,
+                session_status: self.session_status,
+                mechanism: self.mechanism,
+                capture: self.capture,
+                layout: self.layout,
+            },
+            end: None,
+        }
+    }
 }
 
 /// Everything one consumed ring record can be to the journal: a validated
@@ -765,7 +964,7 @@ pub(crate) struct JournalAdapter {
     /// image, caller/router and era authority. A deque represents
     /// duplicate/colliding inputs only; conversion never selects a
     /// winner by FIFO rank. Counts remain bounded by unsettled work.
-    claims: BTreeMap<CallFingerprint, BTreeMap<JournalDomainKey, VecDeque<AdmittedJournalClaim>>>,
+    claims: BTreeMap<CallIdentity, BTreeMap<JournalDomainKey, VecDeque<AdmittedJournalClaim>>>,
     claim_counts: usize,
     last_audit_failure: Option<u64>,
     /// H0 positions below this watermark were voided by an H3-loss
@@ -1243,21 +1442,8 @@ impl JournalAdapter {
             self.taint_image(image);
             return JournalDisposition::Contradiction(JournalContradiction::RefusedOverflow);
         }
-        self.refused.push(RefusedBegin {
-            cut: ordinal,
-            image,
-            pid_tgid: begin.pid_tgid(),
-            function: begin.descriptor() - 1,
-            slot: begin.slot(),
-            session: begin.session_word(),
-            mechanism: begin.entry_mechanism(),
-            slot_id: begin.slot_id(),
-            user_type: begin.user_type(),
-            capture: begin.capture(),
-            flags: begin.call_flags(),
-            entry_ns: begin.entry_ns(),
-            corroborated_return: None,
-        });
+        self.refused
+            .push(RefusedBegin::of_begin(ordinal, begin, image));
         JournalDisposition::BeginRefusedCapacity
     }
 
@@ -1533,9 +1719,9 @@ impl JournalAdapter {
             // keys. Their proof claims can no longer convert; H9 still owns
             // its separate original rows/roles until negative fanout delivers.
             let count = &mut self.claim_counts;
-            self.claims.retain(|fingerprint, claimants| {
-                let affected = taints.contains(&fingerprint.image)
-                    || (overflow && !sightings.contains_key(&fingerprint.image));
+            self.claims.retain(|identity, claimants| {
+                let affected = taints.contains(&identity.image)
+                    || (overflow && !sightings.contains_key(&identity.image));
                 if affected {
                     *count -= claimants.values().map(VecDeque::len).sum::<usize>();
                 }
@@ -1609,12 +1795,11 @@ impl JournalAdapter {
             else {
                 return false;
             };
-            let fingerprint = fingerprint_of_begin(&entry.begin);
             entry.image == (key.cookie, key.exec)
                 && origin.position() <= frontier.0
                 && end.ordinal <= frontier.0
                 && end_agrees_with_begin(&entry.begin, &end.end)
-                && fingerprint_matches_event(&fingerprint, &end.end.payload_base().event)
+                && event_names_shape(&shape_of_entry(entry), &end.end.payload_base().event)
                 && entry.call_key.is_none()
                 && entry.converted_ticket.is_none()
                 && entry.converted_for.is_none()
@@ -1738,7 +1923,7 @@ impl JournalAdapter {
                     .expect("preflight exact own claim")
                 {
                     let claim = self
-                        .consume_claim(&fingerprint_of_begin(&entry.begin), key)
+                        .consume_claim(&identity_of_begin(&entry.begin), key)
                         .expect("retained original own claim");
                     assert_eq!(claim.admission, original.admission);
                     assert_eq!(claim.return_ns, original.return_ns);
@@ -1770,38 +1955,29 @@ fn end_image(end: &ValidatedJournalEnd) -> (u64, u64) {
     (base.event.image.task_cookie, base.event.image.exec_id)
 }
 
-/// One staged BEGIN's attribution shape: the same overlap the
-/// admission side claims, read from wire scalars.
-fn fingerprint_of_begin(begin: &ValidatedJournalBegin) -> CallFingerprint {
-    CallFingerprint {
+/// One staged BEGIN's entry-invariant identity, read from wire scalars.
+fn identity_of_begin(begin: &ValidatedJournalBegin) -> CallIdentity {
+    CallIdentity {
         image: (begin.image_cookie(), begin.image_exec()),
         function: begin.descriptor() - 1,
         pid_tgid: begin.pid_tgid(),
         entry_ns: begin.entry_ns(),
         slot: begin.slot(),
-        session: begin.session_word(),
-        mechanism: begin.entry_mechanism(),
-        capture: begin.capture(),
         slot_id: begin.slot_id(),
         flags: begin.call_flags(),
         user_type: begin.user_type(),
     }
 }
 
-/// One refused BEGIN's attribution shape.
-fn fingerprint_of_refused(refused: &RefusedBegin) -> CallFingerprint {
-    CallFingerprint {
-        image: refused.image,
-        function: refused.function,
-        pid_tgid: refused.pid_tgid,
-        entry_ns: refused.entry_ns,
-        slot: refused.slot,
-        session: refused.session,
-        mechanism: refused.mechanism,
-        capture: refused.capture,
-        slot_id: refused.slot_id,
-        flags: refused.flags,
-        user_type: refused.user_type,
+/// One staged open entry's attribution shape: the BEGIN's identity and
+/// entry words, plus its staged END's returned words.
+fn shape_of_entry(entry: &OpenEntry) -> StagedShape {
+    StagedShape {
+        identity: identity_of_begin(&entry.begin),
+        entry: EntryWords::of_begin(&entry.begin),
+        end: entry
+            .end
+            .map(|end| ReturnedWords::of_event(&end.end.payload_base().event)),
     }
 }
 
@@ -1819,12 +1995,10 @@ fn is_pending_rv(rv: u64) -> bool {
 /// mechanism word exact. Unreachable in production today — async controls
 /// are negative-only, never admitted to the open/refused tables — so
 /// output-neutral; once tracked, a GetID whose END was lost carries bit 6
-/// only on its preserved CALL and corroborates its BEGIN here. This alone
-/// does not stop the seal hold: the admission-side claim fingerprint
-/// (`fingerprint_matches_event`) still compares the capture word exactly,
-/// so a tracked OK GetID with a null or unreadable id would leave its
-/// BEGIN unclaimed and hold the seal on `BoundNotReady` until that check
-/// shares this rule.
+/// only on its preserved CALL and corroborates its BEGIN here. Claim
+/// attribution checks a claim against its BEGIN through the same rules
+/// (`returned_words_agree`), so a tracked OK GetID with a null or
+/// unreadable id would name its own BEGIN as well.
 fn async_get_id_capture_gain(descriptor: u32, rv: u64, before: u32, after: u32) -> bool {
     let lifecycle = crate::kinds::DESCRIPTORS
         .get(descriptor as usize)
@@ -1837,13 +2011,16 @@ fn async_get_id_capture_gain(descriptor: u32, rv: u64, before: u32, after: u32) 
 
 /// Whether one ordinary CALL record corroborates one open BEGIN: the
 /// exact retained invocation — same image, same process, exact
-/// entry-time agreement plus the seven-word call identity — observed
-/// strictly after the BEGIN with a completed (non-pending) return
-/// value. Entry agreement is exact (`ts - duration`, the return path's
-/// own entry reconstruction): a merely later timestamp from another
-/// invocation never qualifies. Capture agreement is exact except for
-/// the one P1 producer rewrite: an OK `C_AsyncGetID` return may gain
-/// ONLY the value-unreadable bit (`async_get_id_capture_gain`).
+/// entry-time agreement plus the entry-invariant call identity —
+/// observed strictly after the BEGIN with a completed (non-pending)
+/// return value. Entry agreement is exact (`ts - duration`, the return
+/// path's own entry reconstruction): a merely later timestamp from
+/// another invocation never qualifies. The words the return path may
+/// rewrite (session, mechanism, capture) follow the same producer rules
+/// as END agreement (`returned_fields_agree`): a lost END's preserved
+/// CALL carries the return-read mechanism, the `SESSION_NONE` of a
+/// sessionless call or the returned `C_OpenSession` handle, and the OK
+/// `C_AsyncGetID` value-unreadable bit.
 fn ordinary_matches_begin(
     event: &p11scope_ebpf_common::Event,
     ordinal: u64,
@@ -1856,47 +2033,31 @@ fn ordinary_matches_begin(
         && event.image.task_cookie == begin.image_cookie()
         && event.image.exec_id == begin.image_exec()
         && event.slot == begin.slot()
-        && event.session == begin.session_word()
-        && event.mechanism == begin.entry_mechanism()
         && event.slot_id == begin.slot_id()
         && event.user_type == begin.user_type()
-        && (event.capture == begin.capture()
-            || async_get_id_capture_gain(
-                begin.descriptor(),
-                event.rv,
-                begin.capture(),
-                event.capture,
-            ))
         && event.flags == begin.call_flags()
+        && returned_fields_agree(begin, event)
 }
 
 /// Whether one ordinary CALL record corroborates one refused BEGIN:
-/// the same exact-invocation binding as an open BEGIN, including the
-/// one P1 producer rewrite for an OK `C_AsyncGetID` return gaining ONLY
-/// the value-unreadable bit (`async_get_id_capture_gain`).
+/// the same exact-invocation binding and producer rewrite rules as an
+/// open BEGIN.
 fn ordinary_matches_refused(
     event: &p11scope_ebpf_common::Event,
     ordinal: u64,
     refused: &RefusedBegin,
 ) -> bool {
+    let shape = refused.shape();
     ordinal > refused.cut
         && event.ts_ns.checked_sub(event.duration_ns) == Some(refused.entry_ns)
         && event.pid_tgid == refused.pid_tgid
         && event.image.task_cookie == refused.image.0
         && event.image.exec_id == refused.image.1
         && event.slot == refused.slot
-        && event.session == refused.session
-        && event.mechanism == refused.mechanism
         && event.slot_id == refused.slot_id
         && event.user_type == refused.user_type
-        && (event.capture == refused.capture
-            || async_get_id_capture_gain(
-                refused.function + 1,
-                event.rv,
-                refused.capture,
-                event.capture,
-            ))
         && event.flags == refused.flags
+        && returned_words_agree(&shape.entry, &ReturnedWords::of_event(event))
 }
 
 // ---------------------------------------------------------------------------
@@ -1923,30 +2084,41 @@ fn returned_fields_agree(
     begin: &ValidatedJournalBegin,
     event: &p11scope_ebpf_common::Event,
 ) -> bool {
+    returned_words_agree(
+        &EntryWords::of_begin(begin),
+        &ReturnedWords::of_event(event),
+    )
+}
+
+/// The rewrite rules of `returned_fields_agree` over plain words, shared by
+/// END agreement, ordinary-CALL corroboration (open and refused BEGINs)
+/// and claim attribution: an admission claim carries the same return-time
+/// words as the END, so it names its BEGIN under exactly these rules.
+fn returned_words_agree(entry: &EntryWords, event: &ReturnedWords) -> bool {
     use p11scope_ebpf_common::object_capture::handle_status;
     use p11scope_ebpf_common::{ARG_NONE, MECH_NONE, SESSION_NONE, lifecycle};
 
-    let Some(semantics) = crate::kinds::DESCRIPTORS.get(begin.descriptor() as usize) else {
+    let Some(semantics) = crate::kinds::DESCRIPTORS.get(entry.descriptor as usize) else {
         return false;
     };
     let absent_session = semantics.session_arg == ARG_NONE
-        && begin.session_status() == handle_status::ABSENT
-        && begin.session_word() == 0;
-    let session_agrees = event.session == begin.session_word()
+        && entry.session_status == handle_status::ABSENT
+        && entry.session == 0;
+    let session_agrees = event.session == entry.session
         || (absent_session
             && (event.session == SESSION_NONE
                 || (semantics.lifecycle == lifecycle::OPEN_SESSION
-                    && begin.capture() & capture::OUTPUT_MASK == capture::OUTPUT_NON_NULL
+                    && entry.capture & capture::OUTPUT_MASK == capture::OUTPUT_NON_NULL
                     && matches!(event.rv, 0 | 0x204)
-                    && returned_word_fits_layout(event.session, begin.layout()))));
+                    && returned_word_fits_layout(event.session, entry.layout))));
     if !session_agrees {
         return false;
     }
 
-    if event.mechanism == begin.entry_mechanism() && event.capture == begin.capture() {
+    if event.mechanism == entry.mechanism && event.capture == entry.capture {
         return true;
     }
-    let before = begin.capture();
+    let before = entry.capture;
     let after = event.capture;
     // Wire-contract rule: an OK `C_AsyncGetID` return may gain ONLY
     // the value-unreadable bit (null output pointer or unreadable
@@ -1956,8 +2128,8 @@ fn returned_fields_agree(
     // or bit change falls through to the strict rule below — in
     // particular the bit never clears and never appears beside
     // another change.
-    if event.mechanism == begin.entry_mechanism()
-        && async_get_id_capture_gain(begin.descriptor(), event.rv, before, after)
+    if event.mechanism == entry.mechanism
+        && async_get_id_capture_gain(entry.descriptor, event.rv, before, after)
     {
         return true;
     }
@@ -1973,24 +2145,22 @@ fn returned_fields_agree(
         return false;
     }
     if entry_state == capture::MECHANISM_VALUE {
-        if event.mechanism != begin.entry_mechanism() {
+        if event.mechanism != entry.mechanism {
             return false;
         }
     } else if !matches!(
         entry_state,
         capture::MECHANISM_NONE | capture::MECHANISM_UNREADABLE
-    ) || begin.entry_mechanism() != MECH_NONE
+    ) || entry.mechanism != MECH_NONE
     {
         return false;
     }
     match return_state {
         capture::MECHANISM_VALUE => {
             entry_failed == return_failed
-                && returned_word_fits_layout(event.mechanism, begin.layout())
+                && returned_word_fits_layout(event.mechanism, entry.layout)
         }
-        capture::MECHANISM_UNREADABLE => {
-            return_failed && event.mechanism == begin.entry_mechanism()
-        }
+        capture::MECHANISM_UNREADABLE => return_failed && event.mechanism == entry.mechanism,
         _ => false,
     }
 }
@@ -3369,7 +3539,8 @@ impl SealedCall {
     /// identity: conversion mints tickets from queued admissions, so
     /// value-equal shapes from different invocations never match) —
     /// then the same catalog function, the same session, and the same
-    /// mechanism capture shape. Value words are never compared (only
+    /// mechanism capture shape up to the producer's return rewrites
+    /// (below). Value words are never compared (only
     /// the finite class crosses); an unreadable sealed session never
     /// matches; a session-less staged head matches only a
     /// session-less sealed call.
@@ -3386,9 +3557,27 @@ impl SealedCall {
         if self.function != function {
             return false;
         }
+        use super::state::MechClass;
+        use p11scope_ebpf_common::{ARG_NONE, lifecycle};
+        // The sealed fingerprint is the BEGIN's entry-time class; the
+        // staged head carries the return-time S1 words. The admission
+        // bound above was already checked against this BEGIN under the
+        // producer's rewrite rules (`returned_words_agree`) before
+        // conversion, so only those class-level rewrites are allowed
+        // here: an absent session may read `SESSION_NONE` (or the
+        // returned `C_OpenSession` handle), and a not-captured or
+        // unreadable entry mechanism may read VALUE or UNREADABLE for a
+        // mechanism-bearing function.
+        let semantics = crate::kinds::DESCRIPTORS.get(function as usize + 1);
         let session_ok = match self.session {
             super::HandleInput::Value(handle) => handle.0 == session,
-            super::HandleInput::Absent => session == p11scope_ebpf_common::SESSION_NONE,
+            super::HandleInput::Absent => {
+                session == p11scope_ebpf_common::SESSION_NONE
+                    || semantics.is_some_and(|semantics| {
+                        semantics.session_arg == ARG_NONE
+                            && semantics.lifecycle == lifecycle::OPEN_SESSION
+                    })
+            }
             super::HandleInput::Unreadable => false,
         };
         if !session_ok {
@@ -3396,15 +3585,21 @@ impl SealedCall {
         }
         let bits = mechanism_capture & capture::MECHANISM_MASK;
         let class = if bits == capture::MECHANISM_VALUE {
-            super::state::MechClass::Value
+            MechClass::Value
         } else if bits == capture::MECHANISM_NULL {
-            super::state::MechClass::Null
+            MechClass::Null
         } else if bits == capture::MECHANISM_UNREADABLE {
-            super::state::MechClass::Unreadable
+            MechClass::Unreadable
         } else {
-            super::state::MechClass::NotCaptured
+            MechClass::NotCaptured
         };
         self.mechanism == class
+            || (semantics.is_some_and(|semantics| semantics.mechanism_arg != ARG_NONE)
+                && matches!(
+                    self.mechanism,
+                    MechClass::NotCaptured | MechClass::Unreadable
+                )
+                && matches!(class, MechClass::Value | MechClass::Unreadable))
     }
 }
 
@@ -3730,13 +3925,14 @@ impl JournalAdapter {
             && endpoint_class(fingerprint.function) == Some(EndpointClass::ModeledAffecting)
         {
             self.claim_fingerprint(
-                fingerprint,
                 key,
                 AdmittedJournalClaim {
                     admission: admitted.h0_ordinal(),
                     return_ns: admitted
                         .journal_return_ns()
                         .expect("fingerprint retained its return"),
+                    returned: fingerprint,
+                    rv: admitted.s1_facts().rv,
                 },
             )?;
         }
@@ -3759,7 +3955,11 @@ impl JournalAdapter {
         (origin.position() == admitted.h0_ordinal()
             && entry.collected_origin == Some(origin)
             && entry.image == fingerprint.image
-            && fingerprint_of_begin(&entry.begin) == fingerprint
+            && fingerprint_names_shape(
+                &shape_of_entry(entry),
+                &fingerprint,
+                admitted.s1_facts().rv,
+            )
             && end_agrees_with_begin(&entry.begin, &end.end)
             && admitted.journal_return_ns() == Some(end.end.payload_base().event.ts_ns)
             && fingerprint_matches_event(&fingerprint, &end.end.payload_base().event)
@@ -3782,10 +3982,7 @@ impl JournalAdapter {
         let Some(entry) = self.retained_admission_entry(admitted) else {
             return false;
         };
-        !self
-            .claims
-            .get(&fingerprint_of_begin(&entry.begin))
-            .is_some_and(|claimants| claimants.values().any(|claims| !claims.is_empty()))
+        !self.identity_claimed(&identity_of_begin(&entry.begin))
             && self.ledger.matches_unconverted_original(
                 entry.begin_ordinal,
                 admitted
@@ -3815,10 +4012,10 @@ impl JournalAdapter {
         {
             return None;
         }
-        let fingerprint = fingerprint_of_begin(&entry.begin);
+        let shape = shape_of_entry(entry);
         let mut originals = self
             .claims
-            .get(&fingerprint)
+            .get(&shape.identity)
             .into_iter()
             .flat_map(|claimants| {
                 claimants
@@ -3830,6 +4027,7 @@ impl JournalAdapter {
         };
         (originals.next().is_none()
             && *claimant == key
+            && claim_names_shape(&shape, claim)
             && claim.admission == origin.position()
             && claim.return_ns == end.end.payload_base().event.ts_ns)
             .then_some(Some(*claim))
@@ -3928,19 +4126,22 @@ impl JournalAdapter {
         // refused begin or claim (even an own claim) must stay on the strict
         // retained path. In particular no per-image/global empty-ledger test
         // can replace this original's complete alias/role release above.
+        // Identity, not enrichment, decides "the same invocation" here:
+        // any same-identity BEGIN, refused BEGIN or claim refuses.
+        let identity = fingerprint.identity();
         if self.open.contains_key(&resource.invocation())
             || self.open.values().any(|entry| {
                 entry.collected_origin == Some(origin)
-                    || fingerprint_of_begin(&entry.begin) == fingerprint
+                    || identity_of_begin(&entry.begin) == identity
             })
             || self
                 .refused
                 .iter()
-                .any(|entry| fingerprint_of_refused(entry) == fingerprint)
+                .any(|entry| entry.identity() == identity)
             || self.claims.iter().any(|(claimed, claimants)| {
                 claimants.iter().any(|(key, claims)| {
                     !claims.is_empty()
-                        && (*claimed == fingerprint
+                        && (*claimed == identity
                             || (key.domain_tag == native.journal_tag()
                                 && claims
                                     .iter()
@@ -4022,22 +4223,23 @@ impl JournalAdapter {
     /// claims, then refuses the attestation.
     fn claim_fingerprint(
         &mut self,
-        fingerprint: CallFingerprint,
         key: JournalDomainKey,
         claim: AdmittedJournalClaim,
     ) -> Result<(), AttestationRefusal> {
+        let fingerprint = claim.returned;
+        let identity = fingerprint.identity();
         let retained = self
             .open
             .values()
             .filter(|entry| {
                 entry.converted_ticket.is_none()
-                    && fingerprint_of_begin(&entry.begin) == fingerprint
+                    && claim_names_shape(&shape_of_entry(entry), &claim)
             })
             .count()
             + self
                 .refused
                 .iter()
-                .filter(|entry| fingerprint_of_refused(entry) == fingerprint)
+                .filter(|entry| claim_names_shape(&entry.shape(), &claim))
                 .count();
         if self
             .physical_return_floors
@@ -4063,14 +4265,17 @@ impl JournalAdapter {
                 return Err(AttestationRefusal::ClaimsExhausted);
             }
         }
+        // Keyed by the entry-invariant identity: two admissions for one
+        // physical invocation (same thread, same entry time) are an
+        // ambiguity even when their returned words differ.
         self.claims
-            .entry(fingerprint)
+            .entry(identity)
             .or_default()
             .entry(key)
             .or_default()
             .push_back(claim);
         self.claim_counts += 1;
-        if self.claims[&fingerprint]
+        if self.claims[&identity]
             .values()
             .map(VecDeque::len)
             .sum::<usize>()
@@ -4109,11 +4314,11 @@ impl JournalAdapter {
     /// validation. Conversion mints its ticket from that H0 identity.
     fn peek_claim(
         &self,
-        fingerprint: &CallFingerprint,
+        identity: &CallIdentity,
         key: JournalDomainKey,
     ) -> Option<AdmittedJournalClaim> {
         self.claims
-            .get(fingerprint)
+            .get(identity)
             .and_then(|claimants| claimants.get(&key))
             .and_then(|ordinals| ordinals.front().copied())
     }
@@ -4126,19 +4331,19 @@ impl JournalAdapter {
     /// (callers refuse loudly, never minting from thin air).
     fn consume_claim(
         &mut self,
-        fingerprint: &CallFingerprint,
+        identity: &CallIdentity,
         key: JournalDomainKey,
     ) -> Option<AdmittedJournalClaim> {
         let mut vacated = false;
         let mut popped = None;
-        if let Some(claimants) = self.claims.get_mut(fingerprint) {
+        if let Some(claimants) = self.claims.get_mut(identity) {
             if let Some(ordinals) = claimants.get_mut(&key) {
                 popped = ordinals.pop_front();
                 if let Some(claim) = popped {
                     self.claim_counts -= 1;
                     let floor = self
                         .physical_return_floors
-                        .get_mut(&fingerprint.pid_tgid)
+                        .get_mut(&identity.pid_tgid)
                         .expect("physical namespace reserved before claim consumption");
                     *floor = (*floor).max(claim.return_ns);
                 }
@@ -4149,7 +4354,7 @@ impl JournalAdapter {
             vacated = claimants.is_empty();
         }
         if vacated {
-            self.claims.remove(fingerprint);
+            self.claims.remove(identity);
         }
         popped
     }
@@ -4168,8 +4373,8 @@ impl JournalAdapter {
         registry: &crate::discovery::caller_registry::CallerRegistry,
     ) -> Result<Option<u64>, joint_driver::RawQuantumRefusal> {
         use joint_driver::RawQuantumRefusal;
-        let fingerprint = fingerprint_of_begin(&entry.begin);
-        let Some(claimants) = self.claims.get(&fingerprint) else {
+        let shape = shape_of_entry(entry);
+        let Some(claimants) = self.claims.get(&shape.identity) else {
             return Ok(None);
         };
         let Some(mine) = claimants.get(&key).filter(|claims| !claims.is_empty()) else {
@@ -4199,6 +4404,9 @@ impl JournalAdapter {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }
         let claim = mine.front().expect("one original admission");
+        if !claim_names_shape(&shape, claim) {
+            return Err(RawQuantumRefusal::DispositionMismatch);
+        }
         let event = end.end.payload_base().event;
         let staged = registry
             .joint_staged_resource(target, claim.admission)
@@ -4209,11 +4417,11 @@ impl JournalAdapter {
                 .collected_origin
                 .is_none_or(|origin| origin.position() != claim.admission)
             || !end_agrees_with_begin(&entry.begin, &end.end)
-            || !fingerprint_matches_event(&fingerprint, &event)
+            || !fingerprint_matches_event(&claim.returned, &event)
             || event.ts_ns != claim.return_ns
             || !self
                 .physical_return_floors
-                .contains_key(&fingerprint.pid_tgid)
+                .contains_key(&shape.identity.pid_tgid)
             || !self.ledger.matches_completed_staging(
                 entry.begin_ordinal,
                 key.domain_tag,
@@ -4359,15 +4567,15 @@ impl JournalAdapter {
                 "one bounded original disposition"
             );
             let (native, admission) = original.expect("preflight exact consumed head");
-            let (ordinal, fingerprint) = {
+            let (ordinal, identity) = {
                 let entry = self
                     .open
                     .remove(&native)
                     .expect("exclusively retained original");
-                (entry.begin_ordinal, fingerprint_of_begin(&entry.begin))
+                (entry.begin_ordinal, identity_of_begin(&entry.begin))
             };
             let claim = self
-                .consume_claim(&fingerprint, key)
+                .consume_claim(&identity, key)
                 .expect("preflight original claim");
             assert_eq!(claim.admission, admission);
             self.ledger.release_h8open(ordinal);
@@ -4385,13 +4593,13 @@ impl JournalAdapter {
     fn attribute_call(
         &self,
         key: JournalDomainKey,
-        fingerprint: &CallFingerprint,
+        shape: &StagedShape,
         live: &[JournalDomainKey],
     ) -> CallAttribution {
         let mut mine = false;
         let mut sibling = false;
         let mut dead = false;
-        if let Some(claimants) = self.claims.get(fingerprint) {
+        if let Some(claimants) = self.claimants_naming(shape) {
             for (claimant, ordinals) in claimants {
                 if ordinals.is_empty() {
                     continue;
@@ -4410,6 +4618,32 @@ impl JournalAdapter {
             (false, true, _) | (false, false, true) => CallAttribution::Sibling,
             _ => CallAttribution::Unclaimed,
         }
+    }
+
+    /// The claimants that may attribute one staged entry: its identity's
+    /// claims, only when every claim there names the entry (the
+    /// producer's rewrite rules against the BEGIN, exact against a staged
+    /// END). A claim on the same entry-time identity that reports a return
+    /// this entry cannot have made is a different call: no claimant
+    /// attributes, so the entry stays Unclaimed and the seal holds.
+    fn claimants_naming(
+        &self,
+        shape: &StagedShape,
+    ) -> Option<&BTreeMap<JournalDomainKey, VecDeque<AdmittedJournalClaim>>> {
+        let claimants = self.claims.get(&shape.identity)?;
+        claimants
+            .values()
+            .flatten()
+            .all(|claim| claim_names_shape(shape, claim))
+            .then_some(claimants)
+    }
+
+    /// Whether any live-or-dead claim, naming the entry or not, sits on
+    /// one entry-time identity: the conservative test for "unclaimed".
+    fn identity_claimed(&self, identity: &CallIdentity) -> bool {
+        self.claims
+            .get(identity)
+            .is_some_and(|claimants| claimants.values().any(|claims| !claims.is_empty()))
     }
 
     /// The plan's seal entry: audit (with a seal-time native fault
@@ -4874,10 +5108,8 @@ impl JournalAdapter {
                 }
                 [] => {}
                 _ => {
-                    let fingerprint = fingerprint_of_begin(&entry.begin);
                     let claimants: Vec<JournalDomainKey> = self
-                        .claims
-                        .get(&fingerprint)
+                        .claimants_naming(&shape_of_entry(entry))
                         .map(|m| {
                             m.iter()
                                 .filter(|(key, ordinals)| {
@@ -4972,7 +5204,7 @@ impl JournalAdapter {
         frontier: u64,
     ) -> bool {
         let image = (key.cookie, key.exec);
-        let mut needs: BTreeMap<CallFingerprint, u64> = BTreeMap::new();
+        let mut needs: BTreeMap<CallIdentity, u64> = BTreeMap::new();
         for entry in self.open.values() {
             if entry.image != image
                 || entry.converted_ticket.is_some()
@@ -4980,9 +5212,10 @@ impl JournalAdapter {
             {
                 continue;
             }
-            match self.attribute_call(key, &fingerprint_of_begin(&entry.begin), live) {
+            let shape = shape_of_entry(entry);
+            match self.attribute_call(key, &shape, live) {
                 CallAttribution::Mine => {
-                    *needs.entry(fingerprint_of_begin(&entry.begin)).or_default() += 1;
+                    *needs.entry(shape.identity).or_default() += 1;
                 }
                 CallAttribution::Sibling => {}
                 CallAttribution::Unclaimed => return false,
@@ -4992,17 +5225,18 @@ impl JournalAdapter {
             if refused.image != image || refused.cut > frontier {
                 continue;
             }
-            match self.attribute_call(key, &fingerprint_of_refused(refused), live) {
+            let shape = refused.shape();
+            match self.attribute_call(key, &shape, live) {
                 CallAttribution::Mine => {
-                    *needs.entry(fingerprint_of_refused(refused)).or_default() += 1;
+                    *needs.entry(shape.identity).or_default() += 1;
                 }
                 CallAttribution::Sibling => {}
                 CallAttribution::Unclaimed => return false,
             }
         }
-        needs.into_iter().all(|(fingerprint, need)| {
+        needs.into_iter().all(|(identity, need)| {
             self.claims
-                .get(&fingerprint)
+                .get(&identity)
                 .and_then(|claimants| claimants.get(&key))
                 .map(|ordinals| ordinals.len() as u64)
                 .unwrap_or(0)
@@ -5028,23 +5262,20 @@ impl JournalAdapter {
             return false;
         }
         let mut waiting = false;
-        let mut needed = BTreeMap::<CallFingerprint, usize>::new();
+        let mut needed = BTreeMap::<CallIdentity, usize>::new();
         for entry in self.open.values().filter(|entry| {
             entry.image == (key.cookie, key.exec)
                 && entry.begin_ordinal <= frontier.0
                 && entry.converted_ticket.is_none()
         }) {
-            let fingerprint = fingerprint_of_begin(&entry.begin);
-            match self.attribute_call(key, &fingerprint, &live) {
+            let shape = shape_of_entry(entry);
+            match self.attribute_call(key, &shape, &live) {
                 CallAttribution::Sibling => {}
                 CallAttribution::Mine => {
-                    *needed.entry(fingerprint).or_default() += 1;
+                    *needed.entry(shape.identity).or_default() += 1;
                 }
                 CallAttribution::Unclaimed => {
-                    let any_claim = self.claims.get(&fingerprint).is_some_and(|claimants| {
-                        claimants.values().any(|claims| !claims.is_empty())
-                    });
-                    if any_claim
+                    if self.identity_claimed(&shape.identity)
                         || entry.end.is_some()
                         || entry.abandon.is_some()
                         || entry.corroborated_return.is_some()
@@ -5056,9 +5287,9 @@ impl JournalAdapter {
             }
         }
         waiting
-            && needed.into_iter().all(|(fingerprint, count)| {
+            && needed.into_iter().all(|(identity, count)| {
                 self.claims
-                    .get(&fingerprint)
+                    .get(&identity)
                     .and_then(|claimants| claimants.get(&key))
                     .is_some_and(|claims| claims.len() >= count)
             })
@@ -5074,8 +5305,7 @@ impl JournalAdapter {
     ) -> bool {
         entry.image == (key.cookie, key.exec)
             && entry.converted_ticket.is_none()
-            && self.attribute_call(key, &fingerprint_of_begin(&entry.begin), live)
-                == CallAttribution::Mine
+            && self.attribute_call(key, &shape_of_entry(entry), live) == CallAttribution::Mine
     }
 
     /// Whether one staged refused begin converts under a sealing key.
@@ -5086,8 +5316,7 @@ impl JournalAdapter {
         refused: &RefusedBegin,
     ) -> bool {
         refused.image == (key.cookie, key.exec)
-            && self.attribute_call(key, &fingerprint_of_refused(refused), live)
-                == CallAttribution::Mine
+            && self.attribute_call(key, &refused.shape(), live) == CallAttribution::Mine
     }
 
     /// Whether one staged open entry's abandonment disposes under a
@@ -5326,14 +5555,12 @@ impl JournalAdapter {
         frontier: u64,
         audit: &JournalAuditReceipt,
     ) -> Result<(), SealFailure> {
-        let mut candidates: BTreeMap<
-            CallFingerprint,
-            (usize, Option<p11scope_ebpf_common::Event>),
-        > = BTreeMap::new();
+        let mut candidates: BTreeMap<CallIdentity, (usize, Option<p11scope_ebpf_common::Event>)> =
+            BTreeMap::new();
         for entry in self.open.values() {
             if entry.begin_ordinal <= frontier && self.converts_here(key, live, entry) {
                 let value = candidates
-                    .entry(fingerprint_of_begin(&entry.begin))
+                    .entry(identity_of_begin(&entry.begin))
                     .or_default();
                 value.0 += 1;
                 value.1 = entry
@@ -5344,28 +5571,28 @@ impl JournalAdapter {
         }
         for entry in &self.refused {
             if entry.cut <= frontier && self.refused_converts_here(key, live, entry) {
-                candidates
-                    .entry(fingerprint_of_refused(entry))
-                    .or_default()
-                    .0 += 1;
+                candidates.entry(entry.identity()).or_default().0 += 1;
             }
         }
-        for (fingerprint, (_, end)) in candidates {
+        for (identity, (_, end)) in candidates {
+            // Two staged BEGINs sharing one entry-time identity (same
+            // thread, same entry time) are an ambiguity whatever their
+            // other words: one claim never covers both.
             let count = self
                 .open
                 .values()
-                .filter(|entry| fingerprint_of_begin(&entry.begin) == fingerprint)
+                .filter(|entry| identity_of_begin(&entry.begin) == identity)
                 .count()
                 + self
                     .refused
                     .iter()
-                    .filter(|entry| fingerprint_of_refused(entry) == fingerprint)
+                    .filter(|entry| entry.identity() == identity)
                     .count();
-            let claims = &self.claims[&fingerprint][&key];
+            let claims = &self.claims[&identity][&key];
             if count != 1 || claims.len() != 1 {
                 // Do not let pruning/void turn this ambiguity into a later
                 // singleton winner. Taint preserves every claim unconsumed.
-                self.taint_image(fingerprint.image);
+                self.taint_image(identity.image);
                 return Err(self.failure(JournalGap::ImageTainted));
             }
             let claim = claims.front().expect("one exact claim");
@@ -5386,10 +5613,13 @@ impl JournalAdapter {
             if !covered {
                 return Err(self.failure(JournalGap::H3Pending));
             }
+            // The END corroborates the claim's full return-time
+            // fingerprint exactly; only the BEGIN side is enrichment-aware.
             if let Some(end) = end
                 && (end.duration_ns == 0
-                    || end.ts_ns.checked_sub(end.duration_ns) != Some(fingerprint.entry_ns)
-                    || end.ts_ns != claim.return_ns)
+                    || end.ts_ns.checked_sub(end.duration_ns) != Some(identity.entry_ns)
+                    || end.ts_ns != claim.return_ns
+                    || !fingerprint_matches_event(&claim.returned, &end))
             {
                 return Err(self.failure(JournalGap::H3Pending));
             }
@@ -5496,14 +5726,14 @@ impl JournalAdapter {
             let mut kept = Vec::with_capacity(self.refused.len());
             for refused in self.refused.iter() {
                 if refused.cut <= frontier && self.refused_converts_here(key, &live, refused) {
-                    consumed.push(fingerprint_of_refused(refused));
+                    consumed.push(refused.identity());
                 } else {
                     kept.push(*refused);
                 }
             }
             self.refused = kept;
-            for fingerprint in &consumed {
-                self.consume_claim(fingerprint, key);
+            for identity in &consumed {
+                self.consume_claim(identity, key);
             }
         }
         // This key's begins in cut order, then their terminals. A
@@ -5527,8 +5757,8 @@ impl JournalAdapter {
             // burn/model mutation; no FIFO/rank inference assigns it.
             // A missing claim is an invariant refusal, never a ticket
             // minted from another invocation.
-            let fingerprint = fingerprint_of_begin(&entry.begin);
-            let Some(claim) = self.peek_claim(&fingerprint, key) else {
+            let identity = identity_of_begin(&entry.begin);
+            let Some(claim) = self.peek_claim(&identity, key) else {
                 self.keys.get_mut(&key).expect("sealed key").tainted = true;
                 return Err(SealFailure {
                     gap: JournalGap::ModelRefused,
@@ -5561,7 +5791,7 @@ impl JournalAdapter {
             }
             match admitted {
                 Ok(token) => {
-                    let popped = self.consume_claim(&fingerprint, key);
+                    let popped = self.consume_claim(&identity, key);
                     debug_assert_eq!(popped, Some(claim));
                     let (session, mechanism) = sealed_fingerprint(&entry.begin);
                     let entry = self.open.get_mut(&native).expect("staged begin");
@@ -6933,21 +7163,7 @@ pub(crate) mod tests {
     /// Test-only refused-BEGIN mirror of the production capacity-refusal
     /// path: the same cut and identity the adapter would retain.
     fn refused_of_begin(begin: &ValidatedJournalBegin, cut: u64) -> RefusedBegin {
-        RefusedBegin {
-            cut,
-            image: (begin.image_cookie(), begin.image_exec()),
-            pid_tgid: begin.pid_tgid(),
-            function: begin.descriptor() - 1,
-            slot: begin.slot(),
-            session: begin.session_word(),
-            mechanism: begin.entry_mechanism(),
-            slot_id: begin.slot_id(),
-            user_type: begin.user_type(),
-            capture: begin.capture(),
-            flags: begin.call_flags(),
-            entry_ns: begin.entry_ns(),
-            corroborated_return: None,
-        }
+        RefusedBegin::of_begin(cut, begin, (begin.image_cookie(), begin.image_exec()))
     }
 
     /// Decode one producer pair into its BEGIN plus the preserved CALL
@@ -14798,19 +15014,16 @@ pub(crate) mod tests {
         );
     }
 
-    /// P2A-1 carry item 2, KNOWN HOLD (not intent): the safe-entry
-    /// producer reads the mechanism word only at return, so the staged
-    /// BEGIN carries NONE + sentinel while the H0 admission (and the
-    /// END) carry VALUE + word. Claims file under the admitted
-    /// (return-side) fingerprint but attribute under the BEGIN
-    /// (entry-side) one by exact equality, so the staged shape is
-    /// Unclaimed and the seal holds with BoundNotReady. The END itself
-    /// stages (return rewrites agree). Owned by the Activation packet
-    /// (P2A-1 finding 1: rewrite-aware claim matching, with END and
-    /// lost-END twins); live, this hold sits behind the H3Loss
-    /// StagedLoss failure. Flip the seal assertion when that lands.
+    /// The safe-entry producer reads the mechanism word only at return,
+    /// so the staged BEGIN carries NONE + sentinel while the H0 admission
+    /// (and the END) carry VALUE + word. Claims are keyed by the
+    /// entry-invariant identity and checked against the BEGIN through the
+    /// producer's rewrite rules, so the claim names its own BEGIN and the
+    /// seal certifies. Exact fingerprint equality left this shape
+    /// Unclaimed and held the seal on `BoundNotReady` (the live wedge of
+    /// the first linked `--system --key-operations` seal).
     #[test]
-    fn object_journal_return_read_mechanism_claim_holds_seal() {
+    fn object_journal_return_read_mechanism_claim_seals() {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
         use p11scope_ebpf_common::{MECH_NONE, capture};
         let mut scene = Scene::new(image_default());
@@ -14859,20 +15072,26 @@ pub(crate) mod tests {
         let admitted_fp = admitted
             .journal_call_fingerprint()
             .expect("the paired return files a claim");
-        let begin_fp = fingerprint_of_begin(&native);
         assert_ne!(
-            (begin_fp.mechanism, begin_fp.capture),
+            (native.entry_mechanism(), native.capture()),
             (admitted_fp.mechanism, admitted_fp.capture),
-            "entry-side vs return-side fingerprints diverge"
+            "entry-side vs return-side words diverge"
+        );
+        assert_eq!(
+            admitted_fp.identity(),
+            identity_of_begin(&native),
+            "the entry-invariant identity agrees"
         );
         let proof = scene
             .adapter
             .attest_key(&admitted)
             .expect("paired return attests");
-        let hold = scene
-            .seal(&scene.bootstrap(proof, 0))
-            .expect_err("the diverged claim holds the seal today");
-        assert_eq!(hold.gap, JournalGap::BoundNotReady);
+        let sealed = scene.seal(&scene.bootstrap(proof, 0));
+        assert!(
+            sealed.is_ok(),
+            "the return-read claim names its BEGIN: {:?}",
+            sealed.err().map(|failure| failure.gap)
+        );
     }
 
     /// One production-shaped enriched call: the BEGIN keeps the safe
@@ -14940,12 +15159,21 @@ pub(crate) mod tests {
         ];
         for (name, shape, rewrite) in cases {
             let (mut scene, proof) = enriched_claim_scene(name, rewrite, |_| {});
-            let begin = scene.adapter.open.values().next().expect("staged BEGIN").begin;
+            let begin = scene
+                .adapter
+                .open
+                .values()
+                .next()
+                .expect("staged BEGIN")
+                .begin;
             let returned = scene.adapter.open.values().next().unwrap().end.unwrap();
             let returned = returned.end.payload_base().event;
             assert!(
-                (begin.session_word(), begin.entry_mechanism(), begin.capture())
-                    != (returned.session, returned.mechanism, returned.capture),
+                (
+                    begin.session_word(),
+                    begin.entry_mechanism(),
+                    begin.capture()
+                ) != (returned.session, returned.mechanism, returned.capture),
                 "{shape}: the twin models a return rewrite, not equality-by-copy"
             );
             if shape == "absent-session" {
@@ -15007,6 +15235,329 @@ pub(crate) mod tests {
             "the lost-END claim names its BEGIN: {:?}",
             sealed.err().map(|failure| failure.gap)
         );
+    }
+
+    /// Attribution of the scene's one staged entry under `proof`'s key.
+    fn staged_attribution(scene: &Scene, proof: JournalDomainProof) -> CallAttribution {
+        let entry = scene.adapter.open.values().next().expect("staged BEGIN");
+        let live = scene.adapter.live_keys_for_image(entry.image);
+        scene
+            .adapter
+            .attribute_call(proof.key, &shape_of_entry(entry), &live)
+    }
+
+    /// A production BEGIN (no END yet) and one H0 admission whose return
+    /// `forge` may change: isolates the BEGIN-side rewrite rules.
+    fn begin_only_claim_scene(
+        name: &str,
+        rewrite: impl FnOnce(
+            &mut p11scope_ebpf_common::CallStart,
+            &mut p11scope_ebpf_common::object_flow::ReturnEventFacts,
+        ),
+        forge: impl FnOnce(&mut Event),
+    ) -> (Scene, JournalDomainProof) {
+        let (begin, end) = producer_agreement_pair(name, rewrite);
+        let mut scene = Scene::new(image_default());
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let JournalRecord::End(staged) = decode_journal_record(&end, &scene.descriptors).unwrap()
+        else {
+            panic!("END")
+        };
+        let mut returned = staged.payload_base().event;
+        forge(&mut returned);
+        let admitted = scene.fixture.admit_original_event(name, returned);
+        let proof = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("the forged return still attests a key");
+        (scene, proof)
+    }
+
+    /// Each enriched word has a healthy twin (the producer's own return
+    /// names the BEGIN: Mine) and mismatch twins (a return the producer
+    /// could not have made from this BEGIN: Unclaimed, and the seal holds
+    /// rather than converting another call's claim).
+    #[test]
+    fn object_journal_enriched_claim_mismatch_stays_unclaimed() {
+        use p11scope_ebpf_common::SESSION_NONE;
+        type Rewrite = fn(
+            &mut p11scope_ebpf_common::CallStart,
+            &mut p11scope_ebpf_common::object_flow::ReturnEventFacts,
+        );
+        type Forge = fn(&mut Event);
+        let cases: [(&str, &str, Rewrite, Forge); 12] = [
+            // Absent session: only SESSION_NONE (or OpenSession's handle).
+            (
+                "C_Initialize",
+                "session-not-none",
+                |_, _| {},
+                |event| {
+                    event.session = 5;
+                },
+            ),
+            (
+                "C_Finalize",
+                "session-not-none",
+                |_, _| {},
+                |event| {
+                    event.session = 0x9090;
+                },
+            ),
+            (
+                "C_CloseAllSessions",
+                "session-handle",
+                |_, _| {},
+                |event| {
+                    event.session = 1;
+                },
+            ),
+            // OpenSession's output needs an OK (or 0x204) return.
+            (
+                "C_OpenSession",
+                "handle-on-failure",
+                |_, _| {},
+                |event| {
+                    event.rv = 5;
+                },
+            ),
+            // A non-sessionless call keeps its session exact.
+            (
+                "C_SignInit",
+                "session-changed",
+                |_, _| {},
+                |event| {
+                    event.session ^= 1;
+                },
+            ),
+            // Mechanism read at return needs a mechanism-allowing rv.
+            (
+                "C_SignInit",
+                "mechanism-on-failure",
+                |_, _| {},
+                |event| {
+                    event.rv = 5;
+                },
+            ),
+            // Only mechanism-state and read-failure bits may change.
+            (
+                "C_SignInit",
+                "output-bits-changed",
+                |_, _| {},
+                |event| {
+                    event.capture ^= capture::OUTPUT_NULL;
+                },
+            ),
+            // A NULL mechanism state is never a return rewrite.
+            (
+                "C_SignInit",
+                "mechanism-null",
+                |_, _| {},
+                |event| {
+                    event.capture =
+                        (event.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_NULL;
+                },
+            ),
+            // UNREADABLE at return keeps the sentinel and the failure bit.
+            (
+                "C_SignInit",
+                "unreadable-with-word",
+                |_, _| {},
+                |event| {
+                    event.capture = (event.capture & !capture::MECHANISM_MASK)
+                        | capture::MECHANISM_UNREADABLE
+                        | capture::ARG_READ_FAILURE;
+                },
+            ),
+            // Identity words stay exact: another entry time or flags word
+            // is another call.
+            (
+                "C_SignInit",
+                "entry-time",
+                |_, _| {},
+                |event| {
+                    event.duration_ns += 1;
+                },
+            ),
+            (
+                "C_OpenSession",
+                "flags",
+                |_, _| {},
+                |event| {
+                    event.flags ^= 1;
+                },
+            ),
+            (
+                "C_Initialize",
+                "user-type",
+                |_, _| {},
+                |event| {
+                    event.user_type ^= 1;
+                },
+            ),
+        ];
+        // Every case runs; the failures are reported together.
+        let mut wrong = Vec::new();
+        for (name, shape, rewrite, forge) in cases {
+            let (scene, proof) = begin_only_claim_scene(name, rewrite, |_| {});
+            let healthy = staged_attribution(&scene, proof);
+            let (mut scene, proof) = begin_only_claim_scene(name, rewrite, forge);
+            let forged = staged_attribution(&scene, proof);
+            let bootstrap = scene.bootstrap(proof, 0);
+            let sealed = scene.seal(&bootstrap).map(|_| ()).map_err(|hold| hold.gap);
+            if healthy != CallAttribution::Mine
+                || forged != CallAttribution::Unclaimed
+                || sealed != Err(JournalGap::BoundNotReady)
+            {
+                wrong.push(format!("{name} {shape}: {healthy:?} {forged:?} {sealed:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "healthy twins name their BEGIN, forged returns stay Unclaimed and hold: {wrong:#?}"
+        );
+        // The absent-session healthy twin really is a rewrite.
+        let (scene, _) = begin_only_claim_scene("C_Initialize", |_, _| {}, |_| {});
+        let entry = scene.adapter.open.values().next().unwrap();
+        assert_eq!(entry.begin.session_word(), 0);
+        assert_eq!(
+            scene
+                .adapter
+                .claims
+                .values()
+                .next()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()[0]
+                .returned
+                .session,
+            SESSION_NONE
+        );
+    }
+
+    /// H9 binds a sealed call to its staged head by admission, function,
+    /// session and mechanism class. The sealed class is the BEGIN's
+    /// entry-time one and the head carries the return-time S1 words, so
+    /// the binding allows exactly the producer's class-level rewrites and
+    /// nothing else.
+    #[test]
+    fn object_journal_sealed_call_matches_return_enriched_head() {
+        for name in [
+            "C_Initialize",
+            "C_Finalize",
+            "C_CloseAllSessions",
+            "C_OpenSession",
+            "C_SignInit",
+        ] {
+            let (mut scene, proof) = enriched_claim_scene(name, |_, _| {}, |_| {});
+            let returned = scene.adapter.open.values().next().unwrap().end.unwrap();
+            let returned = returned.end.payload_base().event;
+            let bootstrap = scene.bootstrap(proof, 0);
+            let success = scene.seal(&bootstrap).expect("the enriched call seals");
+            let call = &success.prefix.settled()[0];
+            let function = function_id(name);
+            let head = call.key.admission();
+            assert!(
+                call.matches_head(function, returned.session, returned.capture, head),
+                "{name}: the sealed call binds its own return-enriched head"
+            );
+            assert!(
+                !call.matches_head(function, returned.session, returned.capture, head + 1),
+                "{name}: another admission never binds"
+            );
+            if name != "C_OpenSession" {
+                assert!(
+                    !call.matches_head(function, returned.session ^ 1, returned.capture, head),
+                    "{name}: only SESSION_NONE or the call's own session"
+                );
+            }
+            let null = (returned.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_NULL;
+            assert!(
+                !call.matches_head(function, returned.session, null, head),
+                "{name}: a NULL mechanism is never a return rewrite"
+            );
+            if name != "C_SignInit" {
+                let value =
+                    (returned.capture & !capture::MECHANISM_MASK) | capture::MECHANISM_VALUE;
+                assert!(
+                    !call.matches_head(function, returned.session, value, head),
+                    "{name}: no mechanism argument, no mechanism read at return"
+                );
+            }
+        }
+    }
+
+    /// The END corroborates the claim's full return-time fingerprint
+    /// exactly: a claim that agrees with the BEGIN's rewrite rules but
+    /// reports another mechanism word than the staged END is not this
+    /// call's claim.
+    #[test]
+    fn object_journal_enriched_claim_must_match_staged_end_exactly() {
+        let (scene, proof) = enriched_claim_scene("C_SignInit", |_, _| {}, |_| {});
+        assert_eq!(staged_attribution(&scene, proof), CallAttribution::Mine);
+        let (mut scene, proof) = enriched_claim_scene(
+            "C_SignInit",
+            |_, _| {},
+            |event| {
+                event.mechanism += 1;
+            },
+        );
+        assert_eq!(
+            staged_attribution(&scene, proof),
+            CallAttribution::Unclaimed,
+            "another returned mechanism than the END"
+        );
+        let bootstrap = scene.bootstrap(proof, 0);
+        let hold = scene
+            .seal(&bootstrap)
+            .expect_err("the END contradicts the claim");
+        assert_eq!(hold.gap, JournalGap::BoundNotReady);
+    }
+
+    /// Two staged BEGINs identical at entry (same thread word, same entry
+    /// time, every identity word) never share one claim: with one
+    /// admission neither converts, and with two admissions the claim
+    /// store taints the image by name.
+    #[test]
+    fn object_journal_identical_entry_begins_never_share_a_claim() {
+        let (first, first_end) = producer_agreement_pair("C_SignInit", |_, _| {});
+        let mut second = first;
+        // Another native key (thread 2), same invocation identity.
+        put_u64(&mut second, 8, 2);
+        for admissions in [1usize, 2] {
+            let mut scene = Scene::new(image_default());
+            assert_eq!(scene.ingest(&first), JournalDisposition::BeginAdmitted);
+            assert_eq!(scene.ingest(&second), JournalDisposition::BeginAdmitted);
+            let JournalRecord::End(staged) =
+                decode_journal_record(&first_end, &scene.descriptors).unwrap()
+            else {
+                panic!("END")
+            };
+            let returned = staged.payload_base().event;
+            let mut proof = None;
+            for _ in 0..admissions {
+                let admitted = scene.fixture.admit_original_event("C_SignInit", returned);
+                proof = Some(scene.adapter.attest_key(&admitted).expect("binds"));
+            }
+            let bootstrap = scene.bootstrap(proof.unwrap(), 0);
+            let failure = scene
+                .seal(&bootstrap)
+                .expect_err("one identity never converts two BEGINs");
+            let expected = if admissions == 1 {
+                JournalGap::BoundNotReady
+            } else {
+                JournalGap::ImageTainted
+            };
+            assert_eq!(failure.gap, expected, "{admissions} admissions");
+            assert!(
+                scene
+                    .adapter
+                    .open
+                    .values()
+                    .all(|entry| entry.converted_ticket.is_none()),
+                "{admissions} admissions: nothing converted"
+            );
+        }
     }
 
     #[test]

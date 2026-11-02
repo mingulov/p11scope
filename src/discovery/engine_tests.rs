@@ -7121,12 +7121,17 @@ fn retained_views_survive_ordinary_rotation_passes() {
         engine.counters.object_skips
     );
 
+    // Cadence 2: pass 2 reconciles and may rotate for unscanned pids;
+    // pass 3 is the next ordinary pass. Rotation behavior itself is
+    // pinned by the rarity and cursor tests; here only the cap fill is.
     refresh_inventory_once(&mut engine);
+    assert_eq!(engine.views.len(), 2, "the reconcile keeps the cap full");
+    let after_reconcile: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     refresh_inventory_once(&mut engine);
     let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     assert!(
-        after_first.iter().all(|pid| kept.contains(pid)),
-        "later ordinary passes displace nothing: {after_first:?} -> {kept:?}"
+        after_reconcile.iter().all(|pid| kept.contains(pid)),
+        "later ordinary passes displace nothing: {after_reconcile:?} -> {kept:?}"
     );
     assert_eq!(kept.len(), 2, "the cap stays full without churn");
 
@@ -7143,7 +7148,8 @@ fn retained_views_survive_ordinary_rotation_passes() {
 /// rotates one out for the rarity-selected newcomer (ordinary passes still
 /// displace nothing); the second reconcile admits forward, never churning
 /// the cooling evictee back in.
-/// (Mandated semantic change: pass 4 used to select 0 into zero free slots.)
+/// (Mandated semantic change: the first reconcile used to select 0 into
+/// zero free slots.)
 #[test]
 fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     struct ChildrenGuard(Vec<std::process::Child>);
@@ -7215,7 +7221,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     // individual, and the representatives move), so retry for an agreeing
     // lowest-first discovery. A deterministically broken selection never
     // agrees and still fails on the last attempt (Task-2 retry idiom).
-    // Refresh-time reads are safe: the children settled long before pass 4.
+    // Refresh-time reads are safe: the children settled long before pass 2.
     let mut agreed = None;
     for _ in 0..50 {
         let candidate =
@@ -7251,19 +7257,12 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     let mut pass1_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     pass1_views.sort_unstable();
     assert_eq!(pass1_views, pids[..2]);
-    for pass in 2..=3 {
-        let before = engine.budget.attempted_io_bytes();
-        refresh_inventory_once(&mut engine);
-        assert_eq!(
-            engine.budget.attempted_io_bytes() - before,
-            0,
-            "ordinary pass {pass} charges nothing"
-        );
-    }
 
-    // Pass 4 reconciles: the slice re-reads every enumerated maps file,
+    // Cadence 2: reconciles land on the even passes; the slice, rarity
+    // and cursor pins below are unchanged, only their passes move.
+    // Pass 2 reconciles: the slice re-reads every enumerated maps file,
     // rarity selection runs over the slice, and the cursor parks at the end.
-    let polls_before_pass4 = engine.polling_rescans_queued;
+    let polls_before_pass2 = engine.polling_rescans_queued;
     let before = engine.budget.attempted_io_bytes();
     refresh_inventory_once(&mut engine);
     let pass4 = engine.budget.attempted_io_bytes() - before;
@@ -7286,12 +7285,12 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     // two slots, so the grouped path takes the group representative (lowest
     // pid) and rotation evicts the lowest retained pid for it. Both evidence
     // records are categorical counts.
-    let mut pass4_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
-    pass4_views.sort_unstable();
+    let mut pass2_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    pass2_views.sort_unstable();
     assert_eq!(
-        pass4_views,
+        pass2_views,
         vec![pids[1], pids[2]],
-        "pass 4 rotates the lowest retained pid out for the group representative"
+        "pass 2 rotates the lowest retained pid out for the group representative"
     );
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
@@ -7315,7 +7314,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     // Queuing a poll is internal evidence, not a published loss (F1): the
     // fruitless rescan publishes no skip of its own.
     assert_eq!(
-        engine.polling_rescans_queued - polls_before_pass4,
+        engine.polling_rescans_queued - polls_before_pass2,
         1,
         "the surviving retained view polls"
     );
@@ -7338,21 +7337,19 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
         engine.counters.object_skips
     );
 
-    // Passes 5-7 are ordinary again: they charge nothing and displace
-    // nothing; pass 8 reconciles and re-reads — maps bytes are never
+    // Pass 3 is ordinary again: it charges nothing and displaces
+    // nothing; pass 4 reconciles and re-reads — maps bytes are never
     // served from a cache.
-    for pass in 5..=7 {
-        let before = engine.budget.attempted_io_bytes();
-        refresh_inventory_once(&mut engine);
-        assert_eq!(
-            engine.budget.attempted_io_bytes() - before,
-            0,
-            "ordinary pass {pass} charges nothing"
-        );
-        let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
-        kept.sort_unstable();
-        assert_eq!(kept, pass4_views, "ordinary pass {pass} displaces nothing");
-    }
+    let before = engine.budget.attempted_io_bytes();
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.budget.attempted_io_bytes() - before,
+        0,
+        "ordinary pass 3 charges nothing"
+    );
+    let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    kept.sort_unstable();
+    assert_eq!(kept, pass2_views, "ordinary pass 3 displaces nothing");
     let before = engine.budget.attempted_io_bytes();
     refresh_inventory_once(&mut engine);
     assert!(
@@ -7362,12 +7359,12 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     // The second sweep admits forward: the cooled-out evictee sits out, so
     // the remaining two unknowns fit the two slots exactly (identity, not
     // grouping) and both rotate in — neither is the just-evicted lowest pid.
-    let mut pass8_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
-    pass8_views.sort_unstable();
+    let mut pass4b_views: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    pass4b_views.sort_unstable();
     assert_eq!(
-        pass8_views,
+        pass4b_views,
         vec![pids[3], pids[4]],
-        "pass 8 walks forward past the cooling evictee"
+        "pass 4 walks forward past the cooling evictee"
     );
 
     for child in &mut children.0 {
@@ -7477,15 +7474,15 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     engine.scheduler.set_quantum_ns_for_test(u64::MAX);
     engine.scheduler.set_slice_pids_for_test(2);
 
-    for _ in 0..3 {
-        refresh_inventory_once(&mut engine);
-    }
+    // Cadence 2: one ordinary pass between reconciles; sweeps land on
+    // passes 2, 4 and 6. Slice, cursor and rotation pins are unchanged.
+    refresh_inventory_once(&mut engine);
     // The cap is full with the two lowest pids after the ordinary passes.
     let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     kept.sort_unstable();
     assert_eq!(kept, pids[..2]);
 
-    // Pass 4: first slice covers the two lowest pids, both retained.
+    // Pass 2: first slice covers the two lowest pids, both retained.
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.scheduler.cursor_for_test(), Some(pids[1]));
     assert!(
@@ -7535,10 +7532,8 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
         engine.counters.object_skips
     );
 
-    // Pass 8: next slice covers the following two pids, neither retained.
-    for _ in 0..3 {
-        refresh_inventory_once(&mut engine);
-    }
+    // Pass 4: next slice covers the following two pids, neither retained.
+    refresh_inventory_once(&mut engine);
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.scheduler.cursor_for_test(), Some(pids[3]));
     assert!(
@@ -7556,14 +7551,12 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     assert_eq!(
         kept,
         vec![pids[2], pids[3]],
-        "pass 8 rotates both unknowns in for both lowest retained pids"
+        "pass 4 rotates both unknowns in for both lowest retained pids"
     );
 
-    // Pass 12: the slice wraps past the end to the lowest pid — which
-    // rotation moved on from at pass 8, so nothing there revalidates.
-    for _ in 0..3 {
-        refresh_inventory_once(&mut engine);
-    }
+    // Pass 6: the slice wraps past the end to the lowest pid — which
+    // rotation moved on from at pass 4, so nothing there revalidates.
+    refresh_inventory_once(&mut engine);
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.scheduler.cursor_for_test(), Some(pids[0]));
     assert!(
@@ -7894,29 +7887,23 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     // A third member arrives after admission with no lifecycle event: the
     // ordinary tick keeps the admitted views and defers the newcomer with
     // an exact gap instead of attempting an allocation it cannot fill.
+    // Cadence 2: the exhaustion scenario below runs on pass 1 (ordinary),
+    // so the refresh queues before the first tick; pass 2 reconciles and
+    // would admit via eviction instead of exhausting.
     let newcomer = std::process::id();
     pids.push(newcomer);
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
-    refresh_inventory_once(&mut engine);
-
-    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
-    assert_eq!(kept, admitted, "deferral keeps the admitted views");
-    assert!(
-        engine.counters.object_skips.iter().any(|skip| {
-            skip.reason
-                == "3 processes in scope; live discovery deferred 1 unscanned processes to the periodic reconciliation sweep (limit 2)"
-        }),
-        "arrival without an event publishes the exact deferral gap: {:?}",
-        engine.counters.object_skips
-    );
-
-    // A queued lifecycle refresh for the newcomer attempts admission and
-    // exhausts: the standard skip names the effective value, the request
-    // stays queued for a later pass, and nothing is displaced.
     engine.request_refresh(newcomer, None);
     refresh_inventory_once(&mut engine);
 
+    // The queued lifecycle refresh attempts admission on the same
+    // ordinary tick and exhausts: the standard skip names the effective
+    // value, the request stays queued for a later pass, and nothing is
+    // displaced. (The arrival-without-request deferral gap this tick
+    // used to assert first is pinned by
+    // retained_views_survive_ordinary_rotation_passes; a queued request
+    // attempts instead of deferring.)
     let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     assert_eq!(kept, admitted, "exhaustion keeps the admitted views");
     assert!(
@@ -21365,6 +21352,570 @@ fn loader_pin_reuse_does_not_carry_across_a_later_dirty_mutation() {
     assert!(engine.loader_plan_cache.is_some());
 }
 
+/// An over-cap inventory tick that admits nothing must not rebuild any
+/// candidate once committed state is rebuild-stable. Two provider-free peers
+/// fill a 2-view cgroup capture; a third live peer holds a refresh request
+/// but no slot, and sits out reconcile selection on cooldown so no sweep
+/// admits it. The first ordinary tick builds twice and its commit
+/// stabilizes; the second tick reconciles over an empty pool and admits
+/// nothing; a fourth peer joins for the third tick, which stays ordinary
+/// and idle and must rebuild nothing. The tick twin pins the third tick's
+/// shape at (0, 2), which excludes the early return there and proves the
+/// fast path did the skipping.
+#[test]
+fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
+    let mut first = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut second = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut waiting = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut fourth = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let (p1, p2, p3, p4) = (first.id(), second.id(), waiting.id(), fourth.id());
+    assert!(p3 < p4, "spawn order pins pid order");
+    let (mut engine, dir) = engine_over_cgroup_naming(&[p1, p2, p3]);
+    // Rebuild counts, not wall-time budgets, are under test: an infinite
+    // tick quantum keeps deep-scan admission deterministic under load.
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    engine.max_scan_pids = 2;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), p1).unwrap());
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), p2).unwrap());
+    engine.next_view_id = 2;
+    assert!(engine.request_refresh_consumed(p3, Some(1_000)));
+    // The waiter sits out reconcile selection on cooldown (reconcile pools
+    // exclude cooling pids without bypass), so sweeps find an empty pool
+    // while ordinary ticks still see its queued request.
+    engine.scheduler.note_evicted(p3);
+    let serial = engine.refresh_requested[&p3].serial;
+    let before = loader_planning_operation_counts(&engine);
+    let scans_before = engine.deep_scans;
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        (before.0 + 2, before.1 + 2),
+        "the first tick builds twice and its commit stabilizes"
+    );
+    let settled = loader_planning_operation_counts(&engine);
+    // The second tick reconciles over an empty pool: the cooling waiter
+    // sits out the selection, the sweep admits nothing, and the tick takes
+    // the early return without building or probing.
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        settled,
+        "an empty-handed reconcile takes the early return"
+    );
+    assert_eq!(
+        engine.deep_scans, scans_before,
+        "the reconcile selects nothing from the empty pool"
+    );
+    assert_eq!(engine.probationary_completions, 0, "nobody probed");
+    assert_eq!(
+        engine
+            .refresh_requested
+            .get(&p3)
+            .map(|request| request.serial),
+        Some(serial),
+        "the waiter's request survives the sweep unconsumed"
+    );
+    // A fourth peer joins for the third tick, which is ordinary and idle
+    // with rebuild stability verified: it runs the build phase and the fast
+    // path skips both rebuilds. The tick twin pins the same shape at
+    // (0, 2): early return is excluded.
+    let listing: String = [p1, p2, p3, p4]
+        .iter()
+        .map(|pid| format!("{pid}\n"))
+        .collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    assert!(engine.request_refresh_consumed(p4, Some(1_500)));
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        settled,
+        "a stable idle tick must not rebuild candidates"
+    );
+    assert_eq!(
+        engine.deep_scans, scans_before,
+        "the ordinary tick selects nothing without free slots"
+    );
+    assert_eq!(
+        engine
+            .refresh_requested
+            .get(&p3)
+            .map(|request| request.serial),
+        Some(serial),
+        "the waiter's request stays queued with its serial"
+    );
+    assert_eq!(
+        engine
+            .refresh_requested
+            .get(&p4)
+            .map(|request| request.serial),
+        Some(serial + 1),
+        "the fresh slotless request stays queued with its serial"
+    );
+    assert_eq!(engine.views.len(), 2);
+    assert!(engine.views.iter().any(|view| view.pid() == p1));
+    assert!(engine.views.iter().any(|view| view.pid() == p2));
+    for child in [&mut first, &mut second, &mut waiting, &mut fourth] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Tick-level evidence equality for the unchanged-tick twin: every admission,
+/// refusal and gap decision the two engines reached. Timing-derived evidence
+/// (stage spans, newcomer ages) and pure performance memos (the loader plan
+/// cache) are excluded by design: the fast path records fewer spans and
+/// preserves the cache across unchanged ticks.
+fn assert_tick_evidence_equal(fast: &Engine, full: &Engine) {
+    assert_eq!(fast.plan, full.plan);
+    let mut fast_discovery = serde_json::to_value(&fast.discovery).unwrap();
+    let mut full_discovery = serde_json::to_value(&full.discovery).unwrap();
+    // Scan durations are wall time, not decisions; each engine scanned for
+    // real on its own clock.
+    fast_discovery.as_object_mut().unwrap().remove("scan_ms");
+    full_discovery.as_object_mut().unwrap().remove("scan_ms");
+    assert_eq!(fast_discovery, full_discovery);
+    assert_eq!(fast.interface_selection(), full.interface_selection());
+    assert_eq!(fast.counters.corroboration, full.counters.corroboration);
+    assert_eq!(
+        fast.counters.manifest_fallbacks,
+        full.counters.manifest_fallbacks
+    );
+    assert_eq!(fast.counters.object_skips, full.counters.object_skips);
+    assert_eq!(fast.selection_claims, full.selection_claims);
+    assert_eq!(fast.selection_tables, full.selection_tables);
+    assert_eq!(fast.modules, full.modules);
+    assert_eq!(fast.pinned.pinned().count(), full.pinned.pinned().count());
+    for pin in fast.pinned.pinned() {
+        assert!(fast.pinned.exactly_matches(pin.id, &full.pinned, pin.id));
+        assert_eq!(fast.pinned.sources(pin.id), full.pinned.sources(pin.id));
+    }
+    assert_eq!(fast.pending_rejected_keys, full.pending_rejected_keys);
+    assert_eq!(fast.refresh_requested, full.refresh_requested);
+    assert_eq!(
+        fast.views
+            .iter()
+            .map(|view| (view.id(), view.pid()))
+            .collect::<Vec<_>>(),
+        full.views
+            .iter()
+            .map(|view| (view.id(), view.pid()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(fast.discovery_truncated, full.discovery_truncated);
+    assert_eq!(
+        fast.newcomer_ages.dropped_unknown,
+        full.newcomer_ages.dropped_unknown
+    );
+    assert_eq!(fast.loader_arms, full.loader_arms);
+    for view in fast.views.iter() {
+        assert_eq!(
+            fast.loader_registry.ids_for_view(view.id()),
+            full.loader_registry.ids_for_view(view.id())
+        );
+    }
+    assert_eq!(fast.facts_revision, full.facts_revision);
+    assert_eq!(fast.published_facts_revision, full.published_facts_revision);
+    assert_eq!(
+        fast.capture_facts.history.decoded,
+        full.capture_facts.history.decoded
+    );
+}
+
+/// Rotation eviction displaces views outside the candidate's `removed` set
+/// (they already left `self.views` during selection), so the
+/// unchanged-tick gate cannot see the displacement: without clearing,
+/// a tick that evicts but admits nothing would fast-path on committed
+/// pins a rebuild would no longer derive.
+#[test]
+fn exploratory_eviction_clears_rebuild_stability() {
+    let sleeps = e06_spawn_sleeps(2);
+    let mut pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    pids.sort_unstable();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let victim = engine
+        .views
+        .iter()
+        .find(|view| engine.exploratory_evictable(view.id()))
+        .expect("a provider-free sleep view is evictable")
+        .id();
+    // Simulate the verified stability a converged commit would leave.
+    engine.plan_rebuild_stable = true;
+    engine.evict_exploratory_views(&BTreeSet::from([victim]));
+    assert!(
+        !engine.views.iter().any(|view| view.id() == victim),
+        "eviction displaced the victim"
+    );
+    assert!(
+        !engine.plan_rebuild_stable,
+        "rotation eviction forces the next tick onto the full rebuild path"
+    );
+}
+
+/// The unchanged-tick equivalence twin. Two identical cgroup captures — one
+/// on the fast path, one forced onto full rebuilds — run the same tick
+/// battery: idle ticks, a reconcile eviction plus admission, an early
+/// return, a refresh rescan and a generation loss. Every tick must leave
+/// byte-identical decisions; only idle ticks may differ in rebuild counts.
+#[test]
+fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
+    let mut first = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut second = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut waiting = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let (p1, p2, p3) = (first.id(), second.id(), waiting.id());
+    assert!(p1 < p2 && p2 < p3, "spawn order pins pid order");
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = [p1, p2, p3].iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let build = || {
+        let mut engine = Engine::empty();
+        engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        // The twin compares decisions, not wall-time budgets: an infinite
+        // tick quantum keeps deep-scan admission deterministic under load.
+        engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+        // The waiter sits out reconcile selection on cooldown (reconcile
+        // pools exclude cooling pids without bypass), so the first sweep
+        // finds an empty pool and admits nothing. The cooldown expires at
+        // the second sweep, which admits both waiters.
+        engine.scheduler.note_evicted(p3);
+        engine.max_scan_pids = 2;
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(0), p1).unwrap());
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(1), p2).unwrap());
+        engine.next_view_id = 2;
+        assert!(engine.request_refresh_consumed(p3, Some(1_000)));
+        engine
+    };
+    let mut fast = build();
+    let mut full = build();
+    full.set_disable_empty_tick_fast_path_for_test(true);
+    let mut fast_counts = loader_planning_operation_counts(&fast);
+    let mut full_counts = loader_planning_operation_counts(&full);
+    let tick_both = |fast: &mut Engine,
+                     full: &mut Engine,
+                     fast_counts: &mut (u64, u64),
+                     full_counts: &mut (u64, u64),
+                     fast_builds: u64,
+                     full_builds: u64| {
+        refresh_inventory_once(fast);
+        refresh_inventory_once(full);
+        assert_tick_evidence_equal(fast, full);
+        assert_eq!(
+            loader_planning_operation_counts(fast),
+            (fast_counts.0 + fast_builds, fast_counts.1 + fast_builds),
+            "fast-path rebuild count"
+        );
+        assert_eq!(
+            loader_planning_operation_counts(full),
+            (full_counts.0 + full_builds, full_counts.1 + full_builds),
+            "full-path rebuild count pins the kill switch"
+        );
+        *fast_counts = loader_planning_operation_counts(fast);
+        *full_counts = loader_planning_operation_counts(full);
+    };
+    // Tick 1: the first commit stabilizes both engines, so both build.
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        2,
+        2,
+    );
+    // Tick 2 reconciles over an empty pool: the cooling waiter sits out
+    // the selection and the sweep admits nothing, but the queued request
+    // still reaches the build phase, so only the fast path skips.
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        0,
+        2,
+    );
+    for engine in [&fast, &full] {
+        assert_eq!(engine.probationary_completions, 0, "nobody probed");
+        assert_eq!(
+            engine
+                .refresh_requested
+                .get(&p3)
+                .map(|request| request.serial),
+            Some(1),
+            "the waiter's request survives the sweep unconsumed"
+        );
+    }
+    // Tick 3: a fourth peer joins the enumeration with its own request. Both
+    // newcomers find no slot, so the ordinary tick stays idle: only the full
+    // path rebuilds. (The waiters' skip texts are static, so the fast-path
+    // merge sees no fresh input here; the builder twin covers freshness.)
+    let mut fourth = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let p4 = fourth.id();
+    assert!(p3 < p4, "spawn order pins pid order");
+    let listing: String = [p1, p2, p3, p4]
+        .iter()
+        .map(|pid| format!("{pid}\n"))
+        .collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    assert!(fast.request_refresh_consumed(p4, Some(1_500)));
+    assert!(full.request_refresh_consumed(p4, Some(1_500)));
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        0,
+        2,
+    );
+    for engine in [&fast, &full] {
+        assert_eq!(
+            engine
+                .refresh_requested
+                .get(&p3)
+                .map(|request| request.serial),
+            Some(1),
+            "the cooling waiter's request stays queued"
+        );
+        assert_eq!(
+            engine
+                .refresh_requested
+                .get(&p4)
+                .map(|request| request.serial),
+            Some(2),
+        );
+    }
+    // Tick 4: the cooldown expired at the second sweep, so reconcile evicts
+    // both holders and admits both viewless peers.
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        2,
+        2,
+    );
+    for engine in [&fast, &full] {
+        assert_eq!(engine.views.len(), 2);
+        assert!(engine.views.iter().any(|view| view.pid() == p3));
+        assert!(engine.views.iter().any(|view| view.pid() == p4));
+        assert!(!engine.refresh_requested.contains_key(&p3));
+        assert!(!engine.refresh_requested.contains_key(&p4));
+    }
+    // Tick 5: nothing pending anywhere; both take the early return.
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        0,
+        0,
+    );
+    // Tick 6: one retained view's generation is lost; both record it. The
+    // retirement terminal path builds one detachment candidate on top of the
+    // tick's two, identically on both engines.
+    fourth.kill().unwrap();
+    fourth.wait().unwrap();
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        3,
+        3,
+    );
+    for engine in [&fast, &full] {
+        assert!(engine.views.iter().all(|view| view.pid() != p4));
+    }
+    // Tick 7: a refresh rescan of a retained view rebuilds on both.
+    assert!(fast.request_refresh_consumed(p3, Some(2_000)));
+    assert!(full.request_refresh_consumed(p3, Some(2_000)));
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        2,
+        2,
+    );
+    for child in [&mut first, &mut second, &mut waiting] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Builder-level twin: the old and new builders run over recorded idle-tick
+/// inputs on loaded captures and must produce byte-identical candidates.
+/// The inputs are genuine tick outputs — the skips one idle cgroup tick
+/// merged — replayed with an in-vec duplicate so both merge arms run.
+#[test]
+fn unchanged_tick_builder_matches_full_build_over_recorded_inputs() {
+    let mut first = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut second = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut waiting = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let (p1, p2, p3) = (first.id(), second.id(), waiting.id());
+    let (mut recorder, _dir) = engine_over_cgroup_naming(&[p1, p2, p3]);
+    recorder.max_scan_pids = 2;
+    recorder
+        .views
+        .push(ProcessView::open(ProcessViewId(0), p1).unwrap());
+    recorder
+        .views
+        .push(ProcessView::open(ProcessViewId(1), p2).unwrap());
+    recorder.next_view_id = 2;
+    assert!(recorder.request_refresh_consumed(p3, Some(1_000)));
+    refresh_inventory_once(&mut recorder);
+    let mut recorded: Vec<Skipped> = recorder.counters.object_skips.clone();
+    assert!(
+        !recorded.is_empty(),
+        "the recorded idle tick merged real skips"
+    );
+    recorded.push(recorded[0].clone());
+    for child in [&mut first, &mut second, &mut waiting] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    let fixture = LoaderPlanningFixture::new();
+    let mut fast = fixture.engine();
+    let mut full = fixture.engine();
+    full.set_disable_empty_tick_fast_path_for_test(true);
+    let empty_views: BTreeSet<ProcessViewId> = BTreeSet::new();
+    // Stabilize: the fixture ends on a cached arm commit, which correctly
+    // leaves rebuild stability clear. Full builds plus their commits
+    // converge committed state (the rebuild drops the initial walk's refused
+    // surface, then verifies the fixpoint); each round rebuilds exactly once
+    // until both engines report stable.
+    let mut rounds = 0;
+    while !(fast.plan_rebuild_stable && full.plan_rebuild_stable) {
+        assert!(
+            rounds < 4,
+            "reuse state converges within a few full builds, round {rounds}"
+        );
+        for engine in [&mut fast, &mut full] {
+            let before = loader_planning_operation_counts(engine);
+            let stabilize = engine
+                .inventory_candidate(&empty_views, &[], &[], Vec::new(), &empty_views)
+                .unwrap();
+            assert_eq!(
+                loader_planning_operation_counts(engine),
+                (before.0 + 1, before.1 + 1),
+                "stabilization round {rounds} rebuilds once"
+            );
+            apply_loader_planning_candidate(engine, stabilize);
+        }
+        assert_tick_evidence_equal(&fast, &full);
+        rounds += 1;
+    }
+    let fast_before = loader_planning_operation_counts(&fast);
+    let full_before = loader_planning_operation_counts(&full);
+    let candidate = fast
+        .inventory_candidate(&empty_views, &[], &[], recorded.clone(), &empty_views)
+        .unwrap();
+    let rebuilt = full
+        .inventory_candidate(&empty_views, &[], &[], recorded, &empty_views)
+        .unwrap();
+    assert_eq!(
+        loader_planning_operation_counts(&fast),
+        fast_before,
+        "the fast path rebuilds nothing"
+    );
+    assert_eq!(
+        loader_planning_operation_counts(&full),
+        (full_before.0 + 1, full_before.1 + 1),
+        "the full path rebuilt once, pinning the kill switch"
+    );
+    // Pre-commit plans legitimately differ in publish-owned overlays (the
+    // commit's publication re-derives them from history on both paths); the
+    // rebuild-derived remainder must match exactly.
+    assert!(
+        candidate.plan.matches_for_stability(&rebuilt.plan),
+        "rebuild-derived plan content matches"
+    );
+    assert_eq!(candidate.delta, rebuilt.delta);
+    assert!(candidate.delta.new.is_empty() && candidate.delta.replace.is_empty());
+    assert_eq!(candidate.modules, rebuilt.modules);
+    assert_eq!(
+        candidate.pinned.pinned().count(),
+        rebuilt.pinned.pinned().count()
+    );
+    for pin in candidate.pinned.pinned() {
+        assert!(
+            candidate
+                .pinned
+                .exactly_matches(pin.id, &rebuilt.pinned, pin.id)
+        );
+        assert_eq!(
+            candidate.pinned.sources(pin.id),
+            rebuilt.pinned.sources(pin.id)
+        );
+    }
+    assert_eq!(candidate.views, rebuilt.views);
+    assert_eq!(candidate.corroboration, rebuilt.corroboration);
+    assert_eq!(candidate.manifest_fallbacks, rebuilt.manifest_fallbacks);
+    assert_eq!(candidate.selection_claims, rebuilt.selection_claims);
+    assert_eq!(candidate.selection_tables, rebuilt.selection_tables);
+    assert!(candidate.selection_admission.is_none() && rebuilt.selection_admission.is_none());
+    assert_eq!(
+        format!("{:?}", candidate.manifest_selection_admissions),
+        format!("{:?}", rebuilt.manifest_selection_admissions)
+    );
+    assert_eq!(
+        candidate.manifest_inventory_slots,
+        rebuilt.manifest_inventory_slots
+    );
+    assert!(candidate.loader_plan_proof.is_none() && rebuilt.loader_plan_proof.is_none());
+    assert!(candidate.exec_preservations.is_empty() && rebuilt.exec_preservations.is_empty());
+    assert!(candidate.exec_completions.is_empty() && rebuilt.exec_completions.is_empty());
+    assert_tick_evidence_equal(&fast, &full);
+    // End to end: committing both candidates (publication normalizes the
+    // overlays) leaves byte-identical engines.
+    apply_loader_planning_candidate(&mut fast, candidate);
+    apply_loader_planning_candidate(&mut full, rebuilt);
+    assert_tick_evidence_equal(&fast, &full);
+    assert_eq!(fast.plan, full.plan);
+    assert!(fast.plan_rebuild_stable && full.plan_rebuild_stable);
+}
+
 #[test]
 fn loader_only_pin_reuses_provider_plan() {
     use std::os::unix::fs::MetadataExt as _;
@@ -22603,6 +23154,7 @@ fn post_attach_generation_loss_detaches_and_cannot_commit_stale_candidate() {
         loader_plan_proof: None,
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
     };
     commit_cleaned_candidate_identity(
         &mut candidate,
@@ -32713,14 +33265,13 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
     engine.budget.set_deadline(Some(0));
 
     // Ordinary frames cannot reach the newcomer (no free slots); the queued
-    // request survives them.
-    for frame in 1..=3 {
-        refresh_inventory_once(&mut engine);
-        assert!(
-            !engine.views.iter().any(|view| view.pid() == newcomer),
-            "frame {frame}: no slot means no attempt yet"
-        );
-    }
+    // request survives them. Cadence 2: only frame 1 is ordinary before
+    // the frame-2 reconcile.
+    refresh_inventory_once(&mut engine);
+    assert!(
+        !engine.views.iter().any(|view| view.pid() == newcomer),
+        "frame 1: no slot means no attempt yet"
+    );
     assert!(
         engine.refresh_requested.contains_key(&newcomer),
         "the queued request survives the ordinary frames"
@@ -32781,7 +33332,7 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
 
     // Clearing cancellation lets the queued request recover the actual child.
     engine.budget.set_deadline(None);
-    for _ in 5..=8 {
+    for _ in 3..=4 {
         refresh_inventory_once(&mut engine);
     }
     let newcomer_view = engine
@@ -32870,13 +33421,16 @@ fn per_tick_accounting_measures_deep_scans_hooks_and_maps_separately() {
     pids.push(newcomer);
     e06_write_listing(scope_dir.path(), &pids);
 
-    for frame in 1..=3 {
+    // Cadence 2: reconciles land on the even frames; the odd frames stay
+    // quiet. The per-frame work pins below are unchanged, only their
+    // frames move.
+    let quiet_frame = |engine: &mut Engine, frame: u32| {
         let (scans, arms, bytes) = (
             engine.deep_scans,
             engine.loader_arms,
             engine.budget.attempted_io_bytes(),
         );
-        refresh_inventory_once(&mut engine);
+        refresh_inventory_once(engine);
         assert_eq!(
             (engine.deep_scans - scans, engine.loader_arms - arms),
             (0, 0),
@@ -32887,8 +33441,8 @@ fn per_tick_accounting_measures_deep_scans_hooks_and_maps_separately() {
             0,
             "ordinary full frame {frame} reads no maps either"
         );
-    }
-
+    };
+    quiet_frame(&mut engine, 1);
     let (scans, arms, bytes) = (
         engine.deep_scans,
         engine.loader_arms,
@@ -32919,25 +33473,7 @@ fn per_tick_accounting_measures_deep_scans_hooks_and_maps_separately() {
             .any(|module| module.path.ends_with("acct-unique.so")),
         "the newcomer provider is admitted on the reconcile"
     );
-
-    for frame in 5..=7 {
-        let (scans, arms, bytes) = (
-            engine.deep_scans,
-            engine.loader_arms,
-            engine.budget.attempted_io_bytes(),
-        );
-        refresh_inventory_once(&mut engine);
-        assert_eq!(
-            (
-                engine.deep_scans - scans,
-                engine.loader_arms - arms,
-                engine.budget.attempted_io_bytes() - bytes
-            ),
-            (0, 0, 0),
-            "ordinary frame {frame} is quiet again"
-        );
-    }
-
+    quiet_frame(&mut engine, 3);
     let (scans, arms, bytes) = (
         engine.deep_scans,
         engine.loader_arms,
@@ -32954,6 +33490,7 @@ fn per_tick_accounting_measures_deep_scans_hooks_and_maps_separately() {
         0,
         "nothing newly armable appears"
     );
+    quiet_frame(&mut engine, 5);
     assert!(
         engine.budget.attempted_io_bytes() - bytes > 0,
         "maps are re-read every reconcile"
@@ -33193,7 +33730,7 @@ fn polling_rescan_upgrades_retained_view_that_gains_a_provider() {
 }
 
 /// F1 (kind pod lane): an under-cap cgroup capture polls its provider-free
-/// processes (a pod's pause container, `sleep infinity`) every fourth frame,
+/// processes (a pod's pause container, `sleep infinity`) every second frame,
 /// and every poll published "queued N retained exploratory views for polling
 /// rescan" as a `discovery unavailable` skip. An exact capture (136/136
 /// probes, exact counts) then read `concrete_gap`, depending only on how
@@ -47471,6 +48008,7 @@ fn midfinal_res3_tableless_provider_peer_does_not_authorize_retry() {
         loader_plan_proof: None,
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
     };
     let declined: BTreeSet<ProcessViewId> = [view_a].into_iter().collect();
     engine.withhold_declined_retry_targets(&mut candidate, &declined);
@@ -47588,6 +48126,7 @@ fn midfinal_res3_exact_target_contribution_from_healthy_peer_attaches() {
         loader_plan_proof: None,
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
     };
     let declined: BTreeSet<ProcessViewId> = [view_a].into_iter().collect();
     engine.withhold_declined_retry_targets(&mut candidate, &declined);

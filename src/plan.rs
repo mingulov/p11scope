@@ -940,6 +940,31 @@ pub(crate) enum CounterHistoryError {
 }
 
 impl AttachPlan {
+    /// Whether two plans agree on everything the rebuild derives. The
+    /// recorded skip list is excluded: every commit's publication
+    /// re-derives it from capture-facts history on both paths, and the
+    /// unchanged-tick path reproduces the build-time merge exactly. The
+    /// remaining exclusions are rebuild outputs that are pure functions of
+    /// the verified build inputs (module refusals, refused surfaces,
+    /// decoded-occurrence counts) or carried constants (vendor scalars):
+    /// they agree on every rebuild-vs-rebuild steady tick, and the
+    /// exclusion bridges only walk-vs-rebuild constructor differences
+    /// while reuse state converges. (Token and mutation generations are
+    /// transparent to equality by their own impls.)
+    pub(crate) fn matches_for_stability(&self, other: &Self) -> bool {
+        let mut ours = self.clone();
+        let mut theirs = other.clone();
+        for plan in [&mut ours, &mut theirs] {
+            plan.skipped.clear();
+            plan.modules_skipped.clear();
+            plan.surfaces.clear();
+            plan.entries_seen = 0;
+            plan.vendor_interfaces = 0;
+            plan.interface_list.clear();
+        }
+        ours == theirs
+    }
+
     /// Object authority for one slot of the sealed plan: the slot must be
     /// current, single-owned, authorized, unambiguous and S1-consistent,
     /// its names must freshly agree, and its frozen cookie must name a

@@ -25,6 +25,31 @@ DEMOTION = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/prepare-dem
 WRAP = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/prepare-diagnostics-wrap.py'))
 
 
+def _warm_symbol_tool(path=None):
+    """Best-effort page-cache warmup for the probe's nm; test-only.
+
+    Runs the real symbol tool once over a real ELF input so its libraries
+    are resident before any timed use. A full run over a file (not
+    --version) is required: only that loads the plugin chain. Any failure
+    is ignored: a missed warmup only leaves later runs as cold as today.
+    """
+    if path is None:
+        path = sys.executable or '/bin/true'
+    if not Path(path).is_file():
+        return
+    try:
+        subprocess.run(['nm', '--demangle=rust', '--defined-only', '--format=posix', path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+try:
+    _warm_symbol_tool()
+except Exception:
+    pass
+
+
 def fixture():
     ledger = [dict(kind='call', pid=123, tid=123, fn='C_GenerateRandom', rv=0,
                    phase='e17', image=0, scope='selected', t0=200 + i, t1=201 + i) for i in range(3)]

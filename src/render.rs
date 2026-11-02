@@ -8257,6 +8257,31 @@ pub(crate) mod tests {
         );
     }
 
+    /// A `run` whose loader hook never fired and whose initial set was
+    /// never validated either (the 0-hit ghost): zero hits prove nothing
+    /// when the initial context itself is unproven, so the report names
+    /// the loader gap and stays PARTIAL.
+    #[test]
+    fn a_never_fired_loader_with_unproven_initial_set_is_an_observation_gap() {
+        let mut ghost = evidence();
+        ghost.loader_discovery.strategies.debug_state_every_hit = 1;
+        ghost.loader_discovery.hits = 0;
+        ghost.loader_discovery.initial_set_timing.unproven = 1;
+        ghost.loader_discovery.initial_set_capture.none = 1;
+        ghost.pause_partial = 1;
+        ghost.verdict();
+        assert!(
+            ghost
+                .gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "{:?}",
+            ghost.gap_classes(true)
+        );
+        assert_eq!(ghost.completeness, "PARTIAL");
+    }
+
     /// An owned run whose pause held every loader hit and table publication
     /// until the probes were attached is not an observation gap for its
     /// loader timing, even with the empty catalog; the same run with one

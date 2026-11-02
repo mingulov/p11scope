@@ -2192,12 +2192,15 @@ pub(crate) fn export_agreement(
 /// surface, proven without calling the provider: the scan showed the full
 /// declared extent readable with the first structural failure in `68..92`
 /// (`extension_impossible`, refuting 92/104-wide), the module exports
-/// neither 3.x interface getter (no conforming route to a 3.x table), and
-/// every retained entry agrees with its export. `exports` is the module
-/// object's completely read `.dynsym` witness (a failed read never yields
-/// a `ReconciledModule`), so absence there is proven absence. Truncation,
-/// a getter export, a disagreeing entry, an unpinned record, or a missing
-/// file owner all stay unproven.
+/// neither 3.x interface getter in any symbol type (no conforming route
+/// to a 3.x table), and every retained entry agrees with its export.
+/// `exports` is the module object's completely read `.dynsym` witness (a
+/// failed read never yields a `ReconciledModule`), so absence there is
+/// proven absence — unless the walk skipped a symbol (`witness_fault`) or
+/// saw a getter it could not list as a definition (`getter_present`).
+/// Truncation, a getter export, a disagreeing entry, an unpinned record,
+/// a missing file owner, a getter in any symbol type, or a faulted walk
+/// all stay unproven.
 pub(crate) fn proven_complete_legacy_prefix(
     table: &ScannedTable,
     exports: &ObjectExports<'_>,
@@ -2212,6 +2215,9 @@ pub(crate) fn proven_complete_legacy_prefix(
         return false;
     }
     if table.file_offset.is_none() {
+        return false;
+    }
+    if exports.getter_present || exports.witness_fault {
         return false;
     }
     if exports.offsets_of("C_GetInterface").next().is_some()

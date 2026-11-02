@@ -597,19 +597,38 @@ pub(crate) struct ExportWalk {
 
 pub(crate) fn exports_matching_in_object(object: &object::File<'_>, wanted: &[&str]) -> ExportWalk {
     let mut found = Vec::new();
+    let mut getter_present = false;
+    let mut witness_fault = false;
     for symbol in object.dynamic_symbols() {
-        let Ok(name) = symbol.name() else { continue };
+        let Ok(name) = symbol.name() else {
+            // An unreadable name: the walk cannot tell whether this
+            // symbol was wanted, so the witness may be incomplete.
+            witness_fault = true;
+            continue;
+        };
+        // Getter presence is recorded whatever the symbol type —
+        // including non-definitions (`STT_GNU_IFUNC`, absolute) the
+        // `is_definition` filter below excludes from `found` — and
+        // whatever the caller asked for, so a narrow `wanted` cannot
+        // hide a 3.x route from the legacy-prefix proof.
+        if name == "C_GetInterface" || name == "C_GetInterfaceList" {
+            getter_present = true;
+        }
         if !wanted.contains(&name) || !symbol.is_definition() {
             continue;
         }
         if let Some(offset) = file_offset(object, symbol.address()) {
             found.push((name.to_string(), offset));
+        } else {
+            // A wanted definition outside every segment: dropped from
+            // the witness, so the witness may be incomplete.
+            witness_fault = true;
         }
     }
     ExportWalk {
         exports: found,
-        getter_present: false,
-        witness_fault: false,
+        getter_present,
+        witness_fault,
     }
 }
 

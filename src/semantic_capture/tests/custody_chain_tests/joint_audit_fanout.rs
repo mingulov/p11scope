@@ -14709,25 +14709,27 @@ fn joint_original_loss_fans_out_before_ack() {
         && feed.reduced == 1
         && feed.staged == 0
         && feed.disposed == 1));
-    // Fail-visible: every caller whose Joint feed this loss ended names
-    // the seal failure, so `authority_lost` never stands without a cause.
-    let degraded: std::collections::BTreeSet<_> =
-        fixture.feeds().iter().map(|feed| feed.caller).collect();
-    let named: std::collections::BTreeSet<_> = fixture
+    // Fail-visible: every Joint feed this loss ended names the seal
+    // failure (staged for the next publication), so `authority_lost`
+    // never stands without a cause.
+    let named = fixture
         .scene
         .real
         .scene
         .coordinator
         .registry()
-        .gaps()
-        .iter()
-        .filter(|gap| {
-            gap.subject == "Joint key operations unavailable; retained S1"
-                && gap.reason == "joint_seal_H3Loss_history_loss"
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, reason)| {
+            subject == "Joint key operations unavailable; retained S1"
+                && reason == "joint_seal_H3Loss_history_loss"
         })
-        .filter_map(|gap| gap.caller)
-        .collect();
-    assert_eq!(named, degraded, "each ended Joint feed names its seal loss");
+        .count();
+    assert_eq!(
+        named,
+        fixture.feeds().len(),
+        "each ended Joint feed names its seal loss"
+    );
     {
         let mut ports = fixture
             .scene

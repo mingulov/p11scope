@@ -4379,6 +4379,79 @@ fn native_semantic_convert_refuses_unauthorized_descriptor_shapes() {
     );
 }
 
+/// A canonical count-only setup call (its own descriptor COUNT_ONLY,
+/// one attested unambiguous name the journal proves irrelevant to
+/// object proof) refuses with the dedicated disposed class: the same
+/// public `slot` code, but H3 disposes its position. Every degraded
+/// shape of the same slot, and a count-only shape of a modeled name,
+/// keeps the ordinary `Slot` loss refusal.
+#[test]
+fn native_semantic_convert_count_only_setup_call_is_disposed_not_lost() {
+    let conv = ConversionScene::new();
+    let r0 = conv.ids[0];
+    let coverage = conv.coverage(vec![r0]);
+    let binding = conv.binding();
+    let setup = |slot: &mut crate::plan::Slot| {
+        slot.names = vec!["C_GetFunctionList".to_string()];
+        slot.semantics = SlotSemantics::COUNT_ONLY;
+    };
+    let convert = |subset: &AttestedSubset| {
+        refusal(admit_call_from_evidence(
+            conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+            binding,
+            subset,
+            CallStanding::Current(&coverage),
+            None,
+        ))
+    };
+    let disposed = subset_with_init_shape(&conv, setup);
+    assert_eq!(
+        convert(&disposed),
+        Err(ConversionRefusal::CountOnlyIrrelevant),
+        "a canonical count-only setup call is disposed"
+    );
+    assert!(ConversionRefusal::CountOnlyIrrelevant.disposes_h3_position());
+    assert_eq!(ConversionRefusal::CountOnlyIrrelevant.code(), "slot");
+    for (label, shape) in [
+        (
+            "unauthorized",
+            (|slot: &mut crate::plan::Slot| slot.semantic_authorized = false)
+                as fn(&mut crate::plan::Slot),
+        ),
+        ("aliased", |slot| slot.aliased = true),
+        ("ambiguous", |slot| slot.semantic_ambiguous = true),
+        ("two names", |slot| {
+            slot.names.push("C_GetInfo".to_string());
+        }),
+    ] {
+        let degraded = subset_with_init_shape(&conv, |slot| {
+            setup(slot);
+            shape(slot);
+        });
+        assert_eq!(
+            convert(&degraded),
+            Err(ConversionRefusal::Slot),
+            "a {label} count-only slot stays a loss refusal"
+        );
+    }
+    let modeled = subset_with_init_shape(&conv, |slot| slot.semantics = SlotSemantics::COUNT_ONLY);
+    assert_eq!(
+        convert(&modeled),
+        Err(ConversionRefusal::Slot),
+        "a count-only shape of a modeled name stays a loss refusal"
+    );
+    for loss in [
+        ConversionRefusal::Domain,
+        ConversionRefusal::Custody,
+        ConversionRefusal::Slot,
+        ConversionRefusal::Coverage,
+        ConversionRefusal::Position,
+        ConversionRefusal::Module,
+    ] {
+        assert!(!loss.disposes_h3_position(), "{loss:?} stays loss");
+    }
+}
+
 #[test]
 fn native_semantic_register_refuses_domain_and_custody_mismatch() {
     let conv = ConversionScene::new();

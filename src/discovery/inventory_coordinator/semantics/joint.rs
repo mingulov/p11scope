@@ -889,11 +889,17 @@ impl PreparedSemanticBatch {
                 registry.observe_instance_semantic(input);
             }
             Err(reason) => {
-                self.h3.shed_floor = Some(
-                    self.h3
-                        .shed_floor
-                        .map_or(entry.token, |at| at.min(entry.token)),
-                );
+                // A proved-irrelevant count-only setup call is disposed:
+                // its position is already among the staged positions.
+                // Every other refusal sheds its position as an H3 loss
+                // barrier.
+                if !reason.disposes_h3_position() {
+                    self.h3.shed_floor = Some(
+                        self.h3
+                            .shed_floor
+                            .map_or(entry.token, |at| at.min(entry.token)),
+                    );
+                }
                 registry.record_gap(RegistryGap {
                     caller: entry.caller,
                     module: None,

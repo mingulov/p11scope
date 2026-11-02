@@ -2613,7 +2613,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// one named gap. Ring loss is never folded into shed, so the
     /// stop line keeps collected == joined + shed. The reason stays
     /// stable so repeat rises coalesce onto one gap row; the exact
-    /// cumulative count lives in unrouted_returns.
+    /// cumulative count lives in events_lost.
     pub(crate) fn disclose_events_ring_loss(
         &mut self,
         lane: &mut crate::inventory_semantics::AttestedSemanticLane,
@@ -2625,8 +2625,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             module: None,
             pid: None,
             subject: "native capture events lost".into(),
-            reason: "the EVENTS ring overwrote records before the drain read them \
-                 (kernel reserve failures; exact count in unrouted_returns)"
+            reason: "the EVENTS ring was full; the kernel refused records \
+                 before the drain could read them \
+                 (kernel reserve failures; exact count in events_lost)"
                 .into(),
             budget: None,
         });

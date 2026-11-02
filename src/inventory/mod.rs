@@ -11795,6 +11795,7 @@ mod tests {
             saturated: bool,
             ring_loss: std::collections::VecDeque<u64>,
             ring_loss_fail: std::collections::VecDeque<bool>,
+            ring_loss_polls: std::rc::Rc<std::cell::Cell<usize>>,
         }
 
         impl StubLaneIo {
@@ -11821,6 +11822,7 @@ mod tests {
                     saturated: false,
                     ring_loss: std::collections::VecDeque::new(),
                     ring_loss_fail: std::collections::VecDeque::new(),
+                    ring_loss_polls: std::rc::Rc::new(std::cell::Cell::new(0)),
                 }
             }
         }
@@ -11907,7 +11909,11 @@ mod tests {
             }
 
             fn events_ring_loss(&mut self) -> Option<u64> {
-                self.ring_loss.pop_front()
+                let value = self.ring_loss.pop_front();
+                if value.is_some() {
+                    self.ring_loss_polls.set(self.ring_loss_polls.get() + 1);
+                }
+                value
             }
 
             fn events_ring_loss_fails(&mut self) -> bool {
@@ -12490,6 +12496,86 @@ mod tests {
                 driver.coordinator.registry().instances().count(),
                 2,
                 "the safety net publishes nothing twice"
+            );
+        }
+
+        #[test]
+        fn terminal_sequence_polls_ring_loss_before_reading_stop_counts() {
+            // Isolate from lines other tests on this thread warned: the
+            // recorder is thread-local and every read drains.
+            take_warned_for_test();
+            // The counter stays flat through the terminal commits,
+            // then rises: only a poll after the last commit discloses
+            // it on the stop line. The poll count pins the rise to
+            // that terminal poll rather than an earlier commit.
+            let mut scene = driver_scene(2);
+            scene.stub.receipt_free = true;
+            // Quiescent with nothing pending: the drain commits no
+            // batch, so the only polls are the Finish commit's and
+            // the terminal poll's.
+            scene.stub.quiesce = true;
+            scene.stub.ring_loss = std::collections::VecDeque::from([0, 7]);
+            let polls = scene.stub.ring_loss_polls.clone();
+            scene.lane.install_test_io(Box::new(scene.stub));
+            let mut driver = ClassicDriver {
+                coordinator: &mut scene.coordinator,
+                inventory_scope: None,
+                scope: InventoryRunScope::Pid(std::process::id()),
+                cgroup: None,
+                max_scan_pids: None,
+                guard: UnavailableImageGuard,
+                deadline: None,
+                attach_backend: crate::attach::BackendSelection::Auto,
+                identity: None,
+                display: None,
+                semantic: Some(scene.lane),
+                semantic_staged: false,
+                seated_summary: None,
+                second_signal: None,
+                lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+                completion_source: None,
+                pending_install: None,
+                installed_promotion: None,
+                retiring: None,
+                joint_finish: JointFinishDriver::NotBegun,
+                stop_requested: false,
+                joint_first_error: None,
+                suspended: false,
+                joint_commit_pending: false,
+                joint_tick_refusal: None,
+                joint_commit_retries: 0,
+                #[cfg(test)]
+                terminal_seq_calls: 0,
+                #[cfg(test)]
+                reclaim_calls: Vec::new(),
+                #[cfg(test)]
+                joint_begin_calls: 0,
+                #[cfg(test)]
+                joint_step_calls: 0,
+                #[cfg(test)]
+                joint_commit_polls: 0,
+                #[cfg(test)]
+                take_promotion_work_calls: 0,
+                #[cfg(test)]
+                drive_pending_install_calls: 0,
+                #[cfg(test)]
+                service_caller_metadata_calls: 0,
+                #[cfg(test)]
+                commit_calls: 0,
+            };
+            driver.semantic.as_mut().unwrap().note_shed_calls(3);
+            driver.on_stop_requested();
+            assert_eq!(
+                take_warned_for_test(),
+                vec![crate::inventory_semantics::semantic_stop_line(
+                    0, 0, 3, 7, 1, 0
+                )],
+                "the stop line carries loss past the last terminal commit"
+            );
+            assert_eq!(
+                polls.get(),
+                2,
+                "the rise lands on the terminal poll, not a commit"
             );
         }
     }
@@ -16734,6 +16820,8 @@ mod promotion_driver_tests {
         /// linked-DD pump twin counts them here.
         pub(crate) discovery: Rc<Cell<usize>>,
         submitted: bool,
+        /// Scripted EVENTS ring-loss counter reads (cumulative).
+        pub(crate) ring_loss: std::collections::VecDeque<u64>,
     }
 
     impl Drop for WindDownIo {
@@ -16761,6 +16849,7 @@ mod promotion_driver_tests {
                 threads: Rc::new(RefCell::new(Vec::new())),
                 drop_spy: None,
                 submitted: false,
+                ring_loss: std::collections::VecDeque::new(),
             }
         }
 
@@ -16783,6 +16872,7 @@ mod promotion_driver_tests {
                 threads: Rc::new(RefCell::new(Vec::new())),
                 drop_spy: None,
                 submitted: false,
+                ring_loss: std::collections::VecDeque::new(),
             }
         }
 
@@ -16958,6 +17048,10 @@ mod promotion_driver_tests {
             _quantum: usize,
         ) -> crate::inventory_semantics::LaneDrainOutcome {
             crate::inventory_semantics::LaneDrainOutcome::default()
+        }
+
+        fn events_ring_loss(&mut self) -> Option<u64> {
+            self.ring_loss.pop_front()
         }
 
         fn service_live_discovery(&mut self) {
@@ -20944,6 +21038,117 @@ mod promotion_driver_tests {
         assert!(
             take_warned_for_test().is_empty(),
             "the armed hold stays silent"
+        );
+    }
+
+    #[test]
+    fn escalate_hold_discloses_ring_loss_on_stop_line_and_summary() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A not-latched Joint lane held for exit (settle bound): the
+        // hold polls the ring-loss counter before it reads the stop
+        // counts, stages the named gap, and serves the post-hold
+        // summary past the handoff — even though no abandon commit
+        // runs on this path.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut io = WindDownIo::completing();
+        io.ring_loss = std::collections::VecDeque::from([9]);
+        let mut lane = joint_lane(io, false);
+        lane.set_scripted_stop_counts_for_test(Some(scripted_nonzero_stop_counts()));
+        lane.note_shed_calls(7);
+        assert!(
+            !lane.joint_finish_disposition_required(),
+            "the twin holds a not-latched lane"
+        );
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.escalate_joint_finish("joint finish settle bound reached");
+        assert!(driver.semantic.is_none(), "the lane is held for exit");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("joint finish settle bound reached"),
+            "a not-latched hold keeps the trigger cause"
+        );
+        let staged: Vec<_> = driver
+            .coordinator
+            .registry()
+            .staged_scope_gaps_for_test()
+            .into_iter()
+            .filter(|(subject, _)| subject == "native capture events lost")
+            .collect();
+        assert_eq!(staged.len(), 1, "the hold stages the named gap: {staged:?}");
+        assert_eq!(
+            take_warned_for_test(),
+            vec![crate::inventory_semantics::semantic_stop_line(
+                68, 5, 7, 9, 0, 12
+            )],
+            "the stop line carries the hold-polled loss"
+        );
+        assert_eq!(
+            driver.semantic_summary().unrouted_returns,
+            9,
+            "the served summary counts the loss past the handoff"
+        );
+    }
+
+    #[test]
+    fn latched_abandon_hold_discloses_ring_loss_on_its_stop_line() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A latched Joint lane held for exit: the abandon commit
+        // runs and publishes, but the hold polls the ring-loss
+        // counter before it reads the stop counts, so the stop line
+        // carries the loss instead of missing it.
+        let mut io = WindDownIo::completing();
+        io.ring_loss = std::collections::VecDeque::from([9]);
+        let mut lane = joint_lane(io, false);
+        lane.set_scripted_stop_counts_for_test(Some(scripted_nonzero_stop_counts()));
+        lane.note_shed_calls(7);
+        lane.note_joint_finish_failure(
+            crate::inventory_semantics::SemanticRefusal::ProviderStorage,
+        );
+        assert!(
+            lane.joint_finish_disposition_required(),
+            "the twin latches the lane"
+        );
+        let mut coordinator = coordinator();
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        let error = ClassicDriver::hold_joint_lane_for_exit(
+            lane,
+            &mut coordinator,
+            "joint finish disposition required",
+            "joint finish abandoned for exit",
+            &mut warn,
+            None,
+        );
+        assert_eq!(
+            error, "joint finish disposition required",
+            "a latched hold keeps the disposition reason"
+        );
+        let gaps: Vec<_> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "native capture events lost")
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the abandon commit publishes the loss gap: {gaps:?}"
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![crate::inventory_semantics::semantic_stop_line(
+                68, 5, 7, 9, 0, 12
+            )],
+            "the stop line carries the hold-polled loss"
         );
     }
 

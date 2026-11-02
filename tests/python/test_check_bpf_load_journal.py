@@ -175,6 +175,9 @@ class JournalGateTests(unittest.TestCase):
             # The plain build exits before loading anything: the probe
             # file holds only its summary.
             "refused-hard": [],
+            # The observed 7.3.1 shape: the pair loads, but the
+            # link is refused (no seal, no joined calls).
+            "refused-loaded": rows,
             "missing-root": [row for row in rows
                              if row["root"] != "p11_return_journal"],
             "unlinked": [row for row in rows if row["btf_id"] == 48],
@@ -206,6 +209,10 @@ class JournalGateTests(unittest.TestCase):
                 "p11scope: inventory --system: "
                 "journal-pair-unavailable-in-build: this build omits the "
                 "production journal object\n"},
+            "refused-loaded": {"rc": 0, "text":
+                "gap [key operations unavailable] "
+                "semantic_attachment_refused; broad inventory continues "
+                "with S1 mechanisms and API results\n"},
             "over-budget": {"rc": 0, "text": LINKED_TEXT},
             "timeout": {"rc": 124, "text": ""},
             "crash": {"rc": 1, "text": LINKED_TEXT + "thread 'main' panicked at src/x.rs:1\n"},
@@ -391,6 +398,18 @@ class JournalGateTests(unittest.TestCase):
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "failed")
         self.assertIn("journal-pair-unavailable-in-build", row["detail"])
+
+    def test_loaded_pair_with_refusal_gap_fails(self):
+        # The observed 7.3.1 shape: the pair loads, but the link
+        # is refused. Refusal wins over the loaded pair: the cell
+        # fails naming the refusal, not the missing seal.
+        result, out = self.run_gate(KERNEL, mode="refused-loaded")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("linked lane refused", row["detail"])
+        self.assertIn("semantic_attachment_refused", row["detail"])
 
     def test_over_budget_row_fails(self):
         # Non-vacuity: a planted over-budget journal row fails the

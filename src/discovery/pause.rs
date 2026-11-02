@@ -3778,6 +3778,45 @@ mod tests {
         }
     }
 
+    /// Delivery tolerance ends at the first sample: a task running again
+    /// after stopped samples means SIGCONT, not a late SIGSTOP, so the
+    /// later samples never wait out a re-stop (SIGTTIN, Ctrl-Z). Staged
+    /// `[stopped, stopped, running, stopped...]` ends partial, not
+    /// confirmed.
+    #[test]
+    fn a_task_running_after_stopped_samples_is_sigcont_not_delivery() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        let running: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from([
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(running),
+            Ok(stopped()),
+        ]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+    }
+
+    /// The delivery wait's own failure is a lifecycle failure like every
+    /// other wait in the cycle, not an unconfirmed pause.
+    #[test]
+    fn a_failed_delivery_wait_is_a_lifecycle_failure() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fail_wait = true;
+        let running: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from([Ok(running)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.lifecycle(), "a failed wait is lifecycle: {error}");
+    }
+
     /// A child that never stops (every sample reports it running) cannot
     /// confirm: the delivery wait ends at the confirmation deadline, which
     /// `always` refuses as a required pause failure.

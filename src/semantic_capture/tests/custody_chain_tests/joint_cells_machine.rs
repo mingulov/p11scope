@@ -2765,9 +2765,14 @@ fn joint_machine_publish_discloses_events_ring_loss_rise() {
         (0, 9, 0, 9),
         "the disclosed delta counts exactly once across poll sites"
     );
-    // And it surfaces through the next registry publish, never stuck staged.
-    scene.scene.real.scene.coordinator.registry_mut().publish();
-    let coordinator = &scene.scene.real.scene.coordinator;
+    // And it surfaces through the production final commit, never stuck staged.
+    let real = &mut scene.scene.real;
+    let (lane, scene) = (&mut real.lane, &mut real.scene);
+    scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(lane))
+        .expect("the production final commit publishes the staged gap");
+    let coordinator = &scene.coordinator;
     let gaps: Vec<_> = coordinator
         .registry()
         .gaps()
@@ -2778,4 +2783,86 @@ fn joint_machine_publish_discloses_events_ring_loss_rise() {
         .collect();
     assert_eq!(gaps.len(), 1, "the staged gap surfaces: {gaps:?}");
     assert_eq!(gaps[0].1, 1, "a single rise surfaces once: {gaps:?}");
+}
+
+/// Plain and machine polls share one ring-loss baseline on one
+/// lane: a rise on either side discloses exactly once, and a flat
+/// read on either side discloses nothing, in either order.
+#[test]
+fn plain_and_machine_polls_share_one_ring_loss_baseline() {
+    let mut scene = MachineScene::new(1);
+    scene.native.fail_births = true;
+    let h0 = scene.scene.real.h0.clone();
+    scene
+        .scene
+        .real
+        .lane
+        .install_test_io(Box::new(PublishRingLossStub {
+            inner: h0,
+            ring_loss: std::collections::VecDeque::from([4, 10, 10, 10]),
+        }));
+    let pid = std::process::id();
+    for (seq, name) in (1u64..).zip([
+        "C_CreateObject",
+        "C_SignInit",
+        "C_SignUpdate",
+        "C_SignFinal",
+    ]) {
+        scene.scene.push(pid, 0, name, seq);
+    }
+    // The machine publish discloses the first rise (4).
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("interleave-machine-first", None);
+    // A plain production commit discloses the second rise (4 -> 10).
+    {
+        let real = &mut scene.scene.real;
+        let (lane, scene) = (&mut real.lane, &mut real.scene);
+        scene
+            .coordinator
+            .commit_batch_with_semantics(false, Some(lane))
+            .expect("the interleaved plain commit publishes");
+    }
+    // A second machine publish finds the counter flat (autonomous:
+    // the first demand is consumed, like the absence twins).
+    for (seq, name) in (5u64..).zip([
+        "C_CreateObject",
+        "C_SignInit",
+        "C_SignUpdate",
+        "C_SignFinal",
+    ]) {
+        scene.scene.push(pid, 0, name, seq);
+    }
+    scene.published_labeled("interleave-machine-second", None);
+    // One more plain commit publishes the coalesced gap row.
+    {
+        let real = &mut scene.scene.real;
+        let (lane, scene) = (&mut real.lane, &mut real.scene);
+        scene
+            .coordinator
+            .commit_batch_with_semantics(false, Some(lane))
+            .expect("the trailing plain commit publishes");
+    }
+    let lane = &scene.scene.real.lane;
+    let summary = lane.semantic_summary();
+    assert_eq!(
+        (
+            lane.shed_calls_disclosed(),
+            lane.events_ring_loss_disclosed(),
+            summary.unrouted_returns,
+            summary.events_lost
+        ),
+        (0, 10, 0, 10),
+        "interleaved rises disclose exactly once across poll sites"
+    );
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let gaps: Vec<_> = coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .zip(coordinator.registry().gap_repeats().iter())
+        .filter(|(gap, _)| gap.subject == "native capture events lost")
+        .map(|(gap, repeats)| (gap.reason.clone(), *repeats))
+        .collect();
+    assert_eq!(gaps.len(), 1, "rises coalesce onto one gap row: {gaps:?}");
+    assert_eq!(gaps[0].1, 2, "two rises surface twice: {gaps:?}");
 }

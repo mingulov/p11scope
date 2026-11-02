@@ -464,26 +464,26 @@ The linked birth seals activate only when the user opts in to per-key tracking
 No formal privacy sign-off before about v0.9 (OD25).** The opt-in is
 `p11scope inventory --key-operations` (default off; selection ruling 2026-11-01).
 What runs at this revision: only the journal object publishes an attach generation, and only under
-`--key-operations`. The journal object carries the DIRTY gap writer but no READY write, so every
-exec-marker birth is refused (`joint_birth_native_MarkerNotReady`). Under the opt-in, only
-absence-then-appearance births (the provider appears in the process after closure, with a committed
-negative witness) can be minted; whether they mint at runtime is not yet measured live. Ordinary
+`--key-operations`. The journal object carries both the READY exec writer and the DIRTY gap writer
+(controller ruling WB-3), so post-closure execs in opted-in sessions publish READY and exec-marker
+births can be minted. Under the opt-in, both exec-marker births and absence-then-appearance births
+(the provider appears in the process after closure, with a committed negative witness) can be minted;
+whether they mint at runtime is not yet measured live. Ordinary
 sessions never get a generation, so the Detailed object's marker stays inactive: its hooks do one gated
-read and return. A follow-up (controller ruling WB-3) adds the READY exec writer and its `self_exec_id`
-read to the journal object, for opted-in sessions after closure only; that text change waits for owner
-approval.
+read and return.
 In a marker build, this adds state only in a lane Session that has published an attach generation
 (closure): only an `inventory --manifest --key-operations` capture whose semantic lane seals over the
-loaded journal pair publishes the attach generation. That Session runs the journal object, which at this
-revision has only the DIRTY gap writer, so the generation arms gap marking and no exec-time READY record.
-Ordinary captures seal with generation 0 and never touch the attach cell; their marker hooks stop at the
-gated read. Under `--system` with the flag, records come only from the gap writer (DIRTY); no exec-time
-record is written until the READY writer lands in the journal object.
+loaded journal pair publishes the attach generation. That Session runs the journal object, which carries
+both the READY exec writer and the DIRTY gap writer, so the generation arms gap marking and exec-time
+READY records. Ordinary captures seal with generation 0 and never touch the attach cell; their marker
+hooks stop at the gated read. Under `--system` with the flag, records come from both writers: DIRTY
+from the gap writer and READY from post-closure execs.
 In a marker build, non-counter metrics, profile and trace Sessions load the same Detailed object
 (counter-mode Sessions load counter objects), so the control map exists there,
 zeroed and frozen, and the hooks do one gated read. The marker adds no state to them. Inventory and counter
-objects do not contain the map. The journal object instead carries the control map and the DIRTY gap writer
-but no READY publish or exec-ID read, and its control row is read back as zero and frozen before any link.
+objects do not contain the map. The journal object instead carries the control map with both the READY
+publish body and the DIRTY gap writer (and its transient `self_exec_id` read at exec only), and its
+control row is read back as zero and frozen before any link.
 The journal object is reachable only through `inventory --key-operations`. v1 is unchanged; the v2 table
 carries one row for this read beside the Exec task ticket row.
 
@@ -506,8 +506,9 @@ one array read and return; fork only zeroes the marker in fresh task storage):
 - at `sched_process_exec` of an in-scope process: create the group leader's `PROC_EPOCH` record if it
   is absent, store the attach generation, and publish READY with the leader's `self_exec_id`; a DIRTY
   word stays DIRTY and spends no further admission (if the record had to be created first, that creation
-  already spent one). At this revision this writer exists only in the Detailed marker object, which never
-  runs with a published generation, so it stops at the gated read; the journal object has no exec writer;
+  already spent one). This writer exists in both the Detailed marker object (which never runs with a
+  published generation, so it stops at the gated read) and the journal object (which publishes READY
+  after closure in opted-in sessions);
 - at fork: nothing is inherited or published; the child starts unmarked in fresh task storage;
 - when a watched call is not fully captured (entry or return refused for scope or ABI, an in-scope
   capture failure such as a lost identity, start record or ring slot, or a call abandoned at thread
@@ -516,7 +517,8 @@ one array read and return; fork only zeroes the marker in fresh task storage):
 
 Under `--system` every process is in scope, so once a Session carries both a published generation and the
 exec writer, every process that execs after closure gets a record holding its exec ID and the attach
-generation. At this revision no Session has both, so no such record is written.
+generation. Opted-in journal sessions carry both, so such records are written there; ordinary sessions
+carry neither.
 
 New transient kernel read: the current group leader's `self_exec_id`, at exec only. It adds to the Stage A
 list (`group_leader`, `flags`, `mm`).
@@ -547,9 +549,9 @@ private capture-lifetime userspace copies (`src/semantics_objects/journal.rs`), 
 and never published: `SessionBirthEvidence` (the image cookie/exec pair, the marker word, the admission
 failure state, the attach generation and custody) and `SessionBirthGrant` (the domain proof, the birth kind,
 the birth cut, the closure generation, the bundled evidence and the optional stream binding). Their raw-value
-`Debug` output must be redacted before activation. At this revision only absence-then-appearance births
-can be minted (exec-marker births refuse with `joint_birth_native_MarkerNotReady`, see Status above);
-whether they mint at runtime is not yet measured live.
+`Debug` output must be redacted before activation. Both exec-marker births and absence-then-appearance
+births can be minted under the opt-in (see Status above); whether they mint at runtime is not yet
+measured live.
 
 Output: nothing new is emitted. The marker only decides whether a process's key operations are reported as
 complete or withheld with a finite `joint_birth_native_<reason>`. No argv, environment, PIN, key, payload or

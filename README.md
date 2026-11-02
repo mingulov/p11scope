@@ -485,8 +485,14 @@ report format.
   separate from Inventory's 4,096 default / 8,192 maximum physical endpoints
   and the explicit aggregate counter modes. Detailed `--pid`, `run`, and any capture aimed with
   `--module` admit providers in discovery order. A recognized proxy closure
-  array is decided after every provider and admitted whole or not at all, so
-  it never crowds out a real provider. A `--cgroup` or `--system`
+  array is decided after every provider: whole when it fits, otherwise refused
+  whole while providers are still arriving, and a leading-templates prefix
+  with a named partial gap only after a pass with no new provider object. In
+  Detailed captures a closure array that fits nowhere takes the leftover room
+  as that prefix when no provider was refused; in every scope the prefix
+  leaves the reserve free, so a provider decoded later still fits, and a later
+  provider that still does not fit is refused by name with the
+  `--exclude-module` remedy. A `--cgroup` or `--system`
   capture without `--module` admits each provider whole or not at all, by
   value — `--manifest` providers first, then providers whose function table
   is corroborated, then heuristic finds, proxy closure arrays last. Heuristic

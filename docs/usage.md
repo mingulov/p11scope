@@ -167,15 +167,19 @@ classification consequences, never the name bytes.
 
 Start with `inspect`: it shows every provider-shaped module the target maps.
 An optional `--module` only narrows that set. On the measured p11-kit stack,
-p11-kit's fixed closure array exceeds the 512-slot ceiling and is refused
-whole, while the later-fitting SoftHSM2 backend attaches; the report is
-explicitly `PARTIAL`, not a claim that the proxy layer was captured. The
-terminal report names each refused or partially covered module with its
-reason: `run` and `profile` print a `Module gaps` section with the first
-five and an "and K more" line, and `inventory` prints the admission
+the one-shot `inspect` verdict refuses p11-kit's fixed closure array whole —
+it exceeds the 512-slot ceiling — while the later-fitting SoftHSM2 backend
+attaches; the report is explicitly `PARTIAL`, not a claim that the proxy
+layer was captured. A live Detailed capture settles one pass later: in
+Detailed captures a closure array that fits nowhere takes the leftover room
+as a leading-templates prefix with a named partial gap when no provider was
+refused. The terminal report names each refused or partially covered module
+with its reason: `run` and `profile` print a `Module gaps` section with the
+first five and an "and K more" line, and `inventory` prints the admission
 reason under each refused module. A capture whose only mapped provider is
-the proxy layer completes with that named gap; an attach-scoped `--pid`
-capture on such a process stops at startup with the named refusal.
+the proxy layer starts with that prefix partial ("3 of 64 template tables
+attached" on the measured stack) and completes with the named gap; only a
+capture that can attach nothing at all stops at startup with a named refusal.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,
@@ -828,11 +832,12 @@ Limits that matter in pods:
   by you" with its path, identity and the number of processes that mapped
   it, and an exclusion that matched nothing is reported as such.
   `--module X` together with an `--exclude-module` that matches X is
-  refused with a named error. Excluded modules are a declared choice, not
+  refused with a named error, and so is a `--prearm-module` or `--manifest`
+  attesting an excluded module. Excluded modules are a declared choice, not
   a loss: the rest of the capture can still be `exact`, and the report
-  says plainly that calls into excluded files were not observed. To work
-  around a proxy closure array crowding out real providers today, pass
-  `--exclude-module libp11-kit.so.0` and capture the backends.
+  says plainly that calls into excluded files were not observed. To leave
+  the proxy layer out entirely and spend its slots on the backends, pass
+  `--exclude-module libp11-kit.so.0`.
 - `--select-endpoint <FUNCTION>` — `profile` or `run` with `--mode metrics`
   and `--counter-mode` only: name one endpoint function (for example
   `C_Sign`) for full detail while aggregate counters continue. The name

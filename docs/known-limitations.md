@@ -32,11 +32,14 @@ Counter banks share one 65,536-entry return-value pool, and
 saturation is reported in the collection health. Per-call
 profile/trace capture stays fixed at 512 attach slots (2,112 only in
 the WIDE source build). A recognized proxy closure array (p11-kit's fixed
-wrapper tables) is admitted whole or not at all in every scope, after all
-providers, so it can never crowd a real provider out of the attach slots.
-Its 6,530+ endpoints exceed every current ceiling, so the proxy layer
-itself stays refused with a named gap while the backends behind it attach
-(costs of covering it are measured in
+wrapper tables) is decided after all providers in every scope: whole when
+it fits, otherwise refused whole while providers are still arriving, and a
+reserve-capped leading-templates prefix with a named partial gap only after
+a pass with no new provider object. In Detailed captures a closure array
+that fits nowhere takes the leftover room as that prefix when no provider
+was refused. Its 6,530+ endpoints exceed every current ceiling, so the proxy
+layer itself is only ever covered by that prefix while the backends behind
+it attach (costs of covering it are measured in
 `docs/notes/2026-11-01-p11kit-proxy-layer-measurement.md`).
 
 Endpoint selection (`--select-endpoint` with `--mode metrics` and

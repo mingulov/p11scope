@@ -1095,8 +1095,9 @@ fn scan_k0_tail(
 /// the tail the pre-quiescence witness snapshot cannot see. A tail
 /// EXEC or fault voids as caller-changed, a tail leader exit as
 /// caller-retired, in the witness step's contract position (after
-/// retirement, before loss). Twins stage the tail directly;
-/// production collects it from the terminal drains.
+/// retirement, before loss); within the step a tail change beats a
+/// witnessed break. Twins stage the tail directly; production
+/// collects it from the terminal drains.
 #[allow(clippy::too_many_arguments)] // One close over all retained inputs; twins drive it directly.
 pub(super) fn close_k0_window_with_tail(
     window: K0Window,
@@ -1152,12 +1153,12 @@ pub(super) fn close_k0_window_with_tail(
         ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
         return;
     }
-    if after_witness.greatest_break_ns != before.greatest_break_ns {
-        ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerRetired).name());
-        return;
-    }
     if let Some(refusal) = scan_k0_tail(resolved.original.pid(), tail_records, tail_malformed) {
         ledger.mark_selection_refused(refusal.name());
+        return;
+    }
+    if after_witness.greatest_break_ns != before.greatest_break_ns {
+        ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerRetired).name());
         return;
     }
     let mut deltas = match collector.observe(after) {

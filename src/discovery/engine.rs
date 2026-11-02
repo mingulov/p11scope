@@ -23886,9 +23886,9 @@ impl Engine {
 
     /// The Q-bounded terminal drain with K0 tail observation: the outer
     /// Q-bounded records ride to the observer, as do the follow-up
-    /// nested pulls. The outer malformed count does not — the Q-bounded
-    /// poll bypasses the PID tap, so it never faulted the witness —
-    /// while nested malformed (via the dequeue path) does.
+    /// nested pulls. The outer malformed count rides too — the
+    /// Q-bounded poll bypasses the PID tap, so the tail is its only
+    /// witness — as does nested malformed.
     pub(crate) fn drain_discovery_terminal_to_position_observed<F, G>(
         &mut self,
         session: &mut dyn EngineSession,
@@ -23944,6 +23944,9 @@ impl Engine {
             *post_q_record |= post_q;
             for record in &records {
                 observe_record(record);
+            }
+            if malformed > 0 {
+                observe_malformed(malformed);
             }
             if backlog && records.is_empty() && malformed == 0 {
                 debug_assert_eq!(quantum, 0, "only a zero quantum pulls nothing with backlog");

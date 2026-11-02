@@ -1,0 +1,11 @@
+# synthetic fixture-failure log from the real fixture-gate string (must match no signature)
+
+running 1 test
+test discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once ... thread 'discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once' (100) panicked at src/discovery/pressure_native_tests.rs:138:5:
+gcc must be installed for twin
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+failures:
+    discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7118 filtered out; finished in 0.01s

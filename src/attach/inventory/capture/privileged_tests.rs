@@ -319,6 +319,7 @@ fn multi_pid_refused_where_unproven(tag: &str) -> Result<bool> {
         "{refused}"
     );
     eprintln!("{tag} backend=Multi refused={refused:?}");
+    eprintln!("P11SCOPE_CELL_BRANCH=pid_filter_refused");
     Ok(true)
 }
 

@@ -1,0 +1,17 @@
+# verbatim copy of the real failing log (privileged run 2026-11-03)
+
+running 1 test
+test discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent ... D4_OVERLAY_COPY_UP lane=B target-backing=false magic=0x794c7630 xino=true auto=Y held=(226, 8589934606) mapfiles=(226,8589934606)
+
+thread 'discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent' (3643858) panicked at src/discovery/d4_overlay_cells.rs:1964:5:
+D-C7-3 stands: upper mapper re-edged to the stale anchor: SweepAttribution { members: [SweptMember { pid: 3643873, start_time: 16965657, exe: ExeIdentity { dev: 47, ino: 59390363, mtime_secs: 1793705092, mtime_nanos: 538271025, path: Some("/home/user/src/m/p11scope-ws/p11scope/.worktrees/v060-wp2-revive-skips/target/wp2r2/debug/deps/p11scope-86f4635b078b4fd6") }, objects: [MatchedObject { key: ObjectKey { device: Device { major: 0, minor: 226 }, inode: 8589934606 }, object: PinnedObjectId(0), path: "/var/tmp/p11scope-ws-tmp/wp2r2/obs-xfail/tmp/.tmp7x5Nl9/merged1/lib.so", double_loaded: false }], unexamined: 3 }], unexamined: {3643873: 3}, unexamined_objects: {ObjectKey { device: Device { major: 0, minor: 35 }, inode: 37737 }, ObjectKey { device: Device { major: 0, minor: 35 }, inode: 247608 }, ObjectKey { device: Device { major: 0, minor: 35 }, inode: 247611 }}, unavailable: 0, losses: {}, member_losses: {}, exited: {}, probed: 1 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7118 filtered out; finished in 0.41s
+

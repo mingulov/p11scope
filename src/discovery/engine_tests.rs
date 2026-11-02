@@ -21365,6 +21365,68 @@ fn loader_pin_reuse_does_not_carry_across_a_later_dirty_mutation() {
     assert!(engine.loader_plan_cache.is_some());
 }
 
+/// An over-cap inventory tick that admits nothing must not rebuild any
+/// candidate. Two provider-free peers fill a 2-view cgroup capture; a third
+/// live peer holds a refresh request but no slot. The ordinary tick attempts
+/// it, finds no slot, and admits nothing — yet it rebuilds the identical
+/// empty-input candidate twice. The request must stay queued with its serial:
+/// an early return would complete it, so that proves the tick ran the full
+/// admission path rather than skipping the builds by skipping the tick.
+#[test]
+fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
+    let mut first = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut second = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut waiting = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let (p1, p2, p3) = (first.id(), second.id(), waiting.id());
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[p1, p2, p3]);
+    engine.max_scan_pids = 2;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), p1).unwrap());
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), p2).unwrap());
+    engine.next_view_id = 2;
+    assert!(engine.request_refresh_consumed(p3, Some(1_000)));
+    let serial = engine.refresh_requested[&p3].serial;
+    let before = loader_planning_operation_counts(&engine);
+    let scans_before = engine.deep_scans;
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        before,
+        "an idle tick must not rebuild candidates"
+    );
+    assert_eq!(
+        engine.deep_scans, scans_before,
+        "no scan ran without a slot"
+    );
+    assert_eq!(
+        engine
+            .refresh_requested
+            .get(&p3)
+            .map(|request| request.serial),
+        Some(serial),
+        "the slotless request stays queued with its serial"
+    );
+    assert_eq!(engine.views.len(), 2);
+    assert!(engine.views.iter().any(|view| view.pid() == p1));
+    assert!(engine.views.iter().any(|view| view.pid() == p2));
+    for child in [&mut first, &mut second, &mut waiting] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
 #[test]
 fn loader_only_pin_reuses_provider_plan() {
     use std::os::unix::fs::MetadataExt as _;

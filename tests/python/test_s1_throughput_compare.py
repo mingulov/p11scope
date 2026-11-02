@@ -2518,6 +2518,56 @@ class JointConservationGate(unittest.TestCase):
                                         "loss gap"):
                 self.run_joint(Path(tmp), mutate)
 
+    def test_cross_row_mechanism_swap_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-xrow-") as tmp:
+            def mutate(doc):
+                child = doc["semantic_edges"][0]
+                sign, keygen = child["mechanisms"]
+                sign["evidence"]["functions"].append("C_GenerateKey")
+                sign["calls"] += keygen["calls"]
+                sign["errors"] += keygen["errors"]
+                child["mechanisms"] = [sign]
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "pinned"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_native_capture_events_lost_gap_fails(self):
+        reason = ("the EVENTS ring overwrote records before the drain "
+                  "read them (kernel reserve failures; exact count in "
+                  "unrouted_returns)")
+        with tempfile.TemporaryDirectory(prefix="joint-evloss-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "native capture events lost",
+                     "reason": reason, "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_native_capture_events_lost_event_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-evlost-ev-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            rows = [json.loads(line) for line in
+                    events.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            ended = rows[-1]
+            assert ended["kind"] == "ended"
+            gap = event_envelope(ended["seq"], R0 + 1_000, "gap_recorded",
+                                 {"index": 0, "caller": None, "module": None,
+                                  "pid": None,
+                                  "subject": "native capture events lost",
+                                  "reason": "ring overwrite before drain",
+                                  "budget": None})
+            rows.insert(-1, gap)
+            ended["seq"] += 1
+            write_jsonl(events, rows)
+            with self.assertRaisesRegex(s1.S1Error, "loss gap"):
+                s1.compare([str(path) for path in ledgers], [str(events)],
+                           str(inventory), FULL_RATE, joint=True)
+
     def test_joint_requires_system_scope(self):
         with tempfile.TemporaryDirectory(prefix="joint-scope-") as tmp:
             workdir = Path(tmp)

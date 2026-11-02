@@ -267,6 +267,56 @@ class VerdictMapping(unittest.TestCase):
                "stop_quiescence=not_requested)", load="99.0", cpus="8")
         self.assertEqual(got, "false|failed|")
 
+    def test_r59_and_counted_loss_are_failed_at_any_load(self):
+        reasons = (
+            "semantic coverage is not the exact R59 stopped disclosure",
+            "loss gap: published capture loss or retirement",
+            "loss gap: semantic input refused beyond count-only setup",
+            "ring_loss 1 (observation.lifecycle.ring_loss)",
+            "events_lost 1 "
+            "(observation.semantic_capture.unrouted_returns)",
+        )
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    self.map_verdict(1, reason, load="99.0", cpus="8"),
+                    "false|failed|")
+
+    def test_foreign_joint_marker_status_is_failed(self):
+        reasons = (
+            "object_observations status unavailable reason "
+            "bootstrap_unavailable, not the Joint marker populated/none",
+            "object_observations status populated reason stale, not the "
+            "Joint marker populated/none",
+        )
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    self.map_verdict(1, reason, load="99.0", cpus="8"),
+                    "false|failed|")
+
+    def test_driver_topology_failures_are_failed(self):
+        reasons = (
+            "no single caller for driver pid 4242: 0 rows",
+            "no single edge for driver pid 4242: 2 rows",
+            "driver module row is not unique",
+            "driver instance row is not unique",
+            "driver semantic row is not unique",
+        )
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    self.map_verdict(1, reason, load="99.0", cpus="8"),
+                    "false|failed|")
+
+    def test_rotation_marker_wording_stays_load_judged(self):
+        reason = ("event stream incomplete: ended marker is not unique "
+                  "and last")
+        self.assertEqual(self.map_verdict(1, reason, load="12.5", cpus="8"),
+                         "false|nonqualifying|")
+        self.assertEqual(self.map_verdict(1, reason, load="2.0", cpus="8"),
+                         "false|failed|")
+
     def test_shapeless_evidence_is_load_judged(self):
         reasons = (
             "unreadable events /tmp/x/events.jsonl.1",

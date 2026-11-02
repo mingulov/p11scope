@@ -455,16 +455,17 @@ proving renderers never receive the tail.
 
 **Status: IMPLEMENTED in development for v0.6.0. FULL and P0 builds contain the
 marker in their Detailed objects and the journal object by default
-(`P11SCOPE_BIRTH_MARKER=0` or `P11SCOPE_JOURNAL=0` omits each); SMALL, WIDE and
+(`P11SCOPE_BIRTH_MARKER=0` omits the marker; `P11SCOPE_JOURNAL=0` omits the journal, and the marker unless explicitly selected (`P11SCOPE_BIRTH_MARKER=1` selects it on any Detailed build)); SMALL, WIDE and
 unsafe builds omit both. The owner approved FULL/P0 inclusion (owner B2, 2026-11-01;
 final yes/no at freeze). Shipping is gated on the live cells and the freeze decision.
 The linked birth seals activate only when the user opts in to per-key tracking
 (owner B1, 2026-11-01), with no new read.
 No formal privacy sign-off before about v0.9 (OD25).** The opt-in is
 `p11scope inventory --key-operations` (default off; selection ruling 2026-11-01).
-At this revision the kernel publish/dirty hooks are implemented and arming works
-under the opt-in, but the Session loop still wires no live reader, so no production
-caller mints births from marker state.
+At this revision the kernel publish/dirty hooks are implemented and the linked lane
+arms its birth machine under the opt-in, while ordinary captures mint no birth
+witness; whether the serviced machine mints birth witnesses at runtime is not yet
+measured live.
 In a marker build, this adds state only in a lane Session that has published an attach generation
 (closure): only an `inventory --manifest --key-operations` capture whose semantic lane seals over the
 loaded journal pair publishes the attach generation and arms the marker. Ordinary captures seal with
@@ -536,8 +537,8 @@ private capture-lifetime userspace copies (`src/semantics_objects/journal.rs`), 
 and never published: `SessionBirthEvidence` (the image cookie/exec pair, the marker word, the admission
 failure state, the attach generation and custody) and `SessionBirthGrant` (the domain proof, the birth kind,
 the birth cut, the closure generation, the bundled evidence and the optional stream binding). Their raw-value
-`Debug` output must be redacted before activation. The Session loop still wires no live
-reader, so no production caller mints births from marker state.
+`Debug` output must be redacted before activation. Whether the serviced machine mints
+birth witnesses at runtime is not yet measured live.
 
 Output: nothing new is emitted. The marker only decides whether a process's key operations are reported as
 complete or withheld with a finite `joint_birth_native_<reason>`. No argv, environment, PIN, key, payload or

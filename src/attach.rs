@@ -680,8 +680,39 @@ fn validate_policy_maps(ebpf: &Ebpf, object_has_unsafe: bool) -> Result<()> {
 /// a Detailed session requires the map exactly when this build enabled
 /// the birth marker; counter banks forbid it independently of the
 /// Detailed build selection.
-#[cfg(test)]
-fn pid_start_tick_verdict(_present: bool, _roots: StaticRoots, _expected: bool) -> Result<()> {
+fn pid_start_tick_verdict(present: bool, roots: StaticRoots, expected: bool) -> Result<()> {
+    const NAME: &str = "PID_START_TICK";
+    match (roots, expected, present) {
+        (StaticRoots::CounterBanks, _, true) => {
+            bail!("{NAME} present in a counter bank object")
+        }
+        (StaticRoots::CounterBanks, _, false) | (StaticRoots::Detailed, false, false) => Ok(()),
+        (StaticRoots::Detailed, false, true) => {
+            bail!("{NAME} present in a marker-off Detailed object (stale build)")
+        }
+        (StaticRoots::Detailed, true, false) => {
+            bail!("{NAME} missing from the Detailed object (stale build)")
+        }
+        (StaticRoots::Detailed, true, true) => Ok(()),
+    }
+}
+
+/// I4: requires `PID_START_TICK` exactly when this build enabled the
+/// birth marker on Detailed roots, and validates its exact metadata.
+/// A present map always validates exactly; absence is decided by the
+/// verdict above.
+fn validate_pid_start_tick_map(ebpf: &Ebpf, roots: StaticRoots) -> Result<()> {
+    const NAME: &str = "PID_START_TICK";
+    let expected = cfg!(p11scope_birth_marker);
+    let map = ebpf.map(NAME);
+    pid_start_tick_verdict(map.is_some(), roots, expected)?;
+    if let Some(map) = map {
+        validate_map_metadata(
+            NAME,
+            policy_map_data(NAME, map)?,
+            map_metadata(MapType::Hash, 4, 8, 1_024, BPF_F_RDONLY_PROG),
+        )?;
+    }
     Ok(())
 }
 
@@ -7033,6 +7064,8 @@ impl Session {
                 SessionPreparation::ValidatePolicy => {
                     validate_policy_maps(&ebpf, object_has_unsafe)
                         .context("validating exact policy-map metadata")?;
+                    validate_pid_start_tick_map(&ebpf, roots)
+                        .context("validating exact PID witness map metadata")?;
                     if journal {
                         journal::validate_journal_maps(&ebpf)
                             .context("validating exact journal map metadata")?;
@@ -7147,6 +7180,14 @@ impl Session {
                 }
                 SessionPreparation::FreezePublished => {
                     freeze_published_maps(&ebpf).context("freezing published policy maps")?;
+                    // I4: the witness content publishes at PublishScope
+                    // above; freeze it with the published maps exactly when
+                    // this build binds births. Validation already required
+                    // the map here, so a miss errors loudly.
+                    if roots == StaticRoots::Detailed && cfg!(p11scope_birth_marker) {
+                        let map = ebpf.map("PID_START_TICK").context("PID_START_TICK map")?;
+                        freeze_map("PID_START_TICK", map)?;
+                    }
                 }
                 SessionPreparation::SelectScope => {
                     uprobe_scope = if let Some(pin) = selected {

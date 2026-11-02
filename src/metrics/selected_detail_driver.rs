@@ -6322,20 +6322,39 @@ mod tests {
         assert!(section.get("detail").is_some());
     }
 
+    /// Capture facts carrying only a truncation total and its
+    /// exit-only subset, for the comparable-loss twins.
+    fn k0_facts(truncated: u64, exit_ended: u64) -> crate::render::CaptureFacts {
+        crate::render::CaptureFacts {
+            discovery_truncated: truncated,
+            exit_ended_truncations: exit_ended,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn k0_comparable_losses_subtracts_exit_ended_truncations() {
         // The K0 window compares the live total minus the exit-only
         // loader-scan truncations, which prove their process exited
         // and are not discovery loss. Other lanes pass through, and
         // the subtraction saturates.
-        let mut facts = crate::render::CaptureFacts::default();
-        facts.discovery_ring_loss = 5;
-        facts.discovery_state_failures = 6;
-        facts.discovery_read_failures = 7;
-        facts.discovery_truncated = 3;
-        facts.exit_ended_truncations = 2;
+        let facts = crate::render::CaptureFacts {
+            discovery_ring_loss: 5,
+            discovery_state_failures: 6,
+            discovery_read_failures: 7,
+            discovery_truncated: 3,
+            exit_ended_truncations: 2,
+            ..Default::default()
+        };
         assert_eq!(k0_comparable_losses(&facts), [5, 6, 7, 1]);
-        facts.exit_ended_truncations = 9;
+        let facts = crate::render::CaptureFacts {
+            discovery_ring_loss: 5,
+            discovery_state_failures: 6,
+            discovery_read_failures: 7,
+            discovery_truncated: 3,
+            exit_ended_truncations: 9,
+            ..Default::default()
+        };
         assert_eq!(k0_comparable_losses(&facts), [5, 6, 7, 0]);
     }
 
@@ -6360,9 +6379,7 @@ mod tests {
             &counts_for(&scene.plan, 100, 100),
             window_of(10, 20),
         );
-        let mut before_facts = crate::render::CaptureFacts::default();
-        before_facts.discovery_truncated = 1;
-        before_facts.exit_ended_truncations = 1;
+        let before_facts = k0_facts(1, 1);
         let window = open_k0_window_with_losses(
             resolved,
             limits_for(&scene.plan),
@@ -6381,9 +6398,7 @@ mod tests {
             &counts_for(&scene.plan, 110, 110),
             window_of(20, 30),
         );
-        let mut after_facts = crate::render::CaptureFacts::default();
-        after_facts.discovery_truncated = 2;
-        after_facts.exit_ended_truncations = 2;
+        let after_facts = k0_facts(2, 2);
         assert!(
             after_facts.discovery_losses()[3] > before_facts.discovery_losses()[3],
             "the raw totals grew: the condition that used to void"
@@ -6430,9 +6445,7 @@ mod tests {
             &counts_for(&scene.plan, 100, 100),
             window_of(10, 20),
         );
-        let mut before_facts = crate::render::CaptureFacts::default();
-        before_facts.discovery_truncated = 1;
-        before_facts.exit_ended_truncations = 1;
+        let before_facts = k0_facts(1, 1);
         let window = open_k0_window_with_losses(
             resolved,
             limits_for(&scene.plan),
@@ -6451,9 +6464,7 @@ mod tests {
             &counts_for(&scene.plan, 110, 110),
             window_of(20, 30),
         );
-        let mut after_facts = crate::render::CaptureFacts::default();
-        after_facts.discovery_truncated = 3;
-        after_facts.exit_ended_truncations = 2;
+        let after_facts = k0_facts(3, 2);
         close_k0_window_with_losses(
             window,
             &scene.plan,

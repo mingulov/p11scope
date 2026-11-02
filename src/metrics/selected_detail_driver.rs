@@ -6620,9 +6620,10 @@ mod tests {
     #[test]
     fn k0_tail_zero_ts_records_void_as_changed() {
         // A clock fault (zero timestamp) never hides inside the
-        // selection window: both zero-ts tail records must void as
-        // caller-changed even though 0 <= stamp. The exec voids on
-        // its kind; the exit voids on its zero stamp (K0-4 arm).
+        // selection window, even though 0 is below every stamp. The
+        // zero-ts exec comes first and voids on its kind, so this twin
+        // pins the exec arm; `k0_tail_lone_zero_ts_exit_voids_as_changed`
+        // pins the zero-ts exit arm on its own.
         let pool = test_pool();
         let scene = stage_single_provider(pool, 4);
         let mut ledger = SelectionLedger::new();
@@ -6675,6 +6676,72 @@ mod tests {
             Some("promotion_caller_changed"),
             "zero-ts tail records void instead of hiding in the window"
         );
+    }
+
+    #[test]
+    fn k0_tail_lone_zero_ts_exit_voids_as_changed() {
+        // A lone zero-timestamp leader exit (a clock fault) voids as
+        // caller-changed on its own: the exit arm, not an exec beside
+        // it, carries the void. A stamped exit ends the window cleanly
+        // (K0-4), so only the zero stamp separates the two.
+        for (label, hook_ts, expect_void) in [("zero", 0, true), ("stamped", 25, false)] {
+            let pool = test_pool();
+            let scene = stage_single_provider(pool, 4);
+            let mut ledger = SelectionLedger::new();
+            let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+                .expect("live name resolves for the K0 window");
+            let pid = resolved.original.pid();
+            let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+            let before = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 100, 100),
+                window_of(10, 20),
+            );
+            let window = open_k0_window(
+                resolved,
+                limits_for(&scene.plan),
+                scene.pool.reserver(),
+                Ok(before),
+                k0_clean(),
+                &mut ledger,
+            )
+            .expect("a healthy selection-time read opens the window");
+            let after = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 110, 110),
+                window_of(20, 30),
+            );
+            let tail = vec![k0_exit_record(pid, hook_ts)];
+            close_k0_window_with_tail(
+                window,
+                &scene.plan,
+                Ok(after),
+                k0_clean(),
+                true,
+                &tail,
+                0,
+                &mut ledger,
+            );
+            let record = ledger.selection.as_ref().expect("selection records");
+            if expect_void {
+                assert_eq!(
+                    record.refusal,
+                    Some("promotion_caller_changed"),
+                    "{label}: a lone zero-ts exit voids"
+                );
+            } else {
+                assert_eq!(record.refusal, None, "{label}: a stamped exit ends cleanly");
+                let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+                let section = &composed["evidence"]["selected_detail"];
+                assert!(section.get("detail").is_some(), "{label}: detail renders");
+            }
+        }
     }
 
     #[test]

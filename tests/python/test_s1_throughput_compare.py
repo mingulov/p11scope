@@ -898,6 +898,53 @@ class ConservationGate(unittest.TestCase):
             self.run_mutation(mutate)
         self.assertIn("api_returns 24 != issued 25", str(ctx.exception))
 
+    def test_slot_refused_setup_conserved(self):
+        def mutate(inventory):
+            child = inventory["semantic_edges"][0]
+            child["operations"]["calls"] = 24
+            child["api_returns"]["count"] = 24
+            inventory["gaps"].append(
+                {"caller": "c0", "module": None, "pid": None,
+                 "subject": "semantic input refused", "reason": "slot",
+                 "budget": None, "repeats": 1})
+        result = self.run_mutation(mutate)
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(result["conservation"]["slot_refused"], 1)
+
+    def test_slot_refused_short_without_gap_fails(self):
+        def mutate(inventory):
+            child = inventory["semantic_edges"][0]
+            child["operations"]["calls"] = 24
+            child["api_returns"]["count"] = 24
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate)
+        self.assertIn("minus slot-refused 0", str(ctx.exception))
+
+    def test_slot_refused_overcounted_fails(self):
+        def mutate(inventory):
+            inventory["gaps"].append(
+                {"caller": "c0", "module": None, "pid": None,
+                 "subject": "semantic input refused", "reason": "slot",
+                 "budget": None, "repeats": 1})
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate)
+        self.assertIn("minus slot-refused 1", str(ctx.exception))
+
+    def test_slot_refused_foreign_scope_ignored(self):
+        # A foreign-scoped slot row never dilutes the driver's exact
+        # totals: conservation fails closed on its own term first.
+        def mutate(inventory):
+            child = inventory["semantic_edges"][0]
+            child["operations"]["calls"] = 24
+            child["api_returns"]["count"] = 24
+            inventory["gaps"].append(
+                {"caller": "c9", "module": None, "pid": None,
+                 "subject": "semantic input refused", "reason": "slot",
+                 "budget": None, "repeats": 1})
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate)
+        self.assertIn("minus slot-refused 0", str(ctx.exception))
+
     def run_rsa_tally_confusion(self, mutate, token):
         # 6.08 phase 1 (S2): the throughput denominator is all-issued from
         # the per-thread T0 ledgers. The 65-call RSA semantic tally is a
@@ -2701,6 +2748,70 @@ class JointConservationGate(unittest.TestCase):
                      "budget": None, "repeats": 1})
             with self.assertRaisesRegex(require_s1(self).S1Error,
                                         "loss gap"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_slot_refused_setup_conserved(self):
+        # The live keyed shape: the two COUNT_ONLY slot probes are
+        # refused at conversion and disclosed, so operations and
+        # api_returns equal issued minus the named slot term.
+        with tempfile.TemporaryDirectory(prefix="joint-slot-") as tmp:
+            def mutate(doc):
+                child = doc["semantic_edges"][0]
+                issued = 20006
+                child["operations"]["calls"] = issued - 2
+                child["api_returns"]["count"] = issued - 2
+                doc["gaps"].append(
+                    {"caller": "c1", "module": None, "pid": None,
+                     "subject": "semantic input refused", "reason": "slot",
+                     "budget": None, "repeats": 2})
+            result = self.run_joint(Path(tmp), mutate)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["conservation"]["slot_refused"], 2)
+
+    def test_slot_refused_short_without_gap_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-slot0-") as tmp:
+            def mutate(doc):
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] = 20004
+                child["api_returns"]["count"] = 20004
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "minus slot-refused 0"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_slot_refused_overcounted_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-slotn-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": "c1", "module": None, "pid": None,
+                     "subject": "semantic input refused", "reason": "slot",
+                     "budget": None, "repeats": 2})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "minus slot-refused 2"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_slot_refused_exceeds_issued_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-slotx-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": "c1", "module": None, "pid": None,
+                     "subject": "semantic input refused", "reason": "slot",
+                     "budget": None, "repeats": 20007})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "exceeds issued"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_slot_refused_foreign_scope_ignored(self):
+        with tempfile.TemporaryDirectory(prefix="joint-slotf-") as tmp:
+            def mutate(doc):
+                child = doc["semantic_edges"][0]
+                child["operations"]["calls"] = 20004
+                child["api_returns"]["count"] = 20004
+                doc["gaps"].append(
+                    {"caller": "c0", "module": "m0", "pid": 999,
+                     "subject": "semantic input refused", "reason": "slot",
+                     "budget": None, "repeats": 2})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "minus slot-refused 0"):
                 self.run_joint(Path(tmp), mutate)
 
     def test_cross_row_mechanism_swap_fails(self):

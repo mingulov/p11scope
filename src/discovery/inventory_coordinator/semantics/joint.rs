@@ -703,6 +703,11 @@ pub(crate) struct PreparedSemanticBatch {
     births_decided: bool,
     // Buffers and nested owned payloads drop before their retained charge.
     storage: Option<ResourceLease>,
+    /// Test-only legacy switch: file fingerprint claims even without
+    /// a journal feed, so the differential test can compare the old
+    /// path against the feed-less skip on identical sequences.
+    #[cfg(test)]
+    test_legacy_claims: bool,
 }
 
 fn allocation_bytes<T>(capacity: usize) -> Option<usize> {
@@ -733,6 +738,8 @@ impl PreparedSemanticBatch {
             stage_cursor: 0,
             births_decided: false,
             storage: None,
+            #[cfg(test)]
+            test_legacy_claims: false,
         }
     }
 
@@ -828,7 +835,10 @@ impl PreparedSemanticBatch {
         &mut self,
         adapter: &mut JournalAdapter,
         ingested: &IngestedRaw,
+        journal_feed: bool,
     ) -> Result<Option<PreparedClaim>, RawQuantumRefusal> {
+        #[cfg(test)]
+        let journal_feed = journal_feed || self.test_legacy_claims;
         let mut next = self.claim_cursor;
         while let Some(entry) = self.entries.get_mut(next) {
             // Conversion refusals need no journal claim. Their original
@@ -839,7 +849,17 @@ impl PreparedSemanticBatch {
                 {
                     return Err(RawQuantumRefusal::Admission);
                 }
-                let claim = adapter.attest_key(input);
+                // Without a journal BEGIN feed no fingerprint claim can
+                // ever be consumed: the store would fill after 2048
+                // modeled calls and every later claim would pay prune
+                // work before refusing. Bind the key only, so the
+                // recorded proof still passes the later admission
+                // checks while the claim store stays empty.
+                let claim = if journal_feed {
+                    adapter.attest_key(input)
+                } else {
+                    adapter.bind_admitted_key(input)
+                };
                 assert!(
                     entry.claim.is_none(),
                     "each actual original claim is retained once"
@@ -1352,7 +1372,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if batch.domain != producers.native_domain() {
             return Err(RawQuantumRefusal::ForeignCapture);
         }
-        batch.claim_next(adapter, ingested)
+        batch.claim_next(adapter, ingested, producers.journal_linked())
+    }
+
+    /// Test-only legacy switch for the pending batch: file fingerprint
+    /// claims even without a journal feed. The differential test sets
+    /// this after every preparation on its legacy arm.
+    #[cfg(test)]
+    pub(crate) fn set_prepared_legacy_claims_for_test(&mut self, on: bool) {
+        if let Some(PendingSemanticBatch::Prepared(batch)) = self
+            .semantic_finalizer
+            .as_mut()
+            .and_then(|state| state.pending_semantic.as_mut())
+        {
+            batch.test_legacy_claims = on;
+        }
     }
 
     pub(crate) fn dispose_prepared_claims_s1(&mut self) {

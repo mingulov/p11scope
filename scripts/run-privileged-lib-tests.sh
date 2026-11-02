@@ -475,6 +475,7 @@ metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live
 # (P11SCOPE_E2E_OBSERVER or the p11scope sibling).
 metrics::k0_live_cells::k0_live_detail_matches_ledger_counts_lp64
 metrics::k0_live_cells::k0_live_exec_voids_detail_counts_lp64
+metrics::k0_live_cells::k0_live_run_detail_matches_ledger_counts_lp64
 metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64
 )
 

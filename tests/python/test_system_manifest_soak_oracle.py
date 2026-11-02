@@ -246,12 +246,24 @@ class SoakOracleTest(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
         self.assertIn("lost=100", verdict["gates"]["loss_accounting"]["detail"])
 
-    def test_green_events_loss_gap_also_names_unrouted(self):
+    def test_red_events_loss_gap_does_not_name_unrouted(self):
         disclosed = make_green(
             self.base / "events-lost-unrouted", unrouted=7,
             gaps=[("native capture events lost", "kernel reserve failures")])
         verdict = self.evaluate(disclosed)
-        self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+        self.assert_red_only(verdict, "loss_accounting")
+        self.assertIn("unrouted_returns=7",
+                      verdict["gates"]["loss_accounting"]["detail"])
+
+    def test_red_events_loss_unknown_gap_fails_loss_accounting(self):
+        unknown = make_green(
+            self.base / "events-loss-unknown",
+            gaps=[("native capture events loss unknown",
+                   "counter could not be read")])
+        verdict = self.evaluate(unknown)
+        self.assert_red_only(verdict, "loss_accounting")
+        self.assertIn("counts cannot be checked",
+                      verdict["gates"]["loss_accounting"]["detail"])
 
     def test_red_loss_silent_events_loss(self):
         silent = make_green(self.base / "silent-events-lost", lost=40)

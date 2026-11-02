@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! K0 live cells: `--select-endpoint` detail from the broad counter on
-//! a real SoftHSM workload (Fedora, root). Both cells run the real
-//! observer binary (`P11SCOPE_E2E_OBSERVER` or the `p11scope` sibling
-//! of this test binary) as `profile --pid --mode metrics
-//! --counter-mode counts --select-endpoint C_Sign` against a
-//! gate-synchronized ledger workload, then compare the `-o` report
-//! with the workload's own exact ledger. The positive pins a known
-//! call count; the negative execs mid-window through the ledger's
-//! exec-chain mode and pins the caller-changed void.
+//! a real SoftHSM workload (root). Every cell runs the real observer
+//! binary (`P11SCOPE_E2E_OBSERVER` or the `p11scope` sibling of this
+//! test binary) with `--mode metrics --counter-mode counts
+//! --select-endpoint C_Sign` against a gate-synchronized ledger
+//! workload, then compares the `-o` report with the workload's own
+//! exact ledger. `profile --pid` and owned `run` positives pin a known
+//! call count with the target held alive through close; the exec
+//! negative execs mid-window through the ledger's exec-chain mode and
+//! pins the caller-changed void; the two exit cells let the watched
+//! process exit inside the window (owned `run` without `--hold`, and a
+//! `--pid` target that ends before the duration) and pin what an exit
+//! does to the detail.
 //!
 //! Gate discipline (no sleeps on the critical path): every phase the
 //! test drives waits on a workload line (`READY`, `WATCH_READY`,
 //! `DONE`) or the observer's `capturing` readiness line (it proves
 //! attach plus discovery plus the pre-loop selection read; live
 //! frames are TTY-only, so a function row never lands in the log),
-//! each under an outer deadline that fails loudly. `--hold` keeps
-//! the watched pid mapped through close so no leader exit voids the
-//! window.
+//! each under an outer deadline that fails loudly. In the positives
+//! `--hold` keeps the watched pid alive through close, so the window
+//! closes on the observer's duration rather than on an exit.
 
 use anyhow::{Context as _, Result, ensure};
 use std::path::{Path, PathBuf};
@@ -89,18 +93,50 @@ fn monotonic_ns() -> u64 {
 
 struct K0Workload {
     dir: tempfile::TempDir,
+    /// Owned-`run` cells under `sudo`: a test-owned 0711 base the
+    /// dropped child can traverse (declared after `dir`, so it drops
+    /// last). `None` keeps the workload under `$TMPDIR`.
+    base: Option<tempfile::TempDir>,
     ledger: PathBuf,
     conf: PathBuf,
 }
 
 impl K0Workload {
     fn build(module: &str) -> Result<Self> {
+        Self::build_with_base(module, None)
+    }
+
+    /// The owned-`run` workload. Under `sudo` the observer drops the
+    /// owned child to the invoking user, who must traverse to its
+    /// ledger, config, token and gate. The runner's `$TMPDIR` is a
+    /// root-only 0700 directory, so the workload goes under a
+    /// test-owned 0711 base in the sticky `/var/tmp` instead and the
+    /// runner's directory is never re-moded. Without `sudo` (root CI)
+    /// the child stays root and `$TMPDIR` serves as is.
+    fn build_owned(module: &str) -> Result<Self> {
+        if std::env::var_os("SUDO_UID").is_none() {
+            return Self::build_with_base(module, None);
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::Builder::new()
+            .prefix("p11scope-k0run-")
+            .tempdir_in("/var/tmp")
+            .context("test-owned base under /var/tmp")?;
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o711))
+            .context("open the test-owned base for traversal")?;
+        Self::build_with_base(module, Some(base))
+    }
+
+    fn build_with_base(module: &str, base: Option<tempfile::TempDir>) -> Result<Self> {
         ensure!(
             Path::new(module).exists(),
             "SoftHSM2 provider {module} is missing"
         );
         ensure!(ledger_source().exists(), "ledger fixture is missing");
-        let dir = tempfile::tempdir()?;
+        let dir = match &base {
+            Some(base) => tempfile::tempdir_in(base.path())?,
+            None => tempfile::tempdir()?,
+        };
         let ledger = dir.path().join("ledger");
         let status = Command::new("cc")
             .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
@@ -129,7 +165,12 @@ impl K0Workload {
             .status()
             .context("running softhsm2-util")?;
         ensure!(status.success(), "softhsm2-util --init-token failed");
-        Ok(Self { dir, ledger, conf })
+        Ok(Self {
+            dir,
+            base,
+            ledger,
+            conf,
+        })
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -148,23 +189,35 @@ impl K0Workload {
 
     /// A gated `mech` image: maps eagerly (discoverable at attach),
     /// prints READY after setup, then waits on `gate` before its
-    /// main-phase iterations and holds the pid after DONE.
-    fn spawn_mech(&self, out: &Path, module: &str, gate: &Path, iters: u32) -> Result<K0Process> {
+    /// main-phase iterations; after DONE it holds the pid (`hold`) or
+    /// exits.
+    fn spawn_mech(
+        &self,
+        out: &Path,
+        module: &str,
+        gate: &Path,
+        iters: u32,
+        hold: bool,
+    ) -> Result<K0Process> {
         ensure!(!gate.exists(), "gate {} pre-exists", gate.display());
         let stderr = out.with_extension("stderr");
+        let iters = iters.to_string();
+        let mut args = vec![
+            "mech",
+            "--cell",
+            "K0P",
+            "--module",
+            module,
+            "--iters",
+            &iters,
+            "--gate",
+            gate.to_str().context("gate path")?,
+        ];
+        if hold {
+            args.push("--hold");
+        }
         let child = Command::new(&self.ledger)
-            .args([
-                "mech",
-                "--cell",
-                "K0P",
-                "--module",
-                module,
-                "--iters",
-                &iters.to_string(),
-                "--gate",
-                gate.to_str().context("gate path")?,
-                "--hold",
-            ])
+            .args(&args)
             .env("SOFTHSM2_CONF", &self.conf)
             .stdin(Stdio::null())
             .stdout(Self::private_log(out)?)
@@ -506,6 +559,9 @@ fn keep_workload_on_failure(workload: K0Workload, outcome: Result<()>, tag: &str
     if outcome.is_err() {
         eprintln!("{tag} evidence kept at {}", workload.dir.path().display());
         let _ = workload.dir.keep();
+        if let Some(base) = workload.base {
+            let _ = base.keep();
+        }
     }
     outcome
 }
@@ -558,7 +614,7 @@ fn k0_detail_inner(workload: &K0Workload, module: &str, observer: &Path) -> Resu
     let ledger_out = workload.path("k0p.ledger.out");
     // Four main-phase iterations, one clean C_Sign each; setup and
     // teardown never call C_Sign, so the window count is exactly 4.
-    let mut target = workload.spawn_mech(&ledger_out, module, &gate, 4)?;
+    let mut target = workload.spawn_mech(&ledger_out, module, &gate, 4, true)?;
     target.wait_for("READY ", Duration::from_secs(60))?;
     let pid = target.child.id();
     let mut child = spawn_observer(observer, pid, 60, &out, &log)?;
@@ -572,8 +628,9 @@ fn k0_detail_inner(workload: &K0Workload, module: &str, observer: &Path) -> Resu
     require_attached_probes(&log, &out)?;
     std::fs::write(&gate, b"open\n")?;
     target.wait_for("DONE ", Duration::from_secs(60))?;
-    // The held pid stays mapped while the observer closes on its own
-    // duration: no leader exit can void the window.
+    // The held pid stays alive while the observer closes on its own
+    // duration, so this positive pins a window without an exit (the
+    // exit cells pin the exit).
     let status = wait_for_observer_stop(&mut child, &log, &out, Duration::from_secs(180))?;
     target.ensure_alive("at observer stop")?;
     target.kill();
@@ -640,38 +697,40 @@ fn spawn_run_observer(
     ledger: &Path,
     conf: &Path,
     gate: &Path,
+    child_tail: &[&str],
 ) -> Result<Child> {
     let log_file = std::fs::File::create(log)?;
-    Command::new(observer)
-        .args([
-            "run",
-            "--mode",
-            "metrics",
-            "--counter-mode",
-            "counts",
-            "--select-endpoint",
-            "C_Sign",
-            "--module",
-            module,
-            "--prearm-module",
-            module,
-            "--duration",
-            &duration_secs.to_string(),
-            "-o",
-            out.to_str().context("out path")?,
-            "--",
-            ledger.to_str().context("ledger path")?,
-            "mech",
-            "--cell",
-            "K0R",
-            "--module",
-            module,
-            "--iters",
-            "4",
-            "--gate",
-            gate.to_str().context("gate path")?,
-            "--hold",
-        ])
+    let mut command = Command::new(observer);
+    command.args([
+        "run",
+        "--mode",
+        "metrics",
+        "--counter-mode",
+        "counts",
+        "--select-endpoint",
+        "C_Sign",
+        "--module",
+        module,
+        "--prearm-module",
+        module,
+        "--duration",
+        &duration_secs.to_string(),
+        "-o",
+        out.to_str().context("out path")?,
+        "--",
+        ledger.to_str().context("ledger path")?,
+        "mech",
+        "--cell",
+        "K0R",
+        "--module",
+        module,
+        "--iters",
+        "4",
+        "--gate",
+        gate.to_str().context("gate path")?,
+    ]);
+    command
+        .args(child_tail)
         .env("SOFTHSM2_CONF", conf)
         .stdin(Stdio::null())
         .stdout(log_file.try_clone()?)
@@ -685,15 +744,44 @@ fn spawn_run_observer(
 fn k0_live_run_detail_matches_ledger_counts_lp64() -> Result<()> {
     let module = softhsm_path()?;
     let observer = observer_binary()?;
-    let workload = K0Workload::build(&module)?;
+    let workload = K0Workload::build_owned(&module)?;
     let outcome = k0_run_inner(&workload, &module, &observer);
     keep_workload_on_failure(workload, outcome, "K0R")
 }
 
 fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<()> {
-    let out = workload.path("k0r.json");
-    let log = workload.path("k0r.observer.log");
-    let gate = workload.path("k0r.gate");
+    let document = k0_owned_run(workload, module, observer, "k0r", OwnedChild::Held)?;
+    require_four_sign_detail(&document)
+}
+
+/// How the owned `mech` child ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnedChild {
+    /// `--hold`: alive past the observer's duration, reaped by its
+    /// handoff PID; the window closes on the duration.
+    Held,
+    /// No `--hold`: the child exits after DONE, inside the window, and
+    /// the capture ends on that exit. `--delay-ms` keeps it alive
+    /// after the gate for that long before its calls, so the observer
+    /// has processed the child's provider-load records while the child
+    /// still runs (a child that exits before that leaves the
+    /// observer's loader discovery for it unfinished: the documented
+    /// `broad_stopping` known issue, not what this shape pins).
+    ExitsAfter { delay_ms: u32 },
+}
+
+/// Drive one owned `run --select-endpoint C_Sign` over a gated `mech`
+/// child doing four clean C_Sign calls, and return the `-o` report.
+fn k0_owned_run(
+    workload: &K0Workload,
+    module: &str,
+    observer: &Path,
+    tag: &str,
+    shape: OwnedChild,
+) -> Result<serde_json::Value> {
+    let out = workload.path(&format!("{tag}.json"));
+    let log = workload.path(&format!("{tag}.observer.log"));
+    let gate = workload.path(&format!("{tag}.gate"));
     ensure!(!gate.exists(), "gate {} pre-exists", gate.display());
     // Four main-phase iterations, one clean C_Sign each; setup and
     // teardown never call C_Sign, so the window count is exactly 4.
@@ -703,9 +791,13 @@ fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<
     // the window and must not void it.
     // The owned child drops to the invoking user when the observer
     // runs as root via sudo; hand the workload tree to that user so
-    // the child can read its ledger, config and token, and open the
-    // runner-owned TMPDIR for traversal.
+    // the child can read its ledger, config, token and gate (the
+    // workload sits under a test-owned 0711 base, `build_owned`).
     if let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
+        ensure!(
+            workload.base.is_some(),
+            "owned-run workload under sudo needs its test-owned base"
+        );
         let status = std::process::Command::new("chown")
             .args([
                 "-R",
@@ -715,12 +807,15 @@ fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<
             .status()
             .context("chown workload to invoking user")?;
         ensure!(status.success(), "chown workload to {uid}:{gid}");
-        if let Some(parent) = workload.dir.path().parent() {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o711))
-                .context("open TMPDIR for the owned child")?;
-        }
     }
+    let delay;
+    let child_tail: Vec<&str> = match shape {
+        OwnedChild::Held => vec!["--hold"],
+        OwnedChild::ExitsAfter { delay_ms } => {
+            delay = delay_ms.to_string();
+            vec!["--delay-ms", &delay]
+        }
+    };
     let mut child = spawn_run_observer(
         observer,
         module,
@@ -730,6 +825,7 @@ fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<
         &workload.ledger,
         &workload.conf,
         &gate,
+        &child_tail,
     )?;
     wait_for_observer_row(
         &log,
@@ -742,24 +838,41 @@ fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<
     std::fs::write(&gate, b"open\n")?;
     wait_for_observer_row(&log, "DONE ", &mut child, &out, Duration::from_secs(60))?;
     let status = wait_for_observer_stop(&mut child, &log, &out, Duration::from_secs(180))?;
-    // The held child stays alive past the observer's duration handoff;
-    // reap it by the handoff PID the observer names.
-    if let Ok(text) = std::fs::read_to_string(&log) {
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix(
+    // A held child stays alive past the observer's duration handoff;
+    // reap it by the handoff PID the observer names. A child that
+    // exited on its own ended the capture and names no handoff.
+    let handoff = std::fs::read_to_string(&log).ok().and_then(|text| {
+        text.lines().find_map(|line| {
+            line.strip_prefix(
                 "p11scope: duration expired without --kill-on-timeout; handed back live child pid ",
-            ) && let Some(pid_text) = rest.split_whitespace().next()
-                && let Ok(pid) = pid_text.parse::<i32>()
-            {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-                let mut status = 0;
-                unsafe {
-                    libc::waitpid(pid, &mut status, 0);
-                }
-            }
+            )?
+            .split_whitespace()
+            .next()?
+            .parse::<i32>()
+            .ok()
+        })
+    });
+    if let Some(pid) = handoff {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
         }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
+    if shape != OwnedChild::Held {
+        // The exit lands inside the window: the capture ended on the
+        // child's own exit, before the duration, with no handoff.
+        let ended_on_exit = std::fs::read_to_string(&log).is_ok_and(|text| {
+            text.lines()
+                .any(|line| line.starts_with("p11scope: capture ended: target exited"))
+        });
+        ensure!(
+            handoff.is_none() && ended_on_exit,
+            "the unheld child must exit inside the window and end the capture: {}",
+            observer_evidence(&log, &out, "no target-exit end")
+        );
     }
     ensure!(
         status.success(),
@@ -770,6 +883,13 @@ fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<
     ensure!(entered == 4 && bad == 0, "workload did 4 clean signs");
     let document: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out).context("reading -o JSON")?)?;
+    Ok(document)
+}
+
+/// The rendered positive: the selection names C_Sign without a refusal,
+/// the detail carries exactly the selected slot with the ledger's four
+/// clean calls, and equals the window aggregate's row for that slot.
+fn require_four_sign_detail(document: &serde_json::Value) -> Result<()> {
     let selected = &document["evidence"]["selected_detail"];
     let record = &selected["selection"];
     ensure!(
@@ -779,7 +899,7 @@ fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<
     let slot = record["slot"].as_u64().context("selection slot")?;
     ensure!(
         record.get("refusal").is_none(),
-        "the owned window succeeds: {record}"
+        "the window succeeds: {record}"
     );
     let detail = selected.get("detail").context("detail renders")?;
     let rows = detail["rows"].as_array().context("detail rows")?;
@@ -802,6 +922,83 @@ fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<
         "live detail equals the aggregate cells for the slot"
     );
     Ok(())
+}
+
+/// What an exit of the watched process inside the window does to the
+/// detail: the documented outcome every exit cell pins. The counter
+/// bank's probes are bound to the original task, so the exit ends the
+/// window cleanly and the detail renders the four calls made before it
+/// (K0-4).
+fn require_exit_outcome(document: &serde_json::Value) -> Result<()> {
+    require_four_sign_detail(document)
+}
+
+#[test]
+#[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): run --select-endpoint counts whose owned child does four C_Sign calls and exits inside the window"]
+fn k0_live_run_exit_in_window_counts_lp64() -> Result<()> {
+    let module = softhsm_path()?;
+    let observer = observer_binary()?;
+    let workload = K0Workload::build_owned(&module)?;
+    // A three-second pause after the gate is a short program's shape:
+    // the observer processes the child's provider-load records while
+    // the child runs (its ticks are tens of milliseconds), then the
+    // child signs four times and exits inside the window.
+    let outcome = k0_owned_run(
+        &workload,
+        &module,
+        &observer,
+        "k0re",
+        OwnedChild::ExitsAfter { delay_ms: 3000 },
+    )
+    .and_then(|document| require_exit_outcome(&document));
+    keep_workload_on_failure(workload, outcome, "K0RE")
+}
+
+#[test]
+#[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): profile --pid --select-endpoint counts whose target does four C_Sign calls and exits before the duration ends"]
+fn k0_live_pid_exit_in_window_counts_lp64() -> Result<()> {
+    let module = softhsm_path()?;
+    let observer = observer_binary()?;
+    let workload = K0Workload::build(&module)?;
+    let outcome = k0_pid_exit_inner(&workload, &module, &observer);
+    keep_workload_on_failure(workload, outcome, "K0PE")
+}
+
+fn k0_pid_exit_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<()> {
+    let out = workload.path("k0pe.json");
+    let log = workload.path("k0pe.observer.log");
+    let gate = workload.path("k0pe.gate");
+    let ledger_out = workload.path("k0pe.ledger.out");
+    // Four main-phase iterations, one clean C_Sign each, then the
+    // target exits (no --hold) while the observer's duration still
+    // runs: the exit lands strictly inside the window.
+    let mut target = workload.spawn_mech(&ledger_out, module, &gate, 4, false)?;
+    target.wait_for("READY ", Duration::from_secs(60))?;
+    let pid = target.child.id();
+    let mut child = spawn_observer(observer, pid, 60, &out, &log)?;
+    wait_for_observer_row(
+        &log,
+        CAPTURE_READY_NEEDLE,
+        &mut child,
+        &out,
+        Duration::from_secs(120),
+    )?;
+    require_attached_probes(&log, &out)?;
+    std::fs::write(&gate, b"open\n")?;
+    target.wait_for("DONE ", Duration::from_secs(60))?;
+    let exited = target.child.wait().context("reaping the target")?;
+    ensure!(exited.success(), "the target exited {exited}");
+    let status = wait_for_observer_stop(&mut child, &log, &out, Duration::from_secs(180))?;
+    ensure!(
+        status.success(),
+        "observer exited {status}: {}",
+        observer_evidence(&log, &out, &format!("exited {status}"))
+    );
+    let (entered, bad) = ledger_main_counts(&ledger_out, "C_Sign")?;
+    ensure!(entered == 4 && bad == 0, "workload did 4 clean signs");
+    let document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).context("reading -o JSON")?)?;
+    require_exit_outcome(&document)
 }
 
 fn k0_exec_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<()> {

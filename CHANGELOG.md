@@ -20,6 +20,17 @@ versioned separately and are opaque, exact dispatch keys.
   counter cannot be read, the report carries a
   `native capture events loss unknown` gap instead, and the count catches up
   on the next successful read.
+- New repeatable `--exclude-module <path-or-name>` for `inspect`, `run`,
+  `profile`, `trace` and `inventory` in every scope: the opposite of
+  `--module`. Discovery stays automatic, except excluded files get no
+  probes and use no slots. A full path excludes exactly that file by
+  identity; a bare name excludes every file with that basename or ELF
+  soname. Excluded files are listed as "excluded by you" (never silent),
+  and the rest of the capture can still be `exact`.
+- Detailed captures keep a proxy closure array's leading-templates prefix
+  in the leftover room when no real provider was refused, so remote-access
+  clients (`p11-kit-client.so`) keep counting through their attached
+  templates; the report names the covered tables.
 
 ### Fixed
 
@@ -42,6 +53,7 @@ versioned separately and are opaque, exact dispatch keys.
   inspection admits first-come (an over-budget heuristic provider admits
   its strongest prefix with the spill disclosed) instead of refusing
   whole modules at the shared reserve.
+>>>>>>> c6ab35747 (docs: document --exclude-module reporting and schema)
 
 ## [0.5.0]
 

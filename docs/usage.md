@@ -812,6 +812,27 @@ Limits that matter in pods:
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one
   aggregate document.
+- `--exclude-module <path-or-name>` — repeatable, for `inspect`, `run`,
+  `profile`, `trace` and `inventory` in every scope: the opposite of
+  `--module`. Discovery stays automatic, except that excluded files get no
+  probes and use no slots. A full path (contains `/`) excludes exactly that
+  file: it is resolved like `--module` (following symlinks) and matched by
+  file identity (device + inode), so a different file at the same path in
+  another mount namespace, container or snap is NOT excluded; a path that
+  does not exist is a usage error at start. A bare name (no `/`) excludes
+  every copy, in every process and namespace, whose file name or ELF soname
+  (`DT_SONAME`) equals the name — for example `libp11-kit.so.0` matches
+  `libp11-kit.so.0.4.8`, a snap's `.0.4.5` and Fedora's `.0.4.11`, while an
+  exact file name such as `libp11-kit.so.0.4.8` matches that version only.
+  Every excluded file is listed in the report (text and JSON) as "excluded
+  by you" with its path, identity and the number of processes that mapped
+  it, and an exclusion that matched nothing is reported as such.
+  `--module X` together with an `--exclude-module` that matches X is
+  refused with a named error. Excluded modules are a declared choice, not
+  a loss: the rest of the capture can still be `exact`, and the report
+  says plainly that calls into excluded files were not observed. To work
+  around a proxy closure array crowding out real providers today, pass
+  `--exclude-module libp11-kit.so.0` and capture the backends.
 - `--select-endpoint <FUNCTION>` — `profile` or `run` with `--mode metrics`
   and `--counter-mode` only: name one endpoint function (for example
   `C_Sign`) for full detail while aggregate counters continue. The name

@@ -6195,13 +6195,13 @@ fn frozen_policy_inventory_matches_embedded_object() {
     // carriable builds; journalless builds omit it, and the unsafe
     // decoder maps add two more maps with five extra programs.
     let (maps, programs) = if unsafe_build {
-        (44, 25)
+        (44, 26)
     } else if wide {
-        (42, 20)
+        (42, 21)
     } else if marker {
-        (43, 20)
+        (43, 21)
     } else {
-        (42, 20)
+        (42, 21)
     };
     let report = run_ok(
         "python3",

@@ -155,6 +155,17 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("unhealthy median=0", table)
         self.assertIn("total=0", table)
 
+    def test_armed_arm_labeled_gated_read_only(self):
+        with tempfile.TemporaryDirectory(
+                prefix="p11scope-markercost-armed-note-") as work:
+            directory = Path(work)
+            log_path, man_path = campaign_fixture(directory)
+            manifest, samples = ANALYZER.verify(str(log_path), str(man_path))
+            table = ANALYZER.render(manifest, samples)
+        self.assertIn("gated read only", table)
+        self.assertIn("lane journal-ready", table)
+        self.assertIn("no production session writes READY", table)
+
     def test_truncated_log_fails(self):
         with tempfile.TemporaryDirectory(
                 prefix="p11scope-markercost-truncated-") as work:

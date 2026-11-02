@@ -183,6 +183,7 @@ if [ "${1-}" = "--self-test" ]; then
     trap 'rm -rf "$SELF_TEST_WORK"' EXIT INT TERM
     command -v gcc >/dev/null || { echo "self-test: gcc required" >&2; exit 1; }
     command -v python3 >/dev/null || { echo "self-test: python3 required" >&2; exit 1; }
+    command -v git >/dev/null || { echo "self-test: git required" >&2; exit 1; }
     gcc -O2 -Wall -Wextra -Werror -o "$SELF_TEST_WORK/exec-storm" \
         "$FIX/exec-storm.c" \
         || { echo "self-test: exec-storm does not compile" >&2; exit 1; }
@@ -223,6 +224,108 @@ EOF
         || { echo "self-test: analyzer self-test failed" >&2; exit 1; }
     sh "$0" --dry-run >/dev/null \
         || { echo "self-test: dry-run failed" >&2; exit 1; }
+    # bpf_parse_totals twins: bpftool omits zero counters, so with
+    # stats on an attached-but-idle program reads 0/0; a program that
+    # is not loaded reports absent (exit 4, never 0/0); stats off or a
+    # non-integer counter fails the read.
+    BPT_OUT=$(echo '[{"name": "p11_entry"}]' | bpf_parse_totals p11_entry 1) \
+        || { echo "self-test: absent counters misread" >&2; exit 1; }
+    [ "$BPT_OUT" = "0 0" ] \
+        || { echo "self-test: absent counters gave $BPT_OUT" >&2; exit 1; }
+    BPT_OUT=$(echo '[{"name": "p11_entry", "run_time_ns": 107, "run_cnt": 2006}]' \
+        | bpf_parse_totals p11_entry 1) \
+        || { echo "self-test: present counters misread" >&2; exit 1; }
+    [ "$BPT_OUT" = "107 2006" ] \
+        || { echo "self-test: present counters gave $BPT_OUT" >&2; exit 1; }
+    BPT_OUT=$(echo '[{"name": "sched_process_e", "run_time_ns": 100, "run_cnt": 2007}, {"name": "sched_process_e", "run_time_ns": 120, "run_cnt": 2007}]' \
+        | bpf_parse_totals sched_process_exec 1) \
+        || { echo "self-test: twin programs misread" >&2; exit 1; }
+    [ "$BPT_OUT" = "220 4014" ] \
+        || { echo "self-test: twin programs gave $BPT_OUT" >&2; exit 1; }
+    BPT_OUT=$(echo '[{"name": "p11_entry", "run_time_ns": 50, "run_cnt": 9}, {"name": "p11_entry"}]' \
+        | bpf_parse_totals p11_entry 1) \
+        || { echo "self-test: mixed counters misread" >&2; exit 1; }
+    [ "$BPT_OUT" = "50 9" ] \
+        || { echo "self-test: mixed counters gave $BPT_OUT" >&2; exit 1; }
+    if echo '[{"name": "p11_entry"}]' | bpf_parse_totals p11_entry 0 >/dev/null 2>&1; then
+        echo "self-test: stats-off read accepted" >&2; exit 1
+    fi
+    BPT_RC=0
+    echo '[]' | bpf_parse_totals p11_entry 1 >"$SELF_TEST_WORK/bpt.out" 2>/dev/null || BPT_RC=$?
+    [ "$BPT_RC" -eq 4 ] \
+        || { echo "self-test: missing program exit $BPT_RC" >&2; exit 1; }
+    [ "$(cat "$SELF_TEST_WORK/bpt.out")" = "absent" ] \
+        || { echo "self-test: missing program gave $(cat "$SELF_TEST_WORK/bpt.out")" >&2; exit 1; }
+    BPT_RC=0
+    echo '[{"name": "other", "run_time_ns": 1, "run_cnt": 1}]' | bpf_parse_totals p11_entry 1 >/dev/null 2>&1 || BPT_RC=$?
+    [ "$BPT_RC" -eq 4 ] \
+        || { echo "self-test: wrong-program exit $BPT_RC" >&2; exit 1; }
+    if echo '[{"name": "p11_entry", "run_time_ns": "107", "run_cnt": 5}]' | bpf_parse_totals p11_entry 1 >/dev/null 2>&1; then
+        echo "self-test: non-integer counter accepted" >&2; exit 1
+    fi
+    if echo '[{"name": "p11_entry", "run_time_ns": -1, "run_cnt": 5}]' | bpf_parse_totals p11_entry 1 >/dev/null 2>&1; then
+        echo "self-test: negative counter accepted" >&2; exit 1
+    fi
+    if echo 'not json' | bpf_parse_totals p11_entry 1 >/dev/null 2>&1; then
+        echo "self-test: non-JSON accepted" >&2; exit 1
+    fi
+    # bpf_delta twins: the after-read gate. A vacuous window (no hook
+    # run time, or fewer than one event per op) fails the sample.
+    BPD_OUT=$(bpf_delta "0 0" "50000 2006" 2000 test) \
+        || { echo "self-test: healthy delta refused" >&2; exit 1; }
+    [ "$BPD_OUT" = "50000 2006" ] \
+        || { echo "self-test: bad delta $BPD_OUT" >&2; exit 1; }
+    BPD_OUT=$(bpf_delta "100 10" "300 2010" 2000 test) \
+        || { echo "self-test: nonzero-base delta refused" >&2; exit 1; }
+    [ "$BPD_OUT" = "200 2000" ] \
+        || { echo "self-test: bad nonzero-base delta $BPD_OUT" >&2; exit 1; }
+    if bpf_delta "0 0" "0 0" 2000 test >/dev/null 2>&1; then
+        echo "self-test: vacuous delta accepted" >&2; exit 1
+    fi
+    if bpf_delta "0 0" "0 2000" 2000 test >/dev/null 2>&1; then
+        echo "self-test: zero-time delta accepted" >&2; exit 1
+    fi
+    if bpf_delta "100 10" "200 20" 2000 test >/dev/null 2>&1; then
+        echo "self-test: short-count delta accepted" >&2; exit 1
+    fi
+    if bpf_delta "200 2010" "100 10" 2000 test >/dev/null 2>&1; then
+        echo "self-test: backwards delta accepted" >&2; exit 1
+    fi
+    # resolve_commit twins: outside a repo the env commit is required
+    # and the tree reads unknown-no-git; inside a repo git stays.
+    RC_DIR=$(mktemp -d "$SELF_TEST_WORK/norepo-XXXXXX") \
+        || { echo "self-test: mktemp failed" >&2; exit 1; }
+    RC_OUT=$(cd "$RC_DIR" || exit 1; export GIT_CEILING_DIRECTORIES=$RC_DIR; P11SCOPE_BENCH_COMMIT=deadbeef1234; export P11SCOPE_BENCH_COMMIT; resolve_commit || exit 1; printf '%s|%s' "$COMMIT" "$TREE_STATUS") \
+        || { echo "self-test: env commit refused outside a repo" >&2; exit 1; }
+    [ "$RC_OUT" = "deadbeef1234|unknown-no-git" ] \
+        || { echo "self-test: bad env resolve $RC_OUT" >&2; exit 1; }
+    if RC_OUT=$(cd "$RC_DIR" || exit 1; export GIT_CEILING_DIRECTORIES=$RC_DIR; unset P11SCOPE_BENCH_COMMIT; resolve_commit); then
+        echo "self-test: missing commit accepted outside a repo" >&2; exit 1
+    fi
+    RC_REPO=$(mktemp -d "$SELF_TEST_WORK/repo-XXXXXX") \
+        || { echo "self-test: mktemp failed" >&2; exit 1; }
+    git -c init.defaultBranch=main init -q "$RC_REPO" \
+        || { echo "self-test: git init failed" >&2; exit 1; }
+    git -C "$RC_REPO" -c user.email=selftest@example -c user.name=selftest -c commit.gpgsign=false commit -q --allow-empty -m test \
+        || { echo "self-test: git commit failed" >&2; exit 1; }
+    RC_SHA=$(git -C "$RC_REPO" rev-parse HEAD) \
+        || { echo "self-test: git rev-parse failed" >&2; exit 1; }
+    RC_OUT=$(cd "$RC_REPO" || exit 1; unset P11SCOPE_BENCH_COMMIT; resolve_commit || exit 1; printf '%s|%s' "$COMMIT" "$TREE_STATUS") \
+        || { echo "self-test: git resolve failed" >&2; exit 1; }
+    [ "$RC_OUT" = "$RC_SHA|" ] \
+        || { echo "self-test: bad git resolve $RC_OUT" >&2; exit 1; }
+    echo dirty > "$RC_REPO/dirty.txt" \
+        || { echo "self-test: dirty write failed" >&2; exit 1; }
+    RC_OUT=$(cd "$RC_REPO" || exit 1; unset P11SCOPE_BENCH_COMMIT; resolve_commit || exit 1; printf '%s' "$TREE_STATUS") \
+        || { echo "self-test: dirty resolve failed" >&2; exit 1; }
+    case $RC_OUT in *"dirty.txt"*) : ;; *)
+        echo "self-test: dirty tree gave $RC_OUT" >&2; exit 1 ;;
+    esac
+    RC_OUT=$(cd "$RC_REPO" || exit 1; P11SCOPE_BENCH_COMMIT=envwins123; export P11SCOPE_BENCH_COMMIT; resolve_commit || exit 1; printf '%s|%s' "$COMMIT" "$TREE_STATUS") \
+        || { echo "self-test: env-over-repo resolve failed" >&2; exit 1; }
+    case $RC_OUT in "envwins123|"*"dirty.txt"*) : ;; *)
+        echo "self-test: env-over-repo gave $RC_OUT" >&2; exit 1 ;;
+    esac
     echo "bench-marker-cost self-test: OK"
     exit 0
 fi

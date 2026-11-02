@@ -385,6 +385,9 @@ def self_test():
         check(f"partial unhealthy verifies ({error})", False)
         table3 = ""
     check("partial unhealthy renders its total", "total=2,000" in table3)
+    check("armed arm labeled gated-read-only, not an armed-marker cost",
+          "gated read only" in table and "lane journal-ready" in table
+          and "no production session writes READY" in table)
     print(f"bench-marker-cost-analyze self-test: "
           f"{'OK' if not failures else 'FAIL ' + str(failures)}")
     return 1 if failures else 0

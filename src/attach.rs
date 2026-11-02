@@ -7103,13 +7103,27 @@ impl Session {
                     .context("validating exact eBPF program inventory")?;
                 }
                 SessionPreparation::PublishScope => {
+                    // I4: the witness binds only when the object carries
+                    // its map; anything else skips the /proc read. The
+                    // selected pin, or the owned child's, anchors the
+                    // read against a PID reused during the object load.
+                    let pid_start = if crate::scope::reads_pid_witness(
+                        scope,
+                        ebpf.map("PID_START_TICK").is_some(),
+                    ) {
+                        let pin = selected.or_else(|| owned_child.map(|child| child.pin()));
+                        crate::scope::pid_start_tick_of(scope, pin)
+                            .context("publishing scope and capture policy")?
+                    } else {
+                        None
+                    };
                     crate::scope::publish(
                         &mut ebpf,
                         scope,
                         policy,
                         generation_token,
                         track_short_lived,
-                        crate::scope::pid_start_tick_of(scope, None)?,
+                        pid_start,
                     )
                     .context("publishing scope and capture policy")?;
                     debug_assert!(process_creation_capture_enabled(scope, policy));

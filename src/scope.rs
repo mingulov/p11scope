@@ -224,25 +224,44 @@ pub(crate) fn publish(
 /// I4: the PID scope target's thread-group start tick (clock ticks since
 /// boot, the `/proc/PID/stat` field 22 the kernel compares), read while
 /// the target is alive at scope publication. `None` for cgroup/system
-/// scopes, which the witness never binds. A dead target refuses loudly
-/// here instead of publishing a number-only scope for a marker build.
+/// scopes, which the witness never binds. When the caller holds the
+/// selected or owned pin, the fresh read must equal the pin's retained
+/// start time and the pin must still be the same process; anything else
+/// refuses loudly instead of binding a PID reused during the object
+/// load. Without a pin there is no earlier identity to contradict, so
+/// the fresh read stands. A dead target refuses loudly here instead of
+/// publishing a number-only scope for a marker build.
 pub(crate) fn pid_start_tick_of(
     scope: &Scope,
-    _pin: Option<&crate::process::PidPin>,
+    pin: Option<&crate::process::PidPin>,
 ) -> Result<Option<u64>> {
     match scope {
-        Scope::Pid(pid) => crate::process::process_start_time(*pid)
-            .map(Some)
-            .with_context(|| format!("reading the start time of PID scope target {pid}")),
+        Scope::Pid(pid) => {
+            let fresh = crate::process::process_start_time(*pid)
+                .with_context(|| format!("reading the start time of PID scope target {pid}"))?;
+            if let Some(pin) = pin {
+                if pin.start_time() != Some(fresh) {
+                    bail!(
+                        "refusing PID_START_TICK for PID scope target {pid}: the fresh start tick {fresh} differs from the pinned {:?}",
+                        pin.start_time()
+                    );
+                }
+                if !pin.still_the_same() {
+                    bail!(
+                        "refusing PID_START_TICK for PID scope target {pid}: the pinned process is no longer the same"
+                    );
+                }
+            }
+            Ok(Some(fresh))
+        }
         Scope::Cgroup { .. } | Scope::System => Ok(None),
     }
 }
 
 /// I4: whether publication reads the PID witness: only PID scope on an
 /// object carrying the witness map; anything else skips the read.
-#[cfg(test)]
-pub(crate) fn reads_pid_witness(_scope: &Scope, _has_witness_map: bool) -> bool {
-    true
+pub(crate) fn reads_pid_witness(scope: &Scope, has_witness_map: bool) -> bool {
+    has_witness_map && matches!(scope, Scope::Pid(_))
 }
 
 pub(crate) fn publish_inventory(ebpf: &mut Ebpf, scope: &Scope) -> Result<()> {

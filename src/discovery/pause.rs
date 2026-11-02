@@ -12,6 +12,7 @@ use p11scope_ebpf_common::{
     PAUSE_REQUESTED,
 };
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub(crate) use crate::events::DiscoveryItem;
@@ -270,6 +271,11 @@ pub(crate) trait PauseIo {
     /// `CLOCK_BOOTTIME` in nanoseconds: the clock domain of the start-time
     /// ticks, so thread births date against the pause arm.
     fn boot_ns(&mut self) -> Result<u64, String>;
+    /// When the last provider hook attach completed, in `CLOCK_BOOTTIME`
+    /// nanoseconds (the start-time-tick domain). `None` when no attach has
+    /// completed or one is still in flight: then no thread born after
+    /// preflight dates as covered.
+    fn last_hook_attach_boot_ns(&mut self) -> Option<u64>;
     fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String>;
     fn arm(&mut self) -> Result<(), String>;
     fn authorization(&mut self) -> Result<Option<u64>, String>;
@@ -2198,6 +2204,10 @@ impl PauseIo for SessionPauseIo<'_> {
         boot_ns().ok_or_else(|| "boot clock read failed".into())
     }
 
+    fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
+        last_hook_attach_boot_ns()
+    }
+
     fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
         // Shared allowance, enforced structurally: a staged pop is a
         // credit transfer and always proceeds, but a ring read needs a
@@ -2872,6 +2882,79 @@ pub(crate) fn boot_ns() -> Option<u64> {
     seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
 }
 
+/// When provider hook attaches completed, in the boot clock. Uprobes are per
+/// file, so once a provider's hooks are live they fire for every thread of
+/// every process mapping it: a thread born strictly after the last completed
+/// attach never ran with a provider unhooked. One process-wide maximum is
+/// kept, which is conservative: an attach for any provider anywhere in this
+/// observer moves the instant later, never earlier.
+pub(crate) struct HookAttachClock {
+    in_flight: AtomicU64,
+    /// Latest completion stamp; zero when none is recorded. An unreadable
+    /// boot clock at completion stamps `u64::MAX`, so nothing dates after it.
+    last_boot_ns: AtomicU64,
+}
+
+static HOOK_ATTACH_CLOCK: HookAttachClock = HookAttachClock::new();
+
+impl HookAttachClock {
+    const fn new() -> Self {
+        Self {
+            in_flight: AtomicU64::new(0),
+            last_boot_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn open(&self) -> HookAttachWindow<'_> {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        HookAttachWindow { clock: self }
+    }
+
+    fn close(&self, completed_boot_ns: Option<u64>) {
+        let stamp = completed_boot_ns.unwrap_or(u64::MAX).max(1);
+        self.last_boot_ns.fetch_max(stamp, Ordering::SeqCst);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// The latest completion, or `None` when none is recorded or an attach
+    /// is open on either side of the read.
+    fn completed(&self) -> Option<u64> {
+        if self.in_flight.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let last = self.last_boot_ns.load(Ordering::SeqCst);
+        if self.in_flight.load(Ordering::SeqCst) != 0 || last == 0 {
+            return None;
+        }
+        Some(last)
+    }
+}
+
+/// One provider hook attach in flight. Its completion is stamped when it
+/// drops, on every return path (success, error or unwind): whatever the
+/// attach made live was live by then, so the stamp is an upper bound on
+/// every hook it installed.
+pub(crate) struct HookAttachWindow<'a> {
+    clock: &'a HookAttachClock,
+}
+
+impl Drop for HookAttachWindow<'_> {
+    fn drop(&mut self) {
+        self.clock.close(boot_ns());
+    }
+}
+
+/// Opens a window around one provider hook attach (see [`HookAttachClock`]).
+pub(crate) fn hook_attach_window() -> HookAttachWindow<'static> {
+    HOOK_ATTACH_CLOCK.open()
+}
+
+/// The last completed provider hook attach in this observer, in the boot
+/// clock, or `None` when none completed yet or one is in flight.
+pub(crate) fn last_hook_attach_boot_ns() -> Option<u64> {
+    HOOK_ATTACH_CLOCK.completed()
+}
+
 pub(crate) struct TimedItem {
     before_ns: u64,
     after_ns: u64,
@@ -2957,6 +3040,10 @@ mod tests {
         last_states: BTreeMap<u32, u8>,
         boot: VecDeque<Result<u64, String>>,
         fallback_boot: u64,
+        /// Scripted last-attach instants, one per read; the last one
+        /// repeats. Default: none recorded.
+        attach_instants: VecDeque<Option<u64>>,
+        fallback_attach: Option<u64>,
         queue: VecDeque<Result<Option<DiscoveryItem>, String>>,
         authorization: Option<u64>,
         authorization_results: VecDeque<Result<Option<u64>, String>>,
@@ -3012,6 +3099,8 @@ mod tests {
                 last_states: BTreeMap::new(),
                 boot: VecDeque::new(),
                 fallback_boot: 0,
+                attach_instants: VecDeque::new(),
+                fallback_attach: None,
                 queue: VecDeque::new(),
                 authorization: None,
                 authorization_results: VecDeque::new(),
@@ -3130,6 +3219,13 @@ mod tests {
                     Ok(self.fallback_boot)
                 }
             }
+        }
+
+        fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
+            if let Some(instant) = self.attach_instants.pop_front() {
+                self.fallback_attach = instant;
+            }
+            self.fallback_attach
         }
 
         fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
@@ -3942,10 +4038,16 @@ mod tests {
     }
 
     /// A birth-dating stop: every stopped sample shows `states` dated by
-    /// `starts`. The confirm path takes four stopped samples (two pre-apply,
-    /// one post-apply, one post-successor-arm).
-    fn birth_dating_io(states: BTreeMap<u32, u8>, starts: BTreeMap<u32, u64>) -> FakeIo {
+    /// `starts`, and the last provider hook attach completed at `attach`
+    /// (`None`: none recorded, or one in flight). The confirm path takes four
+    /// stopped samples (two pre-apply, one post-apply, one post-successor-arm).
+    fn birth_dating_io(
+        states: BTreeMap<u32, u8>,
+        starts: BTreeMap<u32, u64>,
+        attach: Option<u64>,
+    ) -> FakeIo {
         let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = attach;
         io.states = VecDeque::from([
             Ok(states.clone()),
             Ok(states.clone()),
@@ -3961,6 +4063,8 @@ mod tests {
         io
     }
 
+    /// A stop whose current epoch was armed at `arm_boot_ns` (a fresh frame or
+    /// successor re-arm), with the preflight threads 41 and 42 born at tick 50.
     fn birth_dating_coordinator(arm_boot_ns: u64) -> PauseCoordinator {
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.arm_for_test();
@@ -3969,17 +4073,58 @@ mod tests {
         coordinator
     }
 
-    /// A thread born after the arm, by more than one tick of margin, only ever
-    /// ran with the hooks in place: the stop adopts it into the expected set
-    /// and confirms instead of reporting partial.
-    #[test]
-    fn thread_born_after_arm_is_adopted_and_the_stop_confirms() {
+    /// Thread 43 joins the preflight threads, born at `birth_tick`.
+    fn grown_by_one(birth_tick: u64) -> (BTreeMap<u32, u8>, BTreeMap<u32, u64>) {
+        (
+            [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect(),
+            [(41, 50), (42, 50), (43, birth_tick)].into_iter().collect(),
+        )
+    }
+
+    /// Runs one stop that sees thread 43 born at `birth_tick` under an arm at
+    /// `arm_tick` and a last completed attach at `attach_tick`.
+    fn birth_dating_stop(
+        birth_tick: u64,
+        arm_tick: u64,
+        attach_tick: Option<u64>,
+    ) -> PauseCoordinator {
         let tick = test_tick_ns();
-        let arm_boot = 100u64.saturating_mul(tick);
+        let (grown, starts) = grown_by_one(birth_tick);
+        let mut io = birth_dating_io(
+            grown,
+            starts,
+            attach_tick.map(|attach| attach.saturating_mul(tick)),
+        );
+        let mut coordinator = birth_dating_coordinator(arm_tick.saturating_mul(tick));
+        coordinator.service(&mut io).unwrap();
+        coordinator
+    }
+
+    fn assert_covered(coordinator: &PauseCoordinator) {
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(
+            coordinator.expected_tasks.keys().collect::<Vec<_>>(),
+            [&41, &42, &43]
+        );
+        assert!(coordinator.expected_starts.contains_key(&43));
+    }
+
+    fn assert_partial(coordinator: &PauseCoordinator) {
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(!coordinator.rearming_enabled());
+    }
+
+    /// A thread born after the last hook attach, by more than one tick of
+    /// margin, only ever ran with the hooks in place: the stop adopts it into
+    /// the expected set and confirms instead of reporting partial.
+    #[test]
+    fn thread_born_after_last_attach_is_adopted_and_the_stop_confirms() {
+        let tick = test_tick_ns();
+        let instant = 100u64.saturating_mul(tick);
         let grown: BTreeMap<u32, u8> = [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
         let starts: BTreeMap<u32, u64> = [(41, 50), (42, 50), (43, 102)].into_iter().collect();
-        let mut io = birth_dating_io(grown, starts);
-        let mut coordinator = birth_dating_coordinator(arm_boot);
+        let mut io = birth_dating_io(grown, starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator(instant);
 
         coordinator.service(&mut io).unwrap();
 
@@ -3990,37 +4135,153 @@ mod tests {
         );
     }
 
-    /// A thread born before the arm might have run provider code before the
-    /// hooks attached: the stop keeps today's partial.
+    /// The OpenSC shape: worker threads born well after the provider's hooks
+    /// attached but in the same tick as (or one tick after) a fresh frame or
+    /// successor re-arm. The re-arm does not date births; the attach does, so
+    /// the threads are covered and the stop confirms.
     #[test]
-    fn thread_born_before_arm_keeps_partial() {
+    fn birth_after_last_attach_within_a_tick_of_a_fresh_rearm_is_covered() {
+        for birth_tick in [100, 101] {
+            let coordinator = birth_dating_stop(birth_tick, 100, Some(90));
+            assert_covered(&coordinator);
+        }
+    }
+
+    /// A thread born before the last hook attach completed might have run
+    /// provider code before that provider's hooks were live: the stop keeps
+    /// today's partial, however old the arm is.
+    #[test]
+    fn thread_born_before_last_attach_keeps_partial() {
+        assert_partial(&birth_dating_stop(99, 50, Some(100)));
+    }
+
+    /// A thread born after one provider attached (tick 90) but before a later
+    /// module's attach completed (tick 110) dates against the later attach and
+    /// keeps today's partial.
+    #[test]
+    fn later_module_attach_after_the_birth_keeps_partial() {
+        assert_partial(&birth_dating_stop(102, 50, Some(110)));
+    }
+
+    /// The margin against the attach instant is strict in whole ticks: a
+    /// birth at the attach's own tick, or exactly one tick later, keeps
+    /// today's partial; the second tick after it is covered.
+    #[test]
+    fn birth_at_or_one_tick_after_last_attach_keeps_partial() {
+        for birth_tick in [100, 101] {
+            let coordinator = birth_dating_stop(birth_tick, 50, Some(100));
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "birth at tick {birth_tick} must stay partial"
+            );
+            assert!(!coordinator.rearming_enabled());
+        }
+        assert_covered(&birth_dating_stop(102, 50, Some(100)));
+    }
+
+    /// An attach still in flight reports no completed instant: nothing born
+    /// after preflight dates as covered, however old the arm is.
+    #[test]
+    fn attach_in_flight_keeps_partial() {
+        let clock = HookAttachClock::new();
         let tick = test_tick_ns();
-        let arm_boot = 100u64.saturating_mul(tick);
-        let grown: BTreeMap<u32, u8> = [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
-        let starts: BTreeMap<u32, u64> = [(41, 50), (42, 50), (43, 99)].into_iter().collect();
-        let mut io = birth_dating_io(grown, starts);
-        let mut coordinator = birth_dating_coordinator(arm_boot);
+        let earlier = clock.open();
+        drop(earlier);
+        let completed = clock.completed().expect("a closed attach is recorded");
+        let open = clock.open();
+        let in_flight = clock.completed();
+        assert_eq!(in_flight, None, "an open attach reports no instant");
+
+        let (grown, starts) = grown_by_one(completed / tick + 1_000);
+        let mut io = birth_dating_io(grown, starts, in_flight);
+        let mut coordinator = birth_dating_coordinator(50u64.saturating_mul(tick));
+        coordinator.service(&mut io).unwrap();
+        drop(open);
+
+        assert_partial(&coordinator);
+    }
+
+    /// With no attach completion recorded, nothing born after preflight dates
+    /// as covered, however old the arm is.
+    #[test]
+    fn no_attach_instant_recorded_keeps_partial() {
+        assert_eq!(HookAttachClock::new().completed(), None);
+        assert_partial(&birth_dating_stop(102, 50, None));
+    }
+
+    /// A thread adopted before this stop's own attach was verified stopped
+    /// through that attach (the post-apply and post-arm samples require it
+    /// stopped), so the attach completing after its birth does not undo the
+    /// adoption.
+    #[test]
+    fn adopted_thread_survives_the_stops_own_attach() {
+        let tick = test_tick_ns();
+        let (grown, starts) = grown_by_one(102);
+        let mut io = birth_dating_io(grown, starts, Some(90u64.saturating_mul(tick)));
+        io.attach_instants = VecDeque::from([
+            Some(90u64.saturating_mul(tick)),
+            Some(90u64.saturating_mul(tick)),
+            Some(110u64.saturating_mul(tick)),
+            Some(110u64.saturating_mul(tick)),
+        ]);
+        let mut coordinator = birth_dating_coordinator(50u64.saturating_mul(tick));
 
         coordinator.service(&mut io).unwrap();
 
-        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
-        assert!(!coordinator.rearming_enabled());
+        assert_covered(&coordinator);
+    }
+
+    /// The attach clock keeps the latest completion, stamps it in the boot
+    /// clock when the window closes, never moves backward, and fails closed
+    /// (nothing dates after it) when the boot clock was unreadable at close.
+    #[test]
+    fn hook_attach_clock_keeps_the_latest_completion_and_fails_closed() {
+        let clock = HookAttachClock::new();
+        assert_eq!(clock.completed(), None);
+
+        let before = boot_ns().expect("the boot clock reads");
+        drop(clock.open());
+        let after = boot_ns().expect("the boot clock reads");
+        let stamped = clock.completed().expect("a closed attach is recorded");
+        assert!(
+            (before..=after).contains(&stamped),
+            "{before} <= {stamped} <= {after}"
+        );
+
+        let outer = clock.open();
+        let inner = clock.open();
+        drop(inner);
+        assert_eq!(clock.completed(), None, "one attach is still in flight");
+        drop(outer);
+        assert!(clock.completed().unwrap() >= stamped);
+
+        let latest = clock.completed().unwrap();
+        let stale = clock.open();
+        std::mem::forget(stale);
+        clock.close(Some(1));
+        assert_eq!(clock.completed(), Some(latest), "an older stamp never wins");
+
+        let unreadable = clock.open();
+        std::mem::forget(unreadable);
+        clock.close(None);
+        assert_eq!(clock.completed(), Some(u64::MAX));
     }
 
     /// Start time has tick granularity, so the margin is strict: a birth at
-    /// the arm's own tick, or exactly one tick later, keeps today's partial.
-    /// Only the second tick after the arm is covered.
+    /// the instant's own tick, or exactly one tick later, keeps today's
+    /// partial. Only the second tick after it is covered.
     #[test]
-    fn birth_within_one_tick_of_arm_keeps_partial() {
+    fn birth_within_one_tick_of_last_attach_keeps_partial() {
         let tick = test_tick_ns();
-        let arm_boot = 100u64.saturating_mul(tick);
+        let instant = 100u64.saturating_mul(tick);
         for birth_tick in [100, 101] {
             let grown: BTreeMap<u32, u8> =
                 [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
             let starts: BTreeMap<u32, u64> =
                 [(41, 50), (42, 50), (43, birth_tick)].into_iter().collect();
-            let mut io = birth_dating_io(grown, starts);
-            let mut coordinator = birth_dating_coordinator(arm_boot);
+            let mut io = birth_dating_io(grown, starts, Some(instant));
+            let mut coordinator = birth_dating_coordinator(instant);
 
             coordinator.service(&mut io).unwrap();
 
@@ -4038,11 +4299,11 @@ mod tests {
     #[test]
     fn thread_with_unreadable_start_keeps_partial() {
         let tick = test_tick_ns();
-        let arm_boot = 100u64.saturating_mul(tick);
+        let instant = 100u64.saturating_mul(tick);
         let grown: BTreeMap<u32, u8> = [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
         let starts: BTreeMap<u32, u64> = [(41, 50), (42, 50)].into_iter().collect();
-        let mut io = birth_dating_io(grown, starts);
-        let mut coordinator = birth_dating_coordinator(arm_boot);
+        let mut io = birth_dating_io(grown, starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator(instant);
 
         coordinator.service(&mut io).unwrap();
 
@@ -4056,10 +4317,10 @@ mod tests {
     #[test]
     fn reused_tid_with_older_start_keeps_partial() {
         let tick = test_tick_ns();
-        let arm_boot = 100u64.saturating_mul(tick);
+        let instant = 100u64.saturating_mul(tick);
         let starts: BTreeMap<u32, u64> = [(41, 49), (42, 50)].into_iter().collect();
-        let mut io = birth_dating_io(stopped(), starts);
-        let mut coordinator = birth_dating_coordinator(arm_boot);
+        let mut io = birth_dating_io(stopped(), starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator(instant);
 
         coordinator.service(&mut io).unwrap();
 
@@ -4068,14 +4329,15 @@ mod tests {
     }
 
     /// A reused tid keeps today's partial whatever its start time: even a
-    /// newer start does not adopt a tid the preflight already knew.
+    /// start well after the last attach does not adopt a tid the preflight
+    /// already knew.
     #[test]
     fn reused_tid_with_newer_start_keeps_partial() {
         let tick = test_tick_ns();
-        let arm_boot = 100u64.saturating_mul(tick);
+        let instant = 100u64.saturating_mul(tick);
         let starts: BTreeMap<u32, u64> = [(41, 150), (42, 50)].into_iter().collect();
-        let mut io = birth_dating_io(stopped(), starts);
-        let mut coordinator = birth_dating_coordinator(arm_boot);
+        let mut io = birth_dating_io(stopped(), starts, Some(instant));
+        let mut coordinator = birth_dating_coordinator(instant);
 
         coordinator.service(&mut io).unwrap();
 

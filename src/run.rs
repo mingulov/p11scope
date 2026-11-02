@@ -11455,6 +11455,10 @@ mod tests {
             crate::discovery::pause::boot_ns().ok_or_else(|| "boot clock read failed".into())
         }
 
+        fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
+            crate::discovery::pause::last_hook_attach_boot_ns()
+        }
+
         fn dequeue(
             &mut self,
         ) -> std::result::Result<Option<crate::discovery::pause::DiscoveryItem>, String> {

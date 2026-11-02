@@ -1817,10 +1817,14 @@ fn is_pending_rv(rv: u64) -> bool {
 /// value-unreadable bit (null output pointer or unreadable id), never
 /// clearing it and never beside another capture change. Callers keep the
 /// mechanism word exact. Unreachable in production today — async controls
-/// are negative-only, never journaled — so output-neutral; once tracked,
-/// a GetID whose END was lost carries bit 6 only on its preserved CALL
-/// and must still corroborate instead of stalling the seal on
-/// `BoundNotReady`.
+/// are negative-only, never admitted to the open/refused tables — so
+/// output-neutral; once tracked, a GetID whose END was lost carries bit 6
+/// only on its preserved CALL and corroborates its BEGIN here. This alone
+/// does not stop the seal hold: the admission-side claim fingerprint
+/// (`fingerprint_matches_event`) still compares the capture word exactly,
+/// so a tracked OK GetID with a null or unreadable id would leave its
+/// BEGIN unclaimed and hold the seal on `BoundNotReady` until that check
+/// shares this rule.
 fn async_get_id_capture_gain(descriptor: u32, rv: u64, before: u32, after: u32) -> bool {
     let lifecycle = crate::kinds::DESCRIPTORS
         .get(descriptor as usize)
@@ -6948,10 +6952,11 @@ pub(crate) mod tests {
     #[test]
     fn object_journal_ordinary_matching_accepts_get_id_value_unreadable_on_ok() {
         // A GetID whose END was lost carries bit 6 only on its preserved
-        // CALL; it must still corroborate its BEGIN (open or refused)
-        // instead of stalling the seal on BoundNotReady. Unreachable in
-        // production today: async controls are negative-only, never
-        // journaled.
+        // CALL; it must still corroborate its BEGIN (open or refused).
+        // The claim fingerprint is a separate exact check, so this alone
+        // does not release a seal hold. Unreachable in production today:
+        // async controls are negative-only, never admitted to the
+        // open/refused tables.
         assert_eq!(
             endpoint_class(function_id("C_AsyncGetID")),
             Some(EndpointClass::NegativeOnlyAffecting),

@@ -4589,4 +4589,105 @@ mod tests {
         }
         flags
     }
+
+    #[test]
+    fn exclude_module_parses_repeatable_on_profile_run_inspect_and_inventory() {
+        let Command::Profile(a) = parse(args(&[
+            "profile",
+            "--pid",
+            "42",
+            "--exclude-module",
+            "/opt/a.so",
+            "--exclude-module",
+            "libp11-kit.so.0",
+        ]))
+        .unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(
+            a.exclude_modules,
+            vec![PathBuf::from("/opt/a.so"), PathBuf::from("libp11-kit.so.0")]
+        );
+        let Command::Run(r) = parse(args(&[
+            "run",
+            "--exclude-module",
+            "libp11-kit.so.0",
+            "--",
+            "/bin/true",
+        ]))
+        .unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(r.exclude_modules, vec![PathBuf::from("libp11-kit.so.0")]);
+        let Command::Inspect(i) = parse(args(&[
+            "inspect",
+            "--pid",
+            "42",
+            "--exclude-module",
+            "/opt/a.so",
+        ]))
+        .unwrap() else {
+            panic!("expected inspect")
+        };
+        assert_eq!(i.exclude_modules, vec![PathBuf::from("/opt/a.so")]);
+        let Command::Inventory(v) = parse(args(&[
+            "inventory",
+            "--system",
+            "--exclude-module",
+            "libp11-kit.so.0",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(v.exclude_modules, vec![PathBuf::from("libp11-kit.so.0")]);
+    }
+
+    /// Controller ruling (remedies): every remedy a refusal can name is a
+    /// real flag where it is shown. Trace shares the capture surface for
+    /// `--module` and `--exclude-module`, but has no `--mode metrics`, so
+    /// the `--counter-mode` remedy never shows there.
+    #[test]
+    fn refusal_remedies_are_valid_flags_on_trace() {
+        let Command::Trace(t) = parse(args(&[
+            "trace",
+            "--pid",
+            "42",
+            "--module",
+            "a.so",
+            "--exclude-module",
+            "b.so",
+        ]))
+        .unwrap() else {
+            panic!("expected trace")
+        };
+        assert_eq!(t.modules, vec![PathBuf::from("a.so")]);
+        assert_eq!(t.exclude_modules, vec![PathBuf::from("b.so")]);
+        assert!(!t.metrics);
+        assert_eq!(t.counter_mode, None);
+        assert!(parse(args(&["trace", "--pid", "42", "--mode", "metrics"])).is_err());
+    }
+
+    #[test]
+    fn validate_excludes_refuses_missing_paths_and_module_conflicts() {
+        let slice_of = std::slice::from_ref;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("libreal.so.1.2");
+        std::fs::write(&real, b"fake").unwrap();
+        let link = dir.path().join("liblink.so");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // Missing path is a usage error.
+        let missing = dir.path().join("nope.so");
+        assert!(validate_excludes(&[], &[missing]).is_err());
+        // Bare names need no existence.
+        assert!(validate_excludes(&[], &[PathBuf::from("libp11-kit.so.0")]).is_ok());
+        // Exact conflict.
+        assert!(validate_excludes(slice_of(&real), slice_of(&real)).is_err());
+        // Same file via symlink.
+        assert!(validate_excludes(slice_of(&real), slice_of(&link)).is_err());
+        // Bare-name basename conflict.
+        assert!(validate_excludes(slice_of(&real), &[PathBuf::from("libreal.so.1.2")]).is_err());
+        // No conflict.
+        assert!(validate_excludes(slice_of(&real), &[PathBuf::from("other.so")]).is_ok());
+        assert!(validate_excludes(&[], slice_of(&real)).is_ok());
+    }
 }

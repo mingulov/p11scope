@@ -6322,7 +6322,8 @@ fn multi_prefix_population(with_over_budget: bool) -> Result<MultiPrefixPopulati
             "module needs 1 more; only 8192 attach slots are available; 8192 are in use \
              (8192 active, 0 retired; held by {} 8192); 2048 are reserved for providers \
              with a corroborated function table \u{2014} refusing to attach a prefix; to \
-             capture one provider, name it with --module <path>",
+             capture one provider, name it with --module <path>; to free slots, exclude \
+             an unneeded module with --exclude-module <name>",
             a.path.to_str().unwrap(),
         );
         ensure!(

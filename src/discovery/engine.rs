@@ -716,6 +716,10 @@ pub struct Engine {
     /// `P11SCOPE_BROAD_ADMIT=1` in `discover_plan` (production) or directly
     /// by broad tests; `false` preserves selected admission everywhere.
     broad_admit: bool,
+    /// Metrics captures without an explicit `--counter-mode` name that
+    /// remedy in provider-refusal reasons. Set once from the capture args
+    /// in `discover_plan`; every live rebuild keeps it.
+    counter_hint: bool,
     /// View IDs that have ever contributed provider evidence (a scan or a
     /// live record observed modules for them). Eviction eligibility needs
     /// this history, not just the current state: the capture budget keys
@@ -3695,6 +3699,7 @@ impl LiveCandidate {
 struct LoaderPlanCache {
     revision: u64,
     broad_admit: bool,
+    counter_hint: bool,
     plan: plan::AttachPlan,
 }
 
@@ -6599,9 +6604,11 @@ fn discover_plan(
 ) -> Result<Engine> {
     let mut discovered = Engine::empty();
     discovered.broad_admit = broad_admit_from_env();
+    discovered.counter_hint = a.metrics && a.counter_mode.is_none();
     discovered.scope = scope.clone();
     discovered.hooks = a.hooks.clone();
     discovered.module_hints = a.modules.clone();
+    discovered.budget.set_excludes(a.exclude_modules.clone());
     // The capture's scope start, before any observation: the outer bound of
     // every unobserved window. (The `run` path overrides with its pre-spawn
     // instant once it knows it.)
@@ -6925,6 +6932,7 @@ fn build_current_plan(
     manifest_fallbacks: usize,
     broad_admit: bool,
     admission_scope: plan::AdmissionScope,
+    counter_hint: bool,
 ) -> Result<plan::AttachPlan> {
     // Every plan reference is a capture-local pinned ID. Raw mapping keys remain
     // evidence only and cannot select an attach fd.
@@ -6935,6 +6943,7 @@ fn build_current_plan(
         pinned,
         broad_admit,
         admission_scope,
+        counter_hint,
     );
     record_object_skips(&mut plan, &counters.object_skips);
     for object in corroborated {
@@ -8250,6 +8259,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     let plan_start = crate::attach::monotonic_ns();
     let manifest_fallbacks = counters.manifest_fallbacks.len();
     let broad_admit = discovered.broad_admit;
+    let counter_hint = discovered.counter_hint;
     let admission_scope = discovered.admission_scope();
     let prearm_pieces = resolve_prearm_pieces(discovered.prearm_input.as_ref(), &pinned);
     let mut plan = build_current_plan(
@@ -8263,6 +8273,7 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         manifest_fallbacks,
         broad_admit,
         admission_scope,
+        counter_hint,
     )
     .inspect_err(|_| counters.report_notes())?;
     discovered
@@ -10204,6 +10215,7 @@ impl Engine {
             pending_loader_scans: BTreeMap::new(),
             pending_loader_arm_scans: BTreeSet::new(),
             broad_admit: false,
+            counter_hint: false,
             exploratory_dirty: BTreeSet::new(),
             deep_scans: 0,
             loader_arms: 0,
@@ -13042,6 +13054,7 @@ impl Engine {
         );
         let plan_start = crate::attach::monotonic_ns();
         let broad_admit = self.broad_admit;
+        let counter_hint = self.counter_hint;
         let prearm_pieces = resolve_prearm_pieces(self.prearm_input.as_ref(), &pinned);
         let mut rebuilt = self.plan.rebuild_from_sources_broad_with_prearm(
             &modules,
@@ -13049,6 +13062,7 @@ impl Engine {
             &prearm_pieces,
             &pinned,
             broad_admit,
+            counter_hint,
         );
         // Live rebuilds keep pre-armed modules (and only create watches for
         // newly appeared ones — live interval state is never reset).
@@ -13387,6 +13401,7 @@ impl Engine {
             .filter(|cache| {
                 cache.revision == self.published_facts_revision
                     && cache.broad_admit == self.broad_admit
+                    && cache.counter_hint == self.counter_hint
             })
             .map(|cache| cache.plan.clone());
         let mut candidate = if let Some(plan) = cached_plan {
@@ -15302,6 +15317,7 @@ impl Engine {
             self.loader_plan_cache = Some(LoaderPlanCache {
                 revision: self.published_facts_revision,
                 broad_admit: self.broad_admit,
+                counter_hint: self.counter_hint,
                 plan,
             });
         }

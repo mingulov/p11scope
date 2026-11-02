@@ -1272,7 +1272,7 @@ fn capture_fact_stage_publishes_once_or_rolls_back_whole() {
     );
     engine.capture_facts.rollback_stage();
     engine.capture_facts.apply_to_plan(&mut engine.plan);
-    engine.discovery = engine.capture_facts.discovery(&engine.plan);
+    engine.discovery = engine.capture_facts.discovery(&engine.plan, &[], &[]);
     assert_eq!(
         engine.discovery.modules.len(),
         1,
@@ -2122,6 +2122,7 @@ fn shared_scope_capture_starts_when_every_module_is_refused() {
             0,
             false,
             scope,
+            false,
         )
     };
 
@@ -2135,9 +2136,10 @@ fn shared_scope_capture_starts_when_every_module_is_refused() {
     assert!(shared.slots.is_empty());
     assert_eq!(shared.modules_skipped.len(), 1);
     assert!(
-        shared.modules_skipped[0]
-            .reason
-            .ends_with("name it with --module <path>"),
+        shared.modules_skipped[0].reason.ends_with(
+            "; to capture one provider, name it with --module <path>; to free slots, exclude \
+             an unneeded module with --exclude-module <name>"
+        ),
         "{:?}",
         shared.modules_skipped[0]
     );
@@ -2178,6 +2180,7 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
         0,
         false,
         plan::AdmissionScope::Named,
+        false,
     )
     .unwrap();
     engine.counters = counters;
@@ -2769,7 +2772,9 @@ fn a_later_whole_refusal_replaces_a_published_growth_omission() {
     let refusal = &engine.discovery.modules_skipped[0];
     assert!(
         refusal.reason.starts_with("module needs 2 more;")
-            && refusal.reason.ends_with("refusing to attach a prefix"),
+            && refusal.reason.contains("refusing to attach a prefix")
+            && refusal.reason.contains("--module")
+            && refusal.reason.contains("--exclude-module"),
         "{refusal:?}"
     );
     assert!(!plan::is_growth_omission(&refusal.reason), "{refusal:?}");
@@ -8169,6 +8174,56 @@ fn capture_start_members_that_ended_are_not_losses() {
         "three members that ended before capture start are not three losses: {:?}",
         engine.plan().skipped
     );
+}
+
+/// Controller ruling (remedies): `discover` wires a metrics capture without
+/// an explicit `--counter-mode` to the refusal remedy hint, and only that.
+#[test]
+fn discover_wires_metrics_without_counter_mode_to_the_remedy_hint() {
+    for (case, metrics, counter_mode, expected) in [
+        (0, false, None, false),
+        (1, true, None, true),
+        (
+            2,
+            true,
+            Some(p11scope_ebpf_common::CounterMode::Counts),
+            false,
+        ),
+        (
+            3,
+            false,
+            Some(p11scope_ebpf_common::CounterMode::Counts),
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        std::fs::write(dir.path().join("cgroup.procs"), "").expect("an empty cgroup.procs");
+        let args = CaptureArgs {
+            track_short_lived: false,
+            kind: crate::cli::Kind::Profile,
+            modules: vec![],
+            exclude_modules: vec![],
+            manifests: vec![],
+            prearm_modules: vec![],
+            hooks: HookRegistry::builtin(),
+            scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+            metrics,
+            counter_mode,
+            select_endpoint: None,
+            duration: None,
+            out: None,
+            max_events: None,
+            ring_bytes: None,
+            drain_interval: None,
+            max_scan_pids: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            attach_backend: BackendSelection::default(),
+        };
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        let engine = Engine::discover(&args, &scope, None).expect("an empty cgroup still captures");
+        assert_eq!(engine.counter_hint, expected, "case {case}");
+    }
 }
 
 /// Task 2 (cgroup-256 B1): the multi-process scan cap is a CLI-settable Engine
@@ -24179,6 +24234,7 @@ impl LoaderPlanningFixture {
             &pins,
             false,
             plan::AdmissionScope::Shared,
+            false,
         );
         engine.pinned = pins;
         engine.modules = modules;
@@ -31800,6 +31856,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         0,
         false,
         plan::AdmissionScope::Named,
+        false,
     )
     .unwrap();
 
@@ -34932,6 +34989,8 @@ fn p11kit_like_64_table_module() -> ScannedModule {
 /// The 64-table replica must NOT refuse the module. The linked table bypasses
 /// the independent K=4 heuristic cap; the global slot bound admits three
 /// heuristic tables at 512 or all four at 2112. Every spill stays explicit.
+/// Part 0: the admitted prefix is reported as a partial-coverage record
+/// naming the covered templates, not as silence.
 #[test]
 fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     let admitted_heuristics = if cfg!(feature = "wide-detailed-2112") {
@@ -36627,8 +36686,8 @@ fn merge_preflight_success_implies_identical_merge_results() {
     assert_eq!(plan_a.skipped, plan_b.skipped);
     assert_eq!(plan_a.entries_seen, plan_b.entries_seen);
     assert_eq!(
-        format!("{:?}", first.discovery(&plan_a)),
-        format!("{:?}", second.discovery(&plan_b)),
+        format!("{:?}", first.discovery(&plan_a, &[], &[])),
+        format!("{:?}", second.discovery(&plan_b, &[], &[])),
         "merges publish identical discovery"
     );
 }

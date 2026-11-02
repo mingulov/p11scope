@@ -21438,6 +21438,67 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
     }
 }
 
+/// Tick-level evidence equality for the unchanged-tick twin: every admission,
+/// refusal and gap decision the two engines reached. Timing-derived evidence
+/// (stage spans, newcomer ages) and pure performance memos (the loader plan
+/// cache) are excluded by design: the fast path records fewer spans and
+/// preserves the cache across unchanged ticks.
+fn assert_tick_evidence_equal(fast: &Engine, full: &Engine) {
+    assert_eq!(fast.plan, full.plan);
+    let mut fast_discovery = serde_json::to_value(&fast.discovery).unwrap();
+    let mut full_discovery = serde_json::to_value(&full.discovery).unwrap();
+    // Scan durations are wall time, not decisions; each engine scanned for
+    // real on its own clock.
+    fast_discovery.as_object_mut().unwrap().remove("scan_ms");
+    full_discovery.as_object_mut().unwrap().remove("scan_ms");
+    assert_eq!(fast_discovery, full_discovery);
+    assert_eq!(fast.interface_selection(), full.interface_selection());
+    assert_eq!(fast.counters.corroboration, full.counters.corroboration);
+    assert_eq!(
+        fast.counters.manifest_fallbacks,
+        full.counters.manifest_fallbacks
+    );
+    assert_eq!(fast.counters.object_skips, full.counters.object_skips);
+    assert_eq!(fast.selection_claims, full.selection_claims);
+    assert_eq!(fast.selection_tables, full.selection_tables);
+    assert_eq!(fast.modules, full.modules);
+    assert_eq!(fast.pinned.pinned().count(), full.pinned.pinned().count());
+    for pin in fast.pinned.pinned() {
+        assert!(fast.pinned.exactly_matches(pin.id, &full.pinned, pin.id));
+        assert_eq!(fast.pinned.sources(pin.id), full.pinned.sources(pin.id));
+    }
+    assert_eq!(fast.pending_rejected_keys, full.pending_rejected_keys);
+    assert_eq!(fast.refresh_requested, full.refresh_requested);
+    assert_eq!(
+        fast.views
+            .iter()
+            .map(|view| (view.id(), view.pid()))
+            .collect::<Vec<_>>(),
+        full.views
+            .iter()
+            .map(|view| (view.id(), view.pid()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(fast.discovery_truncated, full.discovery_truncated);
+    assert_eq!(
+        fast.newcomer_ages.dropped_unknown,
+        full.newcomer_ages.dropped_unknown
+    );
+    assert_eq!(fast.loader_arms, full.loader_arms);
+    for view in fast.views.iter() {
+        assert_eq!(
+            fast.loader_registry.ids_for_view(view.id()),
+            full.loader_registry.ids_for_view(view.id())
+        );
+    }
+    assert_eq!(fast.facts_revision, full.facts_revision);
+    assert_eq!(fast.published_facts_revision, full.published_facts_revision);
+    assert_eq!(
+        fast.capture_facts.history.decoded,
+        full.capture_facts.history.decoded
+    );
+}
+
 /// Rotation eviction displaces views outside the candidate's `removed` set
 /// (they already left `self.views` during selection), so the
 /// unchanged-tick gate cannot see the displacement: without clearing,
@@ -21468,6 +21529,342 @@ fn exploratory_eviction_clears_rebuild_stability() {
         !engine.plan_rebuild_stable,
         "rotation eviction forces the next tick onto the full rebuild path"
     );
+}
+
+/// The unchanged-tick equivalence twin. Two identical cgroup captures — one
+/// on the fast path, one forced onto full rebuilds — run the same tick
+/// battery: idle ticks, a reconcile eviction plus admission, an early
+/// return, a refresh rescan and a generation loss. Every tick must leave
+/// byte-identical decisions; only idle ticks may differ in rebuild counts.
+#[test]
+fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
+    let mut first = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut second = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut waiting = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let (p1, p2, p3) = (first.id(), second.id(), waiting.id());
+    assert!(p1 < p2 && p2 < p3, "spawn order pins pid order");
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = [p1, p2, p3].iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let build = || {
+        let mut engine = Engine::empty();
+        engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        // The twin compares decisions, not wall-time budgets: an infinite
+        // tick quantum keeps deep-scan admission deterministic under load.
+        engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+        engine.max_scan_pids = 2;
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(0), p1).unwrap());
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(1), p2).unwrap());
+        engine.next_view_id = 2;
+        assert!(engine.request_refresh_consumed(p3, Some(1_000)));
+        engine
+    };
+    let mut fast = build();
+    let mut full = build();
+    full.set_disable_empty_tick_fast_path_for_test(true);
+    let mut fast_counts = loader_planning_operation_counts(&fast);
+    let mut full_counts = loader_planning_operation_counts(&full);
+    let tick_both = |fast: &mut Engine,
+                     full: &mut Engine,
+                     fast_counts: &mut (u64, u64),
+                     full_counts: &mut (u64, u64),
+                     fast_builds: u64,
+                     full_builds: u64| {
+        refresh_inventory_once(fast);
+        refresh_inventory_once(full);
+        assert_tick_evidence_equal(fast, full);
+        assert_eq!(
+            loader_planning_operation_counts(fast),
+            (fast_counts.0 + fast_builds, fast_counts.1 + fast_builds),
+            "fast-path rebuild count"
+        );
+        assert_eq!(
+            loader_planning_operation_counts(full),
+            (full_counts.0 + full_builds, full_counts.1 + full_builds),
+            "full-path rebuild count pins the kill switch"
+        );
+        *fast_counts = loader_planning_operation_counts(fast);
+        *full_counts = loader_planning_operation_counts(full);
+    };
+    // Tick 1: the first commit stabilizes both engines, so both build.
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        2,
+        2,
+    );
+    // Tick 2: an ordinary idle tick. Nothing admits; only the full path
+    // rebuilds.
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        0,
+        2,
+    );
+    assert_eq!(
+        fast.refresh_requested
+            .get(&p3)
+            .map(|request| request.serial),
+        full.refresh_requested
+            .get(&p3)
+            .map(|request| request.serial),
+        "the slotless request stays queued on both engines"
+    );
+    // Tick 3: a fourth peer joins the enumeration with its own request. Both
+    // newcomers find no slot, so the tick stays idle but merges fresh skip
+    // texts through the fast path too.
+    let mut fourth = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let p4 = fourth.id();
+    assert!(p3 < p4, "spawn order pins pid order");
+    let listing: String = [p1, p2, p3, p4]
+        .iter()
+        .map(|pid| format!("{pid}\n"))
+        .collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    assert!(fast.request_refresh_consumed(p4, Some(1_500)));
+    assert!(full.request_refresh_consumed(p4, Some(1_500)));
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        0,
+        2,
+    );
+    for engine in [&fast, &full] {
+        assert_eq!(
+            engine
+                .refresh_requested
+                .get(&p3)
+                .map(|request| request.serial),
+            Some(1),
+        );
+        assert_eq!(
+            engine
+                .refresh_requested
+                .get(&p4)
+                .map(|request| request.serial),
+            Some(2),
+        );
+    }
+    // Tick 4: reconcile evicts both holders and admits both waiters.
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        2,
+        2,
+    );
+    for engine in [&fast, &full] {
+        assert_eq!(engine.views.len(), 2);
+        assert!(engine.views.iter().any(|view| view.pid() == p3));
+        assert!(engine.views.iter().any(|view| view.pid() == p4));
+        assert!(!engine.refresh_requested.contains_key(&p3));
+        assert!(!engine.refresh_requested.contains_key(&p4));
+    }
+    // Tick 5: nothing pending anywhere; both take the early return.
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        0,
+        0,
+    );
+    // Tick 6: one retained view's generation is lost; both record it. The
+    // retirement terminal path builds one detachment candidate on top of the
+    // tick's two, identically on both engines.
+    fourth.kill().unwrap();
+    fourth.wait().unwrap();
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        3,
+        3,
+    );
+    for engine in [&fast, &full] {
+        assert!(engine.views.iter().all(|view| view.pid() != p4));
+    }
+    // Tick 7: a refresh rescan of a retained view rebuilds on both.
+    assert!(fast.request_refresh_consumed(p3, Some(2_000)));
+    assert!(full.request_refresh_consumed(p3, Some(2_000)));
+    tick_both(
+        &mut fast,
+        &mut full,
+        &mut fast_counts,
+        &mut full_counts,
+        2,
+        2,
+    );
+    for child in [&mut first, &mut second, &mut waiting] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Builder-level twin: the old and new builders run over recorded idle-tick
+/// inputs on loaded captures and must produce byte-identical candidates.
+/// The inputs are genuine tick outputs — the skips one idle cgroup tick
+/// merged — replayed with an in-vec duplicate so both merge arms run.
+#[test]
+fn unchanged_tick_builder_matches_full_build_over_recorded_inputs() {
+    let mut first = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut second = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut waiting = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let (p1, p2, p3) = (first.id(), second.id(), waiting.id());
+    let (mut recorder, _dir) = engine_over_cgroup_naming(&[p1, p2, p3]);
+    recorder.max_scan_pids = 2;
+    recorder
+        .views
+        .push(ProcessView::open(ProcessViewId(0), p1).unwrap());
+    recorder
+        .views
+        .push(ProcessView::open(ProcessViewId(1), p2).unwrap());
+    recorder.next_view_id = 2;
+    assert!(recorder.request_refresh_consumed(p3, Some(1_000)));
+    refresh_inventory_once(&mut recorder);
+    let mut recorded: Vec<Skipped> = recorder.counters.object_skips.clone();
+    assert!(
+        !recorded.is_empty(),
+        "the recorded idle tick merged real skips"
+    );
+    recorded.push(recorded[0].clone());
+    for child in [&mut first, &mut second, &mut waiting] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    let fixture = LoaderPlanningFixture::new();
+    let mut fast = fixture.engine();
+    let mut full = fixture.engine();
+    full.set_disable_empty_tick_fast_path_for_test(true);
+    let empty_views: BTreeSet<ProcessViewId> = BTreeSet::new();
+    // Stabilize: the fixture ends on a cached arm commit, which correctly
+    // leaves rebuild stability clear. Full builds plus their commits
+    // converge committed state (the rebuild drops the initial walk's refused
+    // surface, then verifies the fixpoint); each round rebuilds exactly once
+    // until both engines report stable.
+    let mut rounds = 0;
+    while !(fast.plan_rebuild_stable && full.plan_rebuild_stable) {
+        assert!(
+            rounds < 4,
+            "reuse state converges within a few full builds, round {rounds}"
+        );
+        for engine in [&mut fast, &mut full] {
+            let before = loader_planning_operation_counts(engine);
+            let stabilize = engine
+                .inventory_candidate(&empty_views, &[], &[], Vec::new(), &empty_views)
+                .unwrap();
+            assert_eq!(
+                loader_planning_operation_counts(engine),
+                (before.0 + 1, before.1 + 1),
+                "stabilization round {rounds} rebuilds once"
+            );
+            apply_loader_planning_candidate(engine, stabilize);
+        }
+        assert_tick_evidence_equal(&fast, &full);
+        rounds += 1;
+    }
+    let fast_before = loader_planning_operation_counts(&fast);
+    let full_before = loader_planning_operation_counts(&full);
+    let candidate = fast
+        .inventory_candidate(&empty_views, &[], &[], recorded.clone(), &empty_views)
+        .unwrap();
+    let rebuilt = full
+        .inventory_candidate(&empty_views, &[], &[], recorded, &empty_views)
+        .unwrap();
+    assert_eq!(
+        loader_planning_operation_counts(&fast),
+        fast_before,
+        "the fast path rebuilds nothing"
+    );
+    assert_eq!(
+        loader_planning_operation_counts(&full),
+        (full_before.0 + 1, full_before.1 + 1),
+        "the full path rebuilt once, pinning the kill switch"
+    );
+    // Pre-commit plans legitimately differ in publish-owned overlays (the
+    // commit's publication re-derives them from history on both paths); the
+    // rebuild-derived remainder must match exactly.
+    assert!(
+        candidate.plan.matches_for_stability(&rebuilt.plan),
+        "rebuild-derived plan content matches"
+    );
+    assert_eq!(candidate.delta, rebuilt.delta);
+    assert!(candidate.delta.new.is_empty() && candidate.delta.replace.is_empty());
+    assert_eq!(candidate.modules, rebuilt.modules);
+    assert_eq!(
+        candidate.pinned.pinned().count(),
+        rebuilt.pinned.pinned().count()
+    );
+    for pin in candidate.pinned.pinned() {
+        assert!(
+            candidate
+                .pinned
+                .exactly_matches(pin.id, &rebuilt.pinned, pin.id)
+        );
+        assert_eq!(
+            candidate.pinned.sources(pin.id),
+            rebuilt.pinned.sources(pin.id)
+        );
+    }
+    assert_eq!(candidate.views, rebuilt.views);
+    assert_eq!(candidate.corroboration, rebuilt.corroboration);
+    assert_eq!(candidate.manifest_fallbacks, rebuilt.manifest_fallbacks);
+    assert_eq!(candidate.selection_claims, rebuilt.selection_claims);
+    assert_eq!(candidate.selection_tables, rebuilt.selection_tables);
+    assert!(candidate.selection_admission.is_none() && rebuilt.selection_admission.is_none());
+    assert_eq!(
+        format!("{:?}", candidate.manifest_selection_admissions),
+        format!("{:?}", rebuilt.manifest_selection_admissions)
+    );
+    assert_eq!(
+        candidate.manifest_inventory_slots,
+        rebuilt.manifest_inventory_slots
+    );
+    assert!(candidate.loader_plan_proof.is_none() && rebuilt.loader_plan_proof.is_none());
+    assert!(candidate.exec_preservations.is_empty() && rebuilt.exec_preservations.is_empty());
+    assert!(candidate.exec_completions.is_empty() && rebuilt.exec_completions.is_empty());
+    assert_tick_evidence_equal(&fast, &full);
+    // End to end: committing both candidates (publication normalizes the
+    // overlays) leaves byte-identical engines.
+    apply_loader_planning_candidate(&mut fast, candidate);
+    apply_loader_planning_candidate(&mut full, rebuilt);
+    assert_tick_evidence_equal(&fast, &full);
+    assert_eq!(fast.plan, full.plan);
+    assert!(fast.plan_rebuild_stable && full.plan_rebuild_stable);
 }
 
 #[test]

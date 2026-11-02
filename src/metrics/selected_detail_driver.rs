@@ -944,8 +944,8 @@ pub(crate) type K0Facts = Result<Option<LifecycleFacts>, PidContinuityRefusal>;
 /// The open K0 window: the resolved selection, the detail collector
 /// holding the selection-time read as its baseline, the
 /// selection-time witness facts, the selection-time discovery losses,
-/// the selection read's monotonic stamp (lifecycle at or before it is
-/// outside the window), and the collector limits (reused for the close
+/// the selection read's monotonic start stamp (lifecycle strictly
+/// before it is outside the window), and the collector limits (reused for the close
 /// read so both bounds share one budget).
 pub(crate) struct K0Window {
     resolved: ResolvedSelection,
@@ -1023,10 +1023,15 @@ pub(super) fn open_k0_window_with_losses(
             return None;
         }
     };
-    // The selection read's monotonic stamp: lifecycle at or before it
-    // is outside the window.
+    // The selection read's monotonic start stamp: lifecycle strictly
+    // before it is outside the window. The read stamps `started` before
+    // any bank access and `finished` after the last one (its bounds
+    // encompass the component reads, not an atomic snapshot), so a
+    // lifecycle record inside the read, or tied with its start, could
+    // fall between the selected slot's read and the read's end and
+    // stays inside the window.
     let selection_stamp = match &before {
-        Ok(read) => read.view().window.map(|window| window.finished_ns),
+        Ok(read) => read.view().window.map(|window| window.started_ns),
         Err(_) => None,
     };
     let mut collector = CounterCollector::new(limits, reserve);
@@ -1115,8 +1120,9 @@ pub(super) fn close_k0_window_with_losses(
 /// Scan the shutdown-tail discovery records for a lifecycle hit on
 /// the selected caller: an EXEC or a tap fault (malformed tail).
 /// PID-matched like the tap: other PIDs never hit. Records stamped
-/// at or before the selection read are outside the window and are
-/// ignored; a zero timestamp never is (clock fault, fail closed). An
+/// strictly before the selection read's start are outside the window
+/// and are ignored (a tie stays inside); a zero timestamp never is
+/// (clock fault, fail closed). An
 /// in-window EXEC voids as caller-changed whatever its case (a
 /// faulting case fails closed the same way). A leader exit never
 /// voids: the counter bank's probes are bound to the original task in
@@ -1140,7 +1146,7 @@ fn scan_k0_tail(
         }
         if record.hook_ts_ns != 0
             && let Some(stamp) = selection_stamp
-            && record.hook_ts_ns <= stamp
+            && record.hook_ts_ns < stamp
         {
             continue;
         }
@@ -1261,12 +1267,13 @@ pub(super) fn close_k0_window_with_tail_and_losses(
         ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
         return;
     }
-    // An exec stamped at or before the selection read is outside the
-    // window (the owned child's own startup exec); only a later exec
-    // voids. A zero timestamp never is outside (fail closed).
+    // An exec stamped strictly before the selection read's start is
+    // outside the window (the owned child's own startup exec); a tie,
+    // an exec inside the read and any later exec void. A zero
+    // timestamp never is outside (fail closed).
     if after_witness.latest_exec != before.latest_exec {
         let outside = match (after_witness.latest_exec, selection_stamp) {
-            (Some(exec), Some(stamp)) => exec.hook_ts_ns != 0 && exec.hook_ts_ns <= stamp,
+            (Some(exec), Some(stamp)) => exec.hook_ts_ns != 0 && exec.hook_ts_ns < stamp,
             _ => false,
         };
         if !outside {

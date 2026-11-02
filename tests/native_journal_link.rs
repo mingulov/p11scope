@@ -6,6 +6,16 @@ use std::{
     process::Command,
 };
 
+/// Every child spawn in this binary holds this lock, and the preflight
+/// harnesses hold it while writing their stub tools. A fork in a sibling
+/// test thread can otherwise inherit a stub's still-open write descriptor,
+/// and exec'ing that stub then fails with ETXTBSY ("Text file busy").
+static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 const OUTPUT: &str = "journal-proof-v1/p11scope-ebpf-journal-proof-v1";
 const PRODUCERS: [&str; 6] = [
     "p11_journal_begin",
@@ -92,6 +102,7 @@ fn preflight(
     value: Option<&OsStr>,
     settings: &[(&str, &str)],
 ) -> (std::process::Output, bool, Vec<String>) {
+    let _spawn = spawn_lock();
     let root = tempfile::tempdir().unwrap();
     let out = root.path().join("out");
     let tools = root.path().join("tools");
@@ -278,6 +289,7 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
             "unexpected private ELF body {forbidden}"
         );
     }
+    let _spawn = spawn_lock();
     let undefined = Command::new("llvm-nm")
         .arg("--undefined-only")
         .arg(&path)
@@ -318,6 +330,7 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
             "{name}"
         );
     }
+    // Still under the `_spawn` guard taken before `llvm-nm` above.
     let abi = Command::new("python3")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args([
@@ -469,6 +482,7 @@ fn preflight_switch(
     value: Option<&OsStr>,
     settings: &[(&str, &str)],
 ) -> (std::process::Output, bool, Vec<String>) {
+    let _spawn = spawn_lock();
     let root = tempfile::tempdir().unwrap();
     let out = root.path().join("out");
     let tools = root.path().join("tools");
@@ -841,6 +855,7 @@ fn journal_production_elf_replaces_pair_and_retains_shapes() {
             "unexpected production ELF body {forbidden}"
         );
     }
+    let _spawn = spawn_lock();
     let undefined = Command::new("llvm-nm")
         .arg("--undefined-only")
         .arg(&path)

@@ -1811,13 +1811,35 @@ fn is_pending_rv(rv: u64) -> bool {
     pkcs11_types::CkRv(rv) == pkcs11_types::CkRv::PENDING
 }
 
+/// The P1 async producer rewrite, shared by END-vs-BEGIN agreement
+/// (`returned_fields_agree`) and ordinary-CALL corroboration (both
+/// matchers below): an OK `C_AsyncGetID` return may gain ONLY the
+/// value-unreadable bit (null output pointer or unreadable id), never
+/// clearing it and never beside another capture change. Callers keep the
+/// mechanism word exact. Unreachable in production today — async controls
+/// are negative-only, never journaled — so output-neutral; once tracked,
+/// a GetID whose END was lost carries bit 6 only on its preserved CALL
+/// and must still corroborate instead of stalling the seal on
+/// `BoundNotReady`.
+fn async_get_id_capture_gain(descriptor: u32, rv: u64, before: u32, after: u32) -> bool {
+    let lifecycle = crate::kinds::DESCRIPTORS
+        .get(descriptor as usize)
+        .map(|semantics| semantics.lifecycle);
+    lifecycle == Some(p11scope_ebpf_common::lifecycle::ASYNC_GET_ID)
+        && rv == 0
+        && (before ^ after) == capture::ASYNC_VALUE_UNREADABLE
+        && after & capture::ASYNC_VALUE_UNREADABLE != 0
+}
+
 /// Whether one ordinary CALL record corroborates one open BEGIN: the
 /// exact retained invocation — same image, same process, exact
 /// entry-time agreement plus the seven-word call identity — observed
 /// strictly after the BEGIN with a completed (non-pending) return
 /// value. Entry agreement is exact (`ts - duration`, the return path's
 /// own entry reconstruction): a merely later timestamp from another
-/// invocation never qualifies.
+/// invocation never qualifies. Capture agreement is exact except for
+/// the one P1 producer rewrite: an OK `C_AsyncGetID` return may gain
+/// ONLY the value-unreadable bit (`async_get_id_capture_gain`).
 fn ordinary_matches_begin(
     event: &p11scope_ebpf_common::Event,
     ordinal: u64,
@@ -1834,12 +1856,20 @@ fn ordinary_matches_begin(
         && event.mechanism == begin.entry_mechanism()
         && event.slot_id == begin.slot_id()
         && event.user_type == begin.user_type()
-        && event.capture == begin.capture()
+        && (event.capture == begin.capture()
+            || async_get_id_capture_gain(
+                begin.descriptor(),
+                event.rv,
+                begin.capture(),
+                event.capture,
+            ))
         && event.flags == begin.call_flags()
 }
 
 /// Whether one ordinary CALL record corroborates one refused BEGIN:
-/// the same exact-invocation binding as an open BEGIN.
+/// the same exact-invocation binding as an open BEGIN, including the
+/// one P1 producer rewrite for an OK `C_AsyncGetID` return gaining ONLY
+/// the value-unreadable bit (`async_get_id_capture_gain`).
 fn ordinary_matches_refused(
     event: &p11scope_ebpf_common::Event,
     ordinal: u64,
@@ -1855,7 +1885,13 @@ fn ordinary_matches_refused(
         && event.mechanism == refused.mechanism
         && event.slot_id == refused.slot_id
         && event.user_type == refused.user_type
-        && event.capture == refused.capture
+        && (event.capture == refused.capture
+            || async_get_id_capture_gain(
+                refused.function + 1,
+                event.rv,
+                refused.capture,
+                event.capture,
+            ))
         && event.flags == refused.flags
 }
 
@@ -1875,9 +1911,10 @@ fn returned_word_fits_layout(word: u64, layout: u8) -> bool {
 /// Match the session/mechanism rewrites made by capture_return_facts.
 /// Unreadable entry evidence is never an absent session; capture states are
 /// enums, and a captured VALUE (including zero or MECH_NONE's numeric value)
-/// stays exact. Other capture bits, ordinary corroboration and ingress are
-/// unchanged, except that an OK `C_AsyncGetID` return may gain the
-/// value-unreadable bit for a null output pointer or unreadable id.
+/// stays exact. Other capture bits and ingress are unchanged; an OK
+/// `C_AsyncGetID` return may gain the value-unreadable bit for a null output
+/// pointer or unreadable id, here and in ordinary-CALL corroboration alike
+/// (`async_get_id_capture_gain`).
 fn returned_fields_agree(
     begin: &ValidatedJournalBegin,
     event: &p11scope_ebpf_common::Event,
@@ -1909,15 +1946,14 @@ fn returned_fields_agree(
     let after = event.capture;
     // Wire-contract rule: an OK `C_AsyncGetID` return may gain ONLY
     // the value-unreadable bit (null output pointer or unreadable
-    // id), with the mechanism word unchanged. Every other function,
-    // return code or bit change falls through to the strict rule
-    // below — in particular the bit never clears and never appears
-    // beside another change.
-    if semantics.lifecycle == lifecycle::ASYNC_GET_ID
-        && event.rv == 0
-        && event.mechanism == begin.entry_mechanism()
-        && (before ^ after) == capture::ASYNC_VALUE_UNREADABLE
-        && after & capture::ASYNC_VALUE_UNREADABLE != 0
+    // id), with the mechanism word unchanged — the shared
+    // `async_get_id_capture_gain` predicate, also used by
+    // ordinary-CALL corroboration. Every other function, return code
+    // or bit change falls through to the strict rule below — in
+    // particular the bit never clears and never appears beside
+    // another change.
+    if event.mechanism == begin.entry_mechanism()
+        && async_get_id_capture_gain(begin.descriptor(), event.rv, before, after)
     {
         return true;
     }

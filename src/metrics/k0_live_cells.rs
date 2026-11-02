@@ -12,8 +12,10 @@
 //! process exit inside the window (owned `run` without `--hold`, and a
 //! `--pid` target that ends before the duration) and pin what an exit
 //! does to the detail; the gate-less cell runs a short owned child
-//! with no test synchronization and pins that the detail sees every
-//! call the main report saw.
+//! with no test synchronization and pins that every render sees
+//! every call the main report saw, while a fail-closed
+//! `broad_stopping` void with same-report truncation is also accepted
+//! (same constraint as the exec cell).
 //!
 //! Gate discipline (no sleeps on the critical path): every phase the
 //! test drives waits on a workload line (`READY`, `WATCH_READY`,
@@ -1014,13 +1016,16 @@ fn k0_live_run_gateless_exit_matches_main_counts_lp64() -> Result<()> {
     keep_workload_on_failure(workload, outcome, "K0G")
 }
 
-/// The gate-less short-run shape: the selection names C_Sign without
-/// a refusal, the detail renders, and its entered/returned counts
-/// equal the main report's C_Sign calls — no call the aggregate saw
-/// may fall outside the window. The ledger count (four clean signs,
-/// already ensured by the driver) and the aggregate count (also
-/// four: the uprobes attach before the child is released) keep the
-/// comparison non-vacuous.
+/// The gate-less short-run shape: the selection names C_Sign, and the
+/// run either renders exactly — the detail's entered/returned counts
+/// equal the main report's C_Sign calls, so no call the aggregate saw
+/// fell outside the window — or fails closed as `broad_stopping` with
+/// the truncation in the same report (loader records that arrive after
+/// the view retires reject as real truncation; same constraint as the
+/// exec cell). The ledger count (four clean signs, already ensured by
+/// the driver) and the aggregate count (also four: the uprobes attach
+/// before the child is released) keep the render comparison
+/// non-vacuous.
 fn require_detail_matches_main_counts(document: &serde_json::Value) -> Result<()> {
     let selected = &document["evidence"]["selected_detail"];
     let record = &selected["selection"];
@@ -1028,11 +1033,27 @@ fn require_detail_matches_main_counts(document: &serde_json::Value) -> Result<()
         record["endpoint"] == serde_json::json!("C_Sign"),
         "selection names C_Sign: {record}"
     );
+    if record.get("refusal").is_some() {
+        let reason = record["refusal"].as_str().context("void reason")?;
+        let truncated = document["evidence"]["discovery_truncated"]
+            .as_u64()
+            .context("the report carries its truncation count")?;
+        eprintln!(
+            "k0-live-gateless-cell: void reason = {reason} (discovery_truncated={truncated})"
+        );
+        ensure!(
+            reason == "broad_stopping" && truncated >= 1,
+            "the short run fails closed with evidence: {record}"
+        );
+        ensure!(selected.get("detail").is_none(), "no detail on a void");
+        ensure!(
+            selected.get("aggregate").is_none(),
+            "no aggregate on a void"
+        );
+        ensure!(selected.get("lineage").is_none(), "no lineage on a void");
+        return Ok(());
+    }
     let slot = record["slot"].as_u64().context("selection slot")?;
-    ensure!(
-        record.get("refusal").is_none(),
-        "the short window succeeds: {record}"
-    );
     let detail = selected.get("detail").context("detail renders")?;
     let rows = detail["rows"].as_array().context("detail rows")?;
     ensure!(rows.len() == 1, "Detail carries only the selected slot");

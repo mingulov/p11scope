@@ -290,14 +290,15 @@ static u64 tgid(void) { return pid_tgid; }
 static void *task(void) { return current_task; }
 
 /* Scripted bpf_get_func_ret: the ret-based copy hook reads the created
- * VMA through the helper on any arity, never a fixed slot. */
+ * VMA through the helper's out-pointer, whatever the arity. */
 static u64 func_ret_value;
 static unsigned func_ret_calls;
-static u64 func_ret(void *ctx)
+static long func_ret(void *ctx, u64 *value)
 {
     (void)ctx;
     func_ret_calls++;
-    return func_ret_value;
+    *value = func_ret_value;
+    return 0;
 }
 
 static void reset(void)

@@ -41,6 +41,8 @@ pub mod doctor;
 pub mod events;
 #[cfg(test)]
 mod first_use_probe;
+#[cfg(test)]
+pub(crate) mod fixture_guard;
 pub mod inspect;
 pub(crate) mod inspect_identity;
 pub mod inspect_system;

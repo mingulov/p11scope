@@ -612,11 +612,11 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
         "- name: Install packaged bpftool",
         "set -euo pipefail",
-        // Pinned baseline b3b75346: the exec-witness health-counter fix on top
-        // of the PID-scope EXEC ticket fix, the reviewed loader + bank + journal
-        // delta since ba92b4e2 and the loader-gate wiring since 90b8cf9f; all
-        // enumerated in the ci.yml comment.
-        "BASELINE=b3b753469df76553bba7fb0e8dec48666f45569a",
+        // Pinned baseline 16a7bd53: the default journal and birth marker on top
+        // of the exec-witness health-counter fix, the PID-scope EXEC ticket fix,
+        // the reviewed loader + bank + journal delta since ba92b4e2 and the
+        // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
+        "BASELINE=16a7bd538535c6d8fb29680dabf6939ca5573a8e",
         "python3 -I scripts/check-bpf-noninterference.py \\",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
@@ -9716,11 +9716,11 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         "needs: [dedupe, tests]",
         "!cancelled() && needs.dedupe.outputs.run == 'true'",
         "fetch-depth: 0",
-        // Pinned baseline b3b75346: the exec-witness health-counter fix on top
-        // of the PID-scope EXEC ticket fix, the reviewed loader + bank + journal
-        // delta since ba92b4e2 and the loader-gate wiring since 90b8cf9f; all
-        // enumerated in the ci.yml comment.
-        "BASELINE=b3b753469df76553bba7fb0e8dec48666f45569a",
+        // Pinned baseline 16a7bd53: the default journal and birth marker on top
+        // of the exec-witness health-counter fix, the PID-scope EXEC ticket fix,
+        // the reviewed loader + bank + journal delta since ba92b4e2 and the
+        // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
+        "BASELINE=16a7bd538535c6d8fb29680dabf6939ca5573a8e",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"\n",

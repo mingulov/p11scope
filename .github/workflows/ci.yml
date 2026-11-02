@@ -502,7 +502,14 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin b3b75346, the reviewed exec-witness health-counter fix: the native
+      # Pin 16a7bd53, the default journal and birth-marker lane (FULL and P0
+      # builds carry the marker unless P11SCOPE_BIRTH_MARKER=0): the default
+      # Detailed object gains JOURNAL_MARKER_CTL (one map, no new program) plus
+      # the p11_instance_exec_birth and p11_instance_scope_gap bodies and their
+      # calls from the exec, exit, uprobe and uretprobe hooks (.text +4304 B,
+      # .maps +32 B); both Inventory objects are byte-identical to b3b75346.
+      # No other BPF input changed since b3b75346.
+      # Earlier pin b3b75346, the reviewed exec-witness health-counter fix: the native
       # witness no longer counts allocator misses, and emit_lifecycle stamps the
       # EXEC ticket in Detailed only while short-lived tracking is armed outside
       # aggregate captures (counter objects compile the ticket out), a code
@@ -543,7 +550,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=b3b753469df76553bba7fb0e8dec48666f45569a
+          BASELINE=16a7bd538535c6d8fb29680dabf6939ca5573a8e
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

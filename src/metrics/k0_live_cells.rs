@@ -1064,8 +1064,22 @@ fn k0_exec_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result
         record["endpoint"] == serde_json::json!("C_Sign"),
         "selection names C_Sign: {record}"
     );
+    // The exec voids the detail, but the refusal word depends on load:
+    // the contract checks truncation growth (step 1) before the exec
+    // witness (step 3), and the post-exec loader rescan under load
+    // leaves exec-caused truncation behind, which voids as
+    // `broad_stopping`. That arm is only accepted with the truncation
+    // in the same report, so a lost exec witness cannot hide behind
+    // it: quiet runs still take the caller-changed path.
+    let reason = record["refusal"]
+        .as_str()
+        .context("the exec voids the detail")?;
+    let truncated = document["evidence"]["discovery_truncated"]
+        .as_u64()
+        .context("the report carries its truncation count")?;
+    eprintln!("k0-live-exec-cell: void reason = {reason} (discovery_truncated={truncated})");
     ensure!(
-        record["refusal"] == serde_json::json!("promotion_caller_changed"),
+        reason == "promotion_caller_changed" || (reason == "broad_stopping" && truncated >= 1),
         "the exec voids the detail: {record}"
     );
     ensure!(selected.get("detail").is_none(), "no detail on a void");

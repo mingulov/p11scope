@@ -1348,7 +1348,9 @@ fn collect_event_prefix<S: crate::events::RecordSource>(
     // Only the attested allowlisted lane decodes 608-byte records;
     // every other lane stays 368-byte-only through the same cursor.
     // The closures never break early, so a true return means the poll
-    // stopped at its quantum with more possibly waiting.
+    // stopped at its quantum with more possibly waiting (both polls
+    // report true at the quantum, matching `poll`'s documented
+    // convention).
     let quantum_exhausted = match table {
         Some(table) => drain.poll_object_records(Some(limit), table, |record| {
             records.push(record);

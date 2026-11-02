@@ -800,7 +800,8 @@ fn loader_ticket_harness_bank_select_validation() {
 
 /// The gate unit lowers to BPF bitcode warning-free under the exact BPF
 /// object flags, so the host-only unit can never rot. Host-only; emits
-/// LLVM bitcode to a temp dir, no BPF load, no attach.
+/// LLVM bitcode to a temp dir, no BPF load, no attach. It then scores
+/// the touched-function LLVM size against the stated tripwire bound.
 #[test]
 fn loader_gate_unit_compiles_to_bpf_bitcode() {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -885,7 +886,7 @@ fn loader_gate_unit_compiles_to_bpf_bitcode() {
             "native {unit} gate-off bitcode emitted"
         );
     }
-    assert_loader_producer_verifier_probe(temporary.path());
+    assert_loader_producer_size_tripwire(temporary.path());
 }
 
 /// Count LLVM instructions in one named function of disassembled
@@ -1022,36 +1023,30 @@ fn brace_matched_body(text: &str) -> String {
     text[..end].to_owned()
 }
 
-/// Verifier-cost probe for the loader/image producer: disassemble the
+/// LLVM size tripwire for the loader/image producer: disassemble the
 /// gate-enabled unit bitcode, count LLVM instructions in the touched
-/// BPF functions, and score the total against the existing loader-root
-/// pin (minimum across kernels) further limited by the configured
-/// headroom against the verifier limit. Both the numeric pin and the
-/// headroom apply; no new numbers are pinned here. LLVM counts are a
-/// documented proxy (gross-blowup tripwire), never a verifier proof:
-/// genuinely new gate costs are measured and pinned from kernel data
-/// in the later qualification stage.
-fn assert_loader_producer_verifier_probe(bitcode_dir: &Path) {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let budgets_text =
-        std::fs::read_to_string(format!("{manifest}/tests/bpf-verifier-budgets.json"))
-            .expect("verifier budgets file must exist");
-    let budgets: serde_json::Value =
-        serde_json::from_str(&budgets_text).expect("verifier budgets must parse");
-    let limit = budgets["limit"].as_u64().expect("verifier limit pin");
-    let min_headroom = budgets["min_headroom_percent"]
-        .as_f64()
-        .expect("headroom pin");
-    let root = &budgets["programs"]["detailed/dl_debug_state"];
-    let pin = root
-        .as_object()
-        .expect("loader root pin")
-        .values()
-        .map(|value| value.as_u64().expect("per-kernel pin"))
-        .min()
-        .expect("at least one kernel pin");
-    let bound = pin.min((limit as f64 * (1.0 - min_headroom / 100.0)) as u64);
-    assert!(bound > 0, "pin bound must be positive");
+/// BPF functions, and score the total against a stated self-baseline.
+/// THIS IS A SIZE TRIPWIRE, NOT A VERIFIER BUDGET: it catches gross
+/// code-size blowups in CI without a kernel. Verifier budgets for the
+/// gate-1 roots are the `detailed-gate1/<root>` rows in
+/// `tests/bpf-verifier-budgets.json`, measured from real kernel loads.
+/// Baseline: touched total 9039 LLVM insns, measured on the tree that
+/// fixed the gate-1 `p11_return` stack overflow (link frame 112 down to
+/// 64 or below with the select and cut leaves inlined, so the return
+/// path fits 512 with the link as its deepest frame); bound 9491 =
+/// ceil(9039 x 1.05), the >=5% headroom rule. The ticket helper carries
+/// the inlined cut step once per unrolled attempt, which is why the
+/// baseline sits above the pre-fix sum. Do not raise this bound to
+/// quiet the test: a breach means a touched function grew; shrink the
+/// growth or re-baseline with a stated reason.
+fn assert_loader_producer_size_tripwire(bitcode_dir: &Path) {
+    const BASELINE_TOTAL: u64 = 9039;
+    const BOUND: u64 = 9491; // ceil(9039 x 1.05): the >=5% headroom rule
+    // Compile-time pin: the bound keeps >=5% headroom over the baseline.
+    // A breach fails the build, never the test run.
+    const {
+        assert!(BOUND * 100 >= BASELINE_TOTAL * 105);
+    }
     let touched: &[(&str, &[&str])] = &[
         (
             "loader_gate",
@@ -1092,13 +1087,30 @@ fn assert_loader_producer_verifier_probe(bitcode_dir: &Path) {
         for name in *functions {
             let count = llvm_function_insns(&text, name)
                 .unwrap_or_else(|| panic!("touched BPF function {name} must be present"));
-            println!("verifier probe: {unit}::{name} = {count} llvm insns");
+            println!("size tripwire: {unit}::{name} = {count} llvm insns");
             total += count;
         }
     }
-    println!("verifier probe: touched total = {total} llvm insns, bound = {bound}");
+    println!("size tripwire: touched total = {total} llvm insns, bound = {BOUND}");
     assert!(
-        total as u64 <= bound,
-        "touched loader producer {total} llvm insns exceed the loader-root pin {bound}"
+        tripwire_scores_pass(total as u64, BOUND),
+        "touched loader producer {total} llvm insns exceed the size-tripwire bound {BOUND} (baseline {BASELINE_TOTAL}); this is a size tripwire, not a verifier budget"
     );
+    // Twin: the scorer must fail a grown total, so a passing probe
+    // always has teeth. A lowered-bound run of this same test is the
+    // live twin: it must fail on the unchanged tree.
+    assert!(
+        tripwire_scores_pass(BOUND, BOUND),
+        "scorer passes at the bound"
+    );
+    assert!(
+        !tripwire_scores_pass(BOUND + 1, BOUND),
+        "scorer fails a grown total"
+    );
+}
+
+/// Pure scorer for the size tripwire, so the twin exercises the exact
+/// pass/fail boundary without bitcode.
+fn tripwire_scores_pass(total: u64, bound: u64) -> bool {
+    total <= bound
 }

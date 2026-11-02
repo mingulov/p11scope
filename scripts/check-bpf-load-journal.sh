@@ -309,7 +309,7 @@ else
     exit 3
 fi
 # One persistent caller with spread key-operation iterations: it maps
-# the provider once, sets up a session, prints READY, then paces forty
+# the provider once, sets up a session, prints READY, then paces eighty
 # mech iterations a second apart and holds until killed. Short-lived
 # burst callers exit before admission and shed every call as
 # use-before-admission, so the leg waits for READY before the observer

@@ -2375,6 +2375,72 @@ fn object_journal_elf_matches_detailed_attribute_capture() {
     );
 }
 
+/// Journal/marker inventory policy: the five pure-policy
+/// `JournalMarkerInventoryTests` cases (marker presence, variant
+/// forbids, journal accept/refusals) run here by name on every
+/// flavor, beside the release-marker twin in `bpf_map_contracts`.
+#[test]
+fn object_journal_variant_inventory_policy_cases_are_driven() {
+    let output = std::process::Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "-I",
+            "tests/python/test_bpf_map_defs.py",
+            "JournalMarkerInventoryTests.test_release_detailed_marker_presence_accepts",
+            "JournalMarkerInventoryTests.test_release_diagnostic_and_wide_variants_forbid_marker",
+            "JournalMarkerInventoryTests.test_journal_variant_accepts_frozen_inventory",
+            "JournalMarkerInventoryTests.test_journal_variant_refuses_birth_and_missing_gap",
+            "JournalMarkerInventoryTests.test_journal_variant_refuses_inventory_map_and_drift",
+        ])
+        .output()
+        .expect("run journal variant inventory policy cases");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "journal variant inventory: {report}"
+    );
+    assert!(report.contains("Ran 5 tests"), "zero selection: {report}");
+    assert!(report.contains("\nOK\n"), "skipped journal proof: {report}");
+}
+
+/// Journal-roots discipline: the Detailed object refuses journal
+/// entry/return roots (its capture rule runs under Detailed roots
+/// only), on every flavor, from the embedded object.
+#[test]
+fn object_journal_roots_require_journal_programs_is_driven() {
+    let directory = tempfile::tempdir().expect("temporary detailed object");
+    let detailed = directory.path().join("p11scope-ebpf");
+    std::fs::write(&detailed, p11scope::EBPF_OBJECT).expect("write embedded detailed object");
+    let output = std::process::Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("P11SCOPE_OBJECT_CAPTURE_OBJECT", &detailed)
+        .args([
+            "-I",
+            "tests/python/test_bpf_map_defs.py",
+            "ObjectCaptureGlobalsTests.test_object_capture_journal_roots_require_journal_programs",
+        ])
+        .output()
+        .expect("run journal-roots discipline proof");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "journal roots discipline: {report}"
+    );
+    assert!(report.contains("Ran 1 test"), "zero selection: {report}");
+    assert!(
+        !report.contains("skipped"),
+        "skipped journal proof: {report}"
+    );
+}
+
 /// Release seal: a caller-set `P11SCOPE_JOURNAL=0` or
 /// `P11SCOPE_BIRTH_MARKER=0` cannot change the official bytes. The
 /// sealed-environment allowlist names neither switch, and the

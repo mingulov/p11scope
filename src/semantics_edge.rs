@@ -400,6 +400,8 @@ struct PendingCall {
     /// originals; `None` for S1Only or unassociated starts. The
     /// Activation compares this to the redeemed origin's position:
     /// same origin means equal positions.
+    /// First production reader lands with the Activation's receipt gate.
+    #[cfg_attr(not(test), allow(dead_code))]
     origin_pos: Option<u64>,
     sequence: u64,
     // Payload fields precede the move-only owner: refund after destruction.
@@ -418,6 +420,8 @@ struct AsyncId {
     origin: CallOrigin,
     /// The pending record's H0 position, carried over at the GetID
     /// mint — never re-snapshotted, like `origin`.
+    /// First production reader lands with the Activation's receipt gate.
+    #[cfg_attr(not(test), allow(dead_code))]
     origin_pos: Option<u64>,
     sequence: u64,
     resource: Option<ResourceLease>,

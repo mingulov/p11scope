@@ -819,6 +819,7 @@ impl PauseCoordinator {
             return self.fail_cycle(io, "malformed discovery record in pause epoch", false);
         };
         if exact_pid(&first) != self.pid {
+            self.begin_attempt();
             return self.fail_cycle(io, "unaccounted discovery record in pause epoch", false);
         }
 
@@ -849,6 +850,7 @@ impl PauseCoordinator {
                 Some(PAUSE_REQUESTED) => return self.service_requested(io, deadline),
                 Some(PAUSE_ARMED) => {
                     if let Err(error) = self.apply_unowned(io, Some(deadline)) {
+                        self.begin_attempt();
                         return self.fail_cycle(io, error.to_string(), error.lifecycle());
                     }
                     match io.authorization() {

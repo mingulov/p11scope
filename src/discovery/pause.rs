@@ -3843,12 +3843,7 @@ mod tests {
     fn a_task_running_after_stopped_samples_is_sigcont_not_delivery() {
         let mut io = successful_io(vec![record(10, 0, false)]);
         let running: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
-        io.states = VecDeque::from([
-            Ok(stopped()),
-            Ok(stopped()),
-            Ok(running),
-            Ok(stopped()),
-        ]);
+        io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(running), Ok(stopped())]);
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.arm_for_test();
 

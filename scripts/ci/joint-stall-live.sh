@@ -11,11 +11,14 @@
 # Cells (OUTDIR/results.jsonl, one row per cell):
 #   stall-short-stops  every short run exits within D + slack with no
 #                      "joint finish/audit made no progress" gap
-#   wedge-no-abandon   every short run has no "joint finish abandoned for
-#                      exit" gap, exits 0 with no disposition error and no
-#                      progress gap or stderr line
+#   wedge-no-abandon   every short run has no abandon gap, no neighbouring
+#                      distress gap or lane-stopped stderr line, exits 0 with
+#                      no disposition error and no progress gap or stderr line
 #   stall-long-1800    the 1800 s run exits within D + slack with no
 #                      progress gap (only with LONG=1800)
+# Mid-run lane-stop conversions ("joint finish abandoned for lane stop" /
+# "semantic lane stopped") are designed degradation: they pass but are
+# counted as lane_stop_runs, not joint_finish_runs, in the cell detail.
 # With KEY_OPS=1 the same names carry a -linked suffix. The cross-binary
 # "fewer abandons than base" check is a human comparison of two campaigns,
 # not a script assertion.
@@ -33,7 +36,7 @@
 # Live runs must be under the privileged lock and as root:
 #   flock /var/tmp/p11scope-ws-tmp/privileged.lock \
 #     sudo -n scripts/ci/joint-stall-live.sh P11SCOPE OUTDIR
-# --help, --self-test and --check-run need no privileges.
+# --help, --self-test, --check-run and --summarize need no privileges.
 #
 # Apt prerequisites on a GitHub ubuntu-26.04 runner (root):
 #   gcc python3 softhsm2 sudo procps
@@ -56,10 +59,11 @@ HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
 REPO=$(cd "$HERE/../.." && pwd) || exit 2
 
 usage() {
-    sed -n '2,45p' "$0"
+    sed -n '2,56p' "$0"
     echo "usage: $0 P11SCOPE OUTDIR"
     echo "       $0 --help | --self-test"
     echo "       $0 --check-run RUN_JSON STDERR_FILE DURATION_D WALL_S EXIT_CODE SLACK_S"
+    echo "       $0 --summarize RUNS_DIR RESULTS SUFFIX HOST KERNEL SEED RUNS LONG KEY_OPS WALL PASSED FAILED LONG_RC"
 }
 
 die() { echo "joint-stall-live: $1" >&2; exit "${2:-2}"; }
@@ -71,6 +75,28 @@ check_run() {
     python3 -I - "$@" <<'PY'
 import json, re, sys
 run_json, stderr_file, d_s, wall_s, exit_s, slack_s = sys.argv[1:7]
+# Mid-run lane-stop conversion: designed degradation, counted as
+# non-finish evidence, never gated.
+LANE_STOP_SUBJECTS = ("joint finish abandoned for lane stop",
+                      "semantic lane stopped")
+# Neighbouring joint-distress gaps. Each appears only on a distress
+# path, so each fails the wedge cell:
+# - settle bound reached: the finish did not complete within its wall
+#   bound and was abandoned for exit;
+# - held for exit: a stop path held the lane instead of abandoning it
+#   (finished or unlatched), so the finish never committed normally;
+# - retained publication timed out: the publication stayed pending past
+#   the deadline and the report was written without its latest pass;
+# - unfinished publication abandoned: the coordinator dropped an
+#   unfinished Joint publication;
+# - abandon commit failed: committing the abandon-time finish failed;
+# - wound-down failed: the finish's wound-down poll was refused.
+DISTRESS_SUBJECTS = ("joint finish settle bound reached",
+                     "joint finish held for exit",
+                     "retained joint publication timed out",
+                     "unfinished joint publication abandoned",
+                     "joint abandon commit failed",
+                     "joint wound-down failed")
 try:
     duration = int(d_s); wall = int(wall_s); exit_code = int(exit_s); slack = int(slack_s)
 except ValueError:
@@ -78,7 +104,9 @@ except ValueError:
 out = {"duration": duration, "wall": wall, "exit": exit_code,
        "subjects": [], "abandons": 0, "no_progress": False,
        "trips": [], "stderr_no_progress": False, "stderr_abandon": False,
-       "stderr_disposition": False, "time_ok": wall <= duration + slack,
+       "stderr_disposition": False, "stderr_lane_stopped": False,
+       "lane_stop": False, "distress": [],
+       "time_ok": wall <= duration + slack,
        "exit_ok": exit_code == 0, "run_json_ok": False,
        "gaps_suppressed": None}
 try:
@@ -86,6 +114,9 @@ try:
         doc = json.load(f)
 except (OSError, ValueError) as e:
     out["error"] = "run.json unreadable: %s" % e
+    print(json.dumps(out)); sys.exit(1)
+if not isinstance(doc, dict):
+    out["error"] = "run.json is not an object"
     print(json.dumps(out)); sys.exit(1)
 gaps = doc.get("gaps")
 if not isinstance(gaps, list):
@@ -101,6 +132,10 @@ for gap in gaps:
         out["subjects"].append(subject)
     if subject == "joint finish abandoned for exit":
         out["abandons"] += 1
+    if subject in LANE_STOP_SUBJECTS:
+        out["lane_stop"] = True
+    if subject in DISTRESS_SUBJECTS:
+        out["distress"].append(subject)
     if subject in ("joint finish made no progress", "joint audit made no progress"):
         out["no_progress"] = True
         trip = {"subject": subject, "h0_below": None,
@@ -125,6 +160,10 @@ if "abandoned the unfinished live publication" in stderr_text:
     out["stderr_abandon"] = True
 if "joint finish disposition required" in stderr_text:
     out["stderr_disposition"] = True
+# Printed only when the stopped lane's unfinished publication blocks
+# the broad commit and the run fails honestly.
+if "semantic lane stopped" in stderr_text:
+    out["stderr_lane_stopped"] = True
 # Lifecycle loss accounting (recorded, never gated).
 try:
     lifecycle = doc.get("observation", {}).get("lifecycle", {})
@@ -141,7 +180,9 @@ except AttributeError:
 # finish gap (first-N-wins), but the trip stderr line is never capped.
 out["stall_ok"] = bool(out["time_ok"] and not out["no_progress"]
                        and not out["stderr_no_progress"] and out["run_json_ok"])
-out["wedge_ok"] = bool(out["abandons"] == 0 and not out["stderr_abandon"]
+out["wedge_ok"] = bool(out["abandons"] == 0 and not out["distress"]
+                       and not out["stderr_abandon"]
+                       and not out["stderr_lane_stopped"]
                        and out["exit_ok"]
                        and not out["no_progress"] and not out["stderr_no_progress"]
                        and not out["stderr_disposition"] and out["run_json_ok"])
@@ -230,13 +271,163 @@ assert d["stall_ok"] and not d["wedge_ok"], d
 assert d["stderr_abandon"] and not d["stderr_no_progress"], d
 PY
     then pass=$((pass + 1)); else fail=$((fail + 1)); echo "self-test FAIL: abandoned fields"; fi
+    lane_run="$work/in-lane-stop.json"
+    cat > "$lane_run" <<'EOF'
+{"gaps": [{"subject": "joint finish abandoned for lane stop", "reason": "x"},
+          {"subject": "semantic lane stopped", "reason": "y"}]}
+EOF
+    expect lane-stop 0 "$lane_run" "$work/empty.stderr" 30 35 0 60
+    if python3 -I - "$work/out-lane-stop.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["stall_ok"] and d["wedge_ok"], d
+assert d["lane_stop"] and not d["distress"], d
+PY
+    then pass=$((pass + 1)); else fail=$((fail + 1)); echo "self-test FAIL: lane-stop fields"; fi
+    for subject in "joint finish settle bound reached" \
+            "joint finish held for exit" \
+            "retained joint publication timed out" \
+            "unfinished joint publication abandoned" \
+            "joint abandon commit failed" \
+            "joint wound-down failed"; do
+        name=distress-${subject// /-}
+        python3 -I - "$subject" > "$work/in-$name.json" <<'PY'
+import json, sys
+print(json.dumps({"gaps": [{"subject": sys.argv[1], "reason": "x"}]}))
+PY
+        expect "$name" 1 "$work/in-$name.json" "$work/empty.stderr" 30 35 0 60
+    done
+    if python3 -I - "$work/out-distress-joint-finish-settle-bound-reached.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["stall_ok"] and not d["wedge_ok"], d
+assert d["distress"] == ["joint finish settle bound reached"], d
+PY
+    then pass=$((pass + 1)); else fail=$((fail + 1)); echo "self-test FAIL: distress fields"; fi
+    echo "p11scope: the semantic lane stopped (test) but its unfinished joint publication still blocks the broad commit; the run cannot continue past it" > "$work/lane-stopped.stderr"
+    expect lane-stopped 1 "$healthy_run" "$work/lane-stopped.stderr" 30 35 0 60
+    if python3 -I - "$work/out-lane-stopped.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["stall_ok"] and not d["wedge_ok"], d
+assert d["stderr_lane_stopped"], d
+PY
+    then pass=$((pass + 1)); else fail=$((fail + 1)); echo "self-test FAIL: lane-stopped fields"; fi
+    echo "[]" > "$work/nobj.json"
+    expect nonobject 1 "$work/nobj.json" "$work/empty.stderr" 30 35 0 60
+    if python3 -I - "$work/out-nonobject.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["error"] == "run.json is not an object", d
+assert not d["run_json_ok"], d
+PY
+    then pass=$((pass + 1)); else fail=$((fail + 1)); echo "self-test FAIL: nonobject fields"; fi
+    cat > "$work/noscope.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+    chmod +x "$work/noscope.sh"
+    if KEY_OPS=1 LONG=1800 "$0" "$work/noscope.sh" "$work/early" > "$work/early.log" 2>&1; then rc=0; else rc=$?; fi
+    if [ "$rc" = 0 ] && python3 -I - "$work/early/results.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert [r["cell"] for r in rows] == ["stall-short-stops-linked",
+                                     "wedge-no-abandon-linked",
+                                     "stall-long-1800-linked"], rows
+assert all(r["pass"] is False for r in rows), rows
+assert all(r["qualification"] == "nonqualifying" for r in rows), rows
+PY
+    then pass=$((pass + 1)); else fail=$((fail + 1)); echo "self-test FAIL: key-ops-early"; cat "$work/early.log"; fi
     echo "self-test: pass=$pass fail=$fail"
     [ "$fail" -eq 0 ]
+}
+
+# --- Campaign aggregation (also the --summarize entry point) ---
+# Reads RUNS_DIR/run-*.check.json plus run-long.check.json, writes one
+# JSON row per cell to RESULTS, and exits 0 iff every cell passed.
+# Runs whose subjects show a lane-stop conversion are counted as
+# lane_stop_runs, not joint_finish_runs: they passed without ever
+# running a joint finish, so they are not finish evidence.
+summarize() {
+    python3 -I - "$@" <<'PY'
+import glob, json, sys
+if len(sys.argv) != 14:
+    print("usage: --summarize RUNS_DIR RESULTS SUFFIX HOST KERNEL SEED RUNS LONG KEY_OPS WALL PASSED FAILED LONG_RC",
+          file=sys.stderr)
+    sys.exit(2)
+runs_dir, results_path, suffix, host, kernel, seed = sys.argv[1:7]
+runs, long_d, key_ops, wall, passed, failed, long_rc = sys.argv[7:14]
+LANE_STOP_SUBJECTS = ("joint finish abandoned for lane stop",
+                      "semantic lane stopped")
+def lane_stopped(check):
+    if check.get("lane_stop"):
+        return True
+    subjects = check.get("subjects")
+    return isinstance(subjects, list) and any(s in LANE_STOP_SUBJECTS for s in subjects)
+def finished_joint(check):
+    return bool(check.get("run_json_ok")) and not lane_stopped(check)
+checks = []
+for path in sorted(glob.glob(runs_dir + "/run-[0-9]*.check.json")):
+    try:
+        checks.append((path, json.load(open(path))))
+    except (OSError, ValueError):
+        checks.append((path, {"stall_ok": False, "wedge_ok": False,
+                              "abandons": 0, "no_progress": True,
+                              "error": "check.json unreadable"}))
+abandons = sum(int(c.get("abandons") or 0) for _, c in checks)
+trips = sum(1 for _, c in checks if c.get("no_progress"))
+lane_stops = sum(1 for _, c in checks if lane_stopped(c))
+finish_runs = sum(1 for _, c in checks if finished_joint(c))
+max_delay = None
+for _, c in checks:
+    try:
+        delay = int(c["wall"]) - int(c["duration"])
+        max_delay = delay if max_delay is None else max(max_delay, delay)
+    except (KeyError, TypeError, ValueError):
+        pass
+stall_pass = failed == "0" and len(checks) == int(runs)
+wedge_pass = all(c.get("wedge_ok") for _, c in checks) and len(checks) == int(runs)
+rows = [
+    ("stall-short-stops" + suffix, stall_pass, "qualified",
+     "host=%s kernel=%s seed=%s runs=%s passed=%s failed=%s abandons=%d no_progress_runs=%d lane_stop_runs=%d joint_finish_runs=%d max_delay=%ss wall=%ss"
+     % (host, kernel, seed, runs, passed, failed, abandons, trips,
+        lane_stops, finish_runs, max_delay, wall)),
+    ("wedge-no-abandon" + suffix, wedge_pass, "qualified",
+     "host=%s kernel=%s seed=%s runs=%s abandons=%d no_progress_runs=%d lane_stop_runs=%d joint_finish_runs=%d max_delay=%ss"
+     % (host, kernel, seed, runs, abandons, trips, lane_stops,
+        finish_runs, max_delay)),
+]
+if long_d == "1800":
+    try:
+        long_check = json.load(open(runs_dir + "/run-long.check.json"))
+    except (OSError, ValueError):
+        long_check = {"stall_ok": False}
+    long_pass = bool(long_check.get("stall_ok")) and long_rc == "0"
+    try:
+        long_delay = int(long_check["wall"]) - int(long_check["duration"])
+    except (KeyError, TypeError, ValueError):
+        long_delay = None
+    long_lane_stop = (lane_stopped(long_check)
+                      if long_check.get("run_json_ok") else "unknown")
+    rows.append(("stall-long-1800" + suffix, long_pass, "qualified",
+                 "host=%s kernel=%s seed=%s wall=%ss delay=%ss rc=%s no_progress=%s abandons=%s lane_stop=%s"
+                 % (host, kernel, seed, long_check.get("wall"),
+                    long_delay, long_check.get("exit"),
+                    long_check.get("no_progress"),
+                    long_check.get("abandons"), long_lane_stop)))
+with open(results_path, "w", encoding="utf-8") as f:
+    for cell, passed_cell, qualification, detail in rows:
+        f.write(json.dumps({"cell": cell, "pass": bool(passed_cell),
+                            "qualification": qualification,
+                            "detail": detail}) + "\n")
+sys.exit(0 if all(p for _, p, _, _ in rows) else 1)
+PY
 }
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then usage; exit 0; fi
 if [ "${1:-}" = "--self-test" ]; then shift; [ $# -eq 0 ] || { usage >&2; exit 2; }; self_test; exit $?; fi
 if [ "${1:-}" = "--check-run" ]; then shift; check_run "$@"; exit $?; fi
+if [ "${1:-}" = "--summarize" ]; then shift; summarize "$@"; exit $?; fi
 
 [ $# -eq 2 ] || { usage >&2; exit 2; }
 P11SCOPE=$1; OUTDIR=$2
@@ -256,6 +447,35 @@ case $LONG in 0|1800) ;; *) die "LONG must be 0 or 1800" 2 ;; esac
 
 [ -x "$P11SCOPE" ] || { echo "joint-stall-live: P11SCOPE is not executable: $P11SCOPE" >&2; exit 77; }
 P11SCOPE=$(realpath -e -- "$P11SCOPE") || exit 77
+
+SUFFIX=""; KEY_FLAG=()
+if [ "$KEY_OPS" = 1 ]; then
+    SUFFIX="-linked"
+    if "$P11SCOPE" inventory --help 2>&1 | grep -q -- --key-operations; then
+        KEY_FLAG=(--key-operations)
+    else
+        # Unlinked binary: the linked cells are nonqualifying, not
+        # failed. This needs only an executable P11SCOPE and OUTDIR,
+        # so it runs ahead of the live-run prerequisites below (gcc,
+        # softhsm, root); --help/--self-test/--check-run/--summarize
+        # already exit above, so live behavior is unchanged.
+        umask 022
+        mkdir -p "$OUTDIR" || exit 2
+        OUTDIR=$(realpath -e -- "$OUTDIR") || exit 2
+        : > "$OUTDIR/results.jsonl" || exit 2
+        for base in stall-short-stops wedge-no-abandon; do
+            printf '{"cell": "%s", "pass": false, "qualification": "nonqualifying", "detail": "binary predates --key-operations (KEY_OPS=1 on unlinked binary)"}\n' \
+                "$base$SUFFIX" >> "$OUTDIR/results.jsonl"
+        done
+        if [ "$LONG" = 1800 ]; then
+            printf '{"cell": "%s", "pass": false, "qualification": "nonqualifying", "detail": "binary predates --key-operations (KEY_OPS=1 on unlinked binary)"}\n' \
+                "stall-long-1800$SUFFIX" >> "$OUTDIR/results.jsonl"
+        fi
+        echo "joint-stall-live: binary predates --key-operations; linked cells are nonqualifying"
+        exit 0
+    fi
+fi
+
 command -v gcc >/dev/null || { echo "joint-stall-live: gcc required" >&2; exit 77; }
 command -v python3 >/dev/null || { echo "joint-stall-live: python3 required" >&2; exit 77; }
 command -v softhsm2-util >/dev/null || { echo "joint-stall-live: softhsm2-util required" >&2; exit 77; }
@@ -265,16 +485,6 @@ HAMMER_SRC=$REPO/scripts/fixtures/hammer.c
 [ -f "$CHURN_SRC" ] || die "driver source missing: $CHURN_SRC" 77
 [ -f "$HAMMER_SRC" ] || die "hammer source missing: $HAMMER_SRC" 77
 
-SUFFIX=""; KEY_FLAG=()
-if [ "$KEY_OPS" = 1 ]; then
-    SUFFIX="-linked"
-    if "$P11SCOPE" inventory --help 2>&1 | grep -q -- --key-operations; then
-        KEY_FLAG=(--key-operations)
-    else
-        KEY_MISSING=1
-    fi
-fi
-
 umask 022
 mkdir -p "$OUTDIR" || exit 2
 OUTDIR=$(realpath -e -- "$OUTDIR") || exit 2
@@ -283,25 +493,6 @@ RUNS_DIR=$OUTDIR/runs; mkdir -p "$RUNS_DIR" || exit 2
 : > "$OUTDIR/results.jsonl" || exit 2
 
 log() { echo "joint-stall-live: $*"; }
-emit_cell() {
-    python3 -I - "$1" "$2" "$3" "$4" >> "$OUTDIR/results.jsonl" <<'PY'
-import json, sys
-cell, passed, qualification, detail = sys.argv[1:5]
-print(json.dumps({"cell": cell, "pass": passed == "1",
-                  "qualification": qualification, "detail": detail}))
-PY
-}
-
-if [ "${KEY_MISSING:-0}" = 1 ]; then
-    log "binary predates --key-operations; linked cells are nonqualifying"
-    for base in stall-short-stops wedge-no-abandon; do
-        emit_cell "$base$SUFFIX" 0 nonqualifying "binary predates --key-operations (KEY_OPS=1 on unlinked binary)"
-    done
-    if [ "$LONG" = 1800 ]; then
-        emit_cell "stall-long-1800$SUFFIX" 0 nonqualifying "binary predates --key-operations (KEY_OPS=1 on unlinked binary)"
-    fi
-    exit 0
-fi
 
 log "building drivers"
 gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$BIN/refresh-churn" "$CHURN_SRC" -ldl \
@@ -562,62 +753,8 @@ campaign_wall=$(($(date +%s) - campaign_start))
 
 trap - EXIT INT TERM
 
-python3 -I - "$RUNS_DIR" "$OUTDIR/results.jsonl" "$SUFFIX" "$HOST" "$KERNEL" "$SEED" \
-    "$RUNS" "$LONG" "$KEY_OPS" "$campaign_wall" "$short_pass" "$short_fail" "$long_rc" <<'PY'
-import glob, json, sys
-runs_dir, results_path, suffix, host, kernel, seed = sys.argv[1:7]
-runs, long_d, key_ops, wall, passed, failed, long_rc = sys.argv[7:14]
-checks = []
-for path in sorted(glob.glob(runs_dir + "/run-[0-9]*.check.json")):
-    try:
-        checks.append((path, json.load(open(path))))
-    except (OSError, ValueError):
-        checks.append((path, {"stall_ok": False, "wedge_ok": False,
-                              "abandons": 0, "no_progress": True,
-                              "error": "check.json unreadable"}))
-abandons = sum(int(c.get("abandons") or 0) for _, c in checks)
-trips = sum(1 for _, c in checks if c.get("no_progress"))
-max_delay = None
-for _, c in checks:
-    try:
-        delay = int(c["wall"]) - int(c["duration"])
-        max_delay = delay if max_delay is None else max(max_delay, delay)
-    except (KeyError, TypeError, ValueError):
-        pass
-stall_pass = failed == "0" and len(checks) == int(runs)
-wedge_pass = all(c.get("wedge_ok") for _, c in checks) and len(checks) == int(runs)
-rows = [
-    ("stall-short-stops" + suffix, stall_pass, "qualified",
-     "host=%s kernel=%s seed=%s runs=%s passed=%s failed=%s abandons=%d no_progress_runs=%d max_delay=%ss wall=%ss"
-     % (host, kernel, seed, runs, passed, failed, abandons, trips,
-        max_delay, wall)),
-    ("wedge-no-abandon" + suffix, wedge_pass, "qualified",
-     "host=%s kernel=%s seed=%s runs=%s abandons=%d no_progress_runs=%d max_delay=%ss"
-     % (host, kernel, seed, runs, abandons, trips, max_delay)),
-]
-if long_d == "1800":
-    try:
-        long_check = json.load(open(runs_dir + "/run-long.check.json"))
-    except (OSError, ValueError):
-        long_check = {"stall_ok": False}
-    long_pass = bool(long_check.get("stall_ok")) and long_rc == "0"
-    try:
-        long_delay = int(long_check["wall"]) - int(long_check["duration"])
-    except (KeyError, TypeError, ValueError):
-        long_delay = None
-    rows.append(("stall-long-1800" + suffix, long_pass, "qualified",
-                 "host=%s kernel=%s seed=%s wall=%ss delay=%ss rc=%s no_progress=%s abandons=%s"
-                 % (host, kernel, seed, long_check.get("wall"),
-                    long_delay, long_check.get("exit"),
-                    long_check.get("no_progress"),
-                    long_check.get("abandons"))))
-with open(results_path, "w", encoding="utf-8") as f:
-    for cell, passed_cell, qualification, detail in rows:
-        f.write(json.dumps({"cell": cell, "pass": bool(passed_cell),
-                            "qualification": qualification,
-                            "detail": detail}) + "\n")
-sys.exit(0 if all(p for _, p, _, _ in rows) else 1)
-PY
+summarize "$RUNS_DIR" "$OUTDIR/results.jsonl" "$SUFFIX" "$HOST" "$KERNEL" "$SEED" \
+    "$RUNS" "$LONG" "$KEY_OPS" "$campaign_wall" "$short_pass" "$short_fail" "$long_rc"
 rc=$?
 if [ "$rc" -eq 0 ]; then log "campaign PASS"; else log "campaign FAIL"; fi
 exit "$rc"

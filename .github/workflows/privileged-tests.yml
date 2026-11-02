@@ -483,6 +483,7 @@ jobs:
             ${{ github.workspace }}/cli-out/cells/results.jsonl
             ${{ github.workspace }}/cli-out/cells/summary.txt
             ${{ github.workspace }}/cli-out/cells/*.stderr
+            ${{ github.workspace }}/cli-out/cells/*.json
             ${{ github.workspace }}/cli-out/qual.log
             ${{ github.workspace }}/cli-out/vng-console.log
             ${{ runner.temp }}/qual.log

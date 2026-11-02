@@ -1479,6 +1479,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed",
+      "reason": "privileged: healthy linked control routes normally without CoverageFailed",
+      "cell": "privileged"
+    },
+    {
       "file": "src/attach/async_value_flags_tests.rs",
       "path": "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
       "reason": "privileged: OK C_AsyncGetID with NULL output sets ASYNC_VALUE_UNREADABLE (LP64)",

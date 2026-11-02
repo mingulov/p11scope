@@ -337,8 +337,9 @@ inventory::privileged_tests::privileged_joint_absence_and_s1only_siblings_lp64
 inventory::privileged_tests::privileged_joint_promotion_a_to_b_lp64
 # Linked key-operations cells: the live linked lane pumps discovery, a
 # malformed discovery record faults the pump without latching while the
-# next audited batch carries the coverage failure, and the seal
-# generation publishes only with the journal pair. Each runs its own
+# next audited batch carries the coverage failure (its healthy linked
+# control routes normally without one), and the seal generation
+# publishes only with the journal pair. Each runs its own
 # System-scope capture (about half a minute); on builds that omit the
 # journal the linked cells assert the refusal instead. Print KEY_OPS
 # lines.
@@ -346,6 +347,7 @@ inventory::privileged_tests::privileged_key_operations_linked_lane_pumps_live_di
 inventory::privileged_tests::privileged_key_operations_live_discovery_fault_refuses_without_latching
 inventory::privileged_tests::privileged_key_operations_seal_generation_gated_by_flag
 inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching
+inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed
 # v0.5.0 headline end to end: inventory --system --manifest over a live
 # SoftHSM2 ledger workload (gates its dlopen on the observer's pass 0
 # publish, strictly post-attach) exits 0 with populated S1 edges

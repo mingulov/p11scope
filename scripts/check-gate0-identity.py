@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Section-level gate-0 identity check (ruling P2F-2).
+"""Section-level gate-0 identity check (ruling P2F-2, hardened by P2F-5 F3).
 
 Compares the seven default BPF objects between two build output directories
 (a base OUT_DIR and a candidate OUT_DIR). For each object the following must
@@ -11,10 +11,17 @@ be byte-identical:
 - .maps and maps (map definitions, C and Rust sides)
 - symbol table (llvm-nm output)
 - .BTF raw bytes (type/func records; line info lives in .BTF.ext, not .BTF)
+- every relocation section (.rel*) present in either object, except
+  relocations against debug metadata (see below); absent on both counts
+  as identical, as for .rodata. Both spellings (.rel.text and .reluprobe)
+  are covered, so a change that only re-targets references (e.g. map-index
+  churn with identical code bytes) fails.
 
 Debug metadata (.debug_*, .BTF.ext line info) may differ: clang -g embeds the
 source MD5, so any edit to a shared C file changes those bytes. They are
-reported as informational only and never fail the check.
+reported as informational only and never fail the check. Relocations against
+them (.rel.debug_*, .rel.BTF.ext) drift with the debug bytes themselves and
+are skipped for the same reason.
 
 Usage:
   python3 -I scripts/check-gate0-identity.py BASE_OUT CANDIDATE_OUT
@@ -27,6 +34,7 @@ section matches for all seven objects.
 """
 
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
@@ -87,6 +95,95 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def is_relocation_section(name: str) -> bool:
+    """True for ELF relocation section names (.rel*)."""
+    return name.startswith(".rel")
+
+
+def relocation_target(name: str) -> str:
+    """The section a relocation section applies to (.relS -> S)."""
+    if name.startswith(".rela"):
+        return name[len(".rela") :]
+    return name[len(".rel") :]
+
+
+def is_informational_relocation(name: str) -> bool:
+    """True when a relocation section targets debug metadata.
+
+    Relocations against .debug_* and .BTF.ext drift with the debug bytes
+    themselves, which ruling P2F-2 allows to differ (clang -g embeds the
+    source MD5); they are skipped, never compared. Relocations against
+    required sections (.rel.BTF included) are compared like code.
+    """
+    target = relocation_target(name)
+    return target == ".BTF.ext" or target.startswith(".debug")
+
+
+def readelf_section_names(path: Path) -> list[str]:
+    """All ELF section names via readelf -S -W (wide: never truncated)."""
+    readelf = shutil.which("readelf")
+    if readelf is None:
+        raise RuntimeError("readelf not on PATH")
+    result = subprocess.run(
+        [readelf, "-S", "-W", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"readelf failed on {path}: {result.stderr.strip()}")
+    names = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"\s*\[\s*\d+\]\s+(\S+)", line)
+        if match:
+            names.append(match.group(1))
+    return names
+
+
+def relocation_sections(path: Path) -> list[str]:
+    """Required relocation sections of one object, sorted.
+
+    Every .rel* section present, except relocations against informational
+    debug metadata (see is_informational_relocation).
+    """
+    return sorted(
+        name
+        for name in readelf_section_names(path)
+        if is_relocation_section(name) and not is_informational_relocation(name)
+    )
+
+
+def compare_object(base_obj: Path, cand_obj: Path) -> list[str]:
+    """Problems comparing one object pair; [] means identical.
+
+    Every required section plus every relocation section present in either
+    object must be byte-identical (absent on both counts as identical),
+    and the symbol listings must match. Raises RuntimeError when a
+    required tool is missing or fails.
+    """
+    problems: list[str] = []
+    relocs = sorted(
+        set(relocation_sections(base_obj)) | set(relocation_sections(cand_obj))
+    )
+    for section in list(REQUIRED_SECTIONS) + relocs:
+        base_bytes = section_bytes(base_obj, section)
+        cand_bytes = section_bytes(cand_obj, section)
+        if base_bytes is None and cand_bytes is None:
+            continue
+        if base_bytes is None or cand_bytes is None:
+            problems.append(f"{section} present on one side only")
+        elif digest(base_bytes) != digest(cand_bytes):
+            problems.append(
+                f"{section} differs "
+                f"({digest(base_bytes)[:12]} vs {digest(cand_bytes)[:12]})"
+            )
+    base_syms = symbol_text(base_obj)
+    cand_syms = symbol_text(cand_obj)
+    if base_syms != cand_syms:
+        problems.append("symbols (llvm-nm) differ")
+    return problems
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
         print(
@@ -119,34 +216,12 @@ def main(argv: list[str]) -> int:
             print(f"{short}: FAIL (missing in candidate: {cand_obj})")
             failed = True
             continue
-        problems: list[str] = []
-        for section in REQUIRED_SECTIONS:
-            try:
-                base_bytes = section_bytes(base_obj, section)
-                cand_bytes = section_bytes(cand_obj, section)
-            except RuntimeError as error:
-                print(f"{short}: FAIL ({error})")
-                failed = True
-                break
-            if base_bytes is None and cand_bytes is None:
-                continue
-            if base_bytes is None or cand_bytes is None:
-                problems.append(f"{section} present on one side only")
-            elif digest(base_bytes) != digest(cand_bytes):
-                problems.append(
-                    f"{section} differs "
-                    f"({digest(base_bytes)[:12]} vs {digest(cand_bytes)[:12]})"
-                )
-        else:
-            try:
-                base_syms = symbol_text(base_obj)
-                cand_syms = symbol_text(cand_obj)
-            except RuntimeError as error:
-                print(f"{short}: FAIL ({error})")
-                failed = True
-                continue
-            if base_syms != cand_syms:
-                problems.append("symbols (llvm-nm) differ")
+        try:
+            problems = compare_object(base_obj, cand_obj)
+        except RuntimeError as error:
+            print(f"{short}: FAIL ({error})")
+            failed = True
+            continue
         if problems:
             print(f"{short}: FAIL ({'; '.join(problems)})")
             failed = True

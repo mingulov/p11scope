@@ -1505,18 +1505,22 @@ pub(crate) fn scan_refusals_gap_reason(counts: &[u64; 12]) -> Option<String> {
 }
 
 /// One stderr stop line for the semantic lane: lifetime collected,
-/// joined, shed, bound and refused call counts. Counts only; no
-/// identities, paths or payloads.
+/// joined and shed call counts, lost EVENTS records, bound and
+/// refused call counts. Collected covers drained records only, so
+/// collected == joined + shed holds with any loss; kernel ring loss
+/// rides the separate `lost` term in records, never folded into
+/// shed. Counts only; no identities, paths or payloads.
 pub(crate) fn semantic_stop_line(
     collected: u64,
     joined: u64,
     shed: u64,
+    lost: u64,
     bindings: u64,
     refused: u64,
 ) -> String {
     format!(
         "p11scope: semantic calls: collected {collected}, joined {joined}, \
-         shed {shed}, bindings {bindings}, refused {refused}"
+         shed {shed}, lost {lost}, bindings {bindings}, refused {refused}"
     )
 }
 
@@ -2047,6 +2051,12 @@ impl AttestedSemanticLane {
     #[cfg(test)]
     pub(crate) fn shed_calls_disclosed(&self) -> u64 {
         self.disclosed_calls_shed
+    }
+
+    /// Cumulative disclosed EVENTS ring loss in records: the stop
+    /// line's `lost` term and the report's event-loss account.
+    pub(crate) fn events_ring_loss_disclosed(&self) -> u64 {
+        self.events_ring_loss
     }
 
     /// Lifetime (collected, joined, shed, refused) call counters for

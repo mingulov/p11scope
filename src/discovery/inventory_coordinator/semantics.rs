@@ -2609,15 +2609,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Disclose an EVENTS ring-loss rise: exact counts on the stop
-    /// line and the report's event-loss account, plus one named gap.
-    /// The reason stays stable so repeat rises coalesce onto one gap
-    /// row; the exact cumulative count lives in unrouted_returns.
+    /// line's `lost` term and the report's event-loss account, plus
+    /// one named gap. Ring loss is never folded into shed, so the
+    /// stop line keeps collected == joined + shed. The reason stays
+    /// stable so repeat rises coalesce onto one gap row; the exact
+    /// cumulative count lives in unrouted_returns.
     pub(crate) fn disclose_events_ring_loss(
         &mut self,
         lane: &mut crate::inventory_semantics::AttestedSemanticLane,
         delta: u64,
     ) {
-        lane.note_shed_calls(delta);
         lane.note_events_ring_loss(delta);
         self.registry.record_gap(RegistryGap {
             caller: None,

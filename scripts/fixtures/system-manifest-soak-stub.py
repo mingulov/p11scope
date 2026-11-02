@@ -133,7 +133,8 @@ def main(argv):
     Path(args.output).write_text(json.dumps(report), encoding="utf-8")
     joined = sum(totals.values())
     print(f"p11scope: semantic calls: collected {joined}, joined {joined}, "
-          f"shed 0, bindings {len(totals)}, refused 0", file=sys.stderr, flush=True)
+          f"shed 0, lost 0, bindings {len(totals)}, refused 0",
+          file=sys.stderr, flush=True)
     return 0
 
 

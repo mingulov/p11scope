@@ -17,7 +17,8 @@ Six fail-closed gates:
   edge entries on the owned provider copy exactly, with counted
   non-lossy coverage and no foreign caller on that copy.
 - loss_accounting: no silent loss. The semantic stop line conserves
-  (collected == joined + shed); every nonzero shed/refused/unrouted
+  (collected == joined + shed) with its separate lost term for
+  kernel EVENTS ring loss; every nonzero shed/refused/unrouted/lost
   count and every budget refusal has a named gap; every gap carries a
   subject and a reason; gaps_suppressed == 0.
 - resource_accounting: the trace spans the window without stalls, RSS
@@ -49,7 +50,7 @@ RSS_GROWTH_MARGIN_KB = 32 * 1024
 FD_GROWTH_MARGIN = 64
 STOP_LINE_RE = re.compile(
     r"p11scope: semantic calls: collected (\d+), joined (\d+), "
-    r"shed (\d+), bindings (\d+), refused (\d+)")
+    r"shed (\d+), lost (\d+), bindings (\d+), refused (\d+)")
 
 
 class OracleError(ValueError):
@@ -295,7 +296,8 @@ def gate_loss_accounting(evidence):
     matches = STOP_LINE_RE.findall(stderr)
     if not matches:
         return False, "observer stderr has no semantic stop line"
-    collected, joined, shed, bindings, refused = (int(group) for group in matches[-1])
+    collected, joined, shed, lost, bindings, refused = (
+        int(group) for group in matches[-1])
     if collected != joined + shed:
         return False, (f"semantic counts do not conserve: collected={collected} "
                        f"joined={joined} shed={shed}")
@@ -311,14 +313,16 @@ def gate_loss_accounting(evidence):
     for missing in (
             needs(shed, ("semantic", "shed"), "shed"),
             needs(refused, ("admission", "refus"), "refused"),
-            needs(unrouted, ("unrout",), "unrouted_returns"),
+            needs(unrouted, ("unrout", "events lost"), "unrouted_returns"),
+            needs(lost, ("events lost",), "events_lost"),
             needs(refused_total + refused_endpoints,
                   ("admission", "refus", "budget", "exhaust"),
                   "budget_refused")):
         if missing:
             return False, missing
     detail = (f"conserved collected={collected} joined={joined} shed={shed} "
-              f"bindings={bindings} refused={refused}; unrouted={unrouted} "
+              f"lost={lost} bindings={bindings} refused={refused}; "
+              f"unrouted={unrouted} "
               f"cuts={cuts} saturated_edges={saturated_edges} "
               f"observed_edges={observed_edges} budget_refused={refused_total}; "
               f"{len(subjects)} named gaps"

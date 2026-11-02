@@ -2708,6 +2708,7 @@ struct SemanticStopCounts {
     collected: u64,
     joined: u64,
     shed: u64,
+    lost: u64,
     bindings: u64,
     refused: u64,
 }
@@ -2719,12 +2720,14 @@ impl SemanticStopCounts {
     ) -> Self {
         let refusals = lane.scan_refusal_counts();
         let (collected, joined, shed, refused) = lane.semantic_stop_call_counts();
+        let lost = lane.events_ring_loss_disclosed();
         let bindings = coordinator.semantic_bindings_mut().len() as u64;
         Self {
             refusals,
             collected,
             joined,
             shed,
+            lost,
             bindings,
             refused,
         }
@@ -2746,6 +2749,7 @@ fn disclose_semantic_stop(
         counts.collected,
         counts.joined,
         counts.shed,
+        counts.lost,
         counts.bindings,
         counts.refused,
     ));
@@ -12217,6 +12221,7 @@ mod tests {
                 let lane = driver.semantic.as_ref().unwrap();
                 (
                     lane.shed_calls_disclosed(),
+                    lane.events_ring_loss_disclosed(),
                     lane.semantic_summary().unrouted_returns,
                 )
             };
@@ -12224,14 +12229,14 @@ mod tests {
             driver.on_tick();
             assert!(driver.semantic_staged, "the first tick stages");
             assert!(ring_gaps(&driver).is_empty());
-            assert_eq!(lane_counts(&driver), (0, 0));
+            assert_eq!(lane_counts(&driver), (0, 0, 0));
             // First commit reads a zero counter: still quiet.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
             );
             driver.on_tick();
             assert!(ring_gaps(&driver).is_empty());
-            assert_eq!(lane_counts(&driver), (0, 0));
+            assert_eq!(lane_counts(&driver), (0, 0, 0));
             // The counter rises to 7: one named gap plus exact counts.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
@@ -12247,7 +12252,7 @@ mod tests {
                 )],
                 "a rise discloses one named gap"
             );
-            assert_eq!(lane_counts(&driver), (7, 7));
+            assert_eq!(lane_counts(&driver), (0, 7, 7));
             // A flat read discloses nothing new.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
@@ -12255,7 +12260,7 @@ mod tests {
             driver.on_tick();
             assert_eq!(ring_gaps(&driver).len(), 1);
             assert_eq!(ring_gaps(&driver)[0].1, 1);
-            assert_eq!(lane_counts(&driver), (7, 7));
+            assert_eq!(lane_counts(&driver), (0, 7, 7));
             // The next rise accumulates onto the same gap row and counts.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
@@ -12267,7 +12272,7 @@ mod tests {
                 2,
                 "rises coalesce onto one gap row"
             );
-            assert_eq!(lane_counts(&driver), (12, 12));
+            assert_eq!(lane_counts(&driver), (0, 12, 12));
         }
 
         #[test]
@@ -12385,9 +12390,10 @@ mod tests {
             assert_eq!(
                 (
                     lane.shed_calls_disclosed(),
+                    lane.events_ring_loss_disclosed(),
                     lane.semantic_summary().unrouted_returns
                 ),
-                (5, 5)
+                (0, 5, 5)
             );
         }
 
@@ -19822,7 +19828,7 @@ mod promotion_driver_tests {
     /// collected/joined/refused, real shed, no bound callers in the
     /// scene.
     fn expected_stop_line() -> String {
-        crate::inventory_semantics::semantic_stop_line(68, 5, 7, 0, 12)
+        crate::inventory_semantics::semantic_stop_line(68, 5, 7, 0, 0, 12)
     }
 
     #[test]
@@ -20271,7 +20277,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0
             )],
             "the line still prints with zero counts"
         );
@@ -20301,7 +20307,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0
             )],
             "the line still prints with zero counts"
         );
@@ -20431,7 +20437,7 @@ mod promotion_driver_tests {
     /// The stop line the final-lane twin expects: its own scripted
     /// collected/joined/refused, its own real shed, no bound callers.
     fn expected_final_stop_line() -> String {
-        crate::inventory_semantics::semantic_stop_line(11, 3, 4, 0, 5)
+        crate::inventory_semantics::semantic_stop_line(11, 3, 4, 0, 0, 5)
     }
 
     #[test]
@@ -21273,7 +21279,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0
             )],
             "the wind-down discloses the legacy lane once"
         );

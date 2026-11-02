@@ -2701,4 +2701,74 @@ mod gap_tests {
         book.begin_gap(&BTreeSet::from([0]), None, &retained);
         assert!(book.gap_summary().unknown);
     }
+
+    #[test]
+    fn clock_origins_incomparable_reason_names_each_cause() {
+        use std::path::PathBuf;
+
+        // Each incomparable shape names its cause, and the reason
+        // agrees with the comparability verdict on every input, so
+        // the two cannot drift apart.
+        let same = PathBuf::from("time:[42]");
+        let other = PathBuf::from("time:[43]");
+        for (label, active, children, offsets, reason) in [
+            (
+                "comparable",
+                Some(&same),
+                Some(&same),
+                Some("boottime 5 0\nmonotonic 0 0\n"),
+                None,
+            ),
+            (
+                "missing files",
+                None,
+                Some(&same),
+                Some("monotonic 0 0\n"),
+                Some("this kernel does not expose time-namespace files"),
+            ),
+            (
+                "namespaces differ",
+                Some(&same),
+                Some(&other),
+                Some("monotonic 0 0\n"),
+                Some("the process time namespace differs from its children's"),
+            ),
+            (
+                "monotonic offset",
+                Some(&same),
+                Some(&same),
+                Some("monotonic 0 1\n"),
+                Some("the monotonic clock carries a time-namespace offset"),
+            ),
+            (
+                "unreadable offset",
+                Some(&same),
+                Some(&same),
+                Some("monotonic 0\n"),
+                Some("the monotonic timens offset is unreadable"),
+            ),
+            (
+                "missing monotonic line",
+                Some(&same),
+                Some(&same),
+                Some("boottime 0 0\n"),
+                Some("the monotonic timens offset is unreadable"),
+            ),
+            (
+                "duplicated monotonic line",
+                Some(&same),
+                Some(&same),
+                Some("monotonic 0 0\nmonotonic 0 0\n"),
+                Some("the monotonic timens offset is unreadable"),
+            ),
+        ] {
+            let cause = super::clock_origins_incomparable_reason_with(active, children, offsets);
+            assert_eq!(cause, reason, "{label} names its cause");
+            assert_eq!(
+                super::clock_origins_comparable_with(active, children, offsets),
+                cause.is_none(),
+                "{label}: the reason agrees with the verdict"
+            );
+        }
+    }
 }

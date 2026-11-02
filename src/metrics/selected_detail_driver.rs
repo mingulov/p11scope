@@ -6936,4 +6936,48 @@ mod tests {
             "--pid opens with comparable clocks"
         );
     }
+
+    /// The production body of `open_k0_production`, for the call-site
+    /// pins below.
+    fn open_k0_production_body() -> &'static str {
+        let source = include_str!("selected_detail_driver.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let open = production
+            .find("pub(crate) fn open_k0_production(")
+            .expect("K0 open");
+        let body = &production[open..];
+        let end = body.find("\n}\n").expect("K0 open end");
+        &body[..end]
+    }
+
+    #[test]
+    fn open_k0_production_consults_the_owned_clock_refusal() {
+        // Only the pure helper is unit-tested, so deleting the call
+        // inside `open_k0_production` would stay green. Pin the call
+        // and its order: the refusal precedes the window open.
+        let body = open_k0_production_body();
+        let refusal = body
+            .find("k0_owned_clock_refusal(owned, comparable)")
+            .expect("the open consults the owned-clock refusal");
+        let open = body
+            .find("open_k0_window_with_losses(")
+            .expect("the open opens the window");
+        assert!(refusal < open, "the refusal precedes the window open");
+    }
+
+    #[test]
+    fn open_k0_production_names_the_clock_cause_on_refusal() {
+        // The owned-run clock refusal names its clock cause on
+        // stderr, so an operator seeing
+        // `promotion_scope_unsupported` learns why.
+        let body = open_k0_production_body();
+        assert!(
+            body.contains("try_stderr_line"),
+            "the owned-clock refusal names its cause on stderr"
+        );
+        assert!(
+            body.contains("clock_origins_incomparable_reason"),
+            "the cause comes from the clock reason"
+        );
+    }
 }

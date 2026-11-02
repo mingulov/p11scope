@@ -41,7 +41,8 @@ def _restore_int_quit():
 FAKE_OBSERVER = """#!/usr/bin/env python3
 # Fake observer: seal line on stderr, canned doc on -o, SIGINT-stop.
 # KEYOPS_SELFTEST_SCENARIO: populated | unavailable | unavailable-empty |
-# unavailable-bootstrap | garbage-doc | accept-with-token |
+# unavailable-bootstrap | unavailable-bootstrap-gaps | diag-gaps-16 |
+# garbage-doc | accept-with-token |
 # refuse-CODE:MESSAGE | die-at-3 | exit-0-silent
 # Python (not shell): an async-launched bourne shell cannot trap SIGINT
 # back from the inherited ignore, while sigaction always can.
@@ -74,8 +75,20 @@ sys.stderr.write("p11scope: semantic lane ready; mechanisms and API results are 
 sys.stderr.flush()
 DOCS = {"populated": ("populated", "rev 1"),
         "unavailable-empty": ("unavailable", ""),
-        "unavailable-bootstrap": ("unavailable", "bootstrap_unavailable")}
+        "unavailable-bootstrap": ("unavailable", "bootstrap_unavailable"),
+        "unavailable-bootstrap-gaps": ("unavailable", "bootstrap_unavailable"),
+        "diag-gaps-16": ("unavailable", "journal_unavailable")}
 status, reason = DOCS.get(scenario, ("unavailable", "journal_unavailable"))
+
+
+def gaps_json():
+    if scenario == "unavailable-bootstrap-gaps":
+        return ('[{"subject": "Joint birth unavailable; retained S1", '
+                '"reason": "joint_birth_claim_ImageTainted", "repeats": 2}]')
+    if scenario == "diag-gaps-16":
+        return ('[{"subject": "semantic admission refused", '
+                '"reason": "semantic_unavailable:no_receipt", "repeats": 16}]')
+    return '[]'
 
 
 def write_doc():
@@ -84,8 +97,8 @@ def write_doc():
             handle.write("NOT JSON{{{\\n")
             return
         handle.write('{"object_observations": {"status": "%s", "reason": "%s"},\\n'
-                     ' "observation": {"lifecycle": {"ring_loss": 0}}, "gaps": []}\\n'
-                     % (status, reason))
+                     ' "observation": {"lifecycle": {"ring_loss": 0}}, "gaps": %s}\\n'
+                     % (status, reason, gaps_json()))
 
 
 exit_code = int(os.environ.get("FAKE_OBS_EXIT", "0"))
@@ -189,6 +202,8 @@ class LinkedControlTests(unittest.TestCase):
                 scenarios.get("linked-pid", "unavailable"),
             "KEYOPS_SELFTEST_SCENARIO_FLAG_OFF_S1":
                 scenarios.get("flag-off-s1", "unavailable"),
+            "KEYOPS_SELFTEST_SCENARIO_FLAG_OFF_S1_SETTLE10":
+                scenarios.get("flag-off-s1-settle10", "unavailable"),
             "KEYOPS_SELFTEST_SCENARIO_NO_MANIFEST":
                 scenarios.get("flag-without-manifest", "unavailable"),
             "KEYOPS_SELFTEST_SCENARIO_OFF_BUILD":
@@ -221,7 +236,8 @@ class LinkedControlTests(unittest.TestCase):
             {"linked-system": "populated", "linked-pid": "populated"})
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         self.assertEqual(set(rows), {"linked-system", "linked-pid",
-                                    "flag-off-s1", "flag-without-manifest",
+                                    "flag-off-s1", "flag-off-s1-settle10",
+                                    "flag-without-manifest",
                                     "off-build-refusal"})
         self.assertEqual(
             (rows["linked-system"]["pass"], rows["linked-system"]["qualification"]),
@@ -232,49 +248,50 @@ class LinkedControlTests(unittest.TestCase):
         self.assertEqual(
             (rows["flag-off-s1"]["pass"], rows["flag-off-s1"]["qualification"]),
             (True, "qualified"))
+        self.assertIn("settle 0", rows["flag-off-s1"]["detail"])
+        diag = rows["flag-off-s1-settle10"]
+        self.assertEqual((diag["pass"], diag["qualification"]),
+                         (True, "qualified"))
+        self.assertIn("0 no_receipt", diag["detail"])
+        self.assertIn("known issue", diag["detail"])
         self.assertIn("accepted", rows["flag-without-manifest"]["detail"])
         self.assertEqual(rows["flag-without-manifest"]["qualification"], "qualified")
         self.assertIn("R-58", rows["off-build-refusal"]["detail"])
         for row in rows.values():
             self.assertEqual(set(row), {"cell", "pass", "qualification", "detail"})
 
-    def test_open6_expected_failure_keeps_sample(self):
+    def test_populated_oracle_refusal_is_failed_row(self):
         proc, outdir, rows = self.run_script(
-            {"linked-system": "populated"},
+            {"linked-system": "populated", "linked-pid": "populated"},
             extra_env={"FAKE_EXIT": "1",
-                       "FAKE_TEXT": "refused: simulated OPEN-6 shape text"})
-        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+                       "FAKE_TEXT": "refused: simulated shape text"})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
         row = rows["linked-system"]
         self.assertEqual((row["pass"], row["qualification"]),
-                         (True, "expected-failure"))
-        self.assertIn("OPEN-6", row["detail"])
-        self.assertIn("simulated OPEN-6 shape text", row["detail"])
+                         (False, "failed"))
+        self.assertIn("oracle refused the populated linked shape", row["detail"])
+        self.assertIn("simulated shape text", row["detail"])
         sample = outdir / "linked-sample.json"
         self.assertTrue(sample.exists())
         self.assertEqual(json.loads(sample.read_text())["object_observations"]["status"],
                          "populated")
 
-    def test_unavailable_is_product_reason_pid_nonqualifying(self):
+    def test_journal_unavailable_is_stale_pin_failed(self):
         proc, outdir, rows = self.run_script(
-            {},
+            {"linked-system": "unavailable", "linked-pid": "populated"},
             extra_env={"FAKE_EXIT": "1",
                        "FAKE_TEXT": "observer status unavailable with reason journal_unavailable"})
-        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
         row = rows["linked-system"]
         self.assertEqual((row["pass"], row["qualification"]),
-                         (True, "expected-failure"))
-        self.assertIn("product: object_observations unavailable (journal_unavailable)",
-                      row["detail"])
+                         (False, "failed"))
+        self.assertIn("stale pin", row["detail"])
         self.assertIn("journal_unavailable", row["detail"])
         self.assertTrue((outdir / "linked-sample.json").exists())
-        pid_row = rows["linked-pid"]
-        self.assertEqual((pid_row["pass"], pid_row["qualification"]),
-                         (False, "nonqualifying"))
-        self.assertIn("before the seal", pid_row["detail"])
 
     def test_corrupt_observer_doc_is_failed_row(self):
         proc, outdir, rows = self.run_script(
-            {"linked-system": "garbage-doc"})
+            {"linked-system": "garbage-doc", "linked-pid": "populated"})
         self.assertEqual(proc.returncode, 1)
         row = rows["linked-system"]
         self.assertEqual((row["pass"], row["qualification"]),
@@ -282,26 +299,64 @@ class LinkedControlTests(unittest.TestCase):
         self.assertIn("missing or unparsable", row["detail"])
         # The harness records the row and continues: later cells run.
         self.assertEqual(set(rows), {"linked-system", "linked-pid",
-                                    "flag-off-s1", "flag-without-manifest",
+                                    "flag-off-s1", "flag-off-s1-settle10",
+                                    "flag-without-manifest",
                                     "off-build-refusal"})
 
-    def test_bootstrap_reason_is_not_the_pinned_signature(self):
+    def test_bootstrap_without_gaps_is_failed_row(self):
         proc, outdir, rows = self.run_script(
-            {"linked-system": "unavailable-bootstrap"})
+            {"linked-system": "unavailable-bootstrap",
+             "linked-pid": "populated"})
         self.assertEqual(proc.returncode, 1)
         row = rows["linked-system"]
         self.assertEqual((row["pass"], row["qualification"]),
                          (False, "failed"))
-        self.assertIn("not the pinned signature", row["detail"])
         self.assertIn("bootstrap_unavailable", row["detail"])
+        self.assertIn("no gaps", row["detail"])
+        self.assertTrue((outdir / "linked-sample.json").exists())
+
+    def test_bootstrap_with_gaps_records_gap_text(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "unavailable-bootstrap-gaps",
+             "linked-pid": "populated"})
+        self.assertEqual(proc.returncode, 1)
+        row = rows["linked-system"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("bootstrap_unavailable", row["detail"])
+        self.assertIn("Joint birth unavailable; retained S1", row["detail"])
+        self.assertIn("joint_birth_claim_ImageTainted", row["detail"])
+        self.assertTrue((outdir / "linked-sample.json").exists())
+
+    def test_pid_journal_is_stale_pin_failed(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "populated", "linked-pid": "unavailable"})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
+        pid_row = rows["linked-pid"]
+        self.assertEqual((pid_row["pass"], pid_row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("stale pin", pid_row["detail"])
+        self.assertIn("journal_unavailable", pid_row["detail"])
+
+    def test_pid_bootstrap_is_nonqualifying(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "populated",
+             "linked-pid": "unavailable-bootstrap"})
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        pid_row = rows["linked-pid"]
+        self.assertEqual((pid_row["pass"], pid_row["qualification"]),
+                         (False, "nonqualifying"))
+        self.assertIn("before the seal", pid_row["detail"])
+        self.assertIn("bootstrap_unavailable", pid_row["detail"])
+        self.assertIn("while no Joint feed exists", pid_row["detail"])
 
     def test_nonzero_exit_is_not_the_pinned_signature(self):
         proc, outdir, rows = self.run_script(
-            {"linked-system": "unavailable"},
+            {"linked-system": "unavailable", "linked-pid": "populated"},
             extra_env={"FAKE_OBS_EXIT": "1",
                        "FAKE_S1_EXIT": "1",
                        "FAKE_S1_TEXT": ("S1 child API returns are not exactly"
-                                        " 65 current observations")})
+                                        " 66 current observations")})
         self.assertEqual(proc.returncode, 1)
         row = rows["linked-system"]
         self.assertEqual((row["pass"], row["qualification"]),
@@ -310,11 +365,11 @@ class LinkedControlTests(unittest.TestCase):
         s1_row = rows["flag-off-s1"]
         self.assertEqual((s1_row["pass"], s1_row["qualification"]),
                          (False, "failed"))
-        self.assertIn("not the pinned signature", s1_row["detail"])
+        self.assertIn("settle 0", s1_row["detail"])
 
     def test_oracle_pass_on_unavailable_is_stale(self):
         proc, outdir, rows = self.run_script(
-            {"linked-system": "unavailable"})
+            {"linked-system": "unavailable", "linked-pid": "populated"})
         self.assertEqual(proc.returncode, 1)
         row = rows["linked-system"]
         self.assertEqual((row["pass"], row["qualification"]),
@@ -324,7 +379,8 @@ class LinkedControlTests(unittest.TestCase):
     def test_refused_start_with_exit_zero_fails(self):
         proc, outdir, rows = self.run_script(
             {"linked-system": ("refuse-0:p11scope: "
-                              "journal-pair-unavailable-in-build: off")})
+                              "journal-pair-unavailable-in-build: off"),
+             "linked-pid": "populated"})
         self.assertEqual(proc.returncode, 1)
         row = rows["linked-system"]
         self.assertEqual((row["pass"], row["qualification"]),
@@ -335,37 +391,86 @@ class LinkedControlTests(unittest.TestCase):
         text = SCRIPT.read_text()
         self.assertIn('SUDO="sudo -n --preserve-env=SOFTHSM2_CONF"', text)
 
+    def test_old_oracle_text_is_not_expected_failure(self):
+        text = SCRIPT.read_text()
+        self.assertNotIn("not exactly 65 current observations", text)
+
     def test_s1_failure_fails(self):
         proc, outdir, rows = self.run_script(
-            {}, extra_env={"FAKE_S1_EXIT": "1",
-                           "FAKE_S1_TEXT": "s1 topology mismatch"})
+            {"linked-system": "populated", "linked-pid": "populated"},
+            extra_env={"FAKE_S1_EXIT": "1",
+                       "FAKE_S1_TEXT": "s1 topology mismatch"})
         self.assertEqual(proc.returncode, 1)
         row = rows["flag-off-s1"]
         self.assertEqual((row["pass"], row["qualification"]), (False, "failed"))
         self.assertIn("s1 topology mismatch", row["detail"])
+        self.assertIn("settle 0", row["detail"])
 
-    def test_s1_count_drift_is_expected_failure(self):
+    def test_s1_65_text_is_failed_row(self):
         proc, outdir, rows = self.run_script(
-            {}, extra_env={"FAKE_S1_EXIT": "1",
-                           "FAKE_S1_TEXT": ("S1 child API returns are not exactly"
-                                            " 65 current observations"),
-                           "FAKE_EXIT": "1",
-                           "FAKE_TEXT": ("observer status unavailable with "
-                                         "reason journal_unavailable")})
-        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+            {"linked-system": "populated", "linked-pid": "populated"},
+            extra_env={"FAKE_S1_EXIT": "1",
+                       "FAKE_S1_TEXT": ("S1 child API returns are not exactly"
+                                        " 65 current observations")})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
         row = rows["flag-off-s1"]
         self.assertEqual((row["pass"], row["qualification"]),
-                         (True, "expected-failure"))
-        self.assertIn("S1 shape drift", row["detail"])
-        self.assertIn("api_returns=?", row["detail"])
+                         (False, "failed"))
+        self.assertIn("65 current observations", row["detail"])
+
+    def test_s1_66_text_is_failed_row(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "populated", "linked-pid": "populated"},
+            extra_env={"FAKE_S1_EXIT": "1",
+                       "FAKE_S1_TEXT": ("S1 child API returns are not exactly"
+                                        " 66 current observations")})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
+        row = rows["flag-off-s1"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("66 current observations", row["detail"])
+
+    def test_settle10_diagnostic_reports_gaps_as_known_issue(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "populated", "linked-pid": "populated",
+             "flag-off-s1-settle10": "diag-gaps-16"},
+            extra_env={"FAKE_S1_EXIT": "1",
+                       "FAKE_S1_TEXT": "S1 terminal semantic drain or continuity is unproven"})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
+        diag = rows["flag-off-s1-settle10"]
+        self.assertEqual((diag["pass"], diag["qualification"]),
+                         (True, "qualified"))
+        self.assertIn("16 no_receipt", diag["detail"])
+        self.assertIn("known issue", diag["detail"])
+        s1_row = rows["flag-off-s1"]
+        self.assertEqual((s1_row["pass"], s1_row["qualification"]),
+                         (False, "failed"))
+
+    def test_settle10_diagnostic_zero_gaps_is_qualified(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "populated", "linked-pid": "populated",
+             "flag-off-s1-settle10": "unavailable"})
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        diag = rows["flag-off-s1-settle10"]
+        self.assertEqual((diag["pass"], diag["qualification"]),
+                         (True, "qualified"))
+        self.assertIn("0 no_receipt", diag["detail"])
+
+    def test_settle10_diagnostic_flow_failure_is_failed(self):
+        proc, outdir, rows = self.run_script(
+            {"linked-system": "populated", "linked-pid": "populated",
+             "flag-off-s1-settle10": "refuse-9:boom"})
+        self.assertEqual(proc.returncode, 1)
+        diag = rows["flag-off-s1-settle10"]
+        self.assertEqual((diag["pass"], diag["qualification"]),
+                         (False, "failed"))
+        self.assertIn("flow failed", diag["detail"])
 
     def test_no_manifest_refusal_and_off_nonqualifying(self):
         proc, outdir, rows = self.run_script(
-            {"flag-without-manifest": "refuse-2:p11scope: need a manifest"},
-            with_off=False,
-            extra_env={"FAKE_EXIT": "1",
-                       "FAKE_TEXT": ("observer status unavailable with "
-                                     "reason journal_unavailable")})
+            {"linked-system": "populated", "linked-pid": "populated",
+             "flag-without-manifest": "refuse-2:p11scope: need a manifest"},
+            with_off=False)
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         row = rows["flag-without-manifest"]
         self.assertEqual((row["pass"], row["qualification"]), (True, "qualified"))
@@ -377,10 +482,8 @@ class LinkedControlTests(unittest.TestCase):
 
     def test_off_build_accepted_s1(self):
         proc, outdir, rows = self.run_script(
-            {"off-build-refusal": "accept-with-token"},
-            extra_env={"FAKE_EXIT": "1",
-                       "FAKE_TEXT": ("observer status unavailable with "
-                                     "reason journal_unavailable")})
+            {"linked-system": "populated", "linked-pid": "populated",
+             "off-build-refusal": "accept-with-token"})
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         row = rows["off-build-refusal"]
         self.assertEqual((row["pass"], row["qualification"]), (True, "qualified"))

@@ -22,8 +22,9 @@
 # op (a zero delta would certify unattached hooks); absence is recorded
 # per arm and reported, never silently treated as zero cost.
 #
-# Arms rotate across rounds (round r starts at arm (r-1) mod 4), so linear
-# host drift cannot masquerade as an arm difference. Per-sample gates (any
+# Arms run ABBA across rounds (odd rounds forward, even rounds
+# reversed), so linear host drift cannot masquerade as an arm
+# difference. Per-sample gates (any
 # failure fails the campaign immediately): quiet-host load gate (load1 <=
 # MAX_LOAD1, default 4, no cargo/rustc; bounded COOLDOWN, default 300 s,
 # else the campaign is refused), seed READY, observer attach (profile arms:
@@ -56,6 +57,9 @@
 # LOCK, TMPDIR (disk filesystem; the campaign keeps per-sample evidence
 # under a private work dir and copies the log, manifest and cost table
 # to OUTDIR at the end).
+#
+# Apt prerequisites on an ubuntu-26.04 runner: gcc, softhsm2, python3,
+# sudo, flock (util-linux), bpftool.
 set -eu
 cd "$(dirname "$0")/.."
 . scripts/lib.sh
@@ -123,19 +127,23 @@ for cell in os.environ["CELLS"].split():
         raise SystemExit(f"unknown cell {cell}")
 print(json.dumps({"cells": cells,
                   "arms": os.environ["ARMS"].split(),
-                  "rotation": "round r starts at arm (r-1) mod 4",
+                  "rotation": "ABBA: odd rounds forward, even rounds reversed",
                   "completion": {"marker": "DONE"}}))
 EOF
 }
 
-# plan_order CELL: the arm order per round (rotation). Prints one line
-# per round: "round N: arm arm arm arm".
+# plan_order: the arm order per round (ABBA). Prints one line per
+# round: "round N: arm arm arm arm". Odd rounds run the base order,
+# even rounds run it reversed, so every arm shares the same mean
+# temporal position across a round pair.
 plan_order() {
     python3 -I - "$ARMS" "$ROUNDS" <<'EOF'
 import sys
 arms = sys.argv[1].split()
 for r in range(1, int(sys.argv[2]) + 1):
-    order = [arms[(r - 1 + k) % len(arms)] for k in range(len(arms))]
+    order = list(arms)
+    if r % 2 == 0:
+        order.reverse()
     print(f"round {r}: {' '.join(order)}")
 EOF
 }

@@ -9,7 +9,8 @@ spread, and the on-versus-off deltas for the disarmed arm (on-profile
 minus off-profile) and the armed arm (on-armed minus on-profile), each
 beside the 2% owner figure (CP-5) as data. The result is recorded, not
 gated: this program exits nonzero only on a malformed campaign, never
-on a large delta.
+on a large delta. A campaign whose call-rate workload never succeeded
+is malformed: its latency medians would be error-path timings.
 
 Usage: bench-marker-cost-analyze.py LOG --manifest MANIFEST [--out PATH]
        bench-marker-cost-analyze.py --self-test
@@ -77,10 +78,11 @@ def parse_sample(line):
 
 
 def expected_order(arms, rounds):
-    """Arm order per round: round r starts at arm (r-1) mod len(arms)."""
+    """Arm order per round (ABBA): odd rounds forward, even reversed."""
     order = {}
     for rnd in range(1, rounds + 1):
-        order[rnd] = [arms[(rnd - 1 + k) % len(arms)] for k in range(len(arms))]
+        forward = list(arms)
+        order[rnd] = forward if rnd % 2 == 1 else forward[::-1]
     return order
 
 
@@ -106,6 +108,16 @@ def verify(log_path, manifest_path):
     done = [line for line in lines if line.startswith("DONE ")]
     if len(done) != 1:
         raise CampaignError(f"want exactly one DONE line, saw {len(done)}")
+    claimed = None
+    for token in done[0].split()[1:]:
+        if token.startswith("samples="):
+            try:
+                claimed = int(token.split("=", 1)[1])
+            except ValueError:
+                claimed = None
+    if claimed != len(samples):
+        raise CampaignError(
+            f"DONE claims {claimed} samples, log holds {len(samples)}")
     # Per-cell per-round arm order must follow the rotation exactly.
     by_cell_round = {}
     for sample in samples:
@@ -130,6 +142,11 @@ def verify(log_path, manifest_path):
                 raise CampaignError(f"unknown bpf_prog {sample['bpf_prog']}")
     if {s["cell"] for s in samples} != set(cells):
         raise CampaignError("sample cells do not match the manifest")
+    rated = [s for s in samples if s["cell"] == "call-rate"]
+    if rated and all(s["unhealthy"] >= s["ops"] for s in rated):
+        raise CampaignError(
+            "no call-rate sample has a healthy call; the latency "
+            "medians would be error-path timings")
     return manifest, samples
 
 
@@ -169,13 +186,22 @@ def render(manifest, samples):
             else:
                 rates = [s["rate_per_s"] for s in group]
                 lats = [s["lat_med_ns"] for s in group]
+                p90s = [s["lat_p90_ns"] for s in group]
+                sick = [s["unhealthy"] for s in group]
                 r_med, r_lo, r_hi, n = summarize(rates)
                 l_med, l_lo, l_hi, _ = summarize(lats)
+                p_med, p_lo, p_hi, _ = summarize(p90s)
+                u_med, u_lo, u_hi, _ = summarize(sick)
                 medians[arm] = l_med
                 lines.append(f"  {arm:11s} rate/s median={fmt(r_med)} "
                              f"spread=[{fmt(r_lo)},{fmt(r_hi)}] n={n}")
                 lines.append(f"  {arm:11s} lat_ns median={fmt(l_med)} "
                              f"spread=[{fmt(l_lo)},{fmt(l_hi)}]")
+                lines.append(f"  {arm:11s} lat_p90_ns median={fmt(p_med)} "
+                             f"spread=[{fmt(p_lo)},{fmt(p_hi)}]")
+                lines.append(f"  {arm:11s} unhealthy median={fmt(u_med)} "
+                             f"spread=[{fmt(u_lo)},{fmt(u_hi)}] "
+                             f"total={fmt(sum(sick))}")
             present = [s for s in group
                        if s["bpf_ns"] not in ("absent", "none")]
             missing = len(group) - len(present)
@@ -243,14 +269,14 @@ def self_test():
                          "call-rate": {"rounds": 1, "rate": "1k",
                                        "duration_s": 2}},
                "arms": list(ARMS),
-               "rotation": "round r starts at arm (r-1) mod 4",
+               "rotation": "ABBA: odd rounds forward, even rounds reversed",
                "completion": {"marker": "DONE"}}
         if manifest is not None:
             man = manifest(man)
         man_path = f"{work}/manifest.json"
         with open(man_path, "w", encoding="utf-8") as handle:
             json.dump(man, handle)
-        log = [f"MACHINE kernel=test",
+        log = ["MACHINE kernel=test",
                "BINARY which=on path=/bin/on sha256=aa commit=bb",
                "BINARY which=off path=/bin/off sha256=cc commit=bb"]
         lat = 1000
@@ -333,6 +359,32 @@ def self_test():
                   if l.startswith("SAMPLE cell=exec-storm") else l
                   for l in log] + ["DONE samples=12"])
     must_fail("double DONE", extra_lines=("DONE samples=12", "DONE samples=12"))
+    must_fail("DONE count mismatch", extra_lines=("DONE samples=11",))
+    must_fail("DONE count unparseable", extra_lines=("DONE samples=many",))
+    must_fail("no healthy call-rate call",
+              mutate=lambda log: [
+                  l.replace("unhealthy=0", "unhealthy=2000")
+                  if l.startswith("SAMPLE cell=call-rate") else l
+                  for l in log] + ["DONE samples=12"])
+    # One sick sample keeps the campaign: partial errors are data.
+    def sicken_first(log):
+        out = []
+        sickened = False
+        for line in log:
+            if line.startswith("SAMPLE cell=call-rate") and not sickened:
+                line = line.replace("unhealthy=0", "unhealthy=2000", 1)
+                sickened = True
+            out.append(line)
+        return out
+
+    work3, log3, man3 = campaign(
+        mutate=sicken_first, extra_lines=("DONE samples=12",))
+    try:
+        table3 = render(*verify(log3, man3))
+    except CampaignError as error:
+        check(f"partial unhealthy verifies ({error})", False)
+        table3 = ""
+    check("partial unhealthy renders its total", "total=2,000" in table3)
     print(f"bench-marker-cost-analyze self-test: "
           f"{'OK' if not failures else 'FAIL ' + str(failures)}")
     return 1 if failures else 0

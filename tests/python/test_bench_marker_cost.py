@@ -39,7 +39,7 @@ def campaign_fixture(directory, rounds=1, drop=(), mutate=None, done=True):
                   "call-rate": {"rounds": rounds, "rate": "1k",
                                 "duration_s": 2}},
         "arms": ["none", "off-profile", "on-profile", "on-armed"],
-        "rotation": "round r starts at arm (r-1) mod 4",
+        "rotation": "ABBA: odd rounds forward, even rounds reversed",
         "completion": {"marker": "DONE"},
     }
     man_path = directory / "manifest.json"
@@ -96,9 +96,9 @@ class BenchHarnessTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("round 1: none off-profile on-profile on-armed",
                       proc.stdout)
-        self.assertIn("round 2: off-profile on-profile on-armed none",
+        self.assertIn("round 2: on-armed on-profile off-profile none",
                       proc.stdout)
-        self.assertIn("round 3: on-profile on-armed none off-profile",
+        self.assertIn("round 3: none off-profile on-profile on-armed",
                       proc.stdout)
         self.assertIn("samples: 24", proc.stdout)
 
@@ -148,6 +148,12 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("delta disarmed (on-profile - off-profile): "
                       "0 lat_ns (+0.00%, within 2%)", table)
         self.assertIn("recorded, not gated", table)
+        # Health renders per arm: p90 beside the median, unhealthy beside
+        # the rate. The fixture runs clean.
+        self.assertIn("lat_p90_ns median=1,050", table)
+        self.assertIn("lat_p90_ns median=1,150", table)
+        self.assertIn("unhealthy median=0", table)
+        self.assertIn("total=0", table)
 
     def test_truncated_log_fails(self):
         with tempfile.TemporaryDirectory(
@@ -169,6 +175,30 @@ class AnalyzerTests(unittest.TestCase):
                 prefix="p11scope-markercost-nodone-") as work:
             directory = Path(work)
             log_path, man_path = campaign_fixture(directory, done=False)
+            with self.assertRaises(ANALYZER.CampaignError):
+                ANALYZER.verify(str(log_path), str(man_path))
+
+    def test_done_count_mismatch_fails(self):
+        with tempfile.TemporaryDirectory(
+                prefix="p11scope-markercost-count-") as work:
+            directory = Path(work)
+            log_path, man_path = campaign_fixture(directory)
+            log_path.write_text(
+                log_path.read_text().replace("DONE samples=8",
+                                              "DONE samples=7"))
+            with self.assertRaises(ANALYZER.CampaignError):
+                ANALYZER.verify(str(log_path), str(man_path))
+
+    def test_all_unhealthy_campaign_fails(self):
+        def sicken(lines):
+            return [line.replace("unhealthy=0", "unhealthy=2000")
+                    if line.startswith("SAMPLE cell=call-rate") else line
+                    for line in lines]
+
+        with tempfile.TemporaryDirectory(
+                prefix="p11scope-markercost-sick-") as work:
+            directory = Path(work)
+            log_path, man_path = campaign_fixture(directory, mutate=sicken)
             with self.assertRaises(ANALYZER.CampaignError):
                 ANALYZER.verify(str(log_path), str(man_path))
 

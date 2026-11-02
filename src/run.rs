@@ -6276,8 +6276,30 @@ fn capture_profile(
             let ledger = selection_ledger
                 .as_mut()
                 .expect("a K0 window implies a staged selection");
-            let after_losses =
-                metrics::selected_detail_driver::k0_comparable_losses(&context.0.capture_facts());
+            let after_facts = context.0.capture_facts();
+            let after_losses = metrics::selected_detail_driver::k0_comparable_losses(&after_facts);
+            // Non-wire K0 debug line (T-2): the live cells set
+            // `P11SCOPE_K0_DEBUG` to check comparable/exit-only counts.
+            // Never in the JSON report; operators never see it unless
+            // they opt in.
+            if std::env::var_os("P11SCOPE_K0_DEBUG").is_some() {
+                // Space-free arrays: the live cells split this line on
+                // whitespace, and `{:?}` would emit `[0, 0, 0, 0]`.
+                let before = k0.window.before_losses();
+                eprintln!(
+                    "k0-debug: before_comparable=[{},{},{},{}] after_truncated={} after_exit={} after_comparable=[{},{},{},{}]",
+                    before[0],
+                    before[1],
+                    before[2],
+                    before[3],
+                    after_facts.discovery_losses()[3],
+                    after_facts.exit_ended_truncations(),
+                    after_losses[0],
+                    after_losses[1],
+                    after_losses[2],
+                    after_losses[3],
+                );
+            }
             metrics::selected_detail_driver::close_k0_production(
                 k0,
                 context.1,
@@ -14281,22 +14303,26 @@ mod tests {
             .split_once("fn run_terminal(")
             .expect("run_terminal")
             .1;
-        // The binding spans two lines in production; the pin below
-        // matches its head (production precedes the tests module, so
-        // the first match is the production site, not this string).
+        // The close snapshots facts, then comparable losses from them
+        // (production precedes the tests module, so the first match is
+        // the production site, not this string).
+        let facts_binding = terminal_fn
+            .find("let after_facts = context.0.capture_facts()")
+            .expect("K0 close facts");
         let close_binding = terminal_fn
             .find("let after_losses =")
             .expect("K0 close binding");
+        assert!(
+            facts_binding < close_binding,
+            "the K0 close snapshots facts before losses"
+        );
         let close_call = &terminal_fn[close_binding..];
         let close_losses = close_call
-            .find("k0_comparable_losses(")
+            .find("k0_comparable_losses(&after_facts)")
             .expect("K0 close losses");
-        let close_facts = close_call
-            .find("&context.0.capture_facts()")
-            .expect("K0 close facts");
         let close_end = close_call.find(';').expect("K0 close binding end");
         assert!(
-            close_losses < close_end && close_facts < close_end,
+            close_losses < close_end,
             "the K0 close snapshots its comparable losses"
         );
         let close = terminal_fn.find("close_k0_production(").expect("K0 close");

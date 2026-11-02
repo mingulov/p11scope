@@ -6632,6 +6632,7 @@ pub(crate) mod tests {
             name,
             "C_SignInit"
                 | "C_OpenSession"
+                | "C_Initialize"
                 | "C_Finalize"
                 | "C_CloseAllSessions"
                 | "C_CreateObject"
@@ -14872,6 +14873,140 @@ pub(crate) mod tests {
             .seal(&scene.bootstrap(proof, 0))
             .expect_err("the diverged claim holds the seal today");
         assert_eq!(hold.gap, JournalGap::BoundNotReady);
+    }
+
+    /// One production-shaped enriched call: the BEGIN keeps the safe
+    /// entry's words, the END carries the return rewrites of the real
+    /// shared return constructor, and the H0 admission is the END's own
+    /// return event (`forge` lets a twin admit a different return).
+    /// Returns the scene after ingest and attestation, plus the proof.
+    fn enriched_claim_scene(
+        name: &str,
+        rewrite: impl FnOnce(
+            &mut p11scope_ebpf_common::CallStart,
+            &mut p11scope_ebpf_common::object_flow::ReturnEventFacts,
+        ),
+        forge: impl FnOnce(&mut Event),
+    ) -> (Scene, JournalDomainProof) {
+        let (begin, end) = producer_agreement_pair(name, rewrite);
+        let mut scene = Scene::new(image_default());
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        let JournalRecord::End(staged) = decode_journal_record(&end, &scene.descriptors).unwrap()
+        else {
+            panic!("END")
+        };
+        let mut returned = staged.payload_base().event;
+        forge(&mut returned);
+        let admitted = scene.fixture.admit_original_event(name, returned);
+        let proof = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("the paired return attests");
+        (scene, proof)
+    }
+
+    /// Every return rewrite the producer makes keeps the admission claim
+    /// on its own staged BEGIN: absent session to `SESSION_NONE`
+    /// (`C_Initialize`, `C_Finalize`, `C_CloseAllSessions`: the BPF entry
+    /// sets `SESSION_NONE` for a call with no session argument while the
+    /// journal BEGIN keeps word 0), the returned `C_OpenSession` handle
+    /// (read only at return), and the
+    /// mechanism read at return (VALUE, including the value 0 of
+    /// `CKM_RSA_PKCS_KEY_PAIR_GEN`, or UNREADABLE with the read failure).
+    /// The seal certifies each one.
+    #[test]
+    fn object_journal_return_enriched_claims_seal() {
+        use p11scope_ebpf_common::{MECH_NONE, SESSION_NONE};
+        type Rewrite = fn(
+            &mut p11scope_ebpf_common::CallStart,
+            &mut p11scope_ebpf_common::object_flow::ReturnEventFacts,
+        );
+        let cases: [(&str, &str, Rewrite); 7] = [
+            ("C_Initialize", "absent-session", |_, _| {}),
+            ("C_Finalize", "absent-session", |_, _| {}),
+            ("C_CloseAllSessions", "absent-session", |_, _| {}),
+            ("C_OpenSession", "returned-handle", |_, _| {}),
+            ("C_SignInit", "mechanism-value", |_, _| {}),
+            ("C_SignInit", "mechanism-value-zero", |_, facts| {
+                facts.mechanism = 0;
+            }),
+            ("C_SignInit", "mechanism-unreadable", |_, facts| {
+                facts.mechanism = MECH_NONE;
+                facts.capture_flags = (facts.capture_flags & !capture::MECHANISM_MASK)
+                    | capture::MECHANISM_UNREADABLE
+                    | capture::ARG_READ_FAILURE;
+            }),
+        ];
+        for (name, shape, rewrite) in cases {
+            let (mut scene, proof) = enriched_claim_scene(name, rewrite, |_| {});
+            let begin = scene.adapter.open.values().next().expect("staged BEGIN").begin;
+            let returned = scene.adapter.open.values().next().unwrap().end.unwrap();
+            let returned = returned.end.payload_base().event;
+            assert!(
+                (begin.session_word(), begin.entry_mechanism(), begin.capture())
+                    != (returned.session, returned.mechanism, returned.capture),
+                "{shape}: the twin models a return rewrite, not equality-by-copy"
+            );
+            if shape == "absent-session" {
+                assert_eq!((begin.session_word(), returned.session), (0, SESSION_NONE));
+            }
+            let bootstrap = scene.bootstrap(proof, 0);
+            let sealed = scene.seal(&bootstrap);
+            assert!(
+                sealed.is_ok(),
+                "{name} {shape}: the claim names its own BEGIN: {:?}",
+                sealed.err().map(|failure| failure.gap)
+            );
+        }
+    }
+
+    /// Lost END: the preserved ordinary CALL carries the return-enriched
+    /// mechanism while the BEGIN keeps the entry's `MECH_NONE`. The CALL
+    /// still corroborates its own BEGIN, the claim (filed from that same
+    /// return) names it, and the bounded loss seals.
+    #[test]
+    fn object_journal_return_enriched_lost_end_corroborates_and_seals() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let (begin, end) = producer_agreement_pair("C_SignInit", |_, _| {});
+        let mut scene = Scene::new(image_default());
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let JournalRecord::End(lost) = decode_journal_record(&end, &scene.descriptors).unwrap()
+        else {
+            panic!("END")
+        };
+        let call = lost.payload_base().event;
+        assert_eq!(
+            call.capture & capture::MECHANISM_MASK,
+            capture::MECHANISM_VALUE,
+            "the preserved CALL carries the return-read mechanism"
+        );
+        assert_eq!(
+            scene.ingest_ordinary(call),
+            JournalDisposition::ReturnObserved,
+            "the enriched CALL corroborates its own BEGIN"
+        );
+        assert_eq!(
+            scene.ingest(&abandon_bytes(
+                1,
+                1,
+                JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+                (COOKIE, EXEC)
+            )),
+            JournalDisposition::AbandonStaged
+        );
+        let admitted = scene.fixture.admit_original_event("C_SignInit", call);
+        let proof = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("the preserved return attests");
+        let bootstrap = scene.bootstrap(proof, 0);
+        let sealed = scene.seal(&bootstrap);
+        assert!(
+            sealed.is_ok(),
+            "the lost-END claim names its BEGIN: {:?}",
+            sealed.err().map(|failure| failure.gap)
+        );
     }
 
     #[test]

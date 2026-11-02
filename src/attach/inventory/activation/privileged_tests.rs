@@ -4885,6 +4885,23 @@ fn task4_detailed_registration_accepts_instance_tail_and_rejects_mistakes() -> R
     let mut changed = identity.clone();
     changed[hooked.len()]["session_generation"] = serde_json::json!(1);
     assert!(task4_replay_registration(&encode(&changed)?, &offsets, "second_attached").is_err());
+    // The 7.3+ hook set swaps only the exec-release program: accepted.
+    let mut mmap = hooked.clone();
+    mmap[14]["program"] = serde_json::json!("p11_image_mmap_release");
+    task4_replay_registration(&encode(&mmap)?, &offsets, "attached")?;
+    // Both variants at once (five rows): rejected.
+    let mut both = mmap.clone();
+    let mut extra = mmap[14].clone();
+    extra["program"] = serde_json::json!("p11_image_exec_release");
+    extra["position"] = serde_json::json!(both.len());
+    extra["link_id"] = serde_json::json!(both.len() as u64 + 100);
+    extra["program_id"] = serde_json::json!(both.len() as u64 + 21);
+    both.push(extra);
+    assert!(task4_replay_registration(&encode(&both)?, &offsets, "attached").is_err());
+    // Four rows mixing both variants for a stable hook: rejected.
+    let mut mixed = hooked.clone();
+    mixed[11]["program"] = serde_json::json!("p11_image_mmap_release");
+    assert!(task4_replay_registration(&encode(&mixed)?, &offsets, "attached").is_err());
     Ok(())
 }
 

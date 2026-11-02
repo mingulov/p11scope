@@ -7717,6 +7717,7 @@ mod privileged_tests {
                      mm_present=false attach={attach} tasktype={tasktype} \
                      bpf_delta=0 scan_bytes={scan_bytes} fallback=kernel_fix_missing"
                 );
+                eprintln!("P11SCOPE_CELL_BRANCH=denied");
             }
             (Ok(_), IdentityBtf::Ok) => {
                 assert!(
@@ -7740,6 +7741,7 @@ mod privileged_tests {
                      attach={attach} tasktype={tasktype} bpf_delta=0 \
                      scan_bytes={scan_bytes} sink=ok"
                 );
+                eprintln!("P11SCOPE_CELL_BRANCH=eligible");
             }
             (direct, sink) => {
                 let direct = match direct {

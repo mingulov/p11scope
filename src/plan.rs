@@ -30,7 +30,7 @@ use crate::discovery::identity::{
 pub use crate::discovery::scan::Skipped;
 use crate::discovery::scan::{
     ObjectExports, ScannedEntry, ScannedInterface, ScannedTable, TableEvidenceScore,
-    export_agreement, order_tables_by_evidence, proven_complete_legacy_prefix, standard_ordinal,
+    export_agreement, order_tables_by_evidence, published_walk, standard_ordinal,
     table_evidence_score, table_linkage, table_name_authorized, table_observation_authorized,
 };
 use crate::inventory_semantics::SemanticRefusal;
@@ -3413,9 +3413,33 @@ pub(crate) fn semantic_source_claims(
     let mut incomplete: BTreeSet<_> = scanned
         .iter()
         .filter(|module| {
-            module.scanned.tables.iter().any(|table| {
-                table.walk != "full" || table.unpinned.iter().any(|entry| affecting(&entry.subject))
-            })
+            // The same witness `lower_scanned` publishes by, so semantic
+            // completeness and the reported walk never disagree about one
+            // table.
+            let exports = ObjectExports {
+                object: module.scanned.key,
+                symbols: &module.exports,
+                getter_present: module.getter_present,
+                witness_fault: module.witness_fault,
+            };
+            module
+                .scanned
+                .tables
+                .iter()
+                .enumerate()
+                .any(|(index, table)| {
+                    let linked = module
+                        .scanned
+                        .interfaces
+                        .iter()
+                        .any(|interface| interface.table == Some(index));
+                    let walk = if linked {
+                        table.walk
+                    } else {
+                        published_walk(table, &exports)
+                    };
+                    walk != "full" || table.unpinned.iter().any(|entry| affecting(&entry.subject))
+                })
         })
         .map(|module| module.object)
         .collect();
@@ -3748,11 +3772,17 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         // A 68-slot prefix proven to be the complete reachable surface
         // reports a full walk: every function a conforming caller can
         // reach was walked. The source still names the declared 3.x
-        // version, so the mislabelling quirk stays visible.
-        let walk = if proven_complete_legacy_prefix(table, &exports) {
-            "full"
-        } else {
+        // version, so the mislabelling quirk stays visible. A table an
+        // interface record links keeps the raw decoder walk: one table
+        // never publishes both `full` and `known_prefix`.
+        let linked = scanned
+            .interfaces
+            .iter()
+            .any(|interface| interface.table == Some(index));
+        let walk = if linked {
             table.walk
+        } else {
+            published_walk(table, &exports)
         };
         surfaces.push(SurfaceSummary {
             source: format!(

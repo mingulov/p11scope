@@ -37,10 +37,9 @@ use crate::discovery::scan::{
     ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped, decode_exact_table,
     decode_observed_words, decoded_table_addresses, exact_legacy_prefix_bytes,
     exact_table_addresses_n, exact_table_bytes, export_agreement, index_maps_or_refuse,
-    proven_complete_legacy_prefix, read_elf_snapshot, read_maps_or_refuse,
-    read_maps_or_refuse_with_buffers, scan_process_view, scan_process_view_without_memory,
-    scan_skip_truncates, table_evidence_score, table_has_only_opaque_interfaces, table_linkage,
-    target_layout,
+    published_walk, read_elf_snapshot, read_maps_or_refuse, read_maps_or_refuse_with_buffers,
+    scan_process_view, scan_process_view_without_memory, scan_skip_truncates, table_evidence_score,
+    table_has_only_opaque_interfaces, table_linkage, target_layout,
 };
 use crate::discovery::scheduler::{
     DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
@@ -2106,10 +2105,17 @@ impl CaptureFacts {
                     witness_fault: module.witness_fault,
                 };
                 // A proven 68-slot prefix reports a full walk, like the plan.
-                let walk = if proven_complete_legacy_prefix(table, &exports) {
-                    "full"
-                } else {
+                // A table an interface record links keeps the raw decoder
+                // walk, like the plan: one table never publishes both.
+                let linked = module
+                    .scanned
+                    .interfaces
+                    .iter()
+                    .any(|interface| interface.table == Some(table_index));
+                let walk = if linked {
                     table.walk
+                } else {
+                    published_walk(table, &exports)
                 };
                 let surface = (table.version, walk.to_string(), functions);
                 let surface_occurrence = surfaces.entry(surface.clone()).or_insert(0usize);
@@ -8711,6 +8717,14 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                 }
                 existing.tables[index].live_return |= table.live_return;
                 existing.tables[index].manifest_supported |= table.manifest_supported;
+                // The extension proof unions like the other monotonic
+                // observation flags: an equal table is `PartialEq`-equal
+                // with or without the flag, so a later full-extent decode
+                // whose first failure refutes nothing cannot clear an
+                // earlier proof. Clearing happens only by complete-scan
+                // replacement (the view's modules are rebuilt outright),
+                // never by union. This needs a writable table and lasts
+                // until that rescan.
                 existing.tables[index].extension_impossible |= table.extension_impossible;
                 index
             }

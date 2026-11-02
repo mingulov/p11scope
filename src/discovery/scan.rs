@@ -40,9 +40,12 @@ pub(crate) const MAX_TABLE_CANDIDATES: usize = 512;
 /// with: the accepted width when a 3.x-labelled table validates only
 /// its legacy prefix (a provider mislabelling quirk).
 const LEGACY_PREFIX_SLOTS: usize = 68;
-/// Slots in a 3.0/3.1 `CK_FUNCTION_LIST_3_0`: a failure inside
-/// `LEGACY_PREFIX_SLOTS..STANDARD_30_SLOTS` refutes both the 92-wide
-/// and the 104-wide hypotheses, leaving the 68-slot prefix complete.
+/// Slots in a 3.0/3.1 `CK_FUNCTION_LIST_3_0`: a structural failure inside
+/// `LEGACY_PREFIX_SLOTS..STANDARD_30_SLOTS` — unmapped memory, file-backed
+/// non-executable memory, or anonymous non-executable memory — refutes both
+/// the 92-wide and the 104-wide hypotheses, leaving the 68-slot prefix
+/// complete. Executable anonymous memory and executable unusable-path
+/// mappings prove nothing: they may hold a real extension.
 const STANDARD_30_SLOTS: usize = 92;
 const MAX_DECODED_TABLE_ENTRIES: usize = 512 * 104;
 pub(crate) const MAX_INTERFACE_RECORDS: usize = 512;
@@ -1911,13 +1914,18 @@ pub struct ScannedTable {
     /// never decoded, never retained across input changes (a retired module
     /// takes its marks with it).
     pub manifest_supported: bool,
-    /// True when the 3.x extension is present but structurally impossible:
-    /// the full declared extent was readable, the 68-slot legacy prefix
-    /// validated, and the first structural failure falls in
-    /// `68..92`, refuting the 92-wide and 104-wide layouts. Set only by
-    /// `decode_candidate`; truncation, `decode_observed_words`, and anchor
-    /// recovery never set it. Unioned by `merge_scanned_module` like the
-    /// other monotonic observation flags, and ignored by `PartialEq`.
+    /// True when the 3.x extension is structurally impossible: the full
+    /// declared extent was readable, the 68-slot legacy prefix validated,
+    /// and the first structural failure — unmapped, file-backed
+    /// non-executable, or anonymous non-executable memory — falls in
+    /// `68..92`, refuting the 92-wide and 104-wide layouts. Executable
+    /// anonymous memory and executable unusable-path mappings never set
+    /// it. Set only by `decode_candidate`; truncation,
+    /// `decode_observed_words`, and anchor recovery never set it. Unioned
+    /// by `merge_scanned_module` like the other monotonic observation
+    /// flags — a later full-extent decode that refutes nothing cannot
+    /// clear an earlier proof until a complete rescan replaces the
+    /// module — and ignored by `PartialEq`.
     pub extension_impossible: bool,
 }
 
@@ -2227,6 +2235,19 @@ pub(crate) fn proven_complete_legacy_prefix(
     }
     let agreement = export_agreement(table, exports);
     agreement.corroborates() && agreement.agreeing == table.entries.len()
+}
+
+/// The walk label every surface publisher reports for one scanned table:
+/// `full` when the legacy-prefix proof holds, otherwise the raw decoder
+/// walk. Plan lowering, engine history and semantic completeness all use
+/// this one helper, so a proven table is never `full` in one place and
+/// `known_prefix` in another.
+pub(crate) fn published_walk(table: &ScannedTable, exports: &ObjectExports<'_>) -> &'static str {
+    if proven_complete_legacy_prefix(table, exports) {
+        "full"
+    } else {
+        table.walk
+    }
 }
 
 /// Publication evidence for one candidate table, strongest first: a table
@@ -2561,7 +2582,7 @@ fn decode_candidate(
         (bytes, true)
     };
     let full_extent_readable = !short_prefix;
-    let mut failed_ordinal: Option<usize> = None;
+    let mut refuting_ordinal: Option<usize> = None;
 
     // Validate the readable candidate before reserving decoded records.
     // Each validated slot is retained: file-backed entries as their normalized
@@ -2615,28 +2636,42 @@ fn decode_candidate(
             if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
-            failed_ordinal = Some(ordinal);
+            // Only a structural failure refutes the wider layouts: unmapped
+            // memory, or anonymous memory without execute permission (which
+            // cannot hold code). Executable anonymous memory (JIT code,
+            // trampolines) may hold a real extension the scanner cannot
+            // attach, so it proves nothing.
+            let refutes = match maps.containing(value) {
+                None => true,
+                Some(entry) => entry.permissions[2] != b'x',
+            };
+            if refutes {
+                refuting_ordinal = Some(ordinal);
+            }
             short_prefix = true;
             break;
         };
         if permissions[2] != b'x' {
-            // A pointer into data ⇒ not a function table, unless the
-            // failure is a mislabelled tail past a complete legacy prefix.
+            // A file-backed pointer into data ⇒ not a function table,
+            // unless the failure is a mislabelled tail past a complete
+            // legacy prefix. Data cannot hold the extension, so the
+            // failure refutes the wider layouts.
             if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
-            failed_ordinal = Some(ordinal);
+            refuting_ordinal = Some(ordinal);
             short_prefix = true;
             break;
         }
         let MappedPath::Usable(path) = path else {
             // Deleted/ambiguous pathname ⇒ cannot become an attach target,
             // unless the failure is a mislabelled tail past a complete
-            // legacy prefix.
+            // legacy prefix. The mapping is executable (a non-executable
+            // one failed above), so it may hold real code reached through
+            // a path the scanner cannot use: no refutation.
             if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
-            failed_ordinal = Some(ordinal);
             short_prefix = true;
             break;
         };
@@ -2755,7 +2790,7 @@ fn decode_candidate(
     }
     let extension_impossible = full_extent_readable
         && version.0 == 3
-        && failed_ordinal
+        && refuting_ordinal
             .is_some_and(|ordinal| (LEGACY_PREFIX_SLOTS..STANDARD_30_SLOTS).contains(&ordinal));
     Ok(Some((
         ScannedTable {

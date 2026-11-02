@@ -1466,6 +1466,8 @@ pub(crate) mod tests {
         let path = path.to_str().unwrap().to_string();
         ReconciledModule {
             exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
             object,
             entry_objects: vec![entry_objects],
             scanned: ScannedModule {

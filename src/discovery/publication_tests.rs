@@ -3344,6 +3344,8 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         .collect();
     let module = ReconciledModule {
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
         scanned: ScannedModule {
             mapped_identity: None,
             double_loaded: false,
@@ -3405,6 +3407,8 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
     let small_object = PinnedObjectId(8);
     let small = ReconciledModule {
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
         scanned: ScannedModule {
             mapped_identity: None,
             double_loaded: false,

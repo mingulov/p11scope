@@ -40,9 +40,12 @@ pub(crate) const MAX_TABLE_CANDIDATES: usize = 512;
 /// with: the accepted width when a 3.x-labelled table validates only
 /// its legacy prefix (a provider mislabelling quirk).
 const LEGACY_PREFIX_SLOTS: usize = 68;
-/// Slots in a 3.0/3.1 `CK_FUNCTION_LIST_3_0`: a failure inside
-/// `LEGACY_PREFIX_SLOTS..STANDARD_30_SLOTS` refutes both the 92-wide
-/// and the 104-wide hypotheses, leaving the 68-slot prefix complete.
+/// Slots in a 3.0/3.1 `CK_FUNCTION_LIST_3_0`: a structural failure inside
+/// `LEGACY_PREFIX_SLOTS..STANDARD_30_SLOTS` — unmapped memory, file-backed
+/// non-executable memory, or anonymous non-executable memory — refutes both
+/// the 92-wide and the 104-wide hypotheses, leaving the 68-slot prefix
+/// complete. Executable anonymous memory and executable unusable-path
+/// mappings prove nothing: they may hold a real extension.
 const STANDARD_30_SLOTS: usize = 92;
 const MAX_DECODED_TABLE_ENTRIES: usize = 512 * 104;
 pub(crate) const MAX_INTERFACE_RECORDS: usize = 512;
@@ -277,50 +280,62 @@ fn read_raw_scan_facts_budgeted(
     wanted: &[&str],
     budget: &mut CaptureWorkBudget,
 ) -> Result<ElfExportFacts, String> {
-    let (abi, exports, excluded_anchor_ranges, work_units) = if budget
-        .retained_mapped_identity(file)
-        .is_some()
-    {
-        let facts = read_elf_snapshot(file, budget)?.raw_scan_facts(wanted)?;
-        (
-            facts.abi,
-            facts.exports,
-            facts.excluded_anchor_ranges,
-            facts.work_units,
-        )
-    } else if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
-        let mut metadata = None;
-        let (abi, exports) = read_inventory_export_facts_budgeted_with(
-            file,
-            wanted,
-            budget,
-            crate::attach::monotonic_ns,
-            |file, wanted, reservation| {
-                let facts =
-                    p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, reservation)?;
-                metadata = Some((facts.excluded_anchor_ranges, facts.work_units));
-                Ok((facts.abi, facts.exports, facts.structural_bytes))
-            },
-        )?;
-        let (ranges, work) = metadata.expect("successful raw ELF query returned metadata");
-        (abi, exports, ranges, work)
-    } else {
-        // Detailed retains its demand-paged structural post-read debit;
-        // no new whole-file gate is introduced for sparse objects.
-        let facts = p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, u64::MAX)?;
-        let remaining = budget.remaining_window_io().unwrap_or(0);
-        if facts.structural_bytes > remaining {
-            budget.record_io(usize::try_from(remaining).unwrap_or(usize::MAX));
-            return Err(format!("read failed: {IO_CEILING_REASON}"));
-        }
-        budget.record_io(usize::try_from(facts.structural_bytes).unwrap_or(usize::MAX));
-        (
-            facts.abi,
-            facts.exports,
-            facts.excluded_anchor_ranges,
-            facts.work_units,
-        )
-    };
+    let (abi, exports, excluded_anchor_ranges, work_units, getter_present, witness_fault) =
+        if budget.retained_mapped_identity(file).is_some() {
+            let facts = read_elf_snapshot(file, budget)?.raw_scan_facts(wanted)?;
+            (
+                facts.abi,
+                facts.exports,
+                facts.excluded_anchor_ranges,
+                facts.work_units,
+                facts.getter_present,
+                facts.witness_fault,
+            )
+        } else if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
+            let mut metadata = None;
+            let (abi, exports) = read_inventory_export_facts_budgeted_with(
+                file,
+                wanted,
+                budget,
+                crate::attach::monotonic_ns,
+                |file, wanted, reservation| {
+                    let facts = p11scope_manifest::elf::read_raw_scan_facts_bounded(
+                        file,
+                        wanted,
+                        reservation,
+                    )?;
+                    metadata = Some((
+                        facts.excluded_anchor_ranges,
+                        facts.work_units,
+                        facts.getter_present,
+                        facts.witness_fault,
+                    ));
+                    Ok((facts.abi, facts.exports, facts.structural_bytes))
+                },
+            )?;
+            let (ranges, work, getter_present, witness_fault) =
+                metadata.expect("successful raw ELF query returned metadata");
+            (abi, exports, ranges, work, getter_present, witness_fault)
+        } else {
+            // Detailed retains its demand-paged structural post-read debit;
+            // no new whole-file gate is introduced for sparse objects.
+            let facts =
+                p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, u64::MAX)?;
+            let remaining = budget.remaining_window_io().unwrap_or(0);
+            if facts.structural_bytes > remaining {
+                budget.record_io(usize::try_from(remaining).unwrap_or(usize::MAX));
+                return Err(format!("read failed: {IO_CEILING_REASON}"));
+            }
+            budget.record_io(usize::try_from(facts.structural_bytes).unwrap_or(usize::MAX));
+            (
+                facts.abi,
+                facts.exports,
+                facts.excluded_anchor_ranges,
+                facts.work_units,
+                facts.getter_present,
+                facts.witness_fault,
+            )
+        };
     budget.spend(work_units).map_err(str::to_string)?;
     if let Some(reason) = budget.check_deadline_now() {
         return Err(reason.into());
@@ -328,6 +343,8 @@ fn read_raw_scan_facts_budgeted(
     Ok(ElfExportFacts {
         abi,
         exports,
+        getter_present,
+        witness_fault,
         excluded_anchor_ranges,
     })
 }
@@ -888,6 +905,13 @@ pub(crate) struct InspectedFileKey {
 pub(crate) struct ElfExportFacts {
     pub(crate) abi: ElfAbi,
     pub(crate) exports: Vec<(String, u64)>,
+    /// A 3.x interface getter name appears among the image's dynamic
+    /// symbols in any symbol type, including non-definitions absent from
+    /// `exports` (see `RawScanElfFacts`).
+    pub(crate) getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol, so `exports` may be
+    /// incomplete (see `RawScanElfFacts`).
+    pub(crate) witness_fault: bool,
     pub(crate) excluded_anchor_ranges: Vec<(u64, u64)>,
 }
 
@@ -1890,13 +1914,18 @@ pub struct ScannedTable {
     /// never decoded, never retained across input changes (a retired module
     /// takes its marks with it).
     pub manifest_supported: bool,
-    /// True when the 3.x extension is present but structurally impossible:
-    /// the full declared extent was readable, the 68-slot legacy prefix
-    /// validated, and the first structural failure falls in
-    /// `68..92`, refuting the 92-wide and 104-wide layouts. Set only by
-    /// `decode_candidate`; truncation, `decode_observed_words`, and anchor
-    /// recovery never set it. Unioned by `merge_scanned_module` like the
-    /// other monotonic observation flags, and ignored by `PartialEq`.
+    /// True when the 3.x extension is structurally impossible: the full
+    /// declared extent was readable, the 68-slot legacy prefix validated,
+    /// and the first structural failure — unmapped, file-backed
+    /// non-executable, or anonymous non-executable memory — falls in
+    /// `68..92`, refuting the 92-wide and 104-wide layouts. Executable
+    /// anonymous memory and executable unusable-path mappings never set
+    /// it. Set only by `decode_candidate`; truncation,
+    /// `decode_observed_words`, and anchor recovery never set it. Unioned
+    /// by `merge_scanned_module` like the other monotonic observation
+    /// flags — a later full-extent decode that refutes nothing cannot
+    /// clear an earlier proof until a complete rescan replaces the
+    /// module — and ignored by `PartialEq`.
     pub extension_impossible: bool,
 }
 
@@ -2064,7 +2093,8 @@ pub(crate) fn standard_ordinal(name: &str) -> Option<u16> {
 /// The export-linkage witness for one module's tables: the module object's
 /// own `.dynsym` definitions of standard names, `(name, file offset)`.
 /// Definitions only — `is_definition` excludes `STT_GNU_IFUNC`, whose value
-/// is a resolver, not the function — so an IFUNC name is simply absent.
+/// is a resolver, not the function — so an IFUNC name is simply absent
+/// from `symbols` (but still sets `getter_present`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ObjectExports<'a> {
     /// The object whose `.dynsym` was read. Only an entry that lands in this
@@ -2072,6 +2102,13 @@ pub(crate) struct ObjectExports<'a> {
     /// dependency's symbols it was not read from.
     pub(crate) object: ObjectKey,
     pub(crate) symbols: &'a [(String, u64)],
+    /// A 3.x interface getter name appears among the object's dynamic
+    /// symbols in any symbol type, including non-definitions absent from
+    /// `symbols`. Refuses the legacy-prefix proof.
+    pub(crate) getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol, so `symbols` may be
+    /// incomplete. Refuses the legacy-prefix proof.
+    pub(crate) witness_fault: bool,
 }
 
 impl<'a> ObjectExports<'a> {
@@ -2083,6 +2120,8 @@ impl<'a> ObjectExports<'a> {
             inode: 0,
         },
         symbols: &[],
+        getter_present: false,
+        witness_fault: false,
     };
 
     /// Every definition of `name`, in dynsym order (a versioned name may
@@ -2161,12 +2200,15 @@ pub(crate) fn export_agreement(
 /// surface, proven without calling the provider: the scan showed the full
 /// declared extent readable with the first structural failure in `68..92`
 /// (`extension_impossible`, refuting 92/104-wide), the module exports
-/// neither 3.x interface getter (no conforming route to a 3.x table), and
-/// every retained entry agrees with its export. `exports` is the module
-/// object's completely read `.dynsym` witness (a failed read never yields
-/// a `ReconciledModule`), so absence there is proven absence. Truncation,
-/// a getter export, a disagreeing entry, an unpinned record, or a missing
-/// file owner all stay unproven.
+/// neither 3.x interface getter in any symbol type (no conforming route
+/// to a 3.x table), and every retained entry agrees with its export.
+/// `exports` is the module object's completely read `.dynsym` witness (a
+/// failed read never yields a `ReconciledModule`), so absence there is
+/// proven absence — unless the walk skipped a symbol (`witness_fault`) or
+/// saw a getter it could not list as a definition (`getter_present`).
+/// Truncation, a getter export, a disagreeing entry, an unpinned record,
+/// a missing file owner, a getter in any symbol type, or a faulted walk
+/// all stay unproven.
 pub(crate) fn proven_complete_legacy_prefix(
     table: &ScannedTable,
     exports: &ObjectExports<'_>,
@@ -2183,6 +2225,9 @@ pub(crate) fn proven_complete_legacy_prefix(
     if table.file_offset.is_none() {
         return false;
     }
+    if exports.getter_present || exports.witness_fault {
+        return false;
+    }
     if exports.offsets_of("C_GetInterface").next().is_some()
         || exports.offsets_of("C_GetInterfaceList").next().is_some()
     {
@@ -2190,6 +2235,19 @@ pub(crate) fn proven_complete_legacy_prefix(
     }
     let agreement = export_agreement(table, exports);
     agreement.corroborates() && agreement.agreeing == table.entries.len()
+}
+
+/// The walk label every surface publisher reports for one scanned table:
+/// `full` when the legacy-prefix proof holds, otherwise the raw decoder
+/// walk. Plan lowering, engine history and semantic completeness all use
+/// this one helper, so a proven table is never `full` in one place and
+/// `known_prefix` in another.
+pub(crate) fn published_walk(table: &ScannedTable, exports: &ObjectExports<'_>) -> &'static str {
+    if proven_complete_legacy_prefix(table, exports) {
+        "full"
+    } else {
+        table.walk
+    }
 }
 
 /// Publication evidence for one candidate table, strongest first: a table
@@ -2524,7 +2582,7 @@ fn decode_candidate(
         (bytes, true)
     };
     let full_extent_readable = !short_prefix;
-    let mut failed_ordinal: Option<usize> = None;
+    let mut refuting_ordinal: Option<usize> = None;
 
     // Validate the readable candidate before reserving decoded records.
     // Each validated slot is retained: file-backed entries as their normalized
@@ -2578,28 +2636,42 @@ fn decode_candidate(
             if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
-            failed_ordinal = Some(ordinal);
+            // Only a structural failure refutes the wider layouts: unmapped
+            // memory, or anonymous memory without execute permission (which
+            // cannot hold code). Executable anonymous memory (JIT code,
+            // trampolines) may hold a real extension the scanner cannot
+            // attach, so it proves nothing.
+            let refutes = match maps.containing(value) {
+                None => true,
+                Some(entry) => entry.permissions[2] != b'x',
+            };
+            if refutes {
+                refuting_ordinal = Some(ordinal);
+            }
             short_prefix = true;
             break;
         };
         if permissions[2] != b'x' {
-            // A pointer into data ⇒ not a function table, unless the
-            // failure is a mislabelled tail past a complete legacy prefix.
+            // A file-backed pointer into data ⇒ not a function table,
+            // unless the failure is a mislabelled tail past a complete
+            // legacy prefix. Data cannot hold the extension, so the
+            // failure refutes the wider layouts.
             if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
-            failed_ordinal = Some(ordinal);
+            refuting_ordinal = Some(ordinal);
             short_prefix = true;
             break;
         }
         let MappedPath::Usable(path) = path else {
             // Deleted/ambiguous pathname ⇒ cannot become an attach target,
             // unless the failure is a mislabelled tail past a complete
-            // legacy prefix.
+            // legacy prefix. The mapping is executable (a non-executable
+            // one failed above), so it may hold real code reached through
+            // a path the scanner cannot use: no refutation.
             if !mislabelled_tail_ordinal(version, ordinal, prefix_non_null, ctx.strict_tail) {
                 return Ok(None);
             }
-            failed_ordinal = Some(ordinal);
             short_prefix = true;
             break;
         };
@@ -2718,7 +2790,7 @@ fn decode_candidate(
     }
     let extension_impossible = full_extent_readable
         && version.0 == 3
-        && failed_ordinal
+        && refuting_ordinal
             .is_some_and(|ordinal| (LEGACY_PREFIX_SLOTS..STANDARD_30_SLOTS).contains(&ordinal));
     Ok(Some((
         ScannedTable {
@@ -5168,6 +5240,8 @@ fn scan_view_examined_mode(
         let ElfExportFacts {
             abi,
             exports,
+            getter_present,
+            witness_fault,
             excluded_anchor_ranges,
         } = facts;
         let layout = target_layout(abi);
@@ -5266,6 +5340,8 @@ fn scan_view_examined_mode(
             let evidence = ObjectExports {
                 object: key,
                 symbols: &exports,
+                getter_present,
+                witness_fault,
             };
             let (tables, exhausted) = detect_tables_with_clock(
                 layout,
@@ -7197,6 +7273,8 @@ mod tests {
         let exports = ObjectExports {
             object: table.entries[0].object,
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         for version in [(2, 40), (3, 0), (3, 1), (3, 2)] {
             table.version = version;
@@ -7278,6 +7356,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         let (tables, skipped) = detect_tables_with_clock(
             LinuxLayout::Lp64,
@@ -7314,6 +7394,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         for word in [0x2802u64, 0x0003, 0x0103] {
             let mut snapshot = vec![0u8; 105 * 8];
@@ -7444,6 +7526,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         for word in [0x2802u64, 0x0003, 0x0103, 0x0203, 0xe707] {
             let mut snapshot = vec![0u8; 69 * 8];
@@ -7568,6 +7652,8 @@ mod tests {
         let exports = ObjectExports {
             object,
             symbols: &facts.exports,
+            getter_present: facts.getter_present,
+            witness_fault: facts.witness_fault,
         };
         for (header, walk) in [(0x2802u64, "full"), (0xa5a5_0000_0000_e707, "known_prefix")] {
             snapshot[..8].copy_from_slice(&header.to_le_bytes());
@@ -7601,6 +7687,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         // Actual ABI26 LP64 rv64 shape: GNU property value 3 looks like
         // version 3.0, 66 padding words are NULL, and .init_array/.fini_array
@@ -7703,6 +7791,8 @@ mod tests {
                     inode,
                 },
                 symbols: &[],
+                getter_present: false,
+                witness_fault: false,
             };
             let (tables, skipped) = detect_tables_with_clock(
                 LinuxLayout::Lp64,
@@ -7734,6 +7824,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         let mut snapshot = vec![0u8; 69 * 8];
         snapshot[..8].copy_from_slice(&0xa5a5_0000_0000_e707u64.to_le_bytes());
@@ -7845,6 +7937,8 @@ mod tests {
                     .collect(),
                 object: PinnedObjectId(object),
                 exports: exports.into(),
+                getter_present: false,
+                witness_fault: false,
                 scanned: ScannedModule {
                     mapped_identity: None,
                     view: ProcessViewId(object),
@@ -7880,6 +7974,8 @@ mod tests {
             &ObjectExports {
                 object: tail.scanned.key,
                 symbols: &tail.exports,
+                getter_present: tail.getter_present,
+                witness_fault: tail.witness_fault,
             },
         );
         assert!(!table_name_authorized(&score));
@@ -7945,6 +8041,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         let mut budget = CaptureWorkBudget::default();
         assert!(budget.charge(DEFAULT_WORK_CEILING - 8));
@@ -11560,6 +11658,8 @@ mod tests {
         let facts = ElfExportFacts {
             abi: ElfAbi::Lp64,
             exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
             excluded_anchor_ranges: Vec::new(),
         };
         assert!(budget.note_elf_export_facts(key(1), facts.clone()));
@@ -11587,6 +11687,8 @@ mod tests {
         let exact = ElfExportFacts {
             abi: ElfAbi::Lp64,
             exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
             excluded_anchor_ranges: Vec::new(),
         };
         let exact_bytes = export_cache_bytes(&key, &exact);
@@ -11603,6 +11705,8 @@ mod tests {
         let one_over = ElfExportFacts {
             abi: exact.abi,
             exports: vec![("C_GetFunctionList_".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
             excluded_anchor_ranges: Vec::new(),
         };
         assert_eq!(export_cache_bytes(&key, &one_over), exact_bytes + 1);

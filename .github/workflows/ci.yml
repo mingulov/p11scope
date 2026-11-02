@@ -695,6 +695,7 @@ jobs:
           UNRUN: scripts/bench-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/bench-count-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/bench-stagea-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/bench-marker-cost.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/build-release.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/capture-stopped-canary.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/check-canary-evidence.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -738,6 +739,9 @@ jobs:
           UNRUN: scripts/verify-live-discovery-preflight.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-receipt-lane02.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/ci/joint-throughput.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/ci/joint-stall-live.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/ci/key-operations-linked-control.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/ci/key-operations-system.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/verify-receipt-lane16.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/matrix/verify-abi-routing.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-fork-scope.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -812,6 +816,7 @@ jobs:
       - run: scripts/build-release.sh --self-test
       - run: scripts/bench-overhead.sh --self-test
       - run: scripts/bench-stagea-overhead.sh --self-test
+      - run: scripts/bench-marker-cost.sh --self-test
       - run: scripts/bench-count-overhead.sh --self-test
       - run: scripts/bench-discovery.sh --self-test
       - run: scripts/k8s-profile-entry.sh --self-test
@@ -832,6 +837,7 @@ jobs:
       - run: scripts/matrix/verify-oracle.sh --self-test
       - run: scripts/matrix/verify-shared-layer.sh --self-test
       - run: scripts/matrix/verify-uretprobe-seccomp.sh --self-test
+      - run: scripts/ci/joint-stall-live.sh --self-test
       - run: python3 -I scripts/check-bpf-map-defs.py --self-test
       - run: python3 -I scripts/check-canary-evidence.py --self-test
       - run: python3 -I scripts/check-capture-evidence.py --self-test
@@ -850,6 +856,7 @@ jobs:
       - run: python3 -I scripts/lane-bench-overhead-oracle-1.py --self-test
       - run: python3 -I scripts/lane-bench-overhead-oracle-3.py --self-test
       - run: python3 -I scripts/bench-stagea-overhead-analyze.py --self-test
+      - run: python3 -I scripts/bench-marker-cost-analyze.py --self-test
       - run: python3 -I scripts/bench-count-overhead-analyze.py --self-test
       - run: python3 -I scripts/bench-discovery-stats.py --self-test
       - run: python3 -I scripts/task-1.6-lane-a.py --self-test

@@ -882,7 +882,8 @@ class CurrentS1ModeTests(unittest.TestCase):
                  ("semantic_capture", "stop_quiescence", "unproven"),
                  ("semantic_capture", "refused_endpoints", 1),
                  ("semantic_capture", "continuity_cuts", 1),
-                 ("semantic_capture", "unrouted_returns", 1)]
+                 ("semantic_capture", "unrouted_returns", 1),
+                 ("semantic_capture", "events_lost", 1)]
         for key, field, value in cases:
             with self.subTest(key=key, field=field):
                 doc = s1_current_doc()
@@ -978,7 +979,8 @@ class CurrentS1ModeTests(unittest.TestCase):
             with self.subTest(group=group, key=key), self.assertRaises(ORACLE.OracleRefusal):
                 self.check(doc)
         for group, key in (("lifecycle", "ring_loss"), ("semantic_capture", "continuity_cuts"),
-                           ("semantic_capture", "refused_endpoints"), ("semantic_capture", "unrouted_returns")):
+                           ("semantic_capture", "refused_endpoints"), ("semantic_capture", "unrouted_returns"),
+                           ("semantic_capture", "events_lost")):
             doc = s1_current_doc()
             doc["observation"][group][key] = False
             with self.subTest(group=group, key=key), self.assertRaises(ORACLE.OracleRefusal):

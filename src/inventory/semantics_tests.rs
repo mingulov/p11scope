@@ -5080,6 +5080,46 @@ fn native_semantic_stop_orders_gate_drain_finish_output() {
 }
 
 #[test]
+fn semantic_summary_reports_ring_loss_as_events_lost() {
+    // Ring loss rides its own additive summary field, disjoint from
+    // the terminal drain's unrouted returns: the two never double
+    // count.
+    let mut conv = ConversionScene::new();
+    conv.lane.note_events_ring_loss(11);
+    let summary = conv.lane.semantic_summary();
+    assert_eq!(summary.events_lost, 11);
+    assert_eq!(summary.unrouted_returns, 0);
+    assert_eq!(summary.json()["events_lost"], 11);
+}
+
+#[test]
+fn live_capture_status_counts_ring_loss_toward_partial() {
+    use crate::inventory_semantics::live_capture_status;
+    // Any ring loss reads partial while the lane is live; a
+    // finished lane stays stopped whatever it lost.
+    assert_eq!(
+        live_capture_status(false, 0, false, 0),
+        SemanticCaptureStatus::Active
+    );
+    assert_eq!(
+        live_capture_status(false, 0, false, 7),
+        SemanticCaptureStatus::Partial
+    );
+    assert_eq!(
+        live_capture_status(false, 1, false, 0),
+        SemanticCaptureStatus::Partial
+    );
+    assert_eq!(
+        live_capture_status(false, 0, true, 0),
+        SemanticCaptureStatus::Partial
+    );
+    assert_eq!(
+        live_capture_status(true, 1, true, 7),
+        SemanticCaptureStatus::Stopped
+    );
+}
+
+#[test]
 fn native_semantic_stop_bounds_noisy_terminal_staging() {
     use crate::inventory_semantics::{
         TERMINAL_STAGED_BATCH_CAP, TerminalBatchStage, run_semantic_stop,

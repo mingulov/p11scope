@@ -5379,6 +5379,7 @@ fn capture_profile(
             engine.plan(),
             engine.pinned(),
             session.pid_lifecycle_facts(),
+            engine.capture_facts().discovery_losses(),
             &mut selection_ledger,
         );
     }
@@ -6268,15 +6269,19 @@ fn capture_profile(
         let kernel_evidence = snapshot.kernel_evidence();
         // K0: close the detail window after the broad terminal read,
         // while the banks are still live (detach is post-publication).
+        // The loss snapshot lands after the terminal drain, so growth
+        // inside the window voids the detail.
         if let Some(k0) = k0 {
             let ledger = selection_ledger
                 .as_mut()
                 .expect("a K0 window implies a staged selection");
+            let after_losses = context.0.capture_facts().discovery_losses();
             metrics::selected_detail_driver::close_k0_production(
                 k0,
                 context.1,
                 context.0.plan(),
                 context.0.pinned(),
+                after_losses,
                 ledger,
             );
         }

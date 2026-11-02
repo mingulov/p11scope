@@ -216,6 +216,13 @@ struct Entry {
     /// Export linkage's witness (`scan::export_agreement`); file-derived, so
     /// every entry for one digest carries the same list.
     exports: Arc<[(String, u64)]>,
+    /// A 3.x interface getter name appears among the object's dynamic
+    /// symbols in any symbol type, including non-definitions absent from
+    /// `exports`. Refuses the legacy-prefix proof.
+    getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol, so `exports` may be
+    /// incomplete. Refuses the legacy-prefix proof.
+    witness_fault: bool,
     /// Whether this object was opened through overlayfs. This narrows the collapse
     /// heuristic but does not prove that another overlay instance resolves to the
     /// same underlying kernel inode.
@@ -930,6 +937,8 @@ impl Entry {
             },
             abi: inspected.abi,
             exports: inspected.exports.clone().into(),
+            getter_present: inspected.getter_present,
+            witness_fault: inspected.witness_fault,
         })
     }
 }
@@ -998,6 +1007,13 @@ pub struct ReconciledModule {
     /// The module object's own standard-name `.dynsym` definitions, from its
     /// pinned inspection: the export-linkage witness for its tables.
     pub exports: Arc<[(String, u64)]>,
+    /// A 3.x interface getter name appears among the module object's
+    /// dynamic symbols in any symbol type, including non-definitions
+    /// absent from `exports`. Refuses the legacy-prefix proof.
+    pub getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol, so `exports` may be
+    /// incomplete. Refuses the legacy-prefix proof.
+    pub witness_fault: bool,
 }
 
 /// Every object opened, identity-matched, hashed, and pinned by a capture-local ID.
@@ -1374,6 +1390,15 @@ impl PinnedObjects {
         self.by_id
             .get(&id)
             .map_or_else(|| Arc::from(Vec::new()), |entry| entry.exports.clone())
+    }
+
+    /// The witness-completeness bits for the pinned object's exports:
+    /// `(getter_present, witness_fault)`. False when the object is not
+    /// pinned here (whose empty exports can never prove anyway).
+    pub(crate) fn export_witness_flags_for(&self, id: PinnedObjectId) -> (bool, bool) {
+        self.by_id.get(&id).map_or((false, false), |entry| {
+            (entry.getter_present, entry.witness_fault)
+        })
     }
 
     /// The content lookup key of a pinned object; `None` when it is not
@@ -2506,6 +2531,8 @@ mod conservative_copy {
                     build_id: old.build_id.as_ref().map(|_| String::new()),
                     abi: old.abi,
                     exports: old.exports.clone(),
+                    getter_present: old.getter_present,
+                    witness_fault: old.witness_fault,
                     overlay: old.overlay,
                     collapsed: old.collapsed,
                     probed_maps_unproven: old.probed_maps_unproven,
@@ -5494,17 +5521,18 @@ mod conservative_copy {
                     }
                     BindPhase::FinishModule => {
                         let object = self.object.take().ok_or(GraphRefusal::Identity)?;
-                        let exports = pins
-                            .by_id
-                            .get(&object)
-                            .ok_or(GraphRefusal::SourceChanged)?
-                            .exports
-                            .clone();
+                        let pinned_entry =
+                            pins.by_id.get(&object).ok_or(GraphRefusal::SourceChanged)?;
+                        let exports = pinned_entry.exports.clone();
+                        let getter_present = pinned_entry.getter_present;
+                        let witness_fault = pinned_entry.witness_fault;
                         self.modules.push(ReconciledModule {
                             scanned: self.module.take().ok_or(GraphRefusal::Identity)?,
                             object,
                             entry_objects: std::mem::take(&mut self.entry_objects),
                             exports,
+                            getter_present,
+                            witness_fault,
                         });
                         self.phase = BindPhase::NextModule;
                     }
@@ -7612,11 +7640,14 @@ pub fn bind_scanned_modules(
                 claims.pins.push(*id);
             }
         }
+        let (getter_present, witness_fault) = pinned.export_witness_flags_for(object);
         reconciled.push(ReconciledModule {
             scanned,
             object,
             entry_objects,
             exports: pinned.exports_for(object),
+            getter_present,
+            witness_fault,
         });
     }
     (reconciled, lost)
@@ -7860,6 +7891,8 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            getter_present: false,
+            witness_fault: false,
             overlay: false,
             collapsed: false,
             probed_maps_unproven: false,
@@ -7906,6 +7939,8 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            getter_present: false,
+            witness_fault: false,
             overlay,
             collapsed: false,
             probed_maps_unproven: false,
@@ -8099,6 +8134,8 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            getter_present: false,
+            witness_fault: false,
             overlay: true,
             collapsed: false,
             probed_maps_unproven: false,
@@ -8136,6 +8173,8 @@ pub(crate) mod test_fixture {
             build_id: None,
             abi: ElfAbi::Lp64,
             exports: Arc::from(Vec::new()),
+            getter_present: false,
+            witness_fault: false,
             overlay: true,
             collapsed: false,
             probed_maps_unproven: false,

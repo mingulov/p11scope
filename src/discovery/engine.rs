@@ -2102,6 +2102,8 @@ impl CaptureFacts {
                 let exports = ObjectExports {
                     object: module.scanned.key,
                     symbols: &module.exports,
+                    getter_present: module.getter_present,
+                    witness_fault: module.witness_fault,
                 };
                 // A proven 68-slot prefix reports a full walk, like the plan.
                 let walk = if proven_complete_legacy_prefix(table, &exports) {

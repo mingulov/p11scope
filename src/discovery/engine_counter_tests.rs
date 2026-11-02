@@ -600,6 +600,8 @@ fn owning_module_for_test(
         object,
         entry_objects: vec![vec![object; slots.len()]],
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
     }
 }
 

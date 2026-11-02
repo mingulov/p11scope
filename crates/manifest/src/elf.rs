@@ -32,6 +32,15 @@ pub enum ElfAbi {
 pub struct RawScanElfFacts {
     pub abi: ElfAbi,
     pub exports: Vec<(String, u64)>,
+    /// A 3.x interface getter name (`C_GetInterface`/`C_GetInterfaceList`)
+    /// appears among the image's dynamic symbols in any symbol type —
+    /// including non-definitions (`STT_GNU_IFUNC`, absolute) that
+    /// `is_definition` excludes from `exports`.
+    pub getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol it could not read
+    /// (unreadable name) or translate (a wanted definition outside every
+    /// segment), so `exports` may be incomplete.
+    pub witness_fault: bool,
     pub excluded_anchor_ranges: Vec<(u64, u64)>,
     pub structural_bytes: u64,
     pub work_units: u64,
@@ -320,7 +329,7 @@ impl ElfSnapshot {
         // The bytes were validated at construction, so the shared validation
         // always passes here; the walk still goes through the one entry.
         let (object, _, _) = classified_validated_object(&self.data)?;
-        Ok(exports_matching_in_object(&object, wanted))
+        Ok(exports_matching_in_object(&object, wanted).exports)
     }
 
     pub fn raw_scan_facts(&self, wanted: &[&str]) -> Result<RawScanElfFacts, String> {
@@ -535,9 +544,12 @@ fn raw_scan_facts_from_bytes(data: &[u8], wanted: &[&str]) -> Result<RawScanElfF
         object::File::Elf64(elf) => collect!(elf),
         _ => unreachable!("classified ELF"),
     };
+    let walk = exports_matching_in_object(&object, wanted);
     Ok(RawScanElfFacts {
         abi,
-        exports: exports_matching_in_object(&object, wanted),
+        exports: walk.exports,
+        getter_present: walk.getter_present,
+        witness_fault: walk.witness_fault,
         excluded_anchor_ranges: ranges,
         // export_table_bytes already includes the ELF/program headers.
         structural_bytes: export_table_bytes(&object, data.len() as u64)
@@ -572,12 +584,18 @@ pub fn read_raw_scan_facts_bounded(
 }
 
 /// The shared exports walk: names from `wanted` that the image exports in
-/// `.dynsym`, in dynsym order with their file offsets. Per-symbol faults skip
-/// the symbol; the walk itself cannot fail.
-pub(crate) fn exports_matching_in_object(
-    object: &object::File<'_>,
-    wanted: &[&str],
-) -> Vec<(String, u64)> {
+/// `.dynsym`, in dynsym order with their file offsets, plus the two
+/// witness-completeness bits the legacy-prefix proof relies on (see
+/// [`RawScanElfFacts`]). Per-symbol faults skip the symbol; the walk
+/// itself cannot fail.
+#[derive(Debug, Default)]
+pub(crate) struct ExportWalk {
+    pub(crate) exports: Vec<(String, u64)>,
+    pub(crate) getter_present: bool,
+    pub(crate) witness_fault: bool,
+}
+
+pub(crate) fn exports_matching_in_object(object: &object::File<'_>, wanted: &[&str]) -> ExportWalk {
     let mut found = Vec::new();
     for symbol in object.dynamic_symbols() {
         let Ok(name) = symbol.name() else { continue };
@@ -588,7 +606,11 @@ pub(crate) fn exports_matching_in_object(
             found.push((name.to_string(), offset));
         }
     }
-    found
+    ExportWalk {
+        exports: found,
+        getter_present: false,
+        witness_fault: false,
+    }
 }
 
 /// Structural bytes the export query logically consumed: the ELF header, the
@@ -645,7 +667,7 @@ fn export_facts_from_mmap(
     // The same segment-range validation the snapshot applies: without it,
     // `file_offset` translates through corrupt headers to offsets past EOF.
     let (object, abi, _) = classified_validated_object(mmap)?;
-    let exports = exports_matching_in_object(&object, wanted);
+    let exports = exports_matching_in_object(&object, wanted).exports;
     Ok((abi, exports, export_table_bytes(&object, mmap.len() as u64)))
 }
 

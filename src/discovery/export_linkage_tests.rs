@@ -517,6 +517,8 @@ fn an_unpinned_entry_whose_name_is_exported_contradicts_the_table() {
         &ObjectExports {
             object,
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         },
     );
     assert_eq!(

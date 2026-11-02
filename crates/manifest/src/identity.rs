@@ -18,7 +18,7 @@ use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
 #[cfg(feature = "identify")]
-use crate::elf::{ElfAbi, classified_validated_object, exports_matching_in_object};
+use crate::elf::{ElfAbi, ExportWalk, classified_validated_object, exports_matching_in_object};
 #[cfg(feature = "identify")]
 use crate::maps::{Device, ObjectKey};
 
@@ -78,6 +78,16 @@ pub struct InspectedObject {
     /// [`crate::elf::exports_matching`]. Read from the bytes already hashed,
     /// so it costs no I/O. Empty when nothing was asked for.
     pub exports: Vec<(String, u64)>,
+    /// A 3.x interface getter name (`C_GetInterface`/`C_GetInterfaceList`)
+    /// appears among the image's dynamic symbols in any symbol type —
+    /// including non-definitions (`STT_GNU_IFUNC`, absolute) that
+    /// `is_definition` excludes from `exports`. False when nothing was
+    /// asked for (no walk ran).
+    pub getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol it could not read
+    /// (unreadable name) or translate (a wanted definition outside every
+    /// segment), so `exports` may be incomplete.
+    pub witness_fault: bool,
 }
 
 #[cfg(feature = "identify")]
@@ -249,8 +259,8 @@ pub fn inspect_file_with_reader_exporting(
             }
         }
     };
-    let exports = if wanted.is_empty() {
-        Vec::new()
+    let walk = if wanted.is_empty() {
+        ExportWalk::default()
     } else {
         exports_matching_in_object(&object, wanted)
     };
@@ -258,7 +268,9 @@ pub fn inspect_file_with_reader_exporting(
         identity,
         executable_ranges,
         abi,
-        exports,
+        exports: walk.exports,
+        getter_present: walk.getter_present,
+        witness_fault: walk.witness_fault,
     })
 }
 

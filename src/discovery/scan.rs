@@ -277,50 +277,62 @@ fn read_raw_scan_facts_budgeted(
     wanted: &[&str],
     budget: &mut CaptureWorkBudget,
 ) -> Result<ElfExportFacts, String> {
-    let (abi, exports, excluded_anchor_ranges, work_units) = if budget
-        .retained_mapped_identity(file)
-        .is_some()
-    {
-        let facts = read_elf_snapshot(file, budget)?.raw_scan_facts(wanted)?;
-        (
-            facts.abi,
-            facts.exports,
-            facts.excluded_anchor_ranges,
-            facts.work_units,
-        )
-    } else if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
-        let mut metadata = None;
-        let (abi, exports) = read_inventory_export_facts_budgeted_with(
-            file,
-            wanted,
-            budget,
-            crate::attach::monotonic_ns,
-            |file, wanted, reservation| {
-                let facts =
-                    p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, reservation)?;
-                metadata = Some((facts.excluded_anchor_ranges, facts.work_units));
-                Ok((facts.abi, facts.exports, facts.structural_bytes))
-            },
-        )?;
-        let (ranges, work) = metadata.expect("successful raw ELF query returned metadata");
-        (abi, exports, ranges, work)
-    } else {
-        // Detailed retains its demand-paged structural post-read debit;
-        // no new whole-file gate is introduced for sparse objects.
-        let facts = p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, u64::MAX)?;
-        let remaining = budget.remaining_window_io().unwrap_or(0);
-        if facts.structural_bytes > remaining {
-            budget.record_io(usize::try_from(remaining).unwrap_or(usize::MAX));
-            return Err(format!("read failed: {IO_CEILING_REASON}"));
-        }
-        budget.record_io(usize::try_from(facts.structural_bytes).unwrap_or(usize::MAX));
-        (
-            facts.abi,
-            facts.exports,
-            facts.excluded_anchor_ranges,
-            facts.work_units,
-        )
-    };
+    let (abi, exports, excluded_anchor_ranges, work_units, getter_present, witness_fault) =
+        if budget.retained_mapped_identity(file).is_some() {
+            let facts = read_elf_snapshot(file, budget)?.raw_scan_facts(wanted)?;
+            (
+                facts.abi,
+                facts.exports,
+                facts.excluded_anchor_ranges,
+                facts.work_units,
+                facts.getter_present,
+                facts.witness_fault,
+            )
+        } else if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
+            let mut metadata = None;
+            let (abi, exports) = read_inventory_export_facts_budgeted_with(
+                file,
+                wanted,
+                budget,
+                crate::attach::monotonic_ns,
+                |file, wanted, reservation| {
+                    let facts = p11scope_manifest::elf::read_raw_scan_facts_bounded(
+                        file,
+                        wanted,
+                        reservation,
+                    )?;
+                    metadata = Some((
+                        facts.excluded_anchor_ranges,
+                        facts.work_units,
+                        facts.getter_present,
+                        facts.witness_fault,
+                    ));
+                    Ok((facts.abi, facts.exports, facts.structural_bytes))
+                },
+            )?;
+            let (ranges, work, getter_present, witness_fault) =
+                metadata.expect("successful raw ELF query returned metadata");
+            (abi, exports, ranges, work, getter_present, witness_fault)
+        } else {
+            // Detailed retains its demand-paged structural post-read debit;
+            // no new whole-file gate is introduced for sparse objects.
+            let facts =
+                p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, u64::MAX)?;
+            let remaining = budget.remaining_window_io().unwrap_or(0);
+            if facts.structural_bytes > remaining {
+                budget.record_io(usize::try_from(remaining).unwrap_or(usize::MAX));
+                return Err(format!("read failed: {IO_CEILING_REASON}"));
+            }
+            budget.record_io(usize::try_from(facts.structural_bytes).unwrap_or(usize::MAX));
+            (
+                facts.abi,
+                facts.exports,
+                facts.excluded_anchor_ranges,
+                facts.work_units,
+                facts.getter_present,
+                facts.witness_fault,
+            )
+        };
     budget.spend(work_units).map_err(str::to_string)?;
     if let Some(reason) = budget.check_deadline_now() {
         return Err(reason.into());
@@ -328,6 +340,8 @@ fn read_raw_scan_facts_budgeted(
     Ok(ElfExportFacts {
         abi,
         exports,
+        getter_present,
+        witness_fault,
         excluded_anchor_ranges,
     })
 }
@@ -888,6 +902,13 @@ pub(crate) struct InspectedFileKey {
 pub(crate) struct ElfExportFacts {
     pub(crate) abi: ElfAbi,
     pub(crate) exports: Vec<(String, u64)>,
+    /// A 3.x interface getter name appears among the image's dynamic
+    /// symbols in any symbol type, including non-definitions absent from
+    /// `exports` (see `RawScanElfFacts`).
+    pub(crate) getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol, so `exports` may be
+    /// incomplete (see `RawScanElfFacts`).
+    pub(crate) witness_fault: bool,
     pub(crate) excluded_anchor_ranges: Vec<(u64, u64)>,
 }
 
@@ -2064,7 +2085,8 @@ pub(crate) fn standard_ordinal(name: &str) -> Option<u16> {
 /// The export-linkage witness for one module's tables: the module object's
 /// own `.dynsym` definitions of standard names, `(name, file offset)`.
 /// Definitions only — `is_definition` excludes `STT_GNU_IFUNC`, whose value
-/// is a resolver, not the function — so an IFUNC name is simply absent.
+/// is a resolver, not the function — so an IFUNC name is simply absent
+/// from `symbols` (but still sets `getter_present`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ObjectExports<'a> {
     /// The object whose `.dynsym` was read. Only an entry that lands in this
@@ -2072,6 +2094,13 @@ pub(crate) struct ObjectExports<'a> {
     /// dependency's symbols it was not read from.
     pub(crate) object: ObjectKey,
     pub(crate) symbols: &'a [(String, u64)],
+    /// A 3.x interface getter name appears among the object's dynamic
+    /// symbols in any symbol type, including non-definitions absent from
+    /// `symbols`. Refuses the legacy-prefix proof.
+    pub(crate) getter_present: bool,
+    /// Sticky: the exports walk skipped a symbol, so `symbols` may be
+    /// incomplete. Refuses the legacy-prefix proof.
+    pub(crate) witness_fault: bool,
 }
 
 impl<'a> ObjectExports<'a> {
@@ -2083,6 +2112,8 @@ impl<'a> ObjectExports<'a> {
             inode: 0,
         },
         symbols: &[],
+        getter_present: false,
+        witness_fault: false,
     };
 
     /// Every definition of `name`, in dynsym order (a versioned name may
@@ -5168,6 +5199,8 @@ fn scan_view_examined_mode(
         let ElfExportFacts {
             abi,
             exports,
+            getter_present,
+            witness_fault,
             excluded_anchor_ranges,
         } = facts;
         let layout = target_layout(abi);
@@ -5266,6 +5299,8 @@ fn scan_view_examined_mode(
             let evidence = ObjectExports {
                 object: key,
                 symbols: &exports,
+                getter_present,
+                witness_fault,
             };
             let (tables, exhausted) = detect_tables_with_clock(
                 layout,
@@ -7197,6 +7232,8 @@ mod tests {
         let exports = ObjectExports {
             object: table.entries[0].object,
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         for version in [(2, 40), (3, 0), (3, 1), (3, 2)] {
             table.version = version;
@@ -7278,6 +7315,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         let (tables, skipped) = detect_tables_with_clock(
             LinuxLayout::Lp64,
@@ -7314,6 +7353,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         for word in [0x2802u64, 0x0003, 0x0103] {
             let mut snapshot = vec![0u8; 105 * 8];
@@ -7444,6 +7485,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         for word in [0x2802u64, 0x0003, 0x0103, 0x0203, 0xe707] {
             let mut snapshot = vec![0u8; 69 * 8];
@@ -7568,6 +7611,8 @@ mod tests {
         let exports = ObjectExports {
             object,
             symbols: &facts.exports,
+            getter_present: facts.getter_present,
+            witness_fault: facts.witness_fault,
         };
         for (header, walk) in [(0x2802u64, "full"), (0xa5a5_0000_0000_e707, "known_prefix")] {
             snapshot[..8].copy_from_slice(&header.to_le_bytes());
@@ -7601,6 +7646,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         // Actual ABI26 LP64 rv64 shape: GNU property value 3 looks like
         // version 3.0, 66 padding words are NULL, and .init_array/.fini_array
@@ -7703,6 +7750,8 @@ mod tests {
                     inode,
                 },
                 symbols: &[],
+                getter_present: false,
+                witness_fault: false,
             };
             let (tables, skipped) = detect_tables_with_clock(
                 LinuxLayout::Lp64,
@@ -7734,6 +7783,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         let mut snapshot = vec![0u8; 69 * 8];
         snapshot[..8].copy_from_slice(&0xa5a5_0000_0000_e707u64.to_le_bytes());
@@ -7845,6 +7896,8 @@ mod tests {
                     .collect(),
                 object: PinnedObjectId(object),
                 exports: exports.into(),
+                getter_present: false,
+                witness_fault: false,
                 scanned: ScannedModule {
                     mapped_identity: None,
                     view: ProcessViewId(object),
@@ -7880,6 +7933,8 @@ mod tests {
             &ObjectExports {
                 object: tail.scanned.key,
                 symbols: &tail.exports,
+                getter_present: tail.getter_present,
+                witness_fault: tail.witness_fault,
             },
         );
         assert!(!table_name_authorized(&score));
@@ -7945,6 +8000,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         let mut budget = CaptureWorkBudget::default();
         assert!(budget.charge(DEFAULT_WORK_CEILING - 8));
@@ -11560,6 +11617,8 @@ mod tests {
         let facts = ElfExportFacts {
             abi: ElfAbi::Lp64,
             exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
             excluded_anchor_ranges: Vec::new(),
         };
         assert!(budget.note_elf_export_facts(key(1), facts.clone()));
@@ -11587,6 +11646,8 @@ mod tests {
         let exact = ElfExportFacts {
             abi: ElfAbi::Lp64,
             exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
             excluded_anchor_ranges: Vec::new(),
         };
         let exact_bytes = export_cache_bytes(&key, &exact);
@@ -11603,6 +11664,8 @@ mod tests {
         let one_over = ElfExportFacts {
             abi: exact.abi,
             exports: vec![("C_GetFunctionList_".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
             excluded_anchor_ranges: Vec::new(),
         };
         assert_eq!(export_cache_bytes(&key, &one_over), exact_bytes + 1);

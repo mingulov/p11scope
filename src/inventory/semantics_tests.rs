@@ -154,6 +154,8 @@ impl ProviderFixture {
             object,
             entry_objects: vec![vec![object; 2]],
             exports: std::sync::Arc::from(Vec::new()),
+            getter_present: false,
+            witness_fault: false,
         }
     }
 

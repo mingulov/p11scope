@@ -4860,6 +4860,8 @@ pub(crate) mod tests {
         let object = crate::plan::TEST_PINNED_OBJECT;
         let plan = crate::plan::build_from_reconciled_modules(&[ReconciledModule {
             exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
             object,
             entry_objects: vec![vec![object, object], vec![object]],
             scanned: ScannedModule {
@@ -4968,6 +4970,8 @@ pub(crate) mod tests {
         };
         let plan = crate::plan::build_from_reconciled_modules(&[ReconciledModule {
             exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
             object: crate::plan::TEST_PINNED_OBJECT,
             entry_objects: vec![vec![crate::plan::TEST_PINNED_OBJECT]],
             scanned: ScannedModule {
@@ -6243,22 +6247,13 @@ pub(crate) mod tests {
         snapshot
     }
 
-    fn observation_for_decoded_table(
-        snapshot: &[u8],
-        exports: std::sync::Arc<[(String, u64)]>,
-        hook_exports: Vec<String>,
-        expect_walk: &str,
-    ) -> GapClasses {
-        use crate::discovery::identity::{PinnedObjectId, ReconciledModule};
-        use crate::discovery::scan::{CaptureWorkBudget, ScannedModule, decode_exact_table};
-        use crate::plan::build_from_reconciled_modules;
-        use crate::process::{MountNamespaceId, ProcessViewId};
-        use p11scope_manifest::elf::ElfAbi;
+    fn decode_fedora_table(snapshot: &[u8]) -> crate::discovery::scan::ScannedTable {
+        use crate::discovery::scan::{CaptureWorkBudget, decode_exact_table};
         use p11scope_manifest::maps::MapIndex;
 
         let maps = fedora_fixture_maps();
         let map_index = MapIndex::new(&maps).unwrap();
-        let table = decode_exact_table(
+        decode_exact_table(
             snapshot,
             0x7000,
             pkcs11_module::LinuxLayout::Lp64,
@@ -6267,12 +6262,38 @@ pub(crate) mod tests {
             None,
         )
         .expect("budget must admit the table")
-        .expect("the fixture table must decode");
+        .expect("the fixture table must decode")
+    }
+
+    fn observation_for_decoded_table(
+        snapshot: &[u8],
+        exports: std::sync::Arc<[(String, u64)]>,
+        hook_exports: Vec<String>,
+        expect_walk: &str,
+    ) -> GapClasses {
+        let table = decode_fedora_table(snapshot);
         assert_eq!(table.decoded_slot_count(), 68);
         assert_eq!(
             table.walk, "known_prefix",
             "the scan keeps the mislabelling quirk label"
         );
+        observation_for_table(table, exports, hook_exports, expect_walk, false, false)
+    }
+
+    fn observation_for_table(
+        table: crate::discovery::scan::ScannedTable,
+        exports: std::sync::Arc<[(String, u64)]>,
+        hook_exports: Vec<String>,
+        expect_walk: &str,
+        getter_present: bool,
+        witness_fault: bool,
+    ) -> GapClasses {
+        use crate::discovery::identity::{PinnedObjectId, ReconciledModule};
+        use crate::discovery::scan::ScannedModule;
+        use crate::plan::build_from_reconciled_modules;
+        use crate::process::{MountNamespaceId, ProcessViewId};
+        use p11scope_manifest::elf::ElfAbi;
+
         let key = table.entries[0].object;
         let object = PinnedObjectId(0);
         let entry_count = table.entries.len();
@@ -6296,6 +6317,8 @@ pub(crate) mod tests {
             object,
             entry_objects: vec![vec![object; entry_count]],
             exports,
+            getter_present,
+            witness_fault,
         };
         let plan = build_from_reconciled_modules(std::slice::from_ref(&reconciled));
         assert_eq!(plan.surfaces.len(), 1);
@@ -6401,6 +6424,201 @@ pub(crate) mod tests {
         );
     }
 
+    fn extension_failure_at_92_snapshot() -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 0..92 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for slot in 92..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        snapshot
+    }
+
+    fn extension_failure_at_68_snapshot() -> Vec<u8> {
+        let mut snapshot = vec![0u8; 8 + 104 * 8];
+        snapshot[..8].copy_from_slice(&0x0203u64.to_le_bytes());
+        for slot in 0..68 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        for slot in 68..104 {
+            let at = 8 + slot * 8;
+            snapshot[at..at + 8].copy_from_slice(&0x4500u64.to_le_bytes());
+        }
+        snapshot
+    }
+
+    #[test]
+    fn extension_failure_past_the_refutation_range_stays_lossy() {
+        // Slots 68..91 are real functions, so the table may be a genuine
+        // 92-wide 3.0/3.1 table mislabelled 3.2; the failure at 92 refutes
+        // nothing and the 68-slot prefix stays unproven.
+        let table = decode_fedora_table(&extension_failure_at_92_snapshot());
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            !table.extension_impossible,
+            "a failure at 92 is outside 68..92 and proves nothing"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an unrefuted 92-wide hypothesis keeps surfaces lossy: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn extension_failure_at_the_first_refutation_ordinal_is_exact() {
+        // The failure at exactly 68 refutes the 92-wide hypothesis, so the
+        // proven prefix reports full: the lower bound of 68..92 is inclusive.
+        let table = decode_fedora_table(&extension_failure_at_68_snapshot());
+        assert_eq!(table.decoded_slot_count(), 68);
+        assert_eq!(table.walk, "known_prefix");
+        assert!(
+            table.extension_impossible,
+            "a failure exactly at 68 is inside 68..92"
+        );
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "full",
+            false,
+            false,
+        );
+        assert_eq!(
+            classes.observation.status, "exact",
+            "a failure at 68 proves the prefix complete: {:?}",
+            classes.observation.causes
+        );
+        assert!(
+            classes.observation.causes.is_empty(),
+            "no observation gap: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_an_unpinned_entry_stays_lossy() {
+        use crate::discovery::scan::Skipped;
+
+        // A stripped-provider shape: one entry could not be pinned (its
+        // target lies in an object reconciliation could not open), so it
+        // moved to `unpinned` under its ordinal label while the witness
+        // lacks that name. Every pinned entry agrees; only the unpinned
+        // record refuses the proof.
+        let mut table = decode_fedora_table(&fedora_shaped_snapshot());
+        let moved = table.entries.pop().expect("68 decoded entries");
+        table.unpinned.push(Skipped {
+            subject: moved.name.to_string(),
+            reason: "/lib/dep.so could not be reconciled to a comparable pinned object; \
+                     entry was not attached"
+                .into(),
+        });
+        assert_eq!(table.decoded_slot_count(), 68);
+        let mut names: Vec<(String, u64)> = fedora_exports_without_interface_getters().to_vec();
+        names.retain(|(name, _)| *name != moved.name);
+        assert_eq!(names.len(), 67);
+        let classes = observation_for_table(
+            table,
+            names.into(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "an unpinned entry keeps the surface unproven: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_a_fileless_table_stays_lossy() {
+        // An anonymous/heap table has no file owner, so export agreement
+        // cannot authorize it: a missing file offset refuses the proof.
+        let mut table = decode_fedora_table(&fedora_shaped_snapshot());
+        table.file_offset = None;
+        let classes = observation_for_table(
+            table,
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "a fileless table keeps the surface unproven: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_an_ifunc_interface_getter_stays_lossy() {
+        // The witness lists definitions only, so an IFUNC (or absolute)
+        // getter is absent from `symbols`; the presence bit records it
+        // anyway and refuses the proof: a 3.x route may exist.
+        let exports = fedora_exports_without_interface_getters();
+        assert!(
+            !exports
+                .iter()
+                .any(|(name, _)| name == "C_GetInterface" || name == "C_GetInterfaceList"),
+            "an IFUNC getter leaves no definition in the witness"
+        );
+        let classes = observation_for_table(
+            decode_fedora_table(&fedora_shaped_snapshot()),
+            exports,
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            true,
+            false,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "a getter in any symbol type keeps a 3.x route reachable: {:?}",
+            classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn fedora_shape_with_a_faulted_exports_walk_stays_lossy() {
+        // The exports walk skipped a symbol it could not read or
+        // translate, so the witness may be incomplete: the sticky fault
+        // refuses the proof.
+        let classes = observation_for_table(
+            decode_fedora_table(&fedora_shaped_snapshot()),
+            fedora_exports_without_interface_getters(),
+            vec!["C_GetFunctionList".into()],
+            "known_prefix",
+            false,
+            true,
+        );
+        assert_eq!(classes.observation.status, "lossy");
+        assert!(
+            classes.observation.causes.contains(&"surfaces"),
+            "a faulted walk cannot prove getter absence: {:?}",
+            classes.observation.causes
+        );
+    }
+
     #[test]
     fn genuine_104_slot_32_table_stays_full() {
         use crate::discovery::identity::{PinnedObjectId, ReconciledModule};
@@ -6461,6 +6679,8 @@ pub(crate) mod tests {
             object,
             entry_objects: vec![vec![object; 104]],
             exports,
+            getter_present: false,
+            witness_fault: false,
         };
         let plan = build_from_reconciled_modules(std::slice::from_ref(&reconciled));
         assert_eq!(plan.surfaces.len(), 1);

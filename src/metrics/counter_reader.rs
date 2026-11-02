@@ -4665,6 +4665,8 @@ mod tests {
             object,
             entry_objects: vec![vec![object; slots.len()]],
             exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
         }
     }
 

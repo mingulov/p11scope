@@ -775,6 +775,8 @@ pub(super) mod tests {
             object,
             entry_objects: vec![vec![object]],
             exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
             scanned: ScannedModule {
                 mapped_identity: None,
                 double_loaded: false,

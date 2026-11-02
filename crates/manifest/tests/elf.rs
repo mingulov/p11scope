@@ -1220,3 +1220,209 @@ int main(void) { return puts("metadata fixture"); }
         );
     }
 }
+
+/// File range of section-header-table entry `index` (ELF64).
+fn section_range(bytes: &[u8], index: usize) -> (usize, usize) {
+    let (start, size, count) = section_table(bytes);
+    assert!(index < count, "section {index} of {count}");
+    let header = start + index * size;
+    (
+        le_u64(bytes, header + 24).try_into().unwrap(),
+        le_u64(bytes, header + 32).try_into().unwrap(),
+    )
+}
+
+/// Header-table index of the first section of type `kind`.
+fn section_index(bytes: &[u8], kind: u32) -> Option<usize> {
+    let (start, size, count) = section_table(bytes);
+    (0..count).find(|index| {
+        let header = start + index * size;
+        u32::from_le_bytes(bytes[header + 4..header + 8].try_into().unwrap()) == kind
+    })
+}
+
+/// `.dynsym` file range plus the linked string table's file range.
+fn dynsym_ranges(bytes: &[u8]) -> ((usize, usize), (usize, usize)) {
+    let (start, size, _) = section_table(bytes);
+    let index = section_index(bytes, elf::SHT_DYNSYM).expect("fixture has .dynsym");
+    let header = start + index * size;
+    let link = u32::from_le_bytes(bytes[header + 40..header + 44].try_into().unwrap()) as usize;
+    (section_range(bytes, index), section_range(bytes, link))
+}
+
+/// File offset of the `.dynsym` entry naming `name`.
+fn dynsym_entry(bytes: &[u8], name: &str) -> Option<usize> {
+    let ((sym_off, sym_len), (str_off, str_len)) = dynsym_ranges(bytes);
+    assert_eq!(sym_len % 24, 0, "ELF64 symbols are 24 bytes");
+    (0..sym_len / 24).map(|i| sym_off + i * 24).find(|at| {
+        let name_off = u32::from_le_bytes(bytes[*at..*at + 4].try_into().unwrap()) as usize;
+        if name_off >= str_len {
+            return false;
+        }
+        let end = str_off + name_off;
+        let rest = &bytes[end..str_off + str_len];
+        let nul = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+        &rest[..nul] == name.as_bytes()
+    })
+}
+
+#[test]
+fn ifunc_getter_sets_presence_bit_but_stays_out_of_definitions() {
+    use object::{Object as _, ObjectSymbol as _};
+
+    let d = tmp("elf-ifunc-getter");
+    let so = cc_so(
+        &d,
+        "ifunc-provider",
+        "unsigned long C_Initialize(void) { return 0; }\n\
+         static unsigned long get_interface_impl(void) { return 0; }\n\
+         static void *get_interface_resolver(void) { return (void *)get_interface_impl; }\n\
+         unsigned long C_GetInterface(void) __attribute__((ifunc(\"get_interface_resolver\")));\n",
+    );
+    let bytes = std::fs::read(&so).unwrap();
+    // The fixture really exports `C_GetInterface` as an indirect function:
+    // raw type STT_GNU_IFUNC (10), which `is_definition` excludes.
+    let entry = dynsym_entry(&bytes, "C_GetInterface").expect("dynsym names the getter");
+    assert_eq!(
+        bytes[entry + 4] & 0xf,
+        10,
+        "C_GetInterface must be STT_GNU_IFUNC"
+    );
+    let object = object::File::parse(bytes.as_slice()).unwrap();
+    let getter = object
+        .dynamic_symbols()
+        .find(|symbol| symbol.name() == Ok("C_GetInterface"))
+        .expect("dynamic symbols name the getter");
+    assert!(
+        !getter.is_definition(),
+        "IFUNC is not a definition: the witness filter hides it"
+    );
+
+    let wanted = [
+        "C_GetInterface",
+        "C_GetInterfaceList",
+        "C_Initialize",
+        "C_GetFunctionList",
+    ];
+    let file = p11scope_manifest::identity::open_object(&so).unwrap();
+    let snapshot = ElfSnapshot::read(&file).unwrap();
+    let facts = snapshot.raw_scan_facts(&wanted).unwrap();
+    let names: Vec<&str> = facts
+        .exports
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["C_Initialize"],
+        "definitions only: the IFUNC getter stays out of exports"
+    );
+    assert!(
+        facts.getter_present,
+        "the presence bit sees the getter whatever its symbol type"
+    );
+    assert!(!facts.witness_fault, "a healthy image walks without faults");
+
+    let inspected = p11scope_manifest::identity::inspect_file_with_reader_exporting(
+        &file,
+        |file, bytes, offset| file.read_at(bytes, offset),
+        &wanted,
+    )
+    .unwrap();
+    assert!(
+        !inspected
+            .exports
+            .iter()
+            .any(|(name, _)| name == "C_GetInterface"),
+        "the pinned inspection lists definitions only"
+    );
+    assert!(
+        inspected.getter_present,
+        "the pinned inspection records the presence bit"
+    );
+    assert!(!inspected.witness_fault);
+
+    assert!(
+        !exports_matching(&file, &wanted)
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name == "C_GetInterface"),
+        "the frozen export API keeps listing definitions only"
+    );
+}
+
+#[test]
+fn per_symbol_faults_set_the_sticky_witness_flag() {
+    let d = tmp("elf-witness-fault");
+    let source = "unsigned long C_Initialize(void) { return 0; }\n\
+         unsigned long C_GetFunctionList(void **p) { (void)p; return 0; }\n";
+    let wanted = ["C_Initialize", "C_GetFunctionList"];
+    let corrupt = |name: &str, patch: &dyn Fn(&mut Vec<u8>)| {
+        let path = cc_so(&d, name, source);
+        let mut bytes = std::fs::read(&path).unwrap();
+        patch(&mut bytes);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+
+    let healthy = cc_so(&d, "healthy", source);
+    let file = p11scope_manifest::identity::open_object(&healthy).unwrap();
+    let facts = ElfSnapshot::read(&file)
+        .unwrap()
+        .raw_scan_facts(&wanted)
+        .unwrap();
+    assert_eq!(facts.exports.len(), 2, "healthy control exports both");
+    assert!(!facts.getter_present);
+    assert!(!facts.witness_fault, "healthy control walks without faults");
+
+    // A name offset past the string table: the walk cannot read the name.
+    let bad_name = corrupt("bad-name", &|bytes| {
+        let entry = dynsym_entry(bytes, "C_Initialize").expect("dynsym names it");
+        bytes[entry..entry + 4].copy_from_slice(&0x00ff_ffff_u32.to_le_bytes());
+    });
+    let file = p11scope_manifest::identity::open_object(&bad_name).unwrap();
+    let facts = ElfSnapshot::read(&file)
+        .unwrap()
+        .raw_scan_facts(&wanted)
+        .unwrap();
+    assert!(
+        !facts.exports.iter().any(|(name, _)| name == "C_Initialize"),
+        "the unreadable name drops out of exports"
+    );
+    assert!(
+        facts.witness_fault,
+        "an unreadable name sets the sticky fault"
+    );
+    let inspected = p11scope_manifest::identity::inspect_file_with_reader_exporting(
+        &file,
+        |file, bytes, offset| file.read_at(bytes, offset),
+        &wanted,
+    )
+    .unwrap();
+    assert!(
+        inspected.witness_fault,
+        "the pinned inspection records the fault"
+    );
+
+    // A wanted definition outside every segment: untranslatable address.
+    let bad_address = corrupt("bad-address", &|bytes| {
+        let entry = dynsym_entry(bytes, "C_GetFunctionList").expect("dynsym names it");
+        bytes[entry + 8..entry + 16].copy_from_slice(&(u64::MAX - 4096).to_le_bytes());
+    });
+    let file = p11scope_manifest::identity::open_object(&bad_address).unwrap();
+    let facts = ElfSnapshot::read(&file)
+        .unwrap()
+        .raw_scan_facts(&wanted)
+        .unwrap();
+    assert!(
+        !facts
+            .exports
+            .iter()
+            .any(|(name, _)| name == "C_GetFunctionList"),
+        "the untranslatable definition drops out of exports"
+    );
+    assert!(
+        facts.witness_fault,
+        "an untranslatable address sets the sticky fault"
+    );
+}

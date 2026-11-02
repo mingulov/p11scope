@@ -62,6 +62,8 @@ fn build_from_modules(modules: &[p11scope::discovery::scan::ScannedModule]) -> A
         .cloned()
         .map(|scanned| ReconciledModule {
             exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
             object: PinnedObjectId(scanned.key.inode as u32),
             entry_objects: scanned
                 .tables
@@ -120,6 +122,8 @@ fn build_authorized_from_modules(
 fn equal_raw_keys_with_distinct_pinned_objects_never_share_slots() {
     let reconcile = |module, object, targets: Vec<u32>| ReconciledModule {
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
         scanned: module,
         object: PinnedObjectId(object),
         entry_objects: vec![targets.into_iter().map(PinnedObjectId).collect()],
@@ -163,6 +167,8 @@ fn equal_raw_keys_with_distinct_pinned_objects_never_share_slots() {
 fn one_exact_pinned_object_keeps_every_views_nonempty_target_union() {
     let reconcile = |module, targets: Vec<u32>| ReconciledModule {
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
         scanned: module,
         object: PinnedObjectId(7),
         entry_objects: vec![targets.into_iter().map(PinnedObjectId).collect()],

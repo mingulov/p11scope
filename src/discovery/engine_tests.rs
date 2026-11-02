@@ -26884,6 +26884,8 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
     };
     let module = |view, object, path: &str, offset| ReconciledModule {
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
         object,
         entry_objects: vec![vec![object]],
         scanned: ScannedModule {
@@ -26974,6 +26976,8 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
     };
     let module = |view: ProcessViewId, path: &str| ReconciledModule {
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
         object: PinnedObjectId(200),
         entry_objects: vec![vec![PinnedObjectId(200)]],
         scanned: ScannedModule {
@@ -27043,6 +27047,8 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
     };
     let module = |object| ReconciledModule {
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
         object,
         entry_objects: vec![vec![object]],
         scanned: ScannedModule {
@@ -31240,6 +31246,8 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
     engine.next_view_id = 1;
     engine.modules = vec![ReconciledModule {
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
         object: PinnedObjectId(7),
         scanned: ScannedModule {
             mapped_identity: None,
@@ -31413,6 +31421,8 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             name: "module without opened identity",
             modules: vec![ReconciledModule {
                 exports: Default::default(),
+                getter_present: false,
+                witness_fault: false,
                 object: object_without_identity,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
@@ -31434,6 +31444,8 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             name: "table without parallel identities",
             modules: vec![ReconciledModule {
                 exports: Default::default(),
+                getter_present: false,
+                witness_fault: false,
                 object: so_id,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: Vec::new(),
@@ -31447,6 +31459,8 @@ fn merge_preflight_agrees_with_merge_on_failure_modes() {
             name: "entry target without identity",
             modules: vec![ReconciledModule {
                 exports: Default::default(),
+                getter_present: false,
+                witness_fault: false,
                 object: so_id,
                 scanned: reconciled.scanned.clone(),
                 entry_objects: vec![vec![
@@ -46970,6 +46984,8 @@ fn midfinal_res3_provider_module(view: ProcessViewId, offsets: &[u64]) -> Reconc
     let object = PinnedObjectId(100);
     ReconciledModule {
         exports: Default::default(),
+        getter_present: false,
+        witness_fault: false,
         object,
         entry_objects: vec![offsets.iter().map(|_| object).collect()],
         scanned: ScannedModule {

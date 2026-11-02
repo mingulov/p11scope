@@ -3705,6 +3705,8 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
     let exports = ObjectExports {
         object: scanned.key,
         symbols: &module.exports,
+        getter_present: module.getter_present,
+        witness_fault: module.witness_fault,
     };
     let mut tables = Vec::new();
     let mut surfaces = Vec::new();
@@ -6244,6 +6246,8 @@ mod tests {
         let object = PinnedObjectId(key.inode as u32);
         ReconciledModule {
             exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
             object,
             entry_objects: vec![vec![object; entries.len()]],
             scanned: ScannedModule {

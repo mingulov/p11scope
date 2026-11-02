@@ -47,6 +47,7 @@ const MSG_PAUSE_RESUME_DEADLINE: &str = "pause resume observation deadline cross
 const MSG_PAUSE_CAUSAL_DEADLINE: &str = "pause causal deadline crossed";
 const MSG_COALESCED_RECORD_DEADLINE: &str = "coalesced record crossed winner deadline";
 const MSG_UNSERVICED_AT_CLEANUP: &str = "the capture ended before a pause cycle serviced its stop";
+const MSG_TASK_SET_CHANGED: &str = "task set changed or was not entirely stopped";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PauseDiagnostic {
@@ -379,7 +380,6 @@ pub(crate) struct PauseCoordinator {
     /// Kernel start time (boot-relative ticks) of each expected task: thread
     /// identity is the (tid, start time) pair, so a reused tid never passes
     /// as the thread the preflight saw.
-    #[allow(dead_code)]
     expected_starts: BTreeMap<u32, u64>,
     counters: PauseCounters,
     epoch: PauseEpoch,
@@ -392,7 +392,6 @@ pub(crate) struct PauseCoordinator {
     /// Boot clock read beside `armed_at_ns`: the same arm instant in the
     /// start-time-tick domain, so threads born after the arm date as covered.
     /// `None` (no arm, or an unreadable boot clock) dates nothing as covered.
-    #[allow(dead_code)]
     armed_boot_ns: Option<u64>,
     rearming_enabled: bool,
     may_be_stopped: bool,
@@ -461,6 +460,9 @@ impl PauseCoordinator {
         let expected_tasks = io
             .task_states(child.pid())
             .map_err(|error| Self::policy_error(policy, error, true))?;
+        let task_starts = io
+            .task_starts(child.pid())
+            .map_err(|error| Self::policy_error(policy, error, true))?;
         if expected_tasks.is_empty() || !child.pin().still_the_same() {
             return Err(Self::policy_error(
                 policy,
@@ -468,12 +470,24 @@ impl PauseCoordinator {
                 true,
             ));
         }
-        Ok(Self::new(
+        let mut coordinator = Self::new(
             policy,
             child.pid(),
             child.generation().get(),
             expected_tasks,
-        ))
+        );
+        let tids: Vec<u32> = coordinator.expected_tasks.keys().copied().collect();
+        for tid in tids {
+            let Some(start) = task_starts.get(&tid).copied() else {
+                return Err(Self::policy_error(
+                    policy,
+                    format!("cannot read task {tid} start time during pause preflight"),
+                    true,
+                ));
+            };
+            coordinator.expected_starts.insert(tid, start);
+        }
+        Ok(coordinator)
     }
 
     fn new(
@@ -564,6 +578,7 @@ impl PauseCoordinator {
             }
         };
         let armed_at = io.now_ns().ok();
+        let armed_boot = io.boot_ns().ok();
         if let Err(error) = io.arm() {
             return self.arm_cleanup_failed(io, error, false);
         }
@@ -571,6 +586,7 @@ impl PauseCoordinator {
             Ok(Some(PAUSE_ARMED)) => {
                 self.armed = true;
                 self.armed_at_ns = armed_at;
+                self.armed_boot_ns = armed_boot;
                 self.successors_left = MAX_SUCCESSORS_PER_ARM;
                 Ok(ArmResult::Armed)
             }
@@ -1135,6 +1151,7 @@ impl PauseCoordinator {
                 return self.fail_cycle(io, error.to_string(), lifecycle);
             }
             let armed_at = io.now_ns().ok();
+            let armed_boot = io.boot_ns().ok();
             if let Err(error) = io.arm() {
                 return self.fail_cycle(io, error, true);
             }
@@ -1146,6 +1163,7 @@ impl PauseCoordinator {
                 return self.fail_cycle(io, "successor was consumed before prior resume", true);
             }
             self.armed_at_ns = armed_at;
+            self.armed_boot_ns = armed_boot;
             successor_baseline = match io.ring_loss() {
                 Ok(loss) => Some(loss),
                 Err(error) => return self.fail_cycle(io, error, true),
@@ -1398,18 +1416,68 @@ impl PauseCoordinator {
         self.finish_nonconfirmed(retained_error.unwrap_or_else(|| MSG_PAUSE_HELPER_REJECTED.into()))
     }
 
-    fn sample_stopped(&self, io: &mut impl PauseIo, deadline: u64) -> Result<u64, String> {
+    fn sample_stopped(&mut self, io: &mut impl PauseIo, deadline: u64) -> Result<u64, String> {
         let states = io.task_states(self.pid)?;
+        let starts = io.task_starts(self.pid)?;
         let now = io.now_ns()?;
         if now > deadline {
             return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
         }
-        if states.keys().ne(self.expected_tasks.keys())
-            || states.values().any(|state| *state != b'T')
-        {
-            return Err("task set changed or was not entirely stopped".into());
+        let births = self.covered_births(&states, &starts)?;
+        if states.values().any(|state| *state != b'T') {
+            return Err(MSG_TASK_SET_CHANGED.into());
+        }
+        for (tid, start) in births {
+            if let Some(state) = states.get(&tid) {
+                self.expected_tasks.insert(tid, *state);
+            }
+            self.expected_starts.insert(tid, start);
         }
         Ok(now)
+    }
+
+    /// Threads born after the arm, by more than one tick of margin, that this
+    /// sample may adopt into the expected set. Every other change — a missing
+    /// expected tid, a reused tid (same tid, different start time), a birth at
+    /// or within one tick of the arm, an unreadable start time, or no recorded
+    /// arm boot instant — keeps today's task-set refusal.
+    fn covered_births(
+        &self,
+        states: &BTreeMap<u32, u8>,
+        starts: &BTreeMap<u32, u64>,
+    ) -> Result<Vec<(u32, u64)>, String> {
+        for tid in self.expected_tasks.keys() {
+            if !states.contains_key(tid) {
+                return Err(MSG_TASK_SET_CHANGED.into());
+            }
+        }
+        let mut births = Vec::new();
+        for tid in states.keys() {
+            let known = self.expected_tasks.contains_key(tid);
+            match (
+                known,
+                self.expected_starts.get(tid),
+                starts.get(tid).copied(),
+            ) {
+                (true, Some(recorded), Some(start)) if start == *recorded => {}
+                (false, None, Some(start)) if self.birth_covered(start) => {
+                    births.push((*tid, start));
+                }
+                _ => return Err(MSG_TASK_SET_CHANGED.into()),
+            }
+        }
+        Ok(births)
+    }
+
+    /// Whether a start-time tick dates strictly more than one tick after the
+    /// arm. The tick floor is a lower bound on the true birth, so a satisfied
+    /// check proves the margin; an unrecorded arm instant covers nothing.
+    fn birth_covered(&self, start_ticks: u64) -> bool {
+        let Some(armed_boot) = self.armed_boot_ns else {
+            return false;
+        };
+        let tick = clock_tick_ns();
+        start_ticks.saturating_mul(tick) > armed_boot.saturating_add(tick)
     }
 
     fn observe_resumed(
@@ -2770,6 +2838,21 @@ fn parse_task_start(stat: &[u8]) -> Option<u64> {
         .filter(|token| !token.is_empty())
         .nth(19)?;
     std::str::from_utf8(field).ok()?.parse().ok()
+}
+
+/// The kernel clock tick in nanoseconds (`sysconf(_SC_CLK_TCK)`), cached:
+/// start-time ticks quantize births to this granularity, so the covered margin
+/// is strict in whole ticks. Falls back to USER_HZ 100 when the sysconf read
+/// fails.
+fn clock_tick_ns() -> u64 {
+    static TICK_NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TICK_NS.get_or_init(|| {
+        // SAFETY: `sysconf` takes only the name constant and returns the
+        // configured value or -1; it writes through no pointer.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let hz = if hz > 0 { hz as u64 } else { 100 };
+        1_000_000_000 / hz
+    })
 }
 
 /// `CLOCK_BOOTTIME` in nanoseconds: the clock domain of `/proc` starttime

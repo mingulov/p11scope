@@ -6301,6 +6301,158 @@ mod tests {
     }
 
     #[test]
+    fn k0_comparable_losses_subtracts_exit_ended_truncations() {
+        // The K0 window compares the live total minus the exit-only
+        // loader-scan truncations, which prove their process exited
+        // and are not discovery loss. Other lanes pass through, and
+        // the subtraction saturates.
+        let mut facts = crate::render::CaptureFacts::default();
+        facts.discovery_ring_loss = 5;
+        facts.discovery_state_failures = 6;
+        facts.discovery_read_failures = 7;
+        facts.discovery_truncated = 3;
+        facts.exit_ended_truncations = 2;
+        assert_eq!(k0_comparable_losses(&facts), [5, 6, 7, 1]);
+        facts.exit_ended_truncations = 9;
+        assert_eq!(k0_comparable_losses(&facts), [5, 6, 7, 0]);
+    }
+
+    #[test]
+    fn k0_exit_only_truncation_growth_renders() {
+        // Contract step 1 voids on real truncation growth only: the
+        // window's totals grew by an exit-ended loader-scan
+        // truncation (a short `run` child that exited before its
+        // provider load was processed), so the comparable losses are
+        // unchanged and the detail renders.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let mut before_facts = crate::render::CaptureFacts::default();
+        before_facts.discovery_truncated = 1;
+        before_facts.exit_ended_truncations = 1;
+        let window = open_k0_window_with_losses(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            k0_comparable_losses(&before_facts),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let mut after_facts = crate::render::CaptureFacts::default();
+        after_facts.discovery_truncated = 2;
+        after_facts.exit_ended_truncations = 2;
+        assert!(
+            after_facts.discovery_losses()[3] > before_facts.discovery_losses()[3],
+            "the raw totals grew: the condition that used to void"
+        );
+        close_k0_window_with_losses(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            k0_comparable_losses(&after_facts),
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            None,
+            "exit-only growth renders"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_some());
+    }
+
+    #[test]
+    fn k0_mixed_truncation_growth_voids_as_broad_stopping() {
+        // The totals grew by an exit-ended truncation and a real one:
+        // the comparable losses grew, so the window still voids as
+        // `broad_stopping`.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let mut before_facts = crate::render::CaptureFacts::default();
+        before_facts.discovery_truncated = 1;
+        before_facts.exit_ended_truncations = 1;
+        let window = open_k0_window_with_losses(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            k0_comparable_losses(&before_facts),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let mut after_facts = crate::render::CaptureFacts::default();
+        after_facts.discovery_truncated = 3;
+        after_facts.exit_ended_truncations = 2;
+        close_k0_window_with_losses(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            k0_comparable_losses(&after_facts),
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("broad_stopping"),
+            "mixed growth voids"
+        );
+    }
+
+    #[test]
     fn k0_truncation_and_retired_voids_as_broad_stopping() {
         // Precedence: truncation growth beats a retired slot —
         // contract step 1 wins over step 2, so the word pins the order.

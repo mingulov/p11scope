@@ -17223,6 +17223,169 @@ fn rt_add_deferral_cancellation_or_shutdown_settles_pending_as_loss() {
     }));
 }
 
+/// The exit-only split: a deferred scan settled at a proven process
+/// exit counts toward the exit-only truncation count (site 3,
+/// `queue_retirement` with `ExpectedRemoval`), while the existing
+/// total keeps counting it too.
+#[test]
+fn exit_ended_loader_scan_counts_exit_only_on_expected_removal() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    let mut pending_views = PendingViewRetirements::new();
+
+    let before = engine.capture_facts().discovery_losses()[3];
+    engine.queue_retirement(
+        ProcessViewId(0),
+        RetirementCause::ExpectedRemoval,
+        &mut pending_views,
+    );
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(engine.capture_facts().exit_ended_truncations(), 1);
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live loader memory discovery"
+            && skip.reason.contains("expected process exit")
+    }));
+}
+
+/// Site 1 (`service_pending_loader_scans` fallback after exit): the
+/// fallback scan fails on the dead process, the live pin proves the
+/// exit, and the truncation counts exit-only. No retirement is
+/// queued, so this pins site 1 rather than site 3.
+#[test]
+fn exit_ended_loader_scan_counts_exit_only_on_fallback_after_exit() {
+    let (mut fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    assert!(engine.original_exited(ProcessViewId(0)));
+
+    let before = engine.capture_facts().discovery_losses()[3];
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert!(engine.retirement_intents.is_empty());
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(engine.capture_facts().exit_ended_truncations(), 1);
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live loader memory discovery"
+            && skip.reason.contains("expected process exit")
+    }));
+}
+
+/// Site 2 (`process_loader_record` RT_ADD settle after exit): the
+/// settle passes `ended = original_exited(view)`. A live exit race
+/// is the only production trigger (the child exits mid-scan: maps
+/// validation passes on the live process, the scan then fails), and
+/// no deterministic seam fails a metadata scan on a live process
+/// while a dead one fails earlier at maps validation — so this twin
+/// performs site 2's exact settle with a genuinely dead child (live
+/// pin, no script) and pins the count. The settled helper arm is
+/// shared with site 3, which the retirement twin above drives end
+/// to end.
+#[test]
+fn exit_ended_loader_scan_counts_exit_only_on_rt_add_settle_after_exit() {
+    let (mut fixture, mut engine, context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    let key = PendingLoaderScanKey {
+        view: ProcessViewId(0),
+        context,
+    };
+    assert!(engine.pending_loader_scans.contains_key(&key));
+
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    // Site 2's exact predicate, on the live pin.
+    assert!(engine.original_exited(ProcessViewId(0)));
+
+    let before = engine.capture_facts().discovery_losses()[3];
+    engine.settle_pending_loader_scan(
+        key,
+        "a deferred loader memory scan failed during export-hook preparation",
+        engine.original_exited(ProcessViewId(0)),
+    );
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(engine.capture_facts().exit_ended_truncations(), 1);
+}
+
+/// The exit-only split counts nothing on the loss routes: an
+/// exec-refresh retirement, budget exhaustion, capture shutdown,
+/// and a full scan ledger all grow the existing total without
+/// touching the exit-only count.
+#[test]
+fn loader_scan_loss_routes_do_not_count_exit_only() {
+    // Exec-refresh retirement settles the pending scan as loss.
+    {
+        let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        record.announced_count = 2;
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        let mut pending_views = PendingViewRetirements::new();
+        let before = engine.capture_facts().discovery_losses()[3];
+        engine.queue_retirement(
+            ProcessViewId(0),
+            RetirementCause::ExecRefresh,
+            &mut pending_views,
+        );
+        assert!(engine.pending_loader_scans.is_empty());
+        assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+        assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+    }
+    // Budget exhaustion settles the pending scan as loss.
+    {
+        let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        record.announced_count = 1;
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        assert!(!engine.budget.charge(u64::MAX));
+        let before = engine.capture_facts().discovery_losses()[3];
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+        assert!(engine.pending_loader_scans.is_empty());
+        assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+        assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+    }
+    // Capture shutdown settles every pending scan as loss.
+    {
+        let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+        record.announced_count = 1;
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        let before = engine.capture_facts().discovery_losses()[3];
+        engine.settle_terminal_drain();
+        assert!(engine.pending_loader_scans.is_empty());
+        assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+        assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+    }
+    // A full scan ledger refuses the deferral as loss.
+    {
+        let mut engine = Engine::empty();
+        for case in 0..crate::discovery::loader::MAX_LOADER_CONTEXTS {
+            engine.pending_loader_scans.insert(
+                PendingLoaderScanKey {
+                    view: ProcessViewId(0),
+                    context: LoaderContextId::from_case_id(case as u8),
+                },
+                0,
+            );
+        }
+        let before = engine.capture_facts().discovery_losses()[3];
+        engine.defer_loader_memory_scan(
+            PendingLoaderScanKey {
+                view: ProcessViewId(1),
+                context: LoaderContextId::from_case_id(0),
+            },
+            0,
+        );
+        assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+        assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+    }
+}
+
 #[test]
 fn loader_batch_route_adds_one_count_only_seed_without_table_surface() {
     let (_dir, mut engine, _context, record, mut session) = armed_seed_route(2);

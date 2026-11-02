@@ -2625,7 +2625,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             module: None,
             pid: None,
             subject: "native capture events lost".into(),
-            reason: "the EVENTS ring overwrote records before the drain read them \
+            reason: "the EVENTS ring was full; the kernel refused records \
+                 before the drain could read them \
                  (kernel reserve failures; exact count in events_lost)"
                 .into(),
             budget: None,

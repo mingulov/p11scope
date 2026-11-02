@@ -1225,9 +1225,9 @@ class LossGate(unittest.TestCase):
         self.assertIn("loss gap", str(ctx.exception))
 
     def test_native_capture_events_lost_gap_fails(self):
-        reason = ("the EVENTS ring overwrote records before the drain "
-                  "read them (kernel reserve failures; exact count in "
-                  "events_lost)")
+        reason = ("the EVENTS ring was full; the kernel refused records "
+                  "before the drain could read them (kernel reserve "
+                  "failures; exact count in events_lost)")
 
         def mutate_inventory(inventory):
             inventory["gaps"].append(

@@ -2747,7 +2747,8 @@ fn joint_machine_publish_discloses_events_ring_loss_rise() {
         staged,
         [(
             "native capture events lost".to_string(),
-            "the EVENTS ring overwrote records before the drain read them \
+            "the EVENTS ring was full; the kernel refused records \
+             before the drain could read them \
              (kernel reserve failures; exact count in events_lost)"
                 .to_string(),
         )],

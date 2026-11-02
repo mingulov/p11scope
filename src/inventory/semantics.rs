@@ -1970,8 +1970,8 @@ impl AttestedSemanticLane {
         self.disclosed_calls_shed = self.disclosed_calls_shed.saturating_add(shed);
     }
 
-    /// Note disclosed EVENTS ring loss: records the kernel overwrote
-    /// before the drain read them. Feeds the report's event-loss
+    /// Note disclosed EVENTS ring loss: records the kernel refused
+    /// while the ring was full. Feeds the report's event-loss
     /// account beside the stop drain's unrouted returns.
     pub(crate) fn note_events_ring_loss(&mut self, shed: u64) {
         self.events_ring_loss = self.events_ring_loss.saturating_add(shed);

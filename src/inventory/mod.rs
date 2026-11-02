@@ -12302,7 +12302,8 @@ mod tests {
             assert_eq!(
                 ring_gaps(&driver),
                 [(
-                    "the EVENTS ring overwrote records before the drain read them \
+                    "the EVENTS ring was full; the kernel refused records \
+                     before the drain could read them \
                      (kernel reserve failures; exact count in events_lost)"
                         .to_string(),
                     1

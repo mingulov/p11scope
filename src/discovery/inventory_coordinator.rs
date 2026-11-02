@@ -1717,6 +1717,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         });
     }
 
+    /// Latch the lane's journal linkage from its drain producers at
+    /// machine init: the label reads `bootstrap_unavailable` instead
+    /// of `journal_unavailable` on linked lanes before the first
+    /// birth. The per-quantum birth-path latch stays as is.
+    pub(crate) fn note_journal_linked(&mut self, linked: bool) {
+        self.registry.note_journal_linked(linked);
+    }
+
     /// Stages one pass-wide count-refresh loss boundary from the lane
     /// itself (P1-5 terminal-first): an incomplete terminal refresh
     /// demotes the retained counts to lower bounds exactly like a

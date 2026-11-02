@@ -5,20 +5,22 @@
 
 use super::ledger::{ExistingReservation, LedgerGeneration};
 use super::{
-    ConsumptionOrdinal, FaultEpoch, FaultReadError, JournalAdapter, JournalCollection, JournalGap,
-    JournalIngestItem, JournalLimits, JournalNativeKey, OpenEntry, SealFailure, SessionDrainGrant,
-    StagingLedger, end_agrees_with_begin,
+    ConsumptionOrdinal, EndpointClass, FaultEpoch, FaultReadError, JournalAdapter,
+    JournalCollection, JournalGap, JournalIngestItem, JournalLimits, JournalNativeKey, OpenEntry,
+    SealFailure, SessionDrainGrant, StagingLedger, end_agrees_with_begin, endpoint_class,
 };
 use crate::attach::SessionDrainProducers;
 use crate::attach::capture::NativeDomainId;
 use crate::events::{
     BoundedRecordSource, DecodedEventRecord, EventDrain, LIVE_POLL_QUANTUM, RecordSource,
 };
+use crate::plan::AttachPlan;
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal, SemanticResourceReserver,
 };
 use crate::semantics_objects::ObjectSemantics;
 use p11scope_ebpf_common::MAX_DESCRIPTORS;
+use p11scope_ebpf_common::SlotSemantics;
 use p11scope_ebpf_common::object_journal::{JournalRecord, ValidatedJournalBegin};
 use p11scope_ebpf_common::object_wire::ObjectDescriptorWire;
 use std::cell::{Cell, RefCell};
@@ -846,6 +848,50 @@ impl RawJointQuantum {
 
     pub(crate) fn pending_h0_records(&self) -> usize {
         self.ordinary.len()
+    }
+
+    /// Scheduling only: whether this quantum holds a journaled START
+    /// whose END may still arrive. A BEGIN counts as open when this
+    /// quantum owns its raw reservation, it is neither terminal nor
+    /// poisoned, it promises an END, and its function is modeled and
+    /// affecting. Read-only: it grants no admission or custody.
+    pub(crate) fn has_open_affecting_start(&self) -> bool {
+        self.invocations.iter().any(|entry| {
+            entry.owns_raw
+                && !entry.terminal
+                && !entry.poisoned
+                && !entry.begin.no_end()
+                && entry
+                    .begin
+                    .descriptor()
+                    .checked_sub(1)
+                    .is_some_and(|function| {
+                        endpoint_class(function) == Some(EndpointClass::ModeledAffecting)
+                    })
+        })
+    }
+
+    /// Scheduling only: whether every pending H0 record is a
+    /// `COUNT_ONLY` setup call under the lane's plan — a call H0 will
+    /// count but never admit. Empty is false, and an unresolvable
+    /// slot is false: when unsure, the quantum closes. Read-only.
+    pub(crate) fn h0_records_all_count_only(&self, plan: &AttachPlan) -> bool {
+        if self.ordinary.is_empty() {
+            return false;
+        }
+        self.ordinary.iter().all(|record| {
+            plan.slots
+                .iter()
+                .find(|slot| slot.index == record.base.event.slot)
+                .is_some_and(|slot| plan.effective_semantics(slot) == SlotSemantics::COUNT_ONLY)
+        })
+    }
+
+    /// Scheduling only: whether the BEGIN-tracking table can take no
+    /// more invocations, or collection already refused a record.
+    /// Read-only.
+    pub(crate) fn begin_table_full_or_refused(&self) -> bool {
+        self.resource_refused || self.invocations.len() >= self.invocations.capacity()
     }
 
     fn validate_owner(
@@ -3553,5 +3599,163 @@ mod tests {
         for (reason, code) in cases {
             assert_eq!(reason.code(), code);
         }
+    }
+
+    /// Collect one quantum over scripted records for the scheduling
+    /// probes below. The probes read owned state only; the quantum
+    /// never ingests or releases against the dropped setup ledger.
+    fn collect_probe_quantum(records: Vec<Vec<u8>>) -> RawJointQuantum {
+        let rows = publish_object_descriptors();
+        let events = EventsDomain::test_standin(0x6e1);
+        let retained = producers(&events);
+        let pool = SemanticResourcePool::default();
+        let mut adapter = resource_adapter(&pool);
+        let fault = SteadyFault(Cell::new(None));
+        let pending = std::rc::Rc::new(RefCell::new(
+            records
+                .into_iter()
+                .collect::<std::collections::VecDeque<_>>(),
+        ));
+        let mut drain = EventDrain::over_domain(ArrivingRecords(pending), events);
+        RawJointQuantum::collect_with_adapter(
+            &mut drain,
+            &rows,
+            64,
+            &fault,
+            &retained,
+            |bytes| pool.reserve(bytes),
+            &mut adapter,
+        )
+        .unwrap()
+    }
+
+    /// The open-START probe counts an owned modeled BEGIN with no
+    /// END; a terminal, poisoned, NO_END, unmodeled or absent BEGIN
+    /// does not hold the quantum.
+    #[test]
+    fn joint_pregrant_open_start_probes_invocation_state() {
+        use crate::semantics_objects::journal::tests::{
+            ENTRY_NS, begin_bytes, end_bytes_absent, function_id,
+        };
+        use p11scope_ebpf_common::object_journal::JOURNAL_BEGIN_NO_END;
+
+        let open = begin_bytes(1, 1, function_id("C_SignInit"), 0);
+        let quantum = collect_probe_quantum(vec![open.to_vec()]);
+        assert!(quantum.has_open_affecting_start());
+
+        let end = end_bytes_absent(&open, 0, ENTRY_NS + 100);
+        let quantum = collect_probe_quantum(vec![open.to_vec(), end.to_vec()]);
+        assert!(!quantum.has_open_affecting_start());
+
+        let quantum = collect_probe_quantum(vec![open.to_vec(), open.to_vec()]);
+        assert!(quantum.invocations[0].poisoned);
+        assert!(!quantum.has_open_affecting_start());
+
+        let no_end = begin_bytes(1, 2, function_id("C_SignInit"), JOURNAL_BEGIN_NO_END);
+        let quantum = collect_probe_quantum(vec![no_end.to_vec()]);
+        assert!(!quantum.has_open_affecting_start());
+
+        let setup = begin_bytes(1, 3, function_id("C_GetFunctionList"), 0);
+        let quantum = collect_probe_quantum(vec![setup.to_vec()]);
+        assert!(!quantum.has_open_affecting_start());
+
+        let quantum = collect_probe_quantum(vec![]);
+        assert!(!quantum.has_open_affecting_start());
+    }
+
+    fn probe_slot(index: u32, semantics: SlotSemantics) -> crate::plan::Slot {
+        crate::plan::Slot {
+            index,
+            descriptor_index: 0,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: u64::from(index) * 0x10,
+            names: vec![format!("probe-{index}")],
+            aliased: false,
+            semantics,
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        }
+    }
+
+    /// The count-only probe reads each H0 record's attach slot
+    /// against the lane plan: all `COUNT_ONLY` holds, anything
+    /// modeled, unresolvable or absent closes.
+    #[test]
+    fn joint_pregrant_count_only_probes_plan_semantics() {
+        use crate::plan::AttachPlan;
+        use crate::semantics_objects::journal::tests::{
+            ENTRY_NS, begin_bytes, end_bytes_absent, function_id,
+        };
+        let modeled = crate::kinds::DESCRIPTORS[function_id("C_SignInit") as usize + 1];
+        assert_ne!(modeled, SlotSemantics::COUNT_ONLY);
+        let plan = AttachPlan::from_slots(vec![
+            probe_slot(0, SlotSemantics::COUNT_ONLY),
+            probe_slot(1, modeled),
+        ]);
+        let begin = begin_bytes(1, 1, function_id("C_SignInit"), 0);
+        let end = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+        let pair = || vec![begin.to_vec(), end.to_vec()];
+
+        let mut quantum = collect_probe_quantum(pair());
+        assert_eq!(quantum.ordinary.len(), 1);
+        let _ = quantum.ordinary.pop();
+        assert!(!quantum.h0_records_all_count_only(&plan));
+
+        let mut quantum = collect_probe_quantum(pair());
+        quantum.ordinary[0].base.event.slot = 0;
+        assert!(quantum.h0_records_all_count_only(&plan));
+
+        let mut quantum = collect_probe_quantum(pair());
+        quantum.ordinary[0].base.event.slot = 1;
+        assert!(!quantum.h0_records_all_count_only(&plan));
+
+        let mut quantum = collect_probe_quantum(pair());
+        quantum.ordinary[0].base.event.slot = 99;
+        assert!(!quantum.h0_records_all_count_only(&plan));
+
+        let other = begin_bytes(2, 1, function_id("C_SignInit"), 0);
+        let other_end = end_bytes_absent(&other, 0, ENTRY_NS + 100);
+        let mut quantum = collect_probe_quantum(vec![
+            begin.to_vec(),
+            end.to_vec(),
+            other.to_vec(),
+            other_end.to_vec(),
+        ]);
+        assert_eq!(quantum.ordinary.len(), 2);
+        quantum.ordinary[0].base.event.slot = 0;
+        quantum.ordinary[1].base.event.slot = 0;
+        assert!(quantum.h0_records_all_count_only(&plan));
+        quantum.ordinary[1].base.event.slot = 1;
+        assert!(!quantum.h0_records_all_count_only(&plan));
+    }
+
+    /// The BEGIN-table bound reads full-or-refused: room stays open,
+    /// a filled table or any refused record closes the extension.
+    #[test]
+    fn joint_pregrant_begin_table_bound_probes_full_and_refused() {
+        use crate::semantics_objects::journal::tests::{begin_bytes, function_id};
+
+        let quantum = collect_probe_quantum(vec![]);
+        assert!(!quantum.begin_table_full_or_refused());
+
+        let one = begin_bytes(1, 1, function_id("C_SignInit"), 0);
+        let quantum = collect_probe_quantum(vec![one.to_vec()]);
+        assert!(!quantum.begin_table_full_or_refused());
+
+        let full: Vec<Vec<u8>> = (1..=64)
+            .map(|thread| begin_bytes(thread, 1, function_id("C_SignInit"), 0).to_vec())
+            .collect();
+        let quantum = collect_probe_quantum(full);
+        assert_eq!(quantum.invocations.len(), 64);
+        assert!(quantum.begin_table_full_or_refused());
+
+        let overflow: Vec<Vec<u8>> = (1..=65)
+            .map(|thread| begin_bytes(thread, 1, function_id("C_SignInit"), 0).to_vec())
+            .collect();
+        let quantum = collect_probe_quantum(overflow);
+        assert!(quantum.begin_table_full_or_refused());
     }
 }

@@ -1217,13 +1217,33 @@ fn joint_prepared_batch_keeps_equal_shaped_original_admissions() {
             pending_floor: None
         }
     ));
-    assert!(!fixture.scene.coordinator.stage_next_prepared_admission());
+    assert!(
+        !fixture
+            .scene
+            .coordinator
+            .stage_next_prepared_admission(false)
+    );
     fixture.scene.coordinator.dispose_prepared_claims_s1();
     for _ in 0..3 {
-        assert!(fixture.scene.coordinator.stage_next_prepared_admission());
+        assert!(
+            fixture
+                .scene
+                .coordinator
+                .stage_next_prepared_admission(false)
+        );
     }
-    assert!(!fixture.scene.coordinator.stage_next_prepared_admission());
-    assert!(!fixture.scene.coordinator.stage_next_prepared_admission());
+    assert!(
+        !fixture
+            .scene
+            .coordinator
+            .stage_next_prepared_admission(false)
+    );
+    assert!(
+        !fixture
+            .scene
+            .coordinator
+            .stage_next_prepared_admission(false)
+    );
     assert!(
         fixture
             .scene
@@ -1308,7 +1328,12 @@ fn joint_prepared_current_receipt_budget_includes_held_provider_allocations() {
         .unwrap();
     assert!(short_watched_bytes > 0);
     healthy.scene.coordinator.dispose_prepared_claims_s1();
-    assert!(healthy.scene.coordinator.stage_next_prepared_admission());
+    assert!(
+        healthy
+            .scene
+            .coordinator
+            .stage_next_prepared_admission(false)
+    );
     assert!(
         healthy
             .scene
@@ -1380,7 +1405,12 @@ fn joint_prepared_current_receipt_budget_includes_held_provider_allocations() {
             .prepared_semantic_batch()
             .is_none()
     );
-    assert!(!limited.scene.coordinator.stage_next_prepared_admission());
+    assert!(
+        !limited
+            .scene
+            .coordinator
+            .stage_next_prepared_admission(false)
+    );
     assert!(
         !limited
             .scene

@@ -75,7 +75,7 @@ pub(super) fn claim_and_finish(
                 .real
                 .scene
                 .coordinator
-                .stage_next_prepared_admission()
+                .stage_next_prepared_admission(false)
         );
     }
     assert!(
@@ -83,7 +83,7 @@ pub(super) fn claim_and_finish(
             .real
             .scene
             .coordinator
-            .stage_next_prepared_admission()
+            .stage_next_prepared_admission(false)
     );
     assert!(
         fixture
@@ -158,7 +158,7 @@ fn joint_audit_requires_every_original_disposed_before_one_h3_take() {
                     .real
                     .scene
                     .coordinator
-                    .stage_next_prepared_admission()
+                    .stage_next_prepared_admission(false)
             ),
             2 => assert!(
                 fixture

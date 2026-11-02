@@ -59,7 +59,7 @@ pub(super) fn claim_refusal_and_staging_regression() {
         );
         if ordinal == 1 {
             assert!(
-                !coordinator.stage_next_prepared_admission(),
+                !coordinator.stage_next_prepared_admission(false),
                 "all sibling claim decisions precede any original staging move"
             );
         }
@@ -80,10 +80,10 @@ pub(super) fn claim_refusal_and_staging_regression() {
         );
     }
     assert!(!coordinator.finish_prepared_semantic_batch(&fixture.real.lane));
-    assert!(coordinator.stage_next_prepared_admission());
+    assert!(coordinator.stage_next_prepared_admission(false));
     assert!(!coordinator.finish_prepared_semantic_batch(&fixture.real.lane));
-    assert!(coordinator.stage_next_prepared_admission());
-    assert!(!coordinator.stage_next_prepared_admission());
+    assert!(coordinator.stage_next_prepared_admission(false));
+    assert!(!coordinator.stage_next_prepared_admission(false));
     assert!(coordinator.finish_prepared_semantic_batch(&fixture.real.lane));
     coordinator
         .commit_batch_with_semantics(false, Some(&mut fixture.real.lane))
@@ -421,9 +421,20 @@ impl JointScene {
 
     fn finish(&mut self, count: usize, maximum: u64) {
         for _ in 0..count {
-            assert!(self.real.scene.coordinator.stage_next_prepared_admission());
+            assert!(
+                self.real
+                    .scene
+                    .coordinator
+                    .stage_next_prepared_admission(false)
+            );
         }
-        assert!(!self.real.scene.coordinator.stage_next_prepared_admission());
+        assert!(
+            !self
+                .real
+                .scene
+                .coordinator
+                .stage_next_prepared_admission(false)
+        );
         assert!(
             self.real
                 .scene
@@ -486,7 +497,7 @@ fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
             .real
             .scene
             .coordinator
-            .stage_next_prepared_admission()
+            .stage_next_prepared_admission(false)
     );
     assert!(
         !fixture
@@ -532,7 +543,7 @@ fn joint_prepared_all_originals_claim_after_actual_ingest_once() {
                     .real
                     .scene
                     .coordinator
-                    .stage_next_prepared_admission(),
+                    .stage_next_prepared_admission(false),
                 "no original stages before all sibling claim decisions"
             );
         }
@@ -602,7 +613,7 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
             .real
             .scene
             .coordinator
-            .stage_next_prepared_admission()
+            .stage_next_prepared_admission(false)
     );
     assert_eq!(
         fixture
@@ -667,7 +678,7 @@ fn joint_prepared_foreign_or_old_raw_proof_never_advances_claim_cursor() {
             .real
             .scene
             .coordinator
-            .stage_next_prepared_admission()
+            .stage_next_prepared_admission(false)
     );
     assert_eq!(
         fixture
@@ -783,7 +794,7 @@ fn joint_prepared_key_binding_alone_does_not_claim_original() {
                 .real
                 .scene
                 .coordinator
-                .stage_next_prepared_admission()
+                .stage_next_prepared_admission(false)
         );
         assert!(
             !fixture

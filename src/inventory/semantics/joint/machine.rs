@@ -55,6 +55,10 @@ fn reborrow_acquisition<'a, 'b: 'a>(
 }
 
 const RAW_CAPACITY: usize = 4_096;
+// Wall-time bound on a pre-grant linked quantum's extension: at most
+// this long from the quantum's first poll. An engineering limit: it
+// may be raised, never lowered.
+pub(crate) const PREGRANT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 // The actual shared binder selects at most four caller/provider pairs. Its
 // no-call receipts join the same original H0 report, never a second stage.
 const REFRESHES_PER_BIND: usize = 4;
@@ -444,6 +448,9 @@ struct Collected {
     /// The guard trip cause, set when the bound expires the stall and
     /// cleared by the next progressing merge.
     h0_guard_trip: Option<&'static str>,
+    /// First-poll timestamp of this quantum: the pre-grant extension
+    /// bound starts here. `None` closes like an expired bound.
+    pregrant_first_poll: Option<Instant>,
 }
 
 impl Collected {
@@ -1156,6 +1163,11 @@ pub(crate) struct LiveJointMachine {
     // a live no-progress poll. Production never sets this.
     #[cfg(test)]
     pose_no_progress_poll: bool,
+    // Posed pre-grant extension timeout for the bound twin: the
+    // Collecting arm closes as if the wall-time bound expired, without
+    // waiting it out. Production never sets this.
+    #[cfg(test)]
+    pose_pregrant_close_timeout: bool,
     // All original phase buffers and birth leases drop before inline storage.
     _storage: ResourceLease,
 }
@@ -1225,6 +1237,8 @@ impl LiveJointMachine {
             inject: None,
             #[cfg(test)]
             pose_no_progress_poll: false,
+            #[cfg(test)]
+            pose_pregrant_close_timeout: false,
             _storage: storage,
         })
     }
@@ -1236,6 +1250,14 @@ impl LiveJointMachine {
     #[cfg(test)]
     pub(crate) fn pose_no_progress_poll_for_test(&mut self, on: bool) {
         self.pose_no_progress_poll = on;
+    }
+
+    /// Pose (or clear) an expired pre-grant extension bound: while
+    /// posed, the Collecting arm closes as if the wall-time bound
+    /// expired, so the bound twin never waits it out.
+    #[cfg(test)]
+    pub(crate) fn pose_pregrant_close_timeout_for_test(&mut self, on: bool) {
+        self.pose_pregrant_close_timeout = on;
     }
 
     /// Backdate (or clear) the current stall-clock start, so the twin
@@ -2641,6 +2663,7 @@ impl LiveJointMachine {
                             request_pulled: false,
                             h0_idle_passes: 0,
                             h0_guard_trip: None,
+                            pregrant_first_poll: Some(Instant::now()),
                         }),
                         Err(SemanticRefusal::Unavailable),
                     );
@@ -2655,6 +2678,7 @@ impl LiveJointMachine {
                         request_pulled: false,
                         h0_idle_passes: 0,
                         h0_guard_trip: None,
+                        pregrant_first_poll: Some(Instant::now()),
                     }),
                     Ok(Step::Continue),
                 )
@@ -2681,7 +2705,33 @@ impl LiveJointMachine {
                         && !failed
                         && !requested
                         && original.attempted < RAW_CAPACITY;
-                    if !unrequested_empty && !needs_first_end {
+                    // Pre-grant extension on a linked lane: a quantum with
+                    // an in-flight journaled START, or with only count-only
+                    // setup calls among its H0 records, stays open for the
+                    // late rows — within the capacity, table and wall-time
+                    // bounds, and never past a failed collection, a
+                    // request, or Q.
+                    #[cfg(test)]
+                    let posed_pregrant_timeout = self.pose_pregrant_close_timeout;
+                    #[cfg(not(test))]
+                    let posed_pregrant_timeout = false;
+                    let pregrant_timed_out = || {
+                        posed_pregrant_timeout
+                            || original.pregrant_first_poll.is_none_or(|since| {
+                                Instant::now().duration_since(since) >= PREGRANT_CLOSE_TIMEOUT
+                            })
+                    };
+                    let pregrant_extend = self.grant.is_none()
+                        && self.producers.journal_linked()
+                        && !failed
+                        && !requested
+                        && original.attempted < RAW_CAPACITY
+                        && original.raw.pending_h0_records() < MAX_PENDING
+                        && !original.raw.begin_table_full_or_refused()
+                        && (original.raw.has_open_affecting_start()
+                            || original.raw.h0_records_all_count_only(lane.subset().plan()))
+                        && !pregrant_timed_out();
+                    if !unrequested_empty && !needs_first_end && !pregrant_extend {
                         // A requested transaction must not bind on a stale
                         // no-backlog poll: rows may have landed since idle
                         // services last pulled. The finish's first advance
@@ -3016,7 +3066,7 @@ impl LiveJointMachine {
             }
             Phase::StagingNegative(original) => {
                 budget.spend(1);
-                if coordinator.stage_next_prepared_admission() {
+                if coordinator.stage_next_prepared_admission(self.grant.is_none()) {
                     return (Phase::StagingNegative(original), Ok(Step::Continue));
                 }
                 if !coordinator.finish_prepared_semantic_batch(lane) {
@@ -4071,7 +4121,7 @@ impl AttestedSemanticLane {
     /// before the first publication request. This performs no EVENTS/H0 work.
     pub(crate) fn initialize_joint(
         &mut self,
-        coordinator: &InventoryCoordinator<OsProcessSource>,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
     ) -> Result<(), SemanticRefusal> {
         #[cfg(test)]
         {
@@ -4105,6 +4155,7 @@ impl AttestedSemanticLane {
                 &producers,
                 &coordinator.registry().semantic_storage_reserver(),
             )?);
+            coordinator.note_journal_linked(producers.journal_linked());
         }
         Ok(())
     }
@@ -4931,5 +4982,12 @@ mod binding_reservation_tests {
         assert!(kept.reload_not_excluded().is_empty());
         assert_eq!(kept.continued_across_global(), 0);
         assert_eq!(kept.joined_across_global(), 0);
+    }
+
+    /// The pre-grant extension bound is an engineering limit: it may
+    /// be raised, never lowered.
+    #[test]
+    fn pregrant_close_timeout_floor() {
+        assert!(super::PREGRANT_CLOSE_TIMEOUT >= std::time::Duration::from_secs(2));
     }
 }

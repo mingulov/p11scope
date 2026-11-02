@@ -335,6 +335,13 @@ inventory::privileged_tests::privileged_joint_driver_live_finish_begin_poll_woun
 inventory::privileged_tests::privileged_joint_first_birth_q2_and_stop_lp64
 inventory::privileged_tests::privileged_joint_absence_and_s1only_siblings_lp64
 inventory::privileged_tests::privileged_joint_promotion_a_to_b_lp64
+# Joint init linkage latch: a linked lane latches its producers'
+# linkage at init and reads bootstrap before any traffic, an
+# unlinked lane stays unlatched and reads journal_unavailable, and
+# neither stages a gap. Two short System-scope attaches (about a
+# minute); on builds that omit the journal the linked half asserts
+# the refusal instead. Prints KEY_OPS_LATCH lines.
+inventory::privileged_tests::privileged_joint_init_latches_producer_linkage
 # Linked key-operations cells: the live linked lane pumps discovery, a
 # malformed discovery record faults the pump without latching while the
 # next audited batch carries the coverage failure (its healthy linked

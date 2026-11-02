@@ -9943,7 +9943,7 @@ fn joint_birth_first_refused_claim_blocks_later_same_key_original() {
     // A has no physical BEGIN/END. Preserve direct S1 and settle the held B
     // only through an actual later native fault, never a fabricated terminal.
     coordinator.dispose_prepared_claims_s1();
-    while coordinator.stage_next_prepared_admission() {}
+    while coordinator.stage_next_prepared_admission(false) {}
     assert!(coordinator.finish_prepared_semantic_batch(&scene.real.lane));
     coordinator
         .commit_batch_with_semantics(false, Some(&mut scene.real.lane))
@@ -10073,7 +10073,7 @@ fn joint_birth_refused_claim_discloses_retained_s1() {
         charged
     );
     coordinator.dispose_prepared_claims_s1();
-    while coordinator.stage_next_prepared_admission() {}
+    while coordinator.stage_next_prepared_admission(false) {}
     assert!(coordinator.finish_prepared_semantic_batch(&scene.real.lane));
     coordinator
         .commit_batch_with_semantics(false, Some(&mut scene.real.lane))
@@ -10178,7 +10178,12 @@ fn joint_birth_install_refuses_same_quantum_sibling_witness() {
             .unwrap()
             .in_quantum(candidate.quantum)
     }));
-    while scene.real.scene.coordinator.stage_next_prepared_admission() {}
+    while scene
+        .real
+        .scene
+        .coordinator
+        .stage_next_prepared_admission(false)
+    {}
     assert!(
         scene
             .real
@@ -11402,7 +11407,7 @@ fn joint_raw_disposition_reaches_retained_s1only_history() {
             .real
             .scene
             .coordinator
-            .stage_next_prepared_admission()
+            .stage_next_prepared_admission(false)
         {}
         assert!(
             fixture
@@ -15492,7 +15497,7 @@ fn pending_h3_with_subject_before_audit(
             .stage_next_prepared_admission_with_disposition(&fixture.scene.producers, &mut ingested)
             .unwrap()
     } else {
-        coordinator.stage_next_prepared_admission()
+        coordinator.stage_next_prepared_admission(false)
     } {
         staged += 1;
     }
@@ -16979,7 +16984,7 @@ fn joint_first_pending_h3_pins_native_baseline_before_next_fault() {
         .real
         .scene
         .coordinator
-        .stage_next_prepared_admission()
+        .stage_next_prepared_admission(false)
     {}
     assert!(
         fixture
@@ -17073,8 +17078,20 @@ fn first_pending_h3_without_joint_head() -> ZeroHeadPendingScene {
         .unwrap_or_else(|(_, reason)| panic!("actual quiet direct-S1 raw: {reason:?}"));
     assert!(disposed.failure().is_none());
     scene.real.scene.coordinator.dispose_prepared_claims_s1();
-    assert!(scene.real.scene.coordinator.stage_next_prepared_admission());
-    assert!(!scene.real.scene.coordinator.stage_next_prepared_admission());
+    assert!(
+        scene
+            .real
+            .scene
+            .coordinator
+            .stage_next_prepared_admission(false)
+    );
+    assert!(
+        !scene
+            .real
+            .scene
+            .coordinator
+            .stage_next_prepared_admission(false)
+    );
     assert!(
         scene
             .real
@@ -17168,7 +17185,7 @@ fn first_pending_h3_without_joint_head() -> ZeroHeadPendingScene {
             .unwrap()
             .is_none()
     );
-    assert!(!coordinator.stage_next_prepared_admission());
+    assert!(!coordinator.stage_next_prepared_admission(false));
     assert!(coordinator.finish_prepared_semantic_batch(&scene.real.lane));
     coordinator
         .commit_batch_with_semantics(false, Some(&mut scene.real.lane))
@@ -17426,7 +17443,7 @@ fn joint_zero_head_pending_h3_requires_original_continuation_and_keeps_fault_pre
             assert!(q2_proof.replace(proof).is_none());
         }
         let proof = q2_proof.expect("the original is claimed exactly once in either arm");
-        while coordinator.stage_next_prepared_admission() {}
+        while coordinator.stage_next_prepared_admission(false) {}
         assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
         // A retained claim corroborates the original before the collection
         // audit. Only the healthy arm may establish birth and a Joint feed.
@@ -20618,7 +20635,7 @@ fn key_operation_s1only_sibling_pending_h3_reaches_next_frame() {
             .real
             .scene
             .coordinator
-            .stage_next_prepared_admission()
+            .stage_next_prepared_admission(false)
         {}
         assert!(
             fixture

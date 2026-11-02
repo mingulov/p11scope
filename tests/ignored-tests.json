@@ -986,6 +986,12 @@
     },
     {
       "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_joint_init_latches_producer_linkage",
+      "reason": "privileged: joint init latches producer linkage before traffic (serial; plain build asserts the linked refusal)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_joint_promotion_a_to_b_lp64",
       "reason": "privileged: live Joint promotion retires A before B is admitted",
       "cell": "privileged"

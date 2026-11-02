@@ -832,10 +832,14 @@ fn native_semantic_resource_final_types_pinned() {
     // measured 1168. D1 c93a0084 adds the optional shared renderer index:
     // one niche-filled Arc pointer inline, bounded offset rows allocated
     // separately by its explicit heap envelope (no semantic authority/pool).
+    // +8 (cf644635f): the inline `semantic_capture` summary carries the
+    // additive `events_lost` ring-loss count (one u64; the summary grows
+    // 40 -> 48), measured 1184.
     pin!(crate::inventory_present::PresentationRenderIndex, 8);
+    pin!(crate::inventory_semantics::SemanticCaptureSummary, 48);
     pin!(
         crate::inventory_present::Presentation,
-        1168 + size_of::<crate::inventory_present::PresentationRenderIndex>()
+        1176 + size_of::<crate::inventory_present::PresentationRenderIndex>()
     );
     // Supporting payload: RoutedCall carries one EventRecord.
     pin!(p11scope_ebpf_common::EventRecord, 368);

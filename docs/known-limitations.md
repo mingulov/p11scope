@@ -106,18 +106,21 @@ such a call before p11scope sees it, so the child is simply not observed.
 (`auto` can pick either.) Neither case is verified live yet.
 
 At very high call rates the kernel's event ring of a native inventory capture
-can fill before p11scope reads it. The kernel then drops new records but counts
-them, and p11scope reports every drop: the report carries a
-`native capture events lost` gap, and the lost count is included in
-`unrouted_returns` and in the shed count of the stop line. Two limits apply.
-In an ordinary native inventory capture this exact count comes only from
-reading the kernel's drop counter: the prompt draining of a full ring applies
-only when the capture has fallen back to its older path (after a
-`joint machine unavailable` gap), so it does not raise the call rate an
-ordinary capture keeps up with. The counter also counts records, not calls:
-under `--cgroup` or `--system`, a dropped process-start (fork) record counts as
-one lost call, so the reported loss can be higher than the number of calls
-actually lost, never lower.
+can fill before p11scope reads it. The kernel then refuses new records but
+counts them, and p11scope reports every refusal: the report carries a
+`native capture events lost` gap, the stop line carries a separate `lost`
+count, and `observation.semantic_capture.events_lost` holds the same total.
+These records are counted only there, never in `unrouted_returns` or in the
+stop line's shed count. If p11scope cannot read the kernel's counter, the
+report carries a `native capture events loss unknown` gap instead, and
+`events_lost` may be lower than the real loss until a later read succeeds (the
+kernel's counter is cumulative, so that read restores the exact total). Two
+limits apply. Prompt draining of a full ring applies only when the capture has
+fallen back to its older path (after a `joint machine unavailable` gap), so it
+does not raise the call rate an ordinary capture keeps up with. The counter
+also counts records, not calls: under `--cgroup` or `--system`, a refused
+process-start (fork) record counts as one lost call, so the reported loss can
+be higher than the number of calls actually lost, never lower.
 
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are
@@ -219,19 +222,6 @@ not complete semantic attribution or a guarantee for other workloads. The
 earlier failed exact-count/final-drain run remains a historical failure.
 Longer runs (4 h, 24 h) remain unqualified. Startup and stop figures are
 declared per kernel, not a product guarantee.
-
-At high call rates the semantic lane can lose EVENTS records faster
-than it drains them: when the kernel ring is full it refuses new
-records (counted in `EVIDENCE_RING_LOSS`, never silently
-overwritten), and the observer discloses the cumulative loss in a
-`native capture events lost` gap with exact counts on the stop line
-(`lost`) and in `observation.semantic_capture.events_lost`. The
-counter counts records, not calls: at system/cgroup scope a refused
-FORK marker counts too. Prompt saturated-tick commits apply to
-legacy lanes only; joint-machine lanes service the machine instead
-and disclose loss at each publish. Measured ceiling: see release
-re-measure. TODO(controller): fill in the release-observer sustained
-rate ceiling after the joint-keepup campaign.
 
 In long system-wide runs, a live publication can rarely stop making
 progress. After 6 seconds without progress, p11scope abandons that

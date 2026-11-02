@@ -526,7 +526,7 @@ PY
         add_reason "linked lane refused: $REFUSAL"
     elif [ ! -f "$J_TXT" ] || ! grep -q 'p11scope: semantic lane ready' "$J_TXT"; then
         add_reason "semantic lane never sealed"
-    elif ! grep -Eq 'semantic calls: collected [0-9]+, joined [1-9][0-9]*, shed [0-9]+, bindings [1-9][0-9]*' "$J_TXT"; then
+    elif ! grep -Eq 'semantic calls: collected [0-9]+, joined [1-9][0-9]*, shed [0-9]+, lost [0-9]+, bindings [1-9][0-9]*' "$J_TXT"; then
         add_reason "linked lane idle (no joined calls)"
     fi
     OBSERVED="unknown"

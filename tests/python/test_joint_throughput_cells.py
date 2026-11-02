@@ -275,6 +275,10 @@ class VerdictMapping(unittest.TestCase):
             "ring_loss 1 (observation.lifecycle.ring_loss)",
             "events_lost 1 "
             "(observation.semantic_capture.unrouted_returns)",
+            "unrouted_returns 1 "
+            "(observation.semantic_capture.unrouted_returns)",
+            "events_lost 1 (observation.semantic_capture.events_lost)",
+            "semantic_capture events_lost missing or out of range",
         )
         for reason in reasons:
             with self.subTest(reason=reason):

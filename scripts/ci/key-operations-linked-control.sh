@@ -741,15 +741,23 @@ if run_linked_flow "$CELLDIR" "$P11SCOPE" --pid-from-driver --capture native \
             if python3 -I "$QUALIFY" "$OUTDIR/linked-pid-ledger.jsonl" \
                     "$OUTDIR/linked-pid.json" \
                     > "$OUTDIR/linked-pid-oracle.log" 2>&1; then
-                row linked-pid 1 qualified \
-                    "post-closure exec observed under --pid; oracle compare passed"
+                if [ "$OBSERVER_EXIT" -ne 0 ]; then
+                    row linked-pid 0 failed \
+                        "observer exit $OBSERVER_EXIT with object_observations $oo_status ($oo_reason): not the pinned signature (exit 0)"
+                    FAILURES=$((FAILURES + 1))
+                else
+                    row linked-pid 1 qualified \
+                        "post-closure exec observed under --pid; oracle compare passed"
+                fi
             elif [ "$OBSERVER_EXIT" -eq 0 ]; then
                 oracle_text=$(tail -n 5 "$OUTDIR/linked-pid-oracle.log" | tr '\n' ';')
-                row linked-pid 1 expected-failure \
-                    "post-closure exec observed under --pid but oracle refused: $oracle_text"
-            else
                 row linked-pid 0 failed \
-                    "observer exit $OBSERVER_EXIT with a refused populated shape: not the pinned signature (exit 0)"
+                    "post-closure exec observed under --pid but oracle refused: $oracle_text"
+                FAILURES=$((FAILURES + 1))
+            else
+                oracle_text=$(tail -n 5 "$OUTDIR/linked-pid-oracle.log" | tr '\n' ';')
+                row linked-pid 0 failed \
+                    "observer exit $OBSERVER_EXIT with a refused populated shape: $oracle_text: not the pinned signature (exit 0)"
                 FAILURES=$((FAILURES + 1))
             fi
         elif [ "$oo_status" = "unavailable" ] && [ "$oo_reason" = "journal_unavailable" ]; then
@@ -785,6 +793,7 @@ export KEYOPS_SELFTEST_SCENARIO=${KEYOPS_SELFTEST_SCENARIO_FLAG_OFF_S1:-}
 mkdir -p "$CELLDIR" && chmod 0700 "$CELLDIR" || die "cell dir $CELLDIR"
 FLAG_OFF_S1_SETTLE_SAVED=$SETTLE_S
 SETTLE_S=0
+FLAG_OFF_S1_EFFECTIVE=$SETTLE_S
 if run_linked_flow "$CELLDIR" "$P11SCOPE" --pid-from-driver --capture native \
         --manifest "$MANIFEST" --duration "$DURATION" \
         2> "$CELLDIR/flow.stderr"; then
@@ -807,10 +816,10 @@ if run_linked_flow "$CELLDIR" "$P11SCOPE" --pid-from-driver --capture native \
                     "$OUTDIR/flag-off-s1.json" \
                     > "$OUTDIR/flag-off-s1-oracle.log" 2>&1; then
                 row flag-off-s1 1 qualified \
-                    "--s1 compare passed at settle 0; object_observations unavailable ($oo_reason)"
+                    "--s1 compare passed at settle $FLAG_OFF_S1_EFFECTIVE; object_observations unavailable ($oo_reason)"
             else
                 oracle_text=$(tail -n 5 "$OUTDIR/flag-off-s1-oracle.log" | tr '\n' ';')
-                row flag-off-s1 0 failed "--s1 compare failed at settle 0: $oracle_text"
+                row flag-off-s1 0 failed "--s1 compare failed at settle $FLAG_OFF_S1_EFFECTIVE: $oracle_text"
                 FAILURES=$((FAILURES + 1))
             fi
         else
@@ -876,15 +885,24 @@ for gap in doc.get("gaps") or []:
 print(total)
 EOF
             )
-            if python3 -I "$QUALIFY" --s1 "$OUTDIR/flag-off-s1-settle10-ledger.jsonl" \
-                    "$OUTDIR/flag-off-s1-settle10.json" \
-                    > "$OUTDIR/flag-off-s1-settle10-oracle.log" 2>&1; then
-                oracle_note="oracle passed"
-            else
-                oracle_note="oracle: $(tail -n 3 "$OUTDIR/flag-off-s1-settle10-oracle.log" | tr '\n' ';')"
-            fi
-            row flag-off-s1-settle10 1 qualified \
-                "settle-10 diagnostic: $gap_count no_receipt admission gaps (known issue, not a failure); object_observations unavailable ($oo_reason); $oracle_note"
+            case "$gap_count" in
+                ''|*[!0-9]*)
+                    row flag-off-s1-settle10 0 failed \
+                        "no_receipt gap count unreadable ($gap_count)"
+                    FAILURES=$((FAILURES + 1))
+                    ;;
+                *)
+                    if python3 -I "$QUALIFY" --s1 "$OUTDIR/flag-off-s1-settle10-ledger.jsonl" \
+                            "$OUTDIR/flag-off-s1-settle10.json" \
+                            > "$OUTDIR/flag-off-s1-settle10-oracle.log" 2>&1; then
+                        oracle_note="oracle passed"
+                    else
+                        oracle_note="oracle: $(tail -n 3 "$OUTDIR/flag-off-s1-settle10-oracle.log" | tr '\n' ';')"
+                    fi
+                    row flag-off-s1-settle10 1 qualified \
+                        "settle-10 diagnostic: $gap_count no_receipt admission gaps (known issue, not a failure); object_observations unavailable ($oo_reason); $oracle_note"
+                    ;;
+            esac
         else
             row flag-off-s1-settle10 0 failed \
                 "object_observations reads $oo_status ($oo_reason), want unavailable with a finite reason"

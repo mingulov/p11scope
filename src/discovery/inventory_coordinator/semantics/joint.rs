@@ -1697,9 +1697,9 @@ mod tests {
                 },
             )
         }
-        fn staged(
-            entries: &[(u64, ConversionRefusal)],
-        ) -> (Option<u64>, Vec<(Option<CallerId>, String, String)>) {
+        /// (caller, subject, reason) of one staged gap.
+        type StagedGap = (Option<CallerId>, String, String);
+        fn staged(entries: &[(u64, ConversionRefusal)]) -> (Option<u64>, Vec<StagedGap>) {
             let mut batch = batch(entries);
             batch.dispose_claims_s1();
             let mut registry = empty_registry();

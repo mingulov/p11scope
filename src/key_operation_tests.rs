@@ -20331,12 +20331,20 @@ fn key_operation_joint_ordered_fallback_names_its_cause() {
         "the capacity fallback is named once, for its caller"
     );
 
-    // An unsealable call behind a queued call: ordered fallback first.
+    // An unsealable completion behind a queued call (the by-design
+    // carve-out with queued calls): ordered fallback first.
     let mut guarded = GuardedScene::new();
     let (key, id) = queued_joint(&mut guarded, 1);
-    let info = ShapedS1::shaped("C_GetSessionInfo", CkRv::OK.0, 0, 0);
-    let (facts, position) = guarded.admit_shape(&info);
-    guarded.observe(&key, position, facts);
+    let mut complete = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: SESSION,
+        target_function: crate::kinds::function_id("C_SignInit").unwrap(),
+        capture: op_capture(),
+        ts_ns: 999,
+        ..SemanticCall::default()
+    };
+    complete.rv = CkRv::OK.0;
+    guarded.observe(&key, 1_000_000, complete);
     guarded
         .registry
         .publish_with_ledger(guarded.scene.adapter.ledger_mut());

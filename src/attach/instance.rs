@@ -1316,7 +1316,7 @@ impl BirthRowReader for LiveBirthRows<'_> {
 /// issuance token drops with the take (the grant was issued at
 /// attestation). Compiled into production builds but constructed only by
 /// tests: the live seal checks births through `observe_retained_birth`
-/// in `semantic_capture`. Live exec-marker births succeed in opted-in
+/// in `semantic_capture`. Live exec-marker births can succeed in opted-in
 /// `--key-operations` sessions, where the journal object publishes both
 /// the generation and the READY writer.
 #[allow(dead_code)] // Production-compiled, test-constructed (see above).

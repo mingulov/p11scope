@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* H8-D atomic birth marker: one READY/DIRTY word appended to PROC_EPOCH
- * (152 B total) plus a Detailed-only 16 B admission control row
- * {spent, failed}. Live since slice D: the exec-birth and scope-gap
- * roots call publish, dirty, admit and reserve. The transaction leaves
- * (JOURNAL_START, journal threads) stay inactive (pinned by test).
+ * (152 B total) plus a 16 B admission control row {spent, failed}
+ * in the Detailed marker and journal objects. Live since slice D: the
+ * exec-birth and scope-gap roots call publish, dirty, admit and reserve.
+ * The transaction leaves (JOURNAL_START, journal threads) stay inactive
+ * (pinned by test).
  *
  * Word encoding (low 2 bits = state, high 62 = exec generation):
  *   0                  unpublished (fresh storage)
@@ -35,8 +36,8 @@
 #define P11_JOURNAL_MARKER_DIRTY_READ 2
 #define P11_JOURNAL_MARKER_INVALID -1
 
-/* Detailed-only admission control row: spent permits plus the failed
- * latch. Initialized once (zero) before links; userspace never writes
+/* Admission control row (Detailed marker and journal objects): spent
+ * permits plus the failed latch. Initialized once (zero) before links; userspace never writes
  * it. */
 struct journal_admission_control {
     u64 spent;

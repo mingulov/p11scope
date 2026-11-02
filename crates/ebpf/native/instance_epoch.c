@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Task 3 Stage A load-instance continuity witness (Detailed only).
+/* Task 3 Stage A load-instance continuity witness (Detailed and journal).
  *
  * Every file-VMA lifecycle transition passes through the kernel's uprobe
  * bookkeeping: uprobe_mmap (creation, post-adjust), uprobe_munmap (removal,

@@ -454,9 +454,11 @@ proving renderers never receive the tail.
 ## Post-attach birth marker (object journal slice D)
 
 **Status: IMPLEMENTED in development for v0.6.0. FULL and P0 builds contain the
-marker in their Detailed objects and the journal object by default
-(`P11SCOPE_BIRTH_MARKER=0` omits the marker; `P11SCOPE_JOURNAL=0` omits the journal, and the marker unless explicitly selected); SMALL, WIDE and
-unsafe builds omit both by default. `P11SCOPE_BIRTH_MARKER=1` compiles the marker into the Detailed object
+marker in their Detailed objects and the journal object by default. `P11SCOPE_BIRTH_MARKER=0` omits it
+from the Detailed object only: the journal object always carries both marker writers and the
+`self_exec_id` read, so only `P11SCOPE_JOURNAL=0` removes them there (it also omits the Detailed marker
+unless `P11SCOPE_BIRTH_MARKER=1`). SMALL, WIDE and unsafe builds omit both by default.
+`P11SCOPE_BIRTH_MARKER=1` compiles the marker into the Detailed object
 of any build, SMALL, WIDE and unsafe builds included. The owner approved FULL/P0 inclusion (owner B2, 2026-11-01;
 final yes/no at freeze). Shipping is gated on the live cells and the freeze decision.
 The linked birth seals activate only when the user opts in to per-key tracking
@@ -517,8 +519,9 @@ one array read and return; fork only zeroes the marker in fresh task storage):
 
 Under `--system` every process is in scope, so once a Session carries both a published generation and the
 exec writer, every process that execs after closure gets a record holding its exec ID and the attach
-generation. Opted-in journal sessions carry both, so such records are written there; ordinary sessions
-carry neither.
+generation. Only an opted-in journal Session (`inventory --key-operations`) publishes a generation, so
+only such a Session writes these records. Ordinary Sessions never publish one: in a marker build their
+Detailed object contains the exec writer, but it stops at the gated read and writes nothing.
 
 New transient kernel read: the current group leader's `self_exec_id`, at exec only. It adds to the Stage A
 list (`group_leader`, `flags`, `mm`).
@@ -531,7 +534,13 @@ execs) that calls a watched function: it is left not covered. Under the single-l
 reaches BPF (the kernel filter compares only the mm), so the scope check refuses it and the gap marks the
 row DIRTY, spending one admission; under the multi backend the kernel skips the call before BPF runs, so
 the row stays unmarked. Neither path is yet verified live. (The CLONE_VM fork hook
-already creates a shared-mm `PROC_EPOCH` row for such a child regardless of scope.) Stage A already keeps unscoped `PROC_EPOCH` records for processes that map a watched
+already creates a shared-mm `PROC_EPOCH` row for such a child regardless of scope.)
+One more exception until the PID-scope start-time check reaches the journal object: `--pid` admits the
+exec hook by PID number, so under `--key-operations`, if the target exits and a different process later
+gets the same PID number and execs after closure, that process gets a READY record (its `self_exec_id`,
+the attach generation, one admission). Its watched calls never reach BPF (the uprobe filter holds the
+original task), so it is never born.
+Stage A already keeps unscoped `PROC_EPOCH` records for processes that map a watched
 provider file (see above), so this is not new in kind. It is never emitted, and it dies with the task.
 
 Bounds: each record creation, or first marker write, spends one admission from a fixed per-Session budget

@@ -280,8 +280,13 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
     for name in PRODUCERS {
         assert!(functions.contains(name), "missing real native {name}");
     }
+    // The marker publish body ships in this object, inlined into the
+    // `p11_instance_exec_birth` producer root; it has no standalone body.
+    assert!(
+        !functions.contains("p11_journal_marker_publish"),
+        "marker publish must stay inlined into p11_instance_exec_birth"
+    );
     for forbidden in [
-        "p11_journal_marker_publish",
         "p11_journal_combined_entry",
         "p11_journal_combined_return",
         "p11_journal_combined_remove",
@@ -860,8 +865,13 @@ fn journal_production_elf_replaces_pair_and_retains_shapes() {
     for name in PRODUCERS {
         assert!(functions.contains(name), "missing real native {name}");
     }
+    // The marker publish body ships in this object, inlined into the
+    // `p11_instance_exec_birth` producer root; it has no standalone body.
+    assert!(
+        !functions.contains("p11_journal_marker_publish"),
+        "marker publish must stay inlined into p11_instance_exec_birth"
+    );
     for forbidden in [
-        "p11_journal_marker_publish",
         "p11_journal_combined_entry",
         "p11_journal_combined_return",
         "p11_journal_combined_remove",

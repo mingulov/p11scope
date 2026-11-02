@@ -174,7 +174,8 @@ Three environment switches select optional build content. Each accepts unset
   FULL and P0 builds; SMALL, WIDE and unsafe builds omit it silently, and
   explicit `=1` there fails instead. `=0` omits it everywhere.
 - `P11SCOPE_BIRTH_MARKER`: compiles the birth marker into Detailed objects.
-  Unset follows the journal decision; `=0` omits it everywhere, and `=1`
-  selects it on any Detailed build.
+  Unset follows the journal decision; `=0` omits it from Detailed objects, and
+  `=1` selects it on any Detailed build. The journal object always carries the
+  marker; `P11SCOPE_JOURNAL=0` removes it.
 - `P11SCOPE_LOADER_GATE`: compiles the experimental loader gate. Off by
   default; leave it off unless a task explicitly asks for it.

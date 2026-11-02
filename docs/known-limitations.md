@@ -37,8 +37,9 @@ Endpoint selection (`--select-endpoint` with `--mode metrics` and
 `--counter-mode`) details one function from the broad counter's own
 cells between a selection-time read and the close read. It resolves
 on `--pid` and owned-`run` captures only; `--cgroup` and `--system`
-refuse by name. The name resolves once at start; late-loaded providers
-need `--module`. If the watched process replaces itself (exec) between
+refuse by name. The name resolves once at start; a provider loaded
+after start needs `--prearm-module <provider.so>` (with `run`, usually
+required). If the watched process replaces itself (exec) between
 the two reads, the slot retires, the close boundary cannot be proven
 clean, or discovery ring loss, read failures, or truncation grow
 inside the window, the detail is withheld with a named reason while

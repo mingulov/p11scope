@@ -453,6 +453,19 @@ pub struct Engine {
     /// always reads the host topology.
     #[cfg(test)]
     counter_cpus_override: Option<usize>,
+    /// Test-only kill switch for the unchanged-tick candidate fast path.
+    /// The equivalence twin compares both modes engine against engine.
+    #[cfg(test)]
+    disable_empty_tick_fast_path_for_test: bool,
+    /// Whether the committed plan, modules, pins and evidence equal what a
+    /// full rebuild would produce, as verified by comparison at the last
+    /// commit. The rebuild reads committed-plan reuse state, so a commit can
+    /// move it and the next rebuild may differ; only a commit whose
+    /// candidate compares equal establishes this, and every direct write,
+    /// loader-context mutation, cached or hand-built commit, withdrawal or
+    /// withholding clears it. The unchanged-tick fast path runs only while
+    /// it holds.
+    plan_rebuild_stable: bool,
     /// Installed backing of the last completed graph (T4b Install step 4).
     #[allow(dead_code)] // Consumed by T4b.
     graph_backing: Option<Box<GraphBacking>>,
@@ -3577,6 +3590,10 @@ struct LiveCandidate {
     loader_plan_proof: Option<LoaderPlanProof>,
     exec_preservations: Vec<PreparedPreservation>,
     exec_completions: Vec<PreparedCompletedRearm>,
+    /// Whether a full rebuild produced this candidate. Committing one
+    /// re-establishes rebuild stability; cached, hand-built and post-build
+    /// mutated candidates do not.
+    built_by_full_rebuild: bool,
 }
 
 impl LiveCandidate {
@@ -8143,6 +8160,9 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
     discovered.manifest_ordinals = accepted_ordinals;
     discovered.counters = counters;
     discovered.identity_mismatches = identity_mismatches;
+    // Initial discovery bypasses the rebuild: the first tick's full build
+    // re-establishes stability when it commits.
+    discovered.plan_rebuild_stable = false;
     Ok(())
 }
 
@@ -9810,6 +9830,9 @@ impl Engine {
             counter_pool: SemanticResourcePool::with_limit(COUNTER_POOL_BYTES),
             #[cfg(test)]
             counter_cpus_override: None,
+            #[cfg(test)]
+            disable_empty_tick_fast_path_for_test: false,
+            plan_rebuild_stable: false,
             graph_backing: None,
             retired_files: None,
             collected_graph_refusal: None,
@@ -12486,6 +12509,9 @@ impl Engine {
         self.modules = modules;
         self.counters.corroboration = snapshot.corroboration;
         self.counters.manifest_fallbacks = snapshot.manifest_fallbacks;
+        // A restored snapshot bypasses the rebuild: committed state is no
+        // longer provably what a rebuild produces.
+        self.plan_rebuild_stable = false;
         self.note_facts_mutated();
         self.next_selection_binding_id = snapshot.next_selection_binding_id;
         self.selection_bindings = snapshot.selection_bindings;
@@ -12858,6 +12884,7 @@ impl Engine {
             loader_plan_proof: None,
             exec_preservations: Vec::new(),
             exec_completions: Vec::new(),
+            built_by_full_rebuild: true,
         })
     }
 
@@ -12974,6 +13001,7 @@ impl Engine {
                 loader_plan_proof: None,
                 exec_preservations: Vec::new(),
                 exec_completions: Vec::new(),
+                built_by_full_rebuild: false,
             }
         } else {
             self.loader_plan_cache = None;
@@ -13369,6 +13397,7 @@ impl Engine {
                 }
                 if self.plan.is_active(*index) {
                     self.plan.deactivate(*index);
+                    self.plan_rebuild_stable = false;
                     outcome.changed = true;
                 }
             }
@@ -14271,6 +14300,20 @@ impl Engine {
         )
     }
 
+    /// Whether candidate pins reproduce committed pins for the stability
+    /// comparison: same inventory, identities, sources, overlay flag and
+    /// rejection sets. The rebuild filters and walks by exactly these.
+    fn pins_match_for_stability(candidate: &PinnedObjects, committed: &PinnedObjects) -> bool {
+        candidate.pinned().count() == committed.pinned().count()
+            && candidate.has_overlay_uncertainty() == committed.has_overlay_uncertainty()
+            && candidate.newly_rejected_keys(committed).is_empty()
+            && committed.newly_rejected_keys(candidate).is_empty()
+            && candidate.pinned().all(|pin| {
+                candidate.exactly_matches(pin.id, committed, pin.id)
+                    && candidate.sources(pin.id) == committed.sources(pin.id)
+            })
+    }
+
     /// The one complete finalization for a candidate whose links were already
     /// mutated. It never short-circuits and never returns: a lost generation
     /// downgrades the disposition and cleans up, it does not unwind.
@@ -14622,13 +14665,28 @@ impl Engine {
         // so no count can be in them. Kept, they burned the capture-lifetime
         // budget: every conservative replay after an ordinary process exit
         // allocated one more cell per listed-but-inactive endpoint.
+        let slots_before_withdraw = candidate.plan.slots.len();
         if !new_targets_attached {
             candidate
                 .plan
                 .withdraw_unlinked_additions(self.plan.slots.len());
         }
+        let withdrew = candidate.plan.slots.len() != slots_before_withdraw;
         record_object_skips(&mut candidate.plan, &self.counters.object_skips);
         outcome.changed |= candidate.plan != self.plan;
+        // Committing a full rebuild with no post-build withdrawal installs
+        // rebuild output only when the candidate actually converged: the
+        // rebuild reads committed-plan reuse state, so a commit can move it
+        // (surfaces, ordinals) and the next rebuild may differ. Verify by
+        // comparison instead of assuming a fixpoint.
+        let converged = candidate.plan.matches_for_stability(&self.plan)
+            && candidate.modules == self.modules
+            && candidate.corroboration == self.counters.corroboration
+            && candidate.manifest_fallbacks == self.counters.manifest_fallbacks
+            && candidate.selection_claims == self.selection_claims
+            && candidate.selection_tables == self.selection_tables
+            && Self::pins_match_for_stability(&candidate.pinned, &self.pinned);
+        let stabilizes = candidate.built_by_full_rebuild && !withdrew && converged;
         self.pinned = candidate.pinned;
         self.modules = candidate.modules;
         self.plan = candidate.plan;
@@ -14650,6 +14708,7 @@ impl Engine {
         self.counters.manifest_fallbacks = candidate.manifest_fallbacks;
         self.selection_claims = candidate.selection_claims;
         self.selection_tables = candidate.selection_tables;
+        self.plan_rebuild_stable = stabilizes;
         let publication = self.publish_current_capture_facts();
         outcome.disposition = candidate_publication_disposition(retired, &publication);
         if publication.is_err() {
@@ -17759,6 +17818,8 @@ impl Engine {
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
     ) -> Result<OwnedLoaderPrearmOutcome> {
+        // May mutate loader contexts below; selection retainment re-derives.
+        self.plan_rebuild_stable = false;
         let Some(prepared_executable) = child.prepared_executable() else {
             self.mark_partial(
                 "owned initial-set discovery",
@@ -17987,6 +18048,8 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         initiating_error: String,
     ) -> Result<OwnedLoaderPrearmOutcome> {
+        // May mutate loader contexts below; selection retainment re-derives.
+        self.plan_rebuild_stable = false;
         let mut errors = vec![initiating_error];
         let detach_dynamic_start = crate::attach::monotonic_ns();
         let (terminal_exports, detach_failed) = session.detach_dynamic_context(context);
@@ -18314,6 +18377,8 @@ impl Engine {
         additions_allowed: &mut bool,
         closure: &mut PauseClosure,
     ) {
+        // May mutate loader contexts below; selection retainment re-derives.
+        self.plan_rebuild_stable = false;
         let Some(journal) = self.terminal_journal.as_mut() else {
             return;
         };
@@ -18472,6 +18537,8 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         closure: &mut PauseClosure,
     ) -> Result<Option<bool>> {
+        // May mutate loader contexts below; selection retainment re-derives.
+        self.plan_rebuild_stable = false;
         let Some(mut batch) = self.terminal_batch.take() else {
             let Some(journal) = self.terminal_journal else {
                 return Ok(Some(false));
@@ -18626,6 +18693,8 @@ impl Engine {
         collect: &mut DiscoveryCollector<'_>,
         closure: &mut PauseClosure,
     ) -> Result<(bool, bool)> {
+        // May mutate loader contexts below; selection retainment re-derives.
+        self.plan_rebuild_stable = false;
         if self
             .owned_initial_exec
             .is_some_and(|initial| initial.view == view)
@@ -21040,6 +21109,121 @@ impl Engine {
         (scans, failed_pids, deferred_pids, skipped)
     }
 
+    /// Whether the unchanged-tick candidate fast path is disabled. Tests
+    /// only: production always takes the fast path on empty inputs. The
+    /// per-engine flag drives the equivalence twin; the process-wide
+    /// environment variable reruns whole suites against the full path.
+    #[cfg(test)]
+    fn empty_tick_fast_path_disabled(&self) -> bool {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DISABLED
+            .get_or_init(|| std::env::var_os("P11SCOPE_DISABLE_EMPTY_TICK_FAST_PATH").is_some())
+            || self.disable_empty_tick_fast_path_for_test
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_disable_empty_tick_fast_path_for_test(&mut self, disabled: bool) {
+        self.disable_empty_tick_fast_path_for_test = disabled;
+    }
+
+    /// Builds the candidate for a tick that changed nothing: no removals,
+    /// rescans, admissions or declined views. The caller holds only while
+    /// committed state is rebuild-stable — the last commit installed a built
+    /// candidate, so rebinding the retained modules reproduces it — and the
+    /// candidate carries that committed plan, modules, pins and evidence
+    /// with an empty delta. The merge's real side effects run exactly as the
+    /// full path runs them: skip recording, overlay invalidation, stable
+    /// module-id allocation, pre-arm watches, manifest lowering and skip
+    /// publication into the plan. Selection, corroboration and fallback
+    /// evidence is already committed, so there is nothing to re-derive. The
+    /// loader plan cache is cleared exactly as the full path clears it;
+    /// the commit reseeds it when a proved transaction warrants it.
+    fn inventory_candidate_unchanged(
+        &mut self,
+        candidate_pins: PinnedObjects,
+        skipped: Vec<Skipped>,
+    ) -> Result<LiveCandidate> {
+        self.pending_rejected_keys
+            .extend(candidate_pins.newly_rejected_keys(&self.pinned));
+        if self.pinned.has_overlay_uncertainty() || candidate_pins.has_overlay_uncertainty() {
+            self.invalidate_causal_timing();
+        }
+        self.loader_plan_cache = None;
+        attribution::note_all(&skipped);
+        for skip in skipped {
+            if !self.counters.object_skips.contains(&skip) {
+                self.counters.object_skips.push(skip);
+                self.note_facts_mutated();
+            }
+        }
+        let mut plan_ids = self.plan.clone();
+        self.capture_facts.bind_plan_module_ids(
+            &mut plan_ids,
+            &self.modules,
+            &self.manifests,
+            &candidate_pins,
+        )?;
+        let prearm_pieces = resolve_prearm_pieces(self.prearm_input.as_ref(), &candidate_pins);
+        let declared = plan::operator_target_keys(&self.manifests, &prearm_pieces, &candidate_pins);
+        self.prearm
+            .create_watches(&self.plan.modules, &declared, &candidate_pins);
+        let mut lowered = self.plan.clone();
+        let (manifest_selection_admissions, selection_refusals) = lower_manifest_selection_tables(
+            &mut lowered,
+            &self.plan,
+            &self.manifests,
+            &self.manifest_ordinals,
+            &candidate_pins,
+        );
+        for reason in selection_refusals {
+            self.mark_partial("offline interface selection", &reason);
+        }
+        let mut plan = self.plan.clone();
+        record_object_skips(&mut plan, &self.counters.object_skips);
+        let manifest_inventory_slots = plan
+            .slots
+            .iter()
+            .map(|slot| {
+                (
+                    plan::AttachKey {
+                        object: slot.object,
+                        file_offset: slot.file_offset,
+                    },
+                    slot.clone(),
+                )
+            })
+            .collect();
+        let views = self
+            .modules
+            .iter()
+            .map(|module| module.scanned.view)
+            .collect();
+        Ok(LiveCandidate {
+            pinned: candidate_pins,
+            modules: self.modules.clone(),
+            plan,
+            delta: plan::AttachDelta {
+                new: Vec::new(),
+                replace: Vec::new(),
+                retire: Vec::new(),
+            },
+            views,
+            corroboration: self.counters.corroboration.clone(),
+            manifest_fallbacks: self.counters.manifest_fallbacks.clone(),
+            selection_claims: self.selection_claims.clone(),
+            selection_tables: self.selection_tables.clone(),
+            selection_admission: None,
+            manifest_selection_admissions,
+            manifest_inventory_slots,
+            loader_plan_proof: None,
+            exec_preservations: Vec::new(),
+            exec_completions: Vec::new(),
+            // The gate holds only while committed state is rebuild output,
+            // so committing this candidate preserves stability.
+            built_by_full_rebuild: true,
+        })
+    }
+
     fn inventory_candidate(
         &mut self,
         removed: &BTreeSet<ProcessViewId>,
@@ -21048,6 +21232,25 @@ impl Engine {
         mut skipped: Vec<Skipped>,
         declined: &BTreeSet<ProcessViewId>,
     ) -> Result<LiveCandidate> {
+        #[cfg(not(test))]
+        let fast_path_disabled = false;
+        #[cfg(test)]
+        let fast_path_disabled = self.empty_tick_fast_path_disabled();
+        if removed.is_empty()
+            && refreshed.is_empty()
+            && new_views.is_empty()
+            && declined.is_empty()
+            && self.plan_rebuild_stable
+            && !fast_path_disabled
+        {
+            let mut candidate_pins = self.pinned.clone();
+            let (folds, lost) = canonicalize_scanned_overlays(&mut candidate_pins);
+            if folds == 0 && lost.is_empty() {
+                return self.inventory_candidate_unchanged(candidate_pins, skipped);
+            }
+            // A fold would change the pins: fall through to the full path,
+            // which canonicalizes identically.
+        }
         let assemble_start = crate::attach::monotonic_ns();
         let refreshed_ids: BTreeSet<_> = refreshed.iter().map(|(view, _, _)| *view).collect();
         let mut candidate_pins = self.pinned.clone();
@@ -21186,6 +21389,9 @@ impl Engine {
         if withheld.is_empty() {
             return;
         }
+        // Withholding deactivates and excises cells a rebuild would derive,
+        // so committing this candidate no longer installs rebuild output.
+        self.plan_rebuild_stable = false;
         candidate
             .delta
             .new
@@ -27855,6 +28061,9 @@ impl Engine {
             .iter()
             .filter_map(|key| self.plan.slot_index_for_key(*key))
             .collect();
+        if !indices.is_empty() {
+            self.plan_rebuild_stable = false;
+        }
         for index in indices {
             self.plan.deactivate(index);
         }
@@ -28438,6 +28647,7 @@ impl Engine {
             .plan
             .with_counters_policy(budget)
             .map_err(|refusal| anyhow!("{refusal}"))?;
+        self.plan_rebuild_stable = false;
         Ok(())
     }
 
@@ -28531,6 +28741,7 @@ impl Engine {
         self.plan = plan;
         self.pinned = pinned;
         self.modules = modules;
+        self.plan_rebuild_stable = false;
     }
 
     /// Test-only counter growth step through the production apply path:
@@ -28572,6 +28783,7 @@ impl Engine {
             loader_plan_proof: None,
             exec_preservations: Vec::new(),
             exec_completions: Vec::new(),
+            built_by_full_rebuild: false,
         };
         let mut additions_allowed = true;
         let outcome =
@@ -28620,6 +28832,7 @@ impl Engine {
                 .plan
                 .with_counters_policy(budget)
                 .map_err(|refusal| anyhow!("{refusal}"))?;
+            self.plan_rebuild_stable = false;
             Some(budget)
         } else {
             None

@@ -21366,12 +21366,13 @@ fn loader_pin_reuse_does_not_carry_across_a_later_dirty_mutation() {
 }
 
 /// An over-cap inventory tick that admits nothing must not rebuild any
-/// candidate. Two provider-free peers fill a 2-view cgroup capture; a third
-/// live peer holds a refresh request but no slot. The ordinary tick attempts
-/// it, finds no slot, and admits nothing — yet it rebuilds the identical
-/// empty-input candidate twice. The request must stay queued with its serial:
-/// an early return would complete it, so that proves the tick ran the full
-/// admission path rather than skipping the builds by skipping the tick.
+/// candidate once committed state is rebuild-stable. Two provider-free peers
+/// fill a 2-view cgroup capture; a third live peer holds a refresh request
+/// but no slot. The first ordinary tick builds twice and its commit
+/// stabilizes; the second admits nothing and must rebuild nothing. The
+/// request must stay queued with its serial on both ticks: an early return
+/// would complete it, so that proves each tick ran the full admission path
+/// rather than skipping the builds by skipping the tick.
 #[test]
 fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
     let mut first = std::process::Command::new("sleep")
@@ -21388,6 +21389,9 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
         .unwrap();
     let (p1, p2, p3) = (first.id(), second.id(), waiting.id());
     let (mut engine, _dir) = engine_over_cgroup_naming(&[p1, p2, p3]);
+    // Rebuild counts, not wall-time budgets, are under test: an infinite
+    // tick quantum keeps deep-scan admission deterministic under load.
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     engine.max_scan_pids = 2;
     engine
         .views
@@ -21403,8 +21407,15 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
     refresh_inventory_once(&mut engine);
     assert_eq!(
         loader_planning_operation_counts(&engine),
-        before,
-        "an idle tick must not rebuild candidates"
+        (before.0 + 2, before.1 + 2),
+        "the first tick builds twice and its commit stabilizes"
+    );
+    let settled = loader_planning_operation_counts(&engine);
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        settled,
+        "a stable idle tick must not rebuild candidates"
     );
     assert_eq!(
         engine.deep_scans, scans_before,
@@ -22665,6 +22676,7 @@ fn post_attach_generation_loss_detaches_and_cannot_commit_stale_candidate() {
         loader_plan_proof: None,
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
     };
     commit_cleaned_candidate_identity(
         &mut candidate,
@@ -47533,6 +47545,7 @@ fn midfinal_res3_tableless_provider_peer_does_not_authorize_retry() {
         loader_plan_proof: None,
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
     };
     let declined: BTreeSet<ProcessViewId> = [view_a].into_iter().collect();
     engine.withhold_declined_retry_targets(&mut candidate, &declined);
@@ -47650,6 +47663,7 @@ fn midfinal_res3_exact_target_contribution_from_healthy_peer_attaches() {
         loader_plan_proof: None,
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
     };
     let declined: BTreeSet<ProcessViewId> = [view_a].into_iter().collect();
     engine.withhold_declined_retry_targets(&mut candidate, &declined);

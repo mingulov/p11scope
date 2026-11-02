@@ -248,6 +248,7 @@ fn growth_candidate(
         loader_plan_proof: None,
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
     }
 }
 

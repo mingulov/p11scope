@@ -224,15 +224,86 @@ pub(crate) fn publish(
 /// I4: the PID scope target's thread-group start tick (clock ticks since
 /// boot, the `/proc/PID/stat` field 22 the kernel compares), read while
 /// the target is alive at scope publication. `None` for cgroup/system
-/// scopes, which the witness never binds. A dead target refuses loudly
-/// here instead of publishing a number-only scope for a marker build.
-pub(crate) fn pid_start_tick_of(scope: &Scope) -> Result<Option<u64>> {
+/// scopes, which the witness never binds. When the caller holds the
+/// selected or owned pin, the fresh read must equal the pin's retained
+/// start time and the pin must still be the same process; anything else
+/// refuses loudly instead of binding a PID reused during the object
+/// load. Without a pin there is no earlier identity to contradict, so
+/// the fresh read stands. A dead target refuses loudly here instead of
+/// publishing a number-only scope for a marker build.
+pub(crate) fn pid_start_tick_of(
+    scope: &Scope,
+    pin: Option<&crate::process::PidPin>,
+) -> Result<Option<u64>> {
     match scope {
-        Scope::Pid(pid) => crate::process::process_start_time(*pid)
-            .map(Some)
-            .with_context(|| format!("reading the start time of PID scope target {pid}")),
+        Scope::Pid(pid) => {
+            // I4 minor: field 22 adds the reader's time-namespace
+            // boottime offset; a skewed reader would bind a tick the
+            // kernel never matches, so PID births refuse loudly here
+            // instead of failing closed silently.
+            if reader_timens_skews_boottime()? {
+                bail!(
+                    "refusing PID_START_TICK for PID scope target {pid}: nonzero time-namespace boottime offset (/proc/self/timens_offsets)"
+                );
+            }
+            let fresh = crate::process::process_start_time(*pid)
+                .with_context(|| format!("reading the start time of PID scope target {pid}"))?;
+            if let Some(pin) = pin {
+                if pin.start_time() != Some(fresh) {
+                    bail!(
+                        "refusing PID_START_TICK for PID scope target {pid}: the fresh start tick {fresh} differs from the pinned {:?}",
+                        pin.start_time()
+                    );
+                }
+                if !pin.still_the_same() {
+                    bail!(
+                        "refusing PID_START_TICK for PID scope target {pid}: the pinned process is no longer the same"
+                    );
+                }
+            }
+            Ok(Some(fresh))
+        }
         Scope::Cgroup { .. } | Scope::System => Ok(None),
     }
+}
+
+/// I4: whether publication reads the PID witness: only PID scope on an
+/// object carrying the witness map; anything else skips the read.
+pub(crate) fn reads_pid_witness(scope: &Scope, has_witness_map: bool) -> bool {
+    has_witness_map && matches!(scope, Scope::Pid(_))
+}
+
+/// I4 minor: whether `text` (the content of `/proc/self/timens_offsets`)
+/// shows a nonzero boottime offset. `/proc/PID/stat` field 22 adds the
+/// reader's time-namespace boottime offset, so a skewed reader would
+/// bind a tick the kernel never matches. `None` when the boottime line
+/// is missing or malformed; callers fail closed.
+fn timens_boottime_offset(text: &str) -> Option<bool> {
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("boottime"))?;
+    let fields: Vec<&str> = line.split_whitespace().skip(1).collect();
+    if fields.is_empty() {
+        return None;
+    }
+    let mut offset = false;
+    for field in fields {
+        offset |= field.parse::<i64>().ok()? != 0;
+    }
+    Some(offset)
+}
+
+/// I4 minor: whether this process's time namespace skews the boottime
+/// clock the PID witness reads through. An absent file (no
+/// time-namespace support) means no skew; anything unreadable fails
+/// closed toward refusal.
+fn reader_timens_skews_boottime() -> Result<bool> {
+    let text = match std::fs::read_to_string("/proc/self/timens_offsets") {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("reading /proc/self/timens_offsets"),
+    };
+    Ok(timens_boottime_offset(&text).unwrap_or(true))
 }
 
 pub(crate) fn publish_inventory(ebpf: &mut Ebpf, scope: &Scope) -> Result<()> {
@@ -707,7 +778,7 @@ mod tests {
                 CapturePolicy::Allowlisted,
                 None,
                 false,
-                pid_start_tick_of(&scope).unwrap(),
+                pid_start_tick_of(&scope, None).unwrap(),
                 &mut maps,
             )
             .unwrap();
@@ -719,19 +790,145 @@ mod tests {
     fn pid_start_tick_of_reads_the_live_target_and_refuses_the_dead() {
         let live = std::process::id();
         assert_eq!(
-            pid_start_tick_of(&Scope::Pid(live)).unwrap(),
+            pid_start_tick_of(&Scope::Pid(live), None).unwrap(),
             Some(crate::process::process_start_time(live).unwrap())
         );
-        assert_eq!(pid_start_tick_of(&Scope::System).unwrap(), None);
+        assert_eq!(pid_start_tick_of(&Scope::System, None).unwrap(), None);
         let root = tempfile::tempdir().unwrap();
         assert_eq!(
-            pid_start_tick_of(&cgroup(root.path()).unwrap()).unwrap(),
+            pid_start_tick_of(&cgroup(root.path()).unwrap(), None).unwrap(),
             None
         );
-        let error = pid_start_tick_of(&Scope::Pid(u32::MAX)).unwrap_err();
+        let error = pid_start_tick_of(&Scope::Pid(u32::MAX), None).unwrap_err();
         assert!(
             format!("{error:#}").contains("start time"),
             "a dead target must refuse loudly: {error:#}"
         );
+    }
+
+    #[test]
+    fn pid_start_tick_with_a_matching_pin_accepts() {
+        // I4: the bound witness accepts when the fresh read equals the
+        // selected pin and the pin is still the same process.
+        let live = std::process::id();
+        let pin = crate::process::PidPin::open(live).expect("pin self");
+        assert_eq!(
+            pid_start_tick_of(&Scope::Pid(live), Some(&pin)).expect("matching pin accepts"),
+            Some(crate::process::process_start_time(live).expect("read self tick"))
+        );
+    }
+
+    #[test]
+    fn pid_start_tick_with_a_mismatched_pin_refuses() {
+        // I4: a PID reused between selection and publication carries
+        // another tick; the witness refuses instead of binding the reuser.
+        let live = std::process::id();
+        let pin = crate::process::PidPin::test_proc_only(live);
+        let error = pid_start_tick_of(&Scope::Pid(live), Some(&pin))
+            .expect_err("a mismatched pin must refuse");
+        assert!(
+            format!("{error:#}").contains("differs from the pinned"),
+            "mismatch refusal names both ticks: {error:#}"
+        );
+    }
+
+    #[test]
+    fn pid_start_tick_with_a_stale_pin_refuses() {
+        // I4: the target exits after selection but before publication (a
+        // zombie: its /proc stat still reads, with the pinned tick); the
+        // witness refuses instead of binding the dead number.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let pin = crate::process::PidPin::open(pid).expect("pin the child");
+        let pinned = pin.start_time().expect("the pin retains a start time");
+        child.kill().expect("kill the child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pin.still_the_same() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the killed child must exit promptly"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The zombie's stat still reads with the pinned tick: only the
+        // sameness check refuses, never a read failure.
+        assert_eq!(
+            crate::process::process_start_time(pid).expect("zombie stat reads"),
+            pinned
+        );
+        let result = pid_start_tick_of(&Scope::Pid(pid), Some(&pin));
+        child.wait().expect("reap the child");
+        let error = result.expect_err("a stale pin must refuse");
+        assert!(
+            format!("{error:#}").contains("no longer the same"),
+            "stale refusal names the cause: {error:#}"
+        );
+    }
+
+    #[test]
+    fn timens_boottime_offset_reads_the_boottime_line() {
+        // I4 minor: the offset detector fires on any nonzero field and
+        // stays quiet on zeros; a missing or malformed boottime line
+        // fails closed (None), never quiet.
+        for (text, expected) in [
+            (
+                "monotonic           0         0\nboottime            0         0\n",
+                Some(false),
+            ),
+            (
+                "monotonic           0         0\nboottime         3600         0\n",
+                Some(true),
+            ),
+            ("boottime            0         5\n", Some(true)),
+            ("boottime           -1         0\n", Some(true)),
+            ("monotonic           0         0\n", None),
+            ("boottime            0         x\n", None),
+            ("boottime\n", None),
+            ("", None),
+        ] {
+            assert_eq!(timens_boottime_offset(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn reader_timens_check_agrees_with_the_live_offsets_file() {
+        // I4 minor: the live check parses the same file the same way;
+        // self-consistent on any host, with or without an offset.
+        match std::fs::read_to_string("/proc/self/timens_offsets") {
+            Ok(text) => assert_eq!(
+                reader_timens_skews_boottime().expect("live check reads"),
+                timens_boottime_offset(&text).unwrap_or(true)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                assert!(!reader_timens_skews_boottime().expect("absent file means no skew"))
+            }
+            Err(error) => panic!("unexpected offsets read failure: {error}"),
+        }
+    }
+
+    #[test]
+    fn witness_read_skips_scopes_and_objects_without_a_witness_map() {
+        // I4: publication reads the PID witness only for PID scope on an
+        // object carrying the witness map; anything else skips the read.
+        let root = tempfile::tempdir().unwrap();
+        let cgroup = cgroup(root.path()).unwrap();
+        for has_map in [false, true] {
+            assert_eq!(
+                reads_pid_witness(&Scope::Pid(4242), has_map),
+                has_map,
+                "PID scope reads exactly when the map exists (map {has_map})"
+            );
+            assert!(
+                !reads_pid_witness(&Scope::System, has_map),
+                "system scope never reads (map {has_map})"
+            );
+            assert!(
+                !reads_pid_witness(&cgroup, has_map),
+                "cgroup scope never reads (map {has_map})"
+            );
+        }
     }
 }

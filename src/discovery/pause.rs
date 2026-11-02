@@ -7621,9 +7621,10 @@ mod tests {
     /// entry is armed would be stopped by the discovery hook. Reaping (which
     /// frees the number) therefore always follows the coordinator's terminal
     /// cleanup, which removes the authorization. This pins the funnel:
-    /// `Owned::finish` cleans up before it settles, settlement has that one
-    /// call site, and every other production reap precedes the first arm
-    /// (setup and preflight failures return before the coordinator exists).
+    /// `Owned::finish` requests the stop gate and cleans up before it
+    /// settles, settlement has that one call site, and every other
+    /// production reap precedes the first arm (setup and preflight
+    /// failures return before the coordinator exists).
     /// The capture loops route every end (exit, error, signal, timeout,
     /// kill-on-timeout, second SIGINT) through that same finish; that
     /// routing is an audited property of `run.rs`, documented here:
@@ -7656,6 +7657,15 @@ mod tests {
         assert!(
             cleanup < settle,
             "Owned::finish must remove the pause authorization before settling the child"
+        );
+        // The stop gate is requested in the same finish before
+        // settlement, so the links' background move never outruns it.
+        let stop = finish
+            .find("stop_gate().request_stop()")
+            .expect("finish requests the stop gate");
+        assert!(
+            stop < settle,
+            "Owned::finish must request the stop gate before settling the child"
         );
         // The single funnel: settlement is defined once and called from
         // finish only (test calls live past the tests-mod anchor).
@@ -8048,13 +8058,13 @@ mod tests {
         );
     }
 
-    /// `--pause off` twin: the wrapper shape without any pause completes and
+    /// `--pause never` twin: the wrapper shape without any pause completes and
     /// publishes the neutral lattice. Call counts stay out of this cell: an
     /// unpaused child can outrun discovery under load, so exact counts are
     /// verified live, not pinned here.
     #[test]
-    #[ignore = "privileged: run --pause off through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
-    fn privileged_pause_never_env_wrapper_matches_direct_count_lp64() {
+    #[ignore = "privileged: run --pause never through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_never_env_wrapper_publishes_neutral_lattice_lp64() {
         let dir = wrapper_work_dir("never");
         let conf = wrapper_token(&dir);
         let _env = WrapperEnvGuard::set(&conf);

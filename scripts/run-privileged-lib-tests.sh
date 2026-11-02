@@ -291,7 +291,7 @@ discovery::pause::tests::privileged_pause_auto_env_wrapper_matches_direct_count_
 discovery::pause::tests::privileged_pause_auto_preloaded_exec_matches_direct_count_lp64
 discovery::pause::tests::privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64
 discovery::pause::tests::privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64
-discovery::pause::tests::privileged_pause_never_env_wrapper_matches_direct_count_lp64
+discovery::pause::tests::privileged_pause_never_env_wrapper_publishes_neutral_lattice_lp64
 # D4 file-identity qualifying cells: ext4 inode-reuse confirmation
 # parity (own loop ext4 per row) and overlay xino backend parity (own
 # loop layers per mode). The copy-up RED reproducer stays skipped below:

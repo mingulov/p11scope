@@ -4485,10 +4485,14 @@ fn privileged_journal_marker_pid_reuse_exec_creates_no_row() -> Result<()> {
         "a reused PID must gain no marker publication: {}",
         marker_summary(&absent)
     );
+    // Liveness, not the birth proof: the plain exec path stamps any
+    // existing row (`p11_instance_exec`), so a matching generation only
+    // proves the hook ran. No birth is proved by the zero marker word
+    // above plus the unchanged admission row below.
     if let Some(row) = &absent {
         ensure!(
             row.exec_attach_gen == minted,
-            "the exec hook stamped the reused row without birthing it: {} minted {minted}",
+            "the reused row keeps the minted generation (plain-exec stamp, not a birth): {} minted {minted}",
             marker_summary(&absent)
         );
     }

@@ -2035,6 +2035,22 @@ class DriverFixture(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(proc.stdout.strip(), expect)
 
+    def test_keyed_plan_refuses_beyond_the_ledger_ceiling(self):
+        with tempfile.TemporaryDirectory(prefix="s1tp-kceil-") as tmp:
+            driver = self.build_driver(Path(tmp))
+            exact = subprocess.run(
+                [str(driver), "--dry-run", "/no-provider.so", "keyed",
+                 "10k", "20", "ledger.jsonl"],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(exact.returncode, 0, exact.stderr)
+            self.assertIn("200000 calls 99999 ops", exact.stdout)
+            refused = subprocess.run(
+                [str(driver), "--dry-run", "/no-provider.so", "keyed",
+                 "100k", "3", "ledger.jsonl"],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("ledger ceiling", refused.stderr)
+
     def test_keyed_mode_names_all_four_modes_on_mistake(self):
         with tempfile.TemporaryDirectory(prefix="s1tp-kmode-") as tmp:
             driver = self.build_driver(Path(tmp))
@@ -2412,6 +2428,96 @@ class JointActiveGate(unittest.TestCase):
                                         "session"):
                 self.run_joint(Path(tmp), mutate)
 
+    def test_object_budget_refusal_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-budget-") as tmp:
+            def mutate(doc):
+                budgets = doc["object_observations"]["budgets"]
+                budgets["key_rows"]["refused"] = 1
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "refuse"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_object_gap_rows_or_suppression_fail(self):
+        def add_row(doc):
+            doc["object_observations"]["gaps"]["rows"].append(
+                {"subject": "key row shed", "reason": "budget"})
+        def suppress(doc):
+            doc["object_observations"]["gaps"]["suppressed"] = 1
+        for name, mutate in (("rows", add_row),
+                             ("suppressed", suppress)):
+            with tempfile.TemporaryDirectory(prefix="joint-ogap-") as tmp:
+                with self.assertRaisesRegex(
+                        require_s1(self).S1Error,
+                        "gap rows or suppression"):
+                    self.run_joint(Path(tmp), mutate)
+
+    def test_key_row_equation_break_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-equation-") as tmp:
+            def mutate(doc):
+                row = doc["object_observations"]["key_operations"][0]
+                row["completed"] += 1
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "row equation"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_completed_short_of_started_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-completed-") as tmp:
+            def mutate(doc):
+                row = doc["object_observations"]["key_operations"][0]
+                row["failed"] = 1
+                row["completed"] -= 1
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "has completed"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_key_row_identity_fields_fail(self):
+        for field, bad in (("category", "digest"), ("role", "session"),
+                           ("unit", "calls")):
+            with tempfile.TemporaryDirectory(prefix="joint-ident-") as tmp:
+                def mutate(doc, field=field, bad=bad):
+                    doc["object_observations"]["key_operations"][0][field] = bad
+                with self.assertRaisesRegex(require_s1(self).S1Error,
+                                            field):
+                    self.run_joint(Path(tmp), mutate)
+
+    def test_extra_object_view_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-extraobj-") as tmp:
+            def mutate(doc):
+                doc["object_observations"]["objects"].append(
+                    joint_object_view(99, origin="imported",
+                                      creation="unwrap"))
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "object views"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_birth_without_an_observed_interval_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-birthshape-") as tmp:
+            def mutate(doc):
+                view = doc["object_observations"]["objects"][0]
+                view["birth"] = {"start_ns": R0, "end_ns": "soon"}
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "observed interval"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_session_shape_failures_fail(self):
+        for field, bad, expect in (("origin", "imported", "not opened"),
+                                  ("status", "open", "not closed")):
+            with tempfile.TemporaryDirectory(prefix="joint-sesshape-") as tmp:
+                def mutate(doc, field=field, bad=bad):
+                    doc["object_observations"]["sessions"][0][field] = bad
+                with self.assertRaisesRegex(require_s1(self).S1Error,
+                                            expect):
+                    self.run_joint(Path(tmp), mutate)
+
+    def test_expected_per_key_without_a_key_file_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-nokeyfile-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledger, _events, _inventory = healthy_triple(workdir)
+            view = s1.load_ledgers([str(ledger)])
+            with self.assertRaisesRegex(s1.S1Error, "no key file"):
+                s1._joint_expected_per_key(view)
+
 
 class JointConservationGate(unittest.TestCase):
     def run_joint(self, workdir, mutate=None, ops_per_key=(9999,),
@@ -2577,6 +2683,21 @@ class JointConservationGate(unittest.TestCase):
             doc["scope"] = f"pid:{PID}"
             write_json(inventory, doc)
             with self.assertRaisesRegex(s1.S1Error, "system"):
+                s1.compare([str(path) for path in ledgers], [str(events)],
+                           str(inventory), FULL_RATE, joint=True)
+
+    def test_joint_events_scope_must_be_system(self):
+        with tempfile.TemporaryDirectory(prefix="joint-evscope-") as tmp:
+            workdir = Path(tmp)
+            s1 = require_s1(self)
+            ledgers, events, inventory = healthy_joint_triple(workdir)
+            rows = [json.loads(line) for line in
+                    events.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+            assert rows[0]["kind"] == "started"
+            rows[0]["event"]["scope"] = f"pid:{PID}"
+            write_jsonl(events, rows)
+            with self.assertRaisesRegex(s1.S1Error, "not --system"):
                 s1.compare([str(path) for path in ledgers], [str(events)],
                            str(inventory), FULL_RATE, joint=True)
 

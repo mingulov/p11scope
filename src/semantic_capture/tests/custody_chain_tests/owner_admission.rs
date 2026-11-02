@@ -471,6 +471,7 @@ impl AdmissionScene {
                 scope.clone(),
                 HookRegistry::builtin(),
                 vec![provider.clone()],
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
             )
@@ -794,6 +795,7 @@ fn owner_admission_system_late_attested_caller_survives_unrelated_provider_catal
         Scope::System,
         HookRegistry::builtin(),
         hints,
+        vec![],
         OsProcessSource,
         RegistryLimits::default_limits(),
     )

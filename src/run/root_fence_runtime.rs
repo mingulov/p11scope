@@ -299,6 +299,7 @@ fn scenario(
         track_short_lived: false,
         kind,
         modules: vec![stage.join("provider.so")],
+        exclude_modules: vec![],
         manifests: vec![stage.join("provider.json")],
         prearm_modules: vec![],
         hooks: crate::discovery::hooks::HookRegistry::builtin(),

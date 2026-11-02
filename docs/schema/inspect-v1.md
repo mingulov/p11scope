@@ -3,8 +3,13 @@
 
 `p11scope inspect --pid PID --json` retains document ID
 `p11scope/inspect/v1`. Existing `pid`, `scan`, `modules` and `skipped` fields
-keep their meanings. The additive root fields are `application` and
-`application_status`; consumers that ignore unknown fields remain compatible.
+keep their meanings. The additive root fields are `application`,
+`application_status`, `excluded_modules` and `unmatched_excludes`;
+consumers that ignore unknown fields remain compatible. The exclusion
+fields appear only when `--exclude-module` is passed: `excluded_modules`
+lists one row per distinct excluded file (`path`, `dev`, `ino`,
+`processes`), and `unmatched_excludes` lists the inputs that matched no
+mapped file.
 
 An observed application has exactly:
 

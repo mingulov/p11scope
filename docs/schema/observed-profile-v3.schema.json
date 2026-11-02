@@ -232,6 +232,24 @@
             }
           }
         },
+        "excluded_modules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "dev", "ino", "processes"],
+            "properties": {
+              "path": {"type": "string"},
+              "dev": {"type": "integer", "minimum": 0},
+              "ino": {"type": "integer", "minimum": 0},
+              "processes": {"type": "integer", "minimum": 1}
+            }
+          }
+        },
+        "unmatched_excludes": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
         "operation_state_imports": {"type": "integer", "minimum": 0},
         "orphan_ops": {"type": "integer", "minimum": 0},
         "p11scope_env": {

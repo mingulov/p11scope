@@ -29,6 +29,7 @@ fn engine(owners: usize, leases: usize) -> Engine {
         Scope::Pid(std::process::id()),
         HookRegistry::builtin(),
         Vec::new(),
+        vec![],
     )
     .unwrap()
 }
@@ -121,6 +122,7 @@ fn pre_window_owner_refuses_a_cold_group_without_reading_a_default_census() {
         Scope::Pid(group.pid()),
         HookRegistry::builtin(),
         vec![group.program.clone()],
+        vec![],
     )
     .unwrap();
     let error = engine
@@ -319,6 +321,7 @@ fn pid_scoped_engine(pid: u32) -> Engine {
         Scope::Pid(pid),
         HookRegistry::builtin(),
         Vec::new(),
+        vec![],
     )
     .unwrap()
 }

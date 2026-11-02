@@ -2778,6 +2778,8 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         semantic_edges: Vec::new(),
         render_index: Default::default(),
         gaps_suppressed: 0,
+        excluded_modules: Vec::new(),
+        unmatched_excludes: Vec::new(),
         object_observations: crate::key_operation_projection::ObjectObservations::unavailable(
             1,
             "bootstrap_unavailable",

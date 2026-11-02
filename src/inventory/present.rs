@@ -531,6 +531,11 @@ pub(crate) struct Presentation {
     pub(crate) render_index: PresentationRenderIndex,
     pub gaps: Vec<GapView>,
     pub gaps_suppressed: u64,
+    /// Files skipped by `--exclude-module` (a declared operator choice,
+    /// never a loss), plus the inputs that matched nothing. Empty unless
+    /// the operator passed `--exclude-module`.
+    pub excluded_modules: Vec<crate::render::ExcludedOut>,
+    pub unmatched_excludes: Vec<String>,
     pub budgets: BudgetView,
     /// The sanitized Detailed-lane summary (`observation.
     /// semantic_capture`): counts only, set by the run loop from the
@@ -844,6 +849,7 @@ impl Presentation {
         let limits = registry.limits();
         let (observed_edges, saturated_edges) = registry.counter_census();
         let render_index = PresentationRenderIndex::build(&instances, &semantic_edges);
+        let (excluded_modules, unmatched_excludes) = coordinator.excluded_snapshot();
         Ok(Self {
             scope_label: scope_label.to_string(),
             started_ns,
@@ -861,6 +867,8 @@ impl Presentation {
             render_index,
             gaps,
             gaps_suppressed: registry.gaps_suppressed(),
+            excluded_modules,
+            unmatched_excludes,
             semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
             // No Joint evidence reaches the live registry today
             // (live-loop carry): the projection is honestly
@@ -1607,6 +1615,36 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
     }
     if presentation.gaps_suppressed > 0 {
         let _ = writeln!(out, "gaps suppressed: {}", presentation.gaps_suppressed);
+    }
+    if !presentation.excluded_modules.is_empty() {
+        let _ = writeln!(
+            out,
+            "Excluded by you ({} files):",
+            presentation.excluded_modules.len()
+        );
+        for excluded in &presentation.excluded_modules {
+            let _ = writeln!(
+                out,
+                "  {}: excluded by you (device {} inode {}, {} processes mapped it); calls into this file were not observed",
+                escape_controls(&excluded.path),
+                excluded.dev,
+                excluded.ino,
+                excluded.processes
+            );
+        }
+    }
+    if !presentation.unmatched_excludes.is_empty() {
+        let _ = writeln!(
+            out,
+            "Unmatched exclusions ({}): {}",
+            presentation.unmatched_excludes.len(),
+            presentation
+                .unmatched_excludes
+                .iter()
+                .map(|input| escape_controls(input))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     out
 }

@@ -109,6 +109,17 @@ informational only: it never feeds shares, verdicts, `gap_classes` or
 `completeness`, and never forces `PARTIAL`. Like `selected_detail`, it
 is a v3-additive disclosure that introduces no new schema revision.
 
+When a capture passes `--exclude-module`, its evidence also contains
+optional additive `excluded_modules` and `unmatched_excludes` keys.
+Captures without the flag omit both. `excluded_modules` lists one row
+per distinct excluded file with `path`, `dev`, `ino` (the opened file's
+fstat identity) and `processes` (how many in-scope processes mapped
+it); `unmatched_excludes` lists the inputs that matched no mapped
+file, in operator order. Like the disclosure above, these keys never
+feed shares, verdicts, `gap_classes` or `completeness`: excluded
+modules are a declared choice, not a loss, and the rest of the capture
+can still be `exact`.
+
 Under the default `allowlisted` policy, every emitted mechanism has
 `params: null` with `params_omitted: "policy"` beside it, and
 `templates.operations` is always empty. Every `params: null` carries a

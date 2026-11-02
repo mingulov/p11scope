@@ -12766,6 +12766,7 @@ pub(crate) mod tests {
                 crate::attach::Scope::Pid(std::process::id()),
                 crate::discovery::hooks::HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 crate::discovery::caller_registry::OsProcessSource,
                 crate::discovery::caller_registry::RegistryLimits::default_limits(),
             )

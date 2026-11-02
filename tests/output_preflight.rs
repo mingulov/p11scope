@@ -37,6 +37,7 @@ fn untrusted_output_is_refused_before_the_discovery_scan() {
         track_short_lived: false,
         kind: Kind::Profile,
         modules: Vec::new(),
+        exclude_modules: vec![],
         // Poison the discovery scan too: this missing manifest is read inside
         // `Engine::discover`, after the sweep — so if the scan ran first, the
         // manifest would be the error. Sink-first means the untrusted dir wins.
@@ -69,6 +70,7 @@ fn poisoned_profile_args(out: PathBuf) -> CaptureArgs {
         track_short_lived: false,
         kind: Kind::Profile,
         modules: Vec::new(),
+        exclude_modules: vec![],
         // Read inside `Engine::discover`: if discovery ran first, the missing
         // manifest would be the error instead of the output refusal.
         manifests: vec![PathBuf::from("/definitely/not/a/manifest.json")],

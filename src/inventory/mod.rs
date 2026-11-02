@@ -691,6 +691,7 @@ fn registry_limits(max_gaps: Option<usize>) -> RegistryLimits {
 pub fn run(
     scope: impl Into<crate::cli::ScopeArg>,
     modules: &[PathBuf],
+    excludes: &[PathBuf],
     manifests: &[PathBuf],
     prearm_modules: &[PathBuf],
     hooks: &HookRegistry,
@@ -746,6 +747,7 @@ pub fn run(
     run_with_terminal_budget(
         scope,
         modules,
+        excludes,
         manifests,
         prearm_modules,
         hooks,
@@ -958,6 +960,7 @@ fn run_with_terminal_diagnostics(
     run_with_terminal_budget(
         scope,
         modules,
+        &[],
         &[],
         &[],
         hooks,
@@ -1205,6 +1208,7 @@ fn reclaim_pass_heap() {
 fn run_with_terminal_budget(
     scope: impl Into<InventorySelection>,
     modules: &[PathBuf],
+    excludes: &[PathBuf],
     manifests: &[PathBuf],
     prearm_modules: &[PathBuf],
     hooks: &HookRegistry,
@@ -1356,6 +1360,7 @@ fn run_with_terminal_budget(
         engine_scope.clone(),
         hooks.clone(),
         modules.to_vec(),
+        excludes.to_vec(),
         OsProcessSource,
         registry_limits(max_gaps),
         endpoint_budget,
@@ -8085,7 +8090,7 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
             })
         })
         .collect();
-    serde_json::json!({
+    let mut document = serde_json::json!({
         "schema": DOC_ID,
         "caller_metadata": presentation.caller_metadata.summary.json(),
         "scope": presentation.scope_label,
@@ -8117,7 +8122,18 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         // Additive (v1, DR-K8S-2): caller PIDs are this observer's /proc
         // numbering; the kernel's are the initial namespace's.
         "pid_namespace": crate::pidns::PidNamespaceEvidence::of(crate::pidns::numbering()),
-    })
+    });
+    // Additive (v0.6.0): files skipped by `--exclude-module`, a declared
+    // operator choice, never a loss. Omitted when empty.
+    if !presentation.excluded_modules.is_empty() {
+        document["excluded_modules"] =
+            serde_json::to_value(&presentation.excluded_modules).unwrap_or_default();
+    }
+    if !presentation.unmatched_excludes.is_empty() {
+        document["unmatched_excludes"] =
+            serde_json::to_value(&presentation.unmatched_excludes).unwrap_or_default();
+    }
+    document
 }
 
 /// The native binder census (Task 6 C4): every witness row once, bound to a
@@ -8460,6 +8476,7 @@ mod tests {
             Scope::Pid(std::process::id()),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -8488,6 +8505,7 @@ mod tests {
                     let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
                     let error = run_with_terminal_budget(
                         InspectScope::System,
+                        &[],
                         &[],
                         &[],
                         &[],
@@ -8545,6 +8563,7 @@ mod tests {
             crate::cli::ScopeArg::Pid(std::process::id()),
             &[],
             &[],
+            &[],
             &[PathBuf::from("a.so")],
             &HookRegistry::builtin(),
             true,
@@ -8584,6 +8603,7 @@ mod tests {
             let mut stdout = Vec::new();
             let error = run_with_terminal_budget(
                 InspectScope::Pid(std::process::id()),
+                &[],
                 &[],
                 &[],
                 &[PathBuf::from("/opt/p11-provider.so")],
@@ -8694,6 +8714,7 @@ mod tests {
             || {
                 run_with_terminal_budget(
                     InspectScope::Pid(std::process::id()),
+                    &[],
                     &[],
                     &[],
                     &[provider],
@@ -9303,6 +9324,7 @@ mod tests {
         let mut stdout = Vec::new();
         let code = run_with_terminal_budget(
             InspectScope::Pid(std::process::id()),
+            &[],
             &[PathBuf::from("/missing/p11scope-provider")],
             &[],
             &[],
@@ -9490,6 +9512,7 @@ mod tests {
                         Scope::System,
                         HookRegistry::builtin(),
                         Vec::new(),
+                        vec![],
                         OsProcessSource,
                         RegistryLimits::default_limits(),
                         budget,
@@ -9564,6 +9587,7 @@ mod tests {
                 Scope::System,
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
                 budget,
@@ -9623,6 +9647,7 @@ mod tests {
             for dashboard in [false, true] {
                 let error = run(
                     InspectScope::System,
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -17784,6 +17809,7 @@ mod promotion_driver_tests {
             Scope::Pid(std::process::id()),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -24182,6 +24208,7 @@ mod seal_readiness_tests {
             Scope::Pid(std::process::id()),
             crate::discovery::hooks::HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             crate::discovery::caller_registry::RegistryLimits::default_limits(),
         )

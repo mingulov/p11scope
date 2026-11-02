@@ -1272,7 +1272,7 @@ fn capture_fact_stage_publishes_once_or_rolls_back_whole() {
     );
     engine.capture_facts.rollback_stage();
     engine.capture_facts.apply_to_plan(&mut engine.plan);
-    engine.discovery = engine.capture_facts.discovery(&engine.plan);
+    engine.discovery = engine.capture_facts.discovery(&engine.plan, &[], &[]);
     assert_eq!(
         engine.discovery.modules.len(),
         1,
@@ -2122,6 +2122,7 @@ fn shared_scope_capture_starts_when_every_module_is_refused() {
             0,
             false,
             scope,
+            false,
         )
     };
 
@@ -2135,9 +2136,10 @@ fn shared_scope_capture_starts_when_every_module_is_refused() {
     assert!(shared.slots.is_empty());
     assert_eq!(shared.modules_skipped.len(), 1);
     assert!(
-        shared.modules_skipped[0]
-            .reason
-            .ends_with("name it with --module <path>"),
+        shared.modules_skipped[0].reason.ends_with(
+            "; to capture one provider, name it with --module <path>; to free slots, exclude \
+             an unneeded module with --exclude-module <name>"
+        ),
         "{:?}",
         shared.modules_skipped[0]
     );
@@ -2178,6 +2180,7 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
         0,
         false,
         plan::AdmissionScope::Named,
+        false,
     )
     .unwrap();
     engine.counters = counters;
@@ -2769,7 +2772,9 @@ fn a_later_whole_refusal_replaces_a_published_growth_omission() {
     let refusal = &engine.discovery.modules_skipped[0];
     assert!(
         refusal.reason.starts_with("module needs 2 more;")
-            && refusal.reason.ends_with("refusing to attach a prefix"),
+            && refusal.reason.contains("refusing to attach a prefix")
+            && refusal.reason.contains("--module")
+            && refusal.reason.contains("--exclude-module"),
         "{refusal:?}"
     );
     assert!(!plan::is_growth_omission(&refusal.reason), "{refusal:?}");
@@ -8142,6 +8147,7 @@ fn capture_start_members_that_ended_are_not_losses() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -8168,6 +8174,56 @@ fn capture_start_members_that_ended_are_not_losses() {
         "three members that ended before capture start are not three losses: {:?}",
         engine.plan().skipped
     );
+}
+
+/// Controller ruling (remedies): `discover` wires a metrics capture without
+/// an explicit `--counter-mode` to the refusal remedy hint, and only that.
+#[test]
+fn discover_wires_metrics_without_counter_mode_to_the_remedy_hint() {
+    for (case, metrics, counter_mode, expected) in [
+        (0, false, None, false),
+        (1, true, None, true),
+        (
+            2,
+            true,
+            Some(p11scope_ebpf_common::CounterMode::Counts),
+            false,
+        ),
+        (
+            3,
+            false,
+            Some(p11scope_ebpf_common::CounterMode::Counts),
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        std::fs::write(dir.path().join("cgroup.procs"), "").expect("an empty cgroup.procs");
+        let args = CaptureArgs {
+            track_short_lived: false,
+            kind: crate::cli::Kind::Profile,
+            modules: vec![],
+            exclude_modules: vec![],
+            manifests: vec![],
+            prearm_modules: vec![],
+            hooks: HookRegistry::builtin(),
+            scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+            metrics,
+            counter_mode,
+            select_endpoint: None,
+            duration: None,
+            out: None,
+            max_events: None,
+            ring_bytes: None,
+            drain_interval: None,
+            max_scan_pids: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            attach_backend: BackendSelection::default(),
+        };
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        let engine = Engine::discover(&args, &scope, None).expect("an empty cgroup still captures");
+        assert_eq!(engine.counter_hint, expected, "case {case}");
+    }
 }
 
 /// Task 2 (cgroup-256 B1): the multi-process scan cap is a CLI-settable Engine
@@ -8210,6 +8266,7 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -8381,6 +8438,7 @@ fn some_zero_max_scan_pids_clamps_to_default_like_none() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -8451,6 +8509,7 @@ fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -8557,6 +8616,7 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -8726,6 +8786,7 @@ fn retained_views_survive_ordinary_rotation_passes() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -8861,6 +8922,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -9092,6 +9154,7 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -9406,6 +9469,7 @@ fn reconcile_quantum_zero_defers_the_whole_slice() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -9543,6 +9607,7 @@ fn refresh_requests_survive_allocation_exhaustion() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -9639,6 +9704,7 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -24168,6 +24234,7 @@ impl LoaderPlanningFixture {
             &pins,
             false,
             plan::AdmissionScope::Shared,
+            false,
         );
         engine.pinned = pins;
         engine.modules = modules;
@@ -28018,6 +28085,7 @@ fn capture_start_releases_view_ids_for_members_that_ended_before_scan() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -31788,6 +31856,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
         0,
         false,
         plan::AdmissionScope::Named,
+        false,
     )
     .unwrap();
 
@@ -34393,6 +34462,7 @@ fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: hints,
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -34919,6 +34989,8 @@ fn p11kit_like_64_table_module() -> ScannedModule {
 /// The 64-table replica must NOT refuse the module. The linked table bypasses
 /// the independent K=4 heuristic cap; the global slot bound admits three
 /// heuristic tables at 512 or all four at 2112. Every spill stays explicit.
+/// Part 0: the admitted prefix is reported as a partial-coverage record
+/// naming the covered templates, not as silence.
 #[test]
 fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     let admitted_heuristics = if cfg!(feature = "wide-detailed-2112") {
@@ -34934,10 +35006,20 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
 
-    assert!(
-        plan.modules_skipped.is_empty(),
-        "the 64-table module stays admitted under the resource bound, not refused: {:?}",
+    assert_eq!(
+        plan.modules_skipped.len(),
+        1,
+        "the 64-table module stays admitted with a prefix partial, not refused: {:?}",
         plan.modules_skipped
+    );
+    assert!(
+        plan.modules_skipped[0].reason.contains(&format!(
+            "{admitted_heuristics} of 63 template tables attached"
+        )) && plan.modules_skipped[0]
+            .reason
+            .contains("calls through the others are not counted"),
+        "{:?}",
+        plan.modules_skipped[0]
     );
     assert_eq!(
         plan.slots.len(),
@@ -34978,7 +35060,19 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
         .unwrap();
     engine.publish_current_capture_facts().unwrap();
     assert_eq!(engine.discovery.modules.len(), 1);
-    assert!(engine.discovery.modules_skipped.is_empty());
+    assert_eq!(
+        engine.discovery.modules_skipped.len(),
+        1,
+        "published evidence carries the prefix partial: {:?}",
+        engine.discovery.modules_skipped
+    );
+    assert!(
+        engine.discovery.modules_skipped[0]
+            .reason
+            .contains("template tables attached"),
+        "{:?}",
+        engine.discovery.modules_skipped[0]
+    );
     assert_eq!(
         engine.discovery.uncorroborated_candidates, expected_spill,
         "published evidence carries the resource-bound spill count"
@@ -35077,10 +35171,12 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
 
 /// Task 1.3: a table returned by a live provider export carries publication
 /// evidence — it keeps its ordinal names and bypasses the unresolved-heuristic
-/// cap exactly like an interface-linked table.
+/// cap exactly like an interface-linked table. Five tables stay Heuristic
+/// class (a sixth unresolved table would make a closure array, admitted
+/// whole since round 1 rather than through K=4).
 #[test]
 fn live_return_tables_keep_names_and_bypass_the_heuristic_cap() {
-    const TABLES: usize = 6;
+    const TABLES: usize = 5;
     const ENTRIES: usize = 4;
     let mut raw = overlay_module(overlay_key(61));
     raw.tables = (0..TABLES)
@@ -35102,7 +35198,7 @@ fn live_return_tables_keep_names_and_bypass_the_heuristic_cap() {
             unpinned: vec![],
             address: 0x7f00_1000 + table as u64 * 0x1000,
             file_offset: Some(0x90000 + table as u64 * 0x1000),
-            live_return: table == 5,
+            live_return: table == 4,
             manifest_supported: false,
             extension_impossible: false,
         })
@@ -35113,15 +35209,15 @@ fn live_return_tables_keep_names_and_bypass_the_heuristic_cap() {
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
 
-    // Four heuristic tables fill K=4, the live-return table bypasses it, and
-    // the fifth heuristic table spills as evidence.
+    // Four heuristic tables fill K=4 and the live-return table bypasses it;
+    // five tables admit where the cap alone allows four.
     assert!(
         plan.modules_skipped.is_empty(),
         "{:?}",
         plan.modules_skipped
     );
     assert_eq!(plan.slots.len(), 5 * ENTRIES);
-    assert_eq!(plan.uncorroborated_candidates, 1);
+    assert_eq!(plan.uncorroborated_candidates, 0);
     let names_of = |table: usize| {
         plan.slots
             .iter()
@@ -35133,12 +35229,12 @@ fn live_return_tables_keep_names_and_bypass_the_heuristic_cap() {
     for table in 0..4 {
         assert_eq!(names_of(table), ["unknown"]);
     }
-    assert_eq!(names_of(5), ["C_Sign"]);
+    assert_eq!(names_of(4), ["C_Sign"]);
     let tables = &plan.modules[0].tables;
-    assert_eq!(tables.len(), 6);
-    assert_eq!(tables[5].linkage, "live_return");
+    assert_eq!(tables.len(), 5);
+    assert_eq!(tables[4].linkage, "live_return");
     assert!(
-        tables[..5].iter().all(|table| table.linkage == "heuristic"),
+        tables[..4].iter().all(|table| table.linkage == "heuristic"),
         "{tables:?}"
     );
 }
@@ -35355,13 +35451,15 @@ fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_modu
     }
 }
 
-/// Task 1.2 (c): two ASLR/process views of one provider share ONE per-object
-/// cap. Both views decode the same 6 tables (same file offsets, different
+/// Task 1.2 (c): two ASLR/process views of one provider admit ONE union.
+/// Both views decode the same 6 tables (same file offsets, different
 /// runtime addresses); distinct tables admit once, scored by the strongest
 /// instance, so linkage seen in any view counts. Entry bindings, interface
-/// indexes, and exact target pins are preserved per view.
+/// indexes, and exact target pins are preserved per view. Six tables are a
+/// closure array by the classifier, so round 1 admits the fitting union
+/// whole rather than through the per-object K=4 cap.
 #[test]
-fn two_views_share_one_per_object_cap_preserving_pins_and_interfaces() {
+fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
     const TABLES: u64 = 6;
     const ENTRIES: u64 = 10;
     const NAMES: [&str; 8] = [
@@ -35486,17 +35584,17 @@ fn two_views_share_one_per_object_cap_preserving_pins_and_interfaces() {
     assert_eq!(plan.modules.len(), 1, "one object is one module");
     assert!(
         plan.modules_skipped.is_empty(),
-        "shared cap admits, never refuses: {:?}",
+        "fitting union admits, never refuses: {:?}",
         plan.modules_skipped
     );
     assert_eq!(
         plan.slots.len(),
-        50,
-        "1 published x 10 + 4 heuristic x 10 admit under the shared cap"
+        60,
+        "6 distinct tables x 10 admit once as one union across views"
     );
     assert_eq!(
-        plan.uncorroborated_candidates, 1,
-        "6 distinct tables (1 published + 5 heuristic) spill 1 under one shared cap, not per-view"
+        plan.uncorroborated_candidates, 0,
+        "fitting union spills nothing"
     );
     assert_eq!(
         plan.entries_seen, 60,
@@ -35510,18 +35608,16 @@ fn two_views_share_one_per_object_cap_preserving_pins_and_interfaces() {
         plan.surfaces
             .iter()
             .any(|surface| surface.source == "interface[0] exact_standard"),
-        "interface index 0 survives the shared-cap admission: {:?}",
+        "interface index 0 survives the union admission: {:?}",
         plan.surfaces
     );
 
-    // Admitted: tables 0,1,2,3 (heuristic prefix) + 5 (published via any-view
-    // linkage). Spilled: table 4.
+    // Admitted whole: all 6 tables, deduplicated across views by file offset.
     let attached: BTreeSet<u64> = plan.slots.iter().map(|slot| slot.file_offset).collect();
     for table in 0..TABLES {
         let first_entry = 0x20000 + table * ENTRIES * 8;
-        assert_eq!(
+        assert!(
             attached.contains(&first_entry),
-            table != 4,
             "table {table} admission follows the shared evidence order"
         );
     }
@@ -35575,26 +35671,36 @@ fn publish_fifth_table_live(engine: &mut Engine, mut raw: ScannedModule) {
     engine.publish_current_capture_facts().unwrap();
 }
 
-/// Audit F5: published spill evidence is capture-lifetime, the plan counter
-/// stays current-state. The fifth table spills past K=4, then a live return
-/// bypasses it and the rebuild settles: the plan resolves to 0 while the
-/// published evidence still reports the earlier omission.
+/// Audit F5 (round-1 vehicle retired): five heuristic tables are a closure
+/// array by the classifier, so round 1 admits the fitting five whole rather
+/// than spilling the fifth past K=4 — a K=4 spill is unrepresentable for a
+/// scan-only module this size, and spill-history retention stays covered by
+/// the growth-omission (G-03) tests. What remains here is the live half: a
+/// later live publication settles through the same stable-ID extension path
+/// with no spill at any point, and upgrades the table's linkage.
 #[test]
-fn spill_history_retains_earlier_omission_after_live_merge() {
+fn whole_closure_module_settles_live_publication_without_spill() {
     let (mut engine, raw) = spill_history_engine();
-    assert_eq!(engine.plan.uncorroborated_candidates, 1);
-    assert_eq!(engine.discovery.uncorroborated_candidates, 1);
-    assert_eq!(engine.plan.slots.len(), 4);
+    assert_eq!(engine.plan.uncorroborated_candidates, 0);
+    assert_eq!(engine.discovery.uncorroborated_candidates, 0);
+    assert_eq!(engine.plan.slots.len(), 5);
+    let offset = raw.tables[4].file_offset;
     publish_fifth_table_live(&mut engine, raw);
     assert_eq!(engine.plan.slots.len(), 5);
     assert_eq!(
         engine.plan.uncorroborated_candidates, 0,
-        "the live merge resolves the current-inventory spill"
+        "the live merge settles with no spill"
     );
     assert_eq!(
-        engine.discovery.uncorroborated_candidates, 1,
-        "earlier omitted table disappeared from lifetime evidence"
+        engine.discovery.uncorroborated_candidates, 0,
+        "lifetime evidence carries no spill that never happened"
     );
+    let current = engine.plan.modules[0]
+        .tables
+        .iter()
+        .find(|table| table.file_offset == offset)
+        .unwrap();
+    assert_eq!(current.linkage, "live_return");
 }
 
 /// Audit F7: public table provenance follows a later live publication. The
@@ -36614,8 +36720,8 @@ fn merge_preflight_success_implies_identical_merge_results() {
     assert_eq!(plan_a.skipped, plan_b.skipped);
     assert_eq!(plan_a.entries_seen, plan_b.entries_seen);
     assert_eq!(
-        format!("{:?}", first.discovery(&plan_a)),
-        format!("{:?}", second.discovery(&plan_b)),
+        format!("{:?}", first.discovery(&plan_a, &[], &[])),
+        format!("{:?}", second.discovery(&plan_b, &[], &[])),
         "merges publish identical discovery"
     );
 }
@@ -36789,6 +36895,7 @@ fn e06_cgroup_args(
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: hints,
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),

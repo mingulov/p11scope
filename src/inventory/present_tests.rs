@@ -183,6 +183,42 @@ fn refused_but_quiet_renders_both_states_not_one_merged_label() {
     );
 }
 
+/// The snapshot and JSON list `--exclude-module` files as "excluded by
+/// you" with path, identity, and process count, plus unmatched inputs.
+#[test]
+fn snapshot_and_json_list_excluded_modules_and_unmatched_inputs() {
+    let harness = varied_harness();
+    let document = harness.render();
+    let mut presentation = capture_for(&harness, &document);
+    presentation.excluded_modules = vec![crate::render::ExcludedOut {
+        path: "/opt/libp11-kit.so.0.4.8".into(),
+        dev: 42,
+        ino: 1001,
+        processes: 3,
+    }];
+    presentation.unmatched_excludes = vec!["nope.so".into()];
+    let snapshot = render_snapshot(&presentation);
+    assert!(
+        snapshot.contains("Excluded by you (1 files):"),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot.contains("/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 3 processes mapped it)"),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot.contains("Unmatched exclusions (1): nope.so"),
+        "{snapshot}"
+    );
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(
+        out["excluded_modules"][0]["path"],
+        "/opt/libp11-kit.so.0.4.8"
+    );
+    assert_eq!(out["excluded_modules"][0]["processes"], 3);
+    assert_eq!(out["unmatched_excludes"][0], "nope.so");
+}
+
 /// The snapshot names a refused module with its admission reason in plain
 /// words, on the module's own detail line.
 #[test]

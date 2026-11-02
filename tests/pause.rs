@@ -24,6 +24,7 @@ fn paused_run(pause: PausePolicy, marker: &Path) -> RunArgs {
         track_short_lived: false,
         kind: Kind::Profile,
         modules: Vec::new(),
+        exclude_modules: vec![],
         manifests: Vec::new(),
         prearm_modules: Vec::new(),
         hooks: HookRegistry::builtin(),

@@ -688,6 +688,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         scope: Scope,
         hooks: HookRegistry,
         hints: Vec<PathBuf>,
+        excludes: Vec<PathBuf>,
         source: Source,
         registry_limits: RegistryLimits,
     ) -> Result<Self> {
@@ -695,6 +696,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             scope,
             hooks,
             hints,
+            excludes,
             source,
             registry_limits,
             crate::capacity::inventory_endpoint_budget(None).map_err(anyhow::Error::msg)?,
@@ -707,6 +709,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         scope: Scope,
         hooks: HookRegistry,
         hints: Vec<PathBuf>,
+        excludes: Vec<PathBuf>,
         source: Source,
         registry_limits: RegistryLimits,
         endpoint_budget: InventoryBudget,
@@ -721,7 +724,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // registry's caller cap stands behind it as a backstop.
         adapter.set_max_callers(registry_limits.max_callers);
         Ok(Self {
-            engine: Engine::inventory(inventory_config(endpoint_budget)?, scope, hooks, hints)?,
+            engine: Engine::inventory(
+                inventory_config(endpoint_budget)?,
+                scope,
+                hooks,
+                hints,
+                excludes,
+            )?,
             collected_finish_progressed: false,
             promotion_finish: false,
             promotion_records_discarded: 0,
@@ -1936,6 +1945,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     pub(crate) fn registry(&self) -> &CallerRegistry {
         &self.registry
+    }
+
+    /// The capture's `--exclude-module` report rows plus the inputs that
+    /// matched nothing, aggregated from the engine budget's per-(pid, file)
+    /// records. A declared operator choice, never a loss.
+    pub(crate) fn excluded_snapshot(&self) -> (Vec<crate::render::ExcludedOut>, Vec<String>) {
+        let (records, excludes) = self.engine.budget_excluded_snapshot();
+        crate::render::aggregate_excluded(records, excludes)
+    }
+
+    /// Fold an inventory-native pass's `--exclude-module` records into
+    /// the engine budget, where `excluded_snapshot` reports them. The
+    /// collector budgets that record these are per-pass copies; the
+    /// engine budget is the run's report sink. Aggregation dedupes
+    /// repeats, so multi-pass accumulation is idempotent.
+    fn absorb_catalog_excluded(&mut self, excluded: Vec<crate::discovery::scan::ExcludedRecord>) {
+        for record in excluded {
+            self.engine.budget.push_excluded(record);
+        }
     }
 
     /// Observe the actual engine tail attempts without adding counters or
@@ -3357,11 +3385,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         } else {
             crate::discovery::kernel_identity::KernelAnchorExclusions::default()
         };
-        budget
+        let mut out = budget
             .with_retained_mapped_identities(
                 crate::discovery::identity::RetainedMappedIdentities::from_targets(targets),
             )
-            .with_kernel_anchor_exclusions(exclusions)
+            .with_kernel_anchor_exclusions(exclusions);
+        // The collector budget is a fresh copy, but it scans for this
+        // run: it inherits the run's `--exclude-module` inputs so
+        // inventory-native passes skip and record excluded files.
+        out.set_excludes(self.engine.budget.excludes().to_vec());
+        out
     }
 
     /// The pass's collection as an owned job (Task 6 C5.7): it reads
@@ -3617,6 +3650,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             );
         }
         let mut timings = std::mem::take(&mut catalog.stage_timings);
+        self.absorb_catalog_excluded(std::mem::take(&mut catalog.excluded));
         // Absorb at once: the aggregate pins and their fds drop here, never
         // living across reconcile or the native owner scans below.
         let absorb_start = crate::attach::monotonic_ns();
@@ -8736,6 +8770,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             scoped_scan_callers = allowed.len();
             collection.observe_allowed(&allowed);
             let mut catalog = collection.catalog(&allowed);
+            // Same fold as `absorb_catalog_excluded`, inline: `provider`
+            // borrows the attach set, so only disjoint field access fits.
+            for record in std::mem::take(&mut catalog.excluded) {
+                self.engine.budget.push_excluded(record);
+            }
             let absorbed = match (provider, catalog.lowering.take()) {
                 (Some(provider), Some(lowering)) => {
                     match provider
@@ -10014,6 +10053,7 @@ pub(crate) mod tests {
             Scope::Pid(std::process::id()),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -10309,6 +10349,7 @@ pub(crate) mod tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             RefusingSharedCustodySource {
                 attempted: attempted.clone(),
             },
@@ -10374,6 +10415,7 @@ pub(crate) mod tests {
             crate::scope::cgroup(dir).unwrap(),
             HookRegistry::builtin(),
             providers,
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -10390,6 +10432,7 @@ pub(crate) mod tests {
                 Scope::Pid(pid),
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
             )
@@ -10405,6 +10448,7 @@ pub(crate) mod tests {
                 Scope::Pid(std::process::id()),
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
                 budget,
@@ -10454,6 +10498,7 @@ pub(crate) mod tests {
                 Scope::Pid(std::process::id()),
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
                 crate::capacity::inventory_endpoint_budget(None).unwrap(),
@@ -11339,6 +11384,7 @@ pub(crate) mod tests {
             Scope::Pid(std::process::id()),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             scene.source.clone(),
             RegistryLimits::default_limits(),
             budget,
@@ -11560,6 +11606,7 @@ pub(crate) mod tests {
                 scope,
                 HookRegistry::builtin(),
                 vec![self.provider.clone()],
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
                 crate::capacity::InventoryBudget::new(32, 256).unwrap(),
@@ -11696,6 +11743,7 @@ pub(crate) mod tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             vec![fixture.provider.clone()],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
             crate::capacity::InventoryBudget::new(256, 2048).unwrap(),
@@ -12049,6 +12097,7 @@ pub(crate) mod tests {
             Scope::System,
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -12164,6 +12213,7 @@ pub(crate) mod tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             vec![group.program.clone()],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -12348,6 +12398,7 @@ pub(crate) mod tests {
             Scope::System,
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -12492,6 +12543,7 @@ pub(crate) mod tests {
             Scope::Pid(driver_pid),
             HookRegistry::builtin(),
             vec![provider.clone()],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -12625,6 +12677,7 @@ pub(crate) mod tests {
             Scope::Pid(driver_pid),
             HookRegistry::builtin(),
             vec![provider.clone()],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -12868,6 +12921,8 @@ pub(crate) mod tests {
             skipped: Vec::new(),
             notes: Vec::new(),
             explanation: None,
+            excluded: Vec::new(),
+            exclude_inputs: Vec::new(),
             stage_timings: crate::timing::StageTimings::new(),
         }
     }
@@ -12892,6 +12947,7 @@ pub(crate) mod tests {
                 scope,
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
             )
@@ -13461,6 +13517,61 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn collector_budget_inherits_the_run_exclude_module_inputs() {
+        let coordinator = InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![PathBuf::from("libp11-kit.so.0")],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        for semantic_live in [false, true] {
+            let budget = coordinator.collector_budget(
+                crate::discovery::scan::CaptureWorkBudget::default(),
+                semantic_live,
+            );
+            assert_eq!(
+                budget.excludes(),
+                &[PathBuf::from("libp11-kit.so.0")],
+                "semantic_live={semantic_live}"
+            );
+        }
+    }
+
+    #[test]
+    fn absorb_catalog_excluded_surfaces_in_the_run_excluded_snapshot() {
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![
+                PathBuf::from("libp11-kit.so.0"),
+                PathBuf::from("libnothing.so"),
+            ],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let record = || crate::discovery::scan::ExcludedRecord {
+            pid: 100,
+            path: "/opt/libp11-kit.so.0.4.8".into(),
+            dev: 42,
+            ino: 1001,
+            via: PathBuf::from("libp11-kit.so.0"),
+        };
+        coordinator.absorb_catalog_excluded(vec![record()]);
+        // Twice: multi-pass accumulation is idempotent.
+        coordinator.absorb_catalog_excluded(vec![record()]);
+        let (excluded, unmatched) = coordinator.excluded_snapshot();
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].path, "/opt/libp11-kit.so.0.4.8");
+        assert_eq!(excluded[0].processes, 1);
+        assert_eq!(unmatched, vec!["libnothing.so".to_string()]);
+    }
+
     /// A coordinator over a scripted process source, its attach set holding
     /// one provider with `endpoints` entries, and that provider's catalog
     /// for `pid`.
@@ -13487,6 +13598,7 @@ pub(crate) mod tests {
                 Scope::Pid(std::process::id()),
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 source.clone(),
                 RegistryLimits::default_limits(),
             )
@@ -13874,6 +13986,7 @@ pub(crate) mod tests {
             crate::scope::cgroup(fixture.path()).unwrap(),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             crate::discovery::caller_registry::OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -14034,6 +14147,7 @@ pub(crate) mod tests {
             crate::scope::cgroup(dir.path()).unwrap(),
             HookRegistry::builtin(),
             vec![provider],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -14906,6 +15020,7 @@ exit 0
             crate::scope::cgroup(fixture.path()).unwrap(),
             HookRegistry::builtin(),
             vec![fixture.path().join("scoped-provider.so")],
+            vec![],
             source,
             RegistryLimits::default_limits(),
         )
@@ -21650,6 +21765,7 @@ exit 0
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -21854,6 +21970,7 @@ exit 0
             Scope::Pid(self_pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -23842,6 +23959,7 @@ exit 0
             crate::scope::cgroup(fixture.path()).unwrap(),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             crate::discovery::caller_registry::OsProcessSource,
             RegistryLimits::default_limits(),
         )

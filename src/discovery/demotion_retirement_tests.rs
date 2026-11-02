@@ -656,6 +656,7 @@ fn demotion_retirement_fix_one_edge_multiple_objects_keep_ordinary_growth() {
         Scope::Pid(std::process::id()),
         HookRegistry::builtin(),
         Vec::new(),
+        vec![],
         capture.source.clone(),
         limits,
     )

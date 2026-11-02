@@ -880,6 +880,7 @@ impl Scene {
             crate::attach::Scope::System,
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             source.clone(),
             RegistryLimits::default_limits(),
         )
@@ -1065,6 +1066,8 @@ impl Scene {
             skipped: Vec::new(),
             notes: Vec::new(),
             explanation: None,
+            excluded: Vec::new(),
+            exclude_inputs: Vec::new(),
             stage_timings: crate::timing::StageTimings::new(),
         }
     }

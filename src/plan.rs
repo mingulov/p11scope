@@ -527,6 +527,9 @@ fn slot_holders<'a>(
 
 /// A whole-module capacity refusal: the demand, the budget, what holds it,
 /// and — in a shared scope — the reserve and how to aim the capture.
+/// Provider refusals name every remedy valid in this command and scope;
+/// closure-array refusals keep their specialized text (the gap line already
+/// says where forwarded calls are counted).
 struct CapacityRefusal<'a> {
     policy: AdmissionPolicy,
     needed: usize,
@@ -537,6 +540,7 @@ struct CapacityRefusal<'a> {
     reserve: Option<usize>,
     closure_tables: Option<usize>,
     aim_hint: bool,
+    counter_hint: bool,
 }
 
 impl CapacityRefusal<'_> {
@@ -560,7 +564,18 @@ impl CapacityRefusal<'_> {
                  admitted whole or not at all)"
             ));
         }
-        if self.aim_hint {
+        if self.closure_tables.is_none() {
+            reason.push_str("; to capture one provider, name it with --module <path>");
+            reason.push_str(
+                "; to free slots, exclude an unneeded module with --exclude-module <name>",
+            );
+            if self.counter_hint {
+                reason.push_str(
+                    "; to count every endpoint in this metrics capture, re-run with \
+                     --counter-mode counts",
+                );
+            }
+        } else if self.aim_hint {
             reason.push_str("; to capture one provider, name it with --module <path>");
         }
         reason
@@ -1347,7 +1362,14 @@ impl AttachPlan {
         pinned: &PinnedObjects,
         broad_admit: bool,
     ) -> AttachPlan {
-        self.rebuild_from_sources_broad_with_prearm(scanned, manifests, &[], pinned, broad_admit)
+        self.rebuild_from_sources_broad_with_prearm(
+            scanned,
+            manifests,
+            &[],
+            pinned,
+            broad_admit,
+            false,
+        )
     }
 
     /// [`rebuild_from_sources_broad`] plus resolved `--prearm-module` pieces
@@ -1360,6 +1382,7 @@ impl AttachPlan {
         prearm: &[PrearmPlanPiece],
         pinned: &PinnedObjects,
         broad_admit: bool,
+        counter_hint: bool,
     ) -> AttachPlan {
         let (pinned_id, compatible) = pinned_manifest_lookups(pinned);
         let mut rebuilt = self.rebuild_from_sources_with(
@@ -1370,6 +1393,7 @@ impl AttachPlan {
             compatible,
             broad_admit,
             self.admission_policy,
+            counter_hint,
         );
         rebuilt.note_object_identities(pinned);
         rebuilt
@@ -1385,6 +1409,7 @@ impl AttachPlan {
         compatible: impl FnMut(PinnedObjectId, PinnedObjectId) -> bool,
         broad_admit: bool,
         admission_policy: AdmissionPolicy,
+        counter_hint: bool,
     ) -> AttachPlan {
         let owned = self.active_keys_by_owner();
         let mut rebuilt = build_from_sources_with(
@@ -1401,6 +1426,7 @@ impl AttachPlan {
             broad_admit,
             admission_policy,
             self.admission_scope,
+            counter_hint,
         );
         for (key, object) in &self.provisional_get_function_list {
             if key.object != *object || rebuilt.slot_by_key.contains_key(key) {
@@ -2563,6 +2589,7 @@ fn join_source(left: &'static str, right: &'static str) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge(
     discovered: Vec<Discovered<'_>>,
     vendor_interfaces: usize,
@@ -2571,6 +2598,7 @@ fn merge(
     broad_admit: bool,
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
+    counter_hint: bool,
 ) -> AttachPlan {
     let capacity = admission_policy.endpoint_limit();
     let existing_slots = allocated.active;
@@ -3049,6 +3077,7 @@ fn merge(
                     reserve: reserved.then_some(reserve),
                     closure_tables: (class == AdmissionClass::ClosureArray).then_some(table_count),
                     aim_hint: shared,
+                    counter_hint,
                 };
                 decisions[position] = Some(AdmissionDecision::Refused(Skipped {
                     subject: path.to_string(),
@@ -3387,6 +3416,7 @@ pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan
         false,
         AdmissionPolicy::detailed(),
         AdmissionScope::Named,
+        false,
     )
 }
 
@@ -3419,18 +3449,22 @@ pub fn build_from_sources_broad(
         broad_admit,
         AdmissionPolicy::detailed(),
         AdmissionScope::Named,
+        false,
     )
 }
 
 /// Builds the initial detailed plan of a capture under `admission_scope`,
 /// which every live rebuild of it keeps. `broad_admit` is the Task 1.6
-/// experiment, as for [`build_from_sources_broad`].
+/// experiment, as for [`build_from_sources_broad`]. `counter_hint` names
+/// `--counter-mode counts` in provider-refusal reasons; only the engine's
+/// metrics-capture pass sets this, every other caller keeps `false`.
 pub fn build_from_sources_scoped(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
     pinned: &PinnedObjects,
     broad_admit: bool,
     admission_scope: AdmissionScope,
+    counter_hint: bool,
 ) -> AttachPlan {
     build_from_sources_scoped_with_prearm(
         scanned,
@@ -3439,6 +3473,7 @@ pub fn build_from_sources_scoped(
         pinned,
         broad_admit,
         admission_scope,
+        counter_hint,
     )
 }
 
@@ -3452,6 +3487,7 @@ pub fn build_from_sources_scoped_with_prearm(
     pinned: &PinnedObjects,
     broad_admit: bool,
     admission_scope: AdmissionScope,
+    counter_hint: bool,
 ) -> AttachPlan {
     build_from_sources_with_policy(
         scanned,
@@ -3461,6 +3497,7 @@ pub fn build_from_sources_scoped_with_prearm(
         broad_admit,
         AdmissionPolicy::detailed(),
         admission_scope,
+        counter_hint,
     )
 }
 
@@ -3480,6 +3517,7 @@ pub fn build_from_sources_for_policy(
         false,
         admission_policy,
         AdmissionScope::Named,
+        false,
     )
 }
 
@@ -3502,6 +3540,7 @@ pub fn build_from_sources_for_policy_scoped(
         false,
         admission_policy,
         admission_scope,
+        false,
     )
 }
 
@@ -3697,6 +3736,7 @@ pub(crate) fn semantic_source_claims(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_from_sources_with_policy(
     scanned: &[ReconciledModule],
     manifests: &[Manifest],
@@ -3705,6 +3745,7 @@ fn build_from_sources_with_policy(
     broad_admit: bool,
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
+    counter_hint: bool,
 ) -> AttachPlan {
     let (pinned_id, compatible) = pinned_manifest_lookups(pinned);
     let mut plan = build_from_sources_with(
@@ -3721,6 +3762,7 @@ fn build_from_sources_with_policy(
         broad_admit,
         admission_policy,
         admission_scope,
+        counter_hint,
     );
     plan.note_object_identities(pinned);
     plan
@@ -3769,6 +3811,7 @@ fn build_from_sources_with(
     broad_admit: bool,
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
+    counter_hint: bool,
 ) -> AttachPlan {
     let mut discovered: Vec<Discovered<'_>> = scanned.iter().map(lower_scanned).collect();
     let mut orphaned = Vec::new();
@@ -3795,6 +3838,7 @@ fn build_from_sources_with(
         broad_admit,
         admission_policy,
         admission_scope,
+        counter_hint,
     );
     plan.skipped.extend(orphaned);
     plan
@@ -3825,6 +3869,7 @@ fn build_from_test_sources_with_policy(
         false,
         admission_policy,
         AdmissionScope::Named,
+        false,
     )
 }
 
@@ -4044,6 +4089,7 @@ fn build(m: &Manifest) -> AttachPlan {
         false,
         AdmissionPolicy::detailed(),
         AdmissionScope::Named,
+        false,
     );
     plan.skipped.extend(orphaned);
     plan
@@ -7227,6 +7273,7 @@ mod tests {
             false,
             AdmissionPolicy::detailed(),
             AdmissionScope::Named,
+            false,
         )
     }
 
@@ -7361,6 +7408,7 @@ mod tests {
             false,
             AdmissionPolicy::detailed(),
             AdmissionScope::Named,
+            false,
         );
 
         assert_eq!(plan.slots.len(), 2, "distinct pinned objects stay distinct");
@@ -7404,6 +7452,7 @@ mod tests {
             false,
             AdmissionPolicy::detailed(),
             AdmissionScope::Named,
+            false,
         );
         assert!(plan.slots.is_empty());
         assert_eq!(plan.entries_seen, 1);
@@ -10041,7 +10090,8 @@ mod tests {
                 reason: format!(
                     "module needs 2 more; only {MAX_SLOTS} attach slots are available; \
                      {admitted} are in use ({admitted} active, 0 retired) — refusing to attach \
-                     a prefix"
+                     a prefix; to capture one provider, name it with --module <path>; to free \
+                     slots, exclude an unneeded module with --exclude-module <name>"
                 ),
             }]
         );
@@ -10205,6 +10255,7 @@ mod tests {
             |_, _| true,
             false,
             AdmissionPolicy::detailed(),
+            false,
         );
 
         assert_eq!(rebuilt.slots.len(), MAX_SLOTS as usize - 1);
@@ -10366,6 +10417,7 @@ mod tests {
             false,
             AdmissionPolicy::detailed(),
             AdmissionScope::Named,
+            false,
         );
 
         assert_eq!(rebuilt.modules.len(), 1);
@@ -11450,7 +11502,14 @@ mod tests {
     }
 
     fn scoped_plan(modules: &[ReconciledModule], scope: AdmissionScope) -> AttachPlan {
-        build_from_sources_scoped(modules, &[], &PinnedObjects::empty(), false, scope)
+        build_from_sources_scoped(modules, &[], &PinnedObjects::empty(), false, scope, false)
+    }
+
+    fn scoped_plan_with_counter_hint(
+        modules: &[ReconciledModule],
+        scope: AdmissionScope,
+    ) -> AttachPlan {
+        build_from_sources_scoped(modules, &[], &PinnedObjects::empty(), false, scope, true)
     }
 
     fn slots_of(plan: &AttachPlan, inode: u32) -> usize {
@@ -11596,6 +11655,7 @@ mod tests {
             true,
             AdmissionPolicy::detailed(),
             AdmissionScope::Named,
+            false,
         );
 
         assert!(plan.slots.is_empty() && plan.modules.is_empty());
@@ -11634,6 +11694,7 @@ mod tests {
             false,
             AdmissionPolicy::detailed(),
             AdmissionScope::Shared,
+            false,
         );
 
         let refusal = refusal_of(&plan, "/opt/refused.so").unwrap();
@@ -12070,6 +12131,137 @@ mod tests {
         );
     }
 
+    /// Controller ruling (remedies): a provider refused whole names its
+    /// remedies in the reason itself — terminal text and JSON share it —
+    /// in every scope: `--module` to capture it alone, `--exclude-module`
+    /// to free slots. Every pinned fact stays.
+    #[test]
+    fn provider_refusal_names_module_and_exclude_remedies_in_every_scope() {
+        let filled = MAX_SLOTS as usize - 112;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
+        let crowded = provider_with_tables(52, "/opt/crowded.so", 1, 150, true);
+        let modules = [filler, crowded];
+        for scope in [AdmissionScope::Named, AdmissionScope::Shared] {
+            let plan = scoped_plan(&modules, scope);
+            assert_eq!(slots_of(&plan, 52), 0, "{scope:?}: refused whole");
+            let refusal = refusal_of(&plan, "/opt/crowded.so").expect("refused whole");
+            assert!(
+                refusal.reason.contains("--module"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+            assert!(
+                refusal.reason.contains("--exclude-module"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+            assert!(
+                refusal.reason.contains("module needs 150 more"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+            assert!(
+                refusal.reason.contains("refusing to attach a prefix"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+        }
+    }
+
+    /// Controller ruling (remedies): `--counter-mode counts` is named only
+    /// for metrics captures without an explicit counter mode. The
+    /// inspect/inventory builders never set the flag, so their reasons never
+    /// name it.
+    #[test]
+    fn provider_refusal_names_counter_mode_only_for_metrics_captures() {
+        let filled = MAX_SLOTS as usize - 112;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
+        let crowded = provider_with_tables(52, "/opt/crowded.so", 1, 150, true);
+        let modules = [filler, crowded];
+        for scope in [AdmissionScope::Named, AdmissionScope::Shared] {
+            let plain = scoped_plan(&modules, scope);
+            let refusal = refusal_of(&plain, "/opt/crowded.so").expect("refused whole");
+            assert!(
+                !refusal.reason.contains("--counter-mode"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+            let metrics = scoped_plan_with_counter_hint(&modules, scope);
+            let refusal = refusal_of(&metrics, "/opt/crowded.so").expect("refused whole");
+            assert!(
+                refusal.reason.contains("--counter-mode counts"),
+                "{scope:?}: {}",
+                refusal.reason
+            );
+        }
+        for (label, plan) in [
+            (
+                "for_policy",
+                build_from_sources_for_policy(
+                    &modules,
+                    &[],
+                    &PinnedObjects::empty(),
+                    AdmissionPolicy::detailed(),
+                ),
+            ),
+            (
+                "for_policy_scoped",
+                build_from_sources_for_policy_scoped(
+                    &modules,
+                    &[],
+                    &PinnedObjects::empty(),
+                    AdmissionPolicy::detailed(),
+                    AdmissionScope::Shared,
+                ),
+            ),
+        ] {
+            let refusal = refusal_of(&plan, "/opt/crowded.so").expect("refused whole");
+            assert!(
+                !refusal.reason.contains("--counter-mode"),
+                "{label}: {}",
+                refusal.reason
+            );
+        }
+    }
+
+    /// Controller ruling (remedies): a refused closure array keeps its
+    /// specialized text. The gap line already says where its forwarded calls
+    /// are counted, so the provider remedies are not named there — not even
+    /// under a metrics capture.
+    #[test]
+    fn closure_array_refusal_keeps_its_specialized_text_without_new_remedies() {
+        // A crowded-out provider disables the Part 0 prefix, so the closure
+        // array is refused whole in both scopes.
+        let filled = MAX_SLOTS as usize - 112;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
+        let crowded = provider_with_tables(52, "/opt/crowded.so", 1, 150, true);
+        let closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let modules = [filler, crowded, closure];
+        for scope in [AdmissionScope::Named, AdmissionScope::Shared] {
+            for (label, plan) in [
+                ("plain", scoped_plan(&modules, scope)),
+                ("metrics", scoped_plan_with_counter_hint(&modules, scope)),
+            ] {
+                let refusal = refusal_of(&plan, P11_KIT).expect("closure refused whole");
+                assert!(
+                    refusal.reason.contains("lookalike function tables"),
+                    "{scope:?}/{label}: {}",
+                    refusal.reason
+                );
+                assert!(
+                    !refusal.reason.contains("--exclude-module"),
+                    "{scope:?}/{label}: {}",
+                    refusal.reason
+                );
+                assert!(
+                    !refusal.reason.contains("--counter-mode"),
+                    "{scope:?}/{label}: {}",
+                    refusal.reason
+                );
+            }
+        }
+    }
+
     /// Uncorroborated modules leave the shared-scope reserve free, and a
     /// corroborated provider arriving later in the capture is admitted into
     /// it. The refusal says the reserve is why.
@@ -12151,7 +12343,8 @@ mod tests {
             format!(
                 "module needs 20 more; only {capacity} attach slots are available; {} are in \
                  use ({} active, 200 retired; held by /opt/kept.so {}) — refusing to attach \
-                 a prefix",
+                 a prefix; to capture one provider, name it with --module <path>; to free \
+                 slots, exclude an unneeded module with --exclude-module <name>",
                 capacity - 12,
                 capacity - 212,
                 capacity - 212,
@@ -12334,9 +12527,7 @@ mod tests {
             );
             let partial = refusal_of(&plan, P11_KIT).expect("prefix partial");
             assert!(
-                partial
-                    .reason
-                    .contains(&format!("4 of 5 template tables attached")),
+                partial.reason.contains("4 of 5 template tables attached"),
                 "{}",
                 partial.reason
             );

@@ -3512,6 +3512,7 @@ pub(crate) fn engine_for_test(
         Scope::Pid(std::process::id()),
         HookRegistry::builtin(),
         Vec::new(),
+        vec![],
     )
     .unwrap();
     engine.plan = plan::build_from_sources_for_policy(
@@ -3950,6 +3951,7 @@ mod finalizer_history_tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -4170,6 +4172,7 @@ mod finalizer_history_tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -4480,6 +4483,7 @@ mod finalizer_history_tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -4580,6 +4584,7 @@ mod finalizer_history_tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -4708,6 +4713,7 @@ mod finalizer_history_tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -4748,6 +4754,7 @@ mod finalizer_history_tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -4850,6 +4857,7 @@ mod promotion_lifecycle_tests {
             Scope::Pid(std::process::id()),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )

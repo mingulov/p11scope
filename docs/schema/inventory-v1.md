@@ -724,6 +724,11 @@ non-null values needs a new allowlist row.
   mechanisms and API results are unaffected), and the lane records
   one `joint_journal_unavailable` gap. `bootstrap_unavailable` keeps
   its 0.6.0 meaning (journal linked, no birth yet).
+- `excluded_modules`, `unmatched_excludes` (additive within v1):
+  present only when `--exclude-module` is passed. `excluded_modules`
+  lists one row per distinct excluded file (`path`, `dev`, `ino`,
+  `processes`); `unmatched_excludes` lists the inputs that matched no
+  mapped file. A declared operator choice, never a gap or a loss.
 
 ## Semantic instances (additive within v1)
 

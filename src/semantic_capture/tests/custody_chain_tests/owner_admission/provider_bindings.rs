@@ -48,6 +48,7 @@ impl ProviderScene {
             scope.clone(),
             HookRegistry::builtin(),
             providers.clone(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )

@@ -433,6 +433,7 @@ fn args_for(pid: u32, hint: &Path) -> CaptureArgs {
         track_short_lived: false,
         kind: Kind::Profile,
         modules: vec![hint.to_path_buf()],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),

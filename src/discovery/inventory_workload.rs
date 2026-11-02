@@ -878,6 +878,7 @@ impl Harness {
             Scope::System,
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             source.clone(),
             limits,
         )?;

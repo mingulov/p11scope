@@ -824,6 +824,13 @@ struct Scene {
     /// A second caller (pid, start) that maps the provider from this scan
     /// (1-based) on.
     joiner: Option<(u32, u64, usize)>,
+    /// The joiner's observation carries decoded provider tables (the
+    /// stop-discard fixture): the dropped catalog then holds a provider
+    /// newcomer.
+    joiner_tables: bool,
+    /// The joiner arrives maps-matched against the pinned provider
+    /// instead of deep-scanned (the maps-match arm of the same seam).
+    joiner_maps_matched: bool,
     scans: usize,
     /// The first collection waits for this many discovery services (C5.7
     /// threading boundary): it cannot finish unless the loop services the
@@ -862,6 +869,8 @@ impl Scene {
             display_ticks: false,
             native_service_ticks: false,
             joiner: None,
+            joiner_tables: false,
+            joiner_maps_matched: false,
             scans: 0,
             collect_gate: None,
             staged_lifecycle: Vec::new(),
@@ -873,6 +882,23 @@ impl Scene {
 
     fn note(&self, entry: impl Into<String>) {
         self.log.borrow_mut().push(entry.into());
+    }
+
+    /// One decoded provider function table for the stop-discard joiner.
+    /// An all-NULL table is still provider evidence (OD35), so the
+    /// fixture carries its names in `null_entries` rather than entries.
+    fn provider_table_for_test() -> crate::discovery::scan::ScannedTable {
+        crate::discovery::scan::ScannedTable {
+            version: (3, 2),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: vec!["C_GetFunctionList"],
+            unpinned: Vec::new(),
+            address: 0x1000,
+            file_offset: Some(0x200),
+            live_return: false,
+            manifest_supported: false,
+        }
     }
 
     /// The pass's catalog: pid 7 maps the provider, plus the Inventory
@@ -904,14 +930,25 @@ impl Scene {
             mappings: Vec::new(),
             observations: members
                 .iter()
-                .map(|(pid, _)| crate::inspect_system::Observation {
-                    pid: *pid,
-                    path: path.clone(),
-                    exports: Vec::new(),
-                    tables: Vec::new(),
-                    interfaces: Vec::new(),
-                    double_loaded: false,
-                    evidence: crate::inspect_system::ObservationEvidence::DeepScan,
+                .map(|(pid, _)| {
+                    let is_joiner = self.joiner.is_some_and(|joiner| joiner.0 == *pid);
+                    crate::inspect_system::Observation {
+                        pid: *pid,
+                        path: path.clone(),
+                        exports: Vec::new(),
+                        tables: if is_joiner && self.joiner_tables {
+                            vec![Self::provider_table_for_test()]
+                        } else {
+                            Vec::new()
+                        },
+                        interfaces: Vec::new(),
+                        double_loaded: false,
+                        evidence: if is_joiner && self.joiner_maps_matched {
+                            crate::inspect_system::ObservationEvidence::MapsMatch
+                        } else {
+                            crate::inspect_system::ObservationEvidence::DeepScan
+                        },
+                    }
                 })
                 .collect(),
             admission: crate::inspect_system::AdmissionRecord::Admitted {
@@ -934,24 +971,31 @@ impl Scene {
             scan_ms: 0,
             processes: members
                 .iter()
-                .map(|(pid, start)| crate::inspect_system::ProcessRecord {
-                    application: crate::inspect_identity::InspectApplicationResult::Unknown(
-                        crate::inspect_identity::InspectIdentityUnknown::NotExamined,
-                    ),
-                    complete_scan: None,
-                    pid: *pid,
-                    status: crate::inspect_system::MemberStatus::Scanned,
-                    objects: vec![0],
-                    generation: Some(crate::inspect_system::MemberGeneration {
-                        start_time: Some(*start),
-                        exe: Some(ExeIdentity {
-                            dev: 1,
-                            ino: 100,
-                            mtime_secs: 10,
-                            mtime_nanos: 0,
-                            path: Some("/bin/driver".into()),
+                .map(|(pid, start)| {
+                    let is_joiner = self.joiner.is_some_and(|joiner| joiner.0 == *pid);
+                    crate::inspect_system::ProcessRecord {
+                        application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                            crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                        ),
+                        complete_scan: None,
+                        pid: *pid,
+                        status: if is_joiner && self.joiner_maps_matched {
+                            crate::inspect_system::MemberStatus::MapsMatched
+                        } else {
+                            crate::inspect_system::MemberStatus::Scanned
+                        },
+                        objects: vec![0],
+                        generation: Some(crate::inspect_system::MemberGeneration {
+                            start_time: Some(*start),
+                            exe: Some(ExeIdentity {
+                                dev: 1,
+                                ino: 100,
+                                mtime_secs: 10,
+                                mtime_nanos: 0,
+                                path: Some("/bin/driver".into()),
+                            }),
                         }),
-                    }),
+                    }
                 })
                 .collect(),
             objects: vec![object],
@@ -4360,6 +4404,9 @@ mod publication_progress_tests {
         dispose_finish_polls: usize,
         commit_failures: VecDeque<&'static str>,
         stop_in_collector: bool,
+        /// Latch the stop while this 1-based scan's collection runs (the
+        /// trailing-discard fixture): earlier scans apply normally.
+        stop_on_scan: Option<usize>,
     }
 
     impl Driver {
@@ -4400,6 +4447,7 @@ mod publication_progress_tests {
                 dispose_finish_polls: 0,
                 commit_failures: VecDeque::new(),
                 stop_in_collector: false,
+                stop_on_scan: None,
             }
         }
 
@@ -4497,6 +4545,9 @@ mod publication_progress_tests {
             self.host_stops += 1;
             self.scene.coordinator.stop();
         }
+        fn note_discarded_collection(&mut self, collected: &CollectedPass) {
+            self.scene.coordinator.note_discarded_collection(collected);
+        }
     }
 
     impl PassDriver<Pin> for Driver {
@@ -4508,6 +4559,9 @@ mod publication_progress_tests {
             self.scene.scans += 1;
             self.scene.note("collect");
             if self.stop_in_collector {
+                self.stop.set(true);
+            }
+            if self.stop_on_scan == Some(self.scene.scans) {
                 self.stop.set(true);
             }
             if self.pending_on_collect {
@@ -7020,6 +7074,218 @@ mod publication_progress_tests {
             assert_eq!(
                 outcome.stopped.as_ref().unwrap().events,
                 twin.stopped.as_ref().unwrap().events
+            );
+        }
+
+        const STOP_DISCARD_GAP_SUBJECT: &str = "live inventory transaction";
+        const STOP_DISCARD_GAP_REASON: &str = "a new process mapping a provider was dropped while the capture was stopping; its calls were not observed";
+
+        fn has_stop_discard_gap(scene: &Scene) -> bool {
+            scene.coordinator.registry().gaps().iter().any(|gap| {
+                gap.subject == STOP_DISCARD_GAP_SUBJECT && gap.reason == STOP_DISCARD_GAP_REASON
+            })
+        }
+
+        // A stop that lands between collection and apply drops a catalog
+        // that already holds a provider newcomer (pid 8 joins scan 2 with
+        // decoded provider tables, then scan 2 discards). The dropped
+        // newcomer must leave a named gap: its calls were not observed.
+        // The joiner never admits and the completed pass still publishes.
+        #[test]
+        fn stop_discard_with_provider_newcomer_marks_unobserved_calls() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.scene.joiner = Some((8, 800, 2));
+            driver.scene.joiner_tables = true;
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert!(
+                outcome.zero_pass.is_none(),
+                "one pass completed before the stop"
+            );
+            assert!(outcome.stopped.is_some(), "the terminal path completes");
+            assert_eq!(driver.host_stops, 1, "the F9 gate remains once-only");
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            assert!(
+                driver.scene.coordinator.adapter().live_id(8).is_none(),
+                "the discarded pass never admits its joiner"
+            );
+            assert!(
+                has_stop_discard_gap(&driver.scene),
+                "a provider newcomer dropped at stop must mark unobserved calls: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // Twin: the same discarded pass with a provider-free joiner (no
+        // decoded tables) leaves no mark — nothing provider-related was
+        // dropped.
+        #[test]
+        fn stop_discard_with_provider_free_newcomer_marks_no_gap() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.scene.joiner = Some((8, 800, 2));
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert!(
+                outcome.zero_pass.is_none(),
+                "one pass completed before the stop"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            assert!(
+                driver.scene.coordinator.adapter().live_id(8).is_none(),
+                "the discarded pass never admits its joiner"
+            );
+            assert!(
+                !has_stop_discard_gap(&driver.scene),
+                "a checked-clean newcomer dropped at stop must not mark: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // Twin: a discarded pass with no newcomer at all leaves no mark.
+        #[test]
+        fn stop_discard_without_newcomer_marks_no_gap() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert!(
+                outcome.zero_pass.is_none(),
+                "one pass completed before the stop"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            assert!(
+                !has_stop_discard_gap(&driver.scene),
+                "a newcomer-free discard must not mark: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // The maps-match arm: a joiner attributed to the pinned provider
+        // by exact maps identity (no decode of its own) is still a
+        // provider newcomer when its pass discards.
+        #[test]
+        fn stop_discard_with_maps_matched_newcomer_marks_unobserved_calls() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.scene.joiner = Some((8, 800, 2));
+            driver.scene.joiner_maps_matched = true;
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            assert!(
+                driver.scene.coordinator.adapter().live_id(8).is_none(),
+                "the discarded pass never admits its joiner"
+            );
+            assert!(
+                has_stop_discard_gap(&driver.scene),
+                "a maps-matched provider newcomer dropped at stop must mark: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // Retained C1: a stop during a pending publication retains the
+        // unapplied collection, and disposal drops it. A provider
+        // newcomer in that dropped catalog marks like the sync seam.
+        #[test]
+        fn retained_c1_discard_with_provider_newcomer_marks_unobserved_calls() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Pending]);
+            driver.scene.joiner = Some((8, 800, 1));
+            driver.scene.joiner_tables = true;
+            driver.pending_on_collect = true;
+            driver.stop_after_poll = Some(1);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.assert_retained(&outcome);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Collected));
+
+            driver.arm_dispose(&[]);
+            let now = Instant::now();
+            let outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::ZeroPassGap,
+                }
+            ));
+            assert_eq!(run.discarded_collections, 1);
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert!(error_text(&outcome).is_none());
+            assert_eq!(outcome.zero_pass.as_ref().unwrap().discarded, 1);
+            assert!(
+                has_stop_discard_gap(&driver.scene),
+                "a provider newcomer dropped at retained disposal must mark: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // Retained P2: a failed publication with an unapplied collection
+        // drops the collection at disposal. Same mark, same newcomer.
+        #[test]
+        fn retained_p2_discard_with_provider_newcomer_marks_unobserved_calls() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[Poll::Fail]);
+            driver.scene.joiner = Some((8, 800, 1));
+            driver.scene.joiner_tables = true;
+            driver.pending_on_collect = true;
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            driver.assert_retained(&outcome);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, Some(RetainedBlock::Publication));
+            assert!(matches!(run.pass, RetainedPass::Collected { .. }));
+
+            driver.arm_dispose(&[DisposeStep::CommitPoll, DisposeStep::FinishPoll]);
+            let now = Instant::now();
+            let mut outcome = slice(&mut driver, outcome, now, 1);
+            assert_eq!(
+                outcome.retained.as_ref().unwrap().block,
+                Some(RetainedBlock::Publication)
+            );
+            outcome = slice(&mut driver, outcome, now, 1);
+            let run = outcome.retained.as_ref().unwrap();
+            assert_eq!(run.block, None);
+            assert!(matches!(
+                run.pass,
+                RetainedPass::Terminal {
+                    phase: RetainedTerminalPhase::FailureGap,
+                }
+            ));
+            assert_eq!(run.discarded_collections, 1);
+
+            let outcome = pump_to_final(&mut driver, outcome, now, &mut publish);
+            assert_eq!(
+                error_text(&outcome),
+                Some("original publication failure".into())
+            );
+            assert!(
+                has_stop_discard_gap(&driver.scene),
+                "a provider newcomer dropped at failed disposal must mark: {:?}",
+                driver.scene.gap_subjects(),
             );
         }
 

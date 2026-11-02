@@ -486,6 +486,13 @@ pub(crate) trait LaneHost<Pin> {
     /// when a PID/System stop latches before new apply/commit work,
     /// otherwise right after the driver's own prompt gate.
     fn stop_coordinator(&mut self) {}
+    /// A collection the stop discarded before apply (the sync mid-pass
+    /// stop, the retained P2/C1 disposals): account the dropped catalog's
+    /// unadmitted provider newcomers, so a newcomer dropped while the
+    /// capture stops leaves a named gap instead of vanishing silently.
+    /// Read-only over admission; records at most one scope gap, only for
+    /// provider newcomers. Default: ignore.
+    fn note_discarded_collection(&mut self, _collected: &CollectedPass) {}
 }
 
 impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
@@ -540,6 +547,10 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
 
     fn stop_coordinator(&mut self) {
         InventoryCoordinator::stop(self);
+    }
+
+    fn note_discarded_collection(&mut self, collected: &CollectedPass) {
+        InventoryCoordinator::note_discarded_collection(self, collected);
     }
 }
 
@@ -2424,6 +2435,9 @@ where
         // P2: discard the unapplied collection exactly like C1, then report
         // the retained publication failure.
         (RetainedBlock::Publication, pass @ RetainedPass::Collected { .. }) => {
+            if let RetainedPass::Collected { collected, .. } = &*pass {
+                driver.host().note_discarded_collection(collected);
+            }
             *pass = RetainedPass::Terminal {
                 phase: RetainedTerminalPhase::FailureGap,
             };
@@ -2495,6 +2509,9 @@ where
         // joint raw side stays untouched), count the discard, and continue
         // with the failure gap on error or the zero-pass gap without one.
         (RetainedBlock::Collected, pass @ RetainedPass::Collected { .. }) => {
+            if let RetainedPass::Collected { collected, .. } = &*pass {
+                driver.host().note_discarded_collection(collected);
+            }
             *pass = RetainedPass::Terminal {
                 phase: if error.is_some() {
                     RetainedTerminalPhase::FailureGap
@@ -3307,9 +3324,12 @@ where
                     // applied, attached, or minted a successor (F9). The
                     // owned stop drain still runs after the loop. The
                     // completed collection is discarded; the diagnostic
-                    // counts it when no pass completed.
+                    // counts it when no pass completed, and the dropped
+                    // catalog's unadmitted provider newcomers leave a
+                    // named gap.
                     stop_cause.get_or_insert(cause);
                     discarded_collections += 1;
+                    driver.host().note_discarded_collection(&collected);
                     driver.host().stop_coordinator();
                     stop_latched = true;
                     break;

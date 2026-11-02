@@ -7404,6 +7404,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// A collection the stop discarded before apply: inspect the dropped
+    /// catalog, read-only over admission, for attributable members the
+    /// coordinator never admitted that map a provider — deep-scan
+    /// provider tables or interfaces, or a maps-match against a pinned
+    /// provider — and leave one named gap for their unobserved calls.
+    /// Provider-free and newcomer-free discards stay silent. Cgroup
+    /// retained collections carry transaction state rather than final
+    /// scan verdicts, so provider mappings there stay unjudged.
+    /// (Seam wiring: the predicate lands with the fix; until then the
+    /// RED tests fail on the missing gap.)
+    pub(crate) fn note_discarded_collection(
+        &mut self,
+        _collected: &crate::inventory_capture::CollectedPass,
+    ) {
+    }
+
     /// The physical tail and registry share the actual publication boundary.
     pub(crate) fn commit_batch(&mut self, engine_changed: bool) -> Result<BatchReceipt> {
         match self.commit_batch_inner(engine_changed, None, None, None)? {

@@ -14,7 +14,12 @@ bursts. This suite pins its two owned parts without privileges:
 - the script oracle (--check-run) accepts a healthy run and rejects a
   no-progress trip (with h0_below/staged_max/floor), an abandon, a slow
   run, a live-publication stderr line and a disposition error, plus
-  malformed inputs; --self-test passes.
+  malformed inputs; lane-stop conversions pass but are flagged as
+  non-finish evidence, neighbouring distress subjects and the
+  lane-stopped stderr line fail the wedge cell, and a non-object
+  run.json yields a JSON verdict; the --summarize aggregation counts
+  lane-stop and joint-finish runs, and KEY_OPS=1 on an unlinked binary
+  reports nonqualifying rows; --self-test passes.
 
 Healthy and mutation twins run unignored; no SoftHSM install is needed.
 """
@@ -30,6 +35,30 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DRIVER_SRC = ROOT / "tests" / "fixtures" / "joint-stall" / "refresh-churn.c"
 SCRIPT = ROOT / "scripts" / "ci" / "joint-stall-live.sh"
+
+# Mid-run lane-stop conversion subjects: counted as non-finish evidence,
+# never gated (designed degradation).
+LANE_STOP_SUBJECTS = (
+    "joint finish abandoned for lane stop",
+    "semantic lane stopped",
+)
+
+# Neighbouring joint-distress gap subjects: each appears only on a
+# distress path, so each fails the wedge cell.
+DISTRESS_SUBJECTS = (
+    "joint finish settle bound reached",
+    "joint finish held for exit",
+    "retained joint publication timed out",
+    "unfinished joint publication abandoned",
+    "joint abandon commit failed",
+    "joint wound-down failed",
+)
+
+LANE_STOPPED_STDERR = (
+    "p11scope: the semantic lane stopped (test) but its unfinished "
+    "joint publication still blocks the broad commit; "
+    "the run cannot continue past it"
+)
 
 STUB_PROVIDER_C = r"""
 /* Test-only stub PKCS#11 provider: immediate OK returns, no state. */
@@ -280,6 +309,130 @@ class ScriptOracleTests(unittest.TestCase):
         proc = run_ok([str(SCRIPT), "--check-run", str(self.work / "nope.json"),
                        err_path, "30", "35", "0", "60"])
         self.assertEqual(proc.returncode, 1)
+
+    def test_lane_stop_runs_pass_as_non_finish_evidence(self):
+        gaps = json.dumps(
+            {"gaps": [{"subject": s, "reason": "x"}
+                      for s in LANE_STOP_SUBJECTS]})
+        rc, payload = self.check(gaps, "")
+        self.assertEqual(rc, 0, payload)
+        self.assertTrue(payload["stall_ok"])
+        self.assertTrue(payload["wedge_ok"])
+        self.assertTrue(payload["lane_stop"])
+
+    def test_healthy_run_is_not_lane_stop(self):
+        rc, payload = self.check('{"gaps": []}', "")
+        self.assertEqual(rc, 0, payload)
+        self.assertFalse(payload["lane_stop"])
+
+    def test_distress_subjects_fail_wedge_only(self):
+        for subject in DISTRESS_SUBJECTS:
+            with self.subTest(subject=subject):
+                rc, payload = self.check(
+                    json.dumps({"gaps": [{"subject": subject,
+                                          "reason": "x"}]}),
+                    "")
+                self.assertEqual(rc, 1, payload)
+                self.assertTrue(payload["stall_ok"])
+                self.assertFalse(payload["wedge_ok"])
+                self.assertIn(subject, payload["distress"])
+
+    def test_lane_stopped_stderr_fails_wedge_only(self):
+        rc, payload = self.check('{"gaps": []}', LANE_STOPPED_STDERR)
+        self.assertEqual(rc, 1, payload)
+        self.assertTrue(payload["stall_ok"])
+        self.assertFalse(payload["wedge_ok"])
+        self.assertTrue(payload["stderr_lane_stopped"])
+
+    def test_non_object_run_json_yields_json_verdict(self):
+        for doc in ("[]", "42", '"x"', "null"):
+            with self.subTest(doc=doc):
+                rc, payload = self.check(doc, "")
+                self.assertEqual(rc, 1, payload)
+                self.assertIn("error", payload)
+                self.assertFalse(payload["run_json_ok"])
+
+    def write_stub_observer(self):
+        stub = self.work / "noscope.sh"
+        stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+        return str(stub)
+
+    def key_ops_rows(self, outdir, extra_env):
+        env = dict(os.environ)
+        env.update(extra_env)
+        proc = run_ok([str(SCRIPT), self.write_stub_observer(),
+                       str(outdir)], env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = [json.loads(line) for line in
+                (outdir / "results.jsonl").read_text(
+                    encoding="utf-8").splitlines()]
+        for row in rows:
+            self.assertFalse(row["pass"], row)
+            self.assertEqual(row["qualification"], "nonqualifying", row)
+        return rows
+
+    def test_key_ops_unlinked_reports_nonqualifying(self):
+        rows = self.key_ops_rows(self.work / "linked-short",
+                                 {"KEY_OPS": "1"})
+        self.assertEqual([row["cell"] for row in rows],
+                         ["stall-short-stops-linked",
+                          "wedge-no-abandon-linked"])
+
+    def test_key_ops_unlinked_long_reports_three_rows(self):
+        rows = self.key_ops_rows(self.work / "linked-long",
+                                 {"KEY_OPS": "1", "LONG": "1800"})
+        self.assertEqual([row["cell"] for row in rows],
+                         ["stall-short-stops-linked",
+                          "wedge-no-abandon-linked",
+                          "stall-long-1800-linked"])
+
+    def test_summarize_counts_lane_stop_and_finish_runs(self):
+        runs = self.work / "runs"
+        runs.mkdir()
+        (runs / "run-001.check.json").write_text(json.dumps(
+            {"stall_ok": True, "wedge_ok": True, "run_json_ok": True,
+             "subjects": [], "abandons": 0, "no_progress": False,
+             "wall": 35, "duration": 30, "lane_stop": False}),
+            encoding="utf-8")
+        # Old-format lane-stop check (no lane_stop key): the subjects
+        # alone must still exclude it from the finish claim.
+        (runs / "run-002.check.json").write_text(json.dumps(
+            {"stall_ok": True, "wedge_ok": True, "run_json_ok": True,
+             "subjects": list(LANE_STOP_SUBJECTS), "abandons": 0,
+             "no_progress": False, "wall": 36, "duration": 30}),
+            encoding="utf-8")
+        # A tripped run still executed a joint finish: it stays in the
+        # finish count even though both cells fail on it.
+        (runs / "run-003.check.json").write_text(json.dumps(
+            {"stall_ok": False, "wedge_ok": False, "run_json_ok": True,
+             "subjects": ["joint finish made no progress"],
+             "abandons": 0, "no_progress": True,
+             "wall": 40, "duration": 30, "lane_stop": False}),
+            encoding="utf-8")
+        (runs / "run-004.check.json").write_text("not json",
+                                                 encoding="utf-8")
+        (runs / "run-long.check.json").write_text(json.dumps(
+            {"stall_ok": True, "run_json_ok": True, "subjects": [],
+             "wall": 1825, "duration": 1800, "exit": 0,
+             "no_progress": False, "abandons": 0, "lane_stop": False}),
+            encoding="utf-8")
+        results = self.work / "results.jsonl"
+        proc = run_ok([str(SCRIPT), "--summarize", str(runs),
+                       str(results), "", "testhost", "k6.1", "7",
+                       "4", "1800", "0", "500", "2", "2", "0"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        rows = {row["cell"]: row for row in
+                (json.loads(line) for line in
+                 results.read_text(encoding="utf-8").splitlines())}
+        for cell in ("stall-short-stops", "wedge-no-abandon"):
+            self.assertIn(cell, rows)
+            self.assertFalse(rows[cell]["pass"], rows[cell])
+            self.assertIn("lane_stop_runs=1", rows[cell]["detail"])
+            self.assertIn("joint_finish_runs=2", rows[cell]["detail"])
+        self.assertTrue(rows["stall-long-1800"]["pass"])
+        self.assertIn("lane_stop=False",
+                      rows["stall-long-1800"]["detail"])
 
 
 if __name__ == "__main__":

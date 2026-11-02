@@ -19825,6 +19825,25 @@ mod promotion_driver_tests {
         crate::inventory_semantics::semantic_stop_line(68, 5, 7, 0, 12)
     }
 
+    #[test]
+    fn semantic_stop_counts_carry_ring_loss_as_lost() {
+        // Ring loss rides the stop line as its own `lost` term in
+        // records, never folded into the shed call count: the
+        // conservation identity stays collected == joined + shed.
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_stop_counts_for_test(Some(scripted_nonzero_stop_counts()));
+        lane.note_shed_calls(7);
+        lane.note_events_ring_loss(11);
+        let mut coordinator = coordinator();
+        let counts = SemanticStopCounts::read(&lane, &mut coordinator);
+        assert_eq!(counts.shed, 7, "shed counts drained calls only");
+        assert_eq!(counts.lost, 11, "ring loss reads as lost records");
+        assert_eq!(
+            crate::inventory_semantics::semantic_stop_line(68, 5, 7, 11, 0, 12),
+            "p11scope: semantic calls: collected 68, joined 5, shed 7, lost 11, bindings 0, refused 12"
+        );
+    }
+
     /// Committed gaps for one subject, read without publishing:
     /// proves what a commit already published (order against it).
     fn committed_gaps_by_subject(

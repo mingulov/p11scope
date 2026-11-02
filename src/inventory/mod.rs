@@ -5939,6 +5939,9 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn on_lane_stopped(&mut self) {
+        // Terminal coverage disclosure first: post-last-pass EXEC
+        // newcomers stage before the final commit publishes them.
+        self.coordinator.note_post_pass_exec_newcomers();
         // A stop request already disclosed the unjoined winding; a
         // bare lane stop discloses it here instead, still once and
         // still before the final commit.

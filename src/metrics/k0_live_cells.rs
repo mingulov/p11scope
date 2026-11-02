@@ -630,6 +630,158 @@ fn k0_live_exec_voids_detail_counts_lp64() -> Result<()> {
     keep_workload_on_failure(workload, outcome, "K0X")
 }
 
+fn spawn_run_observer(
+    observer: &Path,
+    module: &str,
+    duration_secs: u64,
+    out: &Path,
+    log: &Path,
+    ledger: &Path,
+    conf: &Path,
+    gate: &Path,
+) -> Result<Child> {
+    let log_file = std::fs::File::create(log)?;
+    Command::new(observer)
+        .args([
+            "run",
+            "--mode",
+            "metrics",
+            "--counter-mode",
+            "counts",
+            "--select-endpoint",
+            "C_Sign",
+            "--module",
+            module,
+            "--duration",
+            &duration_secs.to_string(),
+            "-o",
+            out.to_str().context("out path")?,
+            "--",
+            ledger.to_str().context("ledger path")?,
+            "mech",
+            "--cell",
+            "K0R",
+            "--module",
+            module,
+            "--iters",
+            "4",
+            "--gate",
+            gate.to_str().context("gate path")?,
+            "--hold",
+        ])
+        .env("SOFTHSM2_CONF", conf)
+        .stdin(Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
+        .spawn()
+        .context("spawning observer")
+}
+
+#[test]
+#[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): run --select-endpoint counts on a real SoftHSM workload with an exact ledger-known C_Sign count"]
+fn k0_live_run_detail_matches_ledger_counts_lp64() -> Result<()> {
+    let module = softhsm_path()?;
+    let observer = observer_binary()?;
+    let workload = K0Workload::build(&module)?;
+    let outcome = k0_run_inner(&workload, &module, &observer);
+    keep_workload_on_failure(workload, outcome, "K0R")
+}
+
+fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<()> {
+    let out = workload.path("k0r.json");
+    let log = workload.path("k0r.observer.log");
+    let gate = workload.path("k0r.gate");
+    ensure!(!gate.exists(), "gate {} pre-exists", gate.display());
+    // Four main-phase iterations, one clean C_Sign each; setup and
+    // teardown never call C_Sign, so the window count is exactly 4.
+    // The owned child maps its provider after the observer attaches,
+    // so the observer pre-arms the name with --module; the child's own
+    // startup exec precedes the window and must not void it.
+    let mut child = spawn_run_observer(
+        observer,
+        module,
+        60,
+        &out,
+        &log,
+        &workload.ledger,
+        &workload.conf,
+        &gate,
+    )?;
+    wait_for_observer_row(
+        &log,
+        CAPTURE_READY_NEEDLE,
+        &mut child,
+        &out,
+        Duration::from_secs(120),
+    )?;
+    require_attached_probes(&log, &out)?;
+    std::fs::write(&gate, b"open\n")?;
+    wait_for_observer_row(&log, "DONE ", &mut child, &out, Duration::from_secs(60))?;
+    let status = wait_for_observer_stop(&mut child, &log, &out, Duration::from_secs(180))?;
+    // The held child stays alive past the observer's duration handoff;
+    // reap it by the handoff PID the observer names.
+    if let Ok(text) = std::fs::read_to_string(&log) {
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix(
+                "p11scope: duration expired without --kill-on-timeout; handed back live child pid ",
+            ) {
+                if let Some(pid_text) = rest.split_whitespace().next() {
+                    if let Ok(pid) = pid_text.parse::<i32>() {
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                        let mut status = 0;
+                        unsafe {
+                            libc::waitpid(pid, &mut status, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ensure!(
+        status.success(),
+        "observer exited {status}: {}",
+        observer_evidence(&log, &out, &format!("exited {status}"))
+    );
+    let (entered, bad) = ledger_main_counts(&log, "C_Sign")?;
+    ensure!(entered == 4 && bad == 0, "workload did 4 clean signs");
+    let document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).context("reading -o JSON")?)?;
+    let selected = &document["evidence"]["selected_detail"];
+    let record = &selected["selection"];
+    ensure!(
+        record["endpoint"] == serde_json::json!("C_Sign"),
+        "selection names C_Sign: {record}"
+    );
+    let slot = record["slot"].as_u64().context("selection slot")?;
+    ensure!(
+        record.get("refusal").is_none(),
+        "the owned window succeeds: {record}"
+    );
+    let detail = selected.get("detail").context("detail renders")?;
+    let rows = detail["rows"].as_array().context("detail rows")?;
+    ensure!(rows.len() == 1, "Detail carries only the selected slot");
+    ensure!(rows[0]["slot"] == serde_json::json!(slot), "detail slot");
+    ensure!(rows[0]["entered"] == serde_json::json!(4), "detail entered");
+    ensure!(
+        rows[0]["returned"] == serde_json::json!(4),
+        "Detail returned"
+    );
+    ensure!(rows[0]["errors"] == serde_json::json!(0), "detail errors");
+    let aggregate = selected.get("aggregate").context("aggregate renders")?;
+    let aggregate_rows = aggregate["rows"].as_array().context("aggregate rows")?;
+    let sibling = aggregate_rows
+        .iter()
+        .find(|row| row["slot"] == serde_json::json!(slot))
+        .context("aggregate carries the selected slot")?;
+    ensure!(
+        rows[0] == *sibling,
+        "live detail equals the aggregate cells for the slot"
+    );
+    Ok(())
+}
+
 fn k0_exec_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<()> {
     let out = workload.path("k0x.json");
     let log = workload.path("k0x.observer.log");

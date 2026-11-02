@@ -76,9 +76,19 @@ INVENTORY_UNIQUE_ROOTS = frozenset({
 COUNTER_UNIQUE_ROOTS = frozenset({
     "p11_counter_bank_entry", "p11_counter_bank_return",
 })
+# Hook slots whose program loads only on some kernels: each kernel loads
+# exactly one member of each group, so group assignment accepts either
+# member and scoring refuses a kernel where both were measured. Mirrors
+# EXCLUSIVE_VARIANT_GROUPS in tests/python/test_bpf_load_report.py
+# (there with the "detailed/" budget-key prefix).
+EXCLUSIVE_VARIANT_GROUPS = [
+    frozenset({"p11_image_exec_release", "p11_image_mmap_release"}),
+    frozenset({"p11_inst_vma_copy", "p11_inst_vma_retcopy"}),
+]
 DETAILED_UNIQUE_ROOTS = frozenset({
-    "p11_image_query", "p11_image_exec_release",
+    "p11_image_query", "p11_image_exec_release", "p11_image_mmap_release",
     "p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy",
+    "p11_inst_vma_retcopy",
     "p11_selected_bootstrap", "p11_selected_cgroup_migrate",
 })
 # The journal pair replaces the ordinary entry/return roots in the
@@ -418,6 +428,14 @@ def evaluate(loads, kernel, budgets, object_name=None):
                 rows.append({"root": root, "processed": None, "limit": None,
                              "budget": budgets["programs"][root][kernel],
                              "status": "FAIL", "detail": "missing from probe rows"})
+    for group in EXCLUSIVE_VARIANT_GROUPS:
+        both = sorted(root for root in by_root
+                      if root[len(prefix):] in group)
+        if len(both) > 1:
+            rows.append({"root": both[0], "processed": None, "limit": None,
+                         "budget": None, "status": "FAIL",
+                         "detail": f"both variants loaded on {kernel}: "
+                                   f"{', '.join(both)}"})
     for error in group_errors:
         rows.append({"root": error["root"], "processed": None, "limit": None,
                      "budget": None, "status": "FAIL",

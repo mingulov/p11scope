@@ -392,12 +392,18 @@ Detailed image continuity keeps, per existing task cookie, only its existing
 exec ID, a nonwrapping serialization sequence and finite Ready/Poisoned
 state. Authentic admitted non-aggregate entries alone establish/renew Ready.
 Before any joinable stamp, that entry publishes a bounded private index
-from its existing initial-kernel TGID to its existing cookie. The pre-mm
-`exec_mm_release` hook reads current TGID through the existing PID helper,
-looks up this index and poisons the indexed record before replacement.
+from its existing initial-kernel TGID to its existing cookie. At the exec
+mm switch, the `exec_mm_release` hook reads current TGID through the
+existing PID helper, looks up this index and poisons the indexed record
+before replacement. On 7.3+ the same invalidation runs at the `exec_mmap`
+exit and reads only its int return, acting on 0.
 This index supplies negative invalidation only: selected-task queries
 freshly obtain TASK_COOKIE/self_exec_id and never consult it or repair
 state. The hook reads no task-storage value, arguments or mm pointer.
+The `copy_vma` exit reads only the returned new VMA pointer: the fixed
+return slot on the 5-argument prototype, `bpf_get_func_ret` on 6/7-argument
+prototypes. It reads the transient fields listed below and stores nothing
+new.
 State, index, query buffers and finite health remain private and bounded
 to the owning Session; no new public identity, target memory, syscall
 range, path or pointer retention is introduced. Metrics and both Inventory

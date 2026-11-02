@@ -135,8 +135,10 @@ static long (*inst_probe_read_kernel)(void *dst, u32 size, const void *src) = (v
 static struct instance_record *(*inst_storage_get)(void *map, void *task, void *value,
                                                    u64 flags) = (void *)156;
 static void *(*inst_current_task)(void) = (void *)158;
-/* bpf_get_func_ret: the fexit return value on any arity (helper 184, 5.17+). */
-static u64 (*inst_get_func_ret)(void *ctx) = (void *)184;
+/* bpf_get_func_ret: the fexit return value on any arity (helper 184,
+ * 5.17+). Writes the return through the out-pointer, returns 0; the
+ * verifier inlines the call. */
+static long (*inst_get_func_ret)(void *ctx, u64 *value) = (void *)184;
 
 /* Stores LLVM must not merge into a memset call: the Rust `memset` is a
  * global function that 5.15 refuses a stack pointer argument from here. */
@@ -477,15 +479,21 @@ int p11_inst_vma_copy(u64 *ctx)
     return inst_note_vma(ctx[5], 0);
 }
 
-/* copy_vma on 6/7-argument kernels: the 6.18.58+ stable backports append
- * keep_source, 7.3 adds anon_pgoff too, and the fexit return slot moves
- * with the arity (ctx[6], ctx[7]). bpf_get_func_ret reads the returned
- * new VMA on any arity. Same note as the legacy hook above; a separate
- * program so the legacy bytes never move. */
+/* copy_vma on 6/7-argument kernels: the stable backports of 838bb60dc215
+ * append keep_source, 7.3 adds anon_pgoff too, and the fexit return slot
+ * moves with the arity (ctx[6], ctx[7]). bpf_get_func_ret reads the
+ * returned new VMA on any arity. Same note as the legacy hook above; a
+ * separate program so the legacy bytes never move. A nonzero helper
+ * return (only a wrong attach type) is a fault, never a silent no-op. */
 INST_SEC("fexit/copy_vma")
 int p11_inst_vma_retcopy(u64 *ctx)
 {
-    return inst_note_vma(inst_get_func_ret(ctx), 0);
+    u64 ret = 0;
+    if (inst_get_func_ret(ctx, &ret) != 0) {
+        inst_fault(inst_counters());
+        return 0;
+    }
+    return inst_note_vma(ret, 0);
 }
 
 /* Fork: a CLONE_VM child that is not a thread shares its parent's mm, so

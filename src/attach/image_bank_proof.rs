@@ -18,6 +18,12 @@
 //! follows the route, never the current bank. Identity is `(incarnation,
 //! ticket)`; a slot is reused only as a new incarnation with fresh map
 //! objects after closed-zero and reclaim.
+//!
+//! Known limitation: the proof flavour keeps the legacy
+//! `fentry/exec_mm_release` exec hook and does not follow the production
+//! `exec_mmap` fallback, so it cannot seal continuity on 7.3+ kernels.
+//! That is acceptable for a proof-only object: it never loads outside
+//! these tests.
 
 use sha2::Digest as _;
 use std::collections::{HashMap, HashSet};

@@ -26,10 +26,19 @@ COUNTER_BUDGETS_FILE = ROOT / "tests/counter-bpf-verifier-budgets.json"
 KERNEL = "v6.1.188-test"
 OBSERVER = "ab" * 32
 # The driver's default kernel list (scripts/check-bpf-load-kernels.sh)
-# plus the 7.0 guest the budgets also cover.
+# plus the 7.0 guest the budgets also cover. Variant-group members
+# split this set instead of carrying it whole (see below).
 EXPECTED_BUDGET_KERNELS = frozenset({
-    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14",
+    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1",
 })
+# Hook slots whose program loads only on some kernels: each kernel budgets
+# exactly one member of each group, and a missing row for the other member
+# is accepted (it simply does not load there). Mirrors
+# EXCLUSIVE_VARIANT_GROUPS in scripts/bpf-load-report.py.
+EXCLUSIVE_VARIANT_GROUPS = [
+    frozenset({"detailed/p11_image_exec_release", "detailed/p11_image_mmap_release"}),
+    frozenset({"detailed/p11_inst_vma_copy", "detailed/p11_inst_vma_retcopy"}),
+]
 # Counter objects load only where the verifier accepts them (6.6+); the
 # old kernels keep the specified refusal, so the counter file pins its
 # own kernel set. Each counter object loads 15 programs (the 13 defaults
@@ -39,7 +48,7 @@ EXPECTED_BUDGET_KERNELS = frozenset({
 # modes. Every loaded counter program has a cell for each 6.6+ kernel
 # and nothing else.
 EXPECTED_COUNTER_BUDGET_KERNELS = frozenset({
-    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14",
+    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1",
 })
 _COUNTER_MODES = ("counts", "timestamps", "latency")
 _COUNTER_ROOTS = (
@@ -67,15 +76,20 @@ def budgets_files():
 def check_budgets_shape(path):
     """Every budgeted program carries the same kernel set; a missing cell fails.
 
-    The report's budgeted-but-missing FAIL only fires for roots carrying a
-    cell for the requested kernel, so a root silently dropped from one
-    kernel's column would pass with no rows at all. This pin fails such a
-    file. Raises AssertionError naming the mismatch.
+    Variant-group members are the exception: each kernel budgets exactly
+    one member of each group, so a group member carries a strict subset
+    and the members partition the kernel set. The report's
+    budgeted-but-missing FAIL only fires for roots carrying a cell for
+    the requested kernel, so a root silently dropped from one kernel's
+    column would pass with no rows at all. This pin fails such a file.
+    Raises AssertionError naming the mismatch.
     """
     document = json.loads(Path(path).read_text(encoding="ascii"))
     programs = document["programs"]
     assert programs, "budgets file names no programs"
-    kernel_sets = {name: frozenset(cells) for name, cells in programs.items()}
+    grouped = set().union(*EXCLUSIVE_VARIANT_GROUPS)
+    kernel_sets = {name: frozenset(cells) for name, cells in programs.items()
+                   if name not in grouped}
     first, *rest = sorted(kernel_sets)
     for name in rest:
         assert kernel_sets[name] == kernel_sets[first], (
@@ -84,6 +98,19 @@ def check_budgets_shape(path):
     assert kernel_sets[first] == EXPECTED_BUDGET_KERNELS, (
         f"budget kernels {sorted(kernel_sets[first])} differ from "
         f"{sorted(EXPECTED_BUDGET_KERNELS)}")
+    for group in EXCLUSIVE_VARIANT_GROUPS:
+        for member in sorted(group):
+            assert member in programs, (
+                f"variant group {sorted(group)} is missing {member}")
+        covered = {}
+        for member in sorted(group):
+            for kernel in programs[member]:
+                assert kernel not in covered, (
+                    f"{kernel} budgets two members of {sorted(group)}")
+                covered[kernel] = member
+        assert set(covered) == EXPECTED_BUDGET_KERNELS, (
+            f"variant group {sorted(group)} covers {sorted(covered)}, "
+            f"expected {sorted(EXPECTED_BUDGET_KERNELS)}")
 
 
 def check_budgets_cap(path):
@@ -246,6 +273,42 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("p11_return", result.stdout)
         self.assertIn("result=FAIL", result.stdout)
+
+    def test_variant_group_missing_other_member_passes(self):
+        loads = [load_row("p11_inst_vma_retcopy", processed=2500)]
+        budgets = self.write_budgets({"p11_inst_vma_retcopy": {KERNEL: 3000}})
+        result = self.run_report(self.write_loads("probe.jsonl", loads), budgets=budgets)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+
+    def test_variant_group_both_variants_measured_fails(self):
+        loads = [load_row("p11_inst_vma_copy", processed=2500),
+                 load_row("p11_inst_vma_retcopy", processed=2500)]
+        budgets = self.write_budgets({"p11_inst_vma_copy": {KERNEL: 3000},
+                                      "p11_inst_vma_retcopy": {KERNEL: 3000}})
+        result = self.run_report(self.write_loads("probe.jsonl", loads), budgets=budgets)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("both variants loaded", result.stdout)
+
+    def test_variant_group_both_variants_measured_fails_namespaced(self):
+        loads = [load_row("p11_image_exec_release", processed=400),
+                 load_row("p11_image_mmap_release", processed=400)]
+        budgets = self.write_budgets({"detailed/p11_image_exec_release": {KERNEL: 500},
+                                      "detailed/p11_image_mmap_release": {KERNEL: 500}})
+        result = self.run_report(self.write_loads("probe.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("both variants loaded", result.stdout)
+
+    def test_variant_group_members_are_detailed_unique_roots(self):
+        # Either member must assign its BTF group to the Detailed object;
+        # an unknown root fails the whole gate on that kernel.
+        text = SCRIPT.read_text(encoding="ascii")
+        block = text[text.index("DETAILED_UNIQUE_ROOTS"):
+                     text.index("KNOWN_ROOTS")]
+        for member in ["p11_image_exec_release", "p11_image_mmap_release",
+                       "p11_inst_vma_copy", "p11_inst_vma_retcopy"]:
+            self.assertIn(f'"{member}"', block)
 
     def test_low_headroom_fails_even_under_budget(self):
         loads = [load_row("p11_return", processed=960000)]

@@ -215,7 +215,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [v6.6.157, v6.12.111, v6.18.58]
+        kernel: [v6.6.157, v6.12.111, v6.18.58, v7.3.1]
         include:
           # One combined refusal control, never an old positive campaign.
           - kernel: v6.1.188

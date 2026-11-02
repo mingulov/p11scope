@@ -5,6 +5,23 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
+## [Unreleased]
+
+### Added
+
+- 7.3 support: live capture resolves the 7.3 exec-release hook (the
+  `exec_mmap` exit) and the 7-argument `copy_vma` from host BTF, and the
+  BPF kernel matrix loads every program on 7.3.1. A kernel whose hook
+  shapes match none of the known prototypes refuses the hooks by name.
+
+### Fixed
+
+- DONTUNMAP moves missed on kernels with the 6-argument copy_vma (affects
+  0.5.0: 6.18.58 and current 6.6/6.12/7.2 stable heads). The move hook read
+  a fixed argument slot, so an `MREMAP_DONTUNMAP` move of a watched provider
+  mapping went unnoticed there; it now reads the returned VMA on every
+  `copy_vma` shape.
+
 ## [0.5.0]
 
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and

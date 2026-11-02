@@ -279,13 +279,21 @@ int p11_image_exec_release(u64 *ctx)
 /* 7.3 removed exec_mm_release, merging exit and exec release into
  * mm_exit_exec_release, which also fires on thread exit and must not poison
  * live continuity. Newer kernels hook the exec_mmap exit instead: one
- * argument, so the return value is ctx[1]; poison only on success (0), since
- * a failed install leaves the old image in place. Same invalidation as the
- * legacy hook above; a separate program so the legacy bytes never move. */
+ * argument, so the return value is ctx[1]. The release call
+ * mm_exit_exec_release (fs/exec.c:859) sits where exec_mm_release used to
+ * (v7.2:857); the only earlier failure is the -ENOMEM from
+ * alloc_task_exec_state (:853), before anything is released. The two later
+ * failures, down_write_killable (:861-863) and mmap_read_lock_killable
+ * (:871-874), both come after point_of_no_return (:1161) and de_thread
+ * (:1164): fatal-signal-only, and otherwise bprm_execve forces SIGSEGV
+ * (:1887-1888), so the task never runs the old image again and skipping
+ * invalidation there is safe. Poison only on success (0). Same invalidation
+ * as the legacy hook above; a separate program so the legacy bytes never
+ * move. */
 IMG_SEC("fexit/exec_mmap")
 int p11_image_mmap_release(u64 *ctx)
 {
-    if (ctx[1] != 0)
+    if ((int)ctx[1] != 0)
         return 0;
     /* Mandatory negative action even before a bootstrap locator exists. */
     (void)p11_selected_invalidate_tgid((u32)(image_pid_tgid() >> 32));

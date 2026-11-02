@@ -460,18 +460,25 @@ non-null values needs a new allowlist row.
 - `observation.semantic_capture` (additive): the Detailed lane's
   sanitized summary, counts only —
   `{status, admitted_endpoints, refused_endpoints, continuity_cuts,
-  unrouted_returns, stop_quiescence, final_drain}`.
+  unrouted_returns, events_lost, stop_quiescence, final_drain}`.
   `status` is `disabled` (no manifests, no lane), `active`,
-  `partial` (live with refused endpoints or declared loss),
-  `unavailable` (startup failed) or `stopped` (after the terminal
-  sequence). `admitted_endpoints`/`refused_endpoints` count required
+  `partial` (live with refused endpoints, declared loss, or
+  `events_lost` above zero), `unavailable` (startup failed) or
+  `stopped` (after the terminal sequence).
+  `admitted_endpoints`/`refused_endpoints` count required
   endpoints; `continuity_cuts` counts actual successful physical-cut
   advances; `unrouted_returns` counts records the terminal drain
-  consumed that H0 never routed. `stop_quiescence` is `not_requested`,
-  `quiesced` or `unproven`; `final_drain` is null before stop, then
-  whether both owned cursors drained exactly to the proven Q with no
-  post-Q writer and no declared loss. The summary grants no semantic
-  permission; per-provider and per-edge gaps stay authoritative.
+  consumed that H0 never routed; `events_lost` counts EVENTS
+  records the kernel refused while the ring was full (the `lost`
+  term on the stop line; disjoint from `unrouted_returns`, never
+  double counted with it). `stop_quiescence` is `not_requested`,
+  `quiesced` or `unproven`; `final_drain` is null before stop,
+  then whether the terminal drain ran clean: both owned cursors
+  drained exactly to the proven Q with no post-Q writer and no
+  declared terminal loss (it scopes to the terminal drain only and
+  does not cover `events_lost`, which is reported separately). The
+  summary grants no semantic permission; per-provider and per-edge
+  gaps stay authoritative.
 - `observation.native_witnesses` (Task 6 C4): the native caller binder's
   census, every witness row once: `{rows, bound, unbound, pending,
   integrity, unbound_reasons, placement}`. All zero in the scan lane.

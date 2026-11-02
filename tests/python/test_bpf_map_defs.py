@@ -202,7 +202,8 @@ class MapDefsTests(unittest.TestCase):
         _, programs, symbols = checker.inspect(obj)
         self.assertEqual(programs, {"probe", "task_newtask", "sched_process_exec", "sched_process_exit",
                                    "p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy",
-                                   "p11_image_exec_release", "p11_image_query"})
+                                   "p11_image_exec_release", "p11_image_mmap_release",
+                                   "p11_image_query"})
         self.assertTrue(checker.REQUIRED_GLOBAL_HELPERS <= symbols)
         body, elf, _ = self.metadata(obj)
         symbase = elf.sections[".symtab"][0][4]

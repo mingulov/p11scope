@@ -16,7 +16,7 @@
 //! programs: only a session whose loaded object carries both journal roots
 //! seals and drains linked.
 
-use super::instance::INSTANCE_PROGRAMS;
+use super::instance::{EXEC_RELEASE_MMAP_PROGRAM, INSTANCE_PROGRAMS};
 use super::selected_detailed::PROGRAMS as SELECTED_DETAILED_PROGRAMS;
 use super::{
     BPF_F_RDONLY_PROG, DEFAULT_PROGRAMS, EmbeddedFlavor, ExactMapMetadata, map_metadata,
@@ -200,6 +200,7 @@ pub(crate) fn journal_expected_programs() -> BTreeSet<&'static str> {
 pub(crate) fn validate_journal_inventory(ebpf: &Ebpf) -> Result<()> {
     let mut expected = journal_expected_programs();
     expected.extend(INSTANCE_PROGRAMS.iter().map(|(program, _)| *program));
+    expected.insert(EXEC_RELEASE_MMAP_PROGRAM);
     expected.insert("p11_image_query");
     expected.extend(SELECTED_DETAILED_PROGRAMS);
     let actual: BTreeSet<_> = ebpf.programs().map(|(name, _)| name).collect();

@@ -5928,7 +5928,9 @@ fn validate_program_inventory_with_roots(
     let mut expected = expected_programs(unsafe_enabled);
     // The continuity hooks are present in every Detailed object but load
     // before deferred freezes, optionally (`InstanceTracking::prepare`).
+    // Both exec-release variants are present; one loads per kernel.
     expected.extend(INSTANCE_PROGRAMS.iter().map(|(program, _)| *program));
+    expected.insert(instance::EXEC_RELEASE_MMAP_PROGRAM);
     expected.insert("p11_image_query");
     expected.extend(selected_detailed::PROGRAMS);
     if roots == StaticRoots::CounterBanks {

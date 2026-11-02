@@ -492,6 +492,7 @@ EXACT_PROGRAM_SECTIONS = {
     "p11_inst_vma_unmap": "fentry/uprobe_munmap",
     "p11_inst_vma_copy": "fexit/copy_vma",
     "p11_image_exec_release": "fentry/exec_mm_release",
+    "p11_image_mmap_release": "fexit/exec_mmap",
     "p11_image_query": "iter/task",
     "p11_selected_bootstrap": "iter/task",
     "p11_selected_cgroup_migrate": "fentry/cgroup_migrate",
@@ -568,7 +569,8 @@ def validate_private_helpers(elf, prefix, required, optional, label,
             continue
         if inventory and name in ("task_newtask", "p11_inst_vma_map",
                                   "p11_inst_vma_unmap", "p11_inst_vma_copy",
-                                  "p11_image_exec_release", "p11_image_query",
+                                  "p11_image_exec_release", "p11_image_mmap_release",
+                                  "p11_image_query",
                                   "p11_selected_bootstrap", "p11_selected_cgroup_migrate"):
             continue
         matches = [s for s in elf.symbols if s[0] == name]
@@ -2321,12 +2323,13 @@ SAFE_PROGRAMS = {
     "p11_inst_vma_unmap",
     "p11_inst_vma_copy",
     "p11_image_exec_release",
+    "p11_image_mmap_release",
     "p11_image_query",
     "p11_selected_bootstrap",
     "p11_selected_cgroup_migrate",
 }
 INSTANCE_PROGRAMS = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy",
-                     "p11_image_exec_release", "p11_image_query"}
+                     "p11_image_exec_release", "p11_image_mmap_release", "p11_image_query"}
 UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
     "p11_entry_ia32",
     "p11_entry_template", "p11_entry_template_pair",
@@ -2538,9 +2541,9 @@ def self_test():
     assert len(WIDE_MAPS) == 42
     assert len(WIDE_UNSAFE_MAPS) == 44
     assert len(JOURNAL_MAPS) == 46
-    assert len(SAFE_PROGRAMS) == 20
-    assert len(UNSAFE_PROGRAMS) == 25
-    assert len(JOURNAL_PROGRAMS) == 20
+    assert len(SAFE_PROGRAMS) == 21
+    assert len(UNSAFE_PROGRAMS) == 26
+    assert len(JOURNAL_PROGRAMS) == 21
     assert JOURNAL_PROGRAMS == (SAFE_PROGRAMS - {"p11_entry", "p11_return"}) | {"p11_entry_journal", "p11_return_journal"}
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
     base_helpers = (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS

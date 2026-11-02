@@ -1066,6 +1066,8 @@ fn build_variant_with_proof(
             "-C",
             "link-arg=--export=p11_image_exec_release",
             "-C",
+            "link-arg=--export=p11_image_mmap_release",
+            "-C",
             "link-arg=--export=p11_image_query",
             "-C",
             "link-arg=--export=p11_selected_bootstrap",

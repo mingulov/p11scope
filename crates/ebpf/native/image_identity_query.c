@@ -276,6 +276,39 @@ int p11_image_exec_release(u64 *ctx)
         (void)image_write(record, 0, 1);
     return 0;
 }
+/* 7.3 removed exec_mm_release, merging exit and exec release into
+ * mm_exit_exec_release, which also fires on thread exit and must not poison
+ * live continuity. Newer kernels hook the exec_mmap exit instead: one
+ * argument, so the return value is ctx[1]; poison only on success (0), since
+ * a failed install leaves the old image in place. Same invalidation as the
+ * legacy hook above; a separate program so the legacy bytes never move. */
+IMG_SEC("fexit/exec_mmap")
+int p11_image_mmap_release(u64 *ctx)
+{
+    if (ctx[1] != 0)
+        return 0;
+    /* Mandatory negative action even before a bootstrap locator exists. */
+    (void)p11_selected_invalidate_tgid((u32)(image_pid_tgid() >> 32));
+    if (!image_allowed())
+        return 0;
+    u64 tgid = image_pid_tgid() >> 32;
+    if (!tgid) {
+        image_fail();
+        return 0;
+    }
+    u64 *index = image_lookup(&IMAGE_TGID_INDEX, &tgid);
+    if (!index)
+        return 0;
+    u64 cookie = IMG_READ(*index);
+    if (!image_cookie_valid(cookie)) {
+        image_fail();
+        return 0;
+    }
+    struct image_continuity *record = image_lookup(&IMAGE_CONTINUITY, &cookie);
+    if (record)
+        (void)image_write(record, 0, 1);
+    return 0;
+}
 /* Every callback, including skipped/nonleader callbacks, spends a visit.
  * END must be withheld on failure: task_seq_stop ignores the return code. */
 IMG_SEC("iter/task")

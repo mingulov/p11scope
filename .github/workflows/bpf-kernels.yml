@@ -293,6 +293,10 @@ jobs:
           test -s "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
           # Fail when the guest doctor exits nonzero, as the host job does.
           grep -q '^# doctor rc=0$' "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
+          # The pipe exit is tee's, so also require the driver's own
+          # verdict: a budget-only FAIL (count over budget, missing row)
+          # with a healthy doctor must fail the step (P2F-5 F2).
+          grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
       - name: Check one stock pre-Multi host refuses before capture side effects
         if: matrix.refusal_control == true
         shell: bash
@@ -500,6 +504,10 @@ jobs:
           test -s "$GITHUB_WORKSPACE/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt"
           # Fail when the guest doctor exits nonzero, as the host job does.
           grep -q '^# doctor rc=0$' "$GITHUB_WORKSPACE/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt"
+          # The pipe exit is tee's, so also require the driver's own
+          # verdict: a budget-only FAIL (count over budget, missing row)
+          # with a healthy doctor must fail the step (P2F-5 F2).
+          grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt"
       - name: Upload the table and doctor output
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

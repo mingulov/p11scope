@@ -262,6 +262,12 @@
     },
     {
       "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_ordinary_capture_mints_no_birth",
+      "reason": "privileged: birth marker ordinary capture mints no birth",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_pid_outsider_stays_unobserved",
       "reason": "privileged: birth marker PID outsider stays unobserved",
       "cell": "privileged"

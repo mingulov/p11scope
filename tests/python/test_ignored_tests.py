@@ -399,6 +399,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "exec_after_closure_publishes_ready",
             "fork_without_exec_has_no_ready",
             "nonleader_exec_creates_fresh_ready_row",
+            "ordinary_capture_mints_no_birth",
             "pid_outsider_stays_unobserved",
             "return_outside_scope_dirties",
         )}
@@ -857,7 +858,7 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=133",
+            "DEFAULT_TESTS=134",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
             "SKIP_TESTS=87",

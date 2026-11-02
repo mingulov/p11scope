@@ -3110,7 +3110,10 @@ impl LiveJointMachine {
             }
             Phase::StagingNegative(original) => {
                 budget.spend(1);
-                if coordinator.stage_next_prepared_admission(self.grant.is_none()) {
+                if coordinator.stage_next_prepared_admission(
+                    self.grant.is_none(),
+                    self.producers.journal_linked(),
+                ) {
                     return (Phase::StagingNegative(original), Ok(Step::Continue));
                 }
                 if !coordinator.finish_prepared_semantic_batch(lane) {
@@ -4200,6 +4203,9 @@ impl AttestedSemanticLane {
                 &coordinator.registry().semantic_storage_reserver(),
             )?);
             coordinator.note_journal_linked(producers.journal_linked());
+            if !producers.journal_linked() {
+                coordinator.disclose_joint_journal_unavailable_once();
+            }
         }
         Ok(())
     }

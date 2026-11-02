@@ -9476,8 +9476,9 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
 
 /// Joint init latches the lane's journal linkage from its drain
 /// producers before any traffic or birth: a linked lane reads
-/// `bootstrap_unavailable` at first publication, an unlinked lane
-/// reads `journal_unavailable`, and neither stages a gap. Root BPF
+/// `bootstrap_unavailable` at first publication and stages no gap;
+/// an unlinked lane reads `journal_unavailable` plus the one O0
+/// `joint_journal_unavailable` lane disclosure (O6-2 §6). Root BPF
 /// lane, serial.
 #[test]
 #[ignore = "privileged: joint init latches producer linkage before traffic"]
@@ -9564,14 +9565,36 @@ fn privileged_joint_init_latches_producer_linkage() -> Result<()> {
         "an unlinked lane reads journal_unavailable: {}",
         observations.reason
     );
-    assert_init_stages_no_birth_gap(registry, "unlinked");
+    assert_init_stages_unlinked_disclosure(registry);
     eprintln!("KEY_OPS_LATCH unlinked latch=false reason=journal_unavailable");
     drop(lane);
     Ok(())
 }
 
-/// The init latch stages no gap: it only arms the label the first
-/// birth disclosure will carry.
+/// The unlinked init stages exactly the one lane disclosure: the
+/// O0 `joint_journal_unavailable` row, and no per-birth gap.
+fn assert_init_stages_unlinked_disclosure(
+    registry: &crate::discovery::caller_registry::CallerRegistry,
+) {
+    let staged = registry.staged_scope_gaps_for_test();
+    assert!(
+        !staged
+            .iter()
+            .any(|(subject, _)| subject == "Joint birth unavailable; retained S1"),
+        "unlinked: init stages no retained-S1 gap"
+    );
+    assert_eq!(
+        staged
+            .iter()
+            .filter(|(_, reason)| reason == "joint_journal_unavailable")
+            .count(),
+        1,
+        "unlinked: init stages exactly one lane disclosure: {staged:?}"
+    );
+}
+
+/// The linked init latch stages no gap: it only arms the label the
+/// first birth disclosure will carry.
 fn assert_init_stages_no_birth_gap(
     registry: &crate::discovery::caller_registry::CallerRegistry,
     which: &str,

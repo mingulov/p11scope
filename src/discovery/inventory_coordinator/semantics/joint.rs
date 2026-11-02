@@ -1359,19 +1359,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    pub(crate) fn stage_next_prepared_admission(&mut self, pre_grant: bool) -> bool {
+    pub(crate) fn stage_next_prepared_admission(
+        &mut self,
+        pre_grant: bool,
+        journal_linked: bool,
+    ) -> bool {
         let Some(state) = self.semantic_finalizer.as_mut() else {
             return false;
         };
         let Some(PendingSemanticBatch::Prepared(batch)) = state.pending_semantic.as_mut() else {
             return false;
         };
-        // Pre-grant staging discloses why each staged admission's Joint
-        // bind refused, read-only through the adapter: the retained S1
-        // row carries the refusal the birth would have hit. The peek
-        // takes the same pending-exit verdict the staging below will
-        // use, so a custody-refused input skips the disclosure.
+        // Pre-grant staging on a linked lane discloses why each staged
+        // admission's Joint bind refused, read-only through the
+        // adapter: the retained S1 row carries the refusal the birth
+        // would have hit. Unlinked lanes never disclose per birth —
+        // they keep the one O0 lane row. The peek takes the same
+        // pending-exit verdict the staging below will use, so a
+        // custody-refused input skips the disclosure.
         if pre_grant
+            && journal_linked
             && let Some((caller, input)) =
                 batch.stage_peek(|caller| self.adapter.leader_exit_pending(caller))
             && let Err(refusal) = self.joint_capture.adapter().probe_admitted_key(input)

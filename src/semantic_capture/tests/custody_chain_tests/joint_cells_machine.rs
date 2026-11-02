@@ -3037,11 +3037,12 @@ fn joint_pregrant_skewed_end_joins_one_quantum() {
     );
 }
 
-/// T8 companion: the ordinary birth-path capture (grant minted, the
-/// pre-grant flag off) is unchanged by D1 — staging discloses
-/// nothing, the modeled call reduces S1 exactly, and the grant mints.
+/// The linked grant path (grant minted, the pre-grant flag off)
+/// stages no D1 row: staging discloses nothing, the modeled call
+/// reduces S1 exactly, and the grant mints. Linked producers; the
+/// real unlinked ordinary capture is pinned separately below.
 #[test]
-fn joint_pregrant_birth_path_stages_without_disclosure() {
+fn joint_pregrant_linked_grant_path_stages_without_disclosure() {
     let mut scene = pregrant_scene();
     publish_empty_first_quantum(&mut scene);
     scene
@@ -3507,11 +3508,12 @@ fn joint_pregrant_stop_closes_and_finishes_bounded() {
     panic!("the finish publishes within its bound");
 }
 
-/// An unlinked lane never extends: the skewed quantum closes at
-/// once with the same boundary, mints no grant, and keeps the
-/// unlinked label.
-#[test]
-fn joint_pregrant_unlinked_lane_closes_without_extension() {
+/// An unlinked pre-grant scene with the O0 init replicated:
+/// production `initialize_joint` latches the producers' linkage and,
+/// unlinked, discloses the one lane row (the privileged T9 pins that
+/// call site). The machine twin cannot run the live init path, so it
+/// replicates both calls exactly.
+fn unlinked_pregrant_scene() -> MachineScene {
     let mut scene = MachineScene::with_initial_files_and_functions(
         1,
         &[0],
@@ -3545,6 +3547,29 @@ fn joint_pregrant_unlinked_lane_closes_without_extension() {
         !scene.scene.producers.journal_linked(),
         "the twin runs unlinked producers"
     );
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .note_journal_linked(false);
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .disclose_joint_journal_unavailable_once();
+    scene
+}
+
+/// An unlinked lane never extends: the skewed quantum closes at
+/// once with the same boundary, mints no grant, and keeps the
+/// unlinked label.
+#[test]
+fn joint_pregrant_unlinked_lane_closes_without_extension() {
+    let mut scene = unlinked_pregrant_scene();
     publish_empty_first_quantum(&mut scene);
     let pid = std::process::id();
     push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
@@ -3565,47 +3590,16 @@ fn joint_pregrant_unlinked_lane_closes_without_extension() {
     );
 }
 
-/// T8 (O6-4 E1): D1 stays ungated on unlinked lanes with attached
-/// provider inventory. The skewed quantum closes at once (no
-/// extension), disposal taints, and the next bind discloses its taint
-/// refusal per staged admission — while S1 still reduces exactly,
-/// the lane keeps the unlinked label, and no grant mints.
+/// T8 (O6-6 F1), skewed order: an unlinked lane discloses once at
+/// the lane, never per birth. The skewed quantum closes at once (no
+/// extension) and disposal taints, but the tainted bind stages no D1
+/// row — the lane keeps its single O0 `joint_journal_unavailable`
+/// row, S1 still reduces exactly, the label reads unlinked, and no
+/// grant mints.
 #[test]
 fn joint_pregrant_unlinked_lane_discloses_with_s1_exact() {
     use crate::semantics_objects::journal::AttestationRefusal;
-    let mut scene = MachineScene::with_initial_files_and_functions(
-        1,
-        &[0],
-        &["C_GetFunctionList", "C_Initialize"],
-        true,
-    );
-    {
-        let events = scene
-            .scene
-            .drain
-            .consumption_cut()
-            .unwrap()
-            .events()
-            .clone();
-        scene.scene.producers = crate::attach::SessionDrainProducers::test_pair_unlinked(
-            scene.scene.real.lane.domain(),
-            events,
-        );
-        let reserve = scene
-            .scene
-            .real
-            .scene
-            .coordinator
-            .registry()
-            .semantic_storage_reserver();
-        scene.machine =
-            crate::inventory_semantics::LiveJointMachine::new(&scene.scene.producers, &reserve)
-                .unwrap();
-    }
-    assert!(
-        !scene.scene.producers.journal_linked(),
-        "the twin runs unlinked producers"
-    );
+    let mut scene = unlinked_pregrant_scene();
     publish_empty_first_quantum(&mut scene);
     let pid = std::process::id();
     push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
@@ -3632,37 +3626,109 @@ fn joint_pregrant_unlinked_lane_discloses_with_s1_exact() {
         matches!(outcome, Err(AttestationRefusal::ImageTainted)),
         "disposal tainted the image: {outcome:?}"
     );
-    let coordinator = &scene.scene.real.scene.coordinator;
-    let reasons: Vec<String> = coordinator
+    assert_unlinked_lane_disclosure(&scene.scene.real.scene);
+}
+
+/// T8, unskewed order: the BEGIN arrives before the setup CALL in
+/// the first quantum, the END still later. Same unlinked shape: one
+/// lane disclosure, no D1 row, S1 exact, unlinked label, no grant.
+#[test]
+fn joint_pregrant_unlinked_begin_first_discloses_once_with_s1_exact() {
+    use crate::semantics_objects::journal::AttestationRefusal;
+    let mut scene = unlinked_pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    let init_end = push_begin(&mut scene, pid, "C_Initialize", 1);
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 2);
+    assert!(
+        drive_until_closed(&mut scene, 64),
+        "an unlinked lane never extends"
+    );
+    scene.published();
+    scene
+        .scene
+        .drain
+        .source_mut()
+        .push_record(init_end.to_vec());
+    assert_eq!(reach_any(&mut scene, &["BindingKeys"]), "BindingKeys");
+    let input = cloned_only_admission(&mut scene);
+    scene.published();
+    assert!(
+        scene.machine.retained_drain_grant_for_test().is_none(),
+        "no grant mints"
+    );
+    let outcome = bind_probe_outcome(&mut scene, &input);
+    assert!(
+        matches!(outcome, Err(AttestationRefusal::ImageTainted)),
+        "disposal tainted the image: {outcome:?}"
+    );
+    assert_unlinked_lane_disclosure(&scene.scene.real.scene);
+}
+
+/// The real no-flag ordinary capture: unlinked producers with bare
+/// CALL rows only (no journal BEGIN/END at all). The bind succeeds
+/// on the untainted image so a drain grant mints, but the Births
+/// guard installs no feed; the lane keeps one disclosure, stages no
+/// D1 row, reduces S1 exactly, and reads the unlinked label.
+#[test]
+fn joint_pregrant_unlinked_ordinary_capture_discloses_once_with_s1_exact() {
+    let mut scene = unlinked_pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    push_ordinary_payload(&mut scene, pid, "C_Initialize", 2);
+    assert!(
+        drive_until_closed(&mut scene, 64),
+        "an unlinked lane never extends"
+    );
+    scene.published();
+    assert!(
+        scene.machine.retained_drain_grant_for_test().is_some(),
+        "the untainted bind mints the drain grant"
+    );
+    assert_eq!(
+        scene.scene.real.scene.coordinator.registry().joint_feeds(),
+        0,
+        "the Births guard installs no feed on an unlinked lane"
+    );
+    assert_unlinked_lane_disclosure(&scene.scene.real.scene);
+}
+
+/// The honest unlinked shape: exactly one caller-less
+/// `joint_journal_unavailable` row (repeats counted), no
+/// per-birth "Joint birth unavailable" row, the `journal_unavailable`
+/// label, and S1 reduced exactly (the one modeled call).
+fn assert_unlinked_lane_disclosure(
+    scene: &crate::semantic_capture::tests::custody_chain_tests::CustodyScene,
+) {
+    let coordinator = &scene.coordinator;
+    let d1: Vec<&str> = coordinator
         .registry()
         .gaps()
         .iter()
         .filter(|gap| gap.subject == "Joint birth unavailable; retained S1")
-        .map(|gap| gap.reason.clone())
+        .map(|gap| gap.reason.as_str())
         .collect();
-    assert_eq!(
-        reasons,
-        vec!["joint_birth_claim_ImageTainted".to_string()],
-        "the unlinked lane discloses the refused bind"
+    assert!(
+        d1.is_empty(),
+        "an unlinked lane stages no per-birth D1 row: {d1:?}"
     );
-    // The init-time latch with the producers' value. The machine twin
-    // cannot run the live init path, so it replicates the latch input
-    // exactly; the privileged twin pins the production call site.
-    scene
-        .scene
-        .real
-        .scene
-        .coordinator
-        .registry_mut()
-        .note_journal_linked(false);
-    let registry = scene.scene.real.scene.coordinator.registry();
+    let lane_rows: u64 = coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .zip(coordinator.registry().gap_repeats().iter())
+        .filter(|(gap, _)| gap.caller.is_none() && gap.reason == "joint_journal_unavailable")
+        .map(|(_, repeats)| *repeats)
+        .sum();
+    assert_eq!(lane_rows, 1, "exactly one lane disclosure");
+    let registry = coordinator.registry();
     let observations = registry.joint_observations(registry.published_revision());
     assert_eq!(observations.reason, "journal_unavailable");
-    let api_total: u64 = crate::semantic_capture::tests::custody_chain_tests::operation_edge_rows(
-        &scene.scene.real.scene,
-    )
-    .iter()
-    .filter_map(|row| row.0)
-    .sum();
+    let api_total: u64 =
+        crate::semantic_capture::tests::custody_chain_tests::operation_edge_rows(scene)
+            .iter()
+            .filter_map(|row| row.0)
+            .sum();
     assert_eq!(api_total, 1, "the modeled call still reduces S1");
 }

@@ -130,7 +130,7 @@ esac
 case "$OUTDIR" in
     /var/tmp/*) echo "output dir under /var/tmp is hidden from vng guests: $OUTDIR" >&2; exit 2 ;;
 esac
-command -v vng >/dev/null || { echo "vng not on PATH" >&2; exit 2; }
+command -v vng >/dev/null || { echo "vng not on PATH" >&2; exit 77; }
 command -v cc >/dev/null || { echo "cc not on PATH" >&2; exit 77; }
 command -v softhsm2-util >/dev/null || { echo "softhsm2-util not on PATH" >&2; exit 77; }
 MODULE=""

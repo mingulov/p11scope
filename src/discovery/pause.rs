@@ -3100,6 +3100,7 @@ mod tests {
         /// repeats. Default: none recorded.
         attach_instants: VecDeque<Option<u64>>,
         fallback_attach: Option<u64>,
+        state_reads: u64,
         queue: VecDeque<Result<Option<DiscoveryItem>, String>>,
         authorization: Option<u64>,
         authorization_results: VecDeque<Result<Option<u64>, String>>,
@@ -3155,6 +3156,7 @@ mod tests {
                 last_states: BTreeMap::new(),
                 attach_instants: VecDeque::new(),
                 fallback_attach: None,
+                state_reads: 0,
                 queue: VecDeque::new(),
                 authorization: None,
                 authorization_results: VecDeque::new(),
@@ -3234,6 +3236,7 @@ mod tests {
         }
 
         fn task_states(&mut self, _: u32) -> Result<BTreeMap<u32, u8>, String> {
+            self.state_reads = self.state_reads.saturating_add(1);
             let states = match self.states.pop_front() {
                 Some(states) => {
                     if let Ok(states) = &states {
@@ -5560,6 +5563,90 @@ mod tests {
 
         coordinator.service(&mut io).unwrap();
         assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+    }
+
+    #[test]
+    fn stopped_sample_retries_a_lagging_stop_then_confirms() {
+        // Under host load SIGSTOP delivery lags the record: the first
+        // sample sees a running task for a stop that is still landing.
+        // The cycle must poll within its unchanged deadline, not fail it.
+        let mut io = successful_io(vec![record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5)]);
+        let lagging: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from([
+            Ok(lagging),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+        ]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+    }
+
+    #[test]
+    fn stopped_sample_stops_polling_at_the_cycle_deadline() {
+        // A stop that never lands must not spin past its deadline: two
+        // running polls, then the clock crosses the cycle deadline.
+        let mut io = successful_io(vec![record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5), Ok(10), Ok(11), Ok(12), Ok(13), Ok(u64::MAX)]);
+        let lagging: BTreeMap<u32, u8> = [(41, b'R'), (42, b'R')].into_iter().collect();
+        io.states = VecDeque::from([Ok(lagging.clone()), Ok(lagging.clone()), Ok(lagging)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(io.state_reads, 3);
+    }
+
+    #[test]
+    fn stopped_sample_fails_fast_on_exited_tasks() {
+        // A zombie never becomes stopped: no polling, one read, partial.
+        let mut io = successful_io(vec![record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5)]);
+        let zombie: BTreeMap<u32, u8> = [(41, b'Z'), (42, b'T')].into_iter().collect();
+        io.states = VecDeque::from([Ok(zombie)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(io.state_reads, 1);
+    }
+
+    #[test]
+    fn stopped_sample_fails_fast_on_changed_task_set() {
+        // A forked task is a real change, not lag: no polling either.
+        let mut io = successful_io(vec![record(6, 0, false)]);
+        io.authorization = None;
+        io.now = VecDeque::from([Ok(5)]);
+        let forked: BTreeMap<u32, u8> = [(41, b'T'), (43, b'T')].into_iter().collect();
+        io.states = VecDeque::from([Ok(forked)]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(io.state_reads, 1);
     }
 
     #[test]

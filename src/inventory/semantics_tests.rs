@@ -6374,6 +6374,88 @@ fn native_semantic_failed_refresh_attempts_remain_bounded_and_fair() {
 }
 
 #[test]
+fn native_semantic_refresh_picks_share_one_registry_scan() {
+    // Two attested providers, six callers alternating between them. Every
+    // (record, object) pair reaches the registry module find: matching
+    // pairs yield a candidate, the rest scan every module and match
+    // nothing. The four picks must share one scan instead of re-scanning
+    // the registry per pick (quadratic at scale: four full scans per
+    // call over thousands of records).
+    let (_first, _second, subset) = dual_provider_subset();
+    let mut scene = BindingScene::new();
+    let lane = AttestedSemanticLane::start(subset, &Scope::System, BackendSelection::Auto).unwrap();
+    let providers: Vec<(PinnedObjectId, String, ModuleKey, u32)> = lane
+        .subset()
+        .required()
+        .keys()
+        .map(|object| {
+            let pin = lane
+                .subset()
+                .pins()
+                .pinned()
+                .find(|pin| pin.id == *object)
+                .expect("each provider has an original held target");
+            let slot = lane.subset().required()[object]
+                .first()
+                .copied()
+                .expect("each provider requires a slot");
+            (
+                *object,
+                pin.path.to_owned(),
+                ModuleKey::physical(
+                    pin.key.device.major,
+                    pin.key.device.minor,
+                    pin.key.inode,
+                    Some(pin.sha256.to_owned()),
+                    pin.path,
+                ),
+                slot,
+            )
+        })
+        .collect();
+    assert_eq!(providers.len(), 2);
+    let children: Vec<_> = (0..6).map(|_| OwnedStoppedChild::new()).collect();
+    let mut admitted = Vec::new();
+    for (index, child) in children.iter().enumerate() {
+        let caller = scene.admit(child.id(), 100 + index as u64);
+        let (object, path, module, _) = &providers[index % 2];
+        scene.map_module(caller, child.id(), module, path, 200 + index as u64);
+        admitted.push((caller, *object));
+    }
+    let records = scene.coordinator.adapter().records().count();
+    let objects = lane.subset().required().len();
+    let modules = scene.coordinator.registry().modules().count();
+    let attempts = scene
+        .coordinator
+        .semantic_refresh_attempts(&lane, None, |_| true);
+    // Correctness first: the four smallest (caller, object) candidates in
+    // ascending key order, each with its own provider's module and slot. A
+    // fast path that returns the wrong picks (or none) must fail here.
+    let mut candidates = admitted;
+    candidates.sort();
+    assert_eq!(attempts.len(), 4, "the service cap still dispatches four");
+    for (attempt, (caller, object)) in attempts.iter().zip(&candidates[..4]) {
+        assert_eq!(attempt.caller, *caller);
+        let (_, _, module, slot) = providers
+            .iter()
+            .find(|(candidate, _, _, _)| candidate == object)
+            .unwrap();
+        assert_eq!(attempt.module.as_ref(), Some(module));
+        assert_eq!(attempt.slot, *slot);
+    }
+    // Complexity: one registry scan per (record, object) pair, not one per
+    // pick. Four picks over four scans visit roughly four times this
+    // ceiling.
+    let visits = scene.coordinator.semantic_refresh_find_visits();
+    let ceiling = records * objects * modules;
+    assert!(
+        visits as usize <= ceiling,
+        "one shared scan visits each pair once: {visits} <= {ceiling} \
+         ({records} records x {objects} objects x {modules} modules)"
+    );
+}
+
+#[test]
 fn native_semantic_single_provider_refresh_target_preserved() {
     set_sight(1_005);
     let fixture = ProviderFixture::new();

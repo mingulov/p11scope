@@ -14522,6 +14522,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn joint_keepup_live_feed_claim_cost_flat_while_converting() {
+        // The live feed churns: begins convert under their claims
+        // while new claims arrive. The marginal claim stays at one
+        // index probe, the census stays exact across conversion, and
+        // every claim is consumed.
+        const ROUNDS: usize = 8;
+        const BATCH: usize = 64;
+        let mut scene = Scene::new(image_default());
+        scene.adapter.set_prune_oracle_for_test(true);
+        let create = function_id("C_CreateObject");
+        let mut bootstrap = None;
+        for round in 0..ROUNDS {
+            for member in 0..BATCH {
+                let thread = (round * BATCH + member) as u64 + 1;
+                let begin = begin_bytes(thread, 1, create, 0);
+                assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            }
+            let mut proof = None;
+            for _ in 0..BATCH {
+                proof = Some(scene.attest());
+            }
+            if bootstrap.is_none() {
+                bootstrap = Some(scene.bootstrap(proof.expect("round attests"), 0));
+            }
+            if round == ROUNDS - 1 {
+                scene.adapter.reset_test_claim_costs_for_test();
+            }
+            scene.prepare_claims();
+            if round == ROUNDS - 1 {
+                let (calls, visits, prunes) = scene.adapter.test_claim_costs_for_test();
+                assert_eq!(calls, BATCH as u64, "one measured claim per call");
+                assert_eq!(visits, BATCH, "one index probe per claim");
+                assert_eq!(prunes, 0, "no prune below the claim cap");
+            }
+            assert_eq!(
+                scene.adapter.retained_counts,
+                naive_retained_counts(&scene.adapter)
+            );
+            let success = scene
+                .seal(bootstrap.as_ref().expect("round zero bootstraps"))
+                .expect("round seals");
+            assert_eq!(success.prefix.settled().len(), BATCH);
+            assert_eq!(
+                scene.adapter.retained_counts,
+                naive_retained_counts(&scene.adapter)
+            );
+        }
+        assert_eq!(
+            scene.adapter.claim_counts, 0,
+            "the live feed consumes every claim"
+        );
+    }
+
+    #[test]
     fn joint_keepup_phase_trace_records_claim_samples() {
         let mut scene = Scene::new(image_default());
         let create = function_id("C_CreateObject");

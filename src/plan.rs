@@ -326,23 +326,46 @@ pub(crate) fn whole_refusal_needed_count(reason: &str) -> Option<usize> {
 
 /// The omitted endpoints are not called new: an endpoint deactivated earlier
 /// in the capture and listed again needs a fresh slot just the same.
-fn growth_omission_reason(
+/// Like a whole refusal, an omission names what holds the room the growth
+/// needed; a provider omission also names the remedies, so a provider that
+/// arrives after a prefix and still does not fit fails visibly.
+/// Inputs to [`growth_omission_reason`], grouped past clippy's arity cap.
+struct GrowthOmission<'a> {
     omitted: usize,
     capacity: usize,
     in_use: usize,
     retired: usize,
     kept: usize,
     policy: AdmissionPolicy,
-) -> String {
+    holders: &'a [(&'a str, usize)],
+    provider_remedies: bool,
+    counter_hint: bool,
+}
+
+fn growth_omission_reason(details: &GrowthOmission) -> String {
     let endpoints = |count: usize| if count == 1 { "endpoint" } else { "endpoints" };
-    format!(
+    let mut reason = format!(
         "{GROWTH_OMISSION} {omitted} more; only {capacity} {} are available; \
          {} — {omitted} {} not attached; kept its {kept} attached {}",
-        policy.capacity_subject(),
-        slot_use(in_use, retired, &[]),
-        endpoints(omitted),
-        endpoints(kept),
-    )
+        details.policy.capacity_subject(),
+        slot_use(details.in_use, details.retired, details.holders),
+        endpoints(details.omitted),
+        endpoints(details.kept),
+        omitted = details.omitted,
+        capacity = details.capacity,
+        kept = details.kept,
+    );
+    if details.provider_remedies {
+        reason.push_str("; to capture one provider, name it with --module <path>");
+        reason.push_str("; to free slots, exclude an unneeded module with --exclude-module <name>");
+        if details.counter_hint {
+            reason.push_str(
+                "; to count every endpoint in this metrics capture, re-run with \
+                 --counter-mode counts",
+            );
+        }
+    }
+    reason
 }
 
 /// A module's admission class, in admission order.
@@ -3177,11 +3200,12 @@ fn merge(
     let mut skipped = Vec::new();
     let mut surfaces = Vec::new();
     let mut entries_seen = 0usize;
-    for (group, decision) in groups.into_iter().zip(decisions) {
+    for (position, (group, decision)) in groups.into_iter().zip(decisions).enumerate() {
         let key = group[0].key;
         let object = group[0].object;
         let path = group[0].path;
         let source = group[0].source;
+        let (class, _) = classes[position];
         entries_seen += decoded_occurrence_count(&group);
         let (admitted, refused_growth, kept, allocated_slots, closure_prefix) =
             match decision.expect("merge decides every module before building it") {
@@ -3396,14 +3420,17 @@ fn merge(
             if !omitted.is_empty() {
                 let omission = Skipped {
                     subject: path.to_string(),
-                    reason: growth_omission_reason(
-                        omitted.len(),
+                    reason: growth_omission_reason(&GrowthOmission {
+                        omitted: omitted.len(),
                         capacity,
-                        allocated_slots,
+                        in_use: allocated_slots,
                         retired,
-                        kept_attached.len(),
-                        admission_policy,
-                    ),
+                        kept: kept_attached.len(),
+                        policy: admission_policy,
+                        holders: &slot_holders(&holding, &paths),
+                        provider_remedies: class != AdmissionClass::ClosureArray,
+                        counter_hint,
+                    }),
                 };
                 refused_module_objects.push((object, omission.clone()));
                 modules_skipped.push(omission);
@@ -8872,27 +8899,60 @@ mod tests {
         assert_eq!(plan.modules_skipped[0].subject, "/opt/crossing.so");
     }
 
+    /// Omission details with no holders and no remedies, for shape tests.
+    fn plain_omission(
+        omitted: usize,
+        capacity: usize,
+        in_use: usize,
+        retired: usize,
+        kept: usize,
+    ) -> GrowthOmission<'static> {
+        GrowthOmission {
+            omitted,
+            capacity,
+            in_use,
+            retired,
+            kept,
+            policy: AdmissionPolicy::Detailed,
+            holders: &[],
+            provider_remedies: false,
+            counter_hint: false,
+        }
+    }
+
     /// The omission record reads right in the singular and the plural, and
     /// keeps the prefix `is_growth_omission` and its consumers key on.
     #[test]
     fn growth_omission_reason_counts_endpoints_in_singular_and_plural() {
         assert_eq!(
-            growth_omission_reason(1, 512, 512, 0, 1, AdmissionPolicy::Detailed),
+            growth_omission_reason(&plain_omission(1, 512, 512, 0, 1)),
             "admitted module needs 1 more; only 512 attach slots are available; 512 are in use \
              (512 active, 0 retired) — 1 endpoint not attached; kept its 1 attached endpoint"
         );
         assert_eq!(
-            growth_omission_reason(2, 512, 511, 11, 500, AdmissionPolicy::Detailed),
+            growth_omission_reason(&plain_omission(2, 512, 511, 11, 500)),
             "admitted module needs 2 more; only 512 attach slots are available; 511 are in use \
              (500 active, 11 retired) — 2 endpoints not attached; kept its 500 attached endpoints"
         );
+        // A provider omission names what holds the room and the remedies.
+        let named = growth_omission_reason(&GrowthOmission {
+            omitted: 104,
+            capacity: 512,
+            in_use: 447,
+            retired: 0,
+            kept: 1,
+            policy: AdmissionPolicy::Detailed,
+            holders: &[("/usr/lib/libp11-kit.so.0", 309)],
+            provider_remedies: true,
+            counter_hint: false,
+        });
+        assert!(
+            named.contains("held by /usr/lib/libp11-kit.so.0 309"),
+            "{named}"
+        );
+        assert!(named.contains("--exclude-module"), "{named}");
         assert!(is_growth_omission(&growth_omission_reason(
-            1,
-            512,
-            512,
-            0,
-            1,
-            AdmissionPolicy::Detailed
+            &plain_omission(1, 512, 512, 0, 1)
         )));
         let whole = "module needs 2 more; only 512 attach slots are available; 511 are in use — \
                      refusing to attach a prefix";
@@ -8900,28 +8960,16 @@ mod tests {
         // The omitted count round-trips through the record the engine ranks.
         for omitted in [1, 2, 511, 2_113] {
             assert_eq!(
-                growth_omitted_count(&growth_omission_reason(
-                    omitted,
-                    512,
-                    511,
-                    3,
-                    7,
-                    AdmissionPolicy::Detailed
-                )),
+                growth_omitted_count(&growth_omission_reason(&plain_omission(
+                    omitted, 512, 511, 3, 7
+                ))),
                 Some(omitted)
             );
         }
         assert_eq!(growth_omitted_count(whole), None);
         assert_eq!(whole_refusal_needed_count(whole), Some(2));
         assert_eq!(
-            whole_refusal_needed_count(&growth_omission_reason(
-                2,
-                512,
-                511,
-                3,
-                7,
-                AdmissionPolicy::Detailed
-            )),
+            whole_refusal_needed_count(&growth_omission_reason(&plain_omission(2, 512, 511, 3, 7))),
             None
         );
         assert_eq!(
@@ -9114,10 +9162,14 @@ mod tests {
         );
         assert!(
             omission.reason.contains(&format!(
-                "{MAX_SLOTS} are in use ({MAX_SLOTS} active, 0 retired) — 2 endpoints not \
-                 attached; kept its {MAX_SLOTS} attached endpoints"
+                "{MAX_SLOTS} are in use ({MAX_SLOTS} active, 0 retired; held by /proc/self/fd/10 \
+                 {MAX_SLOTS}) — 2 endpoints not attached; kept its {MAX_SLOTS} attached endpoints"
             )),
             "{omission:?}"
+        );
+        assert!(
+            omission.reason.contains("--exclude-module"),
+            "omissions name the remedy: {omission:?}"
         );
 
         let delta = plan.extend_exact(rebuilt).unwrap();
@@ -10349,11 +10401,17 @@ mod tests {
         );
         // The re-admitted endpoint is not called new.
         assert!(
-            omission.reason.ends_with(&format!(
+            omission.reason.contains(&format!(
                 "— 1 endpoint not attached; kept its {} attached endpoints",
                 MAX_SLOTS - 1
             )),
             "{omission:?}"
+        );
+        assert!(
+            omission
+                .reason
+                .ends_with("exclude an unneeded module with --exclude-module <name>"),
+            "omissions name the remedy: {omission:?}"
         );
 
         let delta = plan.extend_exact(rebuilt).unwrap();
@@ -12387,6 +12445,43 @@ mod tests {
             !partial.reason.contains("0 of 64"),
             "never a zero partial: {}",
             partial.reason
+        );
+    }
+
+    /// F1 fail-visible, growth edition: a provider admitted beside the
+    /// prefix whose later growth does not fit omits the growth by name —
+    /// the omission names the prefix holder and the `--exclude-module`
+    /// remedy, never bare counts.
+    #[test]
+    fn provider_growth_omitted_after_the_prefix_names_the_holder_and_remedy() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let small = provider_with_tables(32, "/opt/small.so", 1, 68, false);
+        let first = scoped_plan(&[p11_kit.clone(), small.clone()], AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 32), 68);
+        assert_eq!(
+            slots_of(&first, 31),
+            0,
+            "no prefix while the provider is new"
+        );
+        let settled = first.rebuild_from_sources(&[p11_kit, small], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&settled, 31), 3 * 103, "prefix one pass later");
+        // The provider's table grows past the room the prefix leaves: its
+        // 68 endpoints stay, the 182 new ones are omitted by name.
+        let grown = provider_with_tables(32, "/opt/small.so", 1, 250, false);
+        let closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let rebuilt = settled.rebuild_from_sources(&[closure, grown], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&rebuilt, 32), 68, "kept endpoints stay");
+        assert_eq!(slots_of(&rebuilt, 31), 3 * 103, "prefix kept");
+        let omission = refusal_of(&rebuilt, "/opt/small.so").expect("growth omission recorded");
+        assert!(
+            omission.reason.contains("libp11-kit"),
+            "names the prefix holder: {}",
+            omission.reason
+        );
+        assert!(
+            omission.reason.contains("--exclude-module"),
+            "names the remedy: {}",
+            omission.reason
         );
     }
 

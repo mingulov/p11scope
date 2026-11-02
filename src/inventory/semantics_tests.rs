@@ -4851,6 +4851,7 @@ fn native_semantic_stop_orders_gate_drain_finish_output() {
             "refused_endpoints": 0,
             "continuity_cuts": 0,
             "unrouted_returns": 0,
+            "events_lost": 0,
             "stop_quiescence": "not_requested",
             "final_drain": null,
         })
@@ -4861,12 +4862,14 @@ fn native_semantic_stop_orders_gate_drain_finish_output() {
         refused_endpoints: 1,
         continuity_cuts: 2,
         unrouted_returns: 3,
+        events_lost: 5,
         stop_quiescence: SemanticStopQuiescence::Quiesced,
         final_drain: Some(true),
     };
     assert_eq!(stopped.json()["status"], "stopped");
     assert_eq!(stopped.json()["stop_quiescence"], "quiesced");
     assert_eq!(stopped.json()["final_drain"], true);
+    assert_eq!(stopped.json()["events_lost"], 5);
 
     // Finish certifies nothing about Inventory: the terminal batches
     // commit beside the registry without mutating it, and a repeat

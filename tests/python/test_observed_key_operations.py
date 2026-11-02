@@ -778,6 +778,7 @@ def s1_current_doc():
                    "ring_loss": 0, "malformed": 0, "failed_quanta": 0},
                    "semantic_capture": {"status": "stopped", "admitted_endpoints": 68,
                        "refused_endpoints": 0, "continuity_cuts": 0, "unrouted_returns": 0,
+                       "events_lost": 0,
                        "stop_quiescence": "quiesced", "final_drain": True}})
     return doc
 

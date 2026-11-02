@@ -12274,24 +12274,26 @@ mod tests {
             };
             let lane_counts = |driver: &ClassicDriver<'_>| {
                 let lane = driver.semantic.as_ref().unwrap();
+                let summary = lane.semantic_summary();
                 (
                     lane.shed_calls_disclosed(),
                     lane.events_ring_loss_disclosed(),
-                    lane.semantic_summary().unrouted_returns,
+                    summary.unrouted_returns,
+                    summary.events_lost,
                 )
             };
             // The first tick stages without committing: nothing disclosed.
             driver.on_tick();
             assert!(driver.semantic_staged, "the first tick stages");
             assert!(ring_gaps(&driver).is_empty());
-            assert_eq!(lane_counts(&driver), (0, 0, 0));
+            assert_eq!(lane_counts(&driver), (0, 0, 0, 0));
             // First commit reads a zero counter: still quiet.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
             );
             driver.on_tick();
             assert!(ring_gaps(&driver).is_empty());
-            assert_eq!(lane_counts(&driver), (0, 0, 0));
+            assert_eq!(lane_counts(&driver), (0, 0, 0, 0));
             // The counter rises to 7: one named gap plus exact counts.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
@@ -12301,13 +12303,13 @@ mod tests {
                 ring_gaps(&driver),
                 [(
                     "the EVENTS ring overwrote records before the drain read them \
-                     (kernel reserve failures; exact count in unrouted_returns)"
+                     (kernel reserve failures; exact count in events_lost)"
                         .to_string(),
                     1
                 )],
                 "a rise discloses one named gap"
             );
-            assert_eq!(lane_counts(&driver), (0, 7, 7));
+            assert_eq!(lane_counts(&driver), (0, 7, 0, 7));
             // A flat read discloses nothing new.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
@@ -12315,7 +12317,7 @@ mod tests {
             driver.on_tick();
             assert_eq!(ring_gaps(&driver).len(), 1);
             assert_eq!(ring_gaps(&driver)[0].1, 1);
-            assert_eq!(lane_counts(&driver), (0, 7, 7));
+            assert_eq!(lane_counts(&driver), (0, 7, 0, 7));
             // The next rise accumulates onto the same gap row and counts.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
@@ -12327,7 +12329,7 @@ mod tests {
                 2,
                 "rises coalesce onto one gap row"
             );
-            assert_eq!(lane_counts(&driver), (0, 12, 12));
+            assert_eq!(lane_counts(&driver), (0, 12, 0, 12));
         }
 
         #[test]
@@ -12442,13 +12444,15 @@ mod tests {
                 "a later success still discloses its rise"
             );
             let lane = driver.semantic.as_ref().unwrap();
+            let summary = lane.semantic_summary();
             assert_eq!(
                 (
                     lane.shed_calls_disclosed(),
                     lane.events_ring_loss_disclosed(),
-                    lane.semantic_summary().unrouted_returns
+                    summary.unrouted_returns,
+                    summary.events_lost
                 ),
-                (0, 5, 5)
+                (0, 5, 0, 5)
             );
         }
 
@@ -21136,9 +21140,10 @@ mod promotion_driver_tests {
             )],
             "the stop line carries the hold-polled loss"
         );
+        let summary = driver.semantic_summary();
         assert_eq!(
-            driver.semantic_summary().unrouted_returns,
-            9,
+            (summary.unrouted_returns, summary.events_lost),
+            (0, 9),
             "the served summary counts the loss past the handoff"
         );
     }
@@ -21182,7 +21187,8 @@ mod promotion_driver_tests {
             "a latched hold keeps the disposition reason"
         );
         assert_eq!(
-            summary.unrouted_returns, 9,
+            (summary.unrouted_returns, summary.events_lost),
+            (0, 9),
             "the hold returns the post-commit counts"
         );
         let gaps: Vec<_> = coordinator

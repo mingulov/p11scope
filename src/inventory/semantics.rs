@@ -4692,26 +4692,45 @@ impl AttestedSemanticLane {
                 admitted_endpoints: 0,
                 refused_endpoints: 0,
                 continuity_cuts: 0,
-                unrouted_returns: self.events_ring_loss,
+                unrouted_returns: 0,
+                events_lost: self.events_ring_loss,
                 stop_quiescence,
                 final_drain: self.is_finished().then_some(self.final_drain),
             };
         };
         SemanticCaptureSummary {
-            status: if live.finished {
-                SemanticCaptureStatus::Stopped
-            } else if live.scan_refusals > 0 || live.semantic_loss {
-                SemanticCaptureStatus::Partial
-            } else {
-                SemanticCaptureStatus::Active
-            },
+            status: live_capture_status(
+                live.finished,
+                live.scan_refusals,
+                live.semantic_loss,
+                self.events_ring_loss,
+            ),
             admitted_endpoints,
             refused_endpoints: live.scan_refusals,
             continuity_cuts: live.continuity_cuts,
-            unrouted_returns: live.unrouted_returns.saturating_add(self.events_ring_loss),
+            unrouted_returns: live.unrouted_returns,
+            events_lost: self.events_ring_loss,
             stop_quiescence,
             final_drain: live.finished.then_some(self.final_drain),
         }
+    }
+}
+
+/// A live lane's capture status from its loss signals: stopped
+/// once finished, else partial with any refused endpoint, declared
+/// loss, or disclosed ring loss, else active.
+pub(crate) fn live_capture_status(
+    finished: bool,
+    scan_refusals: u64,
+    semantic_loss: bool,
+    events_ring_loss: u64,
+) -> SemanticCaptureStatus {
+    if finished {
+        SemanticCaptureStatus::Stopped
+    } else if scan_refusals > 0 || semantic_loss || events_ring_loss > 0 {
+        SemanticCaptureStatus::Partial
+    } else {
+        SemanticCaptureStatus::Active
     }
 }
 
@@ -4767,6 +4786,7 @@ pub(crate) struct SemanticCaptureSummary {
     pub refused_endpoints: u64,
     pub continuity_cuts: u64,
     pub unrouted_returns: u64,
+    pub events_lost: u64,
     pub stop_quiescence: SemanticStopQuiescence,
     pub final_drain: Option<bool>,
 }
@@ -4774,8 +4794,8 @@ pub(crate) struct SemanticCaptureSummary {
 impl SemanticCaptureSummary {
     /// The exact `observation.semantic_capture` shape: `{status,
     /// admitted_endpoints, refused_endpoints, continuity_cuts,
-    /// unrouted_returns, stop_quiescence, final_drain}`. `final_drain`
-    /// is null before stop, then a boolean.
+    /// unrouted_returns, events_lost, stop_quiescence, final_drain}`.
+    /// `final_drain` is null before stop, then a boolean.
     pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::json!({
             "status": self.status.label(),
@@ -4783,6 +4803,7 @@ impl SemanticCaptureSummary {
             "refused_endpoints": self.refused_endpoints,
             "continuity_cuts": self.continuity_cuts,
             "unrouted_returns": self.unrouted_returns,
+            "events_lost": self.events_lost,
             "stop_quiescence": self.stop_quiescence.label(),
             "final_drain": self.final_drain,
         })

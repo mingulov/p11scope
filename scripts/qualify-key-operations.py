@@ -874,7 +874,8 @@ def _s1_current_child(doc):
              and capture.get("final_drain") is True and capture.get("stop_quiescence") == "quiesced"
              and _u64(capture.get("admitted_endpoints")) and capture["admitted_endpoints"] > 0
              and all(_u64(capture.get(name)) and capture[name] == 0
-                     for name in ("refused_endpoints", "continuity_cuts", "unrouted_returns")),
+                     for name in ("refused_endpoints", "continuity_cuts", "unrouted_returns",
+                                  "events_lost")),
              "S1 terminal semantic drain or continuity is unproven")
     _require(_u64(doc.get("gaps_suppressed")) and doc["gaps_suppressed"] == 0,
              "S1 suppressed gaps are unknown or nonzero")

@@ -1227,7 +1227,7 @@ class LossGate(unittest.TestCase):
     def test_native_capture_events_lost_gap_fails(self):
         reason = ("the EVENTS ring overwrote records before the drain "
                   "read them (kernel reserve failures; exact count in "
-                  "unrouted_returns)")
+                  "events_lost)")
 
         def mutate_inventory(inventory):
             inventory["gaps"].append(

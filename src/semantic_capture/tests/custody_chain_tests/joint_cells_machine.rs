@@ -2748,19 +2748,21 @@ fn joint_machine_publish_discloses_events_ring_loss_rise() {
         [(
             "native capture events lost".to_string(),
             "the EVENTS ring overwrote records before the drain read them \
-             (kernel reserve failures; exact count in unrouted_returns)"
+             (kernel reserve failures; exact count in events_lost)"
                 .to_string(),
         )],
         "a rise stages one named gap at machine publish"
     );
     let lane = &scene.scene.real.lane;
+    let summary = lane.semantic_summary();
     assert_eq!(
         (
             lane.shed_calls_disclosed(),
             lane.events_ring_loss_disclosed(),
-            lane.semantic_summary().unrouted_returns
+            summary.unrouted_returns,
+            summary.events_lost
         ),
-        (0, 9, 9),
+        (0, 9, 0, 9),
         "the disclosed delta counts exactly once across poll sites"
     );
     // And it surfaces through the next registry publish, never stuck staged.

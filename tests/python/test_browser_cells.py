@@ -290,6 +290,11 @@ class BrowserCells(unittest.TestCase):
                 getattr(server, "cert_requests_sent", 0), 1,
                 f"{label}: stall without outbound CertificateRequest "
                 f"(selection never began) [{outcomes}]")
+        if server.cert_refusals:
+            self.assertGreaterEqual(
+                getattr(server, "cert_requests_sent", 0), 1,
+                f"{label}: refusal without outbound CertificateRequest "
+                f"(selection never began) [{outcomes}]")
         witness = (server.empty_certs + server.selection_stalls
                    + server.cert_refusals)
         self.assertGreaterEqual(
@@ -1442,13 +1447,16 @@ def live_cells_missing_s1(source):
 
 
 def attach_cells_with_opened_floor(source):
-    """``@gate`` attach-drive cells whose ``s1=`` sets ``sessions_opened_min``.
+    """``@gate`` attach-drive cells whose ``s1=`` may set ``sessions_opened_min``.
 
     Parses ``source`` (this suite file) like ``live_cells_missing_s1``.
     Attach cells must never floor in-window session opens: the browser
     opens its NSS token sessions at startup, strictly before the
     profiler can attach, so navigation traffic rides cached sessions
-    and ``sessions.opened`` is legitimately zero. Returns the violating
+    and ``sessions.opened`` is legitimately zero. A non-literal ``s1=``
+    (a name, a call, an unpacking, or a computed key) cannot be proven
+    floor-free statically, so it counts as a violation too: the window
+    rule must fail closed, never bypass silently. Returns the violating
     cell names (empty means the suite honors the window).
     """
     violations = []
@@ -1479,10 +1487,16 @@ def attach_cells_with_opened_floor(source):
                         and call.func.attr == "check_report"):
                     continue
                 for keyword in call.keywords:
-                    if keyword.arg != "s1" or not isinstance(keyword.value, ast.Dict):
+                    if keyword.arg != "s1":
                         continue
-                    keys = [key.value for key in keyword.value.keys
-                            if isinstance(key, ast.Constant)]
+                    if not isinstance(keyword.value, ast.Dict):
+                        violations.append(item.name)
+                        continue
+                    if any(not isinstance(key, ast.Constant)
+                           for key in keyword.value.keys):
+                        violations.append(item.name)
+                        continue
+                    keys = [key.value for key in keyword.value.keys]
                     if "sessions_opened_min" in keys:
                         violations.append(item.name)
     return violations

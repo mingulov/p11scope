@@ -1099,6 +1099,12 @@ pub(crate) struct JournalAdapter {
     /// one sample per claim while enabled.
     #[cfg(test)]
     test_phase_trace: Option<Vec<TestPhaseSample>>,
+    /// Test-only prune-skip oracle: off by default; when on, every
+    /// skipped prune re-scans all claims to prove it would drop
+    /// nothing. The scan is O(claims) per claim, so it stays behind
+    /// this switch instead of taxing every test and wall-time probe.
+    #[cfg(test)]
+    test_prune_oracle: bool,
     last_audit_failure: Option<u64>,
     /// H0 positions below this watermark were voided by an H3-loss
     /// seal: re-presented barriers at or below it wait instead of
@@ -1171,6 +1177,8 @@ impl JournalAdapter {
             test_prune_runs: 0,
             #[cfg(test)]
             test_phase_trace: None,
+            #[cfg(test)]
+            test_prune_oracle: false,
             last_audit_failure: None,
             h3_voided_below: 0,
             voided_through: 0,
@@ -1331,6 +1339,14 @@ impl JournalAdapter {
     #[cfg(test)]
     pub(crate) fn take_phase_trace_for_test(&mut self) -> Vec<TestPhaseSample> {
         self.test_phase_trace.take().unwrap_or_default()
+    }
+
+    /// Test-only prune-skip oracle switch: off by default; while on,
+    /// every skipped prune re-scans all claims to prove it would
+    /// drop nothing.
+    #[cfg(test)]
+    pub(crate) fn set_prune_oracle_for_test(&mut self, on: bool) {
+        self.test_prune_oracle = on;
     }
 
     /// Test-only record of one claim sample; a no-op while tracing is off.
@@ -4618,8 +4634,9 @@ impl JournalAdapter {
             #[cfg(test)]
             {
                 // Differential oracle: a skipped prune must drop nothing.
-                // Every existing test exercising deaths becomes a check.
-                if !self.claims_prune_dirty {
+                // Gated behind the test-only switch: the re-scan is
+                // O(claims) per claim, so only opted-in tests pay it.
+                if !self.claims_prune_dirty && self.test_prune_oracle {
                     let doomed: usize = self
                         .claims
                         .values()
@@ -13904,6 +13921,7 @@ pub(crate) mod tests {
     #[test]
     fn joint_keepup_no_prune_step_at_2048_while_keys_live() {
         let mut scene = keepup_scene_with_retained(2_048);
+        scene.adapter.set_prune_oracle_for_test(true);
         keepup_attest_paired(&mut scene, 2_048);
         assert_eq!(scene.adapter.claim_counts, 2_048);
         scene.adapter.reset_test_claim_costs_for_test();
@@ -13925,6 +13943,7 @@ pub(crate) mod tests {
     #[test]
     fn joint_keepup_cap_boundary_twins_2047_2048_2049() {
         let mut scene = keepup_scene_with_retained(2_048);
+        scene.adapter.set_prune_oracle_for_test(true);
         keepup_attest_paired(&mut scene, 2_047);
         assert_eq!(scene.adapter.claim_counts, 2_047);
         keepup_attest_paired(&mut scene, 1);
@@ -13949,6 +13968,7 @@ pub(crate) mod tests {
 
         fn fuzz(limits: JournalLimits, seed: u64, ops: usize) {
             let mut scene = Scene::new_with_limits(image_default(), limits);
+            scene.adapter.set_prune_oracle_for_test(true);
             let mut rng = KeepupRng::new(seed);
             let create = function_id("C_CreateObject");
             let sign = function_id("C_Sign");
@@ -14159,6 +14179,7 @@ pub(crate) mod tests {
     fn joint_keepup_retained_index_exact_across_seals() {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
         let mut scene = Scene::new(image_default());
+        scene.adapter.set_prune_oracle_for_test(true);
         let proof = scene.attest_calls(2);
         let create = function_id("C_CreateObject");
         let bootstrap = scene.bootstrap(proof, 0);
@@ -14198,6 +14219,7 @@ pub(crate) mod tests {
                 image_sightings: 8,
             },
         );
+        scene.adapter.set_prune_oracle_for_test(true);
         let create = function_id("C_CreateObject");
         let other_image = ImageIdentity {
             task_cookie: COOKIE + 1,
@@ -14274,6 +14296,7 @@ pub(crate) mod tests {
                 image_sightings: 8,
             },
         );
+        scene.adapter.set_prune_oracle_for_test(true);
         let create = function_id("C_CreateObject");
         for thread in 1..=8u64 {
             let begin = begin_bytes(thread, 1, create, 0);

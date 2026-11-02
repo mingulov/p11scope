@@ -2640,9 +2640,10 @@ fn observer_published_a_pass(events: &Path) -> bool {
     })
 }
 
-/// The witness twin: a missing log, an idle log and a `started`-only log
-/// hold the gate; the first `pass_committed` opens it. A bare substring
-/// check (or a dropped `kind` match) turns this red.
+/// The witness twin: a missing log, an empty log and a log with only
+/// `started` and `caller_event` records hold the gate; a `pass_committed`
+/// record opens it. Dropping the `kind` match turns this red. A bare
+/// substring check for `pass_committed` would still pass these inputs.
 #[test]
 fn held_gate_witness_opens_only_on_a_published_pass() -> Result<()> {
     let dir = tempfile::tempdir()?;

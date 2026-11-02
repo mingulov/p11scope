@@ -471,7 +471,10 @@ non-null values needs a new allowlist row.
   consumed that H0 never routed; `events_lost` counts EVENTS
   records the kernel refused while the ring was full (the `lost`
   term on the stop line; disjoint from `unrouted_returns`, never
-  double counted with it). `stop_quiescence` is `not_requested`,
+  double counted with it). While the `native capture events loss
+  unknown` gap is present, `events_lost` may undercount; the kernel
+  counter is cumulative, so the next good read restores the exact
+  total. `stop_quiescence` is `not_requested`,
   `quiesced` or `unproven`; `final_drain` is null before stop,
   then whether the terminal drain ran clean: both owned cursors
   drained exactly to the proven Q with no post-Q writer and no

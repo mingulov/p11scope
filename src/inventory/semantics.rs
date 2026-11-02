@@ -925,10 +925,11 @@ pub(crate) struct AttestedSemanticLane {
     /// Last cumulative EVENTS ring-loss kernel counter read
     /// (EVIDENCE_RING_LOSS); rises disclose.
     events_ring_loss_seen: u64,
-    /// Cumulative disclosed EVENTS ring loss; feeds unrouted_returns.
+    /// Cumulative disclosed EVENTS ring loss; feeds events_lost.
     events_ring_loss: u64,
-    /// An EVENTS ring-loss counter read failed: kernel loss past
-    /// that point is uncounted. Latched, never cleared.
+    /// An EVENTS ring-loss counter read failed: events_lost may
+    /// undercount until a later good read restores the exact
+    /// cumulative total. Latched, never cleared.
     events_loss_unknown: bool,
     /// The unknown-loss gap was already recorded.
     events_loss_unknown_reported: bool,
@@ -2006,8 +2007,9 @@ impl AttestedSemanticLane {
         }
     }
 
-    /// Latch unknown EVENTS loss: a counter read failed, so kernel
-    /// loss past this point is uncounted. Latched, never cleared.
+    /// Latch unknown EVENTS loss: a counter read failed, so
+    /// events_lost may undercount until a later good read restores
+    /// the exact total. Latched, never cleared.
     fn note_events_loss_unknown(&mut self) {
         self.events_loss_unknown = true;
     }

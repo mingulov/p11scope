@@ -1292,6 +1292,7 @@ fn assert_scan_semantic_capture(doc: &Value, context: &str) {
             "refused_endpoints": 0,
             "continuity_cuts": 0,
             "unrouted_returns": 0,
+            "events_lost": 0,
             "stop_quiescence": "not_requested",
             "final_drain": null,
         }),

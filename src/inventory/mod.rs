@@ -12410,7 +12410,7 @@ mod tests {
             assert_eq!(
                 gaps_by_subject(&driver, "native capture events loss unknown"),
                 [(
-                    "the EVENTS ring-loss counter could not be read; kernel loss past this point is uncounted"
+                    "the EVENTS ring-loss counter could not be read; events_lost may undercount until a later good read restores the exact cumulative total"
                         .to_string(),
                     1
                 )],

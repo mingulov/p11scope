@@ -11784,6 +11784,8 @@ mod tests {
             quiesce: bool,
             pending: bool,
             receipt_free: bool,
+            saturated: bool,
+            ring_loss: std::collections::VecDeque<u64>,
         }
 
         impl StubLaneIo {
@@ -11807,6 +11809,8 @@ mod tests {
                     quiesce: false,
                     pending: false,
                     receipt_free: false,
+                    saturated: false,
+                    ring_loss: std::collections::VecDeque::new(),
                 }
             }
         }
@@ -11821,6 +11825,11 @@ mod tests {
             }
 
             fn tick(&mut self, domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {
+                if self.saturated {
+                    let mut report = TickReport::scripted(Vec::new(), Vec::new());
+                    report.collection_saturated = true;
+                    return SemanticBatch::from_tick_report(domain, report, Vec::new(), 0);
+                }
                 if self.receipt_free {
                     return Ok(SemanticBatch::scripted(
                         domain,
@@ -11887,6 +11896,10 @@ mod tests {
 
             fn drain_discovery_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
                 LaneDrainOutcome::default()
+            }
+
+            fn events_ring_loss(&mut self) -> Option<u64> {
+                self.ring_loss.pop_front()
             }
         }
 
@@ -12051,6 +12064,202 @@ mod tests {
                     .is_some_and(|age| age < STAGED_SEMANTIC_MAX_AGE),
                 "the restaged batch is fresh"
             );
+        }
+
+        #[test]
+        fn saturated_tick_commits_promptly_without_waiting_for_a_pass() {
+            let mut scene = driver_scene(2);
+            scene.stub.saturated = true;
+            scene.lane.install_test_io(Box::new(scene.stub));
+            let mut driver = ClassicDriver {
+                coordinator: &mut scene.coordinator,
+                inventory_scope: None,
+                scope: InventoryRunScope::Pid(std::process::id()),
+                cgroup: None,
+                max_scan_pids: None,
+                guard: UnavailableImageGuard,
+                deadline: None,
+                attach_backend: crate::attach::BackendSelection::Auto,
+                identity: None,
+                display: None,
+                semantic: Some(scene.lane),
+                semantic_staged: false,
+                seated_summary: None,
+                second_signal: None,
+                lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+                completion_source: None,
+                pending_install: None,
+                installed_promotion: None,
+                retiring: None,
+                joint_finish: JointFinishDriver::NotBegun,
+                stop_requested: false,
+                joint_first_error: None,
+                suspended: false,
+                joint_commit_pending: false,
+                joint_tick_refusal: None,
+                joint_commit_retries: 0,
+                #[cfg(test)]
+                terminal_seq_calls: 0,
+                #[cfg(test)]
+                reclaim_calls: Vec::new(),
+                #[cfg(test)]
+                joint_begin_calls: 0,
+                #[cfg(test)]
+                joint_step_calls: 0,
+                #[cfg(test)]
+                joint_commit_polls: 0,
+                #[cfg(test)]
+                take_promotion_work_calls: 0,
+                #[cfg(test)]
+                drive_pending_install_calls: 0,
+                #[cfg(test)]
+                service_caller_metadata_calls: 0,
+                #[cfg(test)]
+                commit_calls: 0,
+            };
+            // A saturated collection quantum means the EVENTS ring likely
+            // still holds more: the tick commits promptly so the next
+            // service drains again, instead of waiting for the next pass
+            // or the staleness deadline.
+            driver.on_tick();
+            assert!(
+                !driver.semantic_staged,
+                "a saturated batch commits on its own tick"
+            );
+            assert_eq!(
+                driver.commit_calls, 1,
+                "one prompt commit per saturated tick"
+            );
+            driver.on_tick();
+            assert!(
+                !driver.semantic_staged,
+                "every saturated tick commits promptly"
+            );
+            assert_eq!(
+                driver.commit_calls, 2,
+                "the drain loop commits every tick"
+            );
+        }
+
+        #[test]
+        fn events_ring_loss_rise_discloses_a_named_gap_and_counts() {
+            let mut scene = driver_scene(2);
+            scene.stub.receipt_free = true;
+            scene.stub.ring_loss =
+                std::collections::VecDeque::from([0, 7, 7, 12]);
+            scene.lane.install_test_io(Box::new(scene.stub));
+            let mut driver = ClassicDriver {
+                coordinator: &mut scene.coordinator,
+                inventory_scope: None,
+                scope: InventoryRunScope::Pid(std::process::id()),
+                cgroup: None,
+                max_scan_pids: None,
+                guard: UnavailableImageGuard,
+                deadline: None,
+                attach_backend: crate::attach::BackendSelection::Auto,
+                identity: None,
+                display: None,
+                semantic: Some(scene.lane),
+                semantic_staged: false,
+                seated_summary: None,
+                second_signal: None,
+                lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+                completion_source: None,
+                pending_install: None,
+                installed_promotion: None,
+                retiring: None,
+                joint_finish: JointFinishDriver::NotBegun,
+                stop_requested: false,
+                joint_first_error: None,
+                suspended: false,
+                joint_commit_pending: false,
+                joint_tick_refusal: None,
+                joint_commit_retries: 0,
+                #[cfg(test)]
+                terminal_seq_calls: 0,
+                #[cfg(test)]
+                reclaim_calls: Vec::new(),
+                #[cfg(test)]
+                joint_begin_calls: 0,
+                #[cfg(test)]
+                joint_step_calls: 0,
+                #[cfg(test)]
+                joint_commit_polls: 0,
+                #[cfg(test)]
+                take_promotion_work_calls: 0,
+                #[cfg(test)]
+                drive_pending_install_calls: 0,
+                #[cfg(test)]
+                service_caller_metadata_calls: 0,
+                #[cfg(test)]
+                commit_calls: 0,
+            };
+            let ring_gaps = |driver: &ClassicDriver<'_>| {
+                driver
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .zip(driver.coordinator.registry().gap_repeats().iter())
+                    .filter(|(gap, _)| gap.subject == "native capture events lost")
+                    .map(|(gap, repeats)| (gap.reason.clone(), *repeats))
+                    .collect::<Vec<_>>()
+            };
+            let lane_counts = |driver: &ClassicDriver<'_>| {
+                let lane = driver.semantic.as_ref().unwrap();
+                (
+                    lane.shed_calls_disclosed(),
+                    lane.semantic_summary().unrouted_returns,
+                )
+            };
+            // The first tick stages without committing: nothing disclosed.
+            driver.on_tick();
+            assert!(driver.semantic_staged, "the first tick stages");
+            assert!(ring_gaps(&driver).is_empty());
+            assert_eq!(lane_counts(&driver), (0, 0));
+            // First commit reads a zero counter: still quiet.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert!(ring_gaps(&driver).is_empty());
+            assert_eq!(lane_counts(&driver), (0, 0));
+            // The counter rises to 7: one named gap plus exact counts.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(
+                ring_gaps(&driver),
+                [(
+                    "the EVENTS ring overwrote records before the drain read them \
+                     (kernel reserve failures; exact count in unrouted_returns)"
+                        .to_string(),
+                    1
+                )],
+                "a rise discloses one named gap"
+            );
+            assert_eq!(lane_counts(&driver), (7, 7));
+            // A flat read discloses nothing new.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(ring_gaps(&driver).len(), 1);
+            assert_eq!(ring_gaps(&driver)[0].1, 1);
+            assert_eq!(lane_counts(&driver), (7, 7));
+            // The next rise accumulates onto the same gap row and counts.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(ring_gaps(&driver).len(), 1);
+            assert_eq!(
+                ring_gaps(&driver)[0].1,
+                2,
+                "rises coalesce onto one gap row"
+            );
+            assert_eq!(lane_counts(&driver), (12, 12));
         }
 
         #[test]

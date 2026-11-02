@@ -98,6 +98,7 @@ fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs
         track_short_lived: false,
         kind: Kind::Profile,
         modules: hints,
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),

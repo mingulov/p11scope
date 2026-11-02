@@ -2607,7 +2607,12 @@ impl CaptureFacts {
         }
     }
 
-    fn discovery(&self, plan: &plan::AttachPlan) -> render::DiscoveryEvidence {
+    fn discovery(
+        &self,
+        plan: &plan::AttachPlan,
+        excluded: &[crate::discovery::scan::ExcludedRecord],
+        excludes: &[std::path::PathBuf],
+    ) -> render::DiscoveryEvidence {
         let history = self.visible_history();
         let modules = history
             .modules
@@ -2639,6 +2644,7 @@ impl CaptureFacts {
             .values()
             .filter(|outcome| corroboration_corroborates(**outcome))
             .count() as u64;
+        let (excluded_modules, unmatched_excludes) = render::aggregate_excluded(excluded, excludes);
         render::DiscoveryEvidence {
             modules,
             conflicts: history.conflicts.saturating_add(derived_conflicts),
@@ -2657,6 +2663,8 @@ impl CaptureFacts {
             manifest_object_fallbacks: history.fallbacks.values().cloned().collect(),
             scan_unavailable: history.scan_unavailable.clone(),
             scan_ms: history.scan_ms,
+            excluded_modules,
+            unmatched_excludes,
             ..render::DiscoveryEvidence::default()
         }
     }
@@ -12822,7 +12830,13 @@ impl Engine {
         self.loader_plan_cache = None;
         let project_start = crate::attach::monotonic_ns();
         self.capture_facts.apply_to_plan(&mut self.plan);
-        self.discovery = self.capture_facts.discovery(&self.plan);
+        // Borrow the budget's exclusion records before the mutable plan borrow
+        // ends: clone the small vecs (excluded files are few).
+        let excluded_records = self.budget.excluded().to_vec();
+        let excludes = self.budget.excludes().to_vec();
+        self.discovery = self
+            .capture_facts
+            .discovery(&self.plan, &excluded_records, &excludes);
         self.stage_timings.span(
             crate::timing::StageKind::Projection,
             "project_facts",
@@ -28780,6 +28794,18 @@ impl Engine {
 
     pub fn discovery(&self) -> &render::DiscoveryEvidence {
         &self.discovery
+    }
+
+    /// The capture's `--exclude-module` records and inputs, for inventory
+    /// presentation (which renders from the coordinator, not from this
+    /// engine's projected `DiscoveryEvidence`).
+    pub(crate) fn budget_excluded_snapshot(
+        &self,
+    ) -> (
+        &[crate::discovery::scan::ExcludedRecord],
+        &[std::path::PathBuf],
+    ) {
+        (self.budget.excluded(), self.budget.excludes())
     }
 
     /// Cancels every pre-arm watch at scope end (packet 6.13, R2-D1-7):

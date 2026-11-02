@@ -671,6 +671,7 @@ fn run_public_selection(
         modules,
         &[],
         &[],
+        &[],
         &HookRegistry::builtin(),
         true,
         Some(2),

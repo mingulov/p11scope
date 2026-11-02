@@ -688,6 +688,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         scope: Scope,
         hooks: HookRegistry,
         hints: Vec<PathBuf>,
+        excludes: Vec<PathBuf>,
         source: Source,
         registry_limits: RegistryLimits,
     ) -> Result<Self> {
@@ -695,6 +696,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             scope,
             hooks,
             hints,
+            excludes,
             source,
             registry_limits,
             crate::capacity::inventory_endpoint_budget(None).map_err(anyhow::Error::msg)?,
@@ -707,6 +709,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         scope: Scope,
         hooks: HookRegistry,
         hints: Vec<PathBuf>,
+        excludes: Vec<PathBuf>,
         source: Source,
         registry_limits: RegistryLimits,
         endpoint_budget: InventoryBudget,
@@ -721,7 +724,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // registry's caller cap stands behind it as a backstop.
         adapter.set_max_callers(registry_limits.max_callers);
         Ok(Self {
-            engine: Engine::inventory(inventory_config(endpoint_budget)?, scope, hooks, hints)?,
+            engine: Engine::inventory(
+                inventory_config(endpoint_budget)?,
+                scope,
+                hooks,
+                hints,
+                excludes,
+            )?,
             collected_finish_progressed: false,
             promotion_finish: false,
             promotion_records_discarded: 0,
@@ -1936,6 +1945,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     pub(crate) fn registry(&self) -> &CallerRegistry {
         &self.registry
+    }
+
+    /// The capture's `--exclude-module` report rows plus the inputs that
+    /// matched nothing, aggregated from the engine budget's per-(pid, file)
+    /// records. A declared operator choice, never a loss.
+    pub(crate) fn excluded_snapshot(&self) -> (Vec<crate::render::ExcludedOut>, Vec<String>) {
+        let (records, excludes) = self.engine.budget_excluded_snapshot();
+        crate::render::aggregate_excluded(records, excludes)
     }
 
     /// Observe the actual engine tail attempts without adding counters or
@@ -10014,6 +10031,7 @@ pub(crate) mod tests {
             Scope::Pid(std::process::id()),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -10309,6 +10327,7 @@ pub(crate) mod tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             RefusingSharedCustodySource {
                 attempted: attempted.clone(),
             },
@@ -10374,6 +10393,7 @@ pub(crate) mod tests {
             crate::scope::cgroup(dir).unwrap(),
             HookRegistry::builtin(),
             providers,
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -10390,6 +10410,7 @@ pub(crate) mod tests {
                 Scope::Pid(pid),
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
             )
@@ -10405,6 +10426,7 @@ pub(crate) mod tests {
                 Scope::Pid(std::process::id()),
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
                 budget,
@@ -10454,6 +10476,7 @@ pub(crate) mod tests {
                 Scope::Pid(std::process::id()),
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
                 crate::capacity::inventory_endpoint_budget(None).unwrap(),
@@ -11339,6 +11362,7 @@ pub(crate) mod tests {
             Scope::Pid(std::process::id()),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             scene.source.clone(),
             RegistryLimits::default_limits(),
             budget,
@@ -11560,6 +11584,7 @@ pub(crate) mod tests {
                 scope,
                 HookRegistry::builtin(),
                 vec![self.provider.clone()],
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
                 crate::capacity::InventoryBudget::new(32, 256).unwrap(),
@@ -11696,6 +11721,7 @@ pub(crate) mod tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             vec![fixture.provider.clone()],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
             crate::capacity::InventoryBudget::new(256, 2048).unwrap(),
@@ -12049,6 +12075,7 @@ pub(crate) mod tests {
             Scope::System,
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -12164,6 +12191,7 @@ pub(crate) mod tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             vec![group.program.clone()],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -12348,6 +12376,7 @@ pub(crate) mod tests {
             Scope::System,
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -12492,6 +12521,7 @@ pub(crate) mod tests {
             Scope::Pid(driver_pid),
             HookRegistry::builtin(),
             vec![provider.clone()],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -12625,6 +12655,7 @@ pub(crate) mod tests {
             Scope::Pid(driver_pid),
             HookRegistry::builtin(),
             vec![provider.clone()],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -12892,6 +12923,7 @@ pub(crate) mod tests {
                 scope,
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
             )
@@ -13487,6 +13519,7 @@ pub(crate) mod tests {
                 Scope::Pid(std::process::id()),
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 source.clone(),
                 RegistryLimits::default_limits(),
             )
@@ -13874,6 +13907,7 @@ pub(crate) mod tests {
             crate::scope::cgroup(fixture.path()).unwrap(),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             crate::discovery::caller_registry::OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -14034,6 +14068,7 @@ pub(crate) mod tests {
             crate::scope::cgroup(dir.path()).unwrap(),
             HookRegistry::builtin(),
             vec![provider],
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -14906,6 +14941,7 @@ exit 0
             crate::scope::cgroup(fixture.path()).unwrap(),
             HookRegistry::builtin(),
             vec![fixture.path().join("scoped-provider.so")],
+            vec![],
             source,
             RegistryLimits::default_limits(),
         )
@@ -21650,6 +21686,7 @@ exit 0
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -21854,6 +21891,7 @@ exit 0
             Scope::Pid(self_pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -23842,6 +23880,7 @@ exit 0
             crate::scope::cgroup(fixture.path()).unwrap(),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             crate::discovery::caller_registry::OsProcessSource,
             RegistryLimits::default_limits(),
         )

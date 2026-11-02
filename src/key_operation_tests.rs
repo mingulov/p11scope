@@ -16640,6 +16640,7 @@ fn joint_capture_owner_commit_batch_stages_into_owned_ledger() {
         crate::attach::Scope::Pid(std::process::id()),
         crate::discovery::hooks::HookRegistry::builtin(),
         Vec::new(),
+        vec![],
         crate::discovery::caller_registry::OsProcessSource,
         RegistryLimits::new(8, 8, 8, 8, 8, 8).expect("generous limits"),
     )
@@ -16844,6 +16845,7 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
                 crate::attach::Scope::Pid(std::process::id()),
                 crate::discovery::hooks::HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::new(16, 16, 16, 1024, 1024, 16).expect("generous limits"),
             )
@@ -17294,6 +17296,7 @@ fn joint_capture_owner_commit_batch_below_prepay_refuses_full_gracefully() {
                 crate::attach::Scope::Pid(std::process::id()),
                 crate::discovery::hooks::HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::new(16, 16, 16, 1024, 1024, 16).expect("generous limits"),
             )
@@ -17808,6 +17811,7 @@ fn joint_capture_owner_seal_replay_resource_refusal_disposes_head_keeps_joint() 
                 crate::attach::Scope::Pid(std::process::id()),
                 crate::discovery::hooks::HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::new(16, 16, 16, 1024, 1024, 16).expect("generous limits"),
             )

@@ -29,6 +29,10 @@ pub struct CaptureArgs {
     pub kind: Kind,
     /// `--module` hints; empty ⇒ discover every PKCS#11-looking object in scope.
     pub modules: Vec<PathBuf>,
+    /// `--exclude-module` inputs; empty ⇒ exclude nothing. Repeatable.
+    /// A full path (contains `/`) excludes exactly that file by identity;
+    /// a bare name excludes every file with that basename or ELF soname.
+    pub exclude_modules: Vec<PathBuf>,
     /// `--manifest` inputs; empty ⇒ scan only. Repeatable (spec §4.6).
     pub manifests: Vec<PathBuf>,
     /// `--prearm-module` inputs (packet 6.13): provider files to pin and
@@ -84,6 +88,7 @@ pub struct RunArgs {
     /// `--trace` selects `Kind::Trace`; otherwise this is a profile capture.
     pub kind: Kind,
     pub modules: Vec<PathBuf>,
+    pub exclude_modules: Vec<PathBuf>,
     pub manifests: Vec<PathBuf>,
     /// `--prearm-module` inputs (packet 6.13); see `CaptureArgs`.
     pub prearm_modules: Vec<PathBuf>,
@@ -145,6 +150,7 @@ impl From<InspectScope> for ScopeArg {
 pub struct InspectArgs {
     pub scope: InspectScope,
     pub modules: Vec<PathBuf>,
+    pub exclude_modules: Vec<PathBuf>,
     pub hooks: HookRegistry,
     pub json: bool,
     /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 256 default.
@@ -168,6 +174,7 @@ pub struct DoctorArgs {
 pub struct InventoryArgs {
     pub scope: ScopeArg,
     pub modules: Vec<PathBuf>,
+    pub exclude_modules: Vec<PathBuf>,
     /// Explicit operator inputs for the optional Detailed subset; repeatable.
     pub manifests: Vec<PathBuf>,
     /// `--prearm-module` inputs (packet 6.13); see `CaptureArgs`. Refused
@@ -404,7 +411,7 @@ Use p11scope <command> --help for examples and mode-specific guidance.
 
 usage:
   p11scope --version
-  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
                    [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
@@ -420,17 +427,17 @@ usage:
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--track-short-lived]
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
-  p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
-  p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inspect --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json]
+  p11scope inspect --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
---module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
+--module narrows the scan to named providers. --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots. A full path excludes exactly that file by identity; a bare name excludes every file with that basename or ELF soname. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
@@ -480,7 +487,7 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 ";
 /// `p11scope profile --help`: scoped syntax, examples and evidence limits.
 const PROFILE_HELP: &str = "usage:
-  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
                    [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
@@ -496,6 +503,7 @@ examples (4242 is an example PID, not a detected target):
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
+--exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
@@ -526,6 +534,7 @@ example (4242 is an example PID, not a detected target):
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
+--exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
@@ -548,6 +557,7 @@ example (replace the example program path with your command):
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
+--exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
@@ -569,14 +579,15 @@ Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
 
 /// `p11scope inspect --help`: scoped syntax, examples and evidence limits.
 const INSPECT_HELP: &str = "usage:
-  p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
-  p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
+  p11scope inspect --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json]
+  p11scope inspect --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
 
 example (4242 is an example PID, not a detected target):
   p11scope inspect --pid 4242 --json
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
+--exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 Inspect reports mapped providers and discovery evidence; a mapping does not prove a call.
 Choose --pid or --system. --json preserves the same discovery facts for scripts.
 Unreadable or unexamined identities remain unknown.
@@ -596,9 +607,9 @@ Without --pid or --cgroup, target readiness is unassessed.
 
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
 
 example (4242 is an example PID, not a detected target):
@@ -611,6 +622,7 @@ Choose exactly one of --pid, --cgroup, or --system; --cgroup includes descendant
 Quiet cgroup usage remains unknown: endpoint samples do not prove continuous membership.
 Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, not the cgroup tree.
 --module narrows the scan to named providers.
+--exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is repeatable explicit operator attestation for the optional Detailed subset; requires auto or native.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and attaches proved offsets through the inventory lane, with one interval row per input in `prearm[]`; requires auto or native.
 --key-operations opts in to per-key tracking through a linked journal session (default off); requires --capture auto or native, and a build with the journal object.
@@ -687,6 +699,68 @@ fn require_path(
     Ok(PathBuf::from(value))
 }
 
+/// Validate `--exclude-module` inputs at startup (after parsing, before
+/// discovery, so usage errors exit 2 with the command's hint).
+/// - A full path (contains `/`) must exist (follow symlinks, like `--module`);
+///   otherwise a named usage error. Bare names need no existence: they match
+///   every copy by file name or ELF soname, including container and snap copies
+///   the observer never opens directly.
+/// - `--module X` with a matching `--exclude-module` is refused with a named
+///   error (exact string, same file identity, or bare-name basename match).
+///   Bare-name soname conflicts surface during discovery where the target file
+///   is open and its soname is read.
+pub fn validate_excludes(modules: &[PathBuf], excludes: &[PathBuf]) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let is_path = |p: &PathBuf| p.as_os_str().as_bytes().contains(&b'/');
+    for exclude in excludes {
+        if is_path(exclude) {
+            std::fs::metadata(exclude).map_err(|error| {
+                format!(
+                    "--exclude-module {} does not exist: {error}",
+                    exclude.display()
+                )
+            })?;
+        }
+    }
+    for module in modules {
+        for exclude in excludes {
+            if module == exclude {
+                return Err(format!(
+                    "--module {} and --exclude-module {} name the same input; refusing a module that is both included and excluded",
+                    module.display(),
+                    exclude.display()
+                ));
+            }
+            if is_path(module)
+                && is_path(exclude)
+                && let (Ok(left), Ok(right)) =
+                    (std::fs::metadata(module), std::fs::metadata(exclude))
+                && (left.dev(), left.ino()) == (right.dev(), right.ino())
+            {
+                return Err(format!(
+                    "--module {} and --exclude-module {} are the same file (device {} inode {}); refusing a module that is both included and excluded",
+                    module.display(),
+                    exclude.display(),
+                    left.dev(),
+                    left.ino()
+                ));
+            }
+            if !is_path(exclude)
+                && let Some(base) = module.file_name()
+                && base == exclude.as_os_str()
+            {
+                return Err(format!(
+                    "--module {} is matched by --exclude-module {} (file name); refusing a module that is both included and excluded",
+                    module.display(),
+                    exclude.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Flags and subcommands are matched as text; a non-UTF-8 word can never
 /// equal one, so its lossy form is only ever shown in an "unknown" refusal.
 fn word(arg: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
@@ -752,6 +826,7 @@ fn run_unknown_arg(arg: &str) -> CliError {
 #[derive(Debug, Default)]
 struct Common {
     modules: Vec<PathBuf>,
+    exclude_modules: Vec<PathBuf>,
     manifests: Vec<PathBuf>,
     prearm_modules: Vec<PathBuf>,
     hooks: HookRegistry,
@@ -813,6 +888,9 @@ fn capture_option(
 ) -> Result<bool, CliError> {
     match arg {
         "--module" => common.modules.push(require_path(args, "--module")?),
+        "--exclude-module" => common
+            .exclude_modules
+            .push(require_path(args, "--exclude-module")?),
         "--manifest" => common.manifests.push(require_path(args, "--manifest")?),
         "--prearm-module" => common
             .prearm_modules
@@ -1005,6 +1083,7 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
     let mut pid: Option<u32> = None;
     let mut system = false;
     let mut modules = Vec::new();
+    let mut exclude_modules = Vec::new();
     let mut hooks = HookRegistry::builtin();
     let mut json = false;
     let mut max_scan_pids: Option<usize> = None;
@@ -1019,6 +1098,9 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
             }
             "--system" => system = true,
             "--module" => modules.push(require_path(&mut args, "--module")?),
+            "--exclude-module" => {
+                exclude_modules.push(require_path(&mut args, "--exclude-module")?)
+            }
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--json" => json = true,
             "--max-scan-pids" => {
@@ -1049,6 +1131,7 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
     Ok(InspectArgs {
         scope,
         modules,
+        exclude_modules,
         hooks,
         json,
         max_scan_pids,
@@ -1136,6 +1219,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut cgroup: Option<PathBuf> = None;
     let mut system = false;
     let mut modules = Vec::new();
+    let mut exclude_modules = Vec::new();
     let mut manifests = Vec::new();
     let mut prearm_modules = Vec::new();
     let mut key_operations = false;
@@ -1219,6 +1303,9 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             }
             "--system" => system = true,
             "--module" => modules.push(require_path(&mut args, "--module")?),
+            "--exclude-module" => {
+                exclude_modules.push(require_path(&mut args, "--exclude-module")?)
+            }
             "--manifest" => manifests.push(require_path(&mut args, "--manifest")?),
             "--prearm-module" => prearm_modules.push(require_path(&mut args, "--prearm-module")?),
             "--key-operations" => key_operations = true,
@@ -1409,6 +1496,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     Ok(InventoryArgs {
         scope,
         modules,
+        exclude_modules,
         manifests,
         prearm_modules,
         key_operations,
@@ -1539,6 +1627,7 @@ pub fn parse_capture(
     Ok(CaptureArgs {
         kind,
         modules: common.modules,
+        exclude_modules: common.exclude_modules,
         manifests: common.manifests,
         prearm_modules: common.prearm_modules,
         hooks: common.hooks,
@@ -1627,6 +1716,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
     Ok(RunArgs {
         kind,
         modules: common.modules,
+        exclude_modules: common.exclude_modules,
         manifests: common.manifests,
         prearm_modules: common.prearm_modules,
         hooks: common.hooks,
@@ -4241,14 +4331,15 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        // 9317 / 0xdfb3f736aedb0b7f (exit-only split, merged over
-        // inventory `--key-operations`): the known-issue clause is gone,
-        // restoring the pre-disclosure bytes exactly. USAGE diff vs the
-        // 9463/0xa3f823915c8b8ba7 pin is exactly that removal with its
-        // line wrap restored; no other drift. Pair measured by the
-        // usage-pin extractor, which reproduces the 8794, 8851 and 9060 pins.
-        assert_eq!(USAGE.len(), 9317);
-        assert_eq!(hash, 0xdfb3f736aedb0b7f);
+        // 9807 / 0xdce0388309268c5c (`--exclude-module` merged over
+        // inventory `--key-operations`): USAGE diff vs the
+        // 9317/0xdfb3f736aedb0b7f pin is exactly the lane's +490
+        // `--exclude-module <path-or-name>` synopsis insertions (6
+        // sites: profile, inspect x2, inventory x3) + the exclusion
+        // paragraph extension; no other drift. Pair measured by the
+        // usage-pin extractor, which reproduces the 9317 and 9284 pins.
+        assert_eq!(USAGE.len(), 9807);
+        assert_eq!(hash, 0xdce0388309268c5c);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

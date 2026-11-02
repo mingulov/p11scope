@@ -6,7 +6,7 @@ use crate::attach::CapturePolicy;
 use crate::discovery::elf_needed::{
     GapExeHints, STATIC_HINT_LABEL, STATIC_HINT_SCOPE_D_TRANSITIVE,
 };
-use crate::discovery::scan::Skipped;
+use crate::discovery::scan::{ExcludedRecord, Skipped};
 use crate::kinds;
 use crate::mechanism_names::mechanism_name;
 use crate::metrics::{SlotReport, percentile_ns};
@@ -649,6 +649,17 @@ pub struct DiscoveryEvidence {
     /// `Some("ptrace")` when the memory scan could not run.
     pub scan_unavailable: Option<String>,
     pub scan_ms: u64,
+    /// Files skipped by `--exclude-module`, one record per distinct file
+    /// (device + inode) with the number of in-scope processes that mapped
+    /// it. A declared operator choice, never a loss: excluded files get no
+    /// probes and use no slots, and the rest of the capture can still be
+    /// `exact`. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_modules: Vec<ExcludedOut>,
+    /// `--exclude-module` inputs that matched no mapped file. Omitted when
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_excludes: Vec<String>,
     /// 6.14 Option A exit-time mapping split, `None` unless extensive
     /// mode armed. Serde-skipped carrier: the profile lane hoists it to
     /// the top-level `gap_exit_mappings` key in `versioned_evidence`;
@@ -672,6 +683,58 @@ pub struct GapExitMappings {
     pub unknown: u64,
 }
 
+/// One `--exclude-module` hit for the report: the file's target-view path,
+/// its fstat identity, and how many in-scope processes mapped it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExcludedOut {
+    pub path: String,
+    pub dev: u64,
+    pub ino: u64,
+    pub processes: usize,
+}
+
+/// Aggregate per-(pid, file) exclusion records into per-file report rows
+/// plus the inputs that matched nothing. Files group by (device, inode);
+/// processes counts distinct pids; rows sort by path for stable output.
+/// Unmatched inputs keep operator order.
+pub(crate) fn aggregate_excluded(
+    records: &[ExcludedRecord],
+    excludes: &[std::path::PathBuf],
+) -> (Vec<ExcludedOut>, Vec<String>) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_file: BTreeMap<(u64, u64), (String, BTreeSet<u32>)> = BTreeMap::new();
+    let mut matched: BTreeSet<&std::path::PathBuf> = BTreeSet::new();
+    for record in records {
+        matched.insert(&record.via);
+        by_file
+            .entry((record.dev, record.ino))
+            .and_modify(|(_, pids)| {
+                pids.insert(record.pid);
+            })
+            .or_insert_with(|| {
+                let mut pids = BTreeSet::new();
+                pids.insert(record.pid);
+                (record.path.clone(), pids)
+            });
+    }
+    let mut excluded: Vec<ExcludedOut> = by_file
+        .into_iter()
+        .map(|((dev, ino), (path, pids))| ExcludedOut {
+            path,
+            dev,
+            ino,
+            processes: pids.len(),
+        })
+        .collect();
+    excluded.sort_by(|a, b| a.path.cmp(&b.path));
+    let unmatched: Vec<String> = excludes
+        .iter()
+        .filter(|input| !matched.contains(*input))
+        .map(|input| input.display().to_string())
+        .collect();
+    (excluded, unmatched)
+}
+
 impl Default for DiscoveryEvidence {
     fn default() -> Self {
         Self {
@@ -685,6 +748,8 @@ impl Default for DiscoveryEvidence {
             manifest_object_fallbacks: Vec::new(),
             scan_unavailable: None,
             scan_ms: 0,
+            excluded_modules: Vec::new(),
+            unmatched_excludes: Vec::new(),
             gap_exit_mappings: None,
         }
     }
@@ -1966,6 +2031,40 @@ fn module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
     out
 }
 
+/// Files the operator excluded with `--exclude-module`, never silent: each
+/// with its path, identity, and mapping process count, plus any inputs that
+/// matched nothing. A declared choice, not a loss — calls into excluded
+/// files were not observed, and the rest of the capture can still be exact.
+fn excluded_lines(ev: &Evidence) -> String {
+    let mut out = String::new();
+    let total = ev.discovery.excluded_modules.len();
+    if total > 0 {
+        out.push_str(&format!("Excluded by you ({total} files):\n"));
+        for excluded in &ev.discovery.excluded_modules {
+            out.push_str(&format!(
+                "  {}: excluded by you (device {} inode {}, {} processes mapped it); calls into this file were not observed\n",
+                escape_controls(&excluded.path),
+                excluded.dev,
+                excluded.ino,
+                excluded.processes
+            ));
+        }
+    }
+    if !ev.discovery.unmatched_excludes.is_empty() {
+        out.push_str(&format!(
+            "Unmatched exclusions ({}): {}\n",
+            ev.discovery.unmatched_excludes.len(),
+            ev.discovery
+                .unmatched_excludes
+                .iter()
+                .map(|input| escape_controls(input))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out
+}
+
 /// One named gap line's body: the status, the planner's reason, and the
 /// hint. A refused proxy layer points at the attached providers that count
 /// its forwarded calls; a prefix-admitted proxy layer names its covered
@@ -2083,6 +2182,7 @@ pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> Stri
         );
     }
     text.push_str(&module_gap_lines(ev, reports));
+    text.push_str(&excluded_lines(ev));
     for (has_owner_gap, total, description) in [
         (
             reports.iter().any(|row| row.module_ambiguous),
@@ -6098,6 +6198,78 @@ pub(crate) mod tests {
         );
         assert!(text.contains("4 of 64 template tables attached"), "{text}");
         assert!(!text.contains("--module"), "{text}");
+    }
+
+    /// `--exclude-module` files are listed as "excluded by you" with path,
+    /// identity, and process count, plus unmatched inputs; a capture whose
+    /// only skips are excluded stays exact.
+    #[test]
+    fn scope_summary_lists_excluded_modules_and_unmatched_inputs() {
+        let mut ev = evidence();
+        ev.discovery.excluded_modules.push(ExcludedOut {
+            path: "/opt/libp11-kit.so.0.4.8".into(),
+            dev: 42,
+            ino: 1001,
+            processes: 3,
+        });
+        ev.discovery.unmatched_excludes.push("nope.so".into());
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("Excluded by you (1 files):"), "{text}");
+        assert!(
+            text.contains("/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 3 processes mapped it)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("calls into this file were not observed"),
+            "{text}"
+        );
+        assert!(text.contains("Unmatched exclusions (1): nope.so"), "{text}");
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json["excluded_modules"][0]["path"],
+            "/opt/libp11-kit.so.0.4.8"
+        );
+        assert_eq!(json["excluded_modules"][0]["processes"], 3);
+        assert_eq!(json["unmatched_excludes"][0], "nope.so");
+    }
+
+    #[test]
+    fn aggregate_excluded_groups_by_file_and_names_unmatched_inputs() {
+        use crate::discovery::scan::ExcludedRecord;
+        use std::path::PathBuf;
+        let records = vec![
+            ExcludedRecord {
+                pid: 10,
+                path: "/opt/liba.so".into(),
+                dev: 7,
+                ino: 100,
+                via: PathBuf::from("liba.so"),
+            },
+            ExcludedRecord {
+                pid: 11,
+                path: "/opt/liba.so".into(),
+                dev: 7,
+                ino: 100,
+                via: PathBuf::from("liba.so"),
+            },
+            ExcludedRecord {
+                pid: 10,
+                path: "/snap/liba.so".into(),
+                dev: 8,
+                ino: 200,
+                via: PathBuf::from("liba.so"),
+            },
+        ];
+        let excludes = vec![PathBuf::from("liba.so"), PathBuf::from("nope.so")];
+        let (excluded, unmatched) = aggregate_excluded(&records, &excludes);
+        assert_eq!(excluded.len(), 2);
+        assert_eq!(excluded[0].path, "/opt/liba.so");
+        assert_eq!(excluded[0].processes, 2);
+        assert_eq!(excluded[1].path, "/snap/liba.so");
+        assert_eq!(excluded[1].processes, 1);
+        assert_eq!(unmatched, vec!["nope.so".to_string()]);
     }
 
     /// A refused closure array with nothing captured below it says so: its

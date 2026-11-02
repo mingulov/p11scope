@@ -349,6 +349,7 @@ fn pid_coordinator(pid: u32, module: &Path) -> Result<InventoryCoordinator<OsPro
         Scope::Pid(pid),
         HookRegistry::builtin(),
         vec![module.to_path_buf()],
+        vec![],
         OsProcessSource,
         RegistryLimits::default_limits(),
     )
@@ -3707,6 +3708,7 @@ fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
         engine_scope,
         HookRegistry::builtin(),
         providers.clone(),
+        vec![],
         OsProcessSource,
         RegistryLimits::default_limits(),
     )?;
@@ -4745,6 +4747,7 @@ fn system_joint_coordinator(modules: &[PathBuf]) -> Result<InventoryCoordinator<
         Scope::System,
         HookRegistry::builtin(),
         modules.to_vec(),
+        vec![],
         OsProcessSource,
         RegistryLimits::default_limits(),
     )

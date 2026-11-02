@@ -51,6 +51,7 @@ fn engine_initial_discovery_preserves_plan() {
         track_short_lived: false,
         kind: Kind::Profile,
         modules: vec![provider],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),

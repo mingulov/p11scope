@@ -60,6 +60,8 @@ pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> S
         outcome,
         pinned,
         &InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
+        &[],
+        &[],
     )
 }
 
@@ -68,6 +70,8 @@ fn render_text_with_application(
     outcome: &ScanOutcome,
     pinned: &PinnedObjects,
     application: &InspectApplicationResult,
+    excluded: &[crate::render::ExcludedOut],
+    unmatched: &[String],
 ) -> String {
     let modules = outcome.modules();
     let word = if modules.len() == 1 {
@@ -124,6 +128,31 @@ fn render_text_with_application(
             "skipped: {} — {}",
             crate::render::escape_controls(&skipped.subject),
             crate::render::escape_controls(&skipped.reason)
+        );
+    }
+    if !excluded.is_empty() {
+        let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
+        for item in excluded {
+            let _ = writeln!(
+                out,
+                "  {}: excluded by you (device {} inode {}, {} processes mapped it); calls into this file were not observed",
+                crate::render::escape_controls(&item.path),
+                item.dev,
+                item.ino,
+                item.processes
+            );
+        }
+    }
+    if !unmatched.is_empty() {
+        let _ = writeln!(
+            out,
+            "Unmatched exclusions ({}): {}",
+            unmatched.len(),
+            unmatched
+                .iter()
+                .map(|input| crate::render::escape_controls(input))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     out
@@ -216,6 +245,8 @@ pub fn render_json(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> s
         outcome,
         pinned,
         &InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
+        &[],
+        &[],
     )
 }
 
@@ -224,6 +255,8 @@ fn render_json_with_application(
     outcome: &ScanOutcome,
     pinned: &PinnedObjects,
     application: &InspectApplicationResult,
+    excluded: &[crate::render::ExcludedOut],
+    unmatched: &[String],
 ) -> serde_json::Value {
     let scan = match outcome {
         ScanOutcome::Scanned { scan_ms, .. } => {
@@ -244,7 +277,7 @@ fn render_json_with_application(
         .map(|s| serde_json::json!({ "subject": s.subject, "reason": s.reason }))
         .collect();
     let mut application = application_json(application);
-    serde_json::json!({
+    let mut document = serde_json::json!({
         "schema": DOC_ID,
         "pid": pid,
         "application": application["application"].take(),
@@ -252,7 +285,14 @@ fn render_json_with_application(
         "scan": scan,
         "modules": modules,
         "skipped": skipped,
-    })
+    });
+    if !excluded.is_empty() {
+        document["excluded_modules"] = serde_json::to_value(excluded).unwrap_or_default();
+    }
+    if !unmatched.is_empty() {
+        document["unmatched_excludes"] = serde_json::to_value(unmatched).unwrap_or_default();
+    }
+    document
 }
 
 fn module_json(module: &ScannedModule, pinned: &PinnedObjects) -> serde_json::Value {
@@ -395,16 +435,22 @@ impl InspectImageReader for (ProcessViewImageReader<'_>, CaptureWorkBudget) {
 pub fn run(
     scope: crate::cli::InspectScope,
     hints: &[PathBuf],
+    excludes: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
 ) -> Result<i32> {
     match scope {
-        crate::cli::InspectScope::Pid(pid) => {
-            run_with_writer(pid, hints, hooks, json, &mut std::io::stdout().lock())
-        }
+        crate::cli::InspectScope::Pid(pid) => run_with_writer(
+            pid,
+            hints,
+            excludes,
+            hooks,
+            json,
+            &mut std::io::stdout().lock(),
+        ),
         crate::cli::InspectScope::System => {
-            crate::inspect_system::run(hints, hooks, json, max_scan_pids)
+            crate::inspect_system::run(hints, excludes, hooks, json, max_scan_pids)
         }
     }
 }
@@ -412,6 +458,7 @@ pub fn run(
 fn run_with_writer(
     pid: u32,
     hints: &[PathBuf],
+    excludes: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     out: &mut dyn std::io::Write,
@@ -419,6 +466,7 @@ fn run_with_writer(
     run_with_view(
         pid,
         hints,
+        excludes,
         hooks,
         json,
         out,
@@ -429,16 +477,16 @@ fn run_with_writer(
 fn run_with_view(
     pid: u32,
     hints: &[PathBuf],
+    excludes: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     out: &mut dyn std::io::Write,
     view: Result<ProcessView, String>,
 ) -> Result<i32> {
     let view = view.map_err(|reason| unreadable_target_error(pid, &reason))?;
-    let mut context = (
-        ProcessViewImageReader::new(&view),
-        CaptureWorkBudget::default(),
-    );
+    let mut budget = CaptureWorkBudget::default();
+    budget.set_excludes(excludes.to_vec());
+    let mut context = (ProcessViewImageReader::new(&view), budget);
     let result = scan_and_pin_application_with(
         &mut context,
         |context| context.0.view().still_the_same(),
@@ -453,7 +501,9 @@ fn run_with_view(
             pin_scanned_view_objects(context.0.view(), outcome.modules(), &mut context.1)
         },
     );
-    emit_application_diagnosis(pid, json, out, result)
+    let (excluded, unmatched) =
+        crate::render::aggregate_excluded(context.1.excluded(), context.1.excludes());
+    emit_application_diagnosis(pid, json, out, result, &excluded, &unmatched)
 }
 
 /// Renders a finished — or failed — diagnosis to `out`. Pure over the
@@ -481,6 +531,8 @@ fn emit_diagnosis(
                 InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
             )
         }),
+        &[],
+        &[],
     )
 }
 
@@ -495,6 +547,8 @@ fn emit_application_diagnosis(
     json: bool,
     out: &mut dyn std::io::Write,
     result: Result<ApplicationDiagnosis, String>,
+    excluded: &[crate::render::ExcludedOut],
+    unmatched: &[String],
 ) -> Result<i32> {
     let (outcome, (pinned, pin_skips), application) = match result {
         Ok(result) => result,
@@ -522,13 +576,15 @@ fn emit_application_diagnosis(
             &outcome,
             &pinned,
             &application,
+            excluded,
+            unmatched,
         ))?;
         writeln!(out, "{document}")?;
     } else {
         write!(
             out,
             "{}",
-            render_text_with_application(pid, &outcome, &pinned, &application)
+            render_text_with_application(pid, &outcome, &pinned, &application, excluded, unmatched)
         )?;
     }
     Ok(0)
@@ -677,6 +733,7 @@ mod tests {
             let error = run_with_view(
                 1379,
                 &[],
+                &[],
                 &HookRegistry::builtin(),
                 json,
                 &mut stdout,
@@ -755,8 +812,15 @@ mod tests {
     #[test]
     fn hard_errors_write_nothing_to_stdout() {
         let mut stdout = Vec::new();
-        let error = run_with_writer(u32::MAX, &[], &HookRegistry::builtin(), true, &mut stdout)
-            .unwrap_err();
+        let error = run_with_writer(
+            u32::MAX,
+            &[],
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            &mut stdout,
+        )
+        .unwrap_err();
         assert!(stdout.is_empty(), "hard errors must not touch stdout");
         assert!(!format!("{error:#}").is_empty());
     }
@@ -770,7 +834,8 @@ mod tests {
             crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
         let mut stdout = Vec::new();
         let pid = child.id();
-        let code = run_with_writer(pid, &[], &HookRegistry::builtin(), true, &mut stdout).unwrap();
+        let code =
+            run_with_writer(pid, &[], &[], &HookRegistry::builtin(), true, &mut stdout).unwrap();
         assert_eq!(code, 0);
         let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
         assert_eq!(document["schema"], DOC_ID);
@@ -893,6 +958,45 @@ mod tests {
             skipped: vec![],
             scan_ms: 3,
         }
+    }
+
+    #[test]
+    fn text_and_json_list_excluded_modules_and_unmatched_inputs() {
+        let application = InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined);
+        let excluded = vec![crate::render::ExcludedOut {
+            path: "/opt/libp11-kit.so.0.4.8".into(),
+            dev: 42,
+            ino: 1001,
+            processes: 2,
+        }];
+        let unmatched = vec!["nope.so".to_string()];
+        let out = render_text_with_application(
+            4242,
+            &sample(),
+            &PinnedObjects::empty(),
+            &application,
+            &excluded,
+            &unmatched,
+        );
+        assert!(out.contains("Excluded by you (1 files):"), "{out}");
+        assert!(
+            out.contains("/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 2 processes mapped it)"),
+            "{out}"
+        );
+        assert!(out.contains("Unmatched exclusions (1): nope.so"), "{out}");
+        let value = render_json_with_application(
+            4242,
+            &sample(),
+            &PinnedObjects::empty(),
+            &application,
+            &excluded,
+            &unmatched,
+        );
+        assert_eq!(
+            value["excluded_modules"][0]["path"],
+            "/opt/libp11-kit.so.0.4.8"
+        );
+        assert_eq!(value["unmatched_excludes"][0], "nope.so");
     }
 
     #[test]
@@ -1100,14 +1204,23 @@ mod tests {
                     outcome.clone(),
                     (PinnedObjects::empty(), Vec::new()),
                     application.clone()
-                ))
+                )),
+                &[],
+                &[]
             )
             .unwrap(),
             0
         );
         assert_eq!(
-            emit_application_diagnosis(4242, false, &mut text, Ok((outcome, pins, application)))
-                .unwrap(),
+            emit_application_diagnosis(
+                4242,
+                false,
+                &mut text,
+                Ok((outcome, pins, application)),
+                &[],
+                &[]
+            )
+            .unwrap(),
             0
         );
         (
@@ -1189,7 +1302,7 @@ mod tests {
             crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
         let pid = child.id();
         let mut bytes = Vec::new();
-        run_with_writer(pid, &[], &HookRegistry::builtin(), true, &mut bytes).unwrap();
+        run_with_writer(pid, &[], &[], &HookRegistry::builtin(), true, &mut bytes).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let expected = std::fs::read_link(format!("/proc/{pid}/exe"))
             .unwrap()
@@ -1230,7 +1343,7 @@ mod tests {
         );
         let mut bytes = Vec::new();
         assert_eq!(
-            emit_application_diagnosis(4242, true, &mut bytes, result).unwrap(),
+            emit_application_diagnosis(4242, true, &mut bytes, result, &[], &[]).unwrap(),
             0
         );
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -1256,7 +1369,7 @@ mod tests {
         );
         let mut bytes = Vec::new();
         assert_eq!(
-            emit_application_diagnosis(4242, true, &mut bytes, result).unwrap(),
+            emit_application_diagnosis(4242, true, &mut bytes, result, &[], &[]).unwrap(),
             0
         );
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -1309,7 +1422,9 @@ mod tests {
                         outcome.clone(),
                         (PinnedObjects::empty(), skips.clone()),
                         application.clone(),
-                    ))
+                    )),
+                    &[],
+                    &[]
                 )
                 .unwrap(),
                 0
@@ -1319,7 +1434,9 @@ mod tests {
                     view.pid(),
                     false,
                     &mut text,
-                    Ok((outcome, (pins, skips), application))
+                    Ok((outcome, (pins, skips), application)),
+                    &[],
+                    &[]
                 )
                 .unwrap(),
                 0

@@ -288,6 +288,7 @@ impl Engine {
         scope: Scope,
         hooks: HookRegistry,
         module_hints: Vec<PathBuf>,
+        excludes: Vec<PathBuf>,
     ) -> Result<Self> {
         let mut engine = Self::empty();
         engine.plan = plan::AttachPlan::from_slots_with_policy(
@@ -296,6 +297,7 @@ impl Engine {
         )
         .map_err(anyhow::Error::msg)?;
         engine.budget = CaptureWorkBudget::for_inventory(config.work);
+        engine.budget.set_excludes(excludes);
         engine.inventory = Some(InventoryState::new(config));
         engine.scope = scope;
         engine.hooks = hooks;

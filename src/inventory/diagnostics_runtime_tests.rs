@@ -55,6 +55,7 @@ fn coordinator() -> InventoryCoordinator<OsProcessSource> {
         Scope::Pid(std::process::id()),
         HookRegistry::builtin(),
         Vec::new(),
+        vec![],
         OsProcessSource,
         RegistryLimits::default_limits(),
     )

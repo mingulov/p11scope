@@ -84,12 +84,14 @@ pub(crate) const COUNT_MANIFEST_NOTE: &str =
 /// objects); a fully-unreadable machine is a hard error like pid-inspect.
 pub fn run(
     hints: &[PathBuf],
+    excludes: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
 ) -> Result<i32> {
     run_with_writer(
         hints,
+        excludes,
         hooks,
         json,
         max_scan_pids,
@@ -99,12 +101,19 @@ pub fn run(
 
 fn run_with_writer(
     hints: &[PathBuf],
+    excludes: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
     out: &mut dyn std::io::Write,
 ) -> Result<i32> {
-    let catalog = collect(hints, hooks, max_scan_pids, AdmissionPolicy::detailed())?;
+    let catalog = collect(
+        hints,
+        excludes,
+        hooks,
+        max_scan_pids,
+        AdmissionPolicy::detailed(),
+    )?;
     if stage_timings_requested() {
         eprintln!(
             "p11scope: stage timings: {}",
@@ -1108,17 +1117,14 @@ pub(crate) struct CatalogLowering {
 /// (stdout stays empty).
 pub(crate) fn collect(
     hints: &[PathBuf],
+    excludes: &[PathBuf],
     hooks: &HookRegistry,
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
 ) -> Result<Catalog> {
-    collect_with_budget(
-        hints,
-        hooks,
-        max_scan_pids,
-        policy,
-        CaptureWorkBudget::default(),
-    )
+    let mut budget = CaptureWorkBudget::default();
+    budget.set_excludes(excludes.to_vec());
+    collect_with_budget(hints, hooks, max_scan_pids, policy, budget)
 }
 
 pub(crate) fn collect_with_budget(

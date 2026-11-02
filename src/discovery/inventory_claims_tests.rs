@@ -33,6 +33,7 @@ fn inventory_engine_with_claim_capacity(scan_capacity: usize, claim_capacity: us
         Scope::System,
         HookRegistry::builtin(),
         Vec::new(),
+        vec![],
     )
     .unwrap()
 }

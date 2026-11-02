@@ -7,6 +7,7 @@
 //! authority the offline helper uses — so a scanned offset equals a manifest offset.
 
 use crate::discovery::caller_registry::cold_admit_member;
+use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{ExaminedObject, Pin, pin_of};
 use crate::discovery::retained_member::RetainedGroupMember;
@@ -23,6 +24,7 @@ use pkcs11_module::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1092,6 +1094,26 @@ pub struct CaptureWorkBudget {
     pub(crate) last_installed_deadline: Option<u64>,
     scan_stop_reason: Option<&'static str>,
     scan_stop_reported: bool,
+    /// `--exclude-module` inputs for this capture (set once before scanning,
+    /// read by every member scan). Empty means "exclude nothing".
+    excludes: Vec<PathBuf>,
+    /// Files skipped as excluded by the operator, one record per (pid, file)
+    /// encounter. Accumulated across member scans; the caller aggregates by
+    /// file identity for process counts after all scans complete.
+    excluded: Vec<ExcludedRecord>,
+}
+
+/// One `--exclude-module` hit: a mapped file the scan skipped by operator
+/// choice, never a loss. The identity is the opened file's fstat
+/// (device + inode), comparable across views; the path is the target-view
+/// label for display; `via` is the exclusion input that matched it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExcludedRecord {
+    pub pid: u32,
+    pub path: String,
+    pub dev: u64,
+    pub ino: u64,
+    pub via: PathBuf,
 }
 
 impl CaptureWorkBudget {
@@ -1133,7 +1155,26 @@ impl CaptureWorkBudget {
             last_installed_deadline: None,
             scan_stop_reason: None,
             scan_stop_reported: false,
+            excludes: Vec::new(),
+            excluded: Vec::new(),
         }
+    }
+
+    /// Set the capture's `--exclude-module` inputs before scanning.
+    pub(crate) fn set_excludes(&mut self, excludes: Vec<PathBuf>) {
+        self.excludes = excludes;
+    }
+
+    pub(crate) fn excludes(&self) -> &[PathBuf] {
+        &self.excludes
+    }
+
+    pub(crate) fn push_excluded(&mut self, record: ExcludedRecord) {
+        self.excluded.push(record);
+    }
+
+    pub(crate) fn excluded(&self) -> &[ExcludedRecord] {
+        &self.excluded
     }
 
     pub(crate) fn set_collection_work(&mut self, work: CollectionWork) {
@@ -3870,6 +3911,56 @@ fn hint_gate(kind: HintMatch, hint: &Path, actual: &File) -> Result<(), String> 
     )
 }
 
+/// `--exclude-module` path inputs resolved to file identity: the operator
+/// input plus the device and inode it resolved to.
+type ExcludePaths = Vec<(PathBuf, u64, u64)>;
+/// `--exclude-module` bare-name inputs: the operator input plus its match
+/// bytes (basename or ELF soname).
+type ExcludeNames = Vec<(PathBuf, Vec<u8>)>;
+
+/// Which `--exclude-module` input matches this opened mapped file, if any.
+/// Exact-file paths match by fstat identity (both sides opened files, never
+/// maps vs fstat, so a different file at the same path in another mount
+/// namespace is NOT excluded); bare names match by basename or ELF soname
+/// read from this handle. Returns the matching input for the report.
+pub(crate) fn exclude_match(
+    path: &str,
+    file: &File,
+    exclude_paths: &ExcludePaths,
+    exclude_names: &ExcludeNames,
+) -> Option<PathBuf> {
+    if let Ok(metadata) = file.metadata() {
+        let identity = (metadata.dev(), metadata.ino());
+        if let Some((input, _, _)) = exclude_paths
+            .iter()
+            .find(|(_, dev, ino)| (*dev, *ino) == identity)
+        {
+            return Some(input.clone());
+        }
+    }
+    if exclude_names.is_empty() {
+        return None;
+    }
+    if let Some(base) = Path::new(path).file_name()
+        && let Some((input, _)) = exclude_names
+            .iter()
+            .find(|(_, name)| *name == base.as_bytes())
+    {
+        return Some(input.clone());
+    }
+    // Soname from the pinned handle only (allowlist-v3 Row B pattern: exact
+    // equality against pinned-file metadata, discarded after classification,
+    // never published).
+    let mut charge = 0u64;
+    if let Ok(parsed) = read_elf_needed(file, &mut charge, 0)
+        && let Some(soname) = parsed.soname
+        && let Some((input, _)) = exclude_names.iter().find(|(_, name)| *name == soname)
+    {
+        return Some(input.clone());
+    }
+    None
+}
+
 /// Why `/proc/<pid>/mem` could not be opened, and whether that is a published
 /// discovery loss. `ESRCH` is proof the process ended — the ordinary end of a
 /// process, already recorded by `scan_unavailable`, and nothing a capture that
@@ -5234,6 +5325,26 @@ fn scan_view_examined_mode(
     let hint_ids: Vec<Option<(u64, u64)>> =
         request.hints.iter().map(|h| hint_identity(h)).collect();
     let mut hint_matched = vec![false; request.hints.len()];
+    // `--exclude-module`: full paths resolve once to observer (device, inode)
+    // (follow symlinks, like `--module`); bare names match by basename or ELF
+    // soname below. Unresolvable paths match nothing (reported as unmatched
+    // by the caller aggregating `budget.excluded()`).
+    let exclude_paths: ExcludePaths = budget
+        .excludes()
+        .iter()
+        .filter(|e| e.as_os_str().as_bytes().contains(&b'/'))
+        .filter_map(|e| {
+            std::fs::metadata(e)
+                .ok()
+                .map(|m| (e.clone(), m.dev(), m.ino()))
+        })
+        .collect();
+    let exclude_names: ExcludeNames = budget
+        .excludes()
+        .iter()
+        .filter(|e| !e.as_os_str().as_bytes().contains(&b'/'))
+        .map(|e| (e.clone(), e.as_os_str().as_bytes().to_vec()))
+        .collect();
 
     let groups = candidate_groups(&maps);
     // One mount-table read serves every object this scan opens (H-3).
@@ -5353,6 +5464,31 @@ fn scan_view_examined_mode(
                 reason: refusal
                     .unwrap_or_else(|| "no --module hint could be attributed here".into()),
             });
+            continue;
+        }
+        // `--exclude-module`: excluded files get no probes and use no
+        // slots; they are recorded, never silent. A file both hinted
+        // (`--module`) and excluded is an operator contradiction, refused
+        // here with a named error before any attach.
+        if (!exclude_paths.is_empty() || !exclude_names.is_empty())
+            && let Some(matched) = exclude_match(&path, &file, &exclude_paths, &exclude_names)
+        {
+            if hinted {
+                return Err(format!(
+                    "{} is both named by --module and matched by --exclude-module {}; refusing a module that is both included and excluded",
+                    subject,
+                    matched.display()
+                ));
+            }
+            if let Ok(metadata) = file.metadata() {
+                budget.push_excluded(ExcludedRecord {
+                    pid,
+                    path: path.clone(),
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                    via: matched,
+                });
+            }
             continue;
         }
         // A repeat scan of the unchanged file reuses the cached export facts with
@@ -5674,6 +5810,199 @@ pub(crate) fn final_maps_refusal_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exclusion_inputs(excludes: &[PathBuf]) -> (ExcludePaths, ExcludeNames) {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let paths = excludes
+            .iter()
+            .filter(|e| e.as_os_str().as_bytes().contains(&b'/'))
+            .filter_map(|e| {
+                std::fs::metadata(e)
+                    .ok()
+                    .map(|m| (e.clone(), m.dev(), m.ino()))
+            })
+            .collect();
+        let names = excludes
+            .iter()
+            .filter(|e| !e.as_os_str().as_bytes().contains(&b'/'))
+            .map(|e| (e.clone(), e.as_os_str().as_bytes().to_vec()))
+            .collect();
+        (paths, names)
+    }
+
+    /// A full `--exclude-module` path excludes exactly that file by identity.
+    #[test]
+    fn exclude_match_path_excludes_exactly_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("libtarget.so.1");
+        let other = dir.path().join("libother.so.1");
+        std::fs::write(&target, b"fake-a").unwrap();
+        std::fs::write(&other, b"fake-b").unwrap();
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&target));
+        assert_eq!(paths.len(), 1);
+        let file = File::open(&target).unwrap();
+        assert_eq!(
+            exclude_match(target.to_str().unwrap(), &file, &paths, &names),
+            Some(target.clone())
+        );
+        let other_file = File::open(&other).unwrap();
+        assert_eq!(
+            exclude_match(other.to_str().unwrap(), &other_file, &paths, &names),
+            None
+        );
+    }
+
+    /// A symlinked exclusion path follows the link like `--module` does.
+    #[test]
+    fn exclude_match_path_follows_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("libreal.so.1");
+        let link = dir.path().join("liblink.so");
+        std::fs::write(&real, b"fake").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&link));
+        assert_eq!(paths.len(), 1);
+        let file = File::open(&real).unwrap();
+        assert_eq!(
+            exclude_match(real.to_str().unwrap(), &file, &paths, &names),
+            Some(link.clone())
+        );
+    }
+
+    /// The same path string in another mount namespace is a different file
+    /// (different identity) and is NOT excluded: matching is by fstat
+    /// identity, never by path string.
+    #[test]
+    fn exclude_match_path_ignores_a_different_file_at_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let excluded = dir.path().join("libns.so.1");
+        let stranger = dir.path().join("libother.so.1");
+        std::fs::write(&excluded, b"fake-a").unwrap();
+        std::fs::write(&stranger, b"fake-b").unwrap();
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&excluded));
+        // Same path string as the exclusion, but a different file's handle.
+        let stranger_file = File::open(&stranger).unwrap();
+        assert_eq!(
+            exclude_match(excluded.to_str().unwrap(), &stranger_file, &paths, &names),
+            None
+        );
+    }
+
+    /// A bare `--exclude-module` name matches every file with that basename.
+    #[test]
+    fn exclude_match_bare_name_matches_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("libbare.so.0");
+        std::fs::write(&named, b"not-an-elf").unwrap();
+        let bare = PathBuf::from("libbare.so.0");
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&bare));
+        assert!(paths.is_empty());
+        let file = File::open(&named).unwrap();
+        assert_eq!(
+            exclude_match(named.to_str().unwrap(), &file, &paths, &names),
+            Some(bare)
+        );
+    }
+
+    /// A bare name matching no basename still matches by ELF soname, across
+    /// versions: `libp11-kit.so.0` matches both `.0.4.8` and `.0.4.5`.
+    #[test]
+    fn exclude_match_bare_name_matches_soname_across_versions() {
+        use crate::discovery::elf_needed::fixture::{ElfSpec, build_elf, write_elf};
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = write_elf(
+            dir.path(),
+            "libp11-kit.so.0.4.8",
+            &build_elf(&ElfSpec::lib(b"libp11-kit.so.0", &[])),
+        );
+        let v2 = write_elf(
+            dir.path(),
+            "libp11-kit.so.0.4.5",
+            &build_elf(&ElfSpec::lib(b"libp11-kit.so.0", &[])),
+        );
+        let bare = PathBuf::from("libp11-kit.so.0");
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&bare));
+        for path in [&v1, &v2] {
+            let file = File::open(path).unwrap();
+            assert_eq!(
+                exclude_match(path.to_str().unwrap(), &file, &paths, &names),
+                Some(bare.clone()),
+                "{}",
+                path.display()
+            );
+        }
+        // An exact file name matches that version only.
+        let exact = PathBuf::from("libp11-kit.so.0.4.8");
+        let (paths, names) = exclusion_inputs(std::slice::from_ref(&exact));
+        let file = File::open(&v1).unwrap();
+        assert_eq!(
+            exclude_match(v1.to_str().unwrap(), &file, &paths, &names),
+            Some(exact.clone())
+        );
+        let file = File::open(&v2).unwrap();
+        assert_eq!(
+            exclude_match(v2.to_str().unwrap(), &file, &paths, &names),
+            None
+        );
+    }
+
+    /// A mapped file both hinted (`--module`) and excluded is refused at
+    /// discovery with a named error, before any attach. Uses a stopped
+    /// child and one of its own mapped libraries, so no host path is
+    /// hard-coded.
+    #[test]
+    fn scan_refuses_a_module_both_hinted_and_excluded() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+            .expect("own stopped child maps are readable");
+        let so = maps
+            .lines()
+            .filter_map(|line| line.rsplit(' ').next())
+            .find(|path| path.contains(".so") && std::path::Path::new(path).is_absolute())
+            .expect("a stopped shell maps at least one shared library")
+            .to_string();
+        let basename = std::path::Path::new(&so)
+            .file_name()
+            .expect("mapped library has a file name")
+            .to_os_string();
+        let hooks = HookRegistry::builtin();
+        let hints = vec![PathBuf::from(&so)];
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_excludes(vec![PathBuf::from(basename)]);
+        let error = scan_pid(
+            &ScanRequest {
+                pid,
+                hints: &hints,
+                hooks: &hooks,
+            },
+            &mut budget,
+        )
+        .expect_err("a hinted file matched by --exclude-module is refused");
+        assert!(
+            error.contains("both named by --module and matched by --exclude-module"),
+            "{error}"
+        );
+    }
+
+    /// An exclusion matching nothing returns no match (the caller reports
+    /// the input as unmatched).
+    #[test]
+    fn exclude_match_reports_no_match_for_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let unrelated = dir.path().join("libunrelated.so");
+        std::fs::write(&unrelated, b"not-an-elf").unwrap();
+        let missing = dir.path().join("libmissing.so");
+        let (paths, names) = exclusion_inputs(&[missing, PathBuf::from("libnope.so")]);
+        assert!(paths.is_empty(), "an unresolvable path matches nothing");
+        let file = File::open(&unrelated).unwrap();
+        assert_eq!(
+            exclude_match(unrelated.to_str().unwrap(), &file, &paths, &names),
+            None
+        );
+    }
 
     #[test]
     fn held_scan_transfers_opened_nonprovider_and_invalidates_failed_brackets() {

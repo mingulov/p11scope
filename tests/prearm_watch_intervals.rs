@@ -89,6 +89,7 @@ fn capture_args(
     CaptureArgs {
         kind: Kind::Profile,
         modules,
+        exclude_modules: vec![],
         manifests,
         prearm_modules: prearm,
         hooks: HookRegistry::builtin(),

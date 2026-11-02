@@ -57,22 +57,55 @@ fn run() -> Result<i32> {
         }
         // `kind` travels inside the arguments, so both capture subcommands share
         // one arm as well as one parser.
-        Ok(Command::Profile(a) | Command::Trace(a)) => capture(&a).map(|()| 0),
+        Ok(Command::Profile(a) | Command::Trace(a)) => {
+            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules) {
+                let topic = match a.kind {
+                    cli::Kind::Profile => cli::HelpTopic::Profile,
+                    cli::Kind::Trace => cli::HelpTopic::Trace,
+                };
+                let _ = p11scope::try_stderr_line(&format!("{message}\n{}", topic.hint()));
+                return Ok(2);
+            }
+            capture(&a).map(|()| 0)
+        }
         // `run` owns its child from fork to reap and reports the status a shell
         // would. A child deliberately handed back still running is a success
         // for the observer, so it exits 0.
-        Ok(Command::Run(a)) => run_owned(&a).map(|outcome| outcome.child_exit_code.unwrap_or(0)),
+        Ok(Command::Run(a)) => {
+            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules) {
+                let _ = p11scope::try_stderr_line(&format!(
+                    "{message}\n{}",
+                    cli::HelpTopic::Run.hint()
+                ));
+                return Ok(2);
+            }
+            run_owned(&a).map(|outcome| outcome.child_exit_code.unwrap_or(0))
+        }
         // Both of `inspect`'s hard failures — a pid that names nothing, and a target
         // that exited while its objects were being pinned — mean "the target could
         // not be read at all": one line here, exit 1, never a panic. A
         // fully-unreadable machine fails the same way under `--system`.
         Ok(Command::Inspect(a)) => {
+            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules) {
+                let _ = p11scope::try_stderr_line(&format!(
+                    "{message}\n{}",
+                    cli::HelpTopic::Inspect.hint()
+                ));
+                return Ok(2);
+            }
             let scope = match a.scope {
                 cli::InspectScope::Pid(pid) => format!("inspect --pid {pid}"),
                 cli::InspectScope::System => "inspect --system".to_string(),
             };
-            inspect::run(a.scope, &a.modules, &a.hooks, a.json, a.max_scan_pids)
-                .with_context(|| scope)
+            inspect::run(
+                a.scope,
+                &a.modules,
+                &a.exclude_modules,
+                &a.hooks,
+                a.json,
+                a.max_scan_pids,
+            )
+            .with_context(|| scope)
         }
         Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref(), a.extra_strict),
         Ok(Command::InventoryDiff(a)) => inventory_diff::run(&a),
@@ -80,6 +113,13 @@ fn run() -> Result<i32> {
         // unwritable `-o` — mean "nothing could be observed": one line
         // here, exit 1, never a panic and never an empty-success report.
         Ok(Command::Inventory(a)) => {
+            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules) {
+                let _ = p11scope::try_stderr_line(&format!(
+                    "{message}\n{}",
+                    cli::HelpTopic::Inventory.hint()
+                ));
+                return Ok(2);
+            }
             let scope = match &a.scope {
                 cli::ScopeArg::Pid(pid) => format!("inventory --pid {pid}"),
                 cli::ScopeArg::System => "inventory --system".to_string(),
@@ -90,6 +130,7 @@ fn run() -> Result<i32> {
             inventory::run(
                 a.scope,
                 &a.modules,
+                &a.exclude_modules,
                 &a.manifests,
                 &a.prearm_modules,
                 &a.hooks,

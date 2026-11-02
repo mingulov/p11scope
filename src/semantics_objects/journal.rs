@@ -7801,6 +7801,7 @@ pub(crate) mod tests {
                     crate::attach::Scope::Pid(pid),
                     crate::discovery::hooks::HookRegistry::builtin(),
                     Vec::new(),
+                    vec![],
                     crate::discovery::caller_registry::OsProcessSource,
                     crate::discovery::caller_registry::RegistryLimits::default_limits(),
                 )
@@ -15706,6 +15707,7 @@ pub(crate) mod tests {
             Scope::Pid(pid),
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )
@@ -15956,6 +15958,7 @@ pub(crate) mod tests {
                 crate::attach::Scope::Pid(std::process::id()),
                 crate::discovery::hooks::HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
             )

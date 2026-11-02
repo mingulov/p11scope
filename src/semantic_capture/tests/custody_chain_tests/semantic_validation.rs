@@ -925,6 +925,7 @@ impl RealScene {
             Scope::System,
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )

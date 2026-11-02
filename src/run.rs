@@ -3843,6 +3843,7 @@ fn run_owned_inner_with_host(
         track_short_lived: args.track_short_lived,
         kind: args.kind,
         modules: args.modules.clone(),
+        exclude_modules: args.exclude_modules.clone(),
         manifests: args.manifests.clone(),
         prearm_modules: args.prearm_modules.clone(),
         hooks: args.hooks.clone(),
@@ -13761,6 +13762,7 @@ mod tests {
             let args = CaptureArgs {
                 kind: Kind::Profile,
                 modules: Vec::new(),
+                exclude_modules: vec![],
                 manifests: Vec::new(),
                 prearm_modules: vec![provider.clone()],
                 hooks: HookRegistry::builtin(),
@@ -14215,6 +14217,7 @@ mod tests {
             track_short_lived: false,
             kind: Kind::Profile,
             modules: Vec::new(),
+            exclude_modules: vec![],
             manifests: Vec::new(),
             prearm_modules: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
@@ -14266,6 +14269,7 @@ mod tests {
             track_short_lived: false,
             kind: Kind::Profile,
             modules: Vec::new(),
+            exclude_modules: vec![],
             manifests: Vec::new(),
             prearm_modules: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
@@ -19916,6 +19920,7 @@ mod tests {
         // Above /proc/sys/kernel/pid_max on every supported kernel.
         let error = crate::inspect::run(
             crate::cli::InspectScope::Pid(0x7fff_fff0),
+            &[],
             &[],
             &crate::discovery::hooks::HookRegistry::builtin(),
             false,

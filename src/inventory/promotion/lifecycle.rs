@@ -1292,6 +1292,8 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
         render_index: Default::default(),
         gaps: Vec::new(),
         gaps_suppressed: 0,
+        excluded_modules: Vec::new(),
+        unmatched_excludes: Vec::new(),
         budgets: BudgetView {
             callers_limit: 0,
             callers_occupied: 0,
@@ -1445,6 +1447,7 @@ mod tests {
                 crate::attach::Scope::Pid(std::process::id()),
                 crate::discovery::hooks::HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 crate::discovery::caller_registry::OsProcessSource,
                 crate::discovery::caller_registry::RegistryLimits::default_limits(),
             )

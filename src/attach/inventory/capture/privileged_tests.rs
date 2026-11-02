@@ -1457,6 +1457,7 @@ fn privileged_dr37_selected_promotion_full_loop() -> Result<()> {
             crate::attach::Scope::Pid(pid),
             crate::discovery::hooks::HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             crate::discovery::caller_registry::OsProcessSource,
             crate::discovery::caller_registry::RegistryLimits::default_limits(),
         )?;

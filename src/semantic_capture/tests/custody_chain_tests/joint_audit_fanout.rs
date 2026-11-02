@@ -9082,6 +9082,7 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
             Scope::System,
             HookRegistry::builtin(),
             Vec::new(),
+            vec![],
             OsProcessSource,
             RegistryLimits::default_limits(),
         )

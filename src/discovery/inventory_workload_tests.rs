@@ -1058,6 +1058,7 @@ fn system_sweep_releases_its_pins() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -1832,6 +1833,7 @@ fn inject_native_owner_growth_failure() {
         Scope::Pid(pid),
         HookRegistry::builtin(),
         Vec::new(),
+        vec![],
         OsProcessSource,
         RegistryLimits::default_limits(),
     )
@@ -1989,6 +1991,7 @@ fn inject_provider_mutation_case(invoke_getter: bool) {
         Scope::Pid(driver_pid),
         HookRegistry::builtin(),
         vec![prov.clone()],
+        vec![],
         OsProcessSource,
         RegistryLimits::default_limits(),
     )

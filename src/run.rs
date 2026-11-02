@@ -14237,6 +14237,28 @@ mod tests {
             snapshot < quiesce,
             "capture_profile must snapshot the K0 close witness before quiescence"
         );
+        // K0 tail: the shutdown-tail split collects exactly the records
+        // the pre-quiescence snapshot cannot see — the quiescence-staged
+        // suffix plus the terminal drain — and hands them to the close.
+        // All four sites must survive in order: the staged-suffix slice,
+        // the observed quiescence apply, the guarded terminal branch,
+        // and the take into the close.
+        let suffix = profile
+            .find("staged_records[k0_prefix_records..]")
+            .expect("K0 tail staged suffix");
+        let observed = profile
+            .find("apply_quiesced_discovery_observed(")
+            .expect("K0 tail observed quiescence");
+        let terminal = profile
+            .find("drain_discovery_terminal_to_position_observed(")
+            .expect("K0 tail observed terminal");
+        let take = profile
+            .find("tail_records: k0_tail_records.take()")
+            .expect("K0 tail take");
+        assert!(
+            suffix < observed && observed < terminal && terminal < take,
+            "capture_profile must collect the K0 tail in order"
+        );
     }
 
     #[test]

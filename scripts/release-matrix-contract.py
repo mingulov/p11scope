@@ -129,6 +129,7 @@ DEFAULT_LIB_TESTS = (
     'metrics::k0_live_cells::k0_live_run_detail_matches_ledger_counts_lp64',
     'metrics::k0_live_cells::k0_live_run_exit_in_window_counts_lp64',
     'metrics::k0_live_cells::k0_live_pid_exit_in_window_counts_lp64',
+    'metrics::k0_live_cells::k0_live_run_gateless_exit_matches_main_counts_lp64',
 )
 
 BREADTH = tuple("attach::inventory::activation::privileged_tests::" + name for name in (

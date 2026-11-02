@@ -1424,6 +1424,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/metrics/k0_live_cells.rs",
+      "path": "metrics::k0_live_cells::k0_live_run_gateless_exit_matches_main_counts_lp64",
+      "reason": "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): run --select-endpoint counts on a gate-less short owned child that signs four times and exits at once",
+      "cell": "privileged"
+    },
+    {
       "file": "src/process.rs",
       "path": "process::tests::pidfd_denial::pidfd_denial_helper",
       "reason": "private seccomp helper; invoked by real_pidfd_denial_preserves_proc_identity_without_signal_authority",

@@ -316,6 +316,11 @@ pub struct CaptureFacts {
     pub(crate) discovery_state_failures: u64,
     pub(crate) discovery_read_failures: u64,
     pub(crate) discovery_truncated: u64,
+    /// The exit-ended subset of `discovery_truncated`: loader-scan
+    /// truncations whose process provably exited before the scan
+    /// resolved. Not a fifth loss lane — K0 subtracts it from the
+    /// total when it compares its window snapshots.
+    pub(crate) exit_ended_truncations: u64,
     pub(crate) task_uprobe_link_losses: u64,
 }
 
@@ -365,6 +370,13 @@ impl CaptureFacts {
             self.discovery_read_failures,
             self.discovery_truncated,
         ]
+    }
+
+    /// Loader-scan truncations settled at a proven process exit: the
+    /// exit-only subset of the truncation total. K0's window rule
+    /// compares the total minus this count.
+    pub fn exit_ended_truncations(&self) -> u64 {
+        self.exit_ended_truncations
     }
 
     /// Task-uprobe links that disappeared while their retained process group

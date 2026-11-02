@@ -8397,19 +8397,22 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
     // before 13d8b62d3, its four image maps, the three object-custody maps
     // OBJECT_START/OBJECT_ZERO/OBJECT_DESCRIPTORS from 9d9a9a443 and the
     // three selected-detail maps linked by 4b5c780bb, named
-    // SELECTED_DETAIL/SELECTED_BCTL/SELECTED_DSTATE since feb152a9c);
+    // SELECTED_DETAIL/SELECTED_BCTL/SELECTED_DSTATE since feb152a9c),
+    // plus JOURNAL_MARKER_CTL when this build carries the birth marker
+    // (shipped by default since the WU-2b journal+marker activation);
     // 13 base programs, four continuity hooks and one loaded task
     // iterator (the selected programs stay unloaded outside a selected
     // session); seven base links plus four hook links. Query links are
     // temporary and absent from this retained census.
+    let detailed_census = (42 + usize::from(cfg!(p11scope_birth_marker)), 18, 11);
     let first_census = (
         first_ids.maps.len(),
         first_ids.programs.len(),
         first_ids.links.len(),
     );
     ensure!(
-        first_census == (42, 18, 11),
-        "first Detailed census (maps, programs, links) = {first_census:?}, expected (42, 18, 11)"
+        first_census == detailed_census,
+        "first Detailed census (maps, programs, links) = {first_census:?}, expected {detailed_census:?}"
     );
     let first_witness = task4_session_witness(&first, &first_ids, 1, original.child.id())?;
     task4_record_registration(
@@ -8444,8 +8447,8 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
         second_ids.links.len(),
     );
     ensure!(
-        second_census == (42, 18, 11),
-        "second Detailed census (maps, programs, links) = {second_census:?}, expected (42, 18, 11)"
+        second_census == detailed_census,
+        "second Detailed census (maps, programs, links) = {second_census:?}, expected {detailed_census:?}"
     );
     let second_witness = task4_session_witness(&second, &second_ids, 2, copy.child.id())?;
     ensure!(
@@ -8465,8 +8468,15 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
     )?;
     let ids = first_ids.union(&second_ids);
     // Twice the canonical per-session inventory: the two sessions are
-    // proven disjoint above, so the union is the exact sum 2*(42,18,11).
-    ensure!((ids.maps.len(), ids.programs.len(), ids.links.len()) == (84, 36, 22));
+    // proven disjoint above, so the union is the exact sum 2*detailed_census.
+    ensure!(
+        (ids.maps.len(), ids.programs.len(), ids.links.len())
+            == (
+                2 * detailed_census.0,
+                2 * detailed_census.1,
+                2 * detailed_census.2
+            )
+    );
     task4_ids_phase("second_attached", &ids);
     task4_session_ids("second_attached", second_witness, &second_ids);
     task4_ids_receipt(&ids);

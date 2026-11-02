@@ -2757,9 +2757,10 @@ fn joint_machine_publish_discloses_events_ring_loss_rise() {
     assert_eq!(
         (
             lane.shed_calls_disclosed(),
+            lane.events_ring_loss_disclosed(),
             lane.semantic_summary().unrouted_returns
         ),
-        (9, 9),
+        (0, 9, 9),
         "the disclosed delta counts exactly once across poll sites"
     );
     // And it surfaces through the next registry publish, never stuck staged.

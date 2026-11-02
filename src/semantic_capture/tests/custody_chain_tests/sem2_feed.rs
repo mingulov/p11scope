@@ -221,14 +221,14 @@ fn shed_calls_accumulate_beside_unrouted_gap() {
 #[test]
 fn semantic_stop_line_format_is_exact() {
     assert_eq!(
-        semantic_stop_line(0, 0, 0, 0, 0),
-        "p11scope: semantic calls: collected 0, joined 0, shed 0, bindings 0, refused 0"
+        semantic_stop_line(0, 0, 0, 0, 0, 0),
+        "p11scope: semantic calls: collected 0, joined 0, shed 0, lost 0, bindings 0, refused 0"
     );
     // The live run's shape: burst collected, nothing joined, every
     // refresh scan refused.
     assert_eq!(
-        semantic_stop_line(68, 0, 68, 0, 12),
-        "p11scope: semantic calls: collected 68, joined 0, shed 68, bindings 0, refused 12"
+        semantic_stop_line(68, 0, 68, 0, 0, 12),
+        "p11scope: semantic calls: collected 68, joined 0, shed 68, lost 0, bindings 0, refused 12"
     );
     assert_eq!(scan_refusals_gap_reason(&[0; 12]), None);
 }

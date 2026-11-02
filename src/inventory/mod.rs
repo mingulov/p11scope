@@ -2708,6 +2708,7 @@ struct SemanticStopCounts {
     collected: u64,
     joined: u64,
     shed: u64,
+    lost: u64,
     bindings: u64,
     refused: u64,
 }
@@ -2719,12 +2720,14 @@ impl SemanticStopCounts {
     ) -> Self {
         let refusals = lane.scan_refusal_counts();
         let (collected, joined, shed, refused) = lane.semantic_stop_call_counts();
+        let lost = lane.events_ring_loss_disclosed();
         let bindings = coordinator.semantic_bindings_mut().len() as u64;
         Self {
             refusals,
             collected,
             joined,
             shed,
+            lost,
             bindings,
             refused,
         }
@@ -2746,6 +2749,7 @@ fn disclose_semantic_stop(
         counts.collected,
         counts.joined,
         counts.shed,
+        counts.lost,
         counts.bindings,
         counts.refused,
     ));
@@ -2917,6 +2921,13 @@ impl ClassicDriver<'_> {
                     format!("{error:#}"),
                 ),
             }
+        }
+        // Poll the EVENTS ring-loss counter before reading the stop
+        // counts, like the exit hold: loss during the terminal drain
+        // discloses on the stop line instead of staying silent past
+        // it.
+        if let Some(lane) = self.semantic.as_mut() {
+            self.coordinator.poll_and_disclose_events_ring_loss(lane);
         }
         // One honest stop disclosure through the shared helper: the
         // same aggregate scan-refusal gap plus lifetime call-count
@@ -3305,8 +3316,10 @@ impl ClassicDriver<'_> {
     /// always discloses. Each caller names the abandon gap subject:
     /// exit holds say "for exit"; a mid-run lane-stop conversion
     /// says "for lane stop", so the gap never claims the run is
-    /// leaving while it continues. Returns the first error: the
-    /// disposition where latched, else the trigger cause. Callers
+    /// leaving while it continues. Returns the first error (the
+    /// disposition where latched, else the trigger cause) with the
+    /// post-commit lane summary, so callers serve counts the hold
+    /// disclosed instead of a stale pre-hold snapshot. Callers
     /// disclose the skips (finished or unadmitted holds).
     fn hold_joint_lane_for_exit(
         mut lane: crate::inventory_semantics::AttestedSemanticLane,
@@ -3315,7 +3328,15 @@ impl ClassicDriver<'_> {
         abandon_subject: &str,
         warn: &mut WarnSink<'_>,
         winding_disclosed: Option<&mut bool>,
-    ) -> String {
+    ) -> (
+        String,
+        crate::inventory_semantics::SemanticCaptureSummary,
+    ) {
+        // Poll the EVENTS ring-loss counter before anything reads
+        // the stop counts: loss since the last publish discloses
+        // here, so the stop line and the served summary carry it
+        // even when the lane never publishes again.
+        coordinator.poll_and_disclose_events_ring_loss(&mut lane);
         // A recorded terminal graph refusal predates any later
         // verdict, so it wins as the abandon reason (§1.9, §6.4).
         // Next the machine's latched disposition refusal, so the
@@ -3392,12 +3413,17 @@ impl ClassicDriver<'_> {
                 );
             }
         }
+        // Read the post-commit summary before the hold takes the
+        // lane: the entry poll and the abandon commit above disclosed
+        // counts a pre-hold snapshot cannot carry.
+        let summary = lane.semantic_summary();
         ExitRetention::hold(lane);
-        if latched {
+        let error = if latched {
             reason.to_string()
         } else {
             cause.to_string()
-        }
+        };
+        (error, summary)
     }
 
     /// Direct-step entrypoint for the live privileged tests, which
@@ -3415,6 +3441,7 @@ impl ClassicDriver<'_> {
         let mut warn = WarnSink {
             display: &mut display,
         };
+        let mut seated_summary = None;
         Self::step_begun_joint_finish_with_warn(
             lane,
             finish,
@@ -3422,6 +3449,7 @@ impl ClassicDriver<'_> {
             first_error,
             &mut warn,
             None,
+            &mut seated_summary,
         )
     }
 
@@ -3432,7 +3460,9 @@ impl ClassicDriver<'_> {
     /// bound); Published polls only the wound-down (a refusal skips
     /// the abandon per §6.4 and holds); Abandoned does nothing. A
     /// winding step threads its winding's disclosed flag to the exit
-    /// hold; a live-lane step passes `None`.
+    /// hold; a live-lane step passes `None`. A hold writes its
+    /// post-commit summary through `seated_summary` (winding steps
+    /// pass a scratch, since a retiring lane never serves).
     fn step_begun_joint_finish_with_warn(
         lane: &mut Option<crate::inventory_semantics::AttestedSemanticLane>,
         finish: &mut JointFinishDriver,
@@ -3440,6 +3470,7 @@ impl ClassicDriver<'_> {
         first_error: &mut Option<String>,
         warn: &mut WarnSink<'_>,
         winding_disclosed: Option<&mut bool>,
+        seated_summary: &mut Option<crate::inventory_semantics::SemanticCaptureSummary>,
     ) -> JointStepOutcome {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1024,
@@ -3453,7 +3484,7 @@ impl ClassicDriver<'_> {
                     .is_some_and(|lane| lane.joint_finish_disposition_required())
                 {
                     if let Some(owned) = lane.take() {
-                        let error = Self::hold_joint_lane_for_exit(
+                        let (error, summary) = Self::hold_joint_lane_for_exit(
                             owned,
                             coordinator,
                             "joint finish disposition required",
@@ -3461,6 +3492,7 @@ impl ClassicDriver<'_> {
                             warn,
                             winding_disclosed,
                         );
+                        *seated_summary = Some(summary);
                         first_error.get_or_insert(error);
                     }
                     *finish = JointFinishDriver::Abandoned;
@@ -3508,14 +3540,16 @@ impl ClassicDriver<'_> {
                             // The first error is kept: a pre-set
                             // disposition survives this later failure.
                             // The hold always runs; only the error keeps.
-                            first_error.get_or_insert(Self::hold_joint_lane_for_exit(
+                            let (error, summary) = Self::hold_joint_lane_for_exit(
                                 owned,
                                 coordinator,
                                 &cause,
                                 "joint finish abandoned for exit",
                                 warn,
                                 winding_disclosed,
-                            ));
+                            );
+                            *seated_summary = Some(summary);
+                            first_error.get_or_insert(error);
                         }
                         *finish = JointFinishDriver::Abandoned;
                         JointStepOutcome::Abandoned
@@ -3543,7 +3577,7 @@ impl ClassicDriver<'_> {
         match Self::begin_lane_finish(lane, coordinator) {
             JointFinishDriver::Abandoned => {
                 let lane = semantic.take().expect("joint lane");
-                let error = Self::hold_joint_lane_for_exit(
+                let (error, summary) = Self::hold_joint_lane_for_exit(
                     lane,
                     coordinator,
                     "joint finish disposition required",
@@ -3551,6 +3585,7 @@ impl ClassicDriver<'_> {
                     &mut warn,
                     None,
                 );
+                self.seated_summary = Some(summary);
                 self.joint_first_error.get_or_insert(error);
                 self.joint_finish = JointFinishDriver::Abandoned;
             }
@@ -3583,7 +3618,7 @@ impl ClassicDriver<'_> {
         let mut warn = WarnSink {
             display: &mut self.display,
         };
-        let error = Self::hold_joint_lane_for_exit(
+        let (error, summary) = Self::hold_joint_lane_for_exit(
             lane,
             &mut *self.coordinator,
             cause,
@@ -3591,6 +3626,7 @@ impl ClassicDriver<'_> {
             &mut warn,
             None,
         );
+        self.seated_summary = Some(summary);
         self.joint_first_error.get_or_insert(error);
         if finished || !latched {
             self.coordinator
@@ -3737,6 +3773,9 @@ impl ClassicDriver<'_> {
             let mut warn = WarnSink {
                 display: &mut self.display,
             };
+            // A retiring lane never serves: its hold summary goes to
+            // a scratch, never the seated snapshot.
+            let mut scratch_summary = None;
             let outcome = {
                 let retiring = self.retiring.as_mut().expect("a winding lane retires");
                 let winding = retiring.winding.as_mut().expect("a winding lane retires");
@@ -3747,6 +3786,7 @@ impl ClassicDriver<'_> {
                     &mut self.joint_first_error,
                     &mut warn,
                     Some(&mut winding.stop_disclosed),
+                    &mut scratch_summary,
                 )
             };
             if !matches!(outcome, JointStepOutcome::WoundDown) {
@@ -3996,17 +4036,17 @@ impl ClassicDriver<'_> {
     }
 
     /// Convert a semantic-lane Joint commit refusal into a held lane
-    /// plus a published pass: snapshot what was seated (marked Partial:
-    /// the lane stopped with declared loss for the rest of the run),
-    /// hold the lane for exit (its stop counts disclose once), clear
-    /// the pending commit, name the stop in its own gap, and commit
-    /// the pass's native evidence past the held lane. Later passes
-    /// continue on the legacy path. The hold's first error is dropped
-    /// on purpose: the gap carries the disclosure, and
-    /// `joint_first_error` stays for the finish path, so a continued
-    /// run never surfaces this stale refusal as a later retained
-    /// error. A broad commit failure still fails the call; a
-    /// wedged-publication failure (the machine latched after
+    /// plus a published pass: hold the lane for exit (its stop counts
+    /// disclose once), serve its post-commit summary past the handoff
+    /// (marked Partial: the lane stopped with declared loss for the
+    /// rest of the run), clear the pending commit, name the stop in
+    /// its own gap, and commit the pass's native evidence past the
+    /// held lane. Later passes continue on the legacy path. The
+    /// hold's first error is dropped on purpose: the gap carries the
+    /// disclosure, and `joint_first_error` stays for the finish path,
+    /// so a continued run never surfaces this stale refusal as a
+    /// later retained error. A broad commit failure still fails the
+    /// call; a wedged-publication failure (the machine latched after
     /// physically preparing) names the semantic cause instead of the
     /// internal message.
     fn hold_joint_commit_lane_and_publish(
@@ -4015,15 +4055,11 @@ impl ClassicDriver<'_> {
         reason: &str,
         acquisition: Option<&mut dyn ImageAcquisition>,
     ) -> Result<PassCommitProgress> {
-        self.snapshot_seated_summary();
-        if let Some(summary) = self.seated_summary.as_mut() {
-            summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
-        }
         let mut warn = WarnSink {
             display: &mut self.display,
         };
         let lane = self.semantic.take().expect("a joint lane is seated");
-        Self::hold_joint_lane_for_exit(
+        let (_, summary) = Self::hold_joint_lane_for_exit(
             lane,
             &mut *self.coordinator,
             "joint commit disposition required",
@@ -4031,6 +4067,10 @@ impl ClassicDriver<'_> {
             &mut warn,
             None,
         );
+        self.seated_summary = Some(summary);
+        if let Some(summary) = self.seated_summary.as_mut() {
+            summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
+        }
         self.joint_commit_pending = false;
         self.coordinator.note_scope_gap(
             "semantic lane stopped".to_string(),
@@ -4125,7 +4165,7 @@ impl ClassicDriver<'_> {
                 match begun {
                     JointFinishDriver::Abandoned => {
                         let live = lane.take().expect("a begun lane holds");
-                        let error = Self::hold_joint_lane_for_exit(
+                        let (error, summary) = Self::hold_joint_lane_for_exit(
                             live,
                             coordinator,
                             "joint finish disposition required",
@@ -4133,6 +4173,7 @@ impl ClassicDriver<'_> {
                             warn,
                             None,
                         );
+                        *seated_summary = Some(summary);
                         first_error.get_or_insert(error);
                         *finish = JointFinishDriver::Abandoned;
                     }
@@ -4159,7 +4200,7 @@ impl ClassicDriver<'_> {
                         inner.note_joint_finish_failure(reason);
                     }
                     let live = lane.take().expect("a failed lane holds");
-                    let error = Self::hold_joint_lane_for_exit(
+                    let (error, summary) = Self::hold_joint_lane_for_exit(
                         live,
                         coordinator,
                         "joint finish disposition required",
@@ -4167,6 +4208,7 @@ impl ClassicDriver<'_> {
                         warn,
                         None,
                     );
+                    *seated_summary = Some(summary);
                     // The held gap reuses the hold's own reason, so it
                     // cannot disagree with the first error: the hold
                     // already resolved graph refusal, machine latch,
@@ -4176,7 +4218,7 @@ impl ClassicDriver<'_> {
                     coordinator.note_scope_gap("joint finish held for exit".to_string(), held);
                 } else {
                     let live = lane.take().expect("a failed lane holds");
-                    Self::hold_joint_lane_for_exit(
+                    let (_, summary) = Self::hold_joint_lane_for_exit(
                         live,
                         coordinator,
                         "joint commit disposition required",
@@ -4185,7 +4227,9 @@ impl ClassicDriver<'_> {
                         None,
                     );
                     // The lane stopped with declared loss: the served
-                    // snapshot reads Partial, like the Poll path.
+                    // post-commit summary reads Partial, like the Poll
+                    // path.
+                    *seated_summary = Some(summary);
                     if let Some(summary) = seated_summary.as_mut() {
                         summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
                     }
@@ -4274,6 +4318,7 @@ impl ClassicDriver<'_> {
             &mut self.joint_first_error,
             &mut warn,
             None,
+            &mut self.seated_summary,
         );
         if matches!(outcome, JointStepOutcome::WoundDown) {
             self.complete_final_joint_lane();
@@ -4385,7 +4430,9 @@ impl ClassicDriver<'_> {
                 match Self::begin_lane_finish(lane, &mut *self.coordinator) {
                     JointFinishDriver::Abandoned => {
                         let lane = winding.lane.take().expect("winding lane");
-                        let error = Self::hold_joint_lane_for_exit(
+                        // A retiring lane never serves: its post-commit
+                        // summary is dropped with the hold.
+                        let (error, _) = Self::hold_joint_lane_for_exit(
                             lane,
                             &mut *self.coordinator,
                             "joint finish disposition required",
@@ -5216,11 +5263,11 @@ impl ClassicDriver<'_> {
     }
 
     /// Hold a Joint commit stuck Pending past the retained wall
-    /// bound: snapshot Partial, hold the lane for exit (dropping the
-    /// hold error like a conversion, so the run exits 0), clear the
-    /// pending flag, and name the hold in its own gap plus a stderr
-    /// line. The pump's next Poll then legacy-commits past the held
-    /// lane and the report writes.
+    /// bound: serve the hold's post-commit summary past the handoff
+    /// (marked Partial, like a conversion), dropping the hold error
+    /// so the run exits 0, clear the pending flag, and name the hold
+    /// in its own gap plus a stderr line. The pump's next Poll then
+    /// legacy-commits past the held lane and the report writes.
     fn hold_stuck_retained_joint_publication(&mut self, stalled: Duration) {
         self.snapshot_seated_summary();
         if let Some(summary) = self.seated_summary.as_mut() {
@@ -5230,7 +5277,7 @@ impl ClassicDriver<'_> {
             display: &mut self.display,
         };
         if let Some(lane) = self.semantic.take() {
-            Self::hold_joint_lane_for_exit(
+            let (_, summary) = Self::hold_joint_lane_for_exit(
                 lane,
                 &mut *self.coordinator,
                 "retained joint publication timed out",
@@ -5238,6 +5285,10 @@ impl ClassicDriver<'_> {
                 &mut warn,
                 None,
             );
+            self.seated_summary = Some(summary);
+            if let Some(summary) = self.seated_summary.as_mut() {
+                summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
+            }
         }
         self.joint_commit_pending = false;
         self.coordinator.note_scope_gap(
@@ -5644,6 +5695,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 &mut self.joint_first_error,
                 &mut warn,
                 None,
+                &mut self.seated_summary,
             );
             if matches!(outcome, JointStepOutcome::WoundDown) {
                 self.complete_final_joint_lane();
@@ -6042,6 +6094,7 @@ impl ClassicDriver<'_> {
             &mut self.joint_first_error,
             &mut warn,
             None,
+            &mut self.seated_summary,
         )
     }
 }
@@ -11790,6 +11843,8 @@ mod tests {
             receipt_free: bool,
             saturated: bool,
             ring_loss: std::collections::VecDeque<u64>,
+            ring_loss_fail: std::collections::VecDeque<bool>,
+            ring_loss_polls: std::rc::Rc<std::cell::Cell<usize>>,
         }
 
         impl StubLaneIo {
@@ -11815,6 +11870,8 @@ mod tests {
                     receipt_free: false,
                     saturated: false,
                     ring_loss: std::collections::VecDeque::new(),
+                    ring_loss_fail: std::collections::VecDeque::new(),
+                    ring_loss_polls: std::rc::Rc::new(std::cell::Cell::new(0)),
                 }
             }
         }
@@ -11901,7 +11958,15 @@ mod tests {
             }
 
             fn events_ring_loss(&mut self) -> Option<u64> {
-                self.ring_loss.pop_front()
+                let value = self.ring_loss.pop_front();
+                if value.is_some() {
+                    self.ring_loss_polls.set(self.ring_loss_polls.get() + 1);
+                }
+                value
+            }
+
+            fn events_ring_loss_fails(&mut self) -> bool {
+                self.ring_loss_fail.pop_front().unwrap_or(false)
             }
 
             fn collection_saturated(&self) -> bool {
@@ -12211,6 +12276,7 @@ mod tests {
                 let lane = driver.semantic.as_ref().unwrap();
                 (
                     lane.shed_calls_disclosed(),
+                    lane.events_ring_loss_disclosed(),
                     lane.semantic_summary().unrouted_returns,
                 )
             };
@@ -12218,14 +12284,14 @@ mod tests {
             driver.on_tick();
             assert!(driver.semantic_staged, "the first tick stages");
             assert!(ring_gaps(&driver).is_empty());
-            assert_eq!(lane_counts(&driver), (0, 0));
+            assert_eq!(lane_counts(&driver), (0, 0, 0));
             // First commit reads a zero counter: still quiet.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
             );
             driver.on_tick();
             assert!(ring_gaps(&driver).is_empty());
-            assert_eq!(lane_counts(&driver), (0, 0));
+            assert_eq!(lane_counts(&driver), (0, 0, 0));
             // The counter rises to 7: one named gap plus exact counts.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
@@ -12241,7 +12307,7 @@ mod tests {
                 )],
                 "a rise discloses one named gap"
             );
-            assert_eq!(lane_counts(&driver), (7, 7));
+            assert_eq!(lane_counts(&driver), (0, 7, 7));
             // A flat read discloses nothing new.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
@@ -12249,7 +12315,7 @@ mod tests {
             driver.on_tick();
             assert_eq!(ring_gaps(&driver).len(), 1);
             assert_eq!(ring_gaps(&driver)[0].1, 1);
-            assert_eq!(lane_counts(&driver), (7, 7));
+            assert_eq!(lane_counts(&driver), (0, 7, 7));
             // The next rise accumulates onto the same gap row and counts.
             driver.semantic.as_mut().unwrap().age_staged_for_test(
                 Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
@@ -12261,7 +12327,129 @@ mod tests {
                 2,
                 "rises coalesce onto one gap row"
             );
-            assert_eq!(lane_counts(&driver), (12, 12));
+            assert_eq!(lane_counts(&driver), (0, 12, 12));
+        }
+
+        #[test]
+        fn events_ring_loss_read_failure_discloses_unknown_gap_once() {
+            let mut scene = driver_scene(2);
+            scene.stub.receipt_free = true;
+            // Two failed reads, then a successful read of 5: the
+            // failures disclose one unknown gap, the success the
+            // usual named loss.
+            scene.stub.ring_loss_fail = std::collections::VecDeque::from([true, true, false]);
+            scene.stub.ring_loss = std::collections::VecDeque::from([5]);
+            scene.lane.install_test_io(Box::new(scene.stub));
+            let mut driver = ClassicDriver {
+                coordinator: &mut scene.coordinator,
+                inventory_scope: None,
+                scope: InventoryRunScope::Pid(std::process::id()),
+                cgroup: None,
+                max_scan_pids: None,
+                guard: UnavailableImageGuard,
+                deadline: None,
+                attach_backend: crate::attach::BackendSelection::Auto,
+                identity: None,
+                display: None,
+                semantic: Some(scene.lane),
+                semantic_staged: false,
+                seated_summary: None,
+                second_signal: None,
+                lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+                completion_source: None,
+                pending_install: None,
+                installed_promotion: None,
+                retiring: None,
+                joint_finish: JointFinishDriver::NotBegun,
+                stop_requested: false,
+                joint_first_error: None,
+                suspended: false,
+                joint_commit_pending: false,
+                joint_tick_refusal: None,
+                joint_commit_retries: 0,
+                #[cfg(test)]
+                terminal_seq_calls: 0,
+                #[cfg(test)]
+                reclaim_calls: Vec::new(),
+                #[cfg(test)]
+                joint_begin_calls: 0,
+                #[cfg(test)]
+                joint_step_calls: 0,
+                #[cfg(test)]
+                joint_commit_polls: 0,
+                #[cfg(test)]
+                take_promotion_work_calls: 0,
+                #[cfg(test)]
+                drive_pending_install_calls: 0,
+                #[cfg(test)]
+                service_caller_metadata_calls: 0,
+                #[cfg(test)]
+                commit_calls: 0,
+            };
+            let gaps_by_subject = |driver: &ClassicDriver<'_>, subject: &str| {
+                driver
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .zip(driver.coordinator.registry().gap_repeats().iter())
+                    .filter(|(gap, _)| gap.subject == subject)
+                    .map(|(gap, repeats)| (gap.reason.clone(), *repeats))
+                    .collect::<Vec<_>>()
+            };
+            // The first tick stages without committing: nothing disclosed.
+            driver.on_tick();
+            assert!(driver.semantic_staged, "the first tick stages");
+            assert!(gaps_by_subject(&driver, "native capture events loss unknown").is_empty());
+            // The first failed read discloses one unknown gap, and no
+            // counted loss (the counter never answered).
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(
+                gaps_by_subject(&driver, "native capture events loss unknown"),
+                [(
+                    "the EVENTS ring-loss counter could not be read; kernel loss past this point is uncounted"
+                        .to_string(),
+                    1
+                )],
+                "a failed read discloses one unknown gap"
+            );
+            assert!(gaps_by_subject(&driver, "native capture events lost").is_empty());
+            // A repeat failure discloses nothing new.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(
+                gaps_by_subject(&driver, "native capture events loss unknown").len(),
+                1
+            );
+            assert_eq!(
+                gaps_by_subject(&driver, "native capture events loss unknown")[0].1,
+                1,
+                "repeat failures never re-record the unknown gap"
+            );
+            // The successful read discloses the usual named loss.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(
+                gaps_by_subject(&driver, "native capture events lost").len(),
+                1,
+                "a later success still discloses its rise"
+            );
+            let lane = driver.semantic.as_ref().unwrap();
+            assert_eq!(
+                (
+                    lane.shed_calls_disclosed(),
+                    lane.events_ring_loss_disclosed(),
+                    lane.semantic_summary().unrouted_returns
+                ),
+                (0, 5, 5)
+            );
         }
 
         #[test]
@@ -12357,6 +12545,86 @@ mod tests {
                 driver.coordinator.registry().instances().count(),
                 2,
                 "the safety net publishes nothing twice"
+            );
+        }
+
+        #[test]
+        fn terminal_sequence_polls_ring_loss_before_reading_stop_counts() {
+            // Isolate from lines other tests on this thread warned: the
+            // recorder is thread-local and every read drains.
+            take_warned_for_test();
+            // The counter stays flat through the terminal commits,
+            // then rises: only a poll after the last commit discloses
+            // it on the stop line. The poll count pins the rise to
+            // that terminal poll rather than an earlier commit.
+            let mut scene = driver_scene(2);
+            scene.stub.receipt_free = true;
+            // Quiescent with nothing pending: the drain commits no
+            // batch, so the only polls are the Finish commit's and
+            // the terminal poll's.
+            scene.stub.quiesce = true;
+            scene.stub.ring_loss = std::collections::VecDeque::from([0, 7]);
+            let polls = scene.stub.ring_loss_polls.clone();
+            scene.lane.install_test_io(Box::new(scene.stub));
+            let mut driver = ClassicDriver {
+                coordinator: &mut scene.coordinator,
+                inventory_scope: None,
+                scope: InventoryRunScope::Pid(std::process::id()),
+                cgroup: None,
+                max_scan_pids: None,
+                guard: UnavailableImageGuard,
+                deadline: None,
+                attach_backend: crate::attach::BackendSelection::Auto,
+                identity: None,
+                display: None,
+                semantic: Some(scene.lane),
+                semantic_staged: false,
+                seated_summary: None,
+                second_signal: None,
+                lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+                completion_source: None,
+                pending_install: None,
+                installed_promotion: None,
+                retiring: None,
+                joint_finish: JointFinishDriver::NotBegun,
+                stop_requested: false,
+                joint_first_error: None,
+                suspended: false,
+                joint_commit_pending: false,
+                joint_tick_refusal: None,
+                joint_commit_retries: 0,
+                #[cfg(test)]
+                terminal_seq_calls: 0,
+                #[cfg(test)]
+                reclaim_calls: Vec::new(),
+                #[cfg(test)]
+                joint_begin_calls: 0,
+                #[cfg(test)]
+                joint_step_calls: 0,
+                #[cfg(test)]
+                joint_commit_polls: 0,
+                #[cfg(test)]
+                take_promotion_work_calls: 0,
+                #[cfg(test)]
+                drive_pending_install_calls: 0,
+                #[cfg(test)]
+                service_caller_metadata_calls: 0,
+                #[cfg(test)]
+                commit_calls: 0,
+            };
+            driver.semantic.as_mut().unwrap().note_shed_calls(3);
+            driver.on_stop_requested();
+            assert_eq!(
+                take_warned_for_test(),
+                vec![crate::inventory_semantics::semantic_stop_line(
+                    0, 0, 3, 7, 1, 0
+                )],
+                "the stop line carries loss past the last terminal commit"
+            );
+            assert_eq!(
+                polls.get(),
+                2,
+                "the rise lands on the terminal poll, not a commit"
             );
         }
     }
@@ -16601,6 +16869,8 @@ mod promotion_driver_tests {
         /// linked-DD pump twin counts them here.
         pub(crate) discovery: Rc<Cell<usize>>,
         submitted: bool,
+        /// Scripted EVENTS ring-loss counter reads (cumulative).
+        pub(crate) ring_loss: std::collections::VecDeque<u64>,
     }
 
     impl Drop for WindDownIo {
@@ -16628,6 +16898,7 @@ mod promotion_driver_tests {
                 threads: Rc::new(RefCell::new(Vec::new())),
                 drop_spy: None,
                 submitted: false,
+                ring_loss: std::collections::VecDeque::new(),
             }
         }
 
@@ -16650,6 +16921,7 @@ mod promotion_driver_tests {
                 threads: Rc::new(RefCell::new(Vec::new())),
                 drop_spy: None,
                 submitted: false,
+                ring_loss: std::collections::VecDeque::new(),
             }
         }
 
@@ -16825,6 +17097,10 @@ mod promotion_driver_tests {
             _quantum: usize,
         ) -> crate::inventory_semantics::LaneDrainOutcome {
             crate::inventory_semantics::LaneDrainOutcome::default()
+        }
+
+        fn events_ring_loss(&mut self) -> Option<u64> {
+            self.ring_loss.pop_front()
         }
 
         fn service_live_discovery(&mut self) {
@@ -19695,7 +19971,26 @@ mod promotion_driver_tests {
     /// collected/joined/refused, real shed, no bound callers in the
     /// scene.
     fn expected_stop_line() -> String {
-        crate::inventory_semantics::semantic_stop_line(68, 5, 7, 0, 12)
+        crate::inventory_semantics::semantic_stop_line(68, 5, 7, 0, 0, 12)
+    }
+
+    #[test]
+    fn semantic_stop_counts_carry_ring_loss_as_lost() {
+        // Ring loss rides the stop line as its own `lost` term in
+        // records, never folded into the shed call count: the
+        // conservation identity stays collected == joined + shed.
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_stop_counts_for_test(Some(scripted_nonzero_stop_counts()));
+        lane.note_shed_calls(7);
+        lane.note_events_ring_loss(11);
+        let mut coordinator = coordinator();
+        let counts = SemanticStopCounts::read(&lane, &mut coordinator);
+        assert_eq!(counts.shed, 7, "shed counts drained calls only");
+        assert_eq!(counts.lost, 11, "ring loss reads as lost records");
+        assert_eq!(
+            crate::inventory_semantics::semantic_stop_line(68, 5, 7, 11, 0, 12),
+            "p11scope: semantic calls: collected 68, joined 5, shed 7, lost 11, bindings 0, refused 12"
+        );
     }
 
     /// Committed gaps for one subject, read without publishing:
@@ -20125,7 +20420,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0
             )],
             "the line still prints with zero counts"
         );
@@ -20155,7 +20450,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0
             )],
             "the line still prints with zero counts"
         );
@@ -20285,7 +20580,7 @@ mod promotion_driver_tests {
     /// The stop line the final-lane twin expects: its own scripted
     /// collected/joined/refused, its own real shed, no bound callers.
     fn expected_final_stop_line() -> String {
-        crate::inventory_semantics::semantic_stop_line(11, 3, 4, 0, 5)
+        crate::inventory_semantics::semantic_stop_line(11, 3, 4, 0, 0, 5)
     }
 
     #[test]
@@ -20796,6 +21091,121 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn escalate_hold_discloses_ring_loss_on_stop_line_and_summary() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A not-latched Joint lane held for exit (settle bound): the
+        // hold polls the ring-loss counter before it reads the stop
+        // counts, stages the named gap, and serves the post-hold
+        // summary past the handoff — even though no abandon commit
+        // runs on this path.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut io = WindDownIo::completing();
+        io.ring_loss = std::collections::VecDeque::from([9]);
+        let mut lane = joint_lane(io, false);
+        lane.set_scripted_stop_counts_for_test(Some(scripted_nonzero_stop_counts()));
+        lane.note_shed_calls(7);
+        assert!(
+            !lane.joint_finish_disposition_required(),
+            "the twin holds a not-latched lane"
+        );
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.escalate_joint_finish("joint finish settle bound reached");
+        assert!(driver.semantic.is_none(), "the lane is held for exit");
+        assert_eq!(
+            driver.joint_first_error.as_deref(),
+            Some("joint finish settle bound reached"),
+            "a not-latched hold keeps the trigger cause"
+        );
+        let staged: Vec<_> = driver
+            .coordinator
+            .registry()
+            .staged_scope_gaps_for_test()
+            .into_iter()
+            .filter(|(subject, _)| subject == "native capture events lost")
+            .collect();
+        assert_eq!(staged.len(), 1, "the hold stages the named gap: {staged:?}");
+        assert_eq!(
+            take_warned_for_test(),
+            vec![crate::inventory_semantics::semantic_stop_line(
+                68, 5, 7, 9, 0, 12
+            )],
+            "the stop line carries the hold-polled loss"
+        );
+        assert_eq!(
+            driver.semantic_summary().unrouted_returns,
+            9,
+            "the served summary counts the loss past the handoff"
+        );
+    }
+
+    #[test]
+    fn latched_abandon_hold_discloses_ring_loss_on_its_stop_line() {
+        // Isolate from lines other tests on this thread warned: the
+        // recorder is thread-local and every read drains.
+        take_warned_for_test();
+        // A latched Joint lane held for exit: the abandon commit
+        // runs and publishes, but the hold polls the ring-loss
+        // counter before it reads the stop counts, so the stop line
+        // carries the loss instead of missing it.
+        let mut io = WindDownIo::completing();
+        io.ring_loss = std::collections::VecDeque::from([9]);
+        let mut lane = joint_lane(io, false);
+        lane.set_scripted_stop_counts_for_test(Some(scripted_nonzero_stop_counts()));
+        lane.note_shed_calls(7);
+        lane.note_joint_finish_failure(
+            crate::inventory_semantics::SemanticRefusal::ProviderStorage,
+        );
+        assert!(
+            lane.joint_finish_disposition_required(),
+            "the twin latches the lane"
+        );
+        let mut coordinator = coordinator();
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        let (error, summary) = ClassicDriver::hold_joint_lane_for_exit(
+            lane,
+            &mut coordinator,
+            "joint finish disposition required",
+            "joint finish abandoned for exit",
+            &mut warn,
+            None,
+        );
+        assert_eq!(
+            error, "joint finish disposition required",
+            "a latched hold keeps the disposition reason"
+        );
+        assert_eq!(
+            summary.unrouted_returns, 9,
+            "the hold returns the post-commit counts"
+        );
+        let gaps: Vec<_> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "native capture events lost")
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the abandon commit publishes the loss gap: {gaps:?}"
+        );
+        assert_eq!(
+            take_warned_for_test(),
+            vec![crate::inventory_semantics::semantic_stop_line(
+                68, 5, 7, 9, 0, 12
+            )],
+            "the stop line carries the hold-polled loss"
+        );
+    }
+
+    #[test]
     fn held_tripped_finish_names_wedge_on_stderr() {
         // Isolate from lines other tests on this thread warned: the
         // recorder is thread-local and every read drains.
@@ -21127,7 +21537,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0
             )],
             "the wind-down discloses the legacy lane once"
         );

@@ -14,7 +14,8 @@ evidence directory into a verdict. Six fail-closed gates:
   entries on the owned provider copy exactly; no foreign caller holds
   edges on that copy.
 - loss_accounting: no silent loss — the semantic stop line conserves
-  (collected == joined + shed), every nonzero shed/refused/unrouted
+  (collected == joined + shed) with its separate lost term for
+  kernel ring loss, every nonzero shed/refused/unrouted/lost
   count has a named gap, every gap is named (subject + reason), and
   gaps_suppressed == 0.
 - resource_accounting: the 1 Hz RSS/FD trace spans the window, RSS
@@ -92,7 +93,7 @@ def _resources(rows):
 
 
 def make_green(root, *, horizon=1800, callers=PIDS, mode="live",
-               shed=0, refused=0, unrouted=0, gaps=()):
+               shed=0, refused=0, unrouted=0, lost=0, gaps=()):
     """Write a fully green fixture evidence directory; legs mutate copies."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=False)
@@ -122,7 +123,7 @@ def make_green(root, *, horizon=1800, callers=PIDS, mode="live",
     (root / "observer.stderr").write_text(
         f"p11scope: pass 0: attached\n"
         f"p11scope: semantic calls: collected {collected}, joined {joined}, "
-        f"shed {shed}, bindings {len(callers)}, refused {refused}\n",
+        f"shed {shed}, lost {lost}, bindings {len(callers)}, refused {refused}\n",
         encoding="utf-8")
     step_ms = (horizon + 60) * 1000 // 120
     (root / "resources.tsv").write_text(
@@ -236,6 +237,27 @@ class SoakOracleTest(unittest.TestCase):
             self.base / "shed", shed=100, gaps=[("semantic calls unrouted", "first burst")])
         verdict = self.evaluate(counted)
         self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+
+    def test_green_named_events_loss_passes(self):
+        disclosed = make_green(
+            self.base / "events-lost", lost=100,
+            gaps=[("native capture events lost", "kernel reserve failures")])
+        verdict = self.evaluate(disclosed)
+        self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+        self.assertIn("lost=100", verdict["gates"]["loss_accounting"]["detail"])
+
+    def test_green_events_loss_gap_also_names_unrouted(self):
+        disclosed = make_green(
+            self.base / "events-lost-unrouted", unrouted=7,
+            gaps=[("native capture events lost", "kernel reserve failures")])
+        verdict = self.evaluate(disclosed)
+        self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+
+    def test_red_loss_silent_events_loss(self):
+        silent = make_green(self.base / "silent-events-lost", lost=40)
+        verdict = self.evaluate(silent)
+        self.assert_red_only(verdict, "loss_accounting")
+        self.assertIn("events_lost=40", verdict["gates"]["loss_accounting"]["detail"])
 
     def test_green_dry_run_passes_but_never_qualifies(self):
         dry = make_green(self.base / "dry", horizon=8, mode="dry-run")
@@ -410,7 +432,7 @@ class SoakOracleTest(unittest.TestCase):
         def break_conservation(target):
             (target / "observer.stderr").write_text(
                 "p11scope: semantic calls: collected 100, joined 40, shed 30, "
-                "bindings 2, refused 0\n", encoding="utf-8")
+                "lost 0, bindings 2, refused 0\n", encoding="utf-8")
         self.assert_red_only(
             self.evaluate(mutate_copy(self.green, "leg-unconserved", break_conservation)),
             "loss_accounting")

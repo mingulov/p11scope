@@ -43,8 +43,30 @@ pub(crate) trait DieWithParent {
 
 impl DieWithParent for Command {
     fn die_with_parent(&mut self) -> &mut Self {
-        // RED: no guard registered yet; the orphan cell below fails until
-        // the pre_exec hook lands.
+        use std::os::unix::process::CommandExt as _;
+        // The orphan check compares against the owner at fork: a live
+        // subreaper may adopt the child before the hook runs, so testing
+        // for init alone misses live adoption, and the death signal never
+        // fires for a death that predates it.
+        let owner = std::process::id();
+        // SAFETY: the hook runs after fork before exec; its body uses
+        // async-signal-safe calls only (prctl, getppid, _exit), allocates
+        // nothing and touches no parent memory. The signal fires when the
+        // forking *thread* exits; the spawning test thread outlives its
+        // children (see the module docs), so thread death is test death
+        // here. A parent already gone exits 127 before exec, so no orphan
+        // starts; the caller's readiness logic then fails loud.
+        unsafe {
+            self.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != owner as libc::pid_t {
+                    libc::_exit(127);
+                }
+                Ok(())
+            });
+        }
         self
     }
 }

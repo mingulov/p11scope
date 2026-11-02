@@ -1725,6 +1725,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.registry.note_journal_linked(linked);
     }
 
+    /// Disclose the unlinked journal once per lane at machine init
+    /// (O0): idempotent with the Births and stray-receipt sites, so
+    /// the lane records exactly one `joint_journal_unavailable` row
+    /// however many quanta run unlinked.
+    pub(crate) fn disclose_joint_journal_unavailable_once(&mut self) {
+        self.registry.disclose_joint_journal_unavailable_once();
+    }
+
     /// Stages one pass-wide count-refresh loss boundary from the lane
     /// itself (P1-5 terminal-first): an incomplete terminal refresh
     /// demotes the retained counts to lower bounds exactly like a

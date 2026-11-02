@@ -14793,6 +14793,83 @@ pub(crate) mod tests {
         );
     }
 
+    /// P2A-1 carry item 2, KNOWN HOLD (not intent): the safe-entry
+    /// producer reads the mechanism word only at return, so the staged
+    /// BEGIN carries NONE + sentinel while the H0 admission (and the
+    /// END) carry VALUE + word. Claims file under the admitted
+    /// (return-side) fingerprint but attribute under the BEGIN
+    /// (entry-side) one by exact equality, so the staged shape is
+    /// Unclaimed and the seal holds with BoundNotReady. The END itself
+    /// stages (return rewrites agree). Owned by the Activation packet
+    /// (P2A-1 finding 1: rewrite-aware claim matching, with END and
+    /// lost-END twins); live, this hold sits behind the H3Loss
+    /// StagedLoss failure. Flip the seal assertion when that lands.
+    #[test]
+    fn object_journal_return_read_mechanism_claim_holds_seal() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
+        use p11scope_ebpf_common::{MECH_NONE, capture};
+        let mut scene = Scene::new(image_default());
+        let function = function_id("C_SignInit");
+        let begin = begin_bytes_shaped(
+            1,
+            1,
+            function,
+            0,
+            (COOKIE, EXEC),
+            SESSION,
+            MECH_NONE,
+            capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL,
+            Some((7, 1)),
+            None,
+            FLAGS,
+        );
+        scene.ingest(&begin);
+        let mut end = end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 60);
+        // The return probe's rewrite: VALUE + word over the entry's NONE
+        // + sentinel, at the END event's mechanism/capture offsets.
+        put_u64(&mut end, 24 + 48, 1);
+        put_u32(
+            &mut end,
+            24 + 280,
+            capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+        );
+        assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        let JournalRecord::End(staged) = decode_journal_record(&end, &scene.descriptors).unwrap()
+        else {
+            panic!("END")
+        };
+        let returned = staged.payload_base().event;
+        assert_eq!(returned.mechanism, 1);
+        assert_eq!(
+            returned.capture & capture::MECHANISM_MASK,
+            capture::MECHANISM_VALUE,
+            "the twin models the return rewrite, not equality-by-copy"
+        );
+        let admitted = scene.fixture.admit_original_event("C_SignInit", returned);
+        let JournalRecord::Begin(native) =
+            decode_journal_record(&begin, &scene.descriptors).unwrap()
+        else {
+            panic!("BEGIN")
+        };
+        let admitted_fp = admitted
+            .journal_call_fingerprint()
+            .expect("the paired return files a claim");
+        let begin_fp = fingerprint_of_begin(&native);
+        assert_ne!(
+            (begin_fp.mechanism, begin_fp.capture),
+            (admitted_fp.mechanism, admitted_fp.capture),
+            "entry-side vs return-side fingerprints diverge"
+        );
+        let proof = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("paired return attests");
+        let hold = scene
+            .seal(&scene.bootstrap(proof, 0))
+            .expect_err("the diverged claim holds the seal today");
+        assert_eq!(hold.gap, JournalGap::BoundNotReady);
+    }
+
     #[test]
     fn object_journal_c2_original_interval_refusals_preserve_s1() {
         use crate::semantics_edge::EdgeSemantics;

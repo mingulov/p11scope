@@ -146,6 +146,15 @@ pub(crate) struct JointRegistrationWindow {
     end: usize,
 }
 
+#[cfg(test)]
+impl JointRegistrationWindow {
+    /// Tests-only empty window for cursor/guard twins that never
+    /// consult registrations (peek, stage, claim cursors).
+    pub(crate) fn scripted_empty() -> Self {
+        Self { start: 0, end: 0 }
+    }
+}
+
 struct JointRegistrationSlot {
     hash: u64,
     row: usize,

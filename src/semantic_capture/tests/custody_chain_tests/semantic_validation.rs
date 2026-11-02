@@ -1221,7 +1221,7 @@ fn joint_prepared_batch_keeps_equal_shaped_original_admissions() {
         !fixture
             .scene
             .coordinator
-            .stage_next_prepared_admission(false)
+            .stage_next_prepared_admission(false, true)
     );
     fixture.scene.coordinator.dispose_prepared_claims_s1();
     for _ in 0..3 {
@@ -1229,20 +1229,20 @@ fn joint_prepared_batch_keeps_equal_shaped_original_admissions() {
             fixture
                 .scene
                 .coordinator
-                .stage_next_prepared_admission(false)
+                .stage_next_prepared_admission(false, true)
         );
     }
     assert!(
         !fixture
             .scene
             .coordinator
-            .stage_next_prepared_admission(false)
+            .stage_next_prepared_admission(false, true)
     );
     assert!(
         !fixture
             .scene
             .coordinator
-            .stage_next_prepared_admission(false)
+            .stage_next_prepared_admission(false, true)
     );
     assert!(
         fixture
@@ -1332,7 +1332,7 @@ fn joint_prepared_current_receipt_budget_includes_held_provider_allocations() {
         healthy
             .scene
             .coordinator
-            .stage_next_prepared_admission(false)
+            .stage_next_prepared_admission(false, true)
     );
     assert!(
         healthy
@@ -1409,7 +1409,7 @@ fn joint_prepared_current_receipt_budget_includes_held_provider_allocations() {
         !limited
             .scene
             .coordinator
-            .stage_next_prepared_admission(false)
+            .stage_next_prepared_admission(false, true)
     );
     assert!(
         !limited

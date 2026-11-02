@@ -326,6 +326,10 @@ def main(binary, work, keep):
         # asserting an exact total under load. One loader-timing flake
         # stays green; systematic starvation fails.
         admission_totals = []
+        # PA-5 I2: fail if any non-closure module has a refusal or omission
+        # record in any attempt. "Best of 5 >= 100" alone passed while 4 of 5
+        # runs omitted opensc; a provider must never be starved by p11-kit.
+        non_closure_skips = []
         for attempt in range(1, 6):
             tag = "trust-adm-try%d" % attempt
             run_observer(
@@ -336,6 +340,12 @@ def main(binary, work, keep):
             doc = json.loads((work / (tag + ".json")).read_text())
             total, _ = doc_totals(doc)
             admission_totals.append(total)
+            for skipped in doc.get("evidence", {}).get("modules_skipped", []):
+                reason = skipped.get("reason", "")
+                # Closure records (whole refusal or prefix) are the proxy
+                # layer; anything else is a starved provider.
+                if "proxy closure array" not in reason and "template tables attached" not in reason:
+                    non_closure_skips.append((tag, skipped.get("name", ""), reason[:200]))
             print("trust admission try%d: %d calls%s" % (
                 attempt, total,
                 " %s" % race_flags(doc) if race_flags(doc) else "",
@@ -344,8 +354,11 @@ def main(binary, work, keep):
         require(best >= 100,
                 "trust backend never admitted in 5 attempts: %r"
                 % (admission_totals,))
+        require(not non_closure_skips,
+                "non-closure refusal/omission in trust admission: %r"
+                % (non_closure_skips,))
         results["trust_admission"] = {"attempts": admission_totals, "best": best}
-        print("trust admission twin: best of 5 is %d calls" % best)
+        print("trust admission twin: best of 5 is %d calls, no provider refused or omitted" % best)
 
         # Twin 2: the remote workload excluded to 0, never silent. No
         # --module: discovery stays automatic and the exclusion removes

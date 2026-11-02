@@ -3232,13 +3232,17 @@ fn render_excluded(out: &mut String, catalog: &Catalog) {
     if !excluded.is_empty() {
         let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
         for item in &excluded {
+            let processes = if item.processes == 1 {
+                "1 process mapped it".to_string()
+            } else {
+                format!("{} processes mapped it", item.processes)
+            };
             let _ = writeln!(
                 out,
-                "  {}: excluded by you (device {} inode {}, {} processes mapped it); calls into this file were not observed",
+                "  {}: excluded by you (device {} inode {}, {processes}); calls into this file were not observed",
                 crate::render::escape_controls(&item.path),
                 item.dev,
                 item.ino,
-                item.processes
             );
         }
     }
@@ -5988,7 +5992,7 @@ mod tests {
         assert!(text.contains("Excluded by you (1 files):"), "{text}");
         assert!(
             text.contains(
-                "/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 1 processes mapped it)"
+                "/opt/libp11-kit.so.0.4.8: excluded by you (device 42 inode 1001, 1 process mapped it)"
             ),
             "{text}"
         );

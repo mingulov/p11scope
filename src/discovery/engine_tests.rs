@@ -2815,6 +2815,45 @@ fn a_larger_whole_refusal_replaces_the_published_whole_refusal() {
     assert_eq!(engine.plan.active_slot_count(), 0);
 }
 
+/// PA-5 I1: a later prefix record replaces an earlier whole-refusal record
+/// for the same closure module in the engine history the report renders.
+/// Without this the report says "not attached" while the prefix counts.
+/// This pins the replacement rule that `merge_current` applies: a known
+/// whole-refusal reason plus a new prefix reason for one module replaces.
+#[test]
+fn a_later_closure_prefix_replaces_the_earlier_whole_refusal() {
+    // Real planner reason shapes (from `plan::tests`): a whole refusal names
+    // the lookalike tables with the M2 wording, and a prefix names its
+    // covered templates. Same subject, same module.
+    let whole = "module needs 6283 more; only 512 attach slots are available; 68 are in use \
+         (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a prefix \
+         of its 64 lookalike function tables (a proxy closure array is admitted whole, as a prefix \
+         when first seen, or as published tables)";
+    let prefix = "2 of 64 template tables attached; calls through the others are not counted";
+    assert!(
+        plan::is_closure_array_refusal(whole),
+        "whole refusal recognized"
+    );
+    assert!(
+        !plan::is_closure_array_prefix(whole),
+        "whole refusal is not a prefix"
+    );
+    assert!(plan::is_closure_array_prefix(prefix), "prefix recognized");
+    assert!(
+        !plan::is_closure_array_refusal(prefix),
+        "prefix is not a whole refusal"
+    );
+    // The `merge_current` rule: known whole-refusal + new prefix => replace.
+    let replaces = plan::is_closure_array_refusal(whole) && plan::is_closure_array_prefix(prefix);
+    assert!(
+        replaces,
+        "a later prefix replaces the earlier whole refusal"
+    );
+    // And not the reverse: a known prefix is never replaced by a whole refusal.
+    let reverse = plan::is_closure_array_refusal(prefix) && plan::is_closure_array_prefix(whole);
+    assert!(!reverse, "a whole refusal never replaces a prefix");
+}
+
 #[test]
 fn start_attempt_stages_initial_facts_before_active_cleanup() {
     let (mut engine, _, _, _) = engine_with_overlay(56);

@@ -1028,7 +1028,7 @@ fn copy_vma_proto_kind(raw: &[u8]) -> Option<CopyVmaTarget> {
         let proto = resolve(word(function, 8)?)?;
         let arity = word(proto, 4)?;
         let count = (arity & 65535) as usize;
-        if (arity >> 24) & 31 != 13 || !matches!(count, 5 | 6 | 7) {
+        if (arity >> 24) & 31 != 13 || !matches!(count, 5..=7) {
             return Some(None);
         }
         if !vma_pointee(word(proto, 8)?)? {

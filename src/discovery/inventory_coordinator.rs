@@ -7447,10 +7447,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // rise discloses in the same publication instead of staying
         // silent. A failed read only delays disclosure: the counter is
         // cumulative and the last good value stands.
-        if let Some(lane) = lane.as_deref_mut()
-            && let Some(delta) = lane.poll_events_ring_loss()
-        {
-            self.disclose_events_ring_loss(lane, delta);
+        if let Some(lane) = lane.as_deref_mut() {
+            self.poll_and_disclose_events_ring_loss(lane);
         }
         self.finalize_semantic_batches(lane);
         let applied = self.publish_registry(None)?;

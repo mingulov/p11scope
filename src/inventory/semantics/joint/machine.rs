@@ -3360,6 +3360,14 @@ impl LiveJointMachine {
                         if final_original {
                             self.finish_receipt = Some(receipt);
                         }
+                        // Poll the EVENTS ring-loss counter on every
+                        // machine publish, mirroring the plain commit
+                        // path: a rise discloses in the next
+                        // publication instead of staying silent. The
+                        // poll runs before the demand check below can
+                        // return early, so a publish that outruns its
+                        // demand still discloses.
+                        coordinator.poll_and_disclose_events_ring_loss(lane);
                         if let Some(Demand::Bound {
                             original,
                             base_revision,
@@ -3369,13 +3377,6 @@ impl LiveJointMachine {
                                 return (Phase::Idle, Err(SemanticRefusal::Unavailable));
                             }
                             self.demand = Some(Demand::Published(receipt));
-                        }
-                        // Poll the EVENTS ring-loss counter on every
-                        // machine publish, mirroring the plain commit
-                        // path: a rise discloses in the next
-                        // publication instead of staying silent.
-                        if let Some(delta) = lane.poll_events_ring_loss() {
-                            coordinator.disclose_events_ring_loss(lane, delta);
                         }
                         (Phase::Idle, Ok(Step::Published))
                     }

@@ -927,6 +927,11 @@ pub(crate) struct AttestedSemanticLane {
     events_ring_loss_seen: u64,
     /// Cumulative disclosed EVENTS ring loss; feeds unrouted_returns.
     events_ring_loss: u64,
+    /// An EVENTS ring-loss counter read failed: kernel loss past
+    /// that point is uncounted. Latched, never cleared.
+    events_loss_unknown: bool,
+    /// The unknown-loss gap was already recorded.
+    events_loss_unknown_reported: bool,
     /// The most recent lane tick's collection stopped at its record
     /// quantum with more possibly waiting. The driver reads this
     /// right after a successful tick and commits promptly so the
@@ -1643,6 +1648,8 @@ impl AttestedSemanticLane {
             disclosed_calls_shed: 0,
             events_ring_loss_seen: 0,
             events_ring_loss: 0,
+            events_loss_unknown: false,
+            events_loss_unknown_reported: false,
             last_collection_saturated: false,
             oversized_drop_shed: BTreeMap::new(),
             #[cfg(test)]
@@ -1813,6 +1820,8 @@ impl AttestedSemanticLane {
             disclosed_calls_shed: 0,
             events_ring_loss_seen: 0,
             events_ring_loss: 0,
+            events_loss_unknown: false,
+            events_loss_unknown_reported: false,
             last_collection_saturated: false,
             oversized_drop_shed: BTreeMap::new(),
             #[cfg(test)]
@@ -1967,17 +1976,47 @@ impl AttestedSemanticLane {
     /// Poll the EVENTS ring-loss kernel counter; `Some(delta)` when it
     /// rose since the last poll. The counter is cumulative, so a failed
     /// read only delays disclosure to the next successful poll: the
-    /// last good value stands and nothing is invented. Tests
-    /// substitute the counter through [`LaneTestIo`].
+    /// last good value stands and nothing is invented. A failed read
+    /// also latches the unknown-loss flag (a lane without any
+    /// readable counter stays quiet). Tests substitute the counter
+    /// through [`LaneTestIo`]. Production callers use the
+    /// coordinator's merged poll-and-disclose choke point instead of
+    /// calling this directly, so a polled delta is never dropped.
     pub(crate) fn poll_events_ring_loss(&mut self) -> Option<u64> {
         #[cfg(test)]
         if let Some(test) = self.test_io.as_mut() {
+            if test.events_ring_loss_fails() {
+                self.note_events_loss_unknown();
+                return None;
+            }
             let total = test.events_ring_loss()?;
             return self.note_ring_loss_total(total);
         }
         let live = self.live.as_mut()?;
-        let total = live.session.events_ring_loss().ok()?;
-        self.note_ring_loss_total(total)
+        match live.session.events_ring_loss() {
+            Ok(total) => self.note_ring_loss_total(total),
+            Err(_) => {
+                self.note_events_loss_unknown();
+                None
+            }
+        }
+    }
+
+    /// Latch unknown EVENTS loss: a counter read failed, so kernel
+    /// loss past this point is uncounted. Latched, never cleared.
+    fn note_events_loss_unknown(&mut self) {
+        self.events_loss_unknown = true;
+    }
+
+    /// Take the unknown-loss disclosure, once per lane: true the
+    /// first time a latched failure is collected for its gap, false
+    /// before any failure and after the gap is recorded.
+    pub(crate) fn take_events_loss_unknown(&mut self) -> bool {
+        if self.events_loss_unknown && !self.events_loss_unknown_reported {
+            self.events_loss_unknown_reported = true;
+            return true;
+        }
+        false
     }
 
     /// Fold one cumulative counter read into the lane: `Some(delta)`

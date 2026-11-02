@@ -161,6 +161,35 @@ q() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+# Guest release match: the tag without its leading v must equal uname -r
+# or prefix it, except release candidates, whose tag (v7.4-rc1) boots the
+# dotted triplet (7.4.0-070400rc1-generic): there the triplet prefix plus
+# the same rc marker must match, never another rc number.
+release_ok() {
+    _release_expected=${1#v}
+    _release_guest=$2
+    case "$_release_guest" in
+        "$_release_expected"|"$_release_expected"-*)
+            return 0
+            ;;
+    esac
+    case "$_release_expected" in
+        *-rc[0-9]*)
+            _release_base=${_release_expected%-rc*}
+            _release_tag=${_release_expected##*-rc}
+            case "$_release_guest" in
+                "$_release_base.0-"*rc"$_release_tag")
+                    return 0
+                    ;;
+                "$_release_base.0-"*rc"$_release_tag"[!0-9]*)
+                    return 0
+                    ;;
+            esac
+            ;;
+    esac
+    return 1
+}
+
 FAILED=0
 VNG_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/virtme-ng"
 GUEST_ENV="$OUTDIR/guest-env.sh"
@@ -265,16 +294,13 @@ for KERNEL in "$@"; do
     fi
     grep -E '^(staged-boot-config|boot-config-present)-' "$VNG_LOG" | tail -1
     GUEST_RELEASE=$(grep '^guest-release=' "$VNG_LOG" | tail -1 | cut -d= -f2)
-    case "$GUEST_RELEASE" in
-        "${KERNEL#v}"|"${KERNEL#v}-"*)
-            echo "# guest release $GUEST_RELEASE (expected $KERNEL)"
-            ;;
-        *)
-            echo "# error: guest booted $GUEST_RELEASE, expected $KERNEL"
-            FAILED=1
-            continue
-            ;;
-    esac
+    if release_ok "$KERNEL" "$GUEST_RELEASE"; then
+        echo "# guest release $GUEST_RELEASE (expected $KERNEL)"
+    else
+        echo "# error: guest booted $GUEST_RELEASE, expected $KERNEL"
+        FAILED=1
+        continue
+    fi
     echo "# doctor rc=$(grep '^doctor-rc=' "$VNG_LOG" | tail -1 | cut -d= -f2)"
     if [ ! -f "$DOCTOR_TXT" ] || ! grep -q 'host program preflight' "$DOCTOR_TXT"; then
         echo "# error: doctor never reached host program preflight on $KERNEL"
@@ -300,16 +326,13 @@ for KERNEL in "$@"; do
     fi
     grep -E '^(staged-boot-config|boot-config-present)-' "$VNG_INV_LOG" | tail -1
     INV_RELEASE=$(grep '^guest-release=' "$VNG_INV_LOG" | tail -1 | cut -d= -f2)
-    case "$INV_RELEASE" in
-        "${KERNEL#v}"|"${KERNEL#v}-"*)
-            echo "# inventory guest release $INV_RELEASE (expected $KERNEL)"
-            ;;
-        *)
-            echo "# error: inventory guest booted $INV_RELEASE, expected $KERNEL"
-            FAILED=1
-            continue
-            ;;
-    esac
+    if release_ok "$KERNEL" "$INV_RELEASE"; then
+        echo "# inventory guest release $INV_RELEASE (expected $KERNEL)"
+    else
+        echo "# error: inventory guest booted $INV_RELEASE, expected $KERNEL"
+        FAILED=1
+        continue
+    fi
     # A failed inventory command still falls through to the reports: its
     # probe rows name the refused program, and the Detailed rows from the
     # first guest stay valid. Only infrastructure failures above skip the
@@ -379,16 +402,13 @@ for KERNEL in "$@"; do
             continue
         fi
         C_RELEASE=$(grep '^guest-release=' "$C_VNG_LOG" | tail -1 | cut -d= -f2)
-        case "$C_RELEASE" in
-            "${KERNEL#v}"|"${KERNEL#v}-"*)
-                echo "# counter-$MODE guest release $C_RELEASE (expected $KERNEL)"
-                ;;
-            *)
-                echo "# error: counter-$MODE guest booted $C_RELEASE, expected $KERNEL"
-                FAILED=1
-                continue
-                ;;
-        esac
+        if release_ok "$KERNEL" "$C_RELEASE"; then
+            echo "# counter-$MODE guest release $C_RELEASE (expected $KERNEL)"
+        else
+            echo "# error: counter-$MODE guest booted $C_RELEASE, expected $KERNEL"
+            FAILED=1
+            continue
+        fi
         C_RC=$(grep '^counter-rc=' "$C_VNG_LOG" | tail -1 | cut -d= -f2)
         # A failed counter run still falls through to per-program
         # scoring like inventory does: the probe rows name the

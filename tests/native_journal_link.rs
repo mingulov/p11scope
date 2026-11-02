@@ -357,7 +357,7 @@ expected = {
     'p11_journal_settle_prepare': (4, (('ptr', 16), ('int', 4), ('ptr', 72))),
     'p11_journal_settle_finish': (4, (('ptr', 72), ('int', 4))),
     'p11_owner_start_remove_reason': (8, (('ptr', 16), ('int', 4), ('int', 4))),
-    'p11_instance_exec_birth': (4, ()),
+    'p11_instance_exec_birth': (4, (('int', 4),)),
     'p11_instance_scope_gap': (4, ()),
 }
 for name, (result_size, arguments) in expected.items():

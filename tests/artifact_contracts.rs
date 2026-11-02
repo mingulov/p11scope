@@ -7825,7 +7825,9 @@ fn instance_epoch_journal_gap_selector_keeps_birth_and_exec_reads_separate() {
             ("u32 p11_instance_scope_gap(void)", gap),
             ("void marker_latch(", gap),
             ("extern unsigned char JOURNAL_MARKER_CTL;", gap),
-            ("u32 p11_instance_exec_birth(void)", birth),
+            ("u32 p11_instance_exec_birth(u32 pid_scope_tgid)", birth),
+            ("extern unsigned char PID_START_TICK;", birth),
+            ("start_boottime", birth),
             ("self_exec_id", birth),
             ("#define INST_MARKER_EXEC_ID(", birth),
         ] {

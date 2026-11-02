@@ -274,6 +274,12 @@
     },
     {
       "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_pid_reuse_exec_creates_no_row",
+      "reason": "privileged: birth marker PID reuse exec creates no row",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties",
       "reason": "privileged: birth marker return outside scope dirties",
       "cell": "privileged"
@@ -778,6 +784,36 @@
       "file": "src/discovery/inventory_workload_tests.rs",
       "path": "discovery::inventory_workload::tests::privileged_inventory_attach_projection_n8192",
       "reason": "controller lane: privileged BPF load plus attach-scale projection at 8192 endpoints",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_env_wrapper_matches_direct_count_lp64",
+      "reason": "privileged: run --pause auto through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64",
+      "reason": "privileged: run --pause auto through sh -c exec with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64",
+      "reason": "privileged: run --pause auto through a forking sh wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_never_env_wrapper_matches_direct_count_lp64",
+      "reason": "privileged: run --pause off through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_preloaded_exec_matches_direct_count_lp64",
+      "reason": "privileged: run --pause auto through a preload-then-exec wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
       "cell": "privileged"
     },
     {

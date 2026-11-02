@@ -401,6 +401,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "nonleader_exec_creates_fresh_ready_row",
             "ordinary_capture_mints_no_birth",
             "pid_outsider_stays_unobserved",
+            "pid_reuse_exec_creates_no_row",
             "return_outside_scope_dirties",
         )}
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
@@ -858,7 +859,7 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=143",
+            "DEFAULT_TESTS=150",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
             "SKIP_TESTS=87",

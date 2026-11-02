@@ -187,6 +187,17 @@ static CONFIG: Array<u64> = Array::with_max_entries(2, BPF_F_RDONLY_PROG);
 #[map]
 static PID_FILTER: HashMap<u32, u64> = HashMap::with_max_entries(1024, BPF_F_RDONLY_PROG);
 
+// I4 PID-scope birth identity (marker Detailed and journal objects): the
+// PID scope target's thread-group start tick, published next to the PID
+// at scope publication. The native exec birth compares it after its
+// generation and control gates; a reused PID number carries another
+// tick and is not born. Absent from every other flavor and build: no
+// map, no gate, no read.
+#[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+#[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+#[map]
+static PID_START_TICK: HashMap<u32, u64> = HashMap::with_max_entries(1024, BPF_F_RDONLY_PROG);
+
 #[map]
 static CGROUP_FILTER: CgroupArray = CgroupArray::with_max_entries(1, 0);
 
@@ -2147,6 +2158,20 @@ pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {
     rc
 }
 
+/// I4 PID-scope birth identity: the tgid the native exec birth checks
+/// against `PID_START_TICK`. Under PID scope it is the target `scope_auth`
+/// admitted by number; cgroup and system scopes pass 0 and are unchanged.
+#[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
+#[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
+#[inline(always)]
+fn pid_scope_tgid(scope: &ScopeAuth) -> u32 {
+    if scope.flags & FLAG_PID_FILTER != 0 {
+        scope.tgid
+    } else {
+        0
+    }
+}
+
 #[inline(always)]
 fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
     // Mandatory current-physical-task cleanup precedes all capture filters.
@@ -2167,11 +2192,13 @@ fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
     if let Some(scope) = scope_auth() {
         // H8-D birth marker: an in-scope exec after closure publishes
         // READY (Detailed and journal share; scope-gated, never charged
-        // outside scope; PID seam: witness wraps here after the gen gate).
+        // outside scope). I4: under PID scope the native body births only
+        // the target process itself (start-time witness after the gen
+        // gate); a reused PID number gains no row, charge or exec-ID read.
         #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
         #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
         unsafe {
-            p11_instance_exec_birth();
+            p11_instance_exec_birth(pid_scope_tgid(&scope));
         }
         let old_pid = _ctx.arg::<u64>(1);
         let pid_tgid = helpers::bpf_get_current_pid_tgid();
@@ -3134,9 +3161,11 @@ unsafe extern "C" {
     /// and journal): the exec half publishes READY on the leader row after
     /// closure; the gap half dirties it on an out-of-scope or refused
     /// call. Both own their frames; failures latch the control row.
+    /// `pid_scope_tgid` is the PID scope target's tgid (0 under cgroup
+    /// and system scope), checked against `PID_START_TICK` natively.
     #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
     #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
-    fn p11_instance_exec_birth() -> u32;
+    fn p11_instance_exec_birth(pid_scope_tgid: u32) -> u32;
     #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
     #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
     fn p11_instance_scope_gap() -> u32;

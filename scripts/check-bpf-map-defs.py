@@ -2288,11 +2288,12 @@ _DETAILED_BASE_MAPS = {
         "INSTANCE_START": (9, 16, 24, 16_384),
     }.items()
 }
-# The birth-marker control row ships in default FULL/P0 objects. Builds
-# that cannot carry the journal (unsafe, wide) omit it, so only the
-# default variant requires it.
+# The birth-marker control row and the PID-scope birth witness ship in
+# default FULL/P0 objects. Builds that cannot carry the journal (unsafe,
+# wide) omit them, so only the default variant requires them.
 SAFE_MAPS = _DETAILED_BASE_MAPS | {
     "JOURNAL_MARKER_CTL": map_def(2, 4, 16, 1, 0),
+    "PID_START_TICK": map_def(1, 4, 8, 1_024, 128),
 }
 UNSAFE_MAPS = _DETAILED_BASE_MAPS | {
     "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
@@ -2340,14 +2341,16 @@ UNSAFE_PROGRAMS = SAFE_PROGRAMS | {
     "p11_entry_template_second", "p11_entry_template_types",
 }
 # The production journal object: Detailed maps plus the four journal maps
-# (its own marker control row included), with the entry/return pair
-# replaced by the journal roots. Built only at FULL capacities, with the
-# build's own attribute-capture selection (P0 stubs it, like Detailed).
+# (its own marker control row included) and the PID-scope birth witness,
+# with the entry/return pair replaced by the journal roots. Built only at
+# FULL capacities, with the build's own attribute-capture selection (P0
+# stubs it, like Detailed).
 JOURNAL_MAPS = _DETAILED_BASE_MAPS | {
     "JOURNAL_START": map_def(1, 16, 24, 16_384, 0),
     "JOURNAL_CTL": map_def(2, 4, 24, 1, 0),
     "JOURNAL_MARKER_CTL": map_def(2, 4, 16, 1, 0),
     "JOURNAL_CLASSES": map_def(2, 4, 4, 105, 128),
+    "PID_START_TICK": map_def(1, 4, 8, 1_024, 128),
 }
 JOURNAL_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return"}) | {
     "p11_entry_journal", "p11_return_journal",
@@ -2376,7 +2379,7 @@ INVENTORY_FORBIDDEN_MAPS = {
     "ASYNC_FUNCTIONS", "ATTR_BOOL_BITS", "PAUSE_PIDS", "TASK_COOKIE", "COOKIE_CTL",
     "ROOT_AFFILIATION", "ROOT_CTL", "WATCHED_FILES", "SLOT_FILE", "PROC_EPOCH", "G_EPOCH",
     "INSTANCE_GEN", "INSTANCE_CALIB", "INSTANCE_COUNT", "INSTANCE_START",
-    "JOURNAL_MARKER_CTL",
+    "JOURNAL_MARKER_CTL", "PID_START_TICK",
     "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS", "IMAGE_QUERY_CTL",
     "OBJECT_START", "OBJECT_DESCRIPTORS", "OBJECT_ZERO",
     "SELECTED_DETAIL", "SELECTED_DSTATE", "SELECTED_BCTL",
@@ -2529,6 +2532,11 @@ def self_test():
     assert "JOURNAL_MARKER_CTL" not in UNSAFE_MAPS
     assert "JOURNAL_MARKER_CTL" not in WIDE_MAPS
     assert "JOURNAL_MARKER_CTL" in INVENTORY_FORBIDDEN_MAPS
+    for variant_maps in (SAFE_MAPS, JOURNAL_MAPS):
+        assert variant_maps["PID_START_TICK"] == SAFE_MAPS["PID_FILTER"]
+    for variant_maps in (_DETAILED_BASE_MAPS, UNSAFE_MAPS, WIDE_MAPS):
+        assert "PID_START_TICK" not in variant_maps
+    assert "PID_START_TICK" in INVENTORY_FORBIDDEN_MAPS
     assert SAFE_MAPS["OBJECT_DESCRIPTORS"] == map_def(2, 4, 16, 105, 128)
     assert SAFE_MAPS["OBJECT_ZERO"] == map_def(2, 4, 432, 1, 128)
     assert INVENTORY_MAPS["STACK_GUARD"] == SAFE_MAPS["STACK_GUARD"]
@@ -2540,11 +2548,11 @@ def self_test():
     assert JOURNAL_MAPS["JOURNAL_CTL"] == map_def(2, 4, 24, 1, 0)
     assert JOURNAL_MAPS["JOURNAL_MARKER_CTL"] == map_def(2, 4, 16, 1, 0)
     assert JOURNAL_MAPS["JOURNAL_CLASSES"] == map_def(2, 4, 4, 105, 128)
-    assert len(SAFE_MAPS) == 43
+    assert len(SAFE_MAPS) == 44
     assert len(UNSAFE_MAPS) == 44
     assert len(WIDE_MAPS) == 42
     assert len(WIDE_UNSAFE_MAPS) == 44
-    assert len(JOURNAL_MAPS) == 46
+    assert len(JOURNAL_MAPS) == 47
     assert len(SAFE_PROGRAMS) == 22
     assert len(UNSAFE_PROGRAMS) == 27
     assert len(JOURNAL_PROGRAMS) == 22

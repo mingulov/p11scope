@@ -39,6 +39,13 @@ impl ScopePublicationIo for ScopeMaps {
         Ok(())
     }
 
+    // Witness vocabulary is pinned by the scope.rs witness tests with
+    // their own fake; this fake models an object without the witness
+    // map, so these stay outside the operation sequences below.
+    fn insert_pid_start(&mut self, _pid: u32, _tick: u64) -> Result<bool> {
+        Ok(false)
+    }
+
     fn insert_cgroup(&mut self, directory: File) -> Result<()> {
         self.operation(Operation::InsertCgroup(directory.metadata()?.ino()))?;
         self.cgroup = Some(directory);
@@ -51,6 +58,10 @@ impl ScopePublicationIo for ScopeMaps {
             .pid_readback
             .clone()
             .unwrap_or_else(|| self.pids.clone()))
+    }
+
+    fn read_pid_starts(&mut self) -> Result<BTreeMap<u32, u64>> {
+        Ok(BTreeMap::new())
     }
 
     fn write_config(&mut self, index: u32, value: u64) -> Result<()> {
@@ -248,7 +259,7 @@ fn detailed_scope_factoring_preserves_policies_pause_tokens_and_reserved_config_
                 config: [0, 0x1234],
                 ..ScopeMaps::default()
             };
-            publish_detailed_with(&Scope::Pid(101), policy, token, false, &mut maps).unwrap();
+            publish_detailed_with(&Scope::Pid(101), policy, token, false, None, &mut maps).unwrap();
             assert_eq!(maps.pids, BTreeMap::from([(101, token.unwrap_or(1))]));
             assert_eq!(
                 maps.config,
@@ -264,8 +275,15 @@ fn detailed_scope_factoring_preserves_policies_pause_tokens_and_reserved_config_
     for (scope, token) in [(Scope::Pid(101), Some(0)), (Scope::System, Some(17))] {
         let mut maps = ScopeMaps::default();
         assert!(
-            publish_detailed_with(&scope, CapturePolicy::Allowlisted, token, false, &mut maps)
-                .is_err()
+            publish_detailed_with(
+                &scope,
+                CapturePolicy::Allowlisted,
+                token,
+                false,
+                None,
+                &mut maps
+            )
+            .is_err()
         );
         assert!(maps.operations.is_empty());
     }
@@ -280,6 +298,7 @@ fn detailed_scope_track_short_lived_sets_only_the_extensive_bit() {
             CapturePolicy::Allowlisted,
             None,
             track,
+            None,
             &mut maps,
         )
         .unwrap();
@@ -308,6 +327,7 @@ fn counter_policies_refuse_track_short_lived_config() {
             CapturePolicy::Counter(mode),
             None,
             true,
+            None,
             &mut armed,
         )
         .unwrap_err();
@@ -324,6 +344,7 @@ fn counter_policies_refuse_track_short_lived_config() {
             CapturePolicy::Counter(mode),
             None,
             false,
+            None,
             &mut disarmed,
         )
         .unwrap();
@@ -340,6 +361,7 @@ fn counter_policies_refuse_track_short_lived_config() {
         CapturePolicy::AggregateOnly,
         None,
         true,
+        None,
         &mut aggregate,
     )
     .unwrap();

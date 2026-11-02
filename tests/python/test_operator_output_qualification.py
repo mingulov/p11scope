@@ -746,6 +746,45 @@ class ReporterProbeTests(unittest.TestCase):
                 with self.assertRaises(ChildProcessError):
                     os.waitpid(pid, os.WNOHANG)
 
+    def test_symbol_tool_warmup_runs_real_tool_over_real_file_and_tolerates_failure(self):
+        tools = self.root / 'warmup-symbol-tool'
+        tools.mkdir()
+        log = tools / 'argv.log'
+        tool = tools / 'nm'
+        tool.write_text(f'#!{sys.executable}\nimport sys\n'
+            f'open({str(log)!r}, "w").write("\\n".join(sys.argv))\n')
+        tool.chmod(0o700)
+        with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+            _warm_symbol_tool(str(self.probe))
+        argv = log.read_text().splitlines()
+        self.assertTrue(argv[0].endswith('/nm'), argv)
+        self.assertEqual(argv[1:], ['--demangle=rust', '--defined-only', '--format=posix', str(self.probe)])
+        log.unlink()
+        with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+            _warm_symbol_tool()
+        argv = log.read_text().splitlines()
+        self.assertEqual(argv[1:], ['--demangle=rust', '--defined-only', '--format=posix', sys.executable])
+        tool.write_text(f'#!{sys.executable}\nimport sys\nsys.exit(1)\n')
+        with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+            _warm_symbol_tool(str(self.probe))
+        with tempfile.TemporaryDirectory() as empty:
+            with mock.patch.dict(os.environ, {'PATH': empty}):
+                _warm_symbol_tool(str(self.probe))
+        with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+            _warm_symbol_tool(str(tools / 'absent-input'))
+
+    def test_symbol_tool_warmup_bounds_a_hanging_tool(self):
+        tools = self.root / 'warmup-hanging-tool'
+        tools.mkdir()
+        tool = tools / 'nm'
+        tool.write_text(f'#!{sys.executable}\nimport time\ntime.sleep(60)\n')
+        tool.chmod(0o700)
+        with mock.patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+            started = time.monotonic()
+            _warm_symbol_tool(str(self.probe))
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 10)
+
     def test_wire_witness_requires_actual_mode_identity_and_loss_free_causal_once(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
         expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2, ino=3, file_offset=80, ip=0x1234)

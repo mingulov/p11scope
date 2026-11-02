@@ -1376,6 +1376,15 @@ pub(crate) fn open_k0_production(
 ) -> Option<K0Window> {
     let comparable = clock_origins_comparable();
     if let Some(refusal) = k0_owned_clock_refusal(owned, comparable) {
+        // Name the clock cause on stderr: the report carries the
+        // refusal word, the operator gets the reason. Bounded
+        // transport, like every capture diagnostic.
+        let _ = crate::sink::try_stderr_line(&format!(
+            "p11scope: owned --select-endpoint detail refused as {}: {}",
+            refusal.name(),
+            crate::attach::clock_origins_incomparable_reason()
+                .unwrap_or("the kernel and userspace monotonic clocks cannot be compared"),
+        ));
         ledger.mark_selection_refused(refusal.name());
         return None;
     }

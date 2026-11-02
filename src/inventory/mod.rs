@@ -2922,6 +2922,13 @@ impl ClassicDriver<'_> {
                 ),
             }
         }
+        // Poll the EVENTS ring-loss counter before reading the stop
+        // counts, like the exit hold: loss during the terminal drain
+        // discloses on the stop line instead of staying silent past
+        // it.
+        if let Some(lane) = self.semantic.as_mut() {
+            self.coordinator.poll_and_disclose_events_ring_loss(lane);
+        }
         // One honest stop disclosure through the shared helper: the
         // same aggregate scan-refusal gap plus lifetime call-count
         // line the Joint finish driver emits.
@@ -3309,8 +3316,10 @@ impl ClassicDriver<'_> {
     /// always discloses. Each caller names the abandon gap subject:
     /// exit holds say "for exit"; a mid-run lane-stop conversion
     /// says "for lane stop", so the gap never claims the run is
-    /// leaving while it continues. Returns the first error: the
-    /// disposition where latched, else the trigger cause. Callers
+    /// leaving while it continues. Returns the first error (the
+    /// disposition where latched, else the trigger cause) with the
+    /// post-commit lane summary, so callers serve counts the hold
+    /// disclosed instead of a stale pre-hold snapshot. Callers
     /// disclose the skips (finished or unadmitted holds).
     fn hold_joint_lane_for_exit(
         mut lane: crate::inventory_semantics::AttestedSemanticLane,
@@ -3319,7 +3328,15 @@ impl ClassicDriver<'_> {
         abandon_subject: &str,
         warn: &mut WarnSink<'_>,
         winding_disclosed: Option<&mut bool>,
-    ) -> String {
+    ) -> (
+        String,
+        crate::inventory_semantics::SemanticCaptureSummary,
+    ) {
+        // Poll the EVENTS ring-loss counter before anything reads
+        // the stop counts: loss since the last publish discloses
+        // here, so the stop line and the served summary carry it
+        // even when the lane never publishes again.
+        coordinator.poll_and_disclose_events_ring_loss(&mut lane);
         // A recorded terminal graph refusal predates any later
         // verdict, so it wins as the abandon reason (§1.9, §6.4).
         // Next the machine's latched disposition refusal, so the
@@ -3396,12 +3413,17 @@ impl ClassicDriver<'_> {
                 );
             }
         }
+        // Read the post-commit summary before the hold takes the
+        // lane: the entry poll and the abandon commit above disclosed
+        // counts a pre-hold snapshot cannot carry.
+        let summary = lane.semantic_summary();
         ExitRetention::hold(lane);
-        if latched {
+        let error = if latched {
             reason.to_string()
         } else {
             cause.to_string()
-        }
+        };
+        (error, summary)
     }
 
     /// Direct-step entrypoint for the live privileged tests, which
@@ -3419,6 +3441,7 @@ impl ClassicDriver<'_> {
         let mut warn = WarnSink {
             display: &mut display,
         };
+        let mut seated_summary = None;
         Self::step_begun_joint_finish_with_warn(
             lane,
             finish,
@@ -3426,6 +3449,7 @@ impl ClassicDriver<'_> {
             first_error,
             &mut warn,
             None,
+            &mut seated_summary,
         )
     }
 
@@ -3436,7 +3460,9 @@ impl ClassicDriver<'_> {
     /// bound); Published polls only the wound-down (a refusal skips
     /// the abandon per §6.4 and holds); Abandoned does nothing. A
     /// winding step threads its winding's disclosed flag to the exit
-    /// hold; a live-lane step passes `None`.
+    /// hold; a live-lane step passes `None`. A hold writes its
+    /// post-commit summary through `seated_summary` (winding steps
+    /// pass a scratch, since a retiring lane never serves).
     fn step_begun_joint_finish_with_warn(
         lane: &mut Option<crate::inventory_semantics::AttestedSemanticLane>,
         finish: &mut JointFinishDriver,
@@ -3444,6 +3470,7 @@ impl ClassicDriver<'_> {
         first_error: &mut Option<String>,
         warn: &mut WarnSink<'_>,
         winding_disclosed: Option<&mut bool>,
+        seated_summary: &mut Option<crate::inventory_semantics::SemanticCaptureSummary>,
     ) -> JointStepOutcome {
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1024,
@@ -3457,7 +3484,7 @@ impl ClassicDriver<'_> {
                     .is_some_and(|lane| lane.joint_finish_disposition_required())
                 {
                     if let Some(owned) = lane.take() {
-                        let error = Self::hold_joint_lane_for_exit(
+                        let (error, summary) = Self::hold_joint_lane_for_exit(
                             owned,
                             coordinator,
                             "joint finish disposition required",
@@ -3465,6 +3492,7 @@ impl ClassicDriver<'_> {
                             warn,
                             winding_disclosed,
                         );
+                        *seated_summary = Some(summary);
                         first_error.get_or_insert(error);
                     }
                     *finish = JointFinishDriver::Abandoned;
@@ -3512,14 +3540,16 @@ impl ClassicDriver<'_> {
                             // The first error is kept: a pre-set
                             // disposition survives this later failure.
                             // The hold always runs; only the error keeps.
-                            first_error.get_or_insert(Self::hold_joint_lane_for_exit(
+                            let (error, summary) = Self::hold_joint_lane_for_exit(
                                 owned,
                                 coordinator,
                                 &cause,
                                 "joint finish abandoned for exit",
                                 warn,
                                 winding_disclosed,
-                            ));
+                            );
+                            *seated_summary = Some(summary);
+                            first_error.get_or_insert(error);
                         }
                         *finish = JointFinishDriver::Abandoned;
                         JointStepOutcome::Abandoned
@@ -3547,7 +3577,7 @@ impl ClassicDriver<'_> {
         match Self::begin_lane_finish(lane, coordinator) {
             JointFinishDriver::Abandoned => {
                 let lane = semantic.take().expect("joint lane");
-                let error = Self::hold_joint_lane_for_exit(
+                let (error, summary) = Self::hold_joint_lane_for_exit(
                     lane,
                     coordinator,
                     "joint finish disposition required",
@@ -3555,6 +3585,7 @@ impl ClassicDriver<'_> {
                     &mut warn,
                     None,
                 );
+                self.seated_summary = Some(summary);
                 self.joint_first_error.get_or_insert(error);
                 self.joint_finish = JointFinishDriver::Abandoned;
             }
@@ -3587,7 +3618,7 @@ impl ClassicDriver<'_> {
         let mut warn = WarnSink {
             display: &mut self.display,
         };
-        let error = Self::hold_joint_lane_for_exit(
+        let (error, summary) = Self::hold_joint_lane_for_exit(
             lane,
             &mut *self.coordinator,
             cause,
@@ -3595,6 +3626,7 @@ impl ClassicDriver<'_> {
             &mut warn,
             None,
         );
+        self.seated_summary = Some(summary);
         self.joint_first_error.get_or_insert(error);
         if finished || !latched {
             self.coordinator
@@ -3741,6 +3773,9 @@ impl ClassicDriver<'_> {
             let mut warn = WarnSink {
                 display: &mut self.display,
             };
+            // A retiring lane never serves: its hold summary goes to
+            // a scratch, never the seated snapshot.
+            let mut scratch_summary = None;
             let outcome = {
                 let retiring = self.retiring.as_mut().expect("a winding lane retires");
                 let winding = retiring.winding.as_mut().expect("a winding lane retires");
@@ -3751,6 +3786,7 @@ impl ClassicDriver<'_> {
                     &mut self.joint_first_error,
                     &mut warn,
                     Some(&mut winding.stop_disclosed),
+                    &mut scratch_summary,
                 )
             };
             if !matches!(outcome, JointStepOutcome::WoundDown) {
@@ -4000,17 +4036,17 @@ impl ClassicDriver<'_> {
     }
 
     /// Convert a semantic-lane Joint commit refusal into a held lane
-    /// plus a published pass: snapshot what was seated (marked Partial:
-    /// the lane stopped with declared loss for the rest of the run),
-    /// hold the lane for exit (its stop counts disclose once), clear
-    /// the pending commit, name the stop in its own gap, and commit
-    /// the pass's native evidence past the held lane. Later passes
-    /// continue on the legacy path. The hold's first error is dropped
-    /// on purpose: the gap carries the disclosure, and
-    /// `joint_first_error` stays for the finish path, so a continued
-    /// run never surfaces this stale refusal as a later retained
-    /// error. A broad commit failure still fails the call; a
-    /// wedged-publication failure (the machine latched after
+    /// plus a published pass: hold the lane for exit (its stop counts
+    /// disclose once), serve its post-commit summary past the handoff
+    /// (marked Partial: the lane stopped with declared loss for the
+    /// rest of the run), clear the pending commit, name the stop in
+    /// its own gap, and commit the pass's native evidence past the
+    /// held lane. Later passes continue on the legacy path. The
+    /// hold's first error is dropped on purpose: the gap carries the
+    /// disclosure, and `joint_first_error` stays for the finish path,
+    /// so a continued run never surfaces this stale refusal as a
+    /// later retained error. A broad commit failure still fails the
+    /// call; a wedged-publication failure (the machine latched after
     /// physically preparing) names the semantic cause instead of the
     /// internal message.
     fn hold_joint_commit_lane_and_publish(
@@ -4019,15 +4055,11 @@ impl ClassicDriver<'_> {
         reason: &str,
         acquisition: Option<&mut dyn ImageAcquisition>,
     ) -> Result<PassCommitProgress> {
-        self.snapshot_seated_summary();
-        if let Some(summary) = self.seated_summary.as_mut() {
-            summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
-        }
         let mut warn = WarnSink {
             display: &mut self.display,
         };
         let lane = self.semantic.take().expect("a joint lane is seated");
-        Self::hold_joint_lane_for_exit(
+        let (_, summary) = Self::hold_joint_lane_for_exit(
             lane,
             &mut *self.coordinator,
             "joint commit disposition required",
@@ -4035,6 +4067,10 @@ impl ClassicDriver<'_> {
             &mut warn,
             None,
         );
+        self.seated_summary = Some(summary);
+        if let Some(summary) = self.seated_summary.as_mut() {
+            summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
+        }
         self.joint_commit_pending = false;
         self.coordinator.note_scope_gap(
             "semantic lane stopped".to_string(),
@@ -4129,7 +4165,7 @@ impl ClassicDriver<'_> {
                 match begun {
                     JointFinishDriver::Abandoned => {
                         let live = lane.take().expect("a begun lane holds");
-                        let error = Self::hold_joint_lane_for_exit(
+                        let (error, summary) = Self::hold_joint_lane_for_exit(
                             live,
                             coordinator,
                             "joint finish disposition required",
@@ -4137,6 +4173,7 @@ impl ClassicDriver<'_> {
                             warn,
                             None,
                         );
+                        *seated_summary = Some(summary);
                         first_error.get_or_insert(error);
                         *finish = JointFinishDriver::Abandoned;
                     }
@@ -4163,7 +4200,7 @@ impl ClassicDriver<'_> {
                         inner.note_joint_finish_failure(reason);
                     }
                     let live = lane.take().expect("a failed lane holds");
-                    let error = Self::hold_joint_lane_for_exit(
+                    let (error, summary) = Self::hold_joint_lane_for_exit(
                         live,
                         coordinator,
                         "joint finish disposition required",
@@ -4171,6 +4208,7 @@ impl ClassicDriver<'_> {
                         warn,
                         None,
                     );
+                    *seated_summary = Some(summary);
                     // The held gap reuses the hold's own reason, so it
                     // cannot disagree with the first error: the hold
                     // already resolved graph refusal, machine latch,
@@ -4180,7 +4218,7 @@ impl ClassicDriver<'_> {
                     coordinator.note_scope_gap("joint finish held for exit".to_string(), held);
                 } else {
                     let live = lane.take().expect("a failed lane holds");
-                    Self::hold_joint_lane_for_exit(
+                    let (_, summary) = Self::hold_joint_lane_for_exit(
                         live,
                         coordinator,
                         "joint commit disposition required",
@@ -4189,7 +4227,9 @@ impl ClassicDriver<'_> {
                         None,
                     );
                     // The lane stopped with declared loss: the served
-                    // snapshot reads Partial, like the Poll path.
+                    // post-commit summary reads Partial, like the Poll
+                    // path.
+                    *seated_summary = Some(summary);
                     if let Some(summary) = seated_summary.as_mut() {
                         summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
                     }
@@ -4278,6 +4318,7 @@ impl ClassicDriver<'_> {
             &mut self.joint_first_error,
             &mut warn,
             None,
+            &mut self.seated_summary,
         );
         if matches!(outcome, JointStepOutcome::WoundDown) {
             self.complete_final_joint_lane();
@@ -4389,7 +4430,9 @@ impl ClassicDriver<'_> {
                 match Self::begin_lane_finish(lane, &mut *self.coordinator) {
                     JointFinishDriver::Abandoned => {
                         let lane = winding.lane.take().expect("winding lane");
-                        let error = Self::hold_joint_lane_for_exit(
+                        // A retiring lane never serves: its post-commit
+                        // summary is dropped with the hold.
+                        let (error, _) = Self::hold_joint_lane_for_exit(
                             lane,
                             &mut *self.coordinator,
                             "joint finish disposition required",
@@ -5220,11 +5263,11 @@ impl ClassicDriver<'_> {
     }
 
     /// Hold a Joint commit stuck Pending past the retained wall
-    /// bound: snapshot Partial, hold the lane for exit (dropping the
-    /// hold error like a conversion, so the run exits 0), clear the
-    /// pending flag, and name the hold in its own gap plus a stderr
-    /// line. The pump's next Poll then legacy-commits past the held
-    /// lane and the report writes.
+    /// bound: serve the hold's post-commit summary past the handoff
+    /// (marked Partial, like a conversion), dropping the hold error
+    /// so the run exits 0, clear the pending flag, and name the hold
+    /// in its own gap plus a stderr line. The pump's next Poll then
+    /// legacy-commits past the held lane and the report writes.
     fn hold_stuck_retained_joint_publication(&mut self, stalled: Duration) {
         self.snapshot_seated_summary();
         if let Some(summary) = self.seated_summary.as_mut() {
@@ -5234,7 +5277,7 @@ impl ClassicDriver<'_> {
             display: &mut self.display,
         };
         if let Some(lane) = self.semantic.take() {
-            Self::hold_joint_lane_for_exit(
+            let (_, summary) = Self::hold_joint_lane_for_exit(
                 lane,
                 &mut *self.coordinator,
                 "retained joint publication timed out",
@@ -5242,6 +5285,10 @@ impl ClassicDriver<'_> {
                 &mut warn,
                 None,
             );
+            self.seated_summary = Some(summary);
+            if let Some(summary) = self.seated_summary.as_mut() {
+                summary.status = crate::inventory_semantics::SemanticCaptureStatus::Partial;
+            }
         }
         self.joint_commit_pending = false;
         self.coordinator.note_scope_gap(
@@ -5648,6 +5695,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 &mut self.joint_first_error,
                 &mut warn,
                 None,
+                &mut self.seated_summary,
             );
             if matches!(outcome, JointStepOutcome::WoundDown) {
                 self.complete_final_joint_lane();
@@ -6046,6 +6094,7 @@ impl ClassicDriver<'_> {
             &mut self.joint_first_error,
             &mut warn,
             None,
+            &mut self.seated_summary,
         )
     }
 }
@@ -21120,7 +21169,7 @@ mod promotion_driver_tests {
         let mut warn = WarnSink {
             display: &mut display,
         };
-        let error = ClassicDriver::hold_joint_lane_for_exit(
+        let (error, summary) = ClassicDriver::hold_joint_lane_for_exit(
             lane,
             &mut coordinator,
             "joint finish disposition required",
@@ -21131,6 +21180,10 @@ mod promotion_driver_tests {
         assert_eq!(
             error, "joint finish disposition required",
             "a latched hold keeps the disposition reason"
+        );
+        assert_eq!(
+            summary.unrouted_returns, 9,
+            "the hold returns the post-commit counts"
         );
         let gaps: Vec<_> = coordinator
             .registry()

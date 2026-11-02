@@ -19,13 +19,15 @@
 # BPF run-time deltas (kernel.bpf_stats_enabled, set for the campaign,
 # re-asserted per sample against concurrent cells, restored after)
 # corroborate independently: the sched_process_exec total beside
-# exec-storm, the p11_entry total beside call-rate. A before-read over
+# exec-storm, the p11_entry total beside call-rate, except the armed
+# call-rate arm reads the sealed journal pair (p11_entry_journal plus
+# p11_return_journal, summed as p11_journal_pair, with ordinary
+# p11_entry fallback when the pair is absent). A before-read over
 # attached-but-idle hooks is 0/0 (bpftool omits zero counters with
 # stats on); after the workload the window must show positive run time
 # and at least one hook event per op, else the sample fails (a zero
 # delta would certify unattached hooks). A hook program that is not
-# loaded at all (the sealed journal lane carries p11_entry_journal,
-# not p11_entry) records absent per arm and is reported, never read
+# loaded at all records absent per arm and is reported, never read
 # as zero.
 #
 # Arms run ABBA across rounds (odd rounds forward, even rounds
@@ -203,6 +205,79 @@ print(total_ns, total_cnt)
 ' "$1" "$2"
 }
 
+# bpf_parse_armed_call_rate STATS: read `bpftool -j prog show` JSON on
+# stdin, print "<prog> <run_time_ns> <run_cnt>" for the armed call-rate
+# arm. Prefers the journal pair (p11_entry_journal + p11_return_journal,
+# each with 15-byte truncation, all twins summed) as p11_journal_pair;
+# falls back to ordinary p11_entry when the pair is absent. Exit 0 on a
+# reading; exit 4 with "absent" when neither pair nor ordinary matches;
+# exit 1 on corrupt input or a one-sided pair (entry without return or
+# vice versa: incomplete hooks, never absence or fallback).
+bpf_parse_armed_call_rate() {
+    python3 -I -c '
+import json, sys
+stats = sys.argv[1]
+try:
+    progs = json.load(sys.stdin)
+except Exception as exc:
+    sys.exit(f"bpftool output is not JSON with stats={stats}: {exc}")
+if type(progs) is not list:
+    sys.exit(f"bpftool output is not a prog list with stats={stats}")
+
+
+def read_counters(prog, want):
+    name = prog.get("name", "")
+    if name != want and name != want[:15]:
+        return None
+    row = []
+    for field in ("run_time_ns", "run_cnt"):
+        value = prog.get(field)
+        if value is None and stats == "1":
+            value = 0
+        if type(value) is not int or value < 0:
+            if value is None:
+                sys.exit(f"prog {name!r} has no {field} with stats={stats}"
+                         f" (a concurrent cell may have restored stats=0 or unloaded it)")
+            sys.exit(f"prog {name!r} has invalid {field} {value!r} with stats={stats}")
+        row.append(value)
+    return row
+
+
+entry_ns = entry_cnt = return_ns = return_cnt = 0
+entry_found = return_found = ordinary_found = False
+ordinary_ns = ordinary_cnt = 0
+for prog in progs:
+    if type(prog) is not dict:
+        continue
+    row = read_counters(prog, "p11_entry_journal")
+    if row is not None:
+        entry_found = True
+        entry_ns += row[0]
+        entry_cnt += row[1]
+        continue
+    row = read_counters(prog, "p11_return_journal")
+    if row is not None:
+        return_found = True
+        return_ns += row[0]
+        return_cnt += row[1]
+        continue
+    row = read_counters(prog, "p11_entry")
+    if row is not None:
+        ordinary_found = True
+        ordinary_ns += row[0]
+        ordinary_cnt += row[1]
+if entry_found or return_found:
+    if not (entry_found and return_found):
+        sys.exit("one-sided journal pair: entry_found=%s return_found=%s" % (entry_found, return_found))
+    print("p11_journal_pair", entry_ns + return_ns, entry_cnt + return_cnt)
+elif ordinary_found:
+    print("p11_entry", ordinary_ns, ordinary_cnt)
+else:
+    print("absent")
+    sys.exit(4)
+' "$1"
+}
+
 # bpf_delta BEFORE AFTER OPS ARM: print the "<ns> <cnt>" window delta.
 # Fail on backwards counters or a vacuous window: zero hook run time,
 # or fewer than one event per op, means unattached hooks, which must
@@ -370,6 +445,60 @@ EOF
     fi
     if echo 'not json' | bpf_parse_totals p11_entry 1 >/dev/null 2>&1; then
         echo "self-test: non-JSON accepted" >&2; exit 1
+    fi
+    # bpf_parse_armed_call_rate twins: the sealed journal lane loads the
+    # journal pair, not ordinary entry. The armed call-rate reader prefers
+    # the pair (summed, each with 15-byte truncation) and falls back to
+    # ordinary entry when the pair is absent. A one-sided pair fails.
+    BPA_OUT=$(echo '[{"name": "p11_entry_journal", "run_time_ns": 100, "run_cnt": 1000}, {"name": "p11_return_journal", "run_time_ns": 120, "run_cnt": 1000}]' \
+        | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: journal pair misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_journal_pair 220 2000" ] \
+        || { echo "self-test: journal pair gave $BPA_OUT" >&2; exit 1; }
+    BPA_OUT=$(echo '[{"name": "p11_entry_journ", "run_time_ns": 50, "run_cnt": 500}, {"name": "p11_return_jour", "run_time_ns": 60, "run_cnt": 500}]' \
+        | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: truncated journal pair misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_journal_pair 110 1000" ] \
+        || { echo "self-test: truncated pair gave $BPA_OUT" >&2; exit 1; }
+    BPA_OUT=$(echo '[{"name": "p11_entry_journal"}, {"name": "p11_return_journal"}]' | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: idle journal pair misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_journal_pair 0 0" ] \
+        || { echo "self-test: idle pair gave $BPA_OUT" >&2; exit 1; }
+    BPA_OUT=$(echo '[{"name": "p11_entry_journal", "run_time_ns": 100, "run_cnt": 1000}, {"name": "p11_entry_journal", "run_time_ns": 100, "run_cnt": 1000}, {"name": "p11_return_journal", "run_time_ns": 120, "run_cnt": 1000}]' \
+        | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: twin journal entry misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_journal_pair 320 3000" ] \
+        || { echo "self-test: twin journal gave $BPA_OUT" >&2; exit 1; }
+    BPA_OUT=$(echo '[{"name": "p11_entry", "run_time_ns": 200, "run_cnt": 1500}]' | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: ordinary fallback misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_entry 200 1500" ] \
+        || { echo "self-test: fallback gave $BPA_OUT" >&2; exit 1; }
+    BPA_OUT=$(echo '[{"name": "p11_entry"}]' | bpf_parse_armed_call_rate 1) \
+        || { echo "self-test: idle fallback misread" >&2; exit 1; }
+    [ "$BPA_OUT" = "p11_entry 0 0" ] \
+        || { echo "self-test: idle fallback gave $BPA_OUT" >&2; exit 1; }
+    BPA_RC=0
+    echo '[]' | bpf_parse_armed_call_rate 1 >"$SELF_TEST_WORK/bpa.out" 2>/dev/null || BPA_RC=$?
+    [ "$BPA_RC" -eq 4 ] \
+        || { echo "self-test: armed missing exit $BPA_RC" >&2; exit 1; }
+    [ "$(cat "$SELF_TEST_WORK/bpa.out")" = "absent" ] \
+        || { echo "self-test: armed missing gave $(cat "$SELF_TEST_WORK/bpa.out")" >&2; exit 1; }
+    BPA_RC=0
+    echo '[{"name": "other", "run_time_ns": 1, "run_cnt": 1}]' | bpf_parse_armed_call_rate 1 >/dev/null 2>&1 || BPA_RC=$?
+    [ "$BPA_RC" -eq 4 ] \
+        || { echo "self-test: armed wrong-program exit $BPA_RC" >&2; exit 1; }
+    BPA_RC=0
+    echo '[{"name": "p11_entry_journal", "run_time_ns": 100, "run_cnt": 1000}]' | bpf_parse_armed_call_rate 1 >/dev/null 2>&1 || BPA_RC=$?
+    [ "$BPA_RC" -eq 1 ] \
+        || { echo "self-test: one-sided pair exit $BPA_RC" >&2; exit 1; }
+    if echo '[{"name": "p11_entry_journal"}]' | bpf_parse_armed_call_rate 0 >/dev/null 2>&1; then
+        echo "self-test: armed stats-off read accepted" >&2; exit 1
+    fi
+    if echo '[{"name": "p11_entry_journal", "run_time_ns": "100", "run_cnt": 5}, {"name": "p11_return_journal", "run_time_ns": 120, "run_cnt": 5}]' | bpf_parse_armed_call_rate 1 >/dev/null 2>&1; then
+        echo "self-test: armed non-integer accepted" >&2; exit 1
+    fi
+    if echo 'not json' | bpf_parse_armed_call_rate 1 >/dev/null 2>&1; then
+        echo "self-test: armed non-JSON accepted" >&2; exit 1
     fi
     # bpf_delta twins: the after-read gate. A vacuous window (no hook
     # run time, or fewer than one event per op) fails the sample.
@@ -648,6 +777,31 @@ bpf_totals() {
     fi
 }
 
+# bpf_totals_armed_call_rate: "<prog> <run_time_ns> <run_cnt>" for the
+# armed call-rate arm (journal pair preferred, ordinary fallback), or
+# "absent" when neither is loaded. See bpf_parse_armed_call_rate.
+bpf_totals_armed_call_rate() {
+    bpf_json=$(sudo -n bpftool -j prog show 2>"$WORK/bpftool.stderr")
+    bpf_rc=$?
+    if [ "$bpf_rc" -ne 0 ] || [ -z "$bpf_json" ]; then
+        echo "bpftool prog show failed (exit $bpf_rc):" >&2
+        tail -n 3 "$WORK/bpftool.stderr" >&2 2>/dev/null || true
+        echo "bpf_stats_enabled=$(cat /proc/sys/kernel/bpf_stats_enabled 2>/dev/null)" >&2
+        return 1
+    fi
+    bpf_stats=$(cat /proc/sys/kernel/bpf_stats_enabled 2>/dev/null || echo unknown)
+    if bpf_out=$(printf '%s' "$bpf_json" | bpf_parse_armed_call_rate "$bpf_stats"); then
+        printf '%s\n' "$bpf_out"
+    else
+        bpf_rc=$?
+        if [ "$bpf_rc" -eq 4 ]; then
+            printf '%s\n' "$bpf_out"
+            return 0
+        fi
+        return 1
+    fi
+}
+
 if [ -n "$MODULE" ]; then
     PROVIDER=$MODULE
 else
@@ -768,6 +922,10 @@ run_sample() {
         exec-storm) rs_prog=sched_process_exec ;;
         call-rate) rs_prog=p11_entry ;;
     esac
+    rs_armed_call_rate=no
+    if [ "$rs_cell" = call-rate ] && [ "$rs_arm" = on-armed ]; then
+        rs_armed_call_rate=yes
+    fi
     SAMPLE_SEQ=$((SAMPLE_SEQ + 1))
     S=$WORK/sample-$(printf '%03d' "$SAMPLE_SEQ")-$rs_cell-$rs_arm-r$rs_round
     mkdir -p "$S" && chmod 0700 "$S" || die "sample dir"
@@ -826,7 +984,11 @@ run_sample() {
         # exclusive host the real numbers come from).
         sudo -n sysctl -w kernel.bpf_stats_enabled=1 >/dev/null 2>&1 \
             || { echo "bpf stats re-assert failed" >&2; return 1; }
-        rs_bpf_before=$(bpf_totals "$rs_prog") || { echo "bpf before-read failed" >&2; return 1; }
+        if [ "$rs_armed_call_rate" = yes ]; then
+            rs_bpf_before=$(bpf_totals_armed_call_rate) || { echo "bpf before-read failed" >&2; return 1; }
+        else
+            rs_bpf_before=$(bpf_totals "$rs_prog") || { echo "bpf before-read failed" >&2; return 1; }
+        fi
     else
         rs_bpf_before=none
     fi
@@ -845,12 +1007,32 @@ run_sample() {
             ;;
     esac
     if [ "$rs_arm" != none ]; then
-        rs_bpf_after=$(bpf_totals "$rs_prog") || { echo "bpf after-read failed" >&2; return 1; }
-        if [ "$rs_bpf_before" = absent ] || [ "$rs_bpf_after" = absent ]; then
-            rs_bpf_ns=absent rs_bpf_cnt=absent
+        if [ "$rs_armed_call_rate" = yes ]; then
+            rs_bpf_after=$(bpf_totals_armed_call_rate) || { echo "bpf after-read failed" >&2; return 1; }
+            if [ "$rs_bpf_before" = absent ] || [ "$rs_bpf_after" = absent ]; then
+                rs_prog=p11_journal_pair
+                rs_bpf_ns=absent rs_bpf_cnt=absent
+            else
+                rs_prog_before=${rs_bpf_before%% *}
+                rs_rest_before=${rs_bpf_before#* }
+                rs_prog_after=${rs_bpf_after%% *}
+                rs_rest_after=${rs_bpf_after#* }
+                if [ "$rs_prog_before" != "$rs_prog_after" ]; then
+                    echo "bpf prog changed mid-sample: $rs_prog_before vs $rs_prog_after" >&2
+                    return 1
+                fi
+                rs_prog=$rs_prog_before
+                rs_bpf=$(bpf_delta "$rs_rest_before" "$rs_rest_after" "$rs_ops" "$rs_arm") || return 1
+                rs_bpf_ns=${rs_bpf% *} rs_bpf_cnt=${rs_bpf#* }
+            fi
         else
-            rs_bpf=$(bpf_delta "$rs_bpf_before" "$rs_bpf_after" "$rs_ops" "$rs_arm") || return 1
-            rs_bpf_ns=${rs_bpf% *} rs_bpf_cnt=${rs_bpf#* }
+            rs_bpf_after=$(bpf_totals "$rs_prog") || { echo "bpf after-read failed" >&2; return 1; }
+            if [ "$rs_bpf_before" = absent ] || [ "$rs_bpf_after" = absent ]; then
+                rs_bpf_ns=absent rs_bpf_cnt=absent
+            else
+                rs_bpf=$(bpf_delta "$rs_bpf_before" "$rs_bpf_after" "$rs_ops" "$rs_arm") || return 1
+                rs_bpf_ns=${rs_bpf% *} rs_bpf_cnt=${rs_bpf#* }
+            fi
         fi
         kill -INT "$SPID" 2>/dev/null || true
         if wait "$SPID"; then SPID=; else rs_status=$?; SPID=; echo "observer exited $rs_status" >&2; return 1; fi

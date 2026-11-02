@@ -138,7 +138,7 @@ def verify(log_path, manifest_path):
                 raise CampaignError(
                     f"exec-storm ops {sample['ops']} != manifest {spec['ops']}")
             if sample["arm"] != "none" and sample["bpf_prog"] not in (
-                    "sched_process_exec", "p11_entry"):
+                    "sched_process_exec", "p11_entry", "p11_journal_pair"):
                 raise CampaignError(f"unknown bpf_prog {sample['bpf_prog']}")
     if {s["cell"] for s in samples} != set(cells):
         raise CampaignError("sample cells do not match the manifest")
@@ -392,6 +392,29 @@ def self_test():
     check("armed arm labeled gated-read-only, not an armed-marker cost",
           "gated read only" in table and "lane journal-ready" in table
           and "no production session writes READY" in table)
+    # The armed call-rate arm reads the journal pair, not ordinary entry.
+    def use_journal(log):
+        return [
+            line.replace("bpf_prog=p11_entry", "bpf_prog=p11_journal_pair")
+            if line.startswith("SAMPLE cell=call-rate") and "arm=on-armed" in line
+            else line
+            for line in log]
+
+    work4, log4, man4 = campaign(
+        mutate=use_journal, extra_lines=("DONE samples=12",))
+    try:
+        manifest4, samples4 = verify(log4, man4)
+        table4 = render(manifest4, samples4)
+    except CampaignError as error:
+        check(f"journal-pair campaign verifies ({error})", False)
+        table4 = ""
+    check("journal-pair campaign renders its prog",
+          "bpf p11_journal_pair" in table4)
+    must_fail("unknown bpf_prog",
+              mutate=lambda log: [
+                  line.replace("bpf_prog=p11_entry", "bpf_prog=p11_mystery", 1)
+                  if line.startswith("SAMPLE cell=call-rate") else line
+                  for line in log] + ["DONE samples=12"])
     print(f"bench-marker-cost-analyze self-test: "
           f"{'OK' if not failures else 'FAIL ' + str(failures)}")
     return 1 if failures else 0

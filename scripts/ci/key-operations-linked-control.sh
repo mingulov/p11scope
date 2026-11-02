@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # key-operations-linked-control.sh — installed linked-control cells.
 #
-# Five cells pin the installed `--key-operations` posture at this HEAD:
+# Six cells pin the installed `--key-operations` posture at this HEAD:
 #   linked-system          --system --capture native --key-operations --manifest
 #   linked-pid             same with --pid (pre-seal fixture pid)
-#   flag-off-s1            the workload without --key-operations (--s1 oracle)
+#   flag-off-s1            the workload without --key-operations at settle 0 (--s1 oracle)
+#   flag-off-s1-settle10   the same workload at settle 10: no-receipt gap diagnostic (known issue)
 #   flag-without-manifest  --key-operations without --manifest (finite behavior)
 #   off-build-refusal      the flag on a build without the journal object
 #
@@ -24,7 +25,8 @@
 # Environment: P11SCOPE_OFF (optional off-build observer for
 # off-build-refusal; without it that row is nonqualifying, never pass),
 # MODULE (default: release-matrix-contract --select-module), LOCK,
-# SETTLE_S (default 10: settle after the seal line before the G barrier),
+# SETTLE_S (default 10: settle after the seal line before the G barrier;
+# flag-off-s1 always forces 0 and the settle-10 diagnostic always uses 10),
 # ADMIT_TIMEOUT_S (default 120: bound on waiting for the fixture's pid
 # to be admitted before its G barrier; a timeout proceeds and records),
 # DURATION (default 300: observer backstop; SIGINT after done stops it),
@@ -641,8 +643,9 @@ if run_linked_flow "$CELLDIR" "$P11SCOPE" --system --capture native \
                 else
                     cp "$OUTDIR/linked-system.json" "$OUTDIR/linked-sample.json" || die "sample copy failed"
                     oracle_text=$(tail -n 5 "$OUTDIR/linked-system-oracle.log" | tr '\n' ';')
-                    row linked-system 1 expected-failure \
-                        "OPEN-6: oracle refused the populated linked shape: $oracle_text (sample: linked-sample.json)"
+                    row linked-system 0 failed \
+                        "oracle refused the populated linked shape: $oracle_text (sample: linked-sample.json)"
+                    FAILURES=$((FAILURES + 1))
                 fi
             elif [ "$oo_status" = "unavailable" ] && [ "$oo_reason" = "journal_unavailable" ]; then
                 if python3 -I "$QUALIFY" "$OUTDIR/linked-system-ledger.jsonl" \
@@ -654,12 +657,44 @@ if run_linked_flow "$CELLDIR" "$P11SCOPE" --system --capture native \
                 else
                     oracle_text=" oracle: $(tail -n 3 "$OUTDIR/linked-system-oracle.log" | tr '\n' ';')"
                     cp "$OUTDIR/linked-system.json" "$OUTDIR/linked-sample.json" || die "sample copy failed"
-                    row linked-system 1 expected-failure \
-                        "product: object_observations unavailable (journal_unavailable) on exit $OBSERVER_EXIT;$oracle_text (sample: linked-sample.json)"
+                    row linked-system 0 failed \
+                        "object_observations unavailable (journal_unavailable) on exit $OBSERVER_EXIT is a stale pin on a linked lane;$oracle_text (sample: linked-sample.json)"
+                    FAILURES=$((FAILURES + 1))
                 fi
+            elif [ "$oo_status" = "unavailable" ] && [ "$oo_reason" = "bootstrap_unavailable" ]; then
+                gap_text=$(python3 -I - "$OUTDIR/linked-system.json" <<'EOF' || echo "gaps unreadable"
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    print("report unparsable")
+    sys.exit(0)
+gaps = doc.get("gaps") or []
+if not gaps:
+    print("no gaps")
+else:
+    parts = []
+    for gap in gaps:
+        if type(gap) is not dict:
+            continue
+        parts.append("%s/%s x%s" % (gap.get("subject"), gap.get("reason"), gap.get("repeats")))
+    print("gaps: %s" % ("; ".join(parts)[:500] if parts else "no gaps"))
+EOF
+                )
+                cp "$OUTDIR/linked-system.json" "$OUTDIR/linked-sample.json" || die "sample copy failed"
+                if python3 -I "$QUALIFY" "$OUTDIR/linked-system-ledger.jsonl" \
+                        "$OUTDIR/linked-system.json" \
+                        > "$OUTDIR/linked-system-oracle.log" 2>&1; then
+                    oracle_note="oracle unexpectedly passed"
+                else
+                    oracle_note="oracle: $(tail -n 3 "$OUTDIR/linked-system-oracle.log" | tr '\n' ';')"
+                fi
+                row linked-system 0 failed \
+                    "object_observations unavailable (bootstrap_unavailable) on exit $OBSERVER_EXIT: $gap_text; $oracle_note (sample: linked-sample.json)"
+                FAILURES=$((FAILURES + 1))
             else
                 row linked-system 0 failed \
-                    "object_observations $oo_status ($oo_reason) on exit $OBSERVER_EXIT: not the pinned signature (exit 0 + unavailable journal_unavailable, or a populated oracle refusal)"
+                    "object_observations $oo_status ($oo_reason) on exit $OBSERVER_EXIT: not the pinned signature (exit 0 + populated with an oracle pass)"
                 FAILURES=$((FAILURES + 1))
             fi
         fi
@@ -717,11 +752,16 @@ if run_linked_flow "$CELLDIR" "$P11SCOPE" --pid-from-driver --capture native \
                     "observer exit $OBSERVER_EXIT with a refused populated shape: not the pinned signature (exit 0)"
                 FAILURES=$((FAILURES + 1))
             fi
+        elif [ "$oo_status" = "unavailable" ] && [ "$oo_reason" = "journal_unavailable" ]; then
+            row linked-pid 0 failed \
+                "object_observations unavailable (journal_unavailable): stale pin on a linked lane (want bootstrap_unavailable while no Joint feed exists); the named pid exec'd before the seal and PID scope pins an existing process"
+            FAILURES=$((FAILURES + 1))
         else
             # The only namable pid exec'd before the seal: PID scope pins an
             # existing process, so no post-closure birth is observable there.
+            # Linked lanes read bootstrap_unavailable while no Joint feed exists.
             row linked-pid 0 nonqualifying \
-                "object_observations $oo_status ($oo_reason): the named pid exec'd before the seal and PID scope pins an existing process, so a post-closure exec is unobservable"
+                "object_observations $oo_status ($oo_reason): the named pid exec'd before the seal and PID scope pins an existing process, so a post-closure exec is unobservable (linked lanes read bootstrap_unavailable while no Joint feed exists)"
         fi
     fi
 else
@@ -738,14 +778,17 @@ else
     fi
 fi
 
-# --- flag-off-s1 ---
+# --- flag-off-s1 (settle 0) ---
 say "--- flag-off-s1 ---"
 CELLDIR=$WORK/flag-off-s1
 export KEYOPS_SELFTEST_SCENARIO=${KEYOPS_SELFTEST_SCENARIO_FLAG_OFF_S1:-}
 mkdir -p "$CELLDIR" && chmod 0700 "$CELLDIR" || die "cell dir $CELLDIR"
+FLAG_OFF_S1_SETTLE_SAVED=$SETTLE_S
+SETTLE_S=0
 if run_linked_flow "$CELLDIR" "$P11SCOPE" --pid-from-driver --capture native \
         --manifest "$MANIFEST" --duration "$DURATION" \
         2> "$CELLDIR/flow.stderr"; then
+    SETTLE_S=$FLAG_OFF_S1_SETTLE_SAVED
     copy_evidence "$CELLDIR" out.json ledger.jsonl observer.stderr driver.log admit-sync.txt \
         || die "evidence copy failed"
     mv "$OUTDIR/out.json" "$OUTDIR/flag-off-s1.json" || die "evidence rename failed"
@@ -764,40 +807,11 @@ if run_linked_flow "$CELLDIR" "$P11SCOPE" --pid-from-driver --capture native \
                     "$OUTDIR/flag-off-s1.json" \
                     > "$OUTDIR/flag-off-s1-oracle.log" 2>&1; then
                 row flag-off-s1 1 qualified \
-                    "--s1 compare passed; object_observations unavailable ($oo_reason)"
+                    "--s1 compare passed at settle 0; object_observations unavailable ($oo_reason)"
             else
                 oracle_text=$(tail -n 5 "$OUTDIR/flag-off-s1-oracle.log" | tr '\n' ';')
-                case "$oracle_text" in
-                    *"S1 child API returns are not exactly 65 current observations"*)
-                        if [ "$OBSERVER_EXIT" -ne 0 ]; then
-                            row flag-off-s1 0 failed \
-                                "observer exit $OBSERVER_EXIT with the S1 drift text: not the pinned signature (exit 0)"
-                            FAILURES=$((FAILURES + 1))
-                        else
-                            observed=$(python3 -I -c '
-import json,sys
-try:
-    doc=json.load(open(sys.argv[1]))
-except Exception:
-    print("report unparsable"); sys.exit(0)
-children=doc.get("semantic_edges") or []
-child=children[0] if children and type(children[0]) is dict else {}
-returns=child.get("api_returns") or {}
-count=returns.get("count", "?") if type(returns) is dict else "?"
-refused=sum(gap["repeats"] for gap in doc.get("gaps", [])
-              if type(gap) is dict and gap.get("subject") == "semantic admission refused"
-              and type(gap.get("repeats")) is int)
-print("api_returns=%s no_receipt_admission_gaps=%s" % (count, refused))' \
-                            "$OUTDIR/flag-off-s1.json") || observed="report unparsable"
-                        row flag-off-s1 1 expected-failure \
-                            "S1 shape drift (product/oracle adjudication): $observed; oracle pins 65 gated calls (Oct-26) and forbids admission gaps (Oct-28): $oracle_text"
-                        fi
-                        ;;
-                    *)
-                        row flag-off-s1 0 failed "--s1 compare failed: $oracle_text"
-                        FAILURES=$((FAILURES + 1))
-                        ;;
-                esac
+                row flag-off-s1 0 failed "--s1 compare failed at settle 0: $oracle_text"
+                FAILURES=$((FAILURES + 1))
             fi
         else
             row flag-off-s1 0 failed \
@@ -806,9 +820,82 @@ print("api_returns=%s no_receipt_admission_gaps=%s" % (count, refused))' \
         fi
     fi
 else
+    SETTLE_S=$FLAG_OFF_S1_SETTLE_SAVED
     collect_failure_evidence "$CELLDIR" flag-off-s1
     row flag-off-s1 0 failed \
         "flow failed: $(flow_reason flag-off-s1)"
+    FAILURES=$((FAILURES + 1))
+fi
+
+# --- flag-off-s1-settle10 (diagnostic, known issue) ---
+say "--- flag-off-s1-settle10 ---"
+CELLDIR=$WORK/flag-off-s1-settle10
+export KEYOPS_SELFTEST_SCENARIO=${KEYOPS_SELFTEST_SCENARIO_FLAG_OFF_S1_SETTLE10:-}
+mkdir -p "$CELLDIR" && chmod 0700 "$CELLDIR" || die "cell dir $CELLDIR"
+if [ "$SELFTEST" = 1 ]; then
+    DIAG_SETTLE_S=${KEYOPS_SELFTEST_DIAG_SETTLE_S:-0}
+else
+    DIAG_SETTLE_S=10
+fi
+is_non_negative_int "$DIAG_SETTLE_S" || die "diagnostic settle is not a non-negative integer"
+DIAG_SETTLE_SAVED=$SETTLE_S
+SETTLE_S=$DIAG_SETTLE_S
+if run_linked_flow "$CELLDIR" "$P11SCOPE" --pid-from-driver --capture native \
+        --manifest "$MANIFEST" --duration "$DURATION" \
+        2> "$CELLDIR/flow.stderr"; then
+    SETTLE_S=$DIAG_SETTLE_SAVED
+    copy_evidence "$CELLDIR" out.json ledger.jsonl observer.stderr driver.log admit-sync.txt \
+        || die "evidence copy failed"
+    mv "$OUTDIR/out.json" "$OUTDIR/flag-off-s1-settle10.json" || die "evidence rename failed"
+    mv "$OUTDIR/ledger.jsonl" "$OUTDIR/flag-off-s1-settle10-ledger.jsonl" || die "evidence rename failed"
+    mv "$OUTDIR/observer.stderr" "$OUTDIR/flag-off-s1-settle10-observer.stderr" || die "evidence rename failed"
+    mv "$OUTDIR/driver.log" "$OUTDIR/flag-off-s1-settle10-driver.log" || die "evidence rename failed"
+    mv "$OUTDIR/admit-sync.txt" "$OUTDIR/flag-off-s1-settle10-admit-sync.txt" || die "evidence rename failed"
+    if ! oo_line=$(python3 -I "$CHECKS" oo "$OUTDIR/flag-off-s1-settle10.json"); then
+        row flag-off-s1-settle10 0 failed "observer report missing or unparsable"
+        FAILURES=$((FAILURES + 1))
+    else
+        oo_status=${oo_line%% *}; oo_status=${oo_status#status=}
+        oo_reason=${oo_line#*reason=}
+        if [ "$oo_status" = "unavailable" ] && [ -n "$oo_reason" ]; then
+            gap_count=$(python3 -I - "$OUTDIR/flag-off-s1-settle10.json" <<'EOF' || echo "unreadable"
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    print("unreadable")
+    sys.exit(0)
+total = 0
+for gap in doc.get("gaps") or []:
+    if type(gap) is not dict:
+        continue
+    if gap.get("subject") == "semantic admission refused" \
+            and gap.get("reason") == "semantic_unavailable:no_receipt" \
+            and type(gap.get("repeats")) is int:
+        total += gap["repeats"]
+print(total)
+EOF
+            )
+            if python3 -I "$QUALIFY" --s1 "$OUTDIR/flag-off-s1-settle10-ledger.jsonl" \
+                    "$OUTDIR/flag-off-s1-settle10.json" \
+                    > "$OUTDIR/flag-off-s1-settle10-oracle.log" 2>&1; then
+                oracle_note="oracle passed"
+            else
+                oracle_note="oracle: $(tail -n 3 "$OUTDIR/flag-off-s1-settle10-oracle.log" | tr '\n' ';')"
+            fi
+            row flag-off-s1-settle10 1 qualified \
+                "settle-10 diagnostic: $gap_count no_receipt admission gaps (known issue, not a failure); object_observations unavailable ($oo_reason); $oracle_note"
+        else
+            row flag-off-s1-settle10 0 failed \
+                "object_observations reads $oo_status ($oo_reason), want unavailable with a finite reason"
+            FAILURES=$((FAILURES + 1))
+        fi
+    fi
+else
+    SETTLE_S=$DIAG_SETTLE_SAVED
+    collect_failure_evidence "$CELLDIR" flag-off-s1-settle10
+    row flag-off-s1-settle10 0 failed \
+        "flow failed: $(flow_reason flag-off-s1-settle10)"
     FAILURES=$((FAILURES + 1))
 fi
 

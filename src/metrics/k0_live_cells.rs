@@ -702,7 +702,8 @@ fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<
     // the window and must not void it.
     // The owned child drops to the invoking user when the observer
     // runs as root via sudo; hand the workload tree to that user so
-    // the child can read its ledger, config and token.
+    // the child can read its ledger, config and token, and open the
+    // runner-owned TMPDIR for traversal.
     if let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
         let status = std::process::Command::new("chown")
             .args([
@@ -713,6 +714,11 @@ fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<
             .status()
             .context("chown workload to invoking user")?;
         ensure!(status.success(), "chown workload to {uid}:{gid}");
+        if let Some(parent) = workload.dir.path().parent() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o711))
+                .context("open TMPDIR for the owned child")?;
+        }
     }
     let mut child = spawn_run_observer(
         observer,

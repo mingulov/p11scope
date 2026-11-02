@@ -417,6 +417,26 @@ impl TimedDequeueError {
     }
 }
 
+/// A failed stop proof: the proof itself (`Proof`, a non-lifecycle
+/// partial under `auto`) or the delivery wait's IO failure (`Lifecycle`,
+/// like every other wait in the cycle).
+enum SampleStoppedError {
+    Proof(String),
+    Lifecycle(String),
+}
+
+impl SampleStoppedError {
+    fn lifecycle(&self) -> bool {
+        matches!(self, Self::Lifecycle(_))
+    }
+
+    fn message(self) -> String {
+        match self {
+            Self::Proof(message) | Self::Lifecycle(message) => message,
+        }
+    }
+}
+
 fn clamp_deadline(slot: &mut Option<u64>, candidate: u64) -> u64 {
     let deadline = slot.map_or(candidate, |existing| existing.min(candidate));
     *slot = Some(deadline);
@@ -998,16 +1018,22 @@ impl PauseCoordinator {
             return self.fail_cycle(io, "discovery ring loss in pause epoch", false);
         }
 
-        let first_sample = match self.sample_stopped(io, deadline) {
+        let first_sample = match self.sample_stopped(io, deadline, true) {
             Ok(sample) => sample,
-            Err(error) => return self.fail_cycle(io, error, false),
+            Err(error) => {
+                let lifecycle = error.lifecycle();
+                return self.fail_cycle(io, error.message(), lifecycle);
+            }
         };
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
         }
-        let second_sample = match self.sample_stopped(io, deadline) {
+        let second_sample = match self.sample_stopped(io, deadline, false) {
             Ok(sample) => sample,
-            Err(error) => return self.fail_cycle(io, error, false),
+            Err(error) => {
+                let lifecycle = error.lifecycle();
+                return self.fail_cycle(io, error.message(), lifecycle);
+            }
         };
         if second_sample
             .checked_sub(first_sample)
@@ -1080,8 +1106,9 @@ impl PauseCoordinator {
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
         }
-        if let Err(error) = self.sample_stopped(io, deadline) {
-            return self.fail_cycle(io, error, false);
+        if let Err(error) = self.sample_stopped(io, deadline, false) {
+            let lifecycle = error.lifecycle();
+            return self.fail_cycle(io, error.message(), lifecycle);
         }
         let marker_seen = match io.marker_seen() {
             Ok(seen) => seen,
@@ -1129,8 +1156,9 @@ impl PauseCoordinator {
             if let Err(error) = io.wait_one_ms() {
                 return self.fail_cycle(io, error, true);
             }
-            if let Err(error) = self.sample_stopped(io, deadline) {
-                return self.fail_cycle(io, error, false);
+            if let Err(error) = self.sample_stopped(io, deadline, false) {
+                let lifecycle = error.lifecycle();
+                return self.fail_cycle(io, error.message(), lifecycle);
             }
             match io.marker_seen() {
                 Ok(false) => {}
@@ -1372,24 +1400,52 @@ impl PauseCoordinator {
     }
 
     /// Proves the owned child stopped: the exact preflight task set, every
-    /// task in `T`. The helper's SIGSTOP lands asynchronously, so a matching
-    /// set that is still running waits a millisecond and samples again
-    /// within the causal deadline. A changed set is never waited out: new
-    /// or vanished tasks fail the proof immediately.
-    fn sample_stopped(&self, io: &mut impl PauseIo, deadline: u64) -> Result<u64, String> {
+    /// task in `T`. The helper's SIGSTOP lands asynchronously, so the
+    /// first sample waits for delivery: a matching set that is still
+    /// running waits a millisecond and samples again within the causal
+    /// deadline. Later samples never wait: a running task after the stop
+    /// landed means SIGCONT, and waiting could confirm a later re-stop
+    /// (SIGTTIN, Ctrl-Z) as the pause. A changed set, and any state
+    /// outside R/S/D/T (a zombie leader must never stall the proof), fail
+    /// at once at every sample.
+    fn sample_stopped(
+        &self,
+        io: &mut impl PauseIo,
+        deadline: u64,
+        wait_for_delivery: bool,
+    ) -> Result<u64, SampleStoppedError> {
         loop {
-            let states = io.task_states(self.pid)?;
-            let now = io.now_ns()?;
+            let states = io
+                .task_states(self.pid)
+                .map_err(SampleStoppedError::Proof)?;
+            let now = io.now_ns().map_err(SampleStoppedError::Proof)?;
             if now > deadline {
-                return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
+                return Err(SampleStoppedError::Proof(
+                    MSG_PAUSE_CONFIRMATION_DEADLINE.into(),
+                ));
             }
             if states.keys().ne(self.expected_tasks.keys()) {
-                return Err("task set changed or was not entirely stopped".into());
+                return Err(SampleStoppedError::Proof(
+                    "task set changed or was not entirely stopped".into(),
+                ));
             }
             if states.values().all(|state| *state == b'T') {
                 return Ok(now);
             }
-            io.wait_one_ms()?;
+            if states
+                .values()
+                .any(|state| !matches!(*state, b'R' | b'S' | b'D' | b'T'))
+            {
+                return Err(SampleStoppedError::Proof(
+                    "task state outside R/S/D/T fails without waiting".into(),
+                ));
+            }
+            if !wait_for_delivery {
+                return Err(SampleStoppedError::Proof(
+                    "task running after the first stopped sample".into(),
+                ));
+            }
+            io.wait_one_ms().map_err(SampleStoppedError::Lifecycle)?;
         }
     }
 

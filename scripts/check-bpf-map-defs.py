@@ -456,9 +456,10 @@ REQUIRED_GLOBAL_EXEC_HELPERS = frozenset({"p11_exec_dumpability"})
 # p11_exec_ global namespace: this helper needs two out-word pointers.
 REQUIRED_GLOBAL_EXE_HELPERS = frozenset({"p11_exe_identity"})
 REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS = frozenset({"p11_link_current_cookie"})
-# H8-D post-attach birth marker (Detailed only): the exec half publishes
-# READY after closure, the gap half dirties on refused calls. Counter and
-# inventory objects carry neither these globals nor the control map.
+# H8-D post-attach birth marker (Detailed and journal): the exec half
+# publishes READY after closure, the gap half dirties on refused calls.
+# Counter and inventory objects carry neither these globals nor the
+# control map.
 REQUIRED_GLOBAL_MARKER_HELPERS = frozenset({
     "p11_instance_exec_birth", "p11_instance_scope_gap",
 })
@@ -897,17 +898,15 @@ def check_marker_body(elf, symbol):
 
 
 def validate_journal_marker_helpers(elf):
-    """The journal object carries the DIRTY gap writer and the control
-    map, never the READY publish body: the journal dirties refused
-    calls but publishes no birth and reads no exec ID.
+    """The journal object carries both marker bodies and the control
+    map: the READY publish body births post-closure execs in opted-in
+    sessions, and the DIRTY gap writer dirties refused calls.
     """
-    if any(symbol[0] == "p11_instance_exec_birth" for symbol in elf.symbols):
-        raise RuntimeError("journal object contains the READY publish body")
-    gap = [symbol for symbol in elf.symbols
-           if symbol[0] == "p11_instance_scope_gap"]
-    if len(gap) != 1:
-        raise RuntimeError("journal object requires one scope gap body")
-    check_marker_body(elf, gap[0])
+    for name in ("p11_instance_exec_birth", "p11_instance_scope_gap"):
+        bodies = [symbol for symbol in elf.symbols if symbol[0] == name]
+        if len(bodies) != 1:
+            raise RuntimeError(f"journal object requires one {name} body")
+        check_marker_body(elf, bodies[0])
 
 
 def validate_journal_producers(elf):
@@ -937,15 +936,12 @@ def validate_marker_call_sites(elf, *, journal=False):
     unsafe-only roots (p11_entry_ia32, the template entries and the
     template continuation) must call when defined. Each call must
     resolve to the GLOBAL .text definition, never a same-named local.
-    The journal object instead wires its two journal roots to the gap
-    writer; it publishes no birth.
+    The journal object wires its two journal roots to the gap writer
+    and its exec root to the birth writer.
     """
     markers = {symbol[0] for symbol in elf.symbols
                if symbol[0] in REQUIRED_GLOBAL_MARKER_HELPERS}
-    if journal:
-        if markers != {"p11_instance_scope_gap"}:
-            return
-    elif markers != REQUIRED_GLOBAL_MARKER_HELPERS:
+    if markers != REQUIRED_GLOBAL_MARKER_HELPERS:
         return
     text = elf.indices.get(".text")
     relocs = {}
@@ -970,6 +966,7 @@ def validate_marker_call_sites(elf, *, journal=False):
         required = {
             "p11_entry_journal": "p11_instance_scope_gap",
             "p11_return_journal": "p11_instance_scope_gap",
+            "sched_process_exec": "p11_instance_exec_birth",
         }
         optional = {}
     else:
@@ -2452,10 +2449,9 @@ def validate_inventory(variant, maps, programs, symbols):
     if journal:
         # The exact map comparison above already excludes every map the
         # journal must not carry, including inventory-only maps; here
-        # only the marker wiring needs its own rule.
-        if "p11_instance_exec_birth" in symbols:
-            raise RuntimeError("journal object contains the forbidden READY publish body")
-        missing = {"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"} - symbols
+        # the marker wiring needs its own rule: the control map plus
+        # both marker bodies, birth and gap.
+        missing = (REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}) - symbols
         if missing:
             raise RuntimeError(f"journal object lacks required marker symbols: {sorted(missing)}")
     elif not inventory:
@@ -2571,7 +2567,9 @@ def self_test():
     validate_inventory("wide-diagnostic", WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS, diagnostic[2])
     validate_inventory("default-no-marker", _DETAILED_BASE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | base_helpers)
     validate_inventory("journal", JOURNAL_MAPS, JOURNAL_PROGRAMS,
-                       {"p11_entry_journal"} | base_helpers | {"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"})
+                       {"p11_entry_journal"} | base_helpers | {"JOURNAL_MARKER_CTL",
+                                                               "p11_instance_exec_birth",
+                                                               "p11_instance_scope_gap"})
 
     def rejected(check, *arguments):
         if check is validate_inventory:
@@ -2580,7 +2578,7 @@ def self_test():
             if prefix[0] == "default":
                 extra |= REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
             elif prefix[0] == "journal":
-                extra |= {"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"}
+                extra |= REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
             arguments = (*prefix, symbols | extra)
         errors = io.StringIO()
         try:
@@ -2612,8 +2610,8 @@ def self_test():
         "map removed: JOURNAL_MARKER_CTL",
     ]
     # The default object requires the marker set; the other Detailed
-    # variants forbid any of it; the journal requires the gap writer and
-    # the control map but never the READY publish body.
+    # variants forbid any of it; the journal requires the same marker set
+    # (control map plus birth and gap bodies).
     for extra, missing in [
         (set(), "['JOURNAL_MARKER_CTL', 'p11_instance_exec_birth', 'p11_instance_scope_gap']"),
         ({"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"}, "['p11_instance_exec_birth']"),
@@ -2634,18 +2632,19 @@ def self_test():
                     {"p11_entry", "p11_instance_scope_gap"}) == [
         "release object contains forbidden birth marker symbols: ['p11_instance_scope_gap']"
     ]
-    assert rejected(validate_inventory, "journal", JOURNAL_MAPS, JOURNAL_PROGRAMS,
-                    {"p11_entry_journal", "p11_instance_exec_birth"}) == [
-        "journal object contains the forbidden READY publish body"
-    ]
-    try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            validate_inventory("journal", JOURNAL_MAPS, JOURNAL_PROGRAMS,
-                               {"p11_entry_journal"} | base_helpers | {"JOURNAL_MARKER_CTL"})
-    except RuntimeError as error:
-        assert str(error) == "journal object lacks required marker symbols: ['p11_instance_scope_gap']", error
-    else:
-        raise AssertionError("journal accepted an object without the gap writer")
+    for extra, missing in [
+        (set(), "['JOURNAL_MARKER_CTL', 'p11_instance_exec_birth', 'p11_instance_scope_gap']"),
+        ({"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"}, "['p11_instance_exec_birth']"),
+        ({"JOURNAL_MARKER_CTL", "p11_instance_exec_birth"}, "['p11_instance_scope_gap']"),
+    ]:
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                validate_inventory("journal", JOURNAL_MAPS, JOURNAL_PROGRAMS,
+                                   {"p11_entry_journal"} | base_helpers | extra)
+        except RuntimeError as error:
+            assert str(error) == f"journal object lacks required marker symbols: {missing}", error
+        else:
+            raise AssertionError(f"journal accepted a markerless object with {sorted(extra)}")
     assert rejected(validate_inventory, "journal", JOURNAL_MAPS | {"USAGE": INVENTORY_MAPS["USAGE"]},
                     JOURNAL_PROGRAMS, {"p11_entry_journal"}) == [
         "map added: USAGE"

@@ -816,7 +816,9 @@ fn build_variant_with_proof(
             compile.arg("-DP11SCOPE_INSTANCE_SLOT_BOUND=8192U");
         }
         // H8-D wires the exec-birth and scope-gap globals into the
-        // Detailed instance witness only; counter bitcode stays identical.
+        // Detailed instance witness; the journal instance witness carries
+        // the same READY writer beside its gap, so opted-in sessions can
+        // birth on exec. Counter bitcode stays identical.
         if journal_marker && *unit == "instance_epoch" {
             compile.arg("-DP11SCOPE_JOURNAL_MARKER");
         }
@@ -826,6 +828,7 @@ fn build_variant_with_proof(
             }
             if *unit == "instance_epoch" {
                 compile.arg("-DP11SCOPE_JOURNAL_GAP");
+                compile.arg("-DP11SCOPE_JOURNAL_MARKER");
             }
         }
         // Flavor-wide, like INVENTORY_ONLY: every unit in a gated
@@ -1021,6 +1024,7 @@ fn build_variant_with_proof(
             "p11_journal_settle_prepare",
             "p11_journal_settle_finish",
             "p11_owner_start_remove_reason",
+            "p11_instance_exec_birth",
             "p11_instance_scope_gap",
             "JOURNAL_START",
             "JOURNAL_CTL",
@@ -1105,7 +1109,8 @@ fn build_variant_with_proof(
         append_flag("-C");
         append_flag("link-arg=--export=OBJECT_ZERO");
     }
-    // H8-D birth marker globals: Detailed-only exports. Counter and
+    // H8-D birth marker globals: Detailed exports when the marker is
+    // selected (the journal list above always carries both). Counter and
     // inventory objects carry neither the map nor the globals.
     if journal_marker {
         for flag in [

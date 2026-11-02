@@ -154,12 +154,13 @@ fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
 "#;
     if !comparison
         .lines()
-        // Pinned baseline 6641123f: the async control value flags on top of
-        // the default journal and birth marker (16a7bd53), the exec-witness
+        // Pinned baseline 55101d3c: the journal READY writer on top of the
+        // async control value flags (6641123f), the default journal and birth
+        // marker (16a7bd53), the exec-witness
         // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        .any(|line| line == "          BASELINE=6641123fdbd29a600da4f41b058afa6e6cd9c9fd")
+        .any(|line| line == "          BASELINE=55101d3ca96b398ebca4f85f9e18eca058bb7a05")
         || !comparison.contains(repeat)
         || !comparison.contains(integration)
         || comparison.contains("--host-compiler-transition")
@@ -239,12 +240,13 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
         "a renamed comparison job must be rejected"
     );
     for marker in [
-        // Pinned baseline 6641123f: the async control value flags on top of
-        // the default journal and birth marker (16a7bd53), the exec-witness
+        // Pinned baseline 55101d3c: the journal READY writer on top of the
+        // async control value flags (6641123f), the default journal and birth
+        // marker (16a7bd53), the exec-witness
         // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=6641123fdbd29a600da4f41b058afa6e6cd9c9fd",
+        "BASELINE=55101d3ca96b398ebca4f85f9e18eca058bb7a05",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"",

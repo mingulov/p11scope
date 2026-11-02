@@ -964,7 +964,7 @@ class JournalMarkerInventoryTests(unittest.TestCase):
             | {"JOURNAL_MARKER_CTL"}
         ) - set(missing)
 
-    def journal_symbols(self):
+    def journal_symbols(self, missing=frozenset()):
         return (
             {"p11_entry_journal"}
             | checker.REQUIRED_GLOBAL_HELPERS
@@ -972,8 +972,9 @@ class JournalMarkerInventoryTests(unittest.TestCase):
             | checker.REQUIRED_GLOBAL_EXEC_HELPERS
             | checker.REQUIRED_GLOBAL_EXE_HELPERS
             | checker.SELECTED_GLOBAL_HELPERS
-            | {"JOURNAL_MARKER_CTL", "p11_instance_scope_gap"}
-        )
+            | checker.REQUIRED_GLOBAL_MARKER_HELPERS
+            | {"JOURNAL_MARKER_CTL"}
+        ) - set(missing)
 
     def quiet(self, func, *args):
         errors = io.StringIO()
@@ -1093,17 +1094,17 @@ class JournalMarkerInventoryTests(unittest.TestCase):
         self.quiet(checker.validate_inventory, "journal", checker.JOURNAL_MAPS,
                    checker.JOURNAL_PROGRAMS, self.journal_symbols())
 
-    def test_journal_variant_refuses_birth_and_missing_gap(self):
-        with self.assertRaisesRegex(RuntimeError, "forbidden READY publish body"):
-            checker.validate_inventory("journal", checker.JOURNAL_MAPS,
-                                       checker.JOURNAL_PROGRAMS,
-                                       self.journal_symbols() | {"p11_instance_exec_birth"})
-        for missing in ({"JOURNAL_MARKER_CTL"}, {"p11_instance_scope_gap"}):
+    def test_journal_variant_requires_birth_gap_and_map(self):
+        full = set(checker.REQUIRED_GLOBAL_MARKER_HELPERS) | {"JOURNAL_MARKER_CTL"}
+        for missing in ({"JOURNAL_MARKER_CTL"},
+                        {"p11_instance_exec_birth"},
+                        {"p11_instance_scope_gap"},
+                        full):
             with self.subTest(missing=sorted(missing)):
                 with self.assertRaisesRegex(RuntimeError, "lacks required marker symbols") as raised:
                     checker.validate_inventory("journal", checker.JOURNAL_MAPS,
                                                checker.JOURNAL_PROGRAMS,
-                                               self.journal_symbols() - missing)
+                                               self.journal_symbols(missing=missing))
                 for name in sorted(missing):
                     self.assertIn(name, str(raised.exception))
 

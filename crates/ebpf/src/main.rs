@@ -2153,9 +2153,9 @@ fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
     };
     if let Some(scope) = scope_auth() {
         // H8-D birth marker: an in-scope exec after closure publishes
-        // READY for key-operation birth. Scope-gated: an exec outside
-        // the scope can never be born, so it is never charged.
-        #[cfg(p11scope_birth_marker)]
+        // READY (Detailed and journal share; scope-gated, never charged
+        // outside scope; PID seam: witness wraps here after the gen gate).
+        #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
         #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
         unsafe {
             p11_instance_exec_birth();
@@ -3111,10 +3111,10 @@ unsafe extern "C" {
     #[cfg(not(feature = "inventory-only"))]
     fn p11_instance_exec() -> u32;
     /// H8-D post-attach birth marker (native instance_epoch.c, Detailed
-    /// only): the exec half publishes READY on the leader row after
+    /// and journal): the exec half publishes READY on the leader row after
     /// closure; the gap half dirties it on an out-of-scope or refused
     /// call. Both own their frames; failures latch the control row.
-    #[cfg(p11scope_birth_marker)]
+    #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]
     #[cfg(not(any(feature = "inventory-only", feature = "counter-broad")))]
     fn p11_instance_exec_birth() -> u32;
     #[cfg(any(p11scope_birth_marker, p11scope_journal_roots))]

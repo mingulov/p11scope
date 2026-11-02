@@ -44,6 +44,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
+
+#[allow(dead_code)]
+mod support;
 
 fn serial_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1419,6 +1423,7 @@ fn d3d_dashboard_run_with_identity_discloses_backend() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -1494,6 +1499,7 @@ fn d3d_dashboard_run_with_identity_discloses_backend() {
         .stdin(slave_file.try_clone().unwrap())
         .stdout(slave_file)
         .stderr(Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1567,6 +1573,7 @@ fn d3d_pid_carries_no_identity_key() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );

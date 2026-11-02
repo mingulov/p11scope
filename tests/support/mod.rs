@@ -370,6 +370,7 @@ impl MatchingDecoy {
     pub fn spawn() -> io::Result<Self> {
         Command::new("sleep")
             .arg(SLEEP_ARGUMENT)
+            .die_with_parent()
             .spawn()
             .map(ChildGuard::new)
             .map(Self)
@@ -390,7 +391,11 @@ mod tests {
 
     #[test]
     fn pending_child_kill_failure_returns_without_an_unbounded_wait() {
-        let child = Command::new("sleep").arg(SLEEP_ARGUMENT).spawn().unwrap();
+        let child = Command::new("sleep")
+            .arg(SLEEP_ARGUMENT)
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let mut child = ChildGuard::new(child);
         let started = Instant::now();
         let error = child

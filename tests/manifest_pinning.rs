@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use support::DieWithParent as _;
+
+#[allow(dead_code)]
+mod support;
 
 static CC_LOCK: Mutex<()> = Mutex::new(());
 static DISCOVER_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -1521,7 +1525,11 @@ fn proc_root_manifest_rejects_a_pid_not_in_the_retained_views() {
 
     let d = tmpdir("manifest_pinning_proc_root_wrong_view");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
-    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
     let locator = PathBuf::from(format!("/proc/{}/root{}", child.id(), so.display()));
     let manifest = manifest_for(&locator);
     let observer = ProcessView::open(ProcessViewId(19), std::process::id()).unwrap();
@@ -1543,7 +1551,11 @@ fn proc_root_manifest_rejects_a_stale_retained_process_view() {
 
     let d = tmpdir("manifest_pinning_proc_root_stale_view");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
-    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
     let locator = PathBuf::from(format!("/proc/{}/root{}", child.id(), so.display()));
     let manifest = manifest_for(&locator);
     let view = ProcessView::open(ProcessViewId(20), child.id()).unwrap();
@@ -2135,6 +2147,7 @@ fn replacing_the_file_by_rename_keeps_the_pinned_inode_but_reports_a_change() {
 fn a_pid_pin_detects_process_exit() {
     let mut child = std::process::Command::new("sleep")
         .arg("30")
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pin = p11scope::process::PidPin::open(child.id()).expect("pin a live child");
@@ -2198,6 +2211,7 @@ impl ScannedChild {
             child: Command::new(&executable)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
             exe: executable,

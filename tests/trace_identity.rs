@@ -5,6 +5,10 @@
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
+
+#[allow(dead_code)]
+mod support;
 
 struct Owned(Child);
 impl Drop for Owned {
@@ -21,6 +25,7 @@ fn run(args: &[&str]) -> (i32, String, String) {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );

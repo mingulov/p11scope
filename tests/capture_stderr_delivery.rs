@@ -19,9 +19,13 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
 
 #[path = "support/multi_host.rs"]
 mod multi_host;
+
+#[allow(dead_code)]
+mod support;
 
 // The pipe belongs only to this test and its child. Fill it, then restore its
 // original blocking flags: production must avoid waiting without changing them.
@@ -104,6 +108,7 @@ fn full_or_closed_stderr_preserves_capture_exit_status() {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(writer)
+                .die_with_parent()
                 .spawn()
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);

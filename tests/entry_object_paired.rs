@@ -16,6 +16,10 @@
 use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use support::DieWithParent as _;
+
+#[allow(dead_code)]
+mod support;
 
 /// The suite's test count; update with the suite (it proves selection).
 const EXPECTED_TESTS: u32 = 45;
@@ -132,6 +136,7 @@ fn paired_default_and_unsafe_objects_satisfy_the_entry_contract() {
         .arg("-v")
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::piped())
+        .die_with_parent()
         .spawn()
         .expect("run actual paired entry-object suite");
     let reader = std::io::BufReader::new(child.stderr.take().expect("suite stderr"));

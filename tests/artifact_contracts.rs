@@ -1,9 +1,13 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
+#[allow(dead_code)]
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
 use std::sync::Mutex;
+use support::DieWithParent as _;
 
 #[path = "support/transport_boundaries.rs"]
 mod transport_boundaries;
@@ -156,6 +160,7 @@ fn run_group_within(
         .stdout(fs::File::create(&stdout_path).expect("runner stdout file"))
         .stderr(fs::File::create(&stderr_path).expect("runner stderr file"))
         .process_group(0)
+        .die_with_parent()
         .spawn()
         .unwrap_or_else(|error| panic!("running {program}: {error}"));
     let pid = child.id();

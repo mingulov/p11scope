@@ -14,9 +14,13 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use support::DieWithParent as _;
 
 #[path = "support/multi_host.rs"]
 mod multi_host;
+
+#[allow(dead_code)]
+mod support;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_p11scope")
@@ -68,6 +72,7 @@ impl SleepTarget {
     fn spawn() -> Self {
         let child = Command::new("sleep")
             .arg("287.4139")
+            .die_with_parent()
             .spawn()
             .expect("spawn sleep target");
         Self { child }
@@ -941,6 +946,7 @@ fn se09_profile_without_duration_names_ctrl_c_on_stderr() {
         .args(["profile", "--pid", &target.pid()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .die_with_parent()
         .spawn()
         .expect("spawn p11scope profile");
     // On eligible hosts the notice precedes discovery; give it time to land,

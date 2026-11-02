@@ -2,6 +2,10 @@
 //! Public inspect presentation retains scan-local identity without usage claims.
 
 use std::process::{Child, Command};
+use support::DieWithParent as _;
+
+#[allow(dead_code)]
+mod support;
 
 struct OwnedTarget(Child);
 impl Drop for OwnedTarget {
@@ -13,7 +17,13 @@ impl Drop for OwnedTarget {
 
 #[test]
 fn inspect_public_identity_is_same_in_text_and_json() {
-    let target = OwnedTarget(Command::new("sleep").arg("30").spawn().unwrap());
+    let target = OwnedTarget(
+        Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
     let pid = target.0.id();
     let expected = std::fs::read_link(format!("/proc/{pid}/exe"))
         .unwrap()

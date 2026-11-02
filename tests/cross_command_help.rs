@@ -8,6 +8,10 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStringExt as _;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
+
+#[allow(dead_code)]
+mod support;
 
 fn invoke(words: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_p11scope"))
@@ -239,6 +243,7 @@ fn unread_usage_stderr_does_not_block_exit() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -320,7 +325,12 @@ fn full_or_closed_stderr_preserves_usage_and_hard_error_exit_codes() {
                 command.arg("inspect").stdout(Stdio::null());
                 2
             };
-            let mut child = command.stdin(Stdio::null()).stderr(writer).spawn().unwrap();
+            let mut child = command
+                .stdin(Stdio::null())
+                .stderr(writer)
+                .die_with_parent()
+                .spawn()
+                .unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             let status = loop {
                 if let Some(status) = child.try_wait().unwrap() {

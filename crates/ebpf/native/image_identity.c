@@ -212,12 +212,13 @@ static __always_inline int bank_control_valid(struct control *control)
  * the fold to a later admission. The Session's drain proof (no
  * in-flight selectors of the claimed bank) keeps next_ticket frozen
  * from the claim, so the single read retires exactly. */
-static __always_inline void identity_help_fold(struct image_bank_select *select,
-                                               struct control *controls[2])
+static __always_inline void identity_help_fold(struct image_bank_select *select)
 {
+    u32 key = 0;
 #pragma unroll
     for (u32 slot = 0; slot < IMAGE_BANK_SLOTS; slot++) {
-        struct control *control = controls[slot];
+        struct control *control = bpf_map_lookup_elem(
+            (slot == 0) ? (void *)&COOKIE_CTL : (void *)&COOKIE_CTL_B, &key);
         u64 retired;
         if (select->prepared[slot] || select->folded[slot] != 0)
             continue;
@@ -240,12 +241,13 @@ static __always_inline void identity_help_fold(struct image_bank_select *select,
  * retry) or lands after it (a valid new-epoch issue); only the
  * zero-CAS winner transitions a nonzero watermark to zero, so the
  * zeroing applies exactly once. */
-static __always_inline void identity_help_reprepare(struct image_bank_select *select,
-                                                    struct control *controls[2])
+static __always_inline void identity_help_reprepare(struct image_bank_select *select)
 {
+    u32 key = 0;
 #pragma unroll
     for (u32 slot = 0; slot < IMAGE_BANK_SLOTS; slot++) {
-        struct control *control = controls[slot];
+        struct control *control = bpf_map_lookup_elem(
+            (slot == 0) ? (void *)&COOKIE_CTL : (void *)&COOKIE_CTL_B, &key);
         u64 seen;
         if (!select->prepared[slot] || select->folded[slot] != 1)
             continue;
@@ -285,7 +287,15 @@ static __always_inline void bank_refuse(struct image_bank_select *select)
         identity_count(select, &select->refusals);
 }
 
-__attribute__((noinline)) u32 p11_image_bank_select(void)
+#ifdef P11SCOPE_LOADER_GATE
+/* Gate-1 only: inline the bank-select leaf at its single call site so
+ * the return path pays no call frame for it (its 16 rounded bytes
+ * decide the 512 budget). Gate-0 keeps the outline. */
+__attribute__((always_inline))
+#else
+__attribute__((noinline))
+#endif
+u32 p11_image_bank_select(void)
 {
     struct image_bank_select *select;
     u64 bank;
@@ -301,7 +311,15 @@ __attribute__((noinline)) u32 p11_image_bank_select(void)
     return (u32)bank;
 }
 
-__attribute__((noinline)) u32 p11_image_bank_cut(u64 target)
+#ifdef P11SCOPE_LOADER_GATE
+/* Gate-1 only: inline the bank-cut step at its single call site so the
+ * link frame closes the return-path chain (no subprogram call keeps a
+ * fourth frame on the 512 budget). Gate-0 keeps the outline. */
+__attribute__((always_inline))
+#else
+__attribute__((noinline))
+#endif
+u32 p11_image_bank_cut(u64 target)
 {
     struct image_bank_select *select;
     u64 bank;
@@ -327,6 +345,10 @@ __attribute__((noinline)) u32 p11_image_bank_cut(u64 target)
 #endif
 
 #ifdef P11SCOPE_LOADER_GATE
+/* Singleton control-row key: every control lookup addresses row 0. A
+ * shared rodata zero keeps the constant key off the allocator's
+ * stack (an address-taken local would hold a frame slot). */
+static const u32 control_row_key = 0;
 /* Bank-aware allocator: select first (no storage touched on a bad
  * SELECT), help pending folds and re-prepares unconditionally, then
  * fast-path the current bank with the retained bank as fallback. A
@@ -343,14 +365,12 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
         .status = COOKIE_STATUS_BAD_TASK, .bank = 0,
     };
     struct image_bank_select *select;
-    struct control *controls[2];
     struct control *control;
-    void *storage_map;
     u64 *cell;
-    u64 epochs[2];
     u32 bank;
     u32 source;
-    u32 key = 0;
+    /* Narrow live state: rows and epochs re-read at each use. Control
+     * lookups address the rodata row key, never a stack slot. */
 
     if (!task)
         return result;
@@ -364,13 +384,12 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
         result.status = COOKIE_STATUS_BAD_CONFIG;
         return result;
     }
-    controls[0] = bpf_map_lookup_elem(&COOKIE_CTL, &key);
-    controls[1] = bpf_map_lookup_elem(&COOKIE_CTL_B, &key);
     /* Lifecycle help is unconditional: a corrupt current bank never
      * blocks another bank's fold or re-prepare. */
-    identity_help_fold(select, controls);
-    identity_help_reprepare(select, controls);
-    control = (bank == 0) ? controls[0] : controls[1];
+    identity_help_fold(select);
+    identity_help_reprepare(select);
+    control = bpf_map_lookup_elem((bank == 0) ? (void *)&COOKIE_CTL : (void *)&COOKIE_CTL_B,
+                                  &control_row_key);
     if (!control) {
         result.status = COOKIE_STATUS_NO_CONTROL;
         return result;
@@ -382,19 +401,10 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
         result.status = COOKIE_STATUS_BAD_CONFIG;
         return result;
     }
-    /* Epochs before cells: a loader cycle cannot fit between these
-     * loads and the probes below (it spans a userspace round trip),
-     * while the bump alone could follow a cell read, so incarnation-
-     * first keeps the (cell, epoch) pair coherent. */
-    epochs[0] = select->incarnation[0];
-    epochs[1] = select->incarnation[1];
-    if (bank == 0) {
-        storage_map = &TASK_COOKIE;
-    } else {
-        storage_map = &TASK_COOKIE_B;
-    }
+    /* Epochs load at each use before the cell read: incarnation-first. */
     source = bank;
-    cell = bpf_task_storage_get(storage_map, task, (void *)0, 0);
+    cell = bpf_task_storage_get((bank == 0) ? (void *)&TASK_COOKIE : (void *)&TASK_COOKIE_B,
+                                task, (void *)0, 0);
     if (!cell) {
         void *retained = (bank == 0) ? (void *)&TASK_COOKIE_B : (void *)&TASK_COOKIE;
         cell = bpf_task_storage_get(retained, task, (void *)0, 0);
@@ -402,8 +412,11 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
             source = (bank == 0) ? 1 : 0;
     }
     if (cell) {
-        struct control *origin = (source == 0) ? controls[0] : controls[1];
-        u64 source_epoch = (source == 0) ? epochs[0] : epochs[1];
+        void *origin_map = (source == 0) ? (void *)&COOKIE_CTL : (void *)&COOKIE_CTL_B;
+        struct control *origin = (source == bank) ? control
+            : bpf_map_lookup_elem(origin_map, &control_row_key);
+        /* Source known; its epoch loads before the cell read below. */
+        u64 source_epoch = select->incarnation[source];
         if (!origin) {
             result.status = COOKIE_STATUS_NO_CONTROL;
             return result;
@@ -442,15 +455,11 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
     for (int attempt = 0; attempt < COOKIE_CAS_TRIES; attempt++) {
         u64 ticket;
         u64 observed;
-        u64 proposed;
         u64 epoch;
 
-        /* Fresh epochs every attempt (constant indexes, branch-
-         * selected bank): a loader cycle completing mid-loop must
-         * not issue under the previous epoch. */
-        epochs[0] = select->incarnation[0];
-        epochs[1] = select->incarnation[1];
-        epoch = (bank == 0) ? epochs[0] : epochs[1];
+        /* Fresh epoch every attempt: a loader cycle completing mid-loop
+         * must not issue under the previous epoch. */
+        epoch = select->incarnation[bank];
         if (epoch >= IMAGE_IDENTITY_INCARNATION_LIMIT) {
             if (count_failures) {
                 identity_count(select, &control->unavailable);
@@ -461,26 +470,30 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
         ticket = control->next_ticket;
         if (ticket >= control->limit) {
             u32 other = (bank == 0) ? 1 : 0;
-            struct control *target = (other == 0) ? controls[0] : controls[1];
-            u64 target_prepared = (other == 0) ? select->prepared[0] : select->prepared[1];
-            u64 target_folded = (other == 0) ? select->folded[0] : select->folded[1];
-            u64 target_epoch = (other == 0) ? epochs[0] : epochs[1];
-            /* Short-circuit keeps the target dereferences behind the
-             * validity check, so a missing target refuses uncounted. */
-            int fresh = target_prepared && target_folded == 0 &&
+            void *target_map = (other == 0) ? (void *)&COOKIE_CTL : (void *)&COOKIE_CTL_B;
+            struct control *target = bpf_map_lookup_elem(target_map, &control_row_key);
+            /* Short-circuit keeps the target dereferences behind the validity
+             * check, so a missing target refuses uncounted. */
+            int fresh = select->prepared[other] && select->folded[other] == 0 &&
                 bank_control_valid(target) && target->next_ticket < target->limit &&
-                target_epoch < IMAGE_IDENTITY_INCARNATION_LIMIT;
+                select->incarnation[other] < IMAGE_IDENTITY_INCARNATION_LIMIT;
             if (fresh && p11_image_bank_cut(other) == other) {
                 bank = other;
-                if (bank == 0)
-                    storage_map = &TASK_COOKIE;
-                else
-                    storage_map = &TASK_COOKIE_B;
-                control = target;
+                control = bpf_map_lookup_elem(
+                    (bank == 0) ? (void *)&COOKIE_CTL : (void *)&COOKIE_CTL_B, &control_row_key);
+                if (!control) {
+                    result.status = COOKIE_STATUS_NO_CONTROL;
+                    return result;
+                }
                 continue;
             }
+            /* Re-read the refused row: same address the loop validated.
+             * A witness pass (count_failures clear) counts nothing. */
             if (count_failures) {
-                identity_count(select, &control->unavailable);
+                control = bpf_map_lookup_elem(
+                    (bank == 0) ? (void *)&COOKIE_CTL : (void *)&COOKIE_CTL_B, &control_row_key);
+                if (control)
+                    identity_count(select, &control->unavailable);
             }
             bank_refuse(select);
             result.status = COOKIE_STATUS_QUOTA;
@@ -492,9 +505,12 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
         if (observed != ticket)
             continue;
 
-        proposed = ticket + 1;
-        cell = bpf_task_storage_get(storage_map, task, &proposed,
-                                    BPF_LOCAL_STORAGE_GET_F_CREATE);
+        /* The winning number reuses the observed slot: the CAS result
+         * above is dead from here on, so ticket keeps no address. */
+        observed = ticket + 1;
+        cell = bpf_task_storage_get(
+            (bank == 0) ? (void *)&TASK_COOKIE : (void *)&TASK_COOKIE_B,
+            task, &observed, BPF_LOCAL_STORAGE_GET_F_CREATE);
         if (cell) {
             if (*cell) {
                 result.cookie = *cell;
@@ -510,7 +526,8 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
             return result;
         }
 
-        cell = bpf_task_storage_get(storage_map, task, (void *)0, 0);
+        cell = bpf_task_storage_get(
+            (bank == 0) ? (void *)&TASK_COOKIE : (void *)&TASK_COOKIE_B, task, (void *)0, 0);
         if (cell && *cell) {
             result.cookie = *cell;
             result.bank = bank;
@@ -668,7 +685,14 @@ __attribute__((always_inline)) u32 p11_link_task_identity(struct task_struct *ta
     return identity_for(task, out);
 }
 
-__attribute__((noinline)) u32 p11_link_current_identity(struct image_identity *out)
+__attribute__((noinline))
+#ifdef P11SCOPE_LOADER_GATE
+/* Gate-1 only: -Os codegen for the bank-aware body keeps the inlined
+ * allocator inside the return-path frame budget. Gate-0 keeps the
+ * default pipeline and outline. */
+__attribute__((minsize))
+#endif
+u32 p11_link_current_identity(struct image_identity *out)
 {
     if (!out)
         return COOKIE_STATUS_BAD_TASK;

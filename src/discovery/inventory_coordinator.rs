@@ -7443,6 +7443,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let completion =
             self.prepare_physical_publication(engine_changed, lane.as_deref_mut(), acquisition)?;
+        // Poll the EVENTS ring-loss counter on every plain commit, so a
+        // rise discloses in the same publication instead of staying
+        // silent. A failed read only delays disclosure: the counter is
+        // cumulative and the last good value stands.
+        if let Some(lane) = lane.as_deref_mut()
+            && let Some(delta) = lane.poll_events_ring_loss()
+        {
+            self.disclose_events_ring_loss(lane, delta);
+        }
         self.finalize_semantic_batches(lane);
         let applied = self.publish_registry(None)?;
         Ok(JointCommitProgress::Published(

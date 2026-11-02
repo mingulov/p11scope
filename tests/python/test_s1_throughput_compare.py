@@ -1224,6 +1224,34 @@ class LossGate(unittest.TestCase):
             self.run_mutation(mutate_inventory, mutate_events)
         self.assertIn("loss gap", str(ctx.exception))
 
+    def test_native_capture_events_lost_gap_fails(self):
+        reason = ("the EVENTS ring overwrote records before the drain "
+                  "read them (kernel reserve failures; exact count in "
+                  "unrouted_returns)")
+
+        def mutate_inventory(inventory):
+            inventory["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "subject": "native capture events lost",
+                 "reason": reason, "budget": None,
+                 "repeats": 1})
+
+        def mutate_events(events):
+            ended = events[-1]
+            assert ended["kind"] == "ended"
+            gap = event_envelope(ended["seq"], R0 + 1_000, "gap_recorded",
+                                 {"index": 0, "caller": None, "module": None,
+                                  "pid": None,
+                                  "subject": "native capture events lost",
+                                  "reason": reason,
+                                  "budget": None})
+            events.insert(-1, gap)
+            ended["seq"] += 1
+
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate_inventory, mutate_events)
+        self.assertIn("loss gap", str(ctx.exception))
+
     def test_tolerated_journal_disclosure_passes(self):
         def mutate_inventory(inventory):
             inventory["gaps"].append(

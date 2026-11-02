@@ -2493,3 +2493,286 @@ fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
         .finish_pending_h3(&mut ports, &scene.scene.real.lane)
         .unwrap_or_else(|(_, reason)| panic!("original mixed pending finish: {reason:?}"));
 }
+
+/// Scripts the EVENTS ring-loss counter over a faithful H0: every
+/// other seam delegates to the scene's shared H0 unchanged.
+struct PublishRingLossStub<I> {
+    inner: I,
+    ring_loss: std::collections::VecDeque<u64>,
+}
+
+impl<I: crate::inventory_semantics::LaneTestIo> crate::inventory_semantics::LaneTestIo
+    for PublishRingLossStub<I>
+{
+    fn events_ring_loss(&mut self) -> Option<u64> {
+        self.ring_loss.pop_front()
+    }
+
+    fn stash_pending_floor(&self) -> Option<u64> {
+        self.inner.stash_pending_floor()
+    }
+
+    fn inspect_pending_h3(
+        &self,
+        inspect: &mut dyn FnMut(
+            &crate::semantic_capture::SemanticCapture,
+            &crate::inventory_semantics::RefreshReceiptStash,
+            &crate::attach::SessionDrainProducers,
+        ),
+    ) {
+        self.inner.inspect_pending_h3(inspect)
+    }
+
+    fn semantic_published(&mut self) {
+        self.inner.semantic_published()
+    }
+
+    fn begin_terminal_cleanup(&mut self) -> anyhow::Result<()> {
+        self.inner.begin_terminal_cleanup()
+    }
+
+    fn finish_terminal_cleanup(
+        &mut self,
+        second_signal: &dyn Fn() -> bool,
+        out: &mut dyn std::io::Write,
+    ) -> anyhow::Result<()> {
+        self.inner.finish_terminal_cleanup(second_signal, out)
+    }
+
+    fn poll_terminal_detach(
+        &mut self,
+        out: &mut dyn std::io::Write,
+    ) -> anyhow::Result<crate::attach::ProducerDetachProgress> {
+        self.inner.poll_terminal_detach(out)
+    }
+
+    fn tick_targets(&mut self, pins: &[std::sync::Arc<crate::process::PidPin>]) {
+        self.inner.tick_targets(pins)
+    }
+
+    fn service_live_discovery(&mut self) {
+        self.inner.service_live_discovery()
+    }
+
+    fn collection_saturated(&self) -> bool {
+        self.inner.collection_saturated()
+    }
+
+    fn retained_registration_ns(&self, image: p11scope_ebpf_common::ImageIdentity) -> Option<u64> {
+        self.inner.retained_registration_ns(image)
+    }
+
+    fn validate_attachment(
+        &mut self,
+        subset: &crate::inventory_semantics::AttestedSubset,
+    ) -> Result<(), crate::inventory_semantics::SemanticRefusal> {
+        self.inner.validate_attachment(subset)
+    }
+
+    fn take_refresh_receipt(
+        &mut self,
+        pin: &std::sync::Arc<crate::process::PidPin>,
+        slot: u32,
+    ) -> Option<crate::semantic_capture::CurrentPartitionReceipt> {
+        self.inner.take_refresh_receipt(pin, slot)
+    }
+
+    fn stash_admission_evidence(
+        &mut self,
+        receipts: Vec<crate::semantic_capture::CurrentPartitionReceipt>,
+        outcomes: Vec<crate::semantic_capture::TickOutcome>,
+    ) {
+        self.inner.stash_admission_evidence(receipts, outcomes)
+    }
+
+    fn physical_gaps(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+        gaps: &mut Vec<crate::semantic_capture::PhysicalSemanticGap>,
+    ) -> Option<
+        Result<
+            crate::inventory_semantics::SemanticBatch,
+            crate::inventory_semantics::SemanticRefusal,
+        >,
+    > {
+        self.inner.physical_gaps(domain, gaps)
+    }
+
+    fn validate_collected_preparation(
+        &self,
+        raw: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> Result<(), crate::inventory_semantics::SemanticRefusal> {
+        self.inner.validate_collected_preparation(raw)
+    }
+
+    fn physical_gaps_collected(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+        gaps: &mut Vec<crate::semantic_capture::PhysicalSemanticGap>,
+        raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> Option<
+        Result<
+            crate::inventory_semantics::SemanticBatch,
+            crate::inventory_semantics::SemanticRefusal,
+        >,
+    > {
+        self.inner.physical_gaps_collected(domain, gaps, raw)
+    }
+
+    fn validate_current(
+        &mut self,
+        receipt: &crate::semantic_capture::CurrentPartitionReceipt,
+        report: &mut crate::semantic_capture::TickReport,
+    ) -> Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+        self.inner.validate_current(receipt, report)
+    }
+
+    fn tick(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+    ) -> Result<
+        crate::inventory_semantics::SemanticBatch,
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        self.inner.tick(domain)
+    }
+
+    fn refresh(
+        &mut self,
+        pin: std::sync::Arc<crate::process::PidPin>,
+        slot: u32,
+    ) -> Result<
+        (
+            Vec<p11scope_ebpf_common::ImageIdentity>,
+            std::sync::Arc<crate::process::PidPin>,
+        ),
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        self.inner.refresh(pin, slot)
+    }
+
+    fn refresh_collected(
+        &mut self,
+        pin: std::sync::Arc<crate::process::PidPin>,
+        slot: u32,
+        raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &crate::semantics_objects::journal::JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<
+        (
+            Vec<p11scope_ebpf_common::ImageIdentity>,
+            std::sync::Arc<crate::process::PidPin>,
+        ),
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        self.inner
+            .refresh_collected(pin, slot, raw, adapter, producers)
+    }
+
+    fn has_pending_evidence(&self) -> bool {
+        self.inner.has_pending_evidence()
+    }
+
+    fn finish(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+    ) -> crate::inventory_semantics::SemanticBatch {
+        self.inner.finish(domain)
+    }
+
+    fn quiescent(&mut self) -> bool {
+        self.inner.quiescent()
+    }
+
+    fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+        self.inner.positions()
+    }
+
+    fn drain_events_to(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> crate::inventory_semantics::LaneDrainOutcome {
+        self.inner.drain_events_to(stop, quantum)
+    }
+
+    fn drain_discovery_to(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> crate::inventory_semantics::LaneDrainOutcome {
+        self.inner.drain_discovery_to(stop, quantum)
+    }
+}
+
+/// The machine publish path polls the EVENTS ring-loss counter like
+/// the plain commit path: a rise discloses exactly once even though
+/// both poll sites read the same cumulative counter.
+#[test]
+fn joint_machine_publish_discloses_events_ring_loss_rise() {
+    let mut scene = MachineScene::new(1);
+    scene.native.fail_births = true;
+    let h0 = scene.scene.real.h0.clone();
+    scene
+        .scene
+        .real
+        .lane
+        .install_test_io(Box::new(PublishRingLossStub {
+            inner: h0,
+            ring_loss: std::collections::VecDeque::from([9, 9, 9]),
+        }));
+    let pid = std::process::id();
+    for (seq, name) in (1u64..).zip([
+        "C_CreateObject",
+        "C_SignInit",
+        "C_SignUpdate",
+        "C_SignFinal",
+    ]) {
+        scene.scene.push(pid, 0, name, seq);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("m1-ring-loss", None);
+    // M1 stages one named gap at publish; the counts land immediately.
+    let staged: Vec<_> = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| subject == "native capture events lost")
+        .collect();
+    assert_eq!(
+        staged,
+        [(
+            "native capture events lost".to_string(),
+            "the EVENTS ring overwrote records before the drain read them \
+             (kernel reserve failures; exact count in unrouted_returns)"
+                .to_string(),
+        )],
+        "a rise stages one named gap at machine publish"
+    );
+    let lane = &scene.scene.real.lane;
+    assert_eq!(
+        (
+            lane.shed_calls_disclosed(),
+            lane.semantic_summary().unrouted_returns
+        ),
+        (9, 9),
+        "the disclosed delta counts exactly once across poll sites"
+    );
+    // And it surfaces through the next registry publish, never stuck staged.
+    scene.scene.real.scene.coordinator.registry_mut().publish();
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let gaps: Vec<_> = coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .zip(coordinator.registry().gap_repeats().iter())
+        .filter(|(gap, _)| gap.subject == "native capture events lost")
+        .map(|(gap, repeats)| (gap.reason.clone(), *repeats))
+        .collect();
+    assert_eq!(gaps.len(), 1, "the staged gap surfaces: {gaps:?}");
+    assert_eq!(gaps[0].1, 1, "a single rise surfaces once: {gaps:?}");
+}

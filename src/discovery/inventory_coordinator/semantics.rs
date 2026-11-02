@@ -746,6 +746,9 @@ pub(crate) struct SemanticBindingSet {
     limit: usize,
     provider_limit: usize,
     refresh_cursor: Option<(CallerId, PinnedObjectId)>,
+    /// Registry module-find evaluations during selection (test count).
+    #[cfg(test)]
+    refresh_find_visits: u64,
     /// Refusal-only history across accepted owner scan / failed scope commit.
     /// A later Detailed exec cannot silently reuse the chosen scan-pinned
     /// incarnation merely because its executable pathname/inode stayed equal.
@@ -824,6 +827,8 @@ impl SemanticBindingSet {
             limit: MAX_INSTANCES,
             provider_limit: MAX_INSTANCES,
             refresh_cursor: None,
+            #[cfg(test)]
+            refresh_find_visits: 0,
             admission_images: HashMap::new(),
             successors: HashMap::new(),
             refused_successors: HashMap::new(),
@@ -1330,9 +1335,17 @@ fn consume_current_admission<Source: ProcessSource>(
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
+    /// Registry module-find evaluations during selection (test count).
+    #[cfg(test)]
+    pub(crate) fn semantic_refresh_find_visits(&self) -> u64 {
+        self.semantic_bindings.refresh_find_visits
+    }
+
     /// Four exact mapped attested pairs, including every failed refresh.
-    /// Selection scans bounded retained catalogs without allocating a caller
-    /// cross-product. The cursor advances per caller/provider, including failure.
+    /// The four picks share one registry scan through a bounded per-pair
+    /// memo (freed per call); picks, cursor and charges match the unshared
+    /// scan exactly. The cursor advances per caller/provider, including
+    /// failure.
     pub(crate) fn semantic_refresh_attempts(
         &mut self,
         lane: &AttestedSemanticLane,
@@ -1344,6 +1357,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let mut attempts = Vec::with_capacity(4);
         let mut selected = BTreeSet::new();
+        // The registry, subset and edges are immutable for the whole call,
+        // so a (record, object) module find resolves identically on every
+        // pick. The first pick scans; later picks replay the recorded
+        // outcome and its charge pattern instead of re-scanning the
+        // registry (four full scans per call at scale). A pair the first
+        // pick skipped simply scans live on first reach: still correct.
+        let mut find_memo: BTreeMap<(CallerId, PinnedObjectId), (usize, Option<ModuleKey>)> =
+            BTreeMap::new();
         for _ in 0..4 {
             let mut next = None;
             let mut wrap = None;
@@ -1373,22 +1394,44 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     let Some(slot) = slots.first().copied() else {
                         continue;
                     };
-                    let mut exhausted = false;
-                    let module = self.registry.modules().find(|module| {
-                        if !charge(1) {
-                            exhausted = true;
-                            return true;
+                    let module = if let Some((visits, module)) = find_memo
+                        .get(&key)
+                        .map(|(visits, module)| (*visits, module.clone()))
+                    {
+                        // Replay: identical charges, no registry scan.
+                        for _ in 0..visits {
+                            if !charge(1) {
+                                return attempts;
+                            }
                         }
-                        lane.subset().proves_provider_module(*object, &module.key)
-                            && self
-                                .registry
-                                .edge(record.id, module.id)
-                                .is_some_and(|edge| edge.mapping == MappingState::Mapped)
-                    });
-                    if exhausted {
-                        return attempts;
-                    }
-                    let module = module.map(|module| module.key.clone());
+                        module
+                    } else {
+                        let mut exhausted = false;
+                        let mut visits = 0;
+                        let module = self.registry.modules().find(|module| {
+                            visits += 1;
+                            #[cfg(test)]
+                            {
+                                self.semantic_bindings.refresh_find_visits =
+                                    self.semantic_bindings.refresh_find_visits.saturating_add(1);
+                            }
+                            if !charge(1) {
+                                exhausted = true;
+                                return true;
+                            }
+                            lane.subset().proves_provider_module(*object, &module.key)
+                                && self
+                                    .registry
+                                    .edge(record.id, module.id)
+                                    .is_some_and(|edge| edge.mapping == MappingState::Mapped)
+                        });
+                        if exhausted {
+                            return attempts;
+                        }
+                        let module = module.map(|module| module.key.clone());
+                        find_memo.insert(key, (visits, module.clone()));
+                        module
+                    };
                     if module.is_none() {
                         continue;
                     }

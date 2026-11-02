@@ -234,8 +234,7 @@ fn main() {
     );
     let wide_detailed = env::var_os("CARGO_FEATURE_WIDE_DETAILED_2112").is_some();
     let stub_object_attributes = env::var_os("CARGO_FEATURE_STUB_OBJECT_ATTRIBUTES").is_some();
-    let unsafe_unvalidated =
-        env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some();
+    let unsafe_unvalidated = env::var_os("CARGO_FEATURE_UNSAFE_UNVALIDATED_METADATA").is_some();
     let small_build = small_ring || small_state_maps || small_discovery_ring;
     // Explicit =1 keeps today's refusals; unset omits silently where the
     // build cannot carry the production journal.

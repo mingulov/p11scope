@@ -2154,10 +2154,7 @@ fn object_journal_release_birth_marker_wiring_matches_build() {
     }
     let mut others: Vec<(&str, &[u8])> = vec![
         ("inventory", p11scope::EBPF_INVENTORY_OBJECT),
-        (
-            "inventory-callers",
-            p11scope::EBPF_INVENTORY_CALLERS_OBJECT,
-        ),
+        ("inventory-callers", p11scope::EBPF_INVENTORY_CALLERS_OBJECT),
     ];
     for (name, bytes) in [
         ("counter-counts", p11scope::EBPF_COUNTER_COUNTS_OBJECT),
@@ -2187,16 +2184,14 @@ fn object_journal_release_birth_marker_wiring_matches_build() {
         }
     }
     for (index, bytes) in artifact_bodies.iter().enumerate() {
-        others.push(
-            (
-                [
-                    "counter-counts-artifact",
-                    "counter-timestamps-artifact",
-                    "counter-latency-artifact",
-                ][index],
-                bytes.as_slice(),
-            ),
-        );
+        others.push((
+            [
+                "counter-counts-artifact",
+                "counter-timestamps-artifact",
+                "counter-latency-artifact",
+            ][index],
+            bytes.as_slice(),
+        ));
     }
     assert!(
         others.len() >= 2,
@@ -2339,8 +2334,7 @@ fn object_journal_elf_matches_detailed_attribute_capture() {
     if !expected_journal_selected() {
         return;
     }
-    let journal =
-        std::path::Path::new(env!("OUT_DIR")).join("journal-v1/p11scope-ebpf-journal-v1");
+    let journal = std::path::Path::new(env!("OUT_DIR")).join("journal-v1/p11scope-ebpf-journal-v1");
     assert!(
         journal.is_file(),
         "expected production journal ELF is absent: build-selection interface gap: {}",

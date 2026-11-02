@@ -7826,6 +7826,18 @@ mod tests {
             .status()
             .expect("spawn chown");
         assert!(status.success(), "handing the cell dir to the invoker");
+        // The campaign runner points TMPDIR at a root-only dir, which the
+        // invoker-owned child cannot traverse to reach the cell dir handed
+        // over above (its C_Initialize then fails on the unreadable token).
+        // Grant search-only on TMPDIR itself; names stay hidden (no read
+        // bit) and every higher ancestor is already traversable (the runner
+        // creates OUTDIR default, a lane TMPDIR is invoker-owned).
+        let tmp = std::env::temp_dir();
+        let metadata = std::fs::metadata(&tmp).expect("stat campaign TMPDIR");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() | 0o001);
+        std::fs::set_permissions(&tmp, permissions).expect("search bit on campaign TMPDIR");
     }
 
     /// `run` passes `SOFTHSM2_CONF` through its clean child environment, so

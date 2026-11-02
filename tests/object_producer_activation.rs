@@ -3167,6 +3167,11 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// short-lived tracking is armed outside aggregate captures, plus its
 /// comment lines and the counter-flavor cfg on the helper import):
 /// 144104 B, measured with this same lexer on the integrated source.
+/// Re-baselined for the async control value flags (the only BPF source
+/// change: an unreadable C_AsyncJoin id argument and an OK
+/// C_AsyncGetID with a null output pointer set ASYNC_VALUE_UNREADABLE
+/// with one evidence bump, plus their comment lines): 144520 B,
+/// measured with this same lexer on the integrated source.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3176,8 +3181,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            144104,
-            "2d26a4fbdc7dc004705ebcc0c3debbb9b18a10841432e86f47c98d2b7426ca89"
+            144520,
+            "b95e25da1090ecb50a1d4ee37487b301bcf0c8bee3f963d975d83c8ba7d676e2"
         ),
         "stripped BPF dump must stay byte-identical"
     );

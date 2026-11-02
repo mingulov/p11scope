@@ -19,6 +19,7 @@ failure, 2 on usage errors.
 """
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -61,16 +62,70 @@ def run_gated_fixture(fixture, module, ledger_path, gofile, donefile,
     kinds = []
     ledger_lines = []
     stderr_text = ""
+    stdout_fd = proc.stdout.fileno()
+    stderr_fd = proc.stderr.fileno()
+    line_buf = b""
+
+    def drain_stderr_available():
+        """Read only stderr bytes already available; never blocks."""
+        out = b""
+        while len(out) < 65536:
+            ready, _, _ = select.select([stderr_fd], [], [], 0)
+            if not ready:
+                break
+            try:
+                chunk = os.read(stderr_fd, 65536 - len(out))
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        return out.decode("utf-8", errors="replace")
+
+    def read_row(want):
+        """Read one stdout row, honoring the deadline while blocked.
+
+        select() waits on the pipe with the remaining budget; a silent
+        fixture trips the deadline instead of wedging readline().
+        Raw os.read (not the text wrapper's readline) keeps no hidden
+        buffer, so select-readiness and the bytes consumed agree.
+        """
+        nonlocal line_buf
+        while True:
+            newline = line_buf.find(b"\n")
+            if newline >= 0:
+                raw = line_buf[:newline + 1]
+                line_buf = line_buf[newline + 1:]
+                try:
+                    return raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise FixtureError(
+                        f"non-UTF8 ledger line: {raw[:100]!r}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise FixtureError(f"timeout waiting for {want}")
+            ready, _, _ = select.select([stdout_fd], [], [], remaining)
+            if not ready:
+                raise FixtureError(f"timeout waiting for {want}")
+            try:
+                chunk = os.read(stdout_fd, 65536)
+            except OSError as error:
+                raise FixtureError(
+                    f"fixture stdout unreadable before {want}: {error}")
+            if not chunk:
+                status = proc.poll()
+                if status is None:
+                    raise FixtureError(
+                        "fixture went silent (stdout EOF, still running) "
+                        f"before {want}: {drain_stderr_available()[:300]}")
+                raise FixtureError(
+                    f"fixture exited {status} before {want}: "
+                    f"{drain_stderr_available()[:300]}")
+            line_buf += chunk
 
     def wait_row(want):
         while True:
-            if time.monotonic() > deadline:
-                raise FixtureError(f"timeout waiting for {want}")
-            line = proc.stdout.readline()
-            if line == "":
-                raise FixtureError(
-                    f"fixture exited {proc.poll()} before {want}: "
-                    f"{proc.stderr.read()[:300]}")
+            line = read_row(want)
             ledger_lines.append(line)
             try:
                 kinds.append(json.loads(line).get("kind"))

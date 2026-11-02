@@ -27,7 +27,7 @@ import key_operations_fixture as driver_mod  # noqa: E402
 
 FAKE_FIXTURE = """#!/bin/sh
 # Fake rsa-ledger: bare-byte G/F barriers, canned JSONL rows.
-# Env: FAKE_MODE (rows|early|nonjson), FAKE_EXIT, FAKE_SLEEP.
+# Env: FAKE_MODE (rows|early|nonjson|silent|eof-hold), FAKE_EXIT, FAKE_SLEEP.
 mode=${FAKE_MODE:-rows}
 if [ "$mode" = early ]; then
     echo "application call C_Initialize returned unexpected CK_RV 0x5" >&2
@@ -40,6 +40,15 @@ go=$(dd bs=1 count=1 2>/dev/null)
 if [ "$mode" = nonjson ]; then
     echo "NOT JSON"
     exit 0
+fi
+if [ "$mode" = silent ]; then
+    sleep 120
+    exit 0
+fi
+if [ "$mode" = eof-hold ]; then
+    exec >&-
+    sleep 120
+    exit 1
 fi
 [ -n "${FAKE_SLEEP:-}" ] && sleep "$FAKE_SLEEP"
 echo '{"seq":3,"kind":"sign","time_ns":3}'
@@ -141,6 +150,43 @@ class FixtureDriverTests(unittest.TestCase):
                 proc.communicate()
         self.assertEqual(proc.returncode, 1)
         self.assertIn("go gate", err)
+
+    def test_silent_fixture_trips_the_row_deadline(self):
+        # The driver blocks in read_row while the fixture holds its
+        # stdout open and silent for 120 s; the 3 s deadline must trip
+        # instead of wedging the wait.
+        proc, paths = self.run_driver(
+            timeout_s="3", env={"FAKE_MODE": "silent"})
+        try:
+            Path(paths["gofile"]).touch()
+            start = time.monotonic()
+            out, err = proc.communicate(timeout=60)
+            elapsed = time.monotonic() - start
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("timeout waiting for done", err)
+        self.assertLess(elapsed, 60, "deadline not honored in read")
+
+    def test_stdout_eof_with_live_stderr_fails_fast(self):
+        # The fixture closes stdout but holds stderr open for 120 s;
+        # the EOF diagnostic drain must not block on the live child.
+        proc, paths = self.run_driver(
+            timeout_s="30", env={"FAKE_MODE": "eof-hold"})
+        try:
+            Path(paths["gofile"]).touch()
+            start = time.monotonic()
+            out, err = proc.communicate(timeout=60)
+            elapsed = time.monotonic() - start
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("before done", err)
+        self.assertLess(elapsed, 60, "stderr drain blocked")
 
     def test_bad_exit_after_f_is_failure(self):
         proc, paths = self.run_driver(env={"FAKE_EXIT": "7"})

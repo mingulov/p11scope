@@ -198,13 +198,15 @@ class JournalGateTests(unittest.TestCase):
             "refused-build": {"rc": 0, "text":
                 "p11scope: semantic lane ready; mechanisms and API results "
                 "are recorded from now on (key operations: planned for 0.6.0)\n"
-                "gap: key operations unavailable: "
+                "gap [key operations unavailable] "
                 "journal-pair-unavailable-in-build: this build omits the "
-                "production journal object; broad inventory continues\n"},
+                "production journal object; broad inventory continues "
+                "with S1 mechanisms and API results\n"},
             "refused-noseal": {"rc": 0, "text":
-                "gap: key operations unavailable: "
+                "gap [key operations unavailable] "
                 "journal-pair-unavailable-in-build: this build omits the "
-                "production journal object; broad inventory continues\n"},
+                "production journal object; broad inventory continues "
+                "with S1 mechanisms and API results\n"},
             "refused-hard": {"rc": 1, "text":
                 "p11scope: inventory --system: "
                 "journal-pair-unavailable-in-build: this build omits the "

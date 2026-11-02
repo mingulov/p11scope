@@ -3328,10 +3328,7 @@ impl ClassicDriver<'_> {
         abandon_subject: &str,
         warn: &mut WarnSink<'_>,
         winding_disclosed: Option<&mut bool>,
-    ) -> (
-        String,
-        crate::inventory_semantics::SemanticCaptureSummary,
-    ) {
+    ) -> (String, crate::inventory_semantics::SemanticCaptureSummary) {
         // Poll the EVENTS ring-loss counter before anything reads
         // the stop counts: loss since the last publish discloses
         // here, so the stop line and the served summary carry it

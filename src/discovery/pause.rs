@@ -5524,6 +5524,43 @@ mod tests {
     }
 
     #[test]
+    fn stale_record_apply_failure_with_armed_readback_counts_its_attempt() {
+        // The field order (`service_received` -> `fail_cycle` ->
+        // `finish_nonconfirmed` with no open attempt): an armed epoch
+        // dequeues a stale record while the authorization still reads
+        // ARMED, and the bounded unowned apply fails. The partial must
+        // close an attempt, not outrun the attempt count.
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_ARMED),
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(record(9, 0, false))))]),
+            fail_apply: true,
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.armed_at_ns = Some(10);
+
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+    }
+
+    #[test]
+    fn unaccounted_record_counts_its_attempt() {
+        // Same defect class: a record for another pid fails the cycle
+        // before any attempt opens, so the partial must open one first.
+        let mut foreign = record(9, 0, false);
+        foreign.pid_tgid = 42u64 << 32;
+        let mut io = FakeIo {
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(foreign)))]),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+    }
+
+    #[test]
     fn post_insert_map_read_failure_removes_without_resume_without_request() {
         let mut io = FakeIo {
             authorization_results: VecDeque::from([

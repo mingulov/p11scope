@@ -729,6 +729,16 @@ pub(crate) trait LaneTestIo {
     fn tick_targets(&mut self, _pins: &[Arc<PidPin>]) {}
     /// Service only the owned Detailed DISCOVERY reader, without collecting EVENTS.
     fn service_live_discovery(&mut self) {}
+    /// Scripted EVENTS ring-loss kernel counter (cumulative). None
+    /// when the scripted lane models no readable counter.
+    fn events_ring_loss(&mut self) -> Option<u64> {
+        None
+    }
+    /// Scripted collection saturation: the scripted tick stopped at
+    /// its record quantum with more possibly waiting.
+    fn collection_saturated(&self) -> bool {
+        false
+    }
     /// First-drain stamp of a retained image, for registration
     /// backdating. Test owners without a real H0 retain nothing.
     fn retained_registration_ns(&self, _image: ImageIdentity) -> Option<u64> {
@@ -905,6 +915,17 @@ pub(crate) struct AttestedSemanticLane {
     /// Calls shed without a route across finalizations (the aggregate
     /// unrouted gap's lifetime total), for the honest stop line.
     disclosed_calls_shed: u64,
+    /// Last cumulative EVENTS ring-loss kernel counter read
+    /// (EVIDENCE_RING_LOSS); rises disclose.
+    events_ring_loss_seen: u64,
+    /// Cumulative disclosed EVENTS ring loss; feeds unrouted_returns.
+    events_ring_loss: u64,
+    /// The most recent lane tick's collection stopped at its record
+    /// quantum with more possibly waiting. The driver reads this
+    /// right after a successful tick and commits promptly so the
+    /// next service drains again. Never on the batch: the 168 B
+    /// batch size is pinned.
+    last_collection_saturated: bool,
     /// Route-labeled shed from oversized tick reports (batch construction
     /// refused): counted into the stop line at the drop, disclosed by the
     /// next finalize's unrouted gap. At most one entry per route label.
@@ -1613,6 +1634,9 @@ impl AttestedSemanticLane {
             wound_down_complete: false,
             staged_at: None,
             disclosed_calls_shed: 0,
+            events_ring_loss_seen: 0,
+            events_ring_loss: 0,
+            last_collection_saturated: false,
             oversized_drop_shed: BTreeMap::new(),
             #[cfg(test)]
             test_io: None,
@@ -1780,6 +1804,9 @@ impl AttestedSemanticLane {
             wound_down_complete: false,
             staged_at: None,
             disclosed_calls_shed: 0,
+            events_ring_loss_seen: 0,
+            events_ring_loss: 0,
+            last_collection_saturated: false,
             oversized_drop_shed: BTreeMap::new(),
             #[cfg(test)]
             test_io: None,
@@ -1921,6 +1948,46 @@ impl AttestedSemanticLane {
     /// finalizer counts them beside the aggregate unrouted gap).
     pub(crate) fn note_shed_calls(&mut self, shed: u64) {
         self.disclosed_calls_shed = self.disclosed_calls_shed.saturating_add(shed);
+    }
+
+    /// Note disclosed EVENTS ring loss: records the kernel overwrote
+    /// before the drain read them. Feeds the report's event-loss
+    /// account beside the stop drain's unrouted returns.
+    pub(crate) fn note_events_ring_loss(&mut self, shed: u64) {
+        self.events_ring_loss = self.events_ring_loss.saturating_add(shed);
+    }
+
+    /// Poll the EVENTS ring-loss kernel counter; `Some(delta)` when it
+    /// rose since the last poll. The counter is cumulative, so a failed
+    /// read only delays disclosure to the next successful poll: the
+    /// last good value stands and nothing is invented. Tests
+    /// substitute the counter through [`LaneTestIo`].
+    pub(crate) fn poll_events_ring_loss(&mut self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            let total = test.events_ring_loss()?;
+            return self.note_ring_loss_total(total);
+        }
+        let live = self.live.as_mut()?;
+        let total = live.session.events_ring_loss().ok()?;
+        self.note_ring_loss_total(total)
+    }
+
+    /// Fold one cumulative counter read into the lane: `Some(delta)`
+    /// on a rise. The kernel counter only grows, so the last read
+    /// stands as the next baseline.
+    fn note_ring_loss_total(&mut self, total: u64) -> Option<u64> {
+        let delta = total.saturating_sub(self.events_ring_loss_seen);
+        self.events_ring_loss_seen = total;
+        (delta > 0).then_some(delta)
+    }
+
+    /// Whether the most recent lane tick's collection stopped at its
+    /// record quantum with more possibly waiting. The driver reads
+    /// this right after a successful tick and commits promptly so
+    /// the next service drains again.
+    pub(crate) fn last_collection_saturated(&self) -> bool {
+        self.last_collection_saturated
     }
 
     /// Take stashed oversized-report shed for the next finalize's
@@ -2811,7 +2878,11 @@ impl AttestedSemanticLane {
                     .map(SemanticCallerBinding::pin)
                     .collect::<Vec<_>>(),
             );
-            return test.tick(domain);
+            let batch = test.tick(domain);
+            if batch.is_ok() {
+                self.last_collection_saturated = test.collection_saturated();
+            }
+            return batch;
         }
         let Some(live) = self.live.as_mut() else {
             return Err(SemanticRefusal::Unavailable);
@@ -2828,6 +2899,7 @@ impl AttestedSemanticLane {
             .capture
             .tick(&mut live.session, &pins)
             .map_err(|_| SemanticRefusal::Unavailable)?;
+        let saturated = report.collection_saturated;
         live.ticks += 1;
         live.scan_refusals = live
             .scan_refusals
@@ -2842,6 +2914,7 @@ impl AttestedSemanticLane {
         let shed = merge_stash_into_report(&mut live.stashed_refresh, &mut report);
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
         let counted = unjoined_shed_counts(report.outcomes());
+        self.last_collection_saturated = saturated;
         match SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns()) {
             Ok(batch) => Ok(batch),
             Err(_) => {
@@ -4563,7 +4636,7 @@ impl AttestedSemanticLane {
                 admitted_endpoints: 0,
                 refused_endpoints: 0,
                 continuity_cuts: 0,
-                unrouted_returns: 0,
+                unrouted_returns: self.events_ring_loss,
                 stop_quiescence,
                 final_drain: self.is_finished().then_some(self.final_drain),
             };
@@ -4579,7 +4652,7 @@ impl AttestedSemanticLane {
             admitted_endpoints,
             refused_endpoints: live.scan_refusals,
             continuity_cuts: live.continuity_cuts,
-            unrouted_returns: live.unrouted_returns,
+            unrouted_returns: live.unrouted_returns.saturating_add(self.events_ring_loss),
             stop_quiescence,
             final_drain: live.finished.then_some(self.final_drain),
         }

@@ -23,7 +23,7 @@ use p11scope_ebpf_common::{
     ARG_NONE, CounterMode, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
-    EVIDENCE_ABI_REFUSALS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
+    EVIDENCE_ABI_REFUSALS, EVIDENCE_RING_LOSS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
     IMAGE_IDENTITY_TICKET_LIMIT, ImageIdentityControl, MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT,
     PAUSE_ARMED, PauseKey, ROOT_AFFILIATION_POSITIVE, RootAffiliationControl, SlotSemantics,
@@ -7223,6 +7223,20 @@ impl Session {
             },
             prepared_instance.expect("preparation established image program load result"),
         ))
+    }
+
+    /// Cumulative EVENTS ring reserve failures (EVIDENCE_RING_LOSS,
+    /// all CPUs): records the kernel dropped because the ring was
+    /// full. The inventory lane polls this every commit; rises are
+    /// disclosed, never silent.
+    pub(crate) fn events_ring_loss(&self) -> Result<u64> {
+        let evidence: PerCpuArray<_, u64> =
+            PerCpuArray::try_from(self.ebpf.map("EVIDENCE").context("EVIDENCE map")?)?;
+        Ok(evidence
+            .get(&EVIDENCE_RING_LOSS, 0)?
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add))
     }
 
     pub(crate) fn counter_snapshot(&self) -> Result<CounterSnapshot> {

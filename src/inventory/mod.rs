@@ -5720,7 +5720,11 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 // Original receipt lifetimes include time already spent
                 // in the refresh stash. Publish during this tick: no
                 // later service interval can guarantee timely validation.
-                let publish_now = batch.has_current_receipts();
+                // A saturated collection likewise commits now: the ring
+                // likely still holds more, and the next service is only
+                // milliseconds away, while the next pass is a second out.
+                // Idle and low-rate ticks keep today's batching.
+                let publish_now = batch.has_current_receipts() || lane.last_collection_saturated();
                 self.coordinator.stage_semantic_batch(batch);
                 lane.note_semantic_staged();
                 if publish_now {
@@ -11826,9 +11830,7 @@ mod tests {
 
             fn tick(&mut self, domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {
                 if self.saturated {
-                    let mut report = TickReport::scripted(Vec::new(), Vec::new());
-                    report.collection_saturated = true;
-                    return SemanticBatch::from_tick_report(domain, report, Vec::new(), 0);
+                    return Ok(SemanticBatch::scripted(domain, Vec::new(), 0));
                 }
                 if self.receipt_free {
                     return Ok(SemanticBatch::scripted(
@@ -11900,6 +11902,10 @@ mod tests {
 
             fn events_ring_loss(&mut self) -> Option<u64> {
                 self.ring_loss.pop_front()
+            }
+
+            fn collection_saturated(&self) -> bool {
+                self.saturated
             }
         }
 
@@ -12135,18 +12141,14 @@ mod tests {
                 !driver.semantic_staged,
                 "every saturated tick commits promptly"
             );
-            assert_eq!(
-                driver.commit_calls, 2,
-                "the drain loop commits every tick"
-            );
+            assert_eq!(driver.commit_calls, 2, "the drain loop commits every tick");
         }
 
         #[test]
         fn events_ring_loss_rise_discloses_a_named_gap_and_counts() {
             let mut scene = driver_scene(2);
             scene.stub.receipt_free = true;
-            scene.stub.ring_loss =
-                std::collections::VecDeque::from([0, 7, 7, 12]);
+            scene.stub.ring_loss = std::collections::VecDeque::from([0, 7, 7, 12]);
             scene.lane.install_test_io(Box::new(scene.stub));
             let mut driver = ClassicDriver {
                 coordinator: &mut scene.coordinator,

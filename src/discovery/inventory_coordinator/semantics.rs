@@ -2608,6 +2608,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         lane.note_shed_calls(total);
     }
 
+    /// Disclose an EVENTS ring-loss rise: exact counts on the stop
+    /// line and the report's event-loss account, plus one named gap.
+    /// The reason stays stable so repeat rises coalesce onto one gap
+    /// row; the exact cumulative count lives in unrouted_returns.
+    pub(crate) fn disclose_events_ring_loss(
+        &mut self,
+        lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+        delta: u64,
+    ) {
+        lane.note_shed_calls(delta);
+        lane.note_events_ring_loss(delta);
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "native capture events lost".into(),
+            reason: "the EVENTS ring overwrote records before the drain read them \
+                 (kernel reserve failures; exact count in unrouted_returns)"
+                .into(),
+            budget: None,
+        });
+    }
+
     /// Resolve semantic batches a latched machine stranded behind
     /// its unfinished Joint publication, so the exit-hold abandon
     /// strands neither a Prepared blocker nor an unpublished batch.

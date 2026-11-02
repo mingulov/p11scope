@@ -1316,6 +1316,7 @@ impl CaptureIo for ScriptIo {
                 .filter_map(|_| self.records.pop_front())
                 .collect(),
             status: std::mem::replace(&mut self.collection_status, CollectionStatus::Complete),
+            quantum_exhausted: false,
         }
     }
     fn health(&mut self) -> Result<Health, ()> {

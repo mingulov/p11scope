@@ -935,6 +935,10 @@ pub(crate) struct TickReport {
     awaiting_floor: Option<u64>,
     shed_floor: Option<u64>,
     exhausted: bool,
+    /// This tick's collection stopped at its record quantum with more
+    /// possibly waiting: the driver commits promptly so the next
+    /// service drains again. Retained deliveries never set this.
+    pub(crate) collection_saturated: bool,
 }
 
 fn pending_q_array_bytes<T>(capacity: usize) -> Option<usize> {
@@ -1213,6 +1217,9 @@ impl CollectionStatus {
 struct Collection {
     records: Vec<DecodedEventRecord>,
     status: CollectionStatus,
+    /// The poll stopped at its record quantum with more possibly
+    /// waiting: the ring likely still holds uncollected records.
+    quantum_exhausted: bool,
 }
 
 struct ScanJob {
@@ -1322,6 +1329,7 @@ fn collect_session_events(session: &mut Session, limit: usize) -> Collection {
         return Collection {
             records: Vec::new(),
             status: CollectionStatus::ReadError,
+            quantum_exhausted: false,
         };
     };
     collect_event_prefix(drain, table, limit)
@@ -1339,30 +1347,32 @@ fn collect_event_prefix<S: crate::events::RecordSource>(
     let mut records = Vec::with_capacity(limit);
     // Only the attested allowlisted lane decodes 608-byte records;
     // every other lane stays 368-byte-only through the same cursor.
-    match table {
-        Some(table) => {
-            drain.poll_object_records(Some(limit), table, |record| {
-                records.push(record);
-                ControlFlow::Continue(())
+    // The closures never break early, so a true return means the poll
+    // stopped at its quantum with more possibly waiting.
+    let quantum_exhausted = match table {
+        Some(table) => drain.poll_object_records(Some(limit), table, |record| {
+            records.push(record);
+            ControlFlow::Continue(())
+        }),
+        None => drain.poll_records(Some(limit), |record| {
+            records.push(DecodedEventRecord {
+                joint_resource: None,
+                base: record,
+                object: None,
             });
-        }
-        None => {
-            drain.poll_records(Some(limit), |record| {
-                records.push(DecodedEventRecord {
-                    joint_resource: None,
-                    base: record,
-                    object: None,
-                });
-                ControlFlow::Continue(())
-            });
-        }
-    }
+            ControlFlow::Continue(())
+        }),
+    };
     let status = if drain.malformed() != malformed {
         CollectionStatus::Malformed
     } else {
         CollectionStatus::Complete
     };
-    Collection { records, status }
+    Collection {
+        records,
+        status,
+        quantum_exhausted,
+    }
 }
 
 struct SessionIo<'a> {
@@ -3597,6 +3607,7 @@ impl SemanticCapture {
                     &mut self.pending_discovery_status,
                     CollectionStatus::Complete,
                 ));
+                report.collection_saturated = owned.quantum_exhausted;
                 // Legacy drain failures stay permanent: without the
                 // quantum audit their scope is unknowable.
                 (owned.records.as_slice(), owned.status, None, None, true)

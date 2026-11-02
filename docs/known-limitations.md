@@ -151,7 +151,9 @@ analysis, the gate prints only the percentage), paired-median total
 Absolute times are not comparable across campaigns, only
 within-campaign ratios are. These are measured costs for that workload, not
 bounds for every host. The default `--identity-backend auto` uses kernel
-identity where available. Further userspace speed work is planned for 0.5.x.
+identity where available. Further userspace speed work is unscheduled: the
+measured cost stands as disclosed until feasibility measurements identify
+removable work.
 
 On some overlayfs setups before Linux 6.8, p11scope may be unable to
 prove how a provider file appears in /proc maps: the opened file and

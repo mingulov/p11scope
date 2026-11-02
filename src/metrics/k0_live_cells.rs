@@ -630,6 +630,7 @@ fn k0_live_exec_voids_detail_counts_lp64() -> Result<()> {
     keep_workload_on_failure(workload, outcome, "K0X")
 }
 
+#[allow(clippy::too_many_arguments)] // One owned-run spawn over all retained inputs; the cell drives it directly.
 fn spawn_run_observer(
     observer: &Path,
     module: &str,
@@ -747,17 +748,15 @@ fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix(
                 "p11scope: duration expired without --kill-on-timeout; handed back live child pid ",
-            ) {
-                if let Some(pid_text) = rest.split_whitespace().next() {
-                    if let Ok(pid) = pid_text.parse::<i32>() {
-                        unsafe {
-                            libc::kill(pid, libc::SIGKILL);
-                        }
-                        let mut status = 0;
-                        unsafe {
-                            libc::waitpid(pid, &mut status, 0);
-                        }
-                    }
+            ) && let Some(pid_text) = rest.split_whitespace().next()
+                && let Ok(pid) = pid_text.parse::<i32>()
+            {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                let mut status = 0;
+                unsafe {
+                    libc::waitpid(pid, &mut status, 0);
                 }
             }
         }

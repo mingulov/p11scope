@@ -1149,10 +1149,8 @@ fn scan_k0_tail(
             DISCOVERY_KIND_EXEC => {
                 return Some(Promotion(PromotionRefusal::CallerChanged));
             }
-            DISCOVERY_KIND_LEADER_EXIT => {
-                if record.hook_ts_ns == 0 {
-                    return Some(Promotion(PromotionRefusal::CallerChanged));
-                }
+            DISCOVERY_KIND_LEADER_EXIT if record.hook_ts_ns == 0 => {
+                return Some(Promotion(PromotionRefusal::CallerChanged));
             }
             _ => {}
         }
@@ -1164,12 +1162,12 @@ fn scan_k0_tail(
 /// close body plus a PID-matched scan of the discovery records that
 /// were staged during quiescence and drained in the terminal drain —
 /// the tail the pre-quiescence witness snapshot cannot see. A tail
-/// EXEC or fault voids as caller-changed, a tail leader exit as
-/// caller-retired, in the witness step's contract position (after
-/// retirement, before loss); within the step a tail change beats a
-/// witnessed break. Twins stage the tail directly; production
-/// collects it from the terminal drains.
+/// EXEC or fault voids as caller-changed in the witness step's
+/// contract position (after retirement, before loss); a tail exit ends
+/// cleanly. Twins stage the tail directly; production collects it from
+/// the terminal drains.
 #[cfg_attr(not(test), allow(dead_code))] // Zero-loss tail close for twins; production closes with its losses.
+#[allow(clippy::too_many_arguments)] // One close over all retained inputs; twins drive it directly.
 pub(super) fn close_k0_window_with_tail(
     window: K0Window,
     close_plan: &AttachPlan,

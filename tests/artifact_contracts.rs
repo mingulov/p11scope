@@ -612,11 +612,12 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
         "- name: Install packaged bpftool",
         "set -euo pipefail",
-        // Pinned baseline 16a7bd53: the default journal and birth marker on top
-        // of the exec-witness health-counter fix, the PID-scope EXEC ticket fix,
+        // Pinned baseline 6641123f: the async control value flags on top of
+        // the default journal and birth marker (16a7bd53), the exec-witness
+        // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=16a7bd538535c6d8fb29680dabf6939ca5573a8e",
+        "BASELINE=6641123fdbd29a600da4f41b058afa6e6cd9c9fd",
         "python3 -I scripts/check-bpf-noninterference.py \\",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
@@ -9717,11 +9718,12 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         "needs: [dedupe, tests]",
         "!cancelled() && needs.dedupe.outputs.run == 'true'",
         "fetch-depth: 0",
-        // Pinned baseline 16a7bd53: the default journal and birth marker on top
-        // of the exec-witness health-counter fix, the PID-scope EXEC ticket fix,
+        // Pinned baseline 6641123f: the async control value flags on top of
+        // the default journal and birth marker (16a7bd53), the exec-witness
+        // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=16a7bd538535c6d8fb29680dabf6939ca5573a8e",
+        "BASELINE=6641123fdbd29a600da4f41b058afa6e6cd9c9fd",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"\n",

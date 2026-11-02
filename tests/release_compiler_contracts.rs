@@ -154,11 +154,12 @@ fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
 "#;
     if !comparison
         .lines()
-        // Pinned baseline 16a7bd53: the default journal and birth marker on top
-        // of the exec-witness health-counter fix, the PID-scope EXEC ticket fix,
+        // Pinned baseline 6641123f: the async control value flags on top of
+        // the default journal and birth marker (16a7bd53), the exec-witness
+        // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        .any(|line| line == "          BASELINE=16a7bd538535c6d8fb29680dabf6939ca5573a8e")
+        .any(|line| line == "          BASELINE=6641123fdbd29a600da4f41b058afa6e6cd9c9fd")
         || !comparison.contains(repeat)
         || !comparison.contains(integration)
         || comparison.contains("--host-compiler-transition")
@@ -238,11 +239,12 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
         "a renamed comparison job must be rejected"
     );
     for marker in [
-        // Pinned baseline 16a7bd53: the default journal and birth marker on top
-        // of the exec-witness health-counter fix, the PID-scope EXEC ticket fix,
+        // Pinned baseline 6641123f: the async control value flags on top of
+        // the default journal and birth marker (16a7bd53), the exec-witness
+        // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=16a7bd538535c6d8fb29680dabf6939ca5573a8e",
+        "BASELINE=6641123fdbd29a600da4f41b058afa6e6cd9c9fd",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"",

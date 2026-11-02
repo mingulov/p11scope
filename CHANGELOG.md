@@ -30,7 +30,11 @@ versioned separately and are opaque, exact dispatch keys.
 - Detailed captures keep a proxy closure array's leading-templates prefix
   in the leftover room when no real provider was refused, so remote-access
   clients (`p11-kit-client.so`) keep counting through their attached
-  templates; the report names the covered tables.
+  templates; the report names the covered tables. The prefix is admitted
+  only after a pass with no new provider object and never takes the
+  reserve's slots, so a provider decoded later still fits; a later provider
+  that still does not fit is refused by name with the `--exclude-module`
+  remedy.
 
 ### Fixed
 

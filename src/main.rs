@@ -58,7 +58,10 @@ fn run() -> Result<i32> {
         // `kind` travels inside the arguments, so both capture subcommands share
         // one arm as well as one parser.
         Ok(Command::Profile(a) | Command::Trace(a)) => {
-            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules) {
+            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
+                .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
+                .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
+            {
                 let topic = match a.kind {
                     cli::Kind::Profile => cli::HelpTopic::Profile,
                     cli::Kind::Trace => cli::HelpTopic::Trace,
@@ -72,7 +75,10 @@ fn run() -> Result<i32> {
         // would. A child deliberately handed back still running is a success
         // for the observer, so it exits 0.
         Ok(Command::Run(a)) => {
-            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules) {
+            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
+                .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
+                .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
+            {
                 let _ = p11scope::try_stderr_line(&format!(
                     "{message}\n{}",
                     cli::HelpTopic::Run.hint()
@@ -113,7 +119,10 @@ fn run() -> Result<i32> {
         // unwritable `-o` — mean "nothing could be observed": one line
         // here, exit 1, never a panic and never an empty-success report.
         Ok(Command::Inventory(a)) => {
-            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules) {
+            if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
+                .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
+                .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
+            {
                 let _ = p11scope::try_stderr_line(&format!(
                     "{message}\n{}",
                     cli::HelpTopic::Inventory.hint()

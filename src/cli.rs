@@ -8,7 +8,7 @@ use crate::discovery::hooks::HookRegistry;
 use p11scope_ebpf_common::CounterMode;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,7 +711,6 @@ fn require_path(
 ///   is open and its soname is read.
 pub fn validate_excludes(modules: &[PathBuf], excludes: &[PathBuf]) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::MetadataExt as _;
     let is_path = |p: &PathBuf| p.as_os_str().as_bytes().contains(&b'/');
     for exclude in excludes {
         if is_path(exclude) {
@@ -725,40 +724,167 @@ pub fn validate_excludes(modules: &[PathBuf], excludes: &[PathBuf]) -> Result<()
     }
     for module in modules {
         for exclude in excludes {
-            if module == exclude {
-                return Err(format!(
-                    "--module {} and --exclude-module {} name the same input; refusing a module that is both included and excluded",
-                    module.display(),
-                    exclude.display()
-                ));
-            }
-            if is_path(module)
-                && is_path(exclude)
-                && let (Ok(left), Ok(right)) =
-                    (std::fs::metadata(module), std::fs::metadata(exclude))
-                && (left.dev(), left.ino()) == (right.dev(), right.ino())
-            {
-                return Err(format!(
-                    "--module {} and --exclude-module {} are the same file (device {} inode {}); refusing a module that is both included and excluded",
-                    module.display(),
-                    exclude.display(),
-                    left.dev(),
-                    left.ino()
-                ));
-            }
-            if !is_path(exclude)
-                && let Some(base) = module.file_name()
-                && base == exclude.as_os_str()
-            {
-                return Err(format!(
-                    "--module {} is matched by --exclude-module {} (file name); refusing a module that is both included and excluded",
-                    module.display(),
-                    exclude.display()
-                ));
+            if let Some(reason) = include_exclude_conflict("--module", module, exclude) {
+                return Err(reason);
             }
         }
     }
     Ok(())
+}
+
+/// Which startup exclusion rule an included path trips against an
+/// `--exclude-module` input, if any. Shared by `--module`,
+/// `--prearm-module` and manifest-attested paths; only the message subject
+/// differs.
+enum ExcludeConflict {
+    SameInput,
+    SameFile { dev: u64, ino: u64 },
+    FileName,
+}
+
+/// The three startup conflict rules: exact string, same file identity,
+/// bare-name basename match. Bare-name soname conflicts surface during
+/// discovery where the target file is open and its soname is read.
+fn exclude_conflict(include: &Path, exclude: &Path) -> Option<ExcludeConflict> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let is_path = |p: &Path| p.as_os_str().as_bytes().contains(&b'/');
+    if include == exclude {
+        return Some(ExcludeConflict::SameInput);
+    }
+    if is_path(include)
+        && is_path(exclude)
+        && let (Ok(left), Ok(right)) = (std::fs::metadata(include), std::fs::metadata(exclude))
+        && (left.dev(), left.ino()) == (right.dev(), right.ino())
+    {
+        return Some(ExcludeConflict::SameFile {
+            dev: left.dev(),
+            ino: left.ino(),
+        });
+    }
+    if !is_path(exclude)
+        && let Some(base) = include.file_name()
+        && base == exclude.as_os_str()
+    {
+        return Some(ExcludeConflict::FileName);
+    }
+    None
+}
+
+/// The named-error shape for an include flag (`--module`, `--prearm-module`)
+/// matching an exclusion.
+fn include_exclude_conflict(flag: &str, include: &Path, exclude: &Path) -> Option<String> {
+    match exclude_conflict(include, exclude)? {
+        ExcludeConflict::SameInput => Some(format!(
+            "{flag} {} and --exclude-module {} name the same input; refusing a module that is both included and excluded",
+            include.display(),
+            exclude.display()
+        )),
+        ExcludeConflict::SameFile { dev, ino } => Some(format!(
+            "{flag} {} and --exclude-module {} are the same file (device {dev} inode {ino}); refusing a module that is both included and excluded",
+            include.display(),
+            exclude.display()
+        )),
+        ExcludeConflict::FileName => Some(format!(
+            "{flag} {} is matched by --exclude-module {} (file name); refusing a module that is both included and excluded",
+            include.display(),
+            exclude.display()
+        )),
+    }
+}
+
+/// Validate `--prearm-module` inputs against `--exclude-module` at startup
+/// (same exit-2 usage-error shape as [`validate_excludes`]): a pre-armed
+/// provider matching an exclusion is refused, never silently coexisting
+/// with it. Same three rules (exact string, same file identity, bare-name
+/// basename match); bare-name soname conflicts surface during discovery
+/// where the target file is open and its soname is read.
+pub fn validate_prearm_excludes(prearm: &[PathBuf], excludes: &[PathBuf]) -> Result<(), String> {
+    for input in prearm {
+        for exclude in excludes {
+            if let Some(reason) = include_exclude_conflict("--prearm-module", input, exclude) {
+                return Err(reason);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate `--manifest` inputs against `--exclude-module` at startup (same
+/// exit-2 usage-error shape as [`validate_excludes`]): a manifest attesting
+/// a provider that matches an exclusion is refused. Attested paths are the
+/// manifest's `module_path` plus every attested object path, compared by
+/// the same three rules. Best-effort: an unreadable or unparsable manifest
+/// is left for discovery to report precisely.
+pub fn validate_manifest_excludes(
+    manifests: &[PathBuf],
+    excludes: &[PathBuf],
+) -> Result<(), String> {
+    for manifest in manifests {
+        for attested in manifest_attested_paths(manifest) {
+            for exclude in excludes {
+                if let Some(reason) = manifest_exclude_conflict(manifest, &attested, exclude) {
+                    return Err(reason);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Attested provider paths of one `--manifest` file: `module_path` plus
+/// every object path. Best-effort JSON only (no schema check — discovery
+/// reports a malformed manifest precisely); unreadable or unparsable
+/// input yields no candidates.
+fn manifest_attested_paths(manifest: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(manifest) else {
+        return Vec::new();
+    };
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    if let Some(path) = document
+        .get("module_path")
+        .and_then(serde_json::Value::as_str)
+    {
+        paths.push(PathBuf::from(path));
+    }
+    if let Some(objects) = document
+        .get("objects")
+        .and_then(serde_json::Value::as_array)
+    {
+        for object in objects {
+            if let Some(path) = object.get("path").and_then(serde_json::Value::as_str) {
+                paths.push(PathBuf::from(path));
+            }
+        }
+    }
+    paths
+}
+
+/// The named-error shape for a `--manifest` attesting an excluded provider.
+fn manifest_exclude_conflict(manifest: &Path, attested: &Path, exclude: &Path) -> Option<String> {
+    match exclude_conflict(attested, exclude)? {
+        ExcludeConflict::SameInput => Some(format!(
+            "--manifest {} attests {} and --exclude-module {} names the same input; refusing a module that is both included and excluded",
+            manifest.display(),
+            attested.display(),
+            exclude.display()
+        )),
+        ExcludeConflict::SameFile { dev, ino } => Some(format!(
+            "--manifest {} attests {} and --exclude-module {} is the same file (device {dev} inode {ino}); refusing a module that is both included and excluded",
+            manifest.display(),
+            attested.display(),
+            exclude.display()
+        )),
+        ExcludeConflict::FileName => Some(format!(
+            "--manifest {} attests {}, matched by --exclude-module {} (file name); refusing a module that is both included and excluded",
+            manifest.display(),
+            attested.display(),
+            exclude.display()
+        )),
+    }
 }
 
 /// Flags and subcommands are matched as text; a non-UTF-8 word can never
@@ -4689,5 +4815,81 @@ mod tests {
         // No conflict.
         assert!(validate_excludes(slice_of(&real), &[PathBuf::from("other.so")]).is_ok());
         assert!(validate_excludes(&[], slice_of(&real)).is_ok());
+    }
+
+    /// A `--prearm-module` matching an `--exclude-module` is refused at
+    /// startup with the same named-error shape as the `--module` conflict.
+    #[test]
+    fn validate_prearm_excludes_refuses_prearm_conflicts() {
+        let slice_of = std::slice::from_ref;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("libreal.so.1.2");
+        std::fs::write(&real, b"fake").unwrap();
+        let link = dir.path().join("liblink.so");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // Exact conflict, same shape as --module.
+        let error = validate_prearm_excludes(slice_of(&real), slice_of(&real))
+            .expect_err("prearm naming an excluded file is refused");
+        assert!(error.contains("--prearm-module"), "{error}");
+        assert!(error.contains("--exclude-module"), "{error}");
+        assert!(
+            error.contains("refusing a module that is both included and excluded"),
+            "{error}"
+        );
+        // Same file via symlink.
+        assert!(validate_prearm_excludes(slice_of(&real), slice_of(&link)).is_err());
+        // Bare-name basename conflict.
+        assert!(
+            validate_prearm_excludes(slice_of(&real), &[PathBuf::from("libreal.so.1.2")]).is_err()
+        );
+        // No conflict.
+        assert!(validate_prearm_excludes(slice_of(&real), &[PathBuf::from("other.so")]).is_ok());
+        assert!(validate_prearm_excludes(&[], slice_of(&real)).is_ok());
+    }
+
+    /// A `--manifest` attesting an excluded provider is refused at startup
+    /// with the same named-error shape; unreadable manifests are left for
+    /// discovery to report precisely.
+    #[test]
+    fn validate_manifest_excludes_refuses_manifest_conflicts() {
+        let slice_of = std::slice::from_ref;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("libattested.so.1");
+        std::fs::write(&provider, b"fake").unwrap();
+        let manifest = dir.path().join("attested.json");
+        std::fs::write(
+            &manifest,
+            format!(
+                "{{\"module_path\": \"{}\", \"objects\": [{{\"id\": 0, \"path\": \"{}\"}}]}}",
+                provider.display(),
+                provider.display()
+            ),
+        )
+        .unwrap();
+        // Attested module path matching an exclusion is refused.
+        let error = validate_manifest_excludes(slice_of(&manifest), slice_of(&provider))
+            .expect_err("a manifest attesting an excluded provider is refused");
+        assert!(error.contains("--manifest"), "{error}");
+        assert!(error.contains("libattested.so.1"), "{error}");
+        assert!(error.contains("--exclude-module"), "{error}");
+        assert!(
+            error.contains("refusing a module that is both included and excluded"),
+            "{error}"
+        );
+        // Bare-name match on the attested basename.
+        assert!(
+            validate_manifest_excludes(slice_of(&manifest), &[PathBuf::from("libattested.so.1")])
+                .is_err()
+        );
+        // No conflict.
+        assert!(
+            validate_manifest_excludes(slice_of(&manifest), &[PathBuf::from("other.so")]).is_ok()
+        );
+        // Unreadable or unparsable manifests are skipped, never misreported.
+        let missing = dir.path().join("nope.json");
+        assert!(validate_manifest_excludes(slice_of(&missing), slice_of(&provider)).is_ok());
+        let broken = dir.path().join("broken.json");
+        std::fs::write(&broken, b"not json").unwrap();
+        assert!(validate_manifest_excludes(slice_of(&broken), slice_of(&provider)).is_ok());
     }
 }

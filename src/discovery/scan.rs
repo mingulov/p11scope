@@ -5384,7 +5384,16 @@ fn scan_view_examined_mode(
             })
             .collect();
         let hinted = !matched.is_empty();
-        if !request.hints.is_empty() && !hinted {
+        // F5: the exclusion match is evaluated before the `--module` hint
+        // filter, so a disjoint `--exclude-module` is recorded as excluded —
+        // never misreported as "matched no mapped file" — even for mappings
+        // the narrowing skips. A narrowed-out mapping stays silent on every
+        // pre-exclusion failure (it was never examined) and skips the scan
+        // body once exclusion has been evaluated; with no excludes the old
+        // fast path skips it before any open.
+        let narrowed_out = !request.hints.is_empty() && !hinted;
+        let excludes_present = !exclude_paths.is_empty() || !exclude_names.is_empty();
+        if narrowed_out && !excludes_present {
             continue;
         }
         // Path equality in the target view already confirms the hint
@@ -5404,13 +5413,15 @@ fn scan_view_examined_mode(
             ),
         };
         let Some(usable) = usable else {
-            skipped.push(Skipped {
-                subject,
-                reason: match named {
-                    Some((MappedPath::Unusable { reason }, _)) => reason,
-                    _ => NO_ABSOLUTE_PATHNAME_REASON.into(),
-                },
-            });
+            if !narrowed_out {
+                skipped.push(Skipped {
+                    subject,
+                    reason: match named {
+                        Some((MappedPath::Unusable { reason }, _)) => reason,
+                        _ => NO_ABSOLUTE_PATHNAME_REASON.into(),
+                    },
+                });
+            }
             continue;
         };
         let path = usable.display().to_string();
@@ -5418,12 +5429,16 @@ fn scan_view_examined_mode(
         let file = match open_in_target(view, &path, budget) {
             Ok(file) => file,
             Err(reason) => {
-                skipped.push(Skipped { subject, reason });
+                if !narrowed_out {
+                    skipped.push(Skipped { subject, reason });
+                }
                 continue;
             }
         };
         if let Err(reason) = opened_file_identity_guard(view, &file, key, &mut mounts, budget) {
-            skipped.push(Skipped { subject, reason });
+            if !narrowed_out {
+                skipped.push(Skipped { subject, reason });
+            }
             continue;
         }
         let held = budget
@@ -5431,7 +5446,9 @@ fn scan_view_examined_mode(
             .or_else(|| io.held_identity(&file));
         let scanned_identity = held.map(|held| held.identity);
         if let Err(reason) = mapped_file_guard(io, view, scanned_identity, key, &group, budget) {
-            skipped.push(Skipped { subject, reason });
+            if !narrowed_out {
+                skipped.push(Skipped { subject, reason });
+            }
             continue;
         }
         // Corroborate an inode-only match before attributing the object to the hint.
@@ -5469,7 +5486,8 @@ fn scan_view_examined_mode(
         // `--exclude-module`: excluded files get no probes and use no
         // slots; they are recorded, never silent. A file both hinted
         // (`--module`) and excluded is an operator contradiction, refused
-        // here with a named error before any attach.
+        // here with a named error before any attach. Evaluated for
+        // narrowed-out mappings too (F5), which then skip the scan body.
         if (!exclude_paths.is_empty() || !exclude_names.is_empty())
             && let Some(matched) = exclude_match(&path, &file, &exclude_paths, &exclude_names)
         {
@@ -5489,6 +5507,9 @@ fn scan_view_examined_mode(
                     via: matched,
                 });
             }
+            continue;
+        }
+        if narrowed_out {
             continue;
         }
         // A repeat scan of the unchanged file reuses the cached export facts with
@@ -5984,6 +6005,74 @@ mod tests {
         assert!(
             error.contains("both named by --module and matched by --exclude-module"),
             "{error}"
+        );
+    }
+
+    /// F5: under `--module` narrowing, a disjoint `--exclude-module` is
+    /// still evaluated (before the hint filter): the excluded mapping is
+    /// recorded as excluded, never misreported as "matched no mapped file",
+    /// while the hinted module is still examined and nothing is attached
+    /// for the excluded one. Uses a stopped child and two of its own
+    /// mapped libraries with distinct basenames, so no host path is
+    /// hard-coded.
+    #[test]
+    fn scan_records_excluded_mappings_despite_module_narrowing() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+            .expect("own stopped child maps are readable");
+        let mut libs: Vec<String> = maps
+            .lines()
+            .filter_map(|line| line.rsplit(' ').next())
+            .filter(|path| path.contains(".so") && std::path::Path::new(path).is_absolute())
+            .map(str::to_string)
+            .collect();
+        libs.sort();
+        libs.dedup();
+        assert!(
+            !libs.is_empty(),
+            "a stopped shell maps at least one shared library"
+        );
+        let basename_of = |path: &str| {
+            std::path::Path::new(path)
+                .file_name()
+                .expect("mapped library has a file name")
+                .to_os_string()
+        };
+        let hinted = libs
+            .iter()
+            .find(|path| basename_of(path) != basename_of(&libs[0]))
+            .expect("the child maps libraries with distinct basenames")
+            .clone();
+        let excluded = libs[0].clone();
+        assert_ne!(basename_of(&hinted), basename_of(&excluded));
+        let hooks = HookRegistry::builtin();
+        let hints = vec![PathBuf::from(&hinted)];
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_excludes(vec![PathBuf::from(basename_of(&excluded))]);
+        let outcome = scan_pid(
+            &ScanRequest {
+                pid,
+                hints: &hints,
+                hooks: &hooks,
+            },
+            &mut budget,
+        )
+        .expect("a disjoint exclusion beside --module narrowing succeeds");
+        let _ = outcome;
+        assert!(
+            budget
+                .excluded()
+                .iter()
+                .any(|record| record.path == excluded),
+            "the narrowed-out exclusion is recorded, not unmatched: {:?}",
+            budget.excluded()
+        );
+        assert!(
+            budget.excluded().iter().all(|record| record.path != hinted),
+            "the hinted module is examined, never excluded: {:?}",
+            budget.excluded()
         );
     }
 

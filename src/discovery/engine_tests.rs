@@ -34987,17 +34987,21 @@ fn p11kit_like_64_table_module() -> ScannedModule {
 
 /// Task 1.2 resource-bound test: ordered admission with a per-object cap.
 /// The 64-table replica must NOT refuse the module. The linked table bypasses
-/// the independent K=4 heuristic cap; the global slot bound admits three
-/// heuristic tables at 512 or all four at 2112. Every spill stays explicit.
+/// the independent K=4 heuristic cap; the reserve-capped slot bound admits
+/// two heuristic tables at 512 (104 linked + 208 heuristic of the 384
+/// ceiling) or all four at 2112. Every spill stays explicit.
 /// Part 0: the admitted prefix is reported as a partial-coverage record
-/// naming the covered templates, not as silence.
+/// naming the covered templates, not as silence; the reported total counts
+/// the linked table beside the heuristic ones.
 #[test]
 fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     let admitted_heuristics = if cfg!(feature = "wide-detailed-2112") {
         4u64
     } else {
-        3u64
+        2u64
     };
+    // Reported attached tables: heuristic plus the linked one.
+    let reported_attached = admitted_heuristics + 1;
     let expected_slots = ((admitted_heuristics + 1) * 104) as usize;
     let expected_spill = 63 - admitted_heuristics;
     let raw = p11kit_like_64_table_module();
@@ -35014,7 +35018,7 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     );
     assert!(
         plan.modules_skipped[0].reason.contains(&format!(
-            "{admitted_heuristics} of 63 template tables attached"
+            "{reported_attached} of 63 template tables attached"
         )) && plan.modules_skipped[0]
             .reason
             .contains("calls through the others are not counted"),

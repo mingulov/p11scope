@@ -2614,7 +2614,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// stop line keeps collected == joined + shed. The reason stays
     /// stable so repeat rises coalesce onto one gap row; the exact
     /// cumulative count lives in events_lost.
-    pub(crate) fn disclose_events_ring_loss(
+    fn disclose_events_ring_loss(
         &mut self,
         lane: &mut crate::inventory_semantics::AttestedSemanticLane,
         delta: u64,
@@ -2651,7 +2651,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 module: None,
                 pid: None,
                 subject: "native capture events loss unknown".into(),
-                reason: "the EVENTS ring-loss counter could not be read; kernel loss past this point is uncounted"
+                reason: "the EVENTS ring-loss counter could not be read; events_lost may undercount until a later good read restores the exact cumulative total"
                     .into(),
                 budget: None,
             });

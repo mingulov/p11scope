@@ -293,10 +293,13 @@ static void *task(void) { return current_task; }
  * VMA through the helper's out-pointer, whatever the arity. */
 static u64 func_ret_value;
 static unsigned func_ret_calls;
+static long func_ret_rc;
 static long func_ret(void *ctx, u64 *value)
 {
     (void)ctx;
     func_ret_calls++;
+    if (func_ret_rc)
+        return func_ret_rc; /* the kernel writes nothing on refusal */
     *value = func_ret_value;
     return 0;
 }
@@ -347,6 +350,7 @@ static void reset(void)
     root_calls = scope_calls = identity_calls = emit_calls = 0;
     func_ret_value = 0;
     func_ret_calls = 0;
+    func_ret_rc = 0;
 }
 
 static void map_hook(struct vm_area_struct___p11inst *v)
@@ -928,6 +932,16 @@ int main(int argc, char **argv)
     assert(func_ret_calls == 2);
     assert(records[0].epoch[0] == 2 && counters.watched_hits == 2);
     assert(!g_epoch[5] && !gen[INST_GEN_FAULT]);
+
+    /* A refused helper (wrong attach type) is a fault, never a silent
+     * no-op: the epoch stays and the fault generation moves. */
+    reset();
+    map_hook(&vma);
+    func_ret_rc = -95; /* -EOPNOTSUPP */
+    copy_ret_hook(&vma);
+    assert(func_ret_calls == 1);
+    assert(records[0].epoch[0] == 1 && counters.watched_hits == 1);
+    assert(gen[INST_GEN_FAULT] == 1 && counters.faults == 1);
 
     /* Teardown (mm_users == 0): skipped, never a bump. */
     reset();

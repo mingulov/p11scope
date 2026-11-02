@@ -479,16 +479,20 @@ int p11_inst_vma_copy(u64 *ctx)
     return inst_note_vma(ctx[5], 0);
 }
 
-/* copy_vma on 6/7-argument kernels: the 6.18.58+ stable backports append
- * keep_source, 7.3 adds anon_pgoff too, and the fexit return slot moves
- * with the arity (ctx[6], ctx[7]). bpf_get_func_ret reads the returned
- * new VMA on any arity. Same note as the legacy hook above; a separate
- * program so the legacy bytes never move. */
+/* copy_vma on 6/7-argument kernels: the stable backports of 838bb60dc215
+ * append keep_source, 7.3 adds anon_pgoff too, and the fexit return slot
+ * moves with the arity (ctx[6], ctx[7]). bpf_get_func_ret reads the
+ * returned new VMA on any arity. Same note as the legacy hook above; a
+ * separate program so the legacy bytes never move. A nonzero helper
+ * return (only a wrong attach type) is a fault, never a silent no-op. */
 INST_SEC("fexit/copy_vma")
 int p11_inst_vma_retcopy(u64 *ctx)
 {
     u64 ret = 0;
-    inst_get_func_ret(ctx, &ret);
+    if (inst_get_func_ret(ctx, &ret) != 0) {
+        inst_fault(inst_counters());
+        return 0;
+    }
     return inst_note_vma(ret, 0);
 }
 

@@ -77,9 +77,9 @@ pub(crate) enum ExecReleaseTarget {
 
 /// The 6/7-argument `copy_vma` hook program. Kernels through the 5-argument
 /// shape keep `p11_inst_vma_copy`, which reads the returned new VMA from
-/// the fixed fexit slot; newer kernels (6.18.58+ backports, 7.3+) pass
-/// more arguments, so the return slot moves and the hook reads it through
-/// `bpf_get_func_ret` instead.
+/// the fixed fexit slot; newer kernels (stable backports of 838bb60dc215,
+/// 7.3+) pass more arguments, so the return slot moves and the hook reads
+/// it through `bpf_get_func_ret` instead.
 pub(crate) const COPY_VMA_RET_PROGRAM: &str = "p11_inst_vma_retcopy";
 
 /// Which `copy_vma` prototype the host kernel carries: the 5-argument
@@ -922,9 +922,9 @@ fn exec_mmap_proto_is_exact(raw: &[u8]) -> bool {
 
 /// Which exact `copy_vma` prototype the host BTF carries, if any: the
 /// 5-argument legacy shape (fixed fexit slot `ctx[5]`) or the 6/7-argument
-/// extended shape (`keep_source` backported to 6.18.58+ stable heads,
-/// `anon_pgoff` from 7.3; the return slot moves, so the hook reads it
-/// through `bpf_get_func_ret`). All three spell the return as
+/// extended shape (`keep_source` from the stable backports of
+/// 838bb60dc215, `anon_pgoff` from 7.3; the return slot moves, so the hook
+/// reads it through `bpf_get_func_ret`). All three spell the return as
 /// `struct vm_area_struct *`, `vmap` as a double pointer to it, the
 /// offsets as 8-byte unsigned (`pgoff_t`), `need_rmap_locks` as `bool *`
 /// and `keep_source` as `bool`. Mirrors [`exec_mmap_proto_is_exact`];

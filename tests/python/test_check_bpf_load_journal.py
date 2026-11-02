@@ -73,13 +73,13 @@ def journal_rows():
 
 LINKED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.6.0)
-p11scope: semantic calls: collected 233, joined 203, shed 30, bindings 1, refused 0
+p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0
 key operations: unavailable (bootstrap_unavailable)
 """
 
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.6.0)
-p11scope: semantic calls: collected 233, joined 203, shed 30, bindings 1, refused 0
+p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0
 key operations: not reported by this version (planned for 0.6.0)
 """
 
@@ -171,6 +171,7 @@ class JournalGateTests(unittest.TestCase):
             "linked": rows,
             "linked-unlatched": rows,
             "linked-idle": rows,
+            "linked-oldline": rows,
             "refused-noseal": [row for row in rows if row["btf_id"] == 48],
             # The plain build exits before loading anything: the probe
             # file holds only its summary.
@@ -191,6 +192,10 @@ class JournalGateTests(unittest.TestCase):
             "linked": {"rc": 0, "text": LINKED_TEXT},
             "linked-unlatched": {"rc": 0, "text": LINKED_UNLATCHED_TEXT},
             "linked-idle": {"rc": 0, "text": IDLE_TEXT},
+            # The stop line before it carried a `lost` term: the gate
+            # must not accept it as the current observer's line.
+            "linked-oldline": {"rc": 0, "text": LINKED_TEXT.replace(
+                "shed 30, lost 0, bindings 1", "shed 30, bindings 1")},
             "missing-root": {"rc": 0, "text": LINKED_TEXT},
             "unlinked": {"rc": 0, "text": LINKED_TEXT.replace(
                 "key operations: unavailable (bootstrap_unavailable)",
@@ -364,6 +369,16 @@ class JournalGateTests(unittest.TestCase):
         # A seal with no joined calls is vacuous: the lane never
         # observed its caller, so the cell fails.
         result, out = self.run_gate(KERNEL, mode="linked-idle")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("idle", row["detail"])
+
+    def test_stop_line_without_lost_term_fails(self):
+        # The current stop line names ring loss separately (`lost N`);
+        # the older shape without it is not this observer's evidence.
+        result, out = self.run_gate(KERNEL, mode="linked-oldline")
         self.assertEqual(result.returncode, 1, result.stdout)
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])

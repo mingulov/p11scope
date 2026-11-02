@@ -9,7 +9,7 @@ use crate::semantics_objects::journal::joint_driver::{
     IngestedRaw, RawJointQuantum, RawQuantumRefusal,
 };
 use crate::semantics_objects::journal::tests::{
-    ENTRY_NS, begin_bytes_shaped, end_bytes, end_bytes_absent, function_id,
+    ENTRY_NS, KeepupRng, begin_bytes_shaped, end_bytes, end_bytes_absent, function_id,
 };
 use crate::semantics_objects::journal::{
     AttestationRefusal, H3DispositionEvidence, JournalDomainProof, SessionDrainGrant,
@@ -884,7 +884,12 @@ fn joint_prepared_key_binding_alone_does_not_claim_original() {
 /// shaped pair, without its journal BEGIN. A drain fed only these
 /// rows stages no journal opens: the feed-less session shape.
 fn push_bare_sign_init(fixture: &mut JointScene, pid: u32, sequence: u64) {
-    let (_, end) = fixture.encoded(pid, 0, "C_SignInit", sequence);
+    push_bare_call(fixture, pid, "C_SignInit", sequence);
+}
+
+/// One modeled call as a bare ordinary row for any held function.
+fn push_bare_call(fixture: &mut JointScene, pid: u32, name: &str, sequence: u64) {
+    let (_, end) = fixture.encoded(pid, 0, name, sequence);
     let payload = match decode_journal_record(&end, &publish_object_descriptors()) {
         Some(JournalRecord::End(end)) => end.payload_base(),
         other => panic!("the shaped END decodes: {other:?}"),
@@ -905,7 +910,9 @@ fn joint_keepup_feedless_claim_cost_flat_past_cap() {
     const PER_QUANTUM: usize = 64;
     const QUANTA: usize = 33;
     const TOTAL: usize = PER_QUANTUM * QUANTA;
-    assert!(TOTAL > 2_048, "the bench must cross the claim cap");
+    const {
+        assert!(TOTAL > 2_048, "the bench must cross the claim cap");
+    }
     let mut fixture = JointScene::new(1);
     let events = fixture.drain.consumption_cut().unwrap().events().clone();
     fixture.producers =
@@ -965,4 +972,336 @@ fn joint_keepup_feedless_claim_cost_flat_past_cap() {
         (0, 0, 0),
         "no fingerprint-claim work without a feed"
     );
+}
+
+/// One unlinked joint scene: the session links no journal producer,
+/// so its drain can never carry a journal BEGIN feed.
+fn unlinked_feedless_scene() -> JointScene {
+    let mut fixture = JointScene::new(1);
+    let events = fixture.drain.consumption_cut().unwrap().events().clone();
+    fixture.producers =
+        SessionDrainProducers::test_pair_unlinked(fixture.real.lane.domain(), events);
+    assert!(
+        !fixture.producers.journal_linked(),
+        "the differential session links no journal producer"
+    );
+    fixture
+}
+
+/// Public outputs of one feed-less quantum: joins, gaps, counts and
+/// staged edges. Claim results ride along for the below-cap exact
+/// comparison; the claim store itself is excluded by design.
+struct FeedlessQuantumView {
+    admissions: Vec<(u64, String)>,
+    claims: Vec<(u64, Result<JournalDomainProof, AttestationRefusal>)>,
+    births_installed: usize,
+    staged: usize,
+    h3_max: u64,
+    h3_floor: Option<u64>,
+    revision: u64,
+    gaps: Vec<crate::discovery::caller_registry::RegistryGap>,
+    repeats: Vec<u64>,
+    feeds: usize,
+    edges: Vec<(Option<u64>, u64, bool, u64, u64)>,
+}
+
+/// Run one feed-less quantum on one arm through the production
+/// phase order (claim, births, staging with disposition, finish,
+/// commit) and snapshot its public outputs.
+fn run_feedless_quantum(
+    arm: &mut JointScene,
+    calls: &[(&str, u64)],
+    legacy_claims: bool,
+) -> FeedlessQuantumView {
+    use crate::inventory_semantics::RetainedJointBirths;
+
+    arm.drain.source_mut().bound += calls.len();
+    let pid = std::process::id();
+    for (name, sequence) in calls {
+        push_bare_call(arm, pid, name, *sequence);
+    }
+    let raw = arm.prepare(calls.len());
+    if legacy_claims {
+        arm.real
+            .scene
+            .coordinator
+            .set_prepared_legacy_claims_for_test(true);
+    }
+    let (mut ingested, _) = arm.ingest(raw);
+    let admissions: Vec<(u64, String)> = arm
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .map(|input| (input.h0_ordinal(), input.s1_facts().function.clone()))
+        .collect();
+    let mut claims = Vec::new();
+    {
+        let coordinator = &mut arm.real.scene.coordinator;
+        while let Some((ordinal, claim)) = coordinator
+            .claim_next_prepared_admission(&arm.producers, &ingested)
+            .unwrap()
+        {
+            claims.push((ordinal, claim));
+        }
+    }
+    {
+        // Every recorded Ok proof binds its exact admission: the
+        // skip arm's bind-only proof is genuine, not manufactured.
+        let prepared = arm
+            .real
+            .scene
+            .coordinator
+            .prepared_semantic_batch()
+            .unwrap();
+        for (ordinal, result) in &claims {
+            if let Ok(proof) = result {
+                let input = prepared
+                    .admissions()
+                    .find(|input| input.h0_ordinal() == *ordinal)
+                    .expect("a claimed ordinal was admitted");
+                assert!(
+                    proof.matches_admitted(input),
+                    "the recorded proof binds its exact admission"
+                );
+            }
+        }
+    }
+    let mut births = RetainedJointBirths::new();
+    let disposition = arm
+        .real
+        .scene
+        .coordinator
+        .prepare_joint_births(
+            &ingested,
+            &arm.producers,
+            &mut births,
+            |_, _, _, _, _, _| panic!("unlinked births never reach native consume"),
+        )
+        .unwrap();
+    let mut staged = 0usize;
+    {
+        let coordinator = &mut arm.real.scene.coordinator;
+        while coordinator
+            .stage_next_prepared_admission_with_disposition(&arm.producers, &mut ingested)
+            .unwrap()
+        {
+            staged += 1;
+        }
+    }
+    assert!(
+        arm.real
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&arm.real.lane)
+    );
+    let (h3_max, h3_floor) = match arm.real.scene.coordinator.take_h3_disposition() {
+        H3DispositionEvidence::Clean {
+            staged_max,
+            pending_floor,
+        } => (staged_max, pending_floor),
+        other => panic!("the feed-less quantum stages clean H3, not {other:?}"),
+    };
+    arm.real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut arm.real.lane))
+        .unwrap();
+    let registry = arm.real.scene.coordinator.registry();
+    FeedlessQuantumView {
+        admissions,
+        claims,
+        births_installed: disposition.installed,
+        staged,
+        h3_max,
+        h3_floor,
+        revision: registry.published_revision(),
+        gaps: registry.gaps().to_vec(),
+        repeats: registry.gap_repeats().to_vec(),
+        feeds: registry.joint_feeds(),
+        edges: operation_edge_rows(&arm.real.scene),
+    }
+}
+
+/// Differential over randomized feed-less sequences: the legacy arm
+/// files fingerprint claims (the old path, forced per batch) while
+/// the skip arm binds keys only. Joins, gaps, counts and staged
+/// edges must match every quantum; only the claim store diverges.
+/// `fixed_count` pins the quantum size for the past-cap leg.
+fn feedless_differential_sequences(seed: u64, quanta: usize, fixed_count: Option<usize>) {
+    let mut legacy = unlinked_feedless_scene();
+    let mut skipped = unlinked_feedless_scene();
+    let pid = std::process::id();
+    legacy.bind(pid, image(7), &[0]);
+    skipped.bind(pid, image(7), &[0]);
+    let mut rng = KeepupRng::new(seed);
+    let mut sequence = 0u64;
+    let mut total = 0usize;
+    for quantum in 0..quanta {
+        let count = fixed_count.unwrap_or_else(|| 1 + rng.below(64) as usize);
+        let mut calls = Vec::with_capacity(count);
+        for _ in 0..count {
+            sequence += 1;
+            let name = match rng.below(3) {
+                0 => "C_SignInit",
+                1 => "C_SignUpdate",
+                _ => "C_SignFinal",
+            };
+            calls.push((name, sequence));
+        }
+        let old = run_feedless_quantum(&mut legacy, &calls, true);
+        let new = run_feedless_quantum(&mut skipped, &calls, false);
+        assert_eq!(
+            new.admissions, old.admissions,
+            "seed {seed} quantum {quantum}: identical admissions"
+        );
+        assert_eq!(
+            new.claims.len(),
+            old.claims.len(),
+            "seed {seed} quantum {quantum}: every admission is claimed on both arms"
+        );
+        for (index, ((at_old, res_old), (at_new, res_new))) in
+            old.claims.iter().zip(new.claims.iter()).enumerate()
+        {
+            assert_eq!(
+                at_new, at_old,
+                "seed {seed} quantum {quantum}: identical claim ordinals"
+            );
+            // Proofs bind their own session's domain, so only the
+            // result shapes compare across arms; within-arm proof
+            // genuineness is pinned at claim time above.
+            if total + index < 2_048 {
+                assert!(
+                    res_old.is_ok() && res_new.is_ok(),
+                    "seed {seed} quantum {quantum}: below-cap claims succeed on both arms"
+                );
+            } else {
+                assert_eq!(
+                    *res_old,
+                    Err(AttestationRefusal::ClaimsExhausted),
+                    "seed {seed} quantum {quantum}: the legacy arm bills past the cap"
+                );
+                assert!(
+                    res_new.is_ok(),
+                    "seed {seed} quantum {quantum}: the skip arm never bills"
+                );
+            }
+        }
+        total += count;
+        assert_eq!(
+            new.births_installed, 0,
+            "seed {seed} quantum {quantum}: the skip arm installs no births"
+        );
+        assert_eq!(
+            new.births_installed, old.births_installed,
+            "seed {seed} quantum {quantum}: identical joins"
+        );
+        assert_eq!(
+            new.staged, count,
+            "seed {seed} quantum {quantum}: the skip arm stages every call"
+        );
+        assert_eq!(
+            new.staged, old.staged,
+            "seed {seed} quantum {quantum}: identical staged counts"
+        );
+        assert_eq!(
+            (new.h3_max, new.h3_floor),
+            (old.h3_max, old.h3_floor),
+            "seed {seed} quantum {quantum}: identical H3 disposition"
+        );
+        assert_eq!(
+            new.h3_max, sequence,
+            "seed {seed} quantum {quantum}: H3 covers every staged position"
+        );
+        assert_eq!(
+            new.revision, old.revision,
+            "seed {seed} quantum {quantum}: identical published revisions"
+        );
+        assert_eq!(
+            new.gaps, old.gaps,
+            "seed {seed} quantum {quantum}: identical gaps"
+        );
+        assert!(
+            new.gaps
+                .iter()
+                .any(|gap| gap.reason == "joint_journal_unavailable"),
+            "seed {seed} quantum {quantum}: the unlinked disclosure is present, so the gap comparison is non-vacuous"
+        );
+        assert_eq!(
+            new.repeats, old.repeats,
+            "seed {seed} quantum {quantum}: identical gap repeats"
+        );
+        assert_eq!(
+            new.feeds, old.feeds,
+            "seed {seed} quantum {quantum}: identical joint feeds"
+        );
+        assert_eq!(
+            new.edges, old.edges,
+            "seed {seed} quantum {quantum}: identical staged edges"
+        );
+        assert!(
+            !new.edges.is_empty(),
+            "seed {seed} quantum {quantum}: staged edges exist, so the edge comparison is non-vacuous"
+        );
+    }
+    if fixed_count.is_some() {
+        assert!(total > 2_048, "the past-cap leg must cross the claim cap");
+    }
+    // Both arms staged no journal BEGINs (genuinely feed-less) while
+    // only the legacy arm filled the claim store: this pins the
+    // switch live on both sides.
+    for (label, arm, expect_stored) in
+        [("legacy", &legacy, total.min(2_048)), ("skip", &skipped, 0)]
+    {
+        let adapter = arm.real.scene.coordinator.joint_capture().adapter();
+        assert!(
+            adapter.retained_starts_for_test().is_empty(),
+            "{label} arm: bare rows stage no journal BEGINs"
+        );
+        assert_eq!(
+            adapter.invocation_claims_for_test().0,
+            expect_stored,
+            "{label} arm: claim-store census"
+        );
+    }
+    assert_eq!(
+        legacy
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .test_claim_costs_for_test(),
+        (total as u64, total, 0),
+        "the legacy arm bills fingerprint work per claim, with no prune while keys live"
+    );
+    assert_eq!(
+        skipped
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .test_claim_costs_for_test(),
+        (0, 0, 0),
+        "the skip arm files no fingerprint claims"
+    );
+}
+
+/// Feed-less skip differential: randomized bare-row sequences give
+/// identical public outputs on the legacy and skip arms, including
+/// one leg past the 2048-entry claim cap. Claim-store internals are
+/// the only allowed divergence.
+#[test]
+fn joint_keepup_feedless_skip_matches_legacy_public_outputs() {
+    for seed in [
+        0x1234_5678_9abc_def1,
+        0xdead_beef_cafe_f00d,
+        0x0bad_f00d_5eed_1234,
+    ] {
+        feedless_differential_sequences(seed, 5, None);
+    }
+    feedless_differential_sequences(0xfeed_1e55_ca1c_u64, 33, Some(64));
 }

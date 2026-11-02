@@ -1191,13 +1191,19 @@ pub(super) fn close_k0_window_with_tail_and_losses(
         resolved,
         mut collector,
         before,
-        before_losses: _before_losses,
+        before_losses,
         limits: _,
     } = window;
-    // STUB: discovery-loss voids land with the loss fix; until then the
-    // close ignores loss growth and the window succeeds.
-    let _ = after_losses;
-    if !clean_close {
+    // Discovery loss inside the window voids the detail: a missed
+    // lifecycle record fails closed like the witness it would have fed.
+    // Truncation (including a terminal drain stopped at its allowance)
+    // voids as broad-stopping with the unclean boundary; ring loss or
+    // export failures void as caller-changed with the exec witness.
+    let truncated_grew = after_losses[3] > before_losses[3];
+    let lifecycle_loss_grew = after_losses[0] > before_losses[0]
+        || after_losses[1] > before_losses[1]
+        || after_losses[2] > before_losses[2];
+    if !clean_close || truncated_grew {
         ledger.mark_selection_refused(
             Detail(SelectedDetailRefusal::Gate(
                 DetailToggleRefusal::BroadStopping,
@@ -1227,6 +1233,10 @@ pub(super) fn close_k0_window_with_tail_and_losses(
             return;
         }
     };
+    if lifecycle_loss_grew {
+        ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
+        return;
+    }
     if after_witness.fault_serial != before.fault_serial
         || after_witness.latest_exec != before.latest_exec
     {

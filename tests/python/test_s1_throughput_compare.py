@@ -246,6 +246,7 @@ def inventory_doc(edge, sem_rows, pid=PID, ring_loss=0, unrouted=0,
                                  "refused_endpoints": 0,
                                  "continuity_cuts": 0,
                                  "unrouted_returns": unrouted,
+                                 "events_lost": 0,
                                  "stop_quiescence": quiescence,
                                  "final_drain": drain}},
         "gaps": [{"caller": None, "module": None, "pid": None,
@@ -551,6 +552,7 @@ def joint_inventory_doc(edge, sem_rows, observations, pid=PID,
                                  "refused_endpoints": refused_endpoints,
                                  "continuity_cuts": continuity_cuts,
                                  "unrouted_returns": unrouted,
+                                 "events_lost": 0,
                                  "stop_quiescence": quiescence,
                                  "final_drain": drain}},
         "gaps": [{"caller": None, "module": None, "pid": None,
@@ -1141,13 +1143,62 @@ class LossGate(unittest.TestCase):
             return s1.compare([str(ledger_path)], [str(events_path)],
                               str(inventory_path), 10)
 
-    def test_events_lost_1_fails(self):
+    def test_unrouted_returns_1_fails(self):
         def mutate(inventory):
             inventory["observation"]["semantic_capture"][
                 "unrouted_returns"] = 1
         with self.assertRaises(ValueError) as ctx:
             self.run_mutation(mutate_inventory=mutate)
+        self.assertIn("unrouted_returns 1", str(ctx.exception))
+
+    def test_events_lost_1_fails(self):
+        def mutate(inventory):
+            inventory["observation"]["semantic_capture"]["events_lost"] = 1
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate_inventory=mutate)
         self.assertIn("events_lost 1", str(ctx.exception))
+
+    def test_events_lost_missing_fails(self):
+        def mutate(inventory):
+            del inventory["observation"]["semantic_capture"]["events_lost"]
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate_inventory=mutate)
+        self.assertIn("events_lost missing", str(ctx.exception))
+
+    def test_events_lost_out_of_range_fails(self):
+        def mutate(inventory):
+            inventory["observation"]["semantic_capture"]["events_lost"] = -1
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate_inventory=mutate)
+        self.assertIn("events_lost missing or out of range",
+                      str(ctx.exception))
+
+    def test_native_capture_events_loss_unknown_gap_fails(self):
+        reason = ("the EVENTS ring-loss counter could not be read; "
+                  "events_lost may undercount until a later good read "
+                  "restores the exact cumulative total")
+
+        def mutate_inventory(inventory):
+            inventory["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "subject": "native capture events loss unknown",
+                 "reason": reason, "budget": None, "repeats": 1})
+
+        def mutate_events(events):
+            ended = events[-1]
+            assert ended["kind"] == "ended"
+            gap = event_envelope(ended["seq"], R0 + 1_000, "gap_recorded",
+                                 {"index": 0, "caller": None, "module": None,
+                                  "pid": None,
+                                  "subject": "native capture events loss unknown",
+                                  "reason": reason,
+                                  "budget": None})
+            events.insert(-1, gap)
+            ended["seq"] += 1
+
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate_inventory, mutate_events)
+        self.assertIn("loss gap", str(ctx.exception))
 
     def test_ring_loss_1_fails(self):
         def mutate(inventory):
@@ -2666,9 +2717,9 @@ class JointConservationGate(unittest.TestCase):
                 self.run_joint(Path(tmp), mutate)
 
     def test_native_capture_events_lost_gap_fails(self):
-        reason = ("the EVENTS ring overwrote records before the drain "
-                  "read them (kernel reserve failures; exact count in "
-                  "unrouted_returns)")
+        reason = ("the EVENTS ring was full; the kernel refused records "
+                  "before the drain could read them (kernel reserve "
+                  "failures; exact count in events_lost)")
         with tempfile.TemporaryDirectory(prefix="joint-evloss-") as tmp:
             def mutate(doc):
                 doc["gaps"].append(
@@ -2677,6 +2728,36 @@ class JointConservationGate(unittest.TestCase):
                      "reason": reason, "budget": None, "repeats": 1})
             with self.assertRaisesRegex(require_s1(self).S1Error,
                                         "loss gap"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_native_capture_events_loss_unknown_gap_fails(self):
+        reason = ("the EVENTS ring-loss counter could not be read; "
+                  "events_lost may undercount until a later good read "
+                  "restores the exact cumulative total")
+        with tempfile.TemporaryDirectory(prefix="joint-evunk-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": "native capture events loss unknown",
+                     "reason": reason, "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_events_lost_nonzero_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-evlost-n-") as tmp:
+            def mutate(doc):
+                doc["observation"]["semantic_capture"]["events_lost"] = 3
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "events_lost 3"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_events_lost_missing_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-evlost-m-") as tmp:
+            def mutate(doc):
+                del doc["observation"]["semantic_capture"]["events_lost"]
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "events_lost missing"):
                 self.run_joint(Path(tmp), mutate)
 
     def test_native_capture_events_lost_event_fails(self):

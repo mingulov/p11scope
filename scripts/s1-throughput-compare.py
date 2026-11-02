@@ -29,10 +29,14 @@ Gates, in order; the first failure refuses with its own reason:
    Within one mechanism row, function swaps are invisible in v1 output
    and are a documented blind spot, not a proof.
 3. No published capture loss: observation.lifecycle.ring_loss == 0, the S1
-   event-loss account observation.semantic_capture.unrouted_returns ==
-   0 (reported as events_lost), a proven full drain (final_drain true,
+   terminal-drain account observation.semantic_capture.unrouted_returns
+   == 0, the S1 EVENTS ring-loss account
+   observation.semantic_capture.events_lost present and == 0 (its own
+   reason; a missing field fails), a proven full drain (final_drain true,
    stop_quiescence quiesced), no known-loss gap, loss-free counted
-   coverage on the physical edge, a current semantic child (clean or only
+   coverage on the physical edge (a `native capture events loss unknown`
+   gap is a known-loss gap: the ring-loss count could not be read), a
+   current semantic child (clean or only
    the exact terminal R59 capture_stopped/semantic_loss pair), and a complete
    event stream (ended present, edges_unretained == 0,
    gaps_suppressed == 0, no retention eviction). The v0.5.0
@@ -119,6 +123,7 @@ LOSS_GAP_SUBJECTS = frozenset({
     "native capture lifecycle evidence lost",
     "native capture retirement unsettled",
     "native capture events lost",
+    "native capture events loss unknown",
     "joint machine unavailable",
     "native capture scope custody unproven",
     "native capture refused an extend",
@@ -742,8 +747,14 @@ def check_loss(selected, doc, events, joint=False):
     unrouted = capture.get("unrouted_returns")
     _require(_u64(unrouted), "semantic_capture unrouted_returns out of range")
     _require(unrouted == 0,
-             f"events_lost {unrouted} "
+             f"unrouted_returns {unrouted} "
              "(observation.semantic_capture.unrouted_returns)")
+    events_lost = capture.get("events_lost")
+    _require(_u64(events_lost),
+             "semantic_capture events_lost missing or out of range")
+    _require(events_lost == 0,
+             f"events_lost {events_lost} "
+             "(observation.semantic_capture.events_lost)")
     drain = capture.get("final_drain")
     quiescence = capture.get("stop_quiescence")
     _require(drain is True and quiescence == "quiesced",
@@ -858,8 +869,8 @@ def check_loss(selected, doc, events, joint=False):
     _require(retained.get("suppressed", 0) == 0,
              "event stream incomplete: snapshot suppressed "
              f"{retained.get('suppressed')} gaps")
-    verdict = {"ring_loss": ring_loss, "events_lost": unrouted,
-               "gaps": len(gaps)}
+    verdict = {"ring_loss": ring_loss, "unrouted_returns": unrouted,
+               "events_lost": events_lost, "gaps": len(gaps)}
     if joint:
         verdict["refused_endpoints"] = refused_endpoints
         verdict["continuity_cuts"] = continuity_cuts

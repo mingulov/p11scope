@@ -6113,25 +6113,30 @@ impl JournalAdapter {
                 candidates.entry(entry.identity()).or_default().0 += 1;
             }
         }
+        // One census pass over retained entries replaces the
+        // per-candidate recount: identical totals, O(retained) per
+        // seal instead of O(candidates x retained). Converted entries
+        // still count, exactly as the recount saw them.
+        let mut totals: BTreeMap<CallIdentity, usize> = BTreeMap::new();
+        for entry in self.open.values() {
+            #[cfg(test)]
+            {
+                self.test_seal_census_visits += 1;
+            }
+            *totals.entry(identity_of_begin(&entry.begin)).or_default() += 1;
+        }
+        for entry in &self.refused {
+            #[cfg(test)]
+            {
+                self.test_seal_census_visits += 1;
+            }
+            *totals.entry(entry.identity()).or_default() += 1;
+        }
         for (identity, (_, end)) in candidates {
             // Two staged BEGINs sharing one entry-time identity (same
             // thread, same entry time) are an ambiguity whatever their
             // other words: one claim never covers both.
-            #[cfg(test)]
-            {
-                // One full retained scan per candidate.
-                self.test_seal_census_visits += self.open.len() + self.refused.len();
-            }
-            let count = self
-                .open
-                .values()
-                .filter(|entry| identity_of_begin(&entry.begin) == identity)
-                .count()
-                + self
-                    .refused
-                    .iter()
-                    .filter(|entry| entry.identity() == identity)
-                    .count();
+            let count = totals.get(&identity).copied().unwrap_or(0);
             let claims = &self.claims[&identity][&key];
             if count != 1 || claims.len() != 1 {
                 // Do not let pruning/void turn this ambiguity into a later

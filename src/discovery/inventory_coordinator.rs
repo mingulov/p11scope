@@ -7412,12 +7412,41 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Provider-free and newcomer-free discards stay silent. Cgroup
     /// retained collections carry transaction state rather than final
     /// scan verdicts, so provider mappings there stay unjudged.
-    /// (Seam wiring: the predicate lands with the fix; until then the
-    /// RED tests fail on the missing gap.)
     pub(crate) fn note_discarded_collection(
         &mut self,
-        _collected: &crate::inventory_capture::CollectedPass,
+        collected: &crate::inventory_capture::CollectedPass,
     ) {
+        let crate::inventory_capture::CollectedPass::Legacy(Ok(catalog)) = collected else {
+            return;
+        };
+        let mut provider_pids: BTreeSet<u32> = BTreeSet::new();
+        for object in &catalog.objects {
+            for observation in &object.observations {
+                if !observation.tables.is_empty() || !observation.interfaces.is_empty() {
+                    provider_pids.insert(observation.pid);
+                }
+            }
+        }
+        for process in &catalog.processes {
+            if self.adapter.live_id(process.pid).is_some() {
+                continue;
+            }
+            if !process.status.attributable() {
+                continue;
+            }
+            let maps_provider = process.status == crate::inspect_system::MemberStatus::MapsMatched
+                || provider_pids.contains(&process.pid);
+            if maps_provider {
+                // Same phenomenon class as the discovery Engine's
+                // stop-time mark, reworded for this seam: the mapping may
+                // predate the stop; the drop happened while stopping.
+                self.note_scope_gap(
+                    "live inventory transaction".into(),
+                    "a new process mapping a provider was dropped while the capture was stopping; its calls were not observed".into(),
+                );
+                return;
+            }
+        }
     }
 
     /// The physical tail and registry share the actual publication boundary.

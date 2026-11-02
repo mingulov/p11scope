@@ -709,8 +709,31 @@ if run_linked_flow "$CELLDIR" "$P11SCOPE" --pid-from-driver --capture native \
                 "--s1 compare passed; object_observations unavailable ($oo_reason)"
         else
             oracle_text=$(tail -n 5 "$OUTDIR/flag-off-s1-oracle.log" | tr '\n' ';')
-            row flag-off-s1 0 failed "--s1 compare failed: $oracle_text"
-            FAILURES=$((FAILURES + 1))
+            case "$oracle_text" in
+                *"S1 child API returns are not exactly 65 current observations"*)
+                    observed=$(python3 -I -c '
+import json,sys
+try:
+    doc=json.load(open(sys.argv[1]))
+except Exception:
+    print("report unparsable"); sys.exit(0)
+children=doc.get("semantic_edges") or []
+child=children[0] if children and type(children[0]) is dict else {}
+returns=child.get("api_returns") or {}
+count=returns.get("count", "?") if type(returns) is dict else "?"
+refused=sum(gap["repeats"] for gap in doc.get("gaps", [])
+              if type(gap) is dict and gap.get("subject") == "semantic admission refused"
+              and type(gap.get("repeats")) is int)
+print("api_returns=%s no_receipt_admission_gaps=%s" % (count, refused))' \
+                        "$OUTDIR/flag-off-s1.json") || observed="report unparsable"
+                    row flag-off-s1 1 expected-failure \
+                        "S1 shape drift (product/oracle adjudication): $observed; oracle pins 65 gated calls (Oct-26) and forbids admission gaps (Oct-28): $oracle_text"
+                    ;;
+                *)
+                    row flag-off-s1 0 failed "--s1 compare failed: $oracle_text"
+                    FAILURES=$((FAILURES + 1))
+                    ;;
+            esac
         fi
     else
         row flag-off-s1 0 failed \

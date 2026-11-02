@@ -14,9 +14,10 @@
 #     paces itself, so the wall is fixed; the measures are the achieved
 #     rate (ledgered calls per wall second) and the per-call latency
 #     distribution (t1-t0 over the ledger call rows, workload-side).
-# BPF run-time deltas (kernel.bpf_stats_enabled, set for the campaign and
-# restored after) corroborate independently: the sched_process_exec total
-# beside exec-storm, the p11_entry total beside call-rate. A sample whose
+# BPF run-time deltas (kernel.bpf_stats_enabled, set for the campaign,
+# re-asserted per sample against concurrent cells, restored after)
+# corroborate independently: the sched_process_exec total beside
+# exec-storm, the p11_entry total beside call-rate. A sample whose
 # hook program is present must show at least one hook event per workload
 # op (a zero delta would certify unattached hooks); absence is recorded
 # per arm and reported, never silently treated as zero cost.
@@ -27,8 +28,10 @@
 # MAX_LOAD1, default 4, no cargo/rustc; bounded COOLDOWN, default 300 s,
 # else the campaign is refused), seed READY, observer attach (profile arms:
 # the capturing line with >0 probes and no "attach failed"; the armed arm:
-# the semantic seal line), exact workload op count, observer exit 0, the
-# report parses with evidence of attachment. The campaign pre-declares a
+# the semantic seal line plus pass-1 start, so the storm lands on a
+# steady-state scan, not mid-pass-0 attach), exact workload op count,
+# observer exit 0, the report parses with evidence of attachment. The
+# campaign pre-declares a
 # manifest before the first sample and closes the log with a DONE marker;
 # the verdict math lives in scripts/bench-marker-cost-analyze.py, which
 # also runs standalone on the campaign log with --manifest and rejects any
@@ -60,6 +63,7 @@ SIGNAL_EXEC=$PWD/scripts/ci/run_default_signals.py
 
 MODULE=${MODULE:-}
 LOCK=${LOCK:-/var/tmp/p11scope-ws-tmp/privileged.lock}
+SUDO="sudo -n"
 CELLS=${CELLS:-exec-storm call-rate}
 ROUNDS=${ROUNDS:-2}
 EXEC_OPS=${EXEC_OPS:-2000}
@@ -139,7 +143,12 @@ EOF
 if [ "${1-}" = "--dry-run" ]; then
     [ "$#" -eq 1 ] || { echo "usage: $0 [--self-test|--dry-run]" >&2; exit 2; }
     for knob in ROUNDS EXEC_OPS CALL_DURATION DURATION; do
-        eval "value=\$$knob"
+        case $knob in
+            ROUNDS) value=$ROUNDS ;;
+            EXEC_OPS) value=$EXEC_OPS ;;
+            CALL_DURATION) value=$CALL_DURATION ;;
+            DURATION) value=$DURATION ;;
+        esac
         is_positive_int "$value" || { echo "usage: $knob is a positive integer" >&2; exit 2; }
     done
     for cell in $CELLS; do
@@ -377,22 +386,59 @@ wait_for_seal() {
     done
     return 0
 }
+wait_for_first_pass() {
+    # The seal readies the lane before pass 0 finishes; a storm that
+    # lands mid-pass-0 measures attach, not steady-state hook cost, and
+    # stops with 0 endpoints. Pass 1 starting means pass 0 completed.
+    wffp_end=$(( $(date +%s) + $2 ))
+    while ! grep -Fq "p11scope: pass 1:" "$1" 2>/dev/null; do
+        if [ -n "${SPID-}" ] && ! kill -0 "$SPID" 2>/dev/null; then
+            echo "observer exited before pass 1 started: $1" >&2
+            tail -n 20 "$1" >&2 2>/dev/null || true
+            return 1
+        fi
+        [ "$(date +%s)" -lt "$wffp_end" ] || {
+            echo "observer never started pass 1 within $2s: $1" >&2
+            tail -n 20 "$1" >&2 2>/dev/null || true
+            return 1
+        }
+        sleep 0.5
+    done
+    return 0
+}
 
 # bpf_totals PROG: "<run_time_ns> <run_cnt>" summed over every loaded
 # program whose name is PROG or its 15-byte kernel truncation, or
 # "absent" when none is loaded. Sums (never picks one): with uprobe_multi
 # there is one program per hook anyway, and a sum cannot hide a twin.
 bpf_totals() {
-    sudo -n bpftool -j prog show 2>/dev/null | python3 -I -c '
+    bpf_json=$(sudo -n bpftool -j prog show 2>"$WORK/bpftool.stderr")
+    bpf_rc=$?
+    if [ "$bpf_rc" -ne 0 ] || [ -z "$bpf_json" ]; then
+        echo "bpftool prog show failed (exit $bpf_rc):" >&2
+        tail -n 3 "$WORK/bpftool.stderr" >&2 2>/dev/null || true
+        echo "bpf_stats_enabled=$(cat /proc/sys/kernel/bpf_stats_enabled 2>/dev/null)" >&2
+        return 1
+    fi
+    printf '%s' "$bpf_json" | python3 -I -c '
 import json, sys
 want = sys.argv[1]
 try:
+    with open("/proc/sys/kernel/bpf_stats_enabled", encoding="utf-8") as handle:
+        stats = handle.read().strip()
+except OSError:
+    stats = "unknown"
+try:
     progs = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
+except Exception as exc:
+    sys.exit(f"bpftool output is not JSON with stats={stats}: {exc}")
+if type(progs) is not list:
+    sys.exit(f"bpftool output is not a prog list with stats={stats}")
 total_ns = total_cnt = 0
 found = False
 for prog in progs:
+    if type(prog) is not dict:
+        continue
     name = prog.get("name", "")
     if name != want and name != want[:15]:
         continue
@@ -400,7 +446,8 @@ for prog in progs:
     for field in ("run_time_ns", "run_cnt"):
         value = prog.get(field)
         if type(value) is not int or value < 0:
-            sys.exit(1)
+            sys.exit(f"prog {name!r} has no integer {field} with stats={stats}"
+                     f" (a concurrent cell may have restored stats=0 or unloaded it)")
     total_ns += prog["run_time_ns"]
     total_cnt += prog["run_cnt"]
 if not found:
@@ -548,17 +595,20 @@ run_sample() {
     if [ "$rs_arm" != none ]; then
         case $rs_arm in
             off-profile)
-                sudo -n --preserve-env=SOFTHSM2_CONF python3 -I "$SIGNAL_EXEC" "$OFF_OBSERVER" profile \
+                # shellcheck disable=SC2086
+                $SUDO --preserve-env=SOFTHSM2_CONF python3 -I "$SIGNAL_EXEC" "$OFF_OBSERVER" profile \
                     --system --duration "$DURATION" -o "$S/profile.json" \
                     > "$S/observer.log" 2> "$S/observer.stderr" &
                 ;;
             on-profile)
-                sudo -n --preserve-env=SOFTHSM2_CONF python3 -I "$SIGNAL_EXEC" "$ON_OBSERVER" profile \
+                # shellcheck disable=SC2086
+                $SUDO --preserve-env=SOFTHSM2_CONF python3 -I "$SIGNAL_EXEC" "$ON_OBSERVER" profile \
                     --system --duration "$DURATION" -o "$S/profile.json" \
                     > "$S/observer.log" 2> "$S/observer.stderr" &
                 ;;
             on-armed)
-                sudo -n --preserve-env=SOFTHSM2_CONF python3 -I "$SIGNAL_EXEC" "$ON_OBSERVER" inventory \
+                # shellcheck disable=SC2086
+                $SUDO --preserve-env=SOFTHSM2_CONF python3 -I "$SIGNAL_EXEC" "$ON_OBSERVER" inventory \
                     --system --capture native --key-operations \
                     --manifest "$WORK/manifest.json" --duration "$DURATION" \
                     -o "$S/out.json" \
@@ -572,6 +622,7 @@ run_sample() {
                 ;;
             on-armed)
                 wait_for_seal "$S/observer.stderr" "$ATTACH_TIMEOUT_S" || return 1
+                wait_for_first_pass "$S/observer.stderr" "$ATTACH_TIMEOUT_S" || return 1
                 ;;
         esac
         if grep -q "attach failed" "$S/observer.stderr"; then
@@ -579,6 +630,12 @@ run_sample() {
             cat "$S/observer.stderr" >&2
             return 1
         fi
+        # bpf_stats_enabled is host-global: a concurrent BPF cell can
+        # restore 0 mid-campaign, which drops run_time_ns from bpftool
+        # and fails the read. Re-assert per sample (a no-op on the
+        # exclusive host the real numbers come from).
+        sudo -n sysctl -w kernel.bpf_stats_enabled=1 >/dev/null 2>&1 \
+            || { echo "bpf stats re-assert failed" >&2; return 1; }
         rs_bpf_before=$(bpf_totals "$rs_prog") || { echo "bpf before-read failed" >&2; return 1; }
     else
         rs_bpf_before=none
@@ -629,8 +686,14 @@ run_sample() {
 import json, sys
 doc = json.load(open(sys.argv[1]))
 if sys.argv[2] == "on-armed":
-    if not doc.get("endpoints"):
-        sys.exit(1)
+    observation = doc.get("observation", {})
+    capture = observation.get("semantic_capture", {})
+    attach = observation.get("attach", {})
+    admitted = capture.get("admitted_endpoints", 0)
+    if type(admitted) is not int or admitted <= 0:
+        sys.exit("armed report shows no admitted endpoints")
+    if attach.get("mechanism") != "uprobe-multi":
+        sys.exit("armed report is not a native uprobe-multi capture")
 elif doc.get("evidence", {}).get("attached_probes", 0) <= 0:
     sys.exit(1)
 EOF

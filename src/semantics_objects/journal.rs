@@ -1095,6 +1095,10 @@ pub(crate) struct JournalAdapter {
     test_claim_calls: u64,
     #[cfg(test)]
     test_prune_runs: u64,
+    /// Test-only seal-validation census visits: retained entries
+    /// scanned while attributing staged calls.
+    #[cfg(test)]
+    test_seal_census_visits: usize,
     /// Test-only phase trace: `None` (off) by default; `Some` records
     /// one sample per claim while enabled.
     #[cfg(test)]
@@ -1175,6 +1179,8 @@ impl JournalAdapter {
             test_claim_calls: 0,
             #[cfg(test)]
             test_prune_runs: 0,
+            #[cfg(test)]
+            test_seal_census_visits: 0,
             #[cfg(test)]
             test_phase_trace: None,
             #[cfg(test)]
@@ -1326,6 +1332,15 @@ impl JournalAdapter {
         self.test_claim_calls = 0;
         self.test_claim_scan_visits = 0;
         self.test_prune_runs = 0;
+        self.test_seal_census_visits = 0;
+    }
+
+    /// Test-only read of the seal-validation census visits: retained
+    /// entries scanned while attributing staged calls. Production
+    /// pays nothing for this.
+    #[cfg(test)]
+    pub(crate) fn test_seal_census_visits_for_test(&self) -> usize {
+        self.test_seal_census_visits
     }
 
     /// Test-only phase-trace switch: off by default; while on, every
@@ -6102,6 +6117,11 @@ impl JournalAdapter {
             // Two staged BEGINs sharing one entry-time identity (same
             // thread, same entry time) are an ambiguity whatever their
             // other words: one claim never covers both.
+            #[cfg(test)]
+            {
+                // One full retained scan per candidate.
+                self.test_seal_census_visits += self.open.len() + self.refused.len();
+            }
             let count = self
                 .open
                 .values()
@@ -14465,6 +14485,34 @@ pub(crate) mod tests {
         assert_eq!(
             scene.adapter.claim_counts, 0,
             "the abandoned call's claim converted with its begin"
+        );
+    }
+
+    #[test]
+    fn joint_keepup_seal_validation_census_is_linear_in_retained() {
+        // The live-feed seal attributes every converting call: with a
+        // full open table the attribution census must visit each
+        // retained entry once, not once per candidate.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        const OPENS: usize = 1_024;
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        for thread in 1..=OPENS as u64 {
+            let begin = begin_bytes(thread, 1, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        }
+        let proof = scene.attest_calls(OPENS);
+        scene.prepare_claims();
+        assert_eq!(scene.adapter.claim_counts, OPENS);
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.adapter.reset_test_claim_costs_for_test();
+        let success = scene.seal(&bootstrap).expect("full table seals");
+        assert_eq!(success.prefix.settled().len(), OPENS);
+        assert_eq!(
+            scene.adapter.test_seal_census_visits_for_test(),
+            OPENS,
+            "one census visit per retained entry, not per candidate"
         );
     }
 

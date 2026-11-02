@@ -14729,7 +14729,7 @@ fn joint_original_loss_fans_out_before_ack() {
         .into_iter()
         .filter(|gap| {
             gap.subject == "Joint key operations unavailable; retained S1"
-                && gap.reason == "joint_seal_H3Loss_history_loss"
+                && gap.reason == "joint_seal_h3_loss_history_loss"
         })
         .map(|gap| gap.caller)
         .collect();

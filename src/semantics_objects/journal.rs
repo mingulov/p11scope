@@ -764,6 +764,38 @@ pub(crate) enum JournalGap {
     CutExhausted,
 }
 
+impl JournalGap {
+    /// Frozen snake_case name for disclosures (`joint_seal_<label>_<class>`).
+    /// Never the `Debug` spelling: renaming a variant must not change
+    /// published output.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::FaultChanged => "fault_changed",
+            Self::FaultUnreadable => "fault_unreadable",
+            Self::FaultSaturated => "fault_saturated",
+            Self::Malformed => "malformed",
+            Self::CounterUnprovable => "counter_unprovable",
+            Self::ResourceUnavailable => "resource_unavailable",
+            Self::H3Pending => "h3_pending",
+            Self::H3Loss => "h3_loss",
+            Self::AdapterInvalidated => "adapter_invalidated",
+            Self::DomainTainted => "domain_tainted",
+            Self::ImageTainted => "image_tainted",
+            Self::FrontierRegression => "frontier_regression",
+            Self::BootstrapMismatch => "bootstrap_mismatch",
+            Self::BoundNotReady => "bound_not_ready",
+            Self::ModelRefused => "model_refused",
+            Self::DomainEnded => "domain_ended",
+            Self::ClosureStale => "closure_stale",
+            Self::Stopped => "stopped",
+            Self::DrainMismatch => "drain_mismatch",
+            Self::H3Exhausted => "h3_exhausted",
+            Self::Discarded => "discarded",
+            Self::CutExhausted => "cut_exhausted",
+        }
+    }
+}
+
 /// The model's bootstrap floor: strictly above the birth, the last
 /// sealed frontier, the void fence and every recorded or pending loss
 /// bound. The maximum of strict successors is the strict successor of

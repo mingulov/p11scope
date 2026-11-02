@@ -2251,10 +2251,7 @@ impl CallerRegistry {
                 // in `fallback_joint_for_order`, every Joint ending
                 // carries a cause, so the section's `authority_lost` or
                 // `proof_refused_fallback` never stands without one.
-                self.record_gap(joint_ended_gap(
-                    caller,
-                    format!("joint_seal_{gap:?}_{class}"),
-                ));
+                self.record_gap(joint_ended_gap(caller, joint_seal_reason(gap, class)));
             }
             if !was_joint && matches!(&outcome, FailureBatchProgress::NegativeDelivered(_)) {
                 // A negative-only history still publishes the canonical
@@ -3468,6 +3465,16 @@ impl ConversionRefusal {
     }
 }
 
+/// `joint_seal_<label>_<class>`: the reason naming one seal failure that
+/// ended a Joint feed, from the frozen [`JournalGap::label`] vocabulary
+/// (never the `Debug` spelling) and the H9 class (`history_loss`,
+/// `fallback`).
+///
+/// [`JournalGap::label`]: crate::semantics_objects::journal::JournalGap::label
+fn joint_seal_reason(gap: crate::semantics_objects::journal::JournalGap, class: &str) -> String {
+    format!("joint_seal_{}_{class}", gap.label())
+}
+
 /// The disclosure for one ended Joint feed: S1 stays, Joint key
 /// operations for `caller` are unavailable, and `reason` names the
 /// ending (`joint_seal_*` or `joint_fallback_*`).
@@ -4544,5 +4551,64 @@ mod journal_unavailable_tests {
             !production.contains("false"),
             "linkage derives from the linked flag, not a literal: {production}"
         );
+    }
+}
+
+#[cfg(test)]
+mod joint_ending_reason_tests {
+    use super::joint_seal_reason;
+    use crate::semantics_objects::journal::JournalGap::{self, *};
+
+    /// The seal-ending reasons are frozen snake_case labels for both H9
+    /// classes; every gap has its own label.
+    #[test]
+    fn joint_seal_reasons_use_frozen_labels() {
+        assert_eq!(
+            joint_seal_reason(H3Loss, "history_loss"),
+            "joint_seal_h3_loss_history_loss"
+        );
+        assert_eq!(
+            joint_seal_reason(DomainEnded, "fallback"),
+            "joint_seal_domain_ended_fallback"
+        );
+        assert_eq!(
+            joint_seal_reason(ClosureStale, "fallback"),
+            "joint_seal_closure_stale_fallback"
+        );
+        let all: [JournalGap; 22] = [
+            FaultChanged,
+            FaultUnreadable,
+            FaultSaturated,
+            Malformed,
+            CounterUnprovable,
+            ResourceUnavailable,
+            H3Pending,
+            H3Loss,
+            AdapterInvalidated,
+            DomainTainted,
+            ImageTainted,
+            FrontierRegression,
+            BootstrapMismatch,
+            BoundNotReady,
+            ModelRefused,
+            DomainEnded,
+            ClosureStale,
+            Stopped,
+            DrainMismatch,
+            H3Exhausted,
+            Discarded,
+            CutExhausted,
+        ];
+        let labels: std::collections::BTreeSet<_> = all.iter().map(|gap| gap.label()).collect();
+        assert_eq!(labels.len(), all.len(), "labels are distinct");
+        for label in labels {
+            assert!(
+                !label.is_empty()
+                    && label.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'),
+                "{label} is snake_case"
+            );
+        }
     }
 }

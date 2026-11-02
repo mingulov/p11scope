@@ -154,13 +154,14 @@ fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
 "#;
     if !comparison
         .lines()
-        // Pinned baseline 55101d3c: the journal READY writer on top of the
+        // Pinned baseline 8b7ee11a: the 7.3 exec-release and 6/7-argument
+        // copy_vma hooks on top of the journal READY writer (55101d3c), the
         // async control value flags (6641123f), the default journal and birth
         // marker (16a7bd53), the exec-witness
         // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        .any(|line| line == "          BASELINE=55101d3ca96b398ebca4f85f9e18eca058bb7a05")
+        .any(|line| line == "          BASELINE=8b7ee11ab03c9b0f4a56c9ea88fee22d063a7260")
         || !comparison.contains(repeat)
         || !comparison.contains(integration)
         || comparison.contains("--host-compiler-transition")
@@ -240,13 +241,14 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
         "a renamed comparison job must be rejected"
     );
     for marker in [
-        // Pinned baseline 55101d3c: the journal READY writer on top of the
+        // Pinned baseline 8b7ee11a: the 7.3 exec-release and 6/7-argument
+        // copy_vma hooks on top of the journal READY writer (55101d3c), the
         // async control value flags (6641123f), the default journal and birth
         // marker (16a7bd53), the exec-witness
         // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=55101d3ca96b398ebca4f85f9e18eca058bb7a05",
+        "BASELINE=8b7ee11ab03c9b0f4a56c9ea88fee22d063a7260",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"",

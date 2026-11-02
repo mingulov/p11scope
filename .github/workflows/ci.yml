@@ -502,7 +502,17 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin 55101d3c, the journal READY writer (picked 54693889) plus its
+      # Pin 8b7ee11a, the 7.3 exec-release and 6/7-argument copy_vma hooks
+      # (the picked hook-set series 9fb2c1fb..df782cfc plus the refused-helper
+      # fault 8b7ee11a): the default Detailed object gains the fexit/exec_mmap
+      # section (p11_image_mmap_release) and p11_inst_vma_retcopy in
+      # fexit/copy_vma; p11_inst_vma_copy and every other code section are
+      # byte-identical (only relocation, symbol, string, BTF and debug
+      # sections move), .maps is unchanged, and both Inventory objects are
+      # byte-identical to 55101d3c. The journal object, which this gate does
+      # not compare, gains the same two programs. No other BPF input changed
+      # since 55101d3c.
+      # Earlier pin 55101d3c, the journal READY writer (picked 54693889) plus its
       # comment corrections: the default Detailed object differs from 6641123f
       # only in debug sections (54693889 changes .debug_line through the
       # instance_epoch.c source checksum; 55101d3c also rewraps a
@@ -566,7 +576,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=55101d3ca96b398ebca4f85f9e18eca058bb7a05
+          BASELINE=8b7ee11ab03c9b0f4a56c9ea88fee22d063a7260
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

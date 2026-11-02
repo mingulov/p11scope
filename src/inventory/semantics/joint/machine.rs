@@ -1302,6 +1302,18 @@ impl LiveJointMachine {
         self.pose_pregrant_close_timeout = on;
     }
 
+    /// Set (or clear) the Collecting quantum's first-poll stamp, so
+    /// the twin can exercise the real wall-time comparison without
+    /// waiting it out. Panics outside Collecting: the bound is read
+    /// only there, and a silent no-op would fake the timeout.
+    #[cfg(test)]
+    pub(crate) fn set_pregrant_first_poll_for_test(&mut self, since: Option<Instant>) {
+        let Some(Phase::Collecting(original)) = self.phase.as_mut() else {
+            panic!("the pre-grant bound is read only in Collecting");
+        };
+        original.pregrant_first_poll = since;
+    }
+
     /// Backdate (or clear) the current stall-clock start, so the twin
     /// can pose a stall of any wall-time age without waiting it out.
     #[cfg(test)]

@@ -3219,6 +3219,87 @@ fn joint_pregrant_timeout_closes_and_discloses_tainted_birth() {
     assert_eq!(api_total, 1, "the modeled call still reduces S1");
 }
 
+/// The real 2 s timeout, without the pose seam: an open START holds
+/// the quantum, then a backdated first-poll stamp trips the actual
+/// wall-time comparison — the quantum closes, disposal taints, the
+/// next bind discloses ImageTainted, the label reads
+/// linked-bootstrap, S1 still reduces, and no grant mints. Kills a
+/// clock-comparison mutant the posed twin cannot see.
+#[test]
+fn joint_pregrant_real_timeout_closes_and_taints() {
+    use crate::semantics_objects::journal::AttestationRefusal;
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    let init_end = push_begin(&mut scene, pid, "C_Initialize", 2);
+    assert_eq!(
+        drive_collecting_quiescent(&mut scene),
+        "Collecting",
+        "the START holds first"
+    );
+    // Exactly the bound (PREGRANT_CLOSE_TIMEOUT): the comparison is
+    // `elapsed >= bound`, so the backdated stamp trips it on the
+    // next poll through the real clock.
+    scene.machine.set_pregrant_first_poll_for_test(Some(
+        std::time::Instant::now() - std::time::Duration::from_secs(2),
+    ));
+    assert!(
+        drive_until_closed(&mut scene, 64),
+        "the expired bound closes the extended quantum"
+    );
+    scene.published();
+    scene
+        .scene
+        .drain
+        .source_mut()
+        .push_record(init_end.to_vec());
+    assert_eq!(reach_any(&mut scene, &["BindingKeys"]), "BindingKeys");
+    let input = cloned_only_admission(&mut scene);
+    scene.published();
+    assert!(
+        scene.machine.retained_drain_grant_for_test().is_none(),
+        "the tainted bind mints no grant"
+    );
+    let outcome = bind_probe_outcome(&mut scene, &input);
+    assert!(
+        matches!(outcome, Err(AttestationRefusal::ImageTainted)),
+        "disposal tainted the image: {outcome:?}"
+    );
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let reasons: Vec<String> = coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "Joint birth unavailable; retained S1")
+        .map(|gap| gap.reason.clone())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec!["joint_birth_claim_ImageTainted".to_string()],
+        "the refused bind discloses its cause"
+    );
+    let linked = scene.scene.producers.journal_linked();
+    assert!(linked, "the twin runs linked producers");
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .note_journal_linked(linked);
+    let registry = scene.scene.real.scene.coordinator.registry();
+    let observations = registry.joint_observations(registry.published_revision());
+    assert_eq!(observations.reason, "bootstrap_unavailable");
+    let api_total: u64 = crate::semantic_capture::tests::custody_chain_tests::operation_edge_rows(
+        &scene.scene.real.scene,
+    )
+    .iter()
+    .filter_map(|row| row.0)
+    .sum();
+    assert_eq!(api_total, 1, "the modeled call still reduces S1");
+}
+
 /// F4: a pre-grant admission whose caller has a pending exit stages
 /// no D1 gap — the custody conversion wins and the peek skips the
 /// disclosure, so the input stages exactly the custody refusal and

@@ -2480,6 +2480,53 @@ mod tests {
     }
 
     #[test]
+    fn hook_health_accepts_every_resolved_hook_set() {
+        use super::{CopyVmaTarget, ExecReleaseTarget, HookTargets};
+        for copy in [CopyVmaTarget::Legacy, CopyVmaTarget::FuncRet] {
+            for exec in [
+                ExecReleaseTarget::ExecMmRelease,
+                ExecReleaseTarget::ExecMmap,
+            ] {
+                let names: Vec<&'static str> =
+                    super::active_instance_programs(HookTargets { copy, exec })
+                        .iter()
+                        .map(|(program, _)| *program)
+                        .collect();
+                assert_eq!(
+                    names[2],
+                    if copy == CopyVmaTarget::FuncRet {
+                        super::COPY_VMA_RET_PROGRAM
+                    } else {
+                        "p11_inst_vma_copy"
+                    }
+                );
+                assert_eq!(
+                    names[3],
+                    if exec == ExecReleaseTarget::ExecMmap {
+                        super::EXEC_RELEASE_MMAP_PROGRAM
+                    } else {
+                        "p11_image_exec_release"
+                    }
+                );
+                let stats = healthy_hook_stats_for(&names);
+                let expected = stats
+                    .iter()
+                    .map(|(name, stats)| (*name, stats.program_id))
+                    .collect();
+                super::validate_hook_health_with(
+                    4,
+                    Some(&expected),
+                    || Ok("1".into()),
+                    || Ok(stats),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("the resolved {copy:?}/{exec:?} set validates: {error:#}")
+                });
+            }
+        }
+    }
+
+    #[test]
     fn production_program_info_refuses_shortened_statistics() {
         let info = super::ProgInfoPrefix {
             head: [0; 192],

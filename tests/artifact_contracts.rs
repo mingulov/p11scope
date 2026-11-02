@@ -7313,38 +7313,73 @@ fn stagea_hook_census_accepts_exact_kernel_names_and_refuses_collisions() {
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
     }
-    // The 7.3+ hook set swaps only the exec-release program and validates
-    // identically; a mixed set naming both variants is refused.
-    let mmap_names = [
-        "p11_inst_vma_map",
-        "p11_inst_vma_unmap",
-        "p11_inst_vma_copy",
-        "p11_image_mmap_release",
-    ];
-    let mmap_good: Vec<_> = mmap_names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| {
-            serde_json::json!({
-                "id":index + 1, "name":&name[..15], "run_time_ns":10, "run_cnt":1
+    // Each variant slot swaps only its own program: all four complete
+    // sets validate identically, while a set naming both variants of
+    // either slot is refused.
+    for names in [
+        [
+            "p11_inst_vma_map",
+            "p11_inst_vma_unmap",
+            "p11_inst_vma_copy",
+            "p11_image_mmap_release",
+        ],
+        [
+            "p11_inst_vma_map",
+            "p11_inst_vma_unmap",
+            "p11_inst_vma_retcopy",
+            "p11_image_exec_release",
+        ],
+        [
+            "p11_inst_vma_map",
+            "p11_inst_vma_unmap",
+            "p11_inst_vma_retcopy",
+            "p11_image_mmap_release",
+        ],
+    ] {
+        let set_good: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                serde_json::json!({
+                    "id":index + 1, "name":&name[..15], "run_time_ns":10, "run_cnt":1
+                })
             })
-        })
-        .collect();
-    fs::write(&programs, serde_json::to_vec(&mmap_good).unwrap()).unwrap();
-    for (mode, expected) in [("programs", "4"), ("links", "4"), ("stats", "40 4")] {
-        let output = run(mode);
-        assert!(output.status.success());
-        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+            .collect();
+        fs::write(&programs, serde_json::to_vec(&set_good).unwrap()).unwrap();
+        for (mode, expected) in [("programs", "4"), ("links", "4"), ("stats", "40 4")] {
+            let output = run(mode);
+            assert!(
+                output.status.success(),
+                "hook set {names:?} was refused in {mode} mode"
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+        }
+        let mut mixed = set_good.clone();
+        mixed.push(serde_json::json!({"id":5, "name":names[3], "run_time_ns":10, "run_cnt":1}));
+        mixed[3]["name"] = if names[3] == "p11_image_mmap_release" {
+            serde_json::json!("p11_image_exec_release")
+        } else {
+            serde_json::json!("p11_image_mmap_release")
+        };
+        fs::write(&programs, serde_json::to_vec(&mixed).unwrap()).unwrap();
+        assert!(
+            !run("programs").status.success(),
+            "mixed exec-release hook set was accepted"
+        );
+        let mut mixed_copy = set_good.clone();
+        mixed_copy
+            .push(serde_json::json!({"id":5, "name":names[2], "run_time_ns":10, "run_cnt":1}));
+        mixed_copy[2]["name"] = if names[2] == "p11_inst_vma_retcopy" {
+            serde_json::json!("p11_inst_vma_copy")
+        } else {
+            serde_json::json!("p11_inst_vma_retcopy")
+        };
+        fs::write(&programs, serde_json::to_vec(&mixed_copy).unwrap()).unwrap();
+        assert!(
+            !run("programs").status.success(),
+            "mixed copy_vma hook set was accepted"
+        );
     }
-    let mut mixed = mmap_good.clone();
-    mixed.push(
-        serde_json::json!({"id":5, "name":"p11_image_exec_release", "run_time_ns":10, "run_cnt":1}),
-    );
-    fs::write(&programs, serde_json::to_vec(&mixed).unwrap()).unwrap();
-    assert!(
-        !run("programs").status.success(),
-        "mixed exec-release hook set was accepted"
-    );
     fs::write(&programs, serde_json::to_vec(&good).unwrap()).unwrap();
     for case in 0..2 {
         let mut bad = good_links.clone();

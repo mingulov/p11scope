@@ -351,10 +351,11 @@ import json, sys
 try:
     progs = json.load(open(sys.argv[1]))
     links = json.load(open(sys.argv[2]))
-    stable = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy"}
-    legacy = stable | {"p11_image_exec_release"}
-    exec_mmap = stable | {"p11_image_mmap_release"}
-    want = legacy | exec_mmap
+    stable = {"p11_inst_vma_map", "p11_inst_vma_unmap"}
+    copies = {"p11_inst_vma_copy", "p11_inst_vma_retcopy"}
+    releases = {"p11_image_exec_release", "p11_image_mmap_release"}
+    valid = {frozenset(stable | {copy, release}) for copy in copies for release in releases}
+    want = stable | copies | releases
     aliases = {}
     for full in want:
         for alias in {full, full[:15]}:
@@ -375,7 +376,7 @@ try:
             raise ValueError("duplicate or invalid hook program")
         found[full] = prog
         ids.add(ident)
-    if found and set(found) != legacy and set(found) != exec_mmap:
+    if found and frozenset(found) not in valid:
         raise ValueError("partial hook program set")
     mode = sys.argv[3]
     if mode == "programs":
@@ -392,7 +393,7 @@ try:
             raise ValueError("required hook link missing or duplicated")
         print(len(selected))
     elif mode == "stats":
-        if set(found) != legacy and set(found) != exec_mmap:
+        if frozenset(found) not in valid:
             raise ValueError("required hooks unavailable")
         totals = [0, 0]
         for prog in found.values():

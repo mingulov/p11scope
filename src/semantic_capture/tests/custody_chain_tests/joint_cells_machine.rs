@@ -3848,3 +3848,125 @@ fn assert_unlinked_lane_disclosure(
             .sum();
     assert_eq!(api_total, 1, "the modeled call still reduces S1");
 }
+
+/// A real client's count-only setup calls (`C_GetFunctionList`,
+/// `C_GetSlotList`: ordinary H0 calls on COUNT_ONLY slots, never
+/// journaled) precede its modeled work in the first linked quantum.
+/// Conversion refuses them because they carry no semantic facts, but
+/// the journal proves them irrelevant to object proof, so H3 disposes
+/// their positions: the first seal certifies, the feed stays Joint and
+/// the section populates. A shed barrier here voided the first live
+/// linked `--system` seal as H3Loss and left a silent `authority_lost`.
+#[test]
+fn joint_machine_count_only_setup_calls_seal_populated() {
+    use crate::key_operation_projection::ObsStatus;
+    use crate::semantics_objects::journal::JournalGap;
+
+    let mut scene = MachineScene::with_initial_files_and_functions(
+        1,
+        &[0],
+        &["C_GetFunctionList", "C_GetSlotList", "C_SignInit"],
+        true,
+    );
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    push_ordinary_payload(&mut scene, pid, "C_GetSlotList", 2);
+    scene.scene.push(pid, 0, "C_SignInit", 3);
+    scene.scene.push(pid, 0, "C_SignInit", 4);
+    scene.machine.begin_commit(true).unwrap();
+    assert_eq!(reach_any(&mut scene, &["Audited"]), "Audited");
+    let audit = scene
+        .machine
+        .diagnostic_audit_for_test()
+        .map(|(gap, h3, _, floor, _)| (gap, h3, floor));
+    assert!(
+        !matches!(
+            audit,
+            Some((Some(JournalGap::H3Loss), _, _)) | Some((_, "StagedLoss", _))
+        ),
+        "count-only setup calls are disposed, never an H3 loss barrier: {audit:?}"
+    );
+    scene.published_labeled("count-only-setup", None);
+    let registry = scene.scene.real.scene.coordinator.registry();
+    let observations = registry.joint_observations(registry.published_revision());
+    assert_eq!(
+        (
+            registry.joint_feeds(),
+            observations.status,
+            observations.reason
+        ),
+        (1, ObsStatus::Populated, "none"),
+        "the first seal certifies across the setup calls: audit {audit:?}"
+    );
+}
+
+/// A real client's first linked quantum carries calls whose words the
+/// return probe enriches: `C_Initialize`, `C_CloseAllSessions` and
+/// `C_Finalize` (absent session word 0 at entry, `SESSION_NONE` at
+/// return), `C_OpenSession` (the returned
+/// handle), `C_GenerateKeyPair` and `C_SignInit` (`MECH_NONE` at entry,
+/// the mechanism VALUE read at return). The scene's BEGINs carry the
+/// production entry-time words while the END and the H0 admission
+/// carry the return values. Each admission claim must still name its
+/// own staged BEGIN: the seal certifies and the section populates.
+/// Exact claim/BEGIN equality left all four Unclaimed and held the
+/// first live linked `--system --key-operations` seal on
+/// `BoundNotReady` until the finish bound, with zero rows.
+#[test]
+fn joint_machine_return_enriched_calls_seal_populated() {
+    use crate::key_operation_projection::ObsStatus;
+    use crate::semantics_objects::journal::JournalGap;
+
+    let functions = [
+        "C_Initialize",
+        "C_OpenSession",
+        "C_GenerateKeyPair",
+        "C_SignInit",
+        "C_CloseAllSessions",
+        "C_Finalize",
+    ];
+    let mut scene = MachineScene::with_initial_files_and_functions(1, &[0], &functions, true);
+    let pid = std::process::id();
+    for (sequence, name) in functions.iter().enumerate() {
+        scene.scene.push(pid, 0, name, sequence as u64 + 1);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    assert_eq!(reach_any(&mut scene, &["Audited"]), "Audited");
+    let mut gaps = Vec::new();
+    let mut phases = std::collections::BTreeSet::new();
+    let mut published = false;
+    for _ in 0..512 {
+        phases.insert(phase_of(&scene));
+        if let Some((Some(gap), ..)) = scene.machine.diagnostic_audit_for_test() {
+            gaps.push(gap);
+        }
+        if matches!(
+            scene.service(1).expect("seal service succeeds"),
+            crate::inventory_semantics::JointServiceProgress::Published
+        ) {
+            published = true;
+            break;
+        }
+    }
+    gaps.dedup();
+    assert!(
+        !gaps.contains(&JournalGap::BoundNotReady),
+        "every enriched BEGIN is attributed to its own claim: gaps {gaps:?} phases {phases:?}"
+    );
+    assert!(
+        published,
+        "the first seal publishes: gaps {gaps:?} phases {phases:?} audit {:?}",
+        scene.machine.diagnostic_audit_for_test()
+    );
+    let registry = scene.scene.real.scene.coordinator.registry();
+    let observations = registry.joint_observations(registry.published_revision());
+    assert_eq!(
+        (
+            registry.joint_feeds(),
+            observations.status,
+            observations.reason
+        ),
+        (1, ObsStatus::Populated, "none"),
+        "the first seal certifies across the return-enriched calls"
+    );
+}

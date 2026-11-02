@@ -1090,10 +1090,9 @@ impl IngestedJointQuantum {
             let mut claimed = 0usize;
             let mut refused_claimed = 0usize;
             for entry in adapter.open.values() {
-                let fingerprint = super::fingerprint_of_begin(&entry.begin);
-                let claimants = adapter.claims.get(&fingerprint);
-                let has_claim = claimants
-                    .is_some_and(|claimants| claimants.values().any(|claims| !claims.is_empty()));
+                let shape = super::shape_of_entry(entry);
+                let claimants = adapter.claims.get(&shape.identity);
+                let has_claim = adapter.identity_claimed(&shape.identity);
                 let Some(end) = entry.end else {
                     // A genuine unclaimed START remains in H8 unchanged.
                     if has_claim || entry.abandon.is_some() || entry.corroborated_return.is_some() {
@@ -1128,6 +1127,7 @@ impl IngestedJointQuantum {
                     };
                     let live = adapter.key_is_live(*key);
                     if originals.next().is_some()
+                        || !super::claim_names_shape(&shape, claim)
                         || (!live && self.pending_refused_proof(adapter, *key).is_none())
                         || key.domain_tag != producers.native_domain().journal_tag()
                         || (key.cookie, key.exec) != entry.image
@@ -1174,17 +1174,15 @@ impl IngestedJointQuantum {
                 let Some(end) = entry.end else {
                     return false;
                 };
-                let fingerprint = super::fingerprint_of_begin(&entry.begin);
+                let shape = super::shape_of_entry(entry);
                 if position != origin.position()
                     || position < *floor
                     || position >= self.audit.h0_below
                     || entry.collected_origin != Some(origin)
                     || !resource.matches_producers(producers)
-                    || !super::fingerprint_matches_event(&fingerprint, &record.event)
+                    || !super::event_names_shape(&shape, &record.event)
                     || record.event.ts_ns != end.end.payload_base().event.ts_ns
-                    || adapter.claims.get(&fingerprint).is_some_and(|claimants| {
-                        claimants.values().any(|claims| !claims.is_empty())
-                    })
+                    || adapter.identity_claimed(&shape.identity)
                     || !adapter.ledger.matches_unconverted_original(
                         entry.begin_ordinal,
                         resource.reservation(),

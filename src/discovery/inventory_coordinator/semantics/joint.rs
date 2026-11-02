@@ -889,11 +889,17 @@ impl PreparedSemanticBatch {
                 registry.observe_instance_semantic(input);
             }
             Err(reason) => {
-                self.h3.shed_floor = Some(
-                    self.h3
-                        .shed_floor
-                        .map_or(entry.token, |at| at.min(entry.token)),
-                );
+                // A proved-irrelevant count-only setup call is disposed:
+                // its position is already among the staged positions.
+                // Every other refusal sheds its position as an H3 loss
+                // barrier.
+                if !reason.disposes_h3_position() {
+                    self.h3.shed_floor = Some(
+                        self.h3
+                            .shed_floor
+                            .map_or(entry.token, |at| at.min(entry.token)),
+                    );
+                }
                 registry.record_gap(RegistryGap {
                     caller: entry.caller,
                     module: None,
@@ -1656,6 +1662,97 @@ mod tests {
             gaps,
             vec![("semantic input refused".to_string(), "custody".to_string())],
             "exactly the custody refusal stages"
+        );
+    }
+
+    /// Direct `stage_next` twin for the H3 disposal partition: a disposed
+    /// count-only setup refusal keeps the shed floor (its position is
+    /// already staged), every other refusal sheds its own position as a
+    /// loss barrier, the lowest one wins, and each refusal still stages
+    /// its named gap for its caller.
+    #[test]
+    fn stage_next_sheds_only_genuine_refusals() {
+        use crate::discovery::caller_registry::CallerId;
+        use crate::discovery::caller_registry::instance_input::{
+            ConversionRefusal, JointRegistrationWindow,
+        };
+
+        fn batch(entries: &[(u64, ConversionRefusal)]) -> PreparedSemanticBatch {
+            PreparedSemanticBatch::new(
+                NativeDomainId::mint(),
+                entries
+                    .iter()
+                    .map(|(token, refusal)| {
+                        PreparedAdmission::new((Some(CallerId(7)), *token, Err(*refusal)))
+                    })
+                    .collect(),
+                Vec::new(),
+                JointRegistrationWindow::scripted_empty(),
+                PreparedH3 {
+                    negatives: Vec::new(),
+                    staged_positions: Vec::new(),
+                    awaiting_floor: None,
+                    shed_floor: None,
+                    exhausted: false,
+                },
+            )
+        }
+        /// (caller, subject, reason) of one staged gap.
+        type StagedGap = (Option<CallerId>, String, String);
+        fn staged(entries: &[(u64, ConversionRefusal)]) -> (Option<u64>, Vec<StagedGap>) {
+            let mut batch = batch(entries);
+            batch.dispose_claims_s1();
+            let mut registry = empty_registry();
+            let mut seal_admission = None;
+            for _ in entries {
+                assert!(batch.stage_next(&mut registry, &mut seal_admission, |_| false));
+            }
+            assert!(!batch.stage_next(&mut registry, &mut seal_admission, |_| false));
+            assert!(seal_admission.is_none(), "refusals seal no admission");
+            let gaps = registry
+                .staged_gaps_for_test()
+                .into_iter()
+                .map(|gap| (gap.caller, gap.subject, gap.reason))
+                .collect();
+            (batch.into_h3().shed_floor, gaps)
+        }
+        let gap = |reason: &str| {
+            (
+                Some(CallerId(7)),
+                "semantic input refused".to_string(),
+                reason.to_string(),
+            )
+        };
+
+        // Disposed entries alone: no loss barrier, still named.
+        assert_eq!(
+            staged(&[
+                (5, ConversionRefusal::CountOnlyIrrelevant),
+                (3, ConversionRefusal::CountOnlyIrrelevant),
+            ]),
+            (None, vec![gap("slot"), gap("slot")]),
+            "a disposed count-only setup call keeps the shed floor"
+        );
+        // A genuine refusal sheds its own position; a lower disposed
+        // position never lowers the floor.
+        assert_eq!(
+            staged(&[
+                (5, ConversionRefusal::CountOnlyIrrelevant),
+                (9, ConversionRefusal::Slot),
+                (3, ConversionRefusal::CountOnlyIrrelevant),
+            ]),
+            (Some(9), vec![gap("slot"), gap("slot"), gap("slot")]),
+            "only the genuine loss sets the floor"
+        );
+        // Several losses: the lowest position is the barrier.
+        assert_eq!(
+            staged(&[
+                (12, ConversionRefusal::Coverage),
+                (4, ConversionRefusal::Custody),
+                (2, ConversionRefusal::CountOnlyIrrelevant),
+            ]),
+            (Some(4), vec![gap("coverage"), gap("custody"), gap("slot")]),
+            "the lowest loss is the barrier"
         );
     }
 }

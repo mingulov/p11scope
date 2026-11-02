@@ -14709,6 +14709,36 @@ fn joint_original_loss_fans_out_before_ack() {
         && feed.reduced == 1
         && feed.staged == 0
         && feed.disposed == 1));
+    // Fail-visible: every caller whose Joint feed this loss ended names
+    // the seal failure (staged for the next publication), so
+    // `authority_lost` never stands without a cause. The gap carries
+    // its caller: a caller-less or misattributed gap fails here.
+    let mut degraded: Vec<_> = fixture
+        .feeds()
+        .iter()
+        .map(|feed| Some(feed.caller))
+        .collect();
+    degraded.sort();
+    let mut named: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_gaps_for_test()
+        .into_iter()
+        .filter(|gap| {
+            gap.subject == "Joint key operations unavailable; retained S1"
+                && gap.reason == "joint_seal_h3_loss_history_loss"
+        })
+        .map(|gap| gap.caller)
+        .collect();
+    named.sort();
+    assert_eq!(degraded.len(), 2, "both Joint feeds ended");
+    assert_eq!(
+        named, degraded,
+        "each ended Joint feed names its seal loss under its own caller"
+    );
     {
         let mut ports = fixture
             .scene

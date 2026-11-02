@@ -2210,6 +2210,8 @@ impl CallerRegistry {
             return FailureBatchProgress::Held;
         }
         let was_joint = record.feed.mode() == FeedMode::Joint;
+        let caller = record.caller;
+        let gap = batch.audited().failure().gap;
         let Some(reducer) = record.semantics.as_mut() else {
             return FailureBatchProgress::Held;
         };
@@ -2232,6 +2234,25 @@ impl CallerRegistry {
             FailureBatchProgress::Complete(_) | FailureBatchProgress::NegativeDelivered(_)
         ) {
             self.after_joint_delivery(id, was_joint, model);
+            if was_joint
+                && let FailureBatchProgress::Complete(applied) = &outcome
+                && let Some(class) = match applied {
+                    crate::semantics_key_use::FailureApplyOutcome::Degraded { .. } => {
+                        Some("history_loss")
+                    }
+                    crate::semantics_key_use::FailureApplyOutcome::FellBack { .. } => {
+                        Some("fallback")
+                    }
+                    _ => None,
+                }
+            {
+                // Fail-visible: the seal failure that ended this Joint
+                // feed is named. With the ordered staging fallback named
+                // in `fallback_joint_for_order`, every Joint ending
+                // carries a cause, so the section's `authority_lost` or
+                // `proof_refused_fallback` never stands without one.
+                self.record_gap(joint_ended_gap(caller, joint_seal_reason(gap, class)));
+            }
             if !was_joint && matches!(&outcome, FailureBatchProgress::NegativeDelivered(_)) {
                 // A negative-only history still publishes the canonical
                 // model's completed loss, once per actual delivery.
@@ -2863,11 +2884,21 @@ impl CallerRegistry {
                     StageAction::Staged => return Ok(0),
                     StageAction::CarveOut => {}
                     StageAction::FallbackUncounted => {
-                        fallback_refused = self.fallback_joint_for_order(id, Some(ledger));
+                        fallback_refused = self.fallback_joint_for_order(
+                            id,
+                            input.caller,
+                            "unsealable",
+                            Some(ledger),
+                        );
                     }
                     StageAction::FallbackCounted => {
                         self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
-                        fallback_refused = self.fallback_joint_for_order(id, Some(ledger));
+                        fallback_refused = self.fallback_joint_for_order(
+                            id,
+                            input.caller,
+                            "staging_full",
+                            Some(ledger),
+                        );
                     }
                     StageAction::Drop => {
                         self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
@@ -2889,7 +2920,8 @@ impl CallerRegistry {
                     .staged_len()
                     > 0;
                 if queued {
-                    fallback_refused = self.fallback_joint_for_order(id, None);
+                    fallback_refused =
+                        self.fallback_joint_for_order(id, input.caller, "no_owner", None);
                 }
             }
         }
@@ -2919,10 +2951,15 @@ impl CallerRegistry {
     /// Ordered fallback for one Joint feed (C4): replay queued calls
     /// S1-direct in original order, degrade to S1Only, decrement the
     /// Joint count. Capture-wide accounting stays active for terminals.
-    /// Returns fallback per-edge bound refusals.
+    /// Fail-visible: the ending is named for `caller` as
+    /// `joint_fallback_<cause>` (`unsealable`, `staging_full`,
+    /// `no_owner`), so its `proof_refused_fallback` never stands without
+    /// a cause. Returns fallback per-edge bound refusals.
     fn fallback_joint_for_order(
         &mut self,
         id: RegistryInstanceId,
+        caller: CallerId,
+        cause: &'static str,
         ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> u64 {
         let mut outer = NoSink;
@@ -2944,6 +2981,7 @@ impl CallerRegistry {
         );
         debug_assert_eq!(feed.mode(), FeedMode::S1Only);
         self.joint_feeds = self.joint_feeds.saturating_sub(1);
+        self.record_gap(joint_ended_gap(caller, format!("joint_fallback_{cause}")));
         refused
     }
 
@@ -3394,6 +3432,13 @@ pub(crate) enum ConversionRefusal {
     Domain,
     Custody,
     Slot,
+    /// A canonical count-only setup call (`C_GetFunctionList`,
+    /// `C_GetSlotList`, ...): the attested, unambiguous slot of one name
+    /// whose own descriptor is COUNT_ONLY and which the journal proves
+    /// irrelevant to object proof. It carries no semantic facts, so it
+    /// refuses like any count-only slot (same public `slot` code), but
+    /// it is not lost history: H3 disposes its position.
+    CountOnlyIrrelevant,
     Coverage,
     Position,
     Module,
@@ -3404,11 +3449,43 @@ impl ConversionRefusal {
         match self {
             Self::Domain => "domain",
             Self::Custody => "custody",
-            Self::Slot => "slot",
+            Self::Slot | Self::CountOnlyIrrelevant => "slot",
             Self::Coverage => "coverage",
             Self::Position => "position",
             Self::Module => "module",
         }
+    }
+
+    /// Whether H3 disposes the refused call's H0 position instead of
+    /// shedding it as a loss barrier. Only a proved-irrelevant count-only
+    /// setup call is disposed; every other refusal may hide a call the
+    /// object proof relies on, so it stays loss.
+    pub(crate) const fn disposes_h3_position(self) -> bool {
+        matches!(self, Self::CountOnlyIrrelevant)
+    }
+}
+
+/// `joint_seal_<label>_<class>`: the reason naming one seal failure that
+/// ended a Joint feed, from the frozen [`JournalGap::label`] vocabulary
+/// (never the `Debug` spelling) and the H9 class (`history_loss`,
+/// `fallback`).
+///
+/// [`JournalGap::label`]: crate::semantics_objects::journal::JournalGap::label
+fn joint_seal_reason(gap: crate::semantics_objects::journal::JournalGap, class: &str) -> String {
+    format!("joint_seal_{}_{class}", gap.label())
+}
+
+/// The disclosure for one ended Joint feed: S1 stays, Joint key
+/// operations for `caller` are unavailable, and `reason` names the
+/// ending (`joint_seal_*` or `joint_fallback_*`).
+fn joint_ended_gap(caller: CallerId, reason: String) -> RegistryGap {
+    RegistryGap {
+        caller: Some(caller),
+        module: None,
+        pid: None,
+        subject: "Joint key operations unavailable; retained S1".into(),
+        reason,
+        budget: None,
     }
 }
 
@@ -3497,13 +3574,24 @@ pub(crate) fn admit_call_from_evidence(
     // Descriptor authority comes only from the attested plan: one
     // canonical operator-attested name, unambiguous, never count-only.
     // The flags below are derived from these checks, never selected.
-    if !slot.semantic_authorized
-        || slot.aliased
-        || slot.semantic_ambiguous
-        || slot.names.len() != 1
-        || plan.effective_semantics(slot) == SlotSemantics::COUNT_ONLY
+    if !slot.semantic_authorized || slot.aliased || slot.semantic_ambiguous || slot.names.len() != 1
     {
         return Err(ConversionRefusal::Slot);
+    }
+    if plan.effective_semantics(slot) == SlotSemantics::COUNT_ONLY {
+        // The slot's own descriptor (not a module-ambiguity downgrade)
+        // is count-only, and its one attested name is proved irrelevant
+        // to object proof: a disposed setup call, not lost history.
+        let irrelevant = slot.semantics == SlotSemantics::COUNT_ONLY
+            && !plan.slot_is_module_ambiguous(slot.index)
+            && crate::kinds::function_id(&slot.names[0])
+                .and_then(crate::semantics_objects::journal::endpoint_class)
+                == Some(crate::semantics_objects::journal::EndpointClass::ProvedIrrelevant);
+        return Err(if irrelevant {
+            ConversionRefusal::CountOnlyIrrelevant
+        } else {
+            ConversionRefusal::Slot
+        });
     }
     // Slice D: the tail's descriptor must be the attested slot's
     // descriptor (function ordinal + 1). A validated tail bound to the
@@ -4463,5 +4551,64 @@ mod journal_unavailable_tests {
             !production.contains("false"),
             "linkage derives from the linked flag, not a literal: {production}"
         );
+    }
+}
+
+#[cfg(test)]
+mod joint_ending_reason_tests {
+    use super::joint_seal_reason;
+    use crate::semantics_objects::journal::JournalGap::{self, *};
+
+    /// The seal-ending reasons are frozen snake_case labels for both H9
+    /// classes; every gap has its own label.
+    #[test]
+    fn joint_seal_reasons_use_frozen_labels() {
+        assert_eq!(
+            joint_seal_reason(H3Loss, "history_loss"),
+            "joint_seal_h3_loss_history_loss"
+        );
+        assert_eq!(
+            joint_seal_reason(DomainEnded, "fallback"),
+            "joint_seal_domain_ended_fallback"
+        );
+        assert_eq!(
+            joint_seal_reason(ClosureStale, "fallback"),
+            "joint_seal_closure_stale_fallback"
+        );
+        let all: [JournalGap; 22] = [
+            FaultChanged,
+            FaultUnreadable,
+            FaultSaturated,
+            Malformed,
+            CounterUnprovable,
+            ResourceUnavailable,
+            H3Pending,
+            H3Loss,
+            AdapterInvalidated,
+            DomainTainted,
+            ImageTainted,
+            FrontierRegression,
+            BootstrapMismatch,
+            BoundNotReady,
+            ModelRefused,
+            DomainEnded,
+            ClosureStale,
+            Stopped,
+            DrainMismatch,
+            H3Exhausted,
+            Discarded,
+            CutExhausted,
+        ];
+        let labels: std::collections::BTreeSet<_> = all.iter().map(|gap| gap.label()).collect();
+        assert_eq!(labels.len(), all.len(), "labels are distinct");
+        for label in labels {
+            assert!(
+                !label.is_empty()
+                    && label.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'),
+                "{label} is snake_case"
+            );
+        }
     }
 }

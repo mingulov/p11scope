@@ -259,7 +259,18 @@ impl JointScene {
 
     /// One original physical pair; future-END tests retain these bytes only
     /// on the fixture stack until the same cursor actually receives END.
+    ///
+    /// The BEGIN carries the production entry-time words: the safe entry
+    /// leaves a mechanism-bearing call at `MECH_NONE` with no mechanism
+    /// capture state, and a call with no session argument
+    /// (`C_Initialize`, `C_OpenSession`, `C_CloseAllSessions`,
+    /// `C_Finalize`) at the absent word 0 with status 0. The END (and
+    /// the H0 original decoded from it) carries the return rewrites of
+    /// `capture_return_facts`: the mechanism VALUE, `SESSION_NONE` for a
+    /// sessionless call and the returned `C_OpenSession` handle.
     fn encoded(&self, pid: u32, file: u32, name: &str, sequence: u64) -> ([u8; 224], [u8; 632]) {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_PAIR;
+        use p11scope_ebpf_common::{MECH_NONE, SESSION_NONE};
         let held = self.real.h0.0.borrow();
         let io = &held.io;
         let image = io.targets[&pid].1;
@@ -267,24 +278,38 @@ impl JointScene {
         let endpoint = io.endpoint(slot).unwrap();
         let (base, epoch, _) = io.scan_input(file);
         let init = name == "C_SignInit";
+        let pair = name == "C_GenerateKeyPair";
+        // The mechanism read at return (CKM_RSA_PKCS_KEY_PAIR_GEN is 0).
+        let returned_mechanism = match name {
+            "C_SignInit" => Some(0x000d_u64),
+            "C_GenerateKeyPair" => Some(0),
+            _ => None,
+        };
+        let sessionless = matches!(
+            name,
+            "C_Initialize" | "C_OpenSession" | "C_CloseAllSessions" | "C_Finalize"
+        );
         let mut begin = begin_bytes_shaped(
             u64::from(pid),
             sequence,
             function_id(name),
             0,
             (image.task_cookie, image.exec_id),
-            7,
-            if init { 0x000d } else { 0 },
-            capture::OUTPUT_NON_NULL
-                | if init {
-                    capture::MECHANISM_VALUE
-                } else {
-                    capture::MECHANISM_NONE
-                },
+            if sessionless { 0 } else { 7 },
+            if returned_mechanism.is_some() {
+                MECH_NONE
+            } else {
+                0
+            },
+            capture::OUTPUT_NON_NULL | capture::MECHANISM_NONE,
             init.then_some((9, 1)),
             None,
             0,
         );
+        if sessionless {
+            // H7 absent session: word 0, status 0.
+            begin[125] = 0;
+        }
         begin[24..32].copy_from_slice(&((u64::from(pid) << 32) | u64::from(pid)).to_le_bytes());
         begin[48..56].copy_from_slice(&(sequence * 1_000).to_le_bytes());
         begin[56..64].copy_from_slice(&(base + endpoint.offset).to_le_bytes());
@@ -303,9 +328,34 @@ impl JointScene {
             )
         } else if init {
             end_bytes(&begin, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 10)
+        } else if pair {
+            let mut end = end_bytes(&begin, OBJECT_ACTION_PAIR, 0, ENTRY_NS + 10);
+            // Two VALUE result handles (public, private), distinct per call.
+            end[424..432].copy_from_slice(&(0x9100 + 2 * sequence).to_le_bytes());
+            end[432..440].copy_from_slice(&(0x9101 + 2 * sequence).to_le_bytes());
+            end[506] = 1;
+            end[507] = 1;
+            end
         } else {
             end_bytes_absent(&begin, 0, ENTRY_NS + 10)
         };
+        // The return rewrites at the END event's session (24 + 32),
+        // mechanism (24 + 48) and capture (24 + 280) offsets.
+        let mut end = end;
+        if let Some(mechanism) = returned_mechanism {
+            end[72..80].copy_from_slice(&mechanism.to_le_bytes());
+            end[304..308].copy_from_slice(
+                &(capture::OUTPUT_NON_NULL | capture::MECHANISM_VALUE).to_le_bytes(),
+            );
+        }
+        if sessionless {
+            let returned = if name == "C_OpenSession" {
+                7
+            } else {
+                SESSION_NONE
+            };
+            end[56..64].copy_from_slice(&returned.to_le_bytes());
+        }
         (begin, end)
     }
 

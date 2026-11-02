@@ -501,6 +501,15 @@ struct StagedShape {
     end: Option<ReturnedWords>,
 }
 
+/// One staged BEGIN in the retained census. An open entry is named by
+/// its native key (its shape gains an END while staged); a refused
+/// BEGIN by its shape, which never changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedMember {
+    Open(JournalNativeKey),
+    Refused(StagedShape),
+}
+
 /// One admitted invocation claim. `returned` keeps the H0 admission's full
 /// return-time fingerprint and `rv` its return value: END corroboration
 /// stays exact against them, and BEGIN attribution checks them through
@@ -1060,6 +1069,24 @@ pub(crate) struct JournalAdapter {
     /// winner by FIFO rank. Counts remain bounded by unsettled work.
     claims: BTreeMap<CallIdentity, BTreeMap<JournalDomainKey, VecDeque<AdmittedJournalClaim>>>,
     claim_counts: usize,
+    /// Incremental census of staged BEGINs by entry-invariant identity:
+    /// unconverted opens (by native key, whose shape later gains an END)
+    /// plus refused begins (by their fixed shape). It replaces the
+    /// per-claim linear retained scan: a claim evaluates the exact
+    /// shape rules against only its own identity's members. Every
+    /// open/refused mutation below maintains it.
+    retained_counts: BTreeMap<CallIdentity, Vec<RetainedMember>>,
+    /// Set when a census removal found no member (an invariant break):
+    /// the next claim rebuilds the census from the staged entries
+    /// instead of trusting it, so drift never panics the observer.
+    retained_census_drift: bool,
+    /// Whether a live-to-dead key transition (or a claim pushed for a
+    /// dead key) happened since the last prune: the prune runs only
+    /// then. Liveness is monotone-decreasing (death flags and image
+    /// taints are sticky, keys are never removed, sightings never insert
+    /// under overflow), so a clean flag proves the prune would drop
+    /// nothing.
+    claims_prune_dirty: bool,
     /// Test-only per-claim cost counters: retained-scan visits, claim
     /// calls and prune runs. Production pays nothing for these.
     #[cfg(test)]
@@ -1133,6 +1160,9 @@ impl JournalAdapter {
             sightings: BTreeMap::new(),
             claims: BTreeMap::new(),
             claim_counts: 0,
+            retained_counts: BTreeMap::new(),
+            retained_census_drift: false,
+            claims_prune_dirty: false,
             #[cfg(test)]
             test_claim_scan_visits: 0,
             #[cfg(test)]
@@ -1177,8 +1207,14 @@ impl JournalAdapter {
             }
         }
         for key in &keys[..count] {
-            let ordinal = self.open.remove(key).expect("retained key").begin_ordinal;
-            self.ledger.release_h8open(ordinal);
+            let removed = self.open.remove(key).expect("retained key");
+            if removed.converted_ticket.is_none() {
+                self.retained_member_dec(
+                    identity_of_begin(&removed.begin),
+                    RetainedMember::Open(*key),
+                );
+            }
+            self.ledger.release_h8open(removed.begin_ordinal);
         }
     }
 
@@ -1567,7 +1603,8 @@ impl JournalAdapter {
         if charged.is_err() {
             return self.refuse_begin(ordinal, &begin, image);
         }
-        self.open.insert(
+        let inserted = identity_of_begin(&begin);
+        if let Some(old) = self.open.insert(
             key,
             OpenEntry {
                 begin_ordinal: ordinal,
@@ -1585,7 +1622,11 @@ impl JournalAdapter {
                 collected_origin: None,
                 s1only_subject: None,
             },
-        );
+        ) && old.converted_ticket.is_none()
+        {
+            self.retained_member_dec(identity_of_begin(&old.begin), RetainedMember::Open(key));
+        }
+        self.retained_member_inc(inserted, RetainedMember::Open(key));
         JournalDisposition::BeginAdmitted
     }
 
@@ -1599,8 +1640,9 @@ impl JournalAdapter {
             self.taint_image(image);
             return JournalDisposition::Contradiction(JournalContradiction::RefusedOverflow);
         }
-        self.refused
-            .push(RefusedBegin::of_begin(ordinal, begin, image));
+        let refused = RefusedBegin::of_begin(ordinal, begin, image);
+        self.retained_refused_inc(&refused);
+        self.refused.push(refused);
         JournalDisposition::BeginRefusedCapacity
     }
 
@@ -1763,7 +1805,16 @@ impl JournalAdapter {
         }
         self.note_image_taint(image);
         self.remove_open_where(|_, entry| entry.image == image);
+        let dropped: Vec<RefusedBegin> = self
+            .refused
+            .iter()
+            .filter(|refused| refused.image == image)
+            .copied()
+            .collect();
         self.refused.retain(|refused| refused.image != image);
+        for refused in &dropped {
+            self.retained_refused_dec(refused);
+        }
     }
 
     /// Record only the irreversible image evidence. A raw batch marks its
@@ -1772,17 +1823,24 @@ impl JournalAdapter {
         if !self.tainted_images.contains(&image)
             && self.tainted_images.len() >= self.limits.image_sightings
         {
-            self.taint_overflow = true;
-            self.sightings.remove(&image);
+            if !self.taint_overflow {
+                self.taint_overflow = true;
+                self.claims_prune_dirty = true;
+            }
+            if self.sightings.remove(&image).is_some() {
+                self.claims_prune_dirty = true;
+            }
             if let Some(keys) = self.image_keys.get(&image).cloned() {
                 for key in keys {
+                    let lived = self.key_is_live(key);
                     if let Some(state) = self.keys.get_mut(&key) {
                         state.tainted = true;
                     }
+                    self.claims_prune_dirty |= lived;
                 }
             }
-        } else {
-            self.tainted_images.insert(image);
+        } else if self.tainted_images.insert(image) {
+            self.claims_prune_dirty = true;
         }
     }
 
@@ -1827,6 +1885,7 @@ impl JournalAdapter {
         let taints = &self.tainted_images;
         let overflow = self.taint_overflow;
         let sightings = &self.sightings;
+        let mut killed = false;
         for (key, state) in &mut self.keys {
             let image = (key.cookie, key.exec);
             let affected = unlocalized
@@ -1835,6 +1894,11 @@ impl JournalAdapter {
             if !affected || state.refused {
                 continue;
             }
+            // == key_is_live(key): inline for the &mut borrow.
+            let lived = !state.tainted
+                && !state.era_ended
+                && !taints.contains(&image)
+                && !(overflow && !sightings.contains_key(&image));
             if state.model_registered {
                 let domain = JournalDomainProof {
                     key: *key,
@@ -1846,7 +1910,9 @@ impl JournalAdapter {
                     .extend(model.abandon_domain(domain, &mut self.ledger).effects);
             }
             state.refused = true;
+            killed |= lived;
         }
+        self.claims_prune_dirty |= killed;
         if unlocalized {
             self.invalidated = true;
             self.void_staged();
@@ -1863,11 +1929,26 @@ impl JournalAdapter {
             }
             for key in &doomed[..count] {
                 let entry = self.open.remove(key).expect("retained tainted open");
+                if entry.converted_ticket.is_none() {
+                    self.retained_member_dec(
+                        identity_of_begin(&entry.begin),
+                        RetainedMember::Open(*key),
+                    );
+                }
                 self.ledger.release_h8open(entry.begin_ordinal);
             }
             let taints = &self.tainted_images;
             let overflow = self.taint_overflow;
             let sightings = &self.sightings;
+            let dropped: Vec<RefusedBegin> = self
+                .refused
+                .iter()
+                .filter(|entry| {
+                    taints.contains(&entry.image)
+                        || (overflow && !sightings.contains_key(&entry.image))
+                })
+                .copied()
+                .collect();
             self.refused.retain(|entry| {
                 !taints.contains(&entry.image)
                     && !(overflow && !sightings.contains_key(&entry.image))
@@ -1884,6 +1965,9 @@ impl JournalAdapter {
                 }
                 !affected
             });
+            for refused in &dropped {
+                self.retained_refused_dec(refused);
+            }
         }
         SealFailure {
             scope,
@@ -2036,6 +2120,10 @@ impl JournalAdapter {
             "original refusal union was prepaid"
         );
         let mut effects = ObjectEffects::default();
+        let taints = &self.tainted_images;
+        let overflow = self.taint_overflow;
+        let sightings = &self.sightings;
+        let mut killed = false;
         for (key, state) in &mut self.keys {
             let domain = JournalDomainProof {
                 key: *key,
@@ -2045,13 +2133,22 @@ impl JournalAdapter {
             if domains.binary_search(&domain).is_err() {
                 continue;
             }
+            // == key_is_live(key): inline for the &mut borrow.
+            let image = (key.cookie, key.exec);
+            let lived = !state.refused
+                && !state.tainted
+                && !state.era_ended
+                && !taints.contains(&image)
+                && !(overflow && !sightings.contains_key(&image));
             if !state.refused && state.model_registered {
                 effects
                     .effects
                     .extend(model.abandon_domain(domain, &mut self.ledger).effects);
             }
             state.refused = true;
+            killed |= lived;
         }
+        self.claims_prune_dirty |= killed;
         let mut after = None;
         loop {
             let next = match after {
@@ -4389,6 +4486,92 @@ impl JournalAdapter {
             .collect()
     }
 
+    /// Count one staged BEGIN into the retained census under its
+    /// entry-invariant identity.
+    fn retained_member_inc(&mut self, identity: CallIdentity, member: RetainedMember) {
+        self.retained_counts
+            .entry(identity)
+            .or_default()
+            .push(member);
+    }
+
+    fn retained_refused_inc(&mut self, refused: &RefusedBegin) {
+        self.retained_member_inc(refused.identity(), RetainedMember::Refused(refused.shape()));
+    }
+
+    fn retained_refused_dec(&mut self, refused: &RefusedBegin) {
+        self.retained_member_dec(refused.identity(), RetainedMember::Refused(refused.shape()));
+    }
+
+    /// Drop one staged BEGIN from the retained census: the entry left
+    /// the counted set (removed or converted). Every counted entry was
+    /// added exactly once, so a missing member is census drift: debug
+    /// builds stop on it; release builds mark the census for a rebuild
+    /// before the next claim reads it, never panicking mid-capture.
+    fn retained_member_dec(&mut self, identity: CallIdentity, member: RetainedMember) {
+        let removed = match self.retained_counts.get_mut(&identity) {
+            Some(members) => match members.iter().position(|held| *held == member) {
+                Some(at) => {
+                    members.swap_remove(at);
+                    if members.is_empty() {
+                        self.retained_counts.remove(&identity);
+                    }
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if !removed {
+            debug_assert!(removed, "retained census drift: member never counted");
+            self.retained_census_drift = true;
+        }
+    }
+
+    /// Rebuild the retained census from the staged entries themselves:
+    /// unconverted opens plus refused begins.
+    fn rebuild_retained_census(&mut self) {
+        let mut rebuilt: BTreeMap<CallIdentity, Vec<RetainedMember>> = BTreeMap::new();
+        for (native, entry) in &self.open {
+            if entry.converted_ticket.is_none() {
+                rebuilt
+                    .entry(identity_of_begin(&entry.begin))
+                    .or_default()
+                    .push(RetainedMember::Open(*native));
+            }
+        }
+        for refused in &self.refused {
+            rebuilt
+                .entry(refused.identity())
+                .or_default()
+                .push(RetainedMember::Refused(refused.shape()));
+        }
+        self.retained_counts = rebuilt;
+        self.retained_census_drift = false;
+    }
+
+    /// How many retained staged BEGINs this claim names under the exact
+    /// shape rules (identity, producer rewrite rules, staged END words):
+    /// the same count the per-claim scan produced, evaluated only over
+    /// the claim's own identity.
+    fn retained_named(&mut self, identity: &CallIdentity, claim: &AdmittedJournalClaim) -> usize {
+        if self.retained_census_drift {
+            self.rebuild_retained_census();
+        }
+        self.retained_counts.get(identity).map_or(0, |members| {
+            members
+                .iter()
+                .filter(|member| match member {
+                    RetainedMember::Open(native) => self.open.get(native).is_some_and(|entry| {
+                        entry.converted_ticket.is_none()
+                            && claim_names_shape(&shape_of_entry(entry), claim)
+                    }),
+                    RetainedMember::Refused(shape) => claim_names_shape(shape, claim),
+                })
+                .count()
+        })
+    }
+
     /// Claim one admitted fingerprint for its key, queueing its H0
     /// admission ordinal (C2 identity). Counts stay within the
     /// staged-call bound; a full store first drops dead keys'
@@ -4402,22 +4585,11 @@ impl JournalAdapter {
         let identity = fingerprint.identity();
         #[cfg(test)]
         let claim_trace_start = std::time::Instant::now();
-        let retained = self
-            .open
-            .values()
-            .filter(|entry| {
-                entry.converted_ticket.is_none()
-                    && claim_names_shape(&shape_of_entry(entry), &claim)
-            })
-            .count()
-            + self
-                .refused
-                .iter()
-                .filter(|entry| claim_names_shape(&entry.shape(), &claim))
-                .count();
+        let retained = self.retained_named(&identity, &claim);
         #[cfg(test)]
         {
-            self.test_claim_scan_visits += self.open.len() + self.refused.len();
+            // One index probe replaces the retained scan.
+            self.test_claim_scan_visits += 1;
             self.test_claim_calls += 1;
         }
         if self
@@ -4443,7 +4615,24 @@ impl JournalAdapter {
             .entry(fingerprint.pid_tgid)
             .or_default();
         if self.claim_counts >= self.limits.open_calls + self.limits.refused_begins {
-            self.prune_dead_claims();
+            #[cfg(test)]
+            {
+                // Differential oracle: a skipped prune must drop nothing.
+                // Every existing test exercising deaths becomes a check.
+                if !self.claims_prune_dirty {
+                    let doomed: usize = self
+                        .claims
+                        .values()
+                        .flat_map(|claimants| claimants.iter())
+                        .filter(|(key, _)| !self.key_is_live(**key))
+                        .map(|(_, ordinals)| ordinals.len())
+                        .sum();
+                    debug_assert_eq!(doomed, 0, "skipped prune would drop claims");
+                }
+            }
+            if self.claims_prune_dirty {
+                self.prune_dead_claims();
+            }
             if self.claim_counts >= self.limits.open_calls + self.limits.refused_begins {
                 #[cfg(test)]
                 self.record_claim_trace_for_test(claim_trace_start);
@@ -4460,6 +4649,11 @@ impl JournalAdapter {
             .or_default()
             .push_back(claim);
         self.claim_counts += 1;
+        // A claim pushed for an already-dead key is pruneable, and no
+        // liveness transition announced it: flag the prune explicitly.
+        if !self.key_is_live(key) {
+            self.claims_prune_dirty = true;
+        }
         if self.claims[&identity]
             .values()
             .map(VecDeque::len)
@@ -4499,6 +4693,7 @@ impl JournalAdapter {
             .values()
             .map(|m| m.values().map(VecDeque::len).sum::<usize>())
             .sum::<usize>();
+        self.claims_prune_dirty = false;
     }
 
     /// Peek the exact invocation claim after whole-quantum uniqueness
@@ -5410,7 +5605,9 @@ impl JournalAdapter {
                 let refused = model.abandon_domain(domain, &mut self.ledger);
                 effects.effects.extend(refused.effects);
             }
+            let lived = self.key_is_live(key);
             self.keys.get_mut(&key).expect("doomed key").refused = true;
+            self.claims_prune_dirty |= lived;
         }
         effects
     }
@@ -5689,6 +5886,8 @@ impl JournalAdapter {
         self.open.clear();
         self.ledger.release_all_h8open();
         self.refused.clear();
+        self.retained_counts.clear();
+        self.retained_census_drift = false;
         self.claims.clear();
         self.claim_counts = 0;
         for state in self.keys.values_mut() {
@@ -5792,7 +5991,9 @@ impl JournalAdapter {
         if unbounded {
             let domain = ObjectDomain::sealed(&bootstrap.proof());
             let effects = model.abandon_domain(domain, &mut self.ledger);
+            let lived = self.key_is_live(key);
             self.keys.get_mut(&key).expect("sealed key").refused = true;
+            self.claims_prune_dirty |= lived;
             let drop: BTreeSet<JournalNativeKey> = self
                 .open
                 .iter()
@@ -5805,12 +6006,18 @@ impl JournalAdapter {
                 .collect();
             self.remove_open_where(|native, _| drop.contains(native));
             let mut kept = Vec::with_capacity(self.refused.len());
+            let mut dropped = Vec::new();
             for refused in self.refused.iter() {
                 if !self.refused_converts_here(key, &live, refused) {
                     kept.push(*refused);
+                } else {
+                    dropped.push(*refused);
                 }
             }
             self.refused = kept;
+            for refused in &dropped {
+                self.retained_refused_dec(refused);
+            }
             return Err(SealFailure {
                 gap: JournalGap::DomainTainted,
                 effects,
@@ -5944,7 +6151,9 @@ impl JournalAdapter {
         let domain = ObjectDomain::sealed(&bootstrap.proof());
         let mut effects = ObjectEffects::default();
         if model.register_domain(domain).is_err() {
+            let lived = self.key_is_live(key);
             self.keys.get_mut(&key).expect("sealed key").tainted = true;
+            self.claims_prune_dirty |= lived;
             return Err(SealFailure {
                 gap: JournalGap::ModelRefused,
                 effects,
@@ -6013,7 +6222,9 @@ impl JournalAdapter {
                         Some(retained.bounded_upper.map_or(upper, |kept| kept.max(upper)));
                 }
                 None => {
+                    let lived = self.key_is_live(key);
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
+                    self.claims_prune_dirty |= lived;
                     return Err(SealFailure {
                         gap: JournalGap::ModelRefused,
                         effects,
@@ -6026,14 +6237,15 @@ impl JournalAdapter {
             let mut kept = Vec::with_capacity(self.refused.len());
             for refused in self.refused.iter() {
                 if refused.cut <= frontier && self.refused_converts_here(key, &live, refused) {
-                    consumed.push(refused.identity());
+                    consumed.push(*refused);
                 } else {
                     kept.push(*refused);
                 }
             }
             self.refused = kept;
-            for identity in &consumed {
-                self.consume_claim(identity, key);
+            for refused in &consumed {
+                self.retained_refused_dec(refused);
+                self.consume_claim(&refused.identity(), key);
             }
         }
         // This key's begins in cut order, then their terminals. A
@@ -6059,7 +6271,9 @@ impl JournalAdapter {
             // minted from another invocation.
             let identity = identity_of_begin(&entry.begin);
             let Some(claim) = self.peek_claim(&identity, key) else {
+                let lived = self.key_is_live(key);
                 self.keys.get_mut(&key).expect("sealed key").tainted = true;
+                self.claims_prune_dirty |= lived;
                 return Err(SealFailure {
                     gap: JournalGap::ModelRefused,
                     effects,
@@ -6094,6 +6308,7 @@ impl JournalAdapter {
                     let popped = self.consume_claim(&identity, key);
                     debug_assert_eq!(popped, Some(claim));
                     let (session, mechanism) = sealed_fingerprint(&entry.begin);
+                    self.retained_member_dec(identity, RetainedMember::Open(native));
                     let entry = self.open.get_mut(&native).expect("staged begin");
                     entry.converted_ticket = Some(token);
                     entry.converted_for = Some(key);
@@ -6110,7 +6325,9 @@ impl JournalAdapter {
                     });
                 }
                 Err(_) => {
+                    let lived = self.key_is_live(key);
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
+                    self.claims_prune_dirty |= lived;
                     // The unconverted OpenEntry still owns its original
                     // role/charge; refusal never erased or recreated it.
                     return Err(SealFailure {
@@ -6241,7 +6458,9 @@ impl JournalAdapter {
                 && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
             {
                 let Some(at) = entry.corroborated_return else {
+                    let lived = self.key_is_live(key);
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
+                    self.claims_prune_dirty |= lived;
                     return Err(SealFailure {
                         gap: JournalGap::ModelRefused,
                         effects,
@@ -6327,7 +6546,9 @@ impl JournalAdapter {
         });
         effects.effects.extend(applied.effects);
         if ended {
+            let lived = self.key_is_live(key);
             self.keys.get_mut(&key).expect("sealed key").era_ended = true;
+            self.claims_prune_dirty |= lived;
             return Err(SealFailure {
                 gap: JournalGap::DomainEnded,
                 effects,
@@ -6565,11 +6786,15 @@ impl JournalAdapter {
             let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
             let applied = model.abandon_domain(domain, &mut self.ledger);
             effects.effects.extend(applied.effects);
+            let lived = self.key_is_live(key);
             self.keys.get_mut(&key).expect("stopped key").refused = true;
+            self.claims_prune_dirty |= lived;
         }
         self.open.clear();
         self.ledger.release_all_h8open();
         self.refused.clear();
+        self.retained_counts.clear();
+        self.retained_census_drift = false;
         effects
     }
 }
@@ -13568,6 +13793,94 @@ pub(crate) mod tests {
         scene.fixture.admit_original_event("C_CreateObject", event)
     }
 
+    /// The old retained census as an oracle: unconverted opens plus
+    /// refused begins per entry-invariant identity, recomputed from
+    /// scratch.
+    fn naive_retained_counts(adapter: &JournalAdapter) -> BTreeMap<CallIdentity, usize> {
+        let mut counts = BTreeMap::new();
+        for entry in adapter.open.values() {
+            if entry.converted_ticket.is_none() {
+                *counts.entry(identity_of_begin(&entry.begin)).or_default() += 1;
+            }
+        }
+        for refused in &adapter.refused {
+            *counts.entry(refused.identity()).or_default() += 1;
+        }
+        counts
+    }
+
+    /// The index's per-identity member counts, after checking that every
+    /// open member names a live unconverted entry of that identity and
+    /// every refused member a held refused shape of it.
+    fn indexed_retained_counts(adapter: &JournalAdapter) -> BTreeMap<CallIdentity, usize> {
+        assert!(!adapter.retained_census_drift, "census never drifts");
+        for (identity, members) in &adapter.retained_counts {
+            for member in members {
+                match member {
+                    RetainedMember::Open(native) => {
+                        let entry = adapter.open.get(native).expect("open member staged");
+                        assert!(entry.converted_ticket.is_none(), "open member unconverted");
+                        assert_eq!(identity_of_begin(&entry.begin), *identity);
+                    }
+                    RetainedMember::Refused(shape) => {
+                        assert_eq!(shape.identity, *identity);
+                        assert!(
+                            adapter.refused.iter().any(|held| held.shape() == *shape),
+                            "refused member held"
+                        );
+                    }
+                }
+            }
+        }
+        adapter
+            .retained_counts
+            .iter()
+            .map(|(identity, members)| (*identity, members.len()))
+            .collect()
+    }
+
+    /// The pre-index per-claim scan: how many retained BEGINs one claim
+    /// names under the exact shape rules.
+    fn naive_retained_named(adapter: &JournalAdapter, claim: &AdmittedJournalClaim) -> usize {
+        adapter
+            .open
+            .values()
+            .filter(|entry| {
+                entry.converted_ticket.is_none()
+                    && claim_names_shape(&shape_of_entry(entry), claim)
+            })
+            .count()
+            + adapter
+                .refused
+                .iter()
+                .filter(|entry| claim_names_shape(&entry.shape(), claim))
+                .count()
+    }
+
+    /// Deterministic seeded RNG for differential fuzz (no new dependency).
+    /// Shared with the reservation-table differential test.
+    pub(crate) struct KeepupRng(u64);
+
+    impl KeepupRng {
+        pub(crate) fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        pub(crate) fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        pub(crate) fn below(&mut self, n: u64) -> u64 {
+            assert!(n > 0, "nonempty range");
+            self.next() % n
+        }
+    }
+
     #[test]
     fn joint_keepup_claim_cost_is_independent_of_retained_count() {
         fn marginal_cost(retained: usize) -> usize {
@@ -13631,10 +13944,406 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn joint_keepup_retained_index_matches_naive_scan() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        fn fuzz(limits: JournalLimits, seed: u64, ops: usize) {
+            let mut scene = Scene::new_with_limits(image_default(), limits);
+            let mut rng = KeepupRng::new(seed);
+            let create = function_id("C_CreateObject");
+            let sign = function_id("C_Sign");
+            let mut fresh_thread = 100_001u64;
+            let mut tracked: Vec<([u8; 224], u32)> = Vec::new();
+            for _ in 0..ops {
+                match rng.below(10) {
+                    0..=3 => {
+                        let thread = 1 + rng.below(12);
+                        let seq = 1 + rng.below(6);
+                        let func = if rng.below(2) == 0 { create } else { sign };
+                        let begin = begin_bytes(thread, seq, func, 0);
+                        scene.ingest(&begin);
+                        tracked.push((begin, func));
+                    }
+                    4 => {
+                        if !tracked.is_empty() {
+                            let at = rng.below(tracked.len() as u64) as usize;
+                            let (begin, func) = &tracked[at];
+                            // The END form must match the BEGIN's function:
+                            // present tails validate against the function's
+                            // descriptor row, absent tails validate for any.
+                            let end = if *func == create {
+                                end_bytes(begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 100)
+                            } else {
+                                end_bytes_absent(begin, 0, ENTRY_NS + 100)
+                            };
+                            scene.ingest(&end);
+                        }
+                    }
+                    5 => {
+                        let ghost = begin_bytes_shaped(
+                            50_001 + rng.below(1_000),
+                            1,
+                            create,
+                            0,
+                            (700_000 + rng.next(), rng.next()),
+                            SESSION,
+                            0,
+                            Event::default().capture,
+                            None,
+                            None,
+                            FLAGS,
+                        );
+                        scene.ingest(&end_bytes_absent(&ghost, 0, ENTRY_NS + 100));
+                    }
+                    6 => {
+                        if !tracked.is_empty() {
+                            let at = rng.below(tracked.len() as u64) as usize;
+                            scene.ingest_ordinary(ordinary_for(&tracked[at].0, 0));
+                        }
+                    }
+                    7 => {
+                        if scene.adapter.is_tainted((COOKIE, EXEC)) {
+                            continue;
+                        }
+                        let cap =
+                            scene.adapter.limits.open_calls + scene.adapter.limits.refused_begins;
+                        for _ in 0..1 + rng.below(3) {
+                            scene.attest();
+                        }
+                        if scene.adapter.claim_counts + scene.pending_claims.len() <= cap {
+                            scene.prepare_claims();
+                        }
+                    }
+                    8 => {
+                        let admitted = keepup_admit_fresh(&mut scene, fresh_thread);
+                        fresh_thread += 1;
+                        let floors = scene.adapter.physical_return_floors.clone();
+                        let naive_named = naive_retained_named(
+                            &scene.adapter,
+                            &AdmittedJournalClaim {
+                                admission: 0,
+                                return_ns: 0,
+                                returned: admitted
+                                    .journal_call_fingerprint()
+                                    .expect("fresh admission carries a fingerprint"),
+                                rv: admitted.s1_facts().rv,
+                            },
+                        );
+                        let cap =
+                            scene.adapter.limits.open_calls + scene.adapter.limits.refused_begins;
+                        let at_cap = scene.adapter.claim_counts >= cap;
+                        let dirty_before = scene.adapter.claims_prune_dirty;
+                        let naive_drop: usize = scene
+                            .adapter
+                            .claims
+                            .values()
+                            .flat_map(|claimants| claimants.iter())
+                            .filter(|(key, _)| !scene.adapter.key_is_live(**key))
+                            .map(|(_, ordinals)| ordinals.len())
+                            .sum();
+                        let pre_count = scene.adapter.claim_counts;
+                        scene.adapter.reset_test_claim_costs_for_test();
+                        let result = scene.adapter.attest_key(&admitted);
+                        // Both oracles apply whenever the claim check is
+                        // actually reached (past key binding).
+                        let reached = !matches!(
+                            result,
+                            Err(AttestationRefusal::ImageTainted
+                                | AttestationRefusal::KeysExhausted
+                                | AttestationRefusal::Stopped
+                                | AttestationRefusal::ImageSealed)
+                        );
+                        if reached {
+                            let fp = admitted
+                                .journal_call_fingerprint()
+                                .expect("fresh admission carries a fingerprint");
+                            let expect_stale = floors
+                                .get(&fp.pid_tgid)
+                                .is_some_and(|floor| fp.entry_ns < *floor)
+                                && naive_named != 1;
+                            assert_eq!(
+                                result == Err(AttestationRefusal::InvocationStale),
+                                expect_stale,
+                                "stale branch must match the naive retained count"
+                            );
+                        }
+                        if reached && at_cap {
+                            let (_, _, prunes) = scene.adapter.test_claim_costs_for_test();
+                            assert_eq!(
+                                prunes,
+                                u64::from(dirty_before),
+                                "prune runs exactly when dirty"
+                            );
+                            if !dirty_before {
+                                assert_eq!(naive_drop, 0, "a skipped prune must drop nothing");
+                            }
+                            let dropped = if dirty_before { naive_drop } else { 0 };
+                            assert_eq!(
+                                scene.adapter.claim_counts,
+                                pre_count - dropped + usize::from(result.is_ok()),
+                                "prune drops exactly the dead-key claims"
+                            );
+                        }
+                    }
+                    _ => {
+                        match rng.below(4) {
+                            0 => {
+                                let image = if rng.below(20) == 0 {
+                                    (COOKIE, EXEC)
+                                } else {
+                                    (900_000 + rng.next(), rng.next())
+                                };
+                                scene.adapter.taint_image(image);
+                            }
+                            1 => {
+                                scene.adapter.void_staged();
+                            }
+                            2 => {
+                                if let Some((fp, key)) =
+                                    scene.adapter.claims.iter().next().and_then(
+                                        |(fp, claimants)| {
+                                            claimants.keys().next().map(|key| (*fp, *key))
+                                        },
+                                    )
+                                {
+                                    scene.adapter.consume_claim(&fp, key);
+                                }
+                            }
+                            _ => {
+                                // Flag-death plus an immediate below-cap
+                                // push: simulates a seal-flag death (the
+                                // push announces it via rule (b), exactly
+                                // as a setter announcement would before
+                                // any at-cap claim).
+                                let cap = scene.adapter.limits.open_calls
+                                    + scene.adapter.limits.refused_begins;
+                                if scene.adapter.claim_counts < cap
+                                    && !scene.adapter.is_tainted((COOKIE, EXEC))
+                                    && let Some(key) = scene.adapter.keys.keys().next().copied()
+                                {
+                                    scene.adapter.keys.get_mut(&key).expect("key held").refused =
+                                        true;
+                                    let admitted = keepup_admit_fresh(&mut scene, fresh_thread);
+                                    fresh_thread += 1;
+                                    scene
+                                        .adapter
+                                        .attest_key(&admitted)
+                                        .expect("below-cap push announces the death");
+                                }
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    indexed_retained_counts(&scene.adapter),
+                    naive_retained_counts(&scene.adapter),
+                    "index must match the naive scan after every op"
+                );
+            }
+        }
+        fuzz(JournalLimits::policy(), 0x1234_5678_9abc_def1, 600);
+        fuzz(
+            JournalLimits {
+                open_calls: 4,
+                thread_floors: 64,
+                refused_begins: 4,
+                domain_keys: 4,
+                image_sightings: 4,
+            },
+            0xdead_beef_cafe_f00d,
+            600,
+        );
+    }
+
+    #[test]
+    fn joint_keepup_retained_index_exact_across_seals() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_calls(2);
+        let create = function_id("C_CreateObject");
+        let bootstrap = scene.bootstrap(proof, 0);
+        for round in 1..=4u64 {
+            scene.attest();
+            let begin = begin_bytes(1, round, create, 0);
+            scene.ingest(&begin);
+            scene.ingest(&end_bytes(
+                &begin,
+                OBJECT_ACTION_CREATE,
+                0,
+                ENTRY_NS + 50 + round,
+            ));
+            assert_eq!(
+                indexed_retained_counts(&scene.adapter),
+                naive_retained_counts(&scene.adapter)
+            );
+            let success = scene.seal(&bootstrap).expect("round seals");
+            assert_eq!(success.prefix.settled().len(), 1);
+            assert_eq!(
+                indexed_retained_counts(&scene.adapter),
+                naive_retained_counts(&scene.adapter)
+            );
+        }
+    }
+
+    #[test]
+    fn joint_keepup_prune_drops_only_dead_keys_and_makes_room() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 4,
+                thread_floors: 64,
+                refused_begins: 4,
+                domain_keys: 4,
+                image_sightings: 8,
+            },
+        );
+        let create = function_id("C_CreateObject");
+        let other_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let mut other = AttestationFixture::new(other_image);
+        // Four A-begins fill the open table; four B-begins take the
+        // refused shelf.
+        for thread in 1..=4u64 {
+            let begin = begin_bytes(thread, 1, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        }
+        let mut b_begins = Vec::new();
+        for thread in 5..=8u64 {
+            let begin = begin_bytes_image(thread, 1, create, 0, (COOKIE + 1, EXEC));
+            assert_eq!(
+                scene.ingest(&begin),
+                JournalDisposition::BeginRefusedCapacity
+            );
+            b_begins.push(begin);
+        }
+        // Four claims per key fill the store exactly.
+        keepup_attest_paired(&mut scene, 4);
+        for begin in &b_begins {
+            scene.admit_other_end(
+                &mut other,
+                "C_CreateObject",
+                &end_bytes(begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50),
+            );
+        }
+        assert_eq!(scene.adapter.claim_counts, 8);
+        assert!(!scene.adapter.claims_prune_dirty);
+        let key_a = scene.attest().key;
+        // Killing B's image (a real setter) dirties the prune without
+        // touching A's live claims.
+        scene.adapter.taint_image((COOKIE + 1, EXEC));
+        assert!(scene.adapter.claims_prune_dirty);
+        assert_eq!(scene.adapter.claim_counts, 8);
+        assert_eq!(
+            indexed_retained_counts(&scene.adapter),
+            naive_retained_counts(&scene.adapter)
+        );
+        // The next at-cap claim prunes exactly B's dead claims, makes
+        // room, and succeeds.
+        scene.adapter.reset_test_claim_costs_for_test();
+        let admitted = keepup_admit_fresh(&mut scene, 100_001);
+        scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("room after prune");
+        let (_, _, prunes) = scene.adapter.test_claim_costs_for_test();
+        assert_eq!(prunes, 1);
+        assert_eq!(scene.adapter.claim_counts, 5);
+        assert!(!scene.adapter.claims_prune_dirty);
+        for claimants in scene.adapter.claims.values() {
+            for key in claimants.keys() {
+                assert_eq!(*key, key_a, "only A's live claims survive");
+            }
+        }
+    }
+
+    #[test]
+    fn joint_keepup_prune_flag_announced_by_later_push() {
+        // A flag-death the setter did not announce (simulated by a direct
+        // write): the next below-cap push for the dead key announces it
+        // via rule (b), so the following at-cap claim still prunes.
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 4,
+                thread_floors: 64,
+                refused_begins: 4,
+                domain_keys: 4,
+                image_sightings: 8,
+            },
+        );
+        let create = function_id("C_CreateObject");
+        for thread in 1..=8u64 {
+            let begin = begin_bytes(thread, 1, create, 0);
+            let expected = if thread <= 4 {
+                JournalDisposition::BeginAdmitted
+            } else {
+                JournalDisposition::BeginRefusedCapacity
+            };
+            assert_eq!(scene.ingest(&begin), expected);
+        }
+        keepup_attest_paired(&mut scene, 8);
+        assert_eq!(scene.adapter.claim_counts, 8);
+        assert!(!scene.adapter.claims_prune_dirty);
+        let key = *scene.adapter.keys.keys().next().expect("one key");
+        scene.adapter.keys.get_mut(&key).expect("key held").refused = true;
+        assert!(!scene.adapter.claims_prune_dirty);
+        // Make room and push for the dead key: rule (b) announces it.
+        let (fp, _) = scene
+            .adapter
+            .claims
+            .iter()
+            .next()
+            .and_then(|(fp, claimants)| claimants.keys().next().map(|_| *fp))
+            .map(|fp| (fp, key))
+            .expect("claims filed");
+        scene.adapter.consume_claim(&fp, key);
+        assert_eq!(scene.adapter.claim_counts, 7);
+        let admitted = keepup_admit_fresh(&mut scene, 100_001);
+        scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("below-cap push succeeds");
+        assert!(scene.adapter.claims_prune_dirty);
+        // The at-cap claim prunes all eight dead claims and succeeds.
+        // Rule (b) re-announces: the surviving claim is pruneable too.
+        scene.adapter.reset_test_claim_costs_for_test();
+        let admitted = keepup_admit_fresh(&mut scene, 100_002);
+        scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("room after prune");
+        let (_, _, prunes) = scene.adapter.test_claim_costs_for_test();
+        assert_eq!(prunes, 1);
+        assert_eq!(scene.adapter.claim_counts, 1);
+        assert!(scene.adapter.claims_prune_dirty);
+        // Fill again: the next at-cap claim prunes once more.
+        for thread in 100_003..100_010u64 {
+            let admitted = keepup_admit_fresh(&mut scene, thread);
+            scene
+                .adapter
+                .attest_key(&admitted)
+                .expect("below-cap push succeeds");
+        }
+        assert_eq!(scene.adapter.claim_counts, 8);
+        scene.adapter.reset_test_claim_costs_for_test();
+        let admitted = keepup_admit_fresh(&mut scene, 100_010);
+        scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("room after second prune");
+        let (_, _, prunes) = scene.adapter.test_claim_costs_for_test();
+        assert_eq!(prunes, 1);
+        assert_eq!(scene.adapter.claim_counts, 1);
+    }
+
+    #[test]
     fn joint_keepup_phase_trace_records_claim_samples() {
         let mut scene = Scene::new(image_default());
         let create = function_id("C_CreateObject");
-        for thread in 1..=2u64 {
+        for thread in 1..=3u64 {
             scene.ingest(&begin_bytes(thread, 1, create, 0));
         }
         keepup_attest_paired(&mut scene, 1);
@@ -13644,9 +14353,15 @@ pub(crate) mod tests {
         );
         scene.adapter.set_phase_trace_for_test(true);
         keepup_attest_paired(&mut scene, 1);
+        keepup_attest_paired(&mut scene, 1);
         let trace = scene.adapter.take_phase_trace_for_test();
-        assert_eq!(trace.len(), 1, "one claim records one sample");
-        assert_eq!(trace[0].phase, TestCostPhase::Claim);
+        assert_eq!(trace.len(), 2, "one sample per claim");
+        assert!(
+            trace.iter().all(|s| s.phase == TestCostPhase::Claim),
+            "claims record claim samples"
+        );
+        let durations: Vec<u64> = trace.iter().map(|s| s.duration_ns).collect();
+        assert_eq!(durations.len(), 2, "one duration per sample");
         assert!(
             scene.adapter.take_phase_trace_for_test().is_empty(),
             "taking drains the trace"

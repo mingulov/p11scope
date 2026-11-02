@@ -806,8 +806,8 @@
     },
     {
       "file": "src/discovery/pause.rs",
-      "path": "discovery::pause::tests::privileged_pause_never_env_wrapper_matches_direct_count_lp64",
-      "reason": "privileged: run --pause off through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "path": "discovery::pause::tests::privileged_pause_never_env_wrapper_publishes_neutral_lattice_lp64",
+      "reason": "privileged: run --pause never through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
       "cell": "privileged"
     },
     {

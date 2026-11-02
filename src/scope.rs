@@ -237,6 +237,15 @@ pub(crate) fn pid_start_tick_of(
 ) -> Result<Option<u64>> {
     match scope {
         Scope::Pid(pid) => {
+            // I4 minor: field 22 adds the reader's time-namespace
+            // boottime offset; a skewed reader would bind a tick the
+            // kernel never matches, so PID births refuse loudly here
+            // instead of failing closed silently.
+            if reader_timens_skews_boottime()? {
+                bail!(
+                    "refusing PID_START_TICK for PID scope target {pid}: nonzero time-namespace boottime offset (/proc/self/timens_offsets)"
+                );
+            }
             let fresh = crate::process::process_start_time(*pid)
                 .with_context(|| format!("reading the start time of PID scope target {pid}"))?;
             if let Some(pin) = pin {
@@ -262,6 +271,39 @@ pub(crate) fn pid_start_tick_of(
 /// object carrying the witness map; anything else skips the read.
 pub(crate) fn reads_pid_witness(scope: &Scope, has_witness_map: bool) -> bool {
     has_witness_map && matches!(scope, Scope::Pid(_))
+}
+
+/// I4 minor: whether `text` (the content of `/proc/self/timens_offsets`)
+/// shows a nonzero boottime offset. `/proc/PID/stat` field 22 adds the
+/// reader's time-namespace boottime offset, so a skewed reader would
+/// bind a tick the kernel never matches. `None` when the boottime line
+/// is missing or malformed; callers fail closed.
+fn timens_boottime_offset(text: &str) -> Option<bool> {
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("boottime"))?;
+    let fields: Vec<&str> = line.split_whitespace().skip(1).collect();
+    if fields.is_empty() {
+        return None;
+    }
+    let mut offset = false;
+    for field in fields {
+        offset |= field.parse::<i64>().ok()? != 0;
+    }
+    Some(offset)
+}
+
+/// I4 minor: whether this process's time namespace skews the boottime
+/// clock the PID witness reads through. An absent file (no
+/// time-namespace support) means no skew; anything unreadable fails
+/// closed toward refusal.
+fn reader_timens_skews_boottime() -> Result<bool> {
+    let text = match std::fs::read_to_string("/proc/self/timens_offsets") {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("reading /proc/self/timens_offsets"),
+    };
+    Ok(timens_boottime_offset(&text).unwrap_or(true))
 }
 
 pub(crate) fn publish_inventory(ebpf: &mut Ebpf, scope: &Scope) -> Result<()> {
@@ -824,6 +866,47 @@ mod tests {
             format!("{error:#}").contains("no longer the same"),
             "stale refusal names the cause: {error:#}"
         );
+    }
+
+    #[test]
+    fn timens_boottime_offset_reads_the_boottime_line() {
+        // I4 minor: the offset detector fires on any nonzero field and
+        // stays quiet on zeros; a missing or malformed boottime line
+        // fails closed (None), never quiet.
+        for (text, expected) in [
+            (
+                "monotonic           0         0\nboottime            0         0\n",
+                Some(false),
+            ),
+            (
+                "monotonic           0         0\nboottime         3600         0\n",
+                Some(true),
+            ),
+            ("boottime            0         5\n", Some(true)),
+            ("boottime           -1         0\n", Some(true)),
+            ("monotonic           0         0\n", None),
+            ("boottime            0         x\n", None),
+            ("boottime\n", None),
+            ("", None),
+        ] {
+            assert_eq!(timens_boottime_offset(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn reader_timens_check_agrees_with_the_live_offsets_file() {
+        // I4 minor: the live check parses the same file the same way;
+        // self-consistent on any host, with or without an offset.
+        match std::fs::read_to_string("/proc/self/timens_offsets") {
+            Ok(text) => assert_eq!(
+                reader_timens_skews_boottime().expect("live check reads"),
+                timens_boottime_offset(&text).unwrap_or(true)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                assert!(!reader_timens_skews_boottime().expect("absent file means no skew"))
+            }
+            Err(error) => panic!("unexpected offsets read failure: {error}"),
+        }
     }
 
     #[test]

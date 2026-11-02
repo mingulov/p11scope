@@ -457,6 +457,10 @@ pub struct Engine {
     /// The equivalence twin compares both modes engine against engine.
     #[cfg(test)]
     disable_empty_tick_fast_path_for_test: bool,
+    /// Test-only kill switch for per-commit publication deferral. The
+    /// equivalence twin compares both modes engine against engine.
+    #[cfg(test)]
+    disable_publish_deferral_for_test: bool,
     /// Whether the committed plan, modules, pins and evidence equal what a
     /// full rebuild would produce, as verified by comparison at the last
     /// commit. The rebuild reads committed-plan reuse state, so a commit can
@@ -9832,6 +9836,8 @@ impl Engine {
             counter_cpus_override: None,
             #[cfg(test)]
             disable_empty_tick_fast_path_for_test: false,
+            #[cfg(test)]
+            disable_publish_deferral_for_test: false,
             plan_rebuild_stable: false,
             graph_backing: None,
             retired_files: None,
@@ -21128,6 +21134,22 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn set_disable_empty_tick_fast_path_for_test(&mut self, disabled: bool) {
         self.disable_empty_tick_fast_path_for_test = disabled;
+    }
+
+    /// Whether per-commit publication deferral is disabled. Tests only:
+    /// production always defers proved-unchanged loader transactions. The
+    /// per-engine flag drives the equivalence twin; the process-wide
+    /// environment variable reruns whole suites against full publication.
+    #[cfg(test)]
+    fn publish_deferral_disabled(&self) -> bool {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DISABLED.get_or_init(|| std::env::var_os("P11SCOPE_DISABLE_PUBLISH_DEFERRAL").is_some())
+            || self.disable_publish_deferral_for_test
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_disable_publish_deferral_for_test(&mut self, disabled: bool) {
+        self.disable_publish_deferral_for_test = disabled;
     }
 
     /// Builds the candidate for a tick that changed nothing: no removals,

@@ -22270,6 +22270,723 @@ fn loader_pin_reuse_falls_back_for_cross_overlay_canonicalization() {
     );
 }
 
+/// Publication op counts behind the deferral gate: fact merges and their
+/// projections. The twin pins both per step, so a vacuous gate (deferring
+/// nothing, or everything) fails loudly instead of passing quietly.
+fn publish_operation_counts(engine: &Engine) -> (u64, u64) {
+    let count = |name| {
+        engine
+            .stage_timings()
+            .ops()
+            .iter()
+            .find(|(op, _, _)| *op == name)
+            .map_or(0, |(_, _, count)| *count)
+    };
+    (count("merge_facts"), count("project_facts"))
+}
+
+fn assert_publish_deferral_history_equal(left: &CaptureHistory, right: &CaptureHistory) {
+    assert_eq!(left.modules, right.modules);
+    assert_eq!(left.decoded, right.decoded);
+    assert_eq!(left.surfaces, right.surfaces);
+    assert_eq!(left.tables, right.tables);
+    assert_eq!(left.skips, right.skips);
+    assert_eq!(left.losses, right.losses);
+    assert_eq!(left.scan_gap_tombstones, right.scan_gap_tombstones);
+    assert_eq!(left.refusals, right.refusals);
+    assert_eq!(left.fallbacks, right.fallbacks);
+    assert_eq!(
+        left.corroboration_tombstones,
+        right.corroboration_tombstones
+    );
+    assert_eq!(left.recorroborated, right.recorroborated);
+    assert_eq!(left.conflicted, right.conflicted);
+    assert_eq!(left.fallback_tombstones, right.fallback_tombstones);
+    assert_eq!(left.conflicts, right.conflicts);
+    assert_eq!(left.uncorroborated, right.uncorroborated);
+    assert_eq!(
+        left.uncorroborated_tombstones,
+        right.uncorroborated_tombstones
+    );
+    assert_eq!(
+        left.uncorroborated_candidates,
+        right.uncorroborated_candidates
+    );
+    assert_eq!(left.scan_unavailable, right.scan_unavailable);
+    assert_eq!(left.scan_ms, right.scan_ms);
+    assert_eq!(left.vendor_interfaces, right.vendor_interfaces);
+    assert_eq!(left.interface_list, right.interface_list);
+    assert_eq!(left.selection_inventory, right.selection_inventory);
+    assert_eq!(left.selection_surfaces, right.selection_surfaces);
+    assert_eq!(
+        left.manifest_selection_ordinals,
+        right.manifest_selection_ordinals
+    );
+    assert_eq!(left.selections, right.selections);
+    assert_eq!(left.selection_truncated, right.selection_truncated);
+    assert_eq!(left.standard_exports, right.standard_exports);
+}
+
+fn assert_publish_deferral_cache_equal(deferred: &Engine, full: &Engine) {
+    match (
+        deferred.loader_plan_cache.as_ref(),
+        full.loader_plan_cache.as_ref(),
+    ) {
+        (None, None) => {}
+        (Some(left), Some(right)) => {
+            assert_eq!(left.revision, right.revision);
+            assert_eq!(left.broad_admit, right.broad_admit);
+            assert_eq!(left.plan, right.plan);
+        }
+        (left, right) => panic!(
+            "planning cache differs: deferred={} full={}",
+            left.is_some(),
+            right.is_some()
+        ),
+    }
+}
+
+/// Full published-state equality for the deferral twin: planning evidence
+/// plus capture history, publication revisions, rebuild stability and the
+/// planning cache. Stage spans stay excluded: the deferred engine records
+/// fewer merge/project spans by design.
+fn assert_publish_deferral_evidence_equal(deferred: &Engine, full: &Engine) {
+    assert_loader_planning_evidence_equal(deferred, full);
+    assert_publish_deferral_history_equal(
+        &deferred.capture_facts.history,
+        &full.capture_facts.history,
+    );
+    assert_eq!(deferred.facts_revision, full.facts_revision);
+    assert_eq!(
+        deferred.published_facts_revision,
+        full.published_facts_revision
+    );
+    assert_eq!(deferred.plan_rebuild_stable, full.plan_rebuild_stable);
+    assert_publish_deferral_cache_equal(deferred, full);
+}
+
+/// A spill-free loader-planning pair: provider and peer only, so rebuilt
+/// plans equal committed plans and stationary hits defer. This is the
+/// shape the settle workload has at scale (measured: 253 of 253 production
+/// reseeds carry fresh-synced plans); the spilling fixture below pins the
+/// stale-cache boundary where hits must publish instead.
+fn clean_deferral_pair(fixture: &LoaderPlanningFixture) -> (Engine, Engine) {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    // Pins are built once and cloned per engine so both engines share the
+    // same opened files, exactly like the fixture's paired engines.
+    let mut raw = Vec::new();
+    let mut base_pins = PinnedObjects::empty();
+    for (minor, name, count) in [(220, "provider.so", 3), (222, "peer.so", 3)] {
+        let path = fixture.dir.path().join(name);
+        let mut module = overlay_module(overlay_key(minor));
+        module.path = path.display().to_string();
+        module.tables[0].entries = overlay_entries(&module, first_offsets(count));
+        let step = real_scan_pin(&path, Some(module.key), minor + 1, OVERLAY_SHA);
+        assert!(base_pins.absorb(step).is_empty());
+        raw.push(module);
+    }
+    let build = || {
+        let mut pins = base_pins.clone();
+        let (modules, skips) = bind_scanned_modules(&raw, &mut pins);
+        assert!(skips.is_empty());
+        let mut engine = Engine::empty();
+        engine.scope = Scope::System;
+        engine.plan = plan::build_from_sources_scoped(
+            &modules,
+            &[],
+            &pins,
+            false,
+            plan::AdmissionScope::Shared,
+        );
+        engine.pinned = pins;
+        engine.modules = modules;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        for view in raw
+            .iter()
+            .map(|module| module.view)
+            .chain([fixture.loader.view, fixture.warm_loader.view])
+        {
+            engine
+                .views
+                .push(ProcessView::open(view, std::process::id()).unwrap());
+        }
+        let mut pending = PendingViewRetirements::new();
+        for offset in 0..=MAX_PENDING_REFRESH as u32 {
+            engine.dispatch_lifecycle_record(
+                &mut ScriptedSession::default(),
+                &exec_record_for(FAKE_PID_FLOOR + offset),
+                &mut pending,
+            );
+        }
+        engine.refresh_requested.clear();
+        engine.publish_current_capture_facts().unwrap();
+        let raw = engine
+            .modules
+            .iter()
+            .map(|module| module.scanned.clone())
+            .collect();
+        let candidate = engine
+            .live_candidate(engine.pinned.clone(), raw, Vec::new())
+            .unwrap();
+        apply_loader_planning_candidate(&mut engine, candidate);
+        assert_eq!(engine.plan.active_slot_count(), 6);
+        fixture.warm(&mut engine);
+        engine
+    };
+    let deferred = build();
+    let mut full = build();
+    full.set_disable_publish_deferral_for_test(true);
+    (deferred, full)
+}
+
+/// The publication-deferral equivalence twin. Two identical loader-planning
+/// engines — one deferring per-commit publication, one forced onto full
+/// publication — run the same adversarial script: stationary hits on a
+/// spill-free pair (which defer) and a spilling pair (whose stale cache
+/// must publish), fresh-derivation misses with empty and nonempty deltas
+/// (which publish their rebuilt fields), loader-pin folds, a retirement,
+/// a staged transaction, an unresolvable merge, a scan-gap skip, records
+/// queued mid-batch, a contradicted counter (which publishes via the
+/// revision leg: the fold drops it but the merge tombstones it), and a
+/// selection loss between stationary arms (which publishes the same
+/// way). Every step must leave identical published state; merge/project
+/// counts pin whether the step's gate fired, so neither a stuck-open nor
+/// a stuck-shut gate can pass quietly.
+#[test]
+fn publish_deferral_matches_full_publication_step_for_step() {
+    // Applies one loader candidate per engine, pins both engines' merge
+    // and project deltas, and compares outcomes plus full published state.
+    // Merge and project deltas split: staged publications merge without
+    // projecting.
+    let apply_both = |fixture: &LoaderPlanningFixture,
+                      deferred: &mut Engine,
+                      full: &mut Engine,
+                      deferred_counts: &mut (u64, u64),
+                      full_counts: &mut (u64, u64),
+                      deferred_merge: u64,
+                      deferred_project: u64,
+                      full_merge: u64,
+                      full_project: u64| {
+        let (candidate, _) = fixture.candidate(deferred, false);
+        let (full_candidate, _) = fixture.candidate(full, false);
+        let outcome = apply_loader_planning_candidate(deferred, candidate);
+        let full_outcome = apply_loader_planning_candidate(full, full_candidate);
+        assert_eq!(outcome.changed, full_outcome.changed);
+        assert_eq!(outcome.disposition, full_outcome.disposition);
+        assert_publish_deferral_evidence_equal(deferred, full);
+        assert_eq!(
+            publish_operation_counts(deferred),
+            (
+                deferred_counts.0 + deferred_merge,
+                deferred_counts.1 + deferred_project
+            ),
+            "deferred-engine merge/project delta"
+        );
+        assert_eq!(
+            publish_operation_counts(full),
+            (full_counts.0 + full_merge, full_counts.1 + full_project),
+            "full-engine merge/project delta pins the kill switch"
+        );
+        *deferred_counts = publish_operation_counts(deferred);
+        *full_counts = publish_operation_counts(full);
+    };
+    // Steps 1-2: stationary hits on a spill-free pair. Both defer; the
+    // second proves the reseed chain survives deferral.
+    let fixture = LoaderPlanningFixture::new();
+    let (mut deferred, mut full) = clean_deferral_pair(&fixture);
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    for _ in 0..2 {
+        apply_both(
+            &fixture,
+            &mut deferred,
+            &mut full,
+            &mut deferred_counts,
+            &mut full_counts,
+            0,
+            0,
+            1,
+            1,
+        );
+    }
+    // Step 3: a fresh-derivation miss publishes even with an empty delta:
+    // the derivation rebuilds synced plan fields that must be re-synced.
+    let fixture = LoaderPlanningFixture::new();
+    let mut deferred = fixture.cold_engine();
+    let mut full = fixture.cold_engine();
+    full.set_disable_publish_deferral_for_test(true);
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    apply_both(
+        &fixture,
+        &mut deferred,
+        &mut full,
+        &mut deferred_counts,
+        &mut full_counts,
+        1,
+        1,
+        1,
+        1,
+    );
+    // Step 4: a miss with a nonempty delta carries no proof and refuses
+    // identically on both engines before finalizing.
+    let fixture = LoaderPlanningFixture::new();
+    let mut deferred = fixture.cold_engine();
+    let mut full = fixture.cold_engine();
+    full.set_disable_publish_deferral_for_test(true);
+    // The late module's backing file is written once and its scan pins
+    // cloned per engine: a second write would bump ctime and the pins'
+    // identity (ino/size/ctime) would genuinely differ between engines.
+    let late_path = fixture.dir.path().join("late.so");
+    let _late_file = overlay_backing_file(&fixture.dir, "late.so");
+    let mut late_module = overlay_module(overlay_key(230));
+    late_module.path = late_path.display().to_string();
+    late_module.tables[0].entries = overlay_entries(&late_module, first_offsets(3));
+    let late_pins = crate::discovery::identity::test_fixture::real_scan_pin(
+        &late_path,
+        Some(late_module.key),
+        231,
+        OVERLAY_SHA,
+    );
+    for engine in [&mut deferred, &mut full] {
+        assert!(engine.pinned.absorb(late_pins.clone()).is_empty());
+        let (mut bound, skips) =
+            bind_scanned_modules(std::slice::from_ref(&late_module), &mut engine.pinned);
+        assert!(skips.is_empty());
+        engine.modules.append(&mut bound);
+    }
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    // The late module refuses on both engines before finalizing: no proof
+    // is attached, and neither side publishes. Pin the gate input plus
+    // the identical refusal.
+    for full_side in [false, true] {
+        let (engine, counts) = if full_side {
+            (&mut full, &mut full_counts)
+        } else {
+            (&mut deferred, &mut deferred_counts)
+        };
+        let (candidate, _) = fixture.candidate(engine, false);
+        assert!(
+            candidate.loader_plan_proof.is_none(),
+            "a nonempty delta carries no proof (full_side={full_side})"
+        );
+        let mut additions_allowed = true;
+        let outcome = engine
+            .apply_candidate(
+                &mut ScriptedSession::default(),
+                candidate,
+                &mut additions_allowed,
+                false,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            outcome.disposition,
+            ApplyDisposition::Refused,
+            "the unplanned module refuses (full_side={full_side})"
+        );
+        assert_eq!(
+            publish_operation_counts(engine),
+            (counts.0, counts.1),
+            "a refusal publishes on neither side (full_side={full_side})"
+        );
+    }
+    assert_publish_deferral_evidence_equal(&deferred, &full);
+    // Step 5: loader-pin folds take the miss path, so both engines fold
+    // identically and publish: only the cached path defers.
+    let (base, provider_module, provider, _) = engine_with_overlay(104);
+    // The folding loader pins are built once and cloned per engine so both
+    // engines fold identical pin stores.
+    let mut loader_module = overlay_module(overlay_key(102));
+    loader_module.tables.clear();
+    loader_module.exports.clear();
+    let base_loader_pins = overlay_view_pin(&loader_module, 999, OVERLAY_SHA, 1, true);
+    let pair = || {
+        let mut engine = Engine::empty();
+        engine.plan = base.plan.clone();
+        engine.pinned = base.pinned.clone();
+        engine.modules = base.modules.clone();
+        engine
+            .views
+            .push(ProcessView::open(provider_module.view, std::process::id()).unwrap());
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        let settled = engine
+            .live_candidate(
+                engine.pinned.clone(),
+                vec![provider_module.clone()],
+                Vec::new(),
+            )
+            .unwrap();
+        apply_loader_planning_candidate(&mut engine, settled);
+        fixture.warm(&mut engine);
+        engine
+            .views
+            .push(ProcessView::open(loader_module.view, std::process::id()).unwrap());
+        let mut loader_pins = base_loader_pins.clone();
+        let (_, skips) =
+            bind_scanned_modules(std::slice::from_ref(&loader_module), &mut loader_pins);
+        assert!(skips.is_empty());
+        let local_loader = loader_pins
+            .id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
+            .unwrap();
+        (engine, loader_pins, local_loader)
+    };
+    let (mut deferred, loader_pins, local_loader) = pair();
+    let (mut full, full_loader_pins, full_local_loader) = pair();
+    full.set_disable_publish_deferral_for_test(true);
+    let deferred_counts = publish_operation_counts(&deferred);
+    let full_counts = publish_operation_counts(&full);
+    let (candidate, loader) = deferred
+        .loader_candidate(
+            loader_module.view,
+            &loader_module,
+            &loader_pins,
+            local_loader,
+            Vec::new(),
+        )
+        .unwrap();
+    let (full_candidate, full_loader) = full
+        .loader_candidate(
+            loader_module.view,
+            &loader_module,
+            &full_loader_pins,
+            full_local_loader,
+            Vec::new(),
+        )
+        .unwrap();
+    let loader = loader.expect("the miss path restores the exact loader pin");
+    let full_loader = full_loader.expect("the full path restores it too");
+    assert_ne!(loader, provider);
+    assert_ne!(full_loader, provider);
+    assert!(candidate.pinned.has_overlay_uncertainty());
+    assert!(full_candidate.pinned.has_overlay_uncertainty());
+    let outcome = apply_loader_planning_candidate(&mut deferred, candidate);
+    let full_outcome = apply_loader_planning_candidate(&mut full, full_candidate);
+    assert_eq!(outcome.changed, full_outcome.changed);
+    assert_eq!(outcome.disposition, full_outcome.disposition);
+    assert_publish_deferral_evidence_equal(&deferred, &full);
+    assert_eq!(
+        publish_operation_counts(&deferred),
+        (deferred_counts.0 + 1, deferred_counts.1 + 1),
+        "the folding miss republishes its rebuilt fields"
+    );
+    assert_eq!(
+        publish_operation_counts(&full),
+        (full_counts.0 + 1, full_counts.1 + 1),
+        "the full engine merges"
+    );
+    // Step 5b: a spilling pair's hits publish: the reseeded cache carries
+    // the pre-sync plan, so the identity gate holds the merge open.
+    let fixture = LoaderPlanningFixture::new();
+    let mut deferred = fixture.engine();
+    let mut full = fixture.engine();
+    full.set_disable_publish_deferral_for_test(true);
+    for engine in [&deferred, &full] {
+        let cache = engine.loader_plan_cache.as_ref().unwrap();
+        assert_eq!(cache.plan.surfaces.len(), 2);
+        assert_eq!(engine.plan.surfaces.len(), 3);
+    }
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    apply_both(
+        &fixture,
+        &mut deferred,
+        &mut full,
+        &mut deferred_counts,
+        &mut full_counts,
+        1,
+        1,
+        1,
+        1,
+    );
+    // Step 6: an admission-time retirement publishes on neither side:
+    // the dead view is stale before mutation, so both engines take the
+    // identical early return with no merge. (Finalize-time retirement —
+    // a view dying mid-apply — is unreachable in-harness: admission and
+    // finalize read the same liveness and admission-stale views are
+    // pruned from the candidate before finalize. The gate's stale-view
+    // guard still holds the merge open for that production TOCTOU.)
+    let fixture = LoaderPlanningFixture::new();
+    let mut deferred = fixture.engine();
+    let mut full = fixture.engine();
+    full.set_disable_publish_deferral_for_test(true);
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    for engine in [&mut deferred, &mut full] {
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(100), child.id()).unwrap());
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    for full_side in [false, true] {
+        let (engine, counts) = if full_side {
+            (&mut full, &mut full_counts)
+        } else {
+            (&mut deferred, &mut deferred_counts)
+        };
+        let (candidate, _) = engine
+            .loader_candidate(
+                ProcessViewId(100),
+                &fixture.loader,
+                &fixture.loader_pins,
+                fixture.local_loader,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut additions_allowed = true;
+        let outcome = engine
+            .apply_candidate(
+                &mut ScriptedSession::default(),
+                candidate,
+                &mut additions_allowed,
+                false,
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !outcome.stale_views.is_empty(),
+            "the dead view retires (full_side={full_side})"
+        );
+        assert_eq!(
+            publish_operation_counts(engine),
+            (counts.0, counts.1),
+            "an admission-time retirement publishes on neither side (full_side={full_side})"
+        );
+        *counts = publish_operation_counts(engine);
+    }
+    assert_publish_deferral_evidence_equal(&deferred, &full);
+    // Step 7: a staged transaction publishes on both: the merge stages.
+    let fixture = LoaderPlanningFixture::new();
+    let mut deferred = fixture.engine();
+    let mut full = fixture.engine();
+    full.set_disable_publish_deferral_for_test(true);
+    deferred.capture_facts.begin_stage().unwrap();
+    full.capture_facts.begin_stage().unwrap();
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    apply_both(
+        &fixture,
+        &mut deferred,
+        &mut full,
+        &mut deferred_counts,
+        &mut full_counts,
+        1,
+        0,
+        1,
+        0,
+    );
+    for engine in [&deferred, &full] {
+        assert!(engine.capture_facts.staged.is_some());
+    }
+    assert_publish_deferral_history_equal(
+        deferred.capture_facts.staged.as_ref().unwrap(),
+        full.capture_facts.staged.as_ref().unwrap(),
+    );
+    deferred.capture_facts.rollback_stage();
+    full.capture_facts.rollback_stage();
+    assert_publish_deferral_evidence_equal(&deferred, &full);
+    // Step 8: unresolvable merge inputs refuse identically on both: the
+    // preflight (which runs the same resolve checks as the gate) rejects
+    // before mutation, so neither side merges. The gate's own resolve
+    // check still holds the merge open past any commit-time input change.
+    let fixture = LoaderPlanningFixture::new();
+    let mut deferred = fixture.engine();
+    let mut full = fixture.engine();
+    full.set_disable_publish_deferral_for_test(true);
+    deferred.manifest_ordinals.push(0);
+    full.manifest_ordinals.push(0);
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    for full_side in [false, true] {
+        let (engine, counts) = if full_side {
+            (&mut full, &mut full_counts)
+        } else {
+            (&mut deferred, &mut deferred_counts)
+        };
+        let (candidate, _) = fixture.candidate(engine, false);
+        let mut additions_allowed = true;
+        let error = engine
+            .apply_candidate(
+                &mut ScriptedSession::default(),
+                candidate,
+                &mut additions_allowed,
+                false,
+                &[],
+            )
+            .err()
+            .expect("unresolvable inputs refuse (full_side={full_side})");
+        assert!(
+            format!("{error:#}").contains("source ordinals"),
+            "identical refusal text (full_side={full_side}): {error:#}"
+        );
+        assert_eq!(
+            publish_operation_counts(engine),
+            (counts.0, counts.1),
+            "a pre-mutation refusal merges on neither side (full_side={full_side})"
+        );
+        *counts = publish_operation_counts(engine);
+    }
+    assert_publish_deferral_evidence_equal(&deferred, &full);
+    // Step 9: a scan-gap skip publishes once, then defers: the first
+    // arm's recording changes the skip list, the second finds it settled.
+    // The pair is spill-free, so the second arm's derivation reproduces
+    // the committed plan and defers without a cache hit.
+    let fixture = LoaderPlanningFixture::new();
+    let (mut deferred, mut full) = clean_deferral_pair(&fixture);
+    for engine in [&mut deferred, &mut full] {
+        engine.counters.object_skips.push(Skipped {
+            subject: "ghost.so".to_string(),
+            reason: "not mapped in the target".to_string(),
+        });
+    }
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    for (deferred_merge, deferred_project) in [(1, 1), (0, 0)] {
+        apply_both(
+            &fixture,
+            &mut deferred,
+            &mut full,
+            &mut deferred_counts,
+            &mut full_counts,
+            deferred_merge,
+            deferred_project,
+            1,
+            1,
+        );
+    }
+    // Step 10: an arm defers first, then records queue and drain on the
+    // deferred history: pending records neither disturb the gate nor
+    // observe the skipped merge.
+    let fixture = LoaderPlanningFixture::new();
+    let (mut deferred, mut full) = clean_deferral_pair(&fixture);
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    apply_both(
+        &fixture,
+        &mut deferred,
+        &mut full,
+        &mut deferred_counts,
+        &mut full_counts,
+        0,
+        0,
+        1,
+        1,
+    );
+    // Queued directly: only the batch driver parks into the pending
+    // queue, so a direct dispatch would consume instead of queueing.
+    for engine in [&mut deferred, &mut full] {
+        for offset in 0..4u32 {
+            engine
+                .pending_discovery_records
+                .push(QueuedDiscoveryRecord {
+                    record: exec_record_for(FAKE_PID_FLOOR + offset),
+                    terminal_owner: None,
+                    terminal_exports: Vec::new(),
+                });
+        }
+        assert!(!engine.pending_discovery_records.is_empty());
+    }
+    assert_publish_deferral_evidence_equal(&deferred, &full);
+    for engine in [&mut deferred, &mut full] {
+        let mut queued = std::mem::take(&mut engine.pending_discovery_records);
+        let mut collect = Engine::collect_discovery_records;
+        engine
+            .process_discovery_records(
+                &mut ScriptedSession::default(),
+                &mut queued,
+                &mut PendingViewRetirements::new(),
+                &mut true,
+                &mut collect,
+                &mut PauseClosure::new(true),
+            )
+            .unwrap();
+        assert!(queued.is_empty(), "the queued records fully dispatch");
+    }
+    assert_publish_deferral_evidence_equal(&deferred, &full);
+    // Step 11: a contradicted counter publishes on both via the revision
+    // leg: the scan gap names an attached path, so the finalize fold
+    // drops it and plan identity holds — but the push dirtied the
+    // revision (as production pushes do), and the merge would tombstone
+    // it in history. Pin the dirty explicitly: a bare counter push
+    // without it would be an unfaithful fixture.
+    let fixture = LoaderPlanningFixture::new();
+    let (mut deferred, mut full) = clean_deferral_pair(&fixture);
+    for engine in [&mut deferred, &mut full] {
+        let subject = engine.plan.modules[0].path.clone();
+        assert!(
+            !engine
+                .counters
+                .object_skips
+                .iter()
+                .any(|skip| skip.subject == subject),
+            "the contradicted gap is a new counter"
+        );
+        engine.counters.object_skips.push(Skipped {
+            subject,
+            reason: "not mapped in the target".to_string(),
+        });
+        engine.note_facts_mutated();
+    }
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    apply_both(
+        &fixture,
+        &mut deferred,
+        &mut full,
+        &mut deferred_counts,
+        &mut full_counts,
+        1,
+        1,
+        1,
+        1,
+    );
+    // Step 12: selection recording between stationary arms publishes on
+    // both via the revision leg: the loss lands in history without
+    // touching the plan, so only the dirty routes around the gate.
+    let fixture = LoaderPlanningFixture::new();
+    let (mut deferred, mut full) = clean_deferral_pair(&fixture);
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    apply_both(
+        &fixture,
+        &mut deferred,
+        &mut full,
+        &mut deferred_counts,
+        &mut full_counts,
+        0,
+        0,
+        1,
+        1,
+    );
+    for engine in [&mut deferred, &mut full] {
+        engine.record_selection_loss("twin selection loss");
+    }
+    apply_both(
+        &fixture,
+        &mut deferred,
+        &mut full,
+        &mut deferred_counts,
+        &mut full_counts,
+        1,
+        1,
+        1,
+        1,
+    );
+}
+
 #[test]
 fn loader_pin_reuse_falls_back_when_old_pin_source_authority_changes() {
     let fixture = LoaderPlanningFixture::new();

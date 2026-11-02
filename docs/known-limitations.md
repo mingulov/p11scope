@@ -37,11 +37,13 @@ Endpoint selection (`--select-endpoint` with `--mode metrics` and
 `--counter-mode`) details one function from the broad counter's own
 cells between a selection-time read and the close read. It resolves
 on `--pid` and owned-`run` captures only; `--cgroup` and `--system`
-refuse by name. If the watched process replaces itself (exec) between
+refuse by name. The name resolves once at start; late-loaded providers
+need `--module`. If the watched process replaces itself (exec) between
 the two reads, the slot retires, the close boundary cannot be proven
 clean, or discovery ring loss, read failures, or truncation grow
 inside the window, the detail is withheld with a named reason while
-aggregate counts continue.
+aggregate counts continue. A leader exit that is the last lifecycle
+record ends the window cleanly and the detail renders up to the exit.
 
 A capture follows at most 256 provider loads and tracks at most
 16,384 program images; past either limit the report carries a named

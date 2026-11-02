@@ -11444,6 +11444,17 @@ mod tests {
             crate::discovery::pause::read_task_states(pid)
         }
 
+        fn task_starts(
+            &mut self,
+            pid: u32,
+        ) -> std::result::Result<std::collections::BTreeMap<u32, u64>, String> {
+            crate::discovery::pause::read_task_starts(pid)
+        }
+
+        fn boot_ns(&mut self) -> std::result::Result<u64, String> {
+            crate::discovery::pause::boot_ns().ok_or_else(|| "boot clock read failed".into())
+        }
+
         fn dequeue(
             &mut self,
         ) -> std::result::Result<Option<crate::discovery::pause::DiscoveryItem>, String> {

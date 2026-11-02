@@ -23868,13 +23868,16 @@ fn has_additions_blocked_mark(engine: &Engine) -> bool {
     })
 }
 
-/// Item 6 (CI system-cell pending-8 flake): a closed tick — the terminal
-/// drain's shape, additions blocked — that admits a provider-free newcomer
-/// must not mark `additions were blocked`. The newcomer was checked (its
-/// scan found no modules), so no attach or publish work is undone; the loss
-/// class must not claim otherwise. The retry request is still retained.
+/// Item 6, live shape: a live closed tick — additions blocked by an
+/// earlier failure in the batch, mutation still allowed — that admits a
+/// provider-free newcomer must not mark `additions were blocked`. The
+/// newcomer was checked (its scan found no modules), so no attach or
+/// publish work is undone; the loss class must not claim otherwise. The
+/// retry request is still retained for a later tick. (The stopped-session
+/// shape, where no later tick can admit the newcomer, is covered by the
+/// stopped-tick tests below.)
 #[test]
-fn terminal_closed_tick_with_provider_free_newcomer_marks_no_additions_blocked() {
+fn closed_tick_with_provider_free_newcomer_marks_no_additions_blocked() {
     let sleep = SystemScopeChildGuard::new(
         std::process::Command::new("sleep")
             .arg("30")
@@ -23896,11 +23899,11 @@ fn terminal_closed_tick_with_provider_free_newcomer_marks_no_additions_blocked()
     );
 }
 
-/// Negative control for the above: a closed tick that admits a PROVIDER
-/// newcomer still marks `additions were blocked` — its targets never
-/// attached, which is real undone work.
+/// Negative control for the above (live closed tick): a tick that admits
+/// a PROVIDER newcomer still marks `additions were blocked` — its targets
+/// never attached, which is real undone work.
 #[test]
-fn terminal_closed_tick_with_provider_newcomer_still_marks_additions_blocked() {
+fn closed_tick_with_provider_newcomer_still_marks_additions_blocked() {
     let dir = tempfile::tempdir().expect("a fixture directory");
     let provider = system_scope_build_fixture(dir.path(), "u07-closed-mark");
     let driver = system_scope_build_driver(dir.path());
@@ -23917,6 +23920,147 @@ fn terminal_closed_tick_with_provider_newcomer_still_marks_additions_blocked() {
     assert!(
         engine.refresh_requested.contains_key(&child.pid()),
         "the unpublished newcomer is still requested again"
+    );
+}
+
+fn has_stop_time_newcomer_mark(engine: &Engine) -> bool {
+    engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live inventory transaction"
+            && skip.reason
+                == "a new process mapped a provider after the capture began stopping; its calls were not observed"
+    })
+}
+
+/// The terminal drain's session shape: link mutation stopped (the stop
+/// gate closed), built on a retained view exactly like the continuity
+/// tests do. Asserts the seam so a silent harness change fails loudly
+/// instead of running the live shape under a stopped name.
+fn stopped_session_for(engine: &Engine) -> ScriptedSession {
+    let anchor = engine
+        .views
+        .first()
+        .expect("a retained view to anchor the stopped session");
+    let mut continuity = crate::attach::PidSessionFixture::new(anchor);
+    continuity.stop_word = p11scope_ebpf_common::STOP_GATE_STOP;
+    let mut session = ScriptedSession::default();
+    session.pid_continuity = Some(std::cell::RefCell::new(continuity));
+    assert!(
+        session.mutation_stopped(),
+        "the fixture must model a stopping capture"
+    );
+    session
+}
+
+/// Item 6, stop-time shape: the terminal drain runs after the stop gate
+/// closed, so `mutation_stopped()` is true and `apply_candidate` refuses
+/// every candidate — but the tick still admits and scans newcomers first.
+/// A scanned newcomer that mapped a provider and is then dropped
+/// unpublished must leave a named gap: its calls were not observed.
+#[test]
+fn stopped_tick_with_provider_newcomer_marks_unobserved_calls() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "stop-newcomer");
+    let driver = system_scope_build_driver(dir.path());
+    let anchor = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("an anchor member"),
+    );
+    let (mut engine, scope) = u07_engine(&[anchor.pid()], std::slice::from_ref(&provider));
+    let mut session = ScriptedSession::default();
+    u07_tick(&mut engine, &mut session, &mut true);
+    assert!(
+        engine.views.iter().any(|view| view.pid() == anchor.pid()),
+        "tick 1 admits the anchor"
+    );
+
+    // The capture begins stopping then a provider newcomer arrives before
+    // the stopped tick runs: the terminal drain's newcomer shape.
+    let mut stopped = stopped_session_for(&engine);
+    let newcomer = system_scope_spawn_loaded(&driver, &provider);
+    u07_name_members(scope.path(), &[anchor.pid(), newcomer.pid()]);
+    let mut additions = true;
+    u07_tick(&mut engine, &mut stopped, &mut additions);
+    assert!(!additions, "the stopped tick closes additions");
+    assert!(
+        engine.views.iter().all(|view| view.pid() != newcomer.pid()),
+        "the stopped tick publishes no newcomer"
+    );
+    assert!(
+        has_stop_time_newcomer_mark(&engine),
+        "a provider newcomer dropped at stop must mark unobserved calls: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Twin: a stopped tick that scans a provider-free newcomer drops it with
+/// no mark — a fully scanned newcomer with no modules needs no attach, so
+/// nothing is undone. Guards the mark above against over-firing.
+#[test]
+fn stopped_tick_with_provider_free_newcomer_marks_no_unobserved_calls() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "stop-clean");
+    let anchor = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("an anchor member"),
+    );
+    let (mut engine, scope) = u07_engine(&[anchor.pid()], std::slice::from_ref(&provider));
+    let mut session = ScriptedSession::default();
+    u07_tick(&mut engine, &mut session, &mut true);
+    assert!(
+        engine.views.iter().any(|view| view.pid() == anchor.pid()),
+        "tick 1 admits the anchor"
+    );
+
+    let mut stopped = stopped_session_for(&engine);
+    let newcomer = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a provider-free newcomer"),
+    );
+    u07_name_members(scope.path(), &[anchor.pid(), newcomer.pid()]);
+    let mut additions = true;
+    u07_tick(&mut engine, &mut stopped, &mut additions);
+    assert!(!additions, "the stopped tick closes additions");
+    assert!(
+        engine.views.iter().all(|view| view.pid() != newcomer.pid()),
+        "the stopped tick publishes no newcomer"
+    );
+    assert!(
+        !has_stop_time_newcomer_mark(&engine),
+        "a checked-clean newcomer dropped at stop must not mark unobserved calls: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Twin: a stopped tick with no newcomer at all leaves no mark.
+#[test]
+fn stopped_tick_without_newcomer_marks_no_unobserved_calls() {
+    let anchor = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("an anchor member"),
+    );
+    let (mut engine, _scope) = u07_engine(&[anchor.pid()], &[]);
+    let mut session = ScriptedSession::default();
+    u07_tick(&mut engine, &mut session, &mut true);
+    assert!(
+        engine.views.iter().any(|view| view.pid() == anchor.pid()),
+        "tick 1 admits the anchor"
+    );
+
+    let mut stopped = stopped_session_for(&engine);
+    let mut additions = true;
+    u07_tick(&mut engine, &mut stopped, &mut additions);
+    assert!(
+        !has_stop_time_newcomer_mark(&engine),
+        "a stopped tick with no newcomer must not mark unobserved calls: {:?}",
+        engine.counters.object_skips
     );
 }
 

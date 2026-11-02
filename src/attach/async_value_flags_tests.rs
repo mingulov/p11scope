@@ -8,7 +8,8 @@
 //! ordinals 99-101) through its line-oriented driver, attaches a real
 //! `Session` to the driver PID, and asserts on the drained `CALL`
 //! events. The unprivileged ledger test below pins the fixture's own
-//! determinism without loading BPF.
+//! determinism without loading BPF; a second unprivileged test pins the
+//! Join id-read-failure arm in BPF source, which no live call can trigger.
 
 use super::*;
 use crate::discovery::identity::pin_scanned_view_objects;
@@ -255,14 +256,28 @@ fn sign_target() -> u32 {
     crate::kinds::function_id("C_Sign").expect("catalog holds C_Sign")
 }
 
+/// Read the semantic-capture-failure evidence cell (index 5), following
+/// the `object_call_evidence` precedent in `instance_tests`.
+fn semantic_capture_failures(session: &Session) -> Result<u64> {
+    use p11scope_ebpf_common::EVIDENCE_SEMANTIC_CAPTURE_FAILURES;
+    let map: PerCpuArray<_, u64> =
+        PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE")?)?;
+    Ok(map
+        .get(&EVIDENCE_SEMANTIC_CAPTURE_FAILURES, 0)?
+        .iter()
+        .copied()
+        .sum())
+}
+
 /// Compile, spawn, attach `functions`, and run `script` (after READY),
-/// returning the ledger lines and the drained CALL events.
+/// returning the ledger lines, the drained CALL events, and the
+/// semantic-capture-failure evidence delta across the script.
 fn run_script(
     abi: ElfAbi,
     functions: &[&str],
     script: &[u8],
     want: usize,
-) -> Result<(Vec<String>, Vec<p11scope_ebpf_common::Event>)> {
+) -> Result<(Vec<String>, Vec<p11scope_ebpf_common::Event>, u64)> {
     let directory = tempfile::tempdir()?;
     let (provider, driver) = compile(directory.path(), abi)?;
     let mut target = Target::spawn(&driver, &["cmd".as_ref(), provider.as_os_str()])?;
@@ -290,12 +305,14 @@ fn run_script(
     for (index, _name) in functions.iter().enumerate() {
         ensure!(session.has_slot_link(index as u32), "slot {index} linked");
     }
+    let evidence_before = semantic_capture_failures(&session)?;
     let mut ledger = Vec::new();
     for command in script {
         ledger.push(target.command(*command)?);
     }
     let calls = drain_calls(&mut session, want, Duration::from_secs(10))?;
-    Ok((ledger, calls))
+    let evidence_after = semantic_capture_failures(&session)?;
+    Ok((ledger, calls, evidence_after - evidence_before))
 }
 
 fn events_for(
@@ -331,10 +348,37 @@ fn async32_fixture_ledger_runs_the_full_flow() -> Result<()> {
     Ok(())
 }
 
+/// Structural pin for the Join id-read-failure arm: no live call can
+/// trigger it (LP64 register reads are infallible and the ia32 stack
+/// word is always mapped at probe entry), so this unprivileged test
+/// pins the `else` arm in BPF source instead of a live RED cell.
+#[test]
+fn join_entry_marks_value_unreadable_when_id_read_fails() {
+    const BPF_MAIN: &str = include_str!("../../crates/ebpf/src/main.rs");
+    let join_anchor = "lifecycle::ASYNC_JOIN => {";
+    let getid_anchor = "lifecycle::ASYNC_GET_ID => {";
+    let join_start = BPF_MAIN
+        .find(join_anchor)
+        .expect("Join entry anchor in BPF main");
+    let after_join = &BPF_MAIN[join_start + join_anchor.len()..];
+    let getid_offset = after_join
+        .find(getid_anchor)
+        .expect("GetID entry anchor follows the Join block");
+    let join_block = &after_join[..getid_offset];
+    assert!(
+        join_block.contains("} else {"),
+        "Join entry keeps its id-read-failure else arm"
+    );
+    assert!(
+        join_block.contains("start.capture |= capture::ASYNC_VALUE_UNREADABLE"),
+        "Join entry else arm sets ASYNC_VALUE_UNREADABLE"
+    );
+}
+
 #[test]
 #[ignore = "privileged: OK C_AsyncGetID with NULL output sets ASYNC_VALUE_UNREADABLE"]
 fn privileged_async_getid_null_output_sets_value_unreadable_lp64() -> Result<()> {
-    let (ledger, calls) = run_script(ElfAbi::Lp64, &["C_AsyncGetID"], b"iotnG", 1)?;
+    let (ledger, calls, evidence) = run_script(ElfAbi::Lp64, &["C_AsyncGetID"], b"iotnG", 1)?;
     ensure!(
         ledger
             == [
@@ -361,13 +405,17 @@ fn privileged_async_getid_null_output_sets_value_unreadable_lp64() -> Result<()>
         event.capture
     );
     ensure!(event.async_value == 0, "no id without output");
+    ensure!(
+        evidence == 1,
+        "OK GetID with NULL output must bump the semantic evidence counter exactly once: {evidence}"
+    );
     Ok(())
 }
 
 #[test]
 #[ignore = "privileged: OK C_AsyncGetID with NULL output sets ASYNC_VALUE_UNREADABLE"]
 fn privileged_async_getid_null_output_sets_value_unreadable_ia32() -> Result<()> {
-    let (ledger, calls) = run_script(ElfAbi::Ilp32, &["C_AsyncGetID"], b"iotnG", 1)?;
+    let (ledger, calls, evidence) = run_script(ElfAbi::Ilp32, &["C_AsyncGetID"], b"iotnG", 1)?;
     ensure!(
         ledger
             == [
@@ -394,13 +442,17 @@ fn privileged_async_getid_null_output_sets_value_unreadable_ia32() -> Result<()>
         event.capture
     );
     ensure!(event.async_value == 0, "no id without output");
+    ensure!(
+        evidence == 1,
+        "OK GetID with NULL output must bump the semantic evidence counter exactly once: {evidence}"
+    );
     Ok(())
 }
 
 #[test]
 #[ignore = "privileged: OK C_AsyncGetID with a valid output reads the id with no flag"]
 fn privileged_async_getid_valid_output_reads_id_lp64() -> Result<()> {
-    let (ledger, calls) = run_script(ElfAbi::Lp64, &["C_AsyncGetID"], b"iotng", 1)?;
+    let (ledger, calls, evidence) = run_script(ElfAbi::Lp64, &["C_AsyncGetID"], b"iotng", 1)?;
     ensure!(
         ledger
             == [
@@ -427,13 +479,17 @@ fn privileged_async_getid_valid_output_reads_id_lp64() -> Result<()> {
         event.capture
     );
     ensure!(event.async_value == 1, "GetID id: {}", event.async_value);
+    ensure!(
+        evidence == 0,
+        "readable GetID id must not bump the semantic evidence counter: {evidence}"
+    );
     Ok(())
 }
 
 #[test]
 #[ignore = "privileged: OK C_AsyncGetID with a valid output reads the id with no flag"]
 fn privileged_async_getid_valid_output_reads_id_ia32() -> Result<()> {
-    let (ledger, calls) = run_script(ElfAbi::Ilp32, &["C_AsyncGetID"], b"iotng", 1)?;
+    let (ledger, calls, evidence) = run_script(ElfAbi::Ilp32, &["C_AsyncGetID"], b"iotng", 1)?;
     ensure!(
         ledger
             == [
@@ -460,13 +516,17 @@ fn privileged_async_getid_valid_output_reads_id_ia32() -> Result<()> {
         event.capture
     );
     ensure!(event.async_value == 1, "GetID id: {}", event.async_value);
+    ensure!(
+        evidence == 0,
+        "readable GetID id must not bump the semantic evidence counter: {evidence}"
+    );
     Ok(())
 }
 
 #[test]
 #[ignore = "privileged: C_AsyncJoin carries the detached id with no flag and the op completes"]
 fn privileged_async_join_reads_id_and_completes_lp64() -> Result<()> {
-    let (ledger, calls) = run_script(
+    let (ledger, calls, evidence) = run_script(
         ElfAbi::Lp64,
         &["C_AsyncGetID", "C_AsyncJoin", "C_AsyncComplete"],
         b"iootngjc",
@@ -531,13 +591,17 @@ fn privileged_async_join_reads_id_and_completes_lp64() -> Result<()> {
         "Complete target: {}",
         complete.target_function
     );
+    ensure!(
+        evidence == 0,
+        "readable GetID/Join flow must not bump the semantic evidence counter: {evidence}"
+    );
     Ok(())
 }
 
 #[test]
 #[ignore = "privileged: C_AsyncJoin carries the detached id with no flag and the op completes"]
 fn privileged_async_join_reads_id_and_completes_ia32() -> Result<()> {
-    let (ledger, calls) = run_script(
+    let (ledger, calls, evidence) = run_script(
         ElfAbi::Ilp32,
         &["C_AsyncGetID", "C_AsyncJoin", "C_AsyncComplete"],
         b"iootngjc",
@@ -601,6 +665,10 @@ fn privileged_async_join_reads_id_and_completes_ia32() -> Result<()> {
         complete.target_function == sign_target(),
         "Complete target: {}",
         complete.target_function
+    );
+    ensure!(
+        evidence == 0,
+        "readable GetID/Join flow must not bump the semantic evidence counter: {evidence}"
     );
     Ok(())
 }

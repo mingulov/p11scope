@@ -274,6 +274,12 @@
     },
     {
       "file": "src/attach/instance_tests.rs",
+      "path": "attach::instance_tests::privileged_journal_marker_pid_reuse_exec_creates_no_row",
+      "reason": "privileged: birth marker PID reuse exec creates no row",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties",
       "reason": "privileged: birth marker return outside scope dirties",
       "cell": "privileged"

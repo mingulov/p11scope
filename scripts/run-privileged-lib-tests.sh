@@ -153,6 +153,7 @@ attach::instance_tests::privileged_journal_marker_fork_without_exec_has_no_ready
 attach::instance_tests::privileged_journal_marker_nonleader_exec_creates_fresh_ready_row
 attach::instance_tests::privileged_journal_marker_ordinary_capture_mints_no_birth
 attach::instance_tests::privileged_journal_marker_pid_outsider_stays_unobserved
+attach::instance_tests::privileged_journal_marker_pid_reuse_exec_creates_no_row
 attach::instance_tests::privileged_journal_marker_return_outside_scope_dirties
 # Journal READY cell: post-closure exec publishes READY in a journal-object
 # session; on builds that omit the journal it asserts the finite refusal.

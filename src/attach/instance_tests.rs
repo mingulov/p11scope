@@ -4364,6 +4364,136 @@ fn privileged_journal_ready_exec_after_closure_publishes_ready() -> Result<()> {
     Ok(())
 }
 
+/// A plain process (never maps the watched provider) holding `pid`: the
+/// kernel's next PID is set through `ns_last_pid` (the CRIU technique) and
+/// the spawn retried, since other host processes may take the number first.
+/// Unlike a cmd target, `sleep` maps no watched file, so Stage A creates no
+/// row for it: any `PROC_EPOCH` row after its spawn exec is the marker's.
+struct ReusedProc {
+    child: Child,
+    pin: Arc<PidPin>,
+}
+
+impl Drop for ReusedProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_plain_with_pid(pid: u32) -> Result<ReusedProc> {
+    for attempt in 0..64 {
+        std::fs::write("/proc/sys/kernel/ns_last_pid", format!("{}", pid - 1))
+            .context("writing ns_last_pid (needs CONFIG_CHECKPOINT_RESTORE and root)")?;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawning plain reuse process")?;
+        if child.id() != pid {
+            let _ = child.kill();
+            let _ = child.wait();
+            continue;
+        }
+        let pin = match PidPin::open(pid) {
+            Ok(pin) => Arc::new(pin),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                continue;
+            }
+        };
+        // The spawn exec is the admitted event: wait until the new image is
+        // observable, so the exec hook has run before the readback.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+                .map(|link| link.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if exe.contains("sleep") {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "the reused process never exec'd its image"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!("MARKER_PID_REUSE pid={pid} attempt={attempt}");
+        return Ok(ReusedProc { child, pin });
+    }
+    bail!("could not reuse pid {pid} in 64 attempts")
+}
+
+/// Birth marker under Scope::Pid with PID reuse: PID scope admits the exec
+/// hook by number alone, so a process that later reuses the target's number
+/// reaches the marker. The marker must never create a row there: after the
+/// reused process's exec it has no `PROC_EPOCH` row and the admission row is
+/// unchanged. The target's own exec first publishes READY (positive control:
+/// PID scope still updates an existing row), spending exactly one admission.
+#[test]
+#[ignore = "privileged: birth marker PID reuse exec creates no row"]
+fn privileged_journal_marker_pid_reuse_exec_creates_no_row() -> Result<()> {
+    if env!("P11SCOPE_BIRTH_MARKER_ENABLED") != "1" {
+        assert_marker_absent_from_detailed()?;
+        return Ok(());
+    }
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let pid = target.pid();
+    let (_view, pins, plan, _key) = pin_and_plan(pid, &provider, &["C_GetSlotInfo"])?;
+    let harness = Harness::start(&plan, pid, &pins)?;
+    let minted = harness.session.instance_maps().mint_attach_generation()?;
+    // Positive control: the admitted target's exec publishes READY.
+    let ready = target.command(b'e')?;
+    ensure!(ready.starts_with("READY"), "owned exec ledger: {ready}");
+    let row = proc_record_of(&harness, &target)?;
+    let exec = ready_exec_of(&row, "the target exec")?;
+    ensure!(
+        row.map(|row| row.exec_attach_gen) == Some(minted),
+        "READY must name the minted closure: {} minted {minted}",
+        marker_summary(&row)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "one exec, one admission: {control:?}"
+    );
+    // The target exits and is reaped, freeing its number; a plain process
+    // (no watched mapping, so no Stage A row) reuses it and execs.
+    drop(target);
+    let reused = spawn_plain_with_pid(pid)?;
+    let absent = harness
+        .session
+        .instance_maps()
+        .record(reused.pin.pidfd()?)?;
+    ensure!(
+        absent.is_none(),
+        "a reused PID must gain no marker row: {}",
+        marker_summary(&absent)
+    );
+    let control = admission_of(&harness)?;
+    ensure!(
+        control.spent == 1 && control.failed == 0,
+        "a reused-PID exec must spend nothing: {control:?}"
+    );
+    let counters = harness.session.instance_maps().counters()?;
+    eprintln!(
+        "MARKER_PID_REUSE_EXEC exec={exec} minted={minted} control={control:?} \
+         counters={counters:?} scans={:?}",
+        harness.scan
+    );
+    ensure!(harness.false_joins().is_empty());
+    ensure!(counters.faults == 0 && harness.misses == 0);
+    ensure!(harness.session.instance_maps().sticky()? == 0);
+    Ok(())
+}
+
 /// Task 1d overhead gate: the mapping hooks attach for profile sessions
 /// but stay down for metrics (aggregate-only) sessions, whose attach still
 /// succeeds with every slot unmapped (`NO_FILE`: no stamp can ever route).

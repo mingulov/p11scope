@@ -401,6 +401,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "nonleader_exec_creates_fresh_ready_row",
             "ordinary_capture_mints_no_birth",
             "pid_outsider_stays_unobserved",
+            "pid_reuse_exec_creates_no_row",
             "return_outside_scope_dirties",
         )}
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))

@@ -1006,6 +1006,22 @@ impl std::fmt::Debug for JournalIngestItem {
     }
 }
 
+/// Test-only per-claim cost phases for the phase trace (the
+/// s1-rate-loss phase-trace approach, kept behind this test-only switch).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestCostPhase {
+    Claim,
+}
+
+/// One test-only phase-trace sample: the phase and its duration.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TestPhaseSample {
+    pub(crate) phase: TestCostPhase,
+    pub(crate) duration_ns: u64,
+}
+
 /// The sealed journal consumer. One adapter serves one Session's retained
 /// drain: domain identity is implicit in that ownership, never a supplied
 /// integer. Ingest is wire truth only; model input happens at seal, after
@@ -1044,6 +1060,18 @@ pub(crate) struct JournalAdapter {
     /// winner by FIFO rank. Counts remain bounded by unsettled work.
     claims: BTreeMap<CallIdentity, BTreeMap<JournalDomainKey, VecDeque<AdmittedJournalClaim>>>,
     claim_counts: usize,
+    /// Test-only per-claim cost counters: retained-scan visits, claim
+    /// calls and prune runs. Production pays nothing for these.
+    #[cfg(test)]
+    test_claim_scan_visits: usize,
+    #[cfg(test)]
+    test_claim_calls: u64,
+    #[cfg(test)]
+    test_prune_runs: u64,
+    /// Test-only phase trace: `None` (off) by default; `Some` records
+    /// one sample per claim while enabled.
+    #[cfg(test)]
+    test_phase_trace: Option<Vec<TestPhaseSample>>,
     last_audit_failure: Option<u64>,
     /// H0 positions below this watermark were voided by an H3-loss
     /// seal: re-presented barriers at or below it wait instead of
@@ -1105,6 +1133,14 @@ impl JournalAdapter {
             sightings: BTreeMap::new(),
             claims: BTreeMap::new(),
             claim_counts: 0,
+            #[cfg(test)]
+            test_claim_scan_visits: 0,
+            #[cfg(test)]
+            test_claim_calls: 0,
+            #[cfg(test)]
+            test_prune_runs: 0,
+            #[cfg(test)]
+            test_phase_trace: None,
             last_audit_failure: None,
             h3_voided_below: 0,
             voided_through: 0,
@@ -1227,6 +1263,49 @@ impl JournalAdapter {
         }
         originals.sort_unstable_by_key(|(admission, _)| *admission);
         (self.claim_counts, originals)
+    }
+
+    /// Test-only read of the per-claim cost counters: claim calls,
+    /// retained-scan visits and prune runs.
+    #[cfg(test)]
+    pub(crate) fn test_claim_costs_for_test(&self) -> (u64, usize, u64) {
+        (
+            self.test_claim_calls,
+            self.test_claim_scan_visits,
+            self.test_prune_runs,
+        )
+    }
+
+    /// Test-only reset of the per-claim cost counters.
+    #[cfg(test)]
+    pub(crate) fn reset_test_claim_costs_for_test(&mut self) {
+        self.test_claim_calls = 0;
+        self.test_claim_scan_visits = 0;
+        self.test_prune_runs = 0;
+    }
+
+    /// Test-only phase-trace switch: off by default; while on, every
+    /// claim records one duration sample.
+    #[cfg(test)]
+    pub(crate) fn set_phase_trace_for_test(&mut self, on: bool) {
+        self.test_phase_trace = on.then(Vec::new);
+    }
+
+    /// Test-only drain of the recorded phase-trace samples.
+    #[cfg(test)]
+    pub(crate) fn take_phase_trace_for_test(&mut self) -> Vec<TestPhaseSample> {
+        self.test_phase_trace.take().unwrap_or_default()
+    }
+
+    /// Test-only record of one claim sample; a no-op while tracing is off.
+    #[cfg(test)]
+    fn record_claim_trace_for_test(&mut self, start: std::time::Instant) {
+        if let Some(trace) = self.test_phase_trace.as_mut() {
+            trace.push(TestPhaseSample {
+                phase: TestCostPhase::Claim,
+                duration_ns: start.elapsed().as_nanos() as u64,
+            });
+        }
     }
 
     #[cfg(test)]
@@ -4321,6 +4400,8 @@ impl JournalAdapter {
     ) -> Result<(), AttestationRefusal> {
         let fingerprint = claim.returned;
         let identity = fingerprint.identity();
+        #[cfg(test)]
+        let claim_trace_start = std::time::Instant::now();
         let retained = self
             .open
             .values()
@@ -4334,12 +4415,19 @@ impl JournalAdapter {
                 .iter()
                 .filter(|entry| claim_names_shape(&entry.shape(), &claim))
                 .count();
+        #[cfg(test)]
+        {
+            self.test_claim_scan_visits += self.open.len() + self.refused.len();
+            self.test_claim_calls += 1;
+        }
         if self
             .physical_return_floors
             .get(&fingerprint.pid_tgid)
             .is_some_and(|floor| fingerprint.entry_ns < *floor)
             && retained != 1
         {
+            #[cfg(test)]
+            self.record_claim_trace_for_test(claim_trace_start);
             return Err(AttestationRefusal::InvocationStale);
         }
         if !self
@@ -4347,6 +4435,8 @@ impl JournalAdapter {
             .contains_key(&fingerprint.pid_tgid)
             && self.physical_return_floors.len() >= self.limits.thread_floors
         {
+            #[cfg(test)]
+            self.record_claim_trace_for_test(claim_trace_start);
             return Err(AttestationRefusal::ClaimsExhausted);
         }
         self.physical_return_floors
@@ -4355,6 +4445,8 @@ impl JournalAdapter {
         if self.claim_counts >= self.limits.open_calls + self.limits.refused_begins {
             self.prune_dead_claims();
             if self.claim_counts >= self.limits.open_calls + self.limits.refused_begins {
+                #[cfg(test)]
+                self.record_claim_trace_for_test(claim_trace_start);
                 return Err(AttestationRefusal::ClaimsExhausted);
             }
         }
@@ -4379,6 +4471,8 @@ impl JournalAdapter {
             // including across later pruning and staging voids.
             self.taint_image(fingerprint.image);
         }
+        #[cfg(test)]
+        self.record_claim_trace_for_test(claim_trace_start);
         Ok(())
     }
 
@@ -4386,6 +4480,10 @@ impl JournalAdapter {
     /// authority is garbage. Solely-dead-claimed staged entries keep
     /// their skip (never convert, never barrier the living).
     fn prune_dead_claims(&mut self) {
+        #[cfg(test)]
+        {
+            self.test_prune_runs += 1;
+        }
         let live: BTreeSet<JournalDomainKey> = self
             .keys
             .keys()
@@ -13417,6 +13515,141 @@ pub(crate) mod tests {
         assert_eq!(
             scene.adapter.claim_counts, 1,
             "normal attestation claims after the original START"
+        );
+    }
+
+    /// One cost scene with `retained` staged begins: the first 1,024 fill
+    /// the open table, the rest (up to 1,024) the refused shelf. Every
+    /// disposition is pinned, so the setup cannot silently degrade.
+    fn keepup_scene_with_retained(retained: usize) -> Scene {
+        assert!(
+            retained <= 2_048,
+            "the refused shelf refuses to taint past 2,048"
+        );
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        for thread in 1..=retained as u64 {
+            let begin = begin_bytes(thread, 1, create, 0);
+            let expected = if thread <= 1_024 {
+                JournalDisposition::BeginAdmitted
+            } else {
+                JournalDisposition::BeginRefusedCapacity
+            };
+            assert_eq!(scene.ingest(&begin), expected);
+        }
+        assert_eq!(scene.adapter.open.len(), retained.min(1_024));
+        assert_eq!(scene.adapter.refused.len(), retained.saturating_sub(1_024));
+        scene
+    }
+
+    /// File `n` paired claims against the scene's retained begins: bare
+    /// attests queue the admissions, then pairing binds each to its
+    /// retained fingerprint and files its claim.
+    fn keepup_attest_paired(scene: &mut Scene, n: usize) {
+        for _ in 0..n {
+            scene.attest();
+        }
+        scene.prepare_claims();
+    }
+
+    /// One fresh-fingerprint admission that bypasses pairing (pairing
+    /// expects admission success): a begin that was never ingested,
+    /// reconstructed into its original event.
+    fn keepup_admit_fresh(scene: &mut Scene, thread: u64) -> AdmittedInstanceCall {
+        use p11scope_ebpf_common::object_journal::decode_journal_record;
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(thread, 1, create, 0);
+        let record =
+            decode_journal_record(&begin, &scene.descriptors).expect("fresh begin decodes");
+        let JournalRecord::Begin(vbegin) = record else {
+            panic!("fresh begin decodes as a begin");
+        };
+        let event = original_for_validated_begin(&vbegin);
+        scene.fixture.admit_original_event("C_CreateObject", event)
+    }
+
+    #[test]
+    fn joint_keepup_claim_cost_is_independent_of_retained_count() {
+        fn marginal_cost(retained: usize) -> usize {
+            let mut scene = keepup_scene_with_retained(retained);
+            keepup_attest_paired(&mut scene, 50);
+            scene.adapter.reset_test_claim_costs_for_test();
+            keepup_attest_paired(&mut scene, 1);
+            let (calls, visits, prunes) = scene.adapter.test_claim_costs_for_test();
+            assert_eq!(calls, 1, "one measured claim");
+            assert_eq!(prunes, 0, "no prune below the claim cap");
+            visits + 1
+        }
+        let low = marginal_cost(100);
+        let high = marginal_cost(2_048);
+        assert!(
+            high < 4 * low,
+            "per-claim scan cost must not grow with retained count: {high} vs {low}"
+        );
+    }
+
+    #[test]
+    fn joint_keepup_no_prune_step_at_2048_while_keys_live() {
+        let mut scene = keepup_scene_with_retained(2_048);
+        keepup_attest_paired(&mut scene, 2_048);
+        assert_eq!(scene.adapter.claim_counts, 2_048);
+        scene.adapter.reset_test_claim_costs_for_test();
+        for index in 0..10 {
+            let admitted = keepup_admit_fresh(&mut scene, 100_001 + index);
+            assert_eq!(
+                scene.adapter.attest_key(&admitted),
+                Err(AttestationRefusal::ClaimsExhausted)
+            );
+        }
+        let (calls, _, prunes) = scene.adapter.test_claim_costs_for_test();
+        assert_eq!(calls, 10, "ten measured cap-hit claims");
+        assert_eq!(
+            prunes, 0,
+            "live keys must not pay a prune rebuild per refused claim"
+        );
+    }
+
+    #[test]
+    fn joint_keepup_cap_boundary_twins_2047_2048_2049() {
+        let mut scene = keepup_scene_with_retained(2_048);
+        keepup_attest_paired(&mut scene, 2_047);
+        assert_eq!(scene.adapter.claim_counts, 2_047);
+        keepup_attest_paired(&mut scene, 1);
+        assert_eq!(
+            scene.adapter.claim_counts, 2_048,
+            "the 2,048th claim still fits below the cap check"
+        );
+        for (step, n) in [2_049, 2_050].into_iter().enumerate() {
+            let admitted = keepup_admit_fresh(&mut scene, 200_001 + step as u64);
+            assert_eq!(
+                scene.adapter.attest_key(&admitted),
+                Err(AttestationRefusal::ClaimsExhausted),
+                "claim {n} refuses at the cap"
+            );
+            assert_eq!(scene.adapter.claim_counts, 2_048);
+        }
+    }
+
+    #[test]
+    fn joint_keepup_phase_trace_records_claim_samples() {
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        for thread in 1..=2u64 {
+            scene.ingest(&begin_bytes(thread, 1, create, 0));
+        }
+        keepup_attest_paired(&mut scene, 1);
+        assert!(
+            scene.adapter.take_phase_trace_for_test().is_empty(),
+            "tracing stays off by default"
+        );
+        scene.adapter.set_phase_trace_for_test(true);
+        keepup_attest_paired(&mut scene, 1);
+        let trace = scene.adapter.take_phase_trace_for_test();
+        assert_eq!(trace.len(), 1, "one claim records one sample");
+        assert_eq!(trace[0].phase, TestCostPhase::Claim);
+        assert!(
+            scene.adapter.take_phase_trace_for_test().is_empty(),
+            "taking drains the trace"
         );
     }
 

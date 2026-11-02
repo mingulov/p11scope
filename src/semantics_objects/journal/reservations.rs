@@ -65,6 +65,10 @@ pub(super) struct ReservationTable<C> {
     live: usize,
     bytes: usize,
     populations: [usize; ROLES],
+    /// Test-only lookup cost counter: slot visits across
+    /// `key_slot`, `id_slot` and free-slot searches.
+    #[cfg(test)]
+    test_slot_visits: std::cell::Cell<usize>,
 }
 
 impl<C> ReservationTable<C> {
@@ -82,6 +86,8 @@ impl<C> ReservationTable<C> {
             live: 0,
             bytes: 0,
             populations: [0; ROLES],
+            #[cfg(test)]
+            test_slot_visits: std::cell::Cell::new(0),
         })
     }
 
@@ -93,6 +99,18 @@ impl<C> ReservationTable<C> {
     }
     pub(super) fn population(&self, role: Role) -> usize {
         self.populations[role.index()]
+    }
+
+    /// Test-only read of the lookup cost counter.
+    #[cfg(test)]
+    pub(super) fn test_slot_visits_for_test(&self) -> usize {
+        self.test_slot_visits.get()
+    }
+
+    /// Test-only reset of the lookup cost counter.
+    #[cfg(test)]
+    pub(super) fn reset_test_slot_visits_for_test(&self) {
+        self.test_slot_visits.set(0);
     }
 
     pub(super) fn reservation(&self, role: Role, key: RoleKey) -> Option<ReservationId> {
@@ -167,6 +185,8 @@ impl<C> ReservationTable<C> {
 
     fn key_slot(&self, role: Role, key: RoleKey) -> Option<usize> {
         self.slots.iter().position(|slot| {
+            #[cfg(test)]
+            self.test_slot_visits.set(self.test_slot_visits.get() + 1);
             slot.as_ref().is_some_and(|operation| {
                 operation.roles[role.index()]
                     .as_ref()
@@ -177,6 +197,8 @@ impl<C> ReservationTable<C> {
 
     fn id_slot(&self, id: ReservationId) -> Option<usize> {
         self.slots.iter().position(|slot| {
+            #[cfg(test)]
+            self.test_slot_visits.set(self.test_slot_visits.get() + 1);
             slot.as_ref()
                 .is_some_and(|operation| operation.aliases.contains(&Some(id)))
         })
@@ -234,7 +256,11 @@ impl<C> ReservationTable<C> {
                 let at = self
                     .slots
                     .iter()
-                    .position(Option::is_none)
+                    .position(|slot| {
+                        #[cfg(test)]
+                        self.test_slot_visits.set(self.test_slot_visits.get() + 1);
+                        slot.is_none()
+                    })
                     .expect("preflight retained a slot");
                 let mut aliases = [None; ROLES];
                 aliases[0] = Some(id);
@@ -569,5 +595,41 @@ mod tests {
         assert_eq!(table.insert(Role::Model, key(1), Some(id), 0, ()), Ok(id));
         assert_eq!(table.population(Role::Raw), 1);
         assert_eq!(table.population(Role::Model), 1);
+    }
+
+    #[test]
+    fn joint_keepup_reservation_lookups_are_bounded_at_full_occupancy() {
+        let mut table = ReservationTable::try_new(1_024).unwrap();
+        for value in 1..=1_024 {
+            let id = table.insert(Role::Raw, key(value), None, 1, ()).unwrap();
+            for (role, bytes) in [
+                (Role::H8Open, 2),
+                (Role::Model, 3),
+                (Role::H9Staged, 4),
+                (Role::Association, 5),
+            ] {
+                table.insert(role, key(value), Some(id), bytes, ()).unwrap();
+            }
+        }
+        table.reset_test_slot_visits_for_test();
+        let mut lookups = 0;
+        for value in (1..=1_024u64).step_by(7) {
+            for role in [
+                Role::Raw,
+                Role::H8Open,
+                Role::Model,
+                Role::H9Staged,
+                Role::Association,
+            ] {
+                assert!(table.reservation(role, key(value)).is_some());
+                assert!(table.member_bytes(role, key(value)).is_some());
+                lookups += 2;
+            }
+        }
+        let visits = table.test_slot_visits_for_test();
+        assert!(
+            visits < lookups * 64,
+            "indexed lookups must not scan the table: {visits} visits for {lookups} lookups"
+        );
     }
 }

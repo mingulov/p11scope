@@ -7,9 +7,12 @@
 //!
 //! The production journal object is a Detailed object whose entry/return
 //! roots are replaced by the journal pair (`p11_entry_journal` /
-//! `p11_return_journal`) plus the four journal maps. It is built only by the
-//! opt-in `P11SCOPE_JOURNAL=1` route; the private proof ELF is never selected
-//! or embedded here. `journal_linked` is derived from the actually loaded
+//! `p11_return_journal`) plus the four journal maps. FULL and P0 builds
+//! carry it by default (`P11SCOPE_JOURNAL=0`, SMALL, WIDE and unsafe builds
+//! omit it); only `inventory --key-operations` loads it. It carries the
+//! marker's DIRTY gap writer but no READY exec write, so exec-marker births
+//! refuse at this revision. The private proof ELF is never selected or
+//! embedded here. `journal_linked` is derived from the actually loaded
 //! programs: only a session whose loaded object carries both journal roots
 //! seals and drains linked.
 

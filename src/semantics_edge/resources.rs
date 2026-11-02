@@ -34,7 +34,8 @@ const OPEN_NODE: usize = internal_node::<u64, u64>();
 const ACTIVE_NODE: usize = internal_node::<(u64, u16), super::OpMachine>();
 const MECHANISM_NODE: usize = internal_node::<u64, super::EdgeMechStat>();
 const PENDING_NODE: usize = internal_node::<(u64, u32), super::PendingCall>();
-const DETACHED_NODE: usize = internal_node::<(u64, u32, u64), super::AsyncId>();
+const DETACHED_NODE: usize =
+    internal_node::<(u64, u32, crate::semantics_objects::AsyncValue), super::AsyncId>();
 const CATEGORY_NODE: usize = internal_node::<&'static str, ()>();
 const FUNCTION_NODE: usize = internal_node::<String, ()>();
 const RETURN_NODE: usize = internal_node::<u64, ()>();
@@ -54,6 +55,7 @@ const _: () = {
     // has no niche: +16 over the pre-position layout).
     assert!(std::mem::size_of::<super::PendingCall>() == 160);
     assert!(std::mem::size_of::<super::AsyncId>() == 176);
+    assert!(std::mem::size_of::<crate::semantics_objects::AsyncValue>() == 8);
     assert!(std::mem::size_of::<ResourceLease>() == 16);
     assert!(std::mem::align_of::<crate::inventory_semantics::SemanticProviderTarget>() <= 8);
     assert!(std::mem::size_of::<crate::inventory_semantics::SemanticProviderTarget>() <= 1024);
@@ -74,7 +76,7 @@ const _: () = {
         + leaf_node::<(u64, u16), super::OpMachine>()
         + leaf_node::<u64, super::EdgeMechStat>()
         + leaf_node::<(u64, u32), super::PendingCall>()
-        + leaf_node::<(u64, u32, u64), super::AsyncId>();
+        + leaf_node::<(u64, u32, crate::semantics_objects::AsyncValue), super::AsyncId>();
     assert!(
         std::mem::size_of::<super::EdgeSemantics>() + empty_roots + 5 * 32 <= REDUCER_BASE_CHARGE
     );

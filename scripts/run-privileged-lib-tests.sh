@@ -471,14 +471,18 @@ metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live
 # Counter CLI and K0 selected-detail live cells over owned cc-built
 # growth fixtures: the counts CLI cell (exact workload-ledger numbers,
 # no selection), the K0 CLI cell (live-plan resolution plus the exact
-# aggregate), and the three SoftHSM ledger cells (exact C_Sign detail,
-# the exec-in-window negative, and the owned-run positive). Root on a
+# aggregate), and the five SoftHSM ledger cells (exact C_Sign detail,
+# the exec-in-window negative, the owned-run positive, and the two
+# exit-in-window cells: owned run without --hold and a --pid target
+# that ends before the duration). Root on a
 # Multi-capable kernel; the ledger cells also need gcc, softhsm2-util,
 # SoftHSM2 and an observer binary (P11SCOPE_E2E_OBSERVER or the
 # p11scope sibling).
 metrics::k0_live_cells::k0_live_detail_matches_ledger_counts_lp64
 metrics::k0_live_cells::k0_live_exec_voids_detail_counts_lp64
 metrics::k0_live_cells::k0_live_run_detail_matches_ledger_counts_lp64
+metrics::k0_live_cells::k0_live_run_exit_in_window_counts_lp64
+metrics::k0_live_cells::k0_live_pid_exit_in_window_counts_lp64
 metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64
 )
 

@@ -5380,6 +5380,7 @@ fn capture_profile(
             engine.pinned(),
             session.pid_lifecycle_facts(),
             engine.capture_facts().discovery_losses(),
+            owned.is_some(),
             &mut selection_ledger,
         );
     }
@@ -14258,6 +14259,34 @@ mod tests {
         assert!(
             suffix < observed && observed < terminal && terminal < take,
             "capture_profile must collect the K0 tail in order"
+        );
+        // K0 loss snapshots: the open passes the live discovery losses
+        // (and whether the capture is owned) before the loop, and the
+        // close reads them again after the terminal drain, inside
+        // `run_terminal`, so growth inside the window voids the detail.
+        let open = profile.find("open_k0_production(").expect("K0 open");
+        let open_call = &profile[open..];
+        let open_losses = open_call
+            .find("engine.capture_facts().discovery_losses(),")
+            .expect("K0 open losses");
+        let open_owned = open_call.find("owned.is_some(),").expect("K0 open owned");
+        let open_end = open_call.find(");").expect("K0 open call end");
+        assert!(
+            open_losses < open_end && open_owned < open_end,
+            "the K0 open passes its losses and owned flag"
+        );
+        let terminal_fn = source
+            .split_once("fn run_terminal(")
+            .expect("run_terminal")
+            .1;
+        let close_losses = terminal_fn
+            .find("let after_losses = context.0.capture_facts().discovery_losses();")
+            .expect("K0 close losses");
+        let close = terminal_fn.find("close_k0_production(").expect("K0 close");
+        let terminal_read = terminal_fn.find(".terminal(").expect("broad terminal read");
+        assert!(
+            terminal_read < close_losses && close_losses < close,
+            "run_terminal must snapshot the K0 close losses after the terminal read and before the close"
         );
     }
 

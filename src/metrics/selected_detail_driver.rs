@@ -1358,8 +1358,14 @@ pub(crate) fn open_k0_production(
     pins: &PinnedObjects,
     before_facts: K0Facts,
     before_losses: [u64; 4],
+    owned: bool,
     ledger: &mut SelectionLedger,
 ) -> Option<K0Window> {
+    let comparable = clock_origins_comparable();
+    if let Some(refusal) = k0_owned_clock_refusal(owned, comparable) {
+        ledger.mark_selection_refused(refusal.name());
+        return None;
+    }
     let limits = CounterLimits { rows, rv_keys };
     let before = k0_broad_read(session, plan, pins, limits, &reserve);
     let mut window = open_k0_window_with_losses(
@@ -1373,11 +1379,26 @@ pub(crate) fn open_k0_production(
     )?;
     // The selection stamp bounds lifecycle by kernel-vs-userspace
     // monotonic comparison; without comparable clock origins the bound
-    // is unprovable, so no observation is ignored.
-    if !clock_origins_comparable() {
+    // is unprovable, so no observation is ignored (a `--pid` target's
+    // window still opens; owned `run` refused above).
+    if !comparable {
         window.selection_stamp = None;
     }
     Some(window)
+}
+
+/// K0-3 fallback: owned `run` needs the selection stamp to ignore the
+/// child's own startup exec, which always precedes the window. Without
+/// comparable kernel and userspace monotonic clock origins (a time
+/// namespace offset, or a kernel without the timens files) the stamp is
+/// unprovable and that exec would void every window as caller-changed,
+/// so the selection refuses up front by name instead: the scope cannot
+/// carry a detail here. A `--pid` target needs no stamp (it predates
+/// the window), so its window opens without one.
+fn k0_owned_clock_refusal(owned: bool, comparable: bool) -> Option<SelectedDriverRefusal> {
+    (owned && !comparable).then_some(SelectedDriverRefusal::Promotion(
+        PromotionRefusal::ScopeUnsupported,
+    ))
 }
 
 /// Everything `run_terminal` needs to close an opened K0 window: the
@@ -6599,9 +6620,10 @@ mod tests {
     #[test]
     fn k0_tail_zero_ts_records_void_as_changed() {
         // A clock fault (zero timestamp) never hides inside the
-        // selection window: both zero-ts tail records must void as
-        // caller-changed even though 0 <= stamp. The exec voids on
-        // its kind; the exit voids on its zero stamp (K0-4 arm).
+        // selection window, even though 0 is below every stamp. The
+        // zero-ts exec comes first and voids on its kind, so this twin
+        // pins the exec arm; `k0_tail_lone_zero_ts_exit_voids_as_changed`
+        // pins the zero-ts exit arm on its own.
         let pool = test_pool();
         let scene = stage_single_provider(pool, 4);
         let mut ledger = SelectionLedger::new();
@@ -6653,6 +6675,100 @@ mod tests {
                 .refusal,
             Some("promotion_caller_changed"),
             "zero-ts tail records void instead of hiding in the window"
+        );
+    }
+
+    #[test]
+    fn k0_tail_lone_zero_ts_exit_voids_as_changed() {
+        // A lone zero-timestamp leader exit (a clock fault) voids as
+        // caller-changed on its own: the exit arm, not an exec beside
+        // it, carries the void. A stamped exit ends the window cleanly
+        // (K0-4), so only the zero stamp separates the two.
+        for (label, hook_ts, expect_void) in [("zero", 0, true), ("stamped", 25, false)] {
+            let pool = test_pool();
+            let scene = stage_single_provider(pool, 4);
+            let mut ledger = SelectionLedger::new();
+            let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+                .expect("live name resolves for the K0 window");
+            let pid = resolved.original.pid();
+            let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+            let before = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 100, 100),
+                window_of(10, 20),
+            );
+            let window = open_k0_window(
+                resolved,
+                limits_for(&scene.plan),
+                scene.pool.reserver(),
+                Ok(before),
+                k0_clean(),
+                &mut ledger,
+            )
+            .expect("a healthy selection-time read opens the window");
+            let after = scripted_read(
+                &scene.pool,
+                &scene.plan,
+                generation,
+                CounterMode::Counts,
+                &counts_for(&scene.plan, 110, 110),
+                window_of(20, 30),
+            );
+            let tail = vec![k0_exit_record(pid, hook_ts)];
+            close_k0_window_with_tail(
+                window,
+                &scene.plan,
+                Ok(after),
+                k0_clean(),
+                true,
+                &tail,
+                0,
+                &mut ledger,
+            );
+            let record = ledger.selection.as_ref().expect("selection records");
+            if expect_void {
+                assert_eq!(
+                    record.refusal,
+                    Some("promotion_caller_changed"),
+                    "{label}: a lone zero-ts exit voids"
+                );
+            } else {
+                assert_eq!(record.refusal, None, "{label}: a stamped exit ends cleanly");
+                let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+                let section = &composed["evidence"]["selected_detail"];
+                assert!(section.get("detail").is_some(), "{label}: detail renders");
+            }
+        }
+    }
+
+    #[test]
+    fn k0_owned_run_refuses_by_name_without_comparable_clocks() {
+        // K0-3 fallback: owned `run` without comparable clock origins
+        // refuses up front as scope-unsupported (its startup exec could
+        // not be bounded); with comparable clocks it opens, and a
+        // `--pid` target opens either way.
+        assert_eq!(
+            k0_owned_clock_refusal(true, false).map(|refusal| refusal.name()),
+            Some("promotion_scope_unsupported"),
+            "owned run without comparable clocks refuses by name"
+        );
+        assert_eq!(
+            k0_owned_clock_refusal(true, true).map(|refusal| refusal.name()),
+            None,
+            "owned run with comparable clocks opens"
+        );
+        assert_eq!(
+            k0_owned_clock_refusal(false, false).map(|refusal| refusal.name()),
+            None,
+            "--pid opens without comparable clocks (no stamp needed)"
+        );
+        assert_eq!(
+            k0_owned_clock_refusal(false, true).map(|refusal| refusal.name()),
+            None,
+            "--pid opens with comparable clocks"
         );
     }
 }

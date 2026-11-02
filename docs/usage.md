@@ -807,7 +807,18 @@ Limits that matter in pods:
   itself (exec) between the two reads, the slot retires, or the close
   boundary cannot be proven clean, the detail is withheld with a named
   reason; a leader exit that is the last lifecycle record ends the
-  window cleanly and the detail renders the counts up to the exit. A
+  window cleanly and the detail renders the counts up to the exit.
+  Known issue: a process that exits before the observer has processed
+  its provider load (for example a `run` child that loads its provider
+  and exits at once) leaves that loader discovery unfinished; the
+  report counts it as discovery truncation and the detail is withheld
+  as `broad_stopping`. A child that keeps running for a few seconds
+  after its provider loads is unaffected. With `run`, the window must
+  tell the child's own startup exec apart from the window by kernel
+  and userspace monotonic time; where the two clocks cannot be
+  compared (a time namespace offset, or a kernel without the time
+  namespace files) the selection refuses as
+  `promotion_scope_unsupported`. A
   window with no calls still renders explicit zero rows. The selection
   attempt — resolved slot or named refusal — is recorded in the
   report's additive `selected_detail` evidence object; unrelated

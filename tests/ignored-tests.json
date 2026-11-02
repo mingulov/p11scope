@@ -787,6 +787,36 @@
       "cell": "privileged"
     },
     {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_env_wrapper_matches_direct_count_lp64",
+      "reason": "privileged: run --pause auto through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64",
+      "reason": "privileged: run --pause auto through sh -c exec with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64",
+      "reason": "privileged: run --pause auto through a forking sh wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_never_env_wrapper_matches_direct_count_lp64",
+      "reason": "privileged: run --pause off through env with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_auto_preloaded_exec_matches_direct_count_lp64",
+      "reason": "privileged: run --pause auto through a preload-then-exec wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/pressure_native_tests.rs",
       "path": "discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once",
       "reason": "privileged: live BPF all-blocked negative twin; run as root with --ignored --test-threads=1 under the privileged lane",

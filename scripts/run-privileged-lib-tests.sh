@@ -283,6 +283,15 @@ discovery::engine::publication_tests::broad_p11kit_admission_arithmetic
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n4097
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n6530
 discovery::inventory_workload::tests::privileged_inventory_attach_projection_n8192
+# Pause exec-wrapper cells: run --pause auto/never through env, sh -c exec,
+# a forking sh wrapper and a preload-then-exec wrapper with a SoftHSM
+# workload (root, BPF, SoftHSM, pkcs11-tool); each wrapper run compares
+# against the direct run's exact call count or neutral lattice.
+discovery::pause::tests::privileged_pause_auto_env_wrapper_matches_direct_count_lp64
+discovery::pause::tests::privileged_pause_auto_preloaded_exec_matches_direct_count_lp64
+discovery::pause::tests::privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64
+discovery::pause::tests::privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64
+discovery::pause::tests::privileged_pause_never_env_wrapper_matches_direct_count_lp64
 # D4 file-identity qualifying cells: ext4 inode-reuse confirmation
 # parity (own loop ext4 per row) and overlay xino backend parity (own
 # loop layers per mode). The copy-up RED reproducer stays skipped below:

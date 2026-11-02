@@ -3066,7 +3066,7 @@ impl LiveJointMachine {
             }
             Phase::StagingNegative(original) => {
                 budget.spend(1);
-                if coordinator.stage_next_prepared_admission() {
+                if coordinator.stage_next_prepared_admission(self.grant.is_none()) {
                     return (Phase::StagingNegative(original), Ok(Step::Continue));
                 }
                 if !coordinator.finish_prepared_semantic_batch(lane) {

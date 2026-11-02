@@ -802,6 +802,19 @@ impl PreparedSemanticBatch {
             .find_map(|entry| entry.input.as_ref()?.as_ref().ok())
     }
 
+    /// The staged caller and admission at the stage cursor, when the
+    /// next `stage_next` call would stage an admitted call. Mirrors
+    /// the staging guard exactly; the pre-grant disclosure peeks
+    /// through this before the input moves into the registry.
+    pub(super) fn stage_peek(&self) -> Option<(Option<CallerId>, &AdmittedInstanceCall)> {
+        if self.claim_cursor != self.entries.len() || self.stage_cursor >= self.claim_cursor {
+            return None;
+        }
+        let entry = self.entries.get(self.stage_cursor)?;
+        let input = entry.input.as_ref()?.as_ref().ok()?;
+        Some((entry.caller, input))
+    }
+
     pub(super) fn claim_next(
         &mut self,
         adapter: &mut JournalAdapter,
@@ -1337,13 +1350,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    pub(crate) fn stage_next_prepared_admission(&mut self) -> bool {
+    pub(crate) fn stage_next_prepared_admission(&mut self, pre_grant: bool) -> bool {
         let Some(state) = self.semantic_finalizer.as_mut() else {
             return false;
         };
         let Some(PendingSemanticBatch::Prepared(batch)) = state.pending_semantic.as_mut() else {
             return false;
         };
+        // Pre-grant staging discloses why each staged admission's Joint
+        // bind refused, read-only through the adapter: the retained S1
+        // row carries the refusal the birth would have hit.
+        if pre_grant
+            && let Some((caller, input)) = batch.stage_peek()
+            && let Err(refusal) = self.joint_capture.adapter().probe_admitted_key(input)
+        {
+            disclose_s1_birth_refusal(
+                &mut self.registry,
+                caller,
+                BirthRefusal::Claim(Some(refusal)).reason(),
+            );
+        }
         batch.stage_next(&mut self.registry, &mut state.seal_admission, |caller| {
             self.adapter.leader_exit_pending(caller)
         })

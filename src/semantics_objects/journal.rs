@@ -3648,19 +3648,15 @@ impl JournalAdapter {
         true
     }
 
-    /// Bind one H3-admitted call's incarnation to a journal key without
-    /// claiming the invocation before its original START is ingested: exact
-    /// native domain, caller, image and router, plus the adapter-tracked
-    /// era. Re-attestation after a fault-void returns the live key; a
-    /// tainted image or a full key table refuses. A second live key for
-    /// an image whose key already converted refuses: sole-key
-    /// attributions cannot be re-examined.
-    /// Birth and closure are verified on top of this binding by
-    /// [`BootstrapReceipt::attest`].
-    pub(crate) fn bind_admitted_key(
-        &mut self,
+    /// Read-only twin of the key-binding refusal checks: which refusal
+    /// one admission's Joint bind would hit, without inserting a key.
+    /// The pre-grant staging pass discloses through this; production
+    /// binding shares it so the disclosure can never drift from the
+    /// bind it names.
+    pub(crate) fn probe_admitted_key(
+        &self,
         admitted: &AdmittedInstanceCall,
-    ) -> Result<JournalDomainProof, AttestationRefusal> {
+    ) -> Result<(), AttestationRefusal> {
         if self.stopped || self.invalidated {
             return Err(AttestationRefusal::Stopped);
         }
@@ -3683,10 +3679,35 @@ impl JournalAdapter {
         {
             return Err(AttestationRefusal::ImageSealed);
         }
+        if !self.keys.contains_key(&key) && self.keys.len() >= self.limits.domain_keys {
+            return Err(AttestationRefusal::KeysExhausted);
+        }
+        Ok(())
+    }
+
+    /// Bind one H3-admitted call's incarnation to a journal key without
+    /// claiming the invocation before its original START is ingested: exact
+    /// native domain, caller, image and router, plus the adapter-tracked
+    /// era. Re-attestation after a fault-void returns the live key; a
+    /// tainted image or a full key table refuses. A second live key for
+    /// an image whose key already converted refuses: sole-key
+    /// attributions cannot be re-examined.
+    /// Birth and closure are verified on top of this binding by
+    /// [`BootstrapReceipt::attest`].
+    pub(crate) fn bind_admitted_key(
+        &mut self,
+        admitted: &AdmittedInstanceCall,
+    ) -> Result<JournalDomainProof, AttestationRefusal> {
+        self.probe_admitted_key(admitted)?;
+        let (domain, image, router, caller) = admitted.journal_binding();
+        let key = JournalDomainKey {
+            domain_tag: domain.journal_tag(),
+            caller: caller.0,
+            cookie: image.task_cookie,
+            exec: image.exec_id,
+            router: router.get(),
+        };
         if !self.keys.contains_key(&key) {
-            if self.keys.len() >= self.limits.domain_keys {
-                return Err(AttestationRefusal::KeysExhausted);
-            }
             self.keys.insert(key, JournalDomainState::default());
             self.image_keys
                 .entry((key.cookie, key.exec))

@@ -4081,7 +4081,7 @@ mod finalizer_history_tests {
         }
         if already_prepared {
             coordinator.dispose_prepared_claims_s1();
-            while coordinator.stage_next_prepared_admission() {}
+            while coordinator.stage_next_prepared_admission(false) {}
             assert!(coordinator.finish_prepared_semantic_batch(&lane));
         }
         coordinator

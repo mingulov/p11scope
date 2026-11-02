@@ -21695,6 +21695,11 @@ impl Engine {
         if victims.is_empty() {
             return;
         }
+        // Rotation evicts views outside the candidate's `removed` set
+        // (they already left `self.views` during selection), so the
+        // unchanged-tick gate cannot see the displacement: committed pins
+        // no longer match what a rebuild would derive. Force the full path.
+        self.plan_rebuild_stable = false;
         #[cfg(test)]
         {
             let logged: Vec<(ProcessViewId, Option<u32>)> = victims

@@ -21438,6 +21438,38 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
     }
 }
 
+/// Rotation eviction displaces views outside the candidate's `removed` set
+/// (they already left `self.views` during selection), so the
+/// unchanged-tick gate cannot see the displacement: without clearing,
+/// a tick that evicts but admits nothing would fast-path on committed
+/// pins a rebuild would no longer derive.
+#[test]
+fn exploratory_eviction_clears_rebuild_stability() {
+    let sleeps = e06_spawn_sleeps(2);
+    let mut pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    pids.sort_unstable();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let victim = engine
+        .views
+        .iter()
+        .find(|view| engine.exploratory_evictable(view.id()))
+        .expect("a provider-free sleep view is evictable")
+        .id();
+    // Simulate the verified stability a converged commit would leave.
+    engine.plan_rebuild_stable = true;
+    engine.evict_exploratory_views(&BTreeSet::from([victim]));
+    assert!(
+        !engine.views.iter().any(|view| view.id() == victim),
+        "eviction displaced the victim"
+    );
+    assert!(
+        !engine.plan_rebuild_stable,
+        "rotation eviction forces the next tick onto the full rebuild path"
+    );
+}
+
 #[test]
 fn loader_only_pin_reuses_provider_plan() {
     use std::os::unix::fs::MetadataExt as _;

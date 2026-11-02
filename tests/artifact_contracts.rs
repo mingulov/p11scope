@@ -3037,9 +3037,10 @@ fn release_runs_every_python3_in_isolated_mode() {
         .match_indices("T4_TOOL_python3")
         .map(|(at, _)| &release[at..])
         .collect();
+    // Eleven since the official journal object gained its map-policy check.
     assert_eq!(
         sites.len(),
-        10,
+        11,
         "the pinned-interpreter call sites moved; re-check each one for -I"
     );
     for site in sites {

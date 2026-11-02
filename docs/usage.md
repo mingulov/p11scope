@@ -1380,6 +1380,13 @@ live-discovery loader/export probes are per-probe `perf_event` uprobes
 everywhere. Below 3, `CAP_BPF`+`CAP_PERFMON` suffice. The `PID namespace` row
 is described under [PID namespaces](#pid-namespaces).
 
+The `journal pair preflight` row preflights this build's production journal
+object: it reads `available` only when both journal roots are present and the
+object flavor is clean, and warns otherwise. `unavailable-in-build` is the
+expected reading on a build without the opt-in journal object, and
+`--extra-strict` lists exactly that value without counting it. The row loads
+nothing, seals nothing, and never enables linked mode.
+
 | Tier | Proven prefix | Meaning and loss |
 | --- | --- | --- |
 | T0 offline | host load/link preflight failed | Offline helper, inspect, and report work only; no live-call evidence. |

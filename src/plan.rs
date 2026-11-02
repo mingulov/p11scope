@@ -3428,16 +3428,12 @@ pub(crate) fn semantic_source_claims(
                 .iter()
                 .enumerate()
                 .any(|(index, table)| {
-                    let linked = module
-                        .scanned
-                        .interfaces
-                        .iter()
-                        .any(|interface| interface.table == Some(index));
-                    let walk = if linked {
-                        table.walk
-                    } else {
-                        published_walk(table, &exports)
-                    };
+                    let walk = published_walk(
+                        index,
+                        &module.scanned.tables,
+                        &module.scanned.interfaces,
+                        &exports,
+                    );
                     walk != "full" || table.unpinned.iter().any(|entry| affecting(&entry.subject))
                 })
         })
@@ -3775,15 +3771,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         // version, so the mislabelling quirk stays visible. A table an
         // interface record links keeps the raw decoder walk: one table
         // never publishes both `full` and `known_prefix`.
-        let linked = scanned
-            .interfaces
-            .iter()
-            .any(|interface| interface.table == Some(index));
-        let walk = if linked {
-            table.walk
-        } else {
-            published_walk(table, &exports)
-        };
+        let walk = published_walk(index, &scanned.tables, &scanned.interfaces, &exports);
         surfaces.push(SurfaceSummary {
             source: format!(
                 "{} table {}.{}",

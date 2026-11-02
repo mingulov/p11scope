@@ -253,6 +253,10 @@ attach::tests::collected_retirement_stopped_session_q_closes_original_lp64
 # cells above.
 attach::tests::sealed_session_drain_linkage_is_behavioral
 discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_serial_production_probe
+# Stamped-legacy surface cell: a legacy-only fixture whose 68-slot list is
+# stamped 3.0/3.1/3.2 (the Fedora SoftHSM 2.7 shape) decodes to a complete
+# surface with no surface gap. BPF-free; scan, pin, reconcile, plan, verdict.
+discovery::engine::tests::stamped_legacy_fixture_reports_no_surface_gap
 # T8 twin fullness control: the identical phase-1 arming with an empty
 # request map admits the same head with zero loss, proving the twin's
 # refusal pins the full blocked map rather than the head. Expected

@@ -2107,16 +2107,12 @@ impl CaptureFacts {
                 // A proven 68-slot prefix reports a full walk, like the plan.
                 // A table an interface record links keeps the raw decoder
                 // walk, like the plan: one table never publishes both.
-                let linked = module
-                    .scanned
-                    .interfaces
-                    .iter()
-                    .any(|interface| interface.table == Some(table_index));
-                let walk = if linked {
-                    table.walk
-                } else {
-                    published_walk(table, &exports)
-                };
+                let walk = published_walk(
+                    table_index,
+                    &module.scanned.tables,
+                    &module.scanned.interfaces,
+                    &exports,
+                );
                 let surface = (table.version, walk.to_string(), functions);
                 let surface_occurrence = surfaces.entry(surface.clone()).or_insert(0usize);
                 let scan_surface = SurfaceOccurrence::Scan {

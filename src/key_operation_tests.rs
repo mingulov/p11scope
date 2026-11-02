@@ -20246,3 +20246,110 @@ fn key_operation_lifecycle_reinitialize_successor_blocked_pending_sealed_era() {
         "no resurrection under reused words"
     );
 }
+
+/// Fail-visible C4: an ordered staging fallback ends the Joint feed and
+/// names that ending for its caller (`joint_fallback_<cause>`), so the
+/// section's `proof_refused_fallback` never stands without a cause.
+/// Staging itself, and an S1Only sibling, name nothing.
+#[test]
+fn key_operation_joint_ordered_fallback_names_its_cause() {
+    fn ended(guarded: &GuardedScene) -> Vec<(Option<CallerId>, String)> {
+        guarded
+            .registry
+            .gaps()
+            .iter()
+            .cloned()
+            .chain(guarded.registry.staged_gaps_for_test())
+            .filter(|gap| gap.subject == "Joint key operations unavailable; retained S1")
+            .map(|gap| (gap.caller, gap.reason))
+            .collect()
+    }
+    fn queued_joint(guarded: &mut GuardedScene, router: u64) -> (InstanceKey, RegistryInstanceId) {
+        let bootstrap = guarded.scene.bootstrap();
+        let key = guarded.key(router);
+        assert!(
+            guarded
+                .registry
+                .install_joint_receipt(key.clone(), bootstrap)
+        );
+        let (_, id) = guarded.register(router);
+        let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+        let (facts, position) = guarded.admit_shape(&init);
+        guarded.observe(&key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+        assert_eq!(
+            guarded.registry.feed_mode_for_test(id),
+            Some(FeedMode::Joint)
+        );
+        (key, id)
+    }
+
+    // No H8 owner with a queued call.
+    let mut guarded = GuardedScene::new();
+    let (key, id) = queued_joint(&mut guarded, 1);
+    let (_, sibling_id) = guarded.register(2);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(sibling_id),
+        Some(FeedMode::S1Only)
+    );
+    assert!(ended(&guarded).is_empty(), "staging ends nothing");
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, position) = guarded.admit_shape(&sign);
+    guarded.observe(&key, position, facts);
+    guarded.registry.publish();
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(id),
+        Some(FeedMode::S1Only)
+    );
+    assert_eq!(
+        ended(&guarded),
+        [(Some(guarded.caller), "joint_fallback_no_owner".to_string())],
+        "the ownerless fallback is named once, for its caller"
+    );
+
+    // A frozen byte pool refuses staging: Full.
+    let mut guarded = GuardedScene::new();
+    let (key, id) = queued_joint(&mut guarded, 1);
+    guarded.scene.adapter.ledger_mut().set_byte_limit(0);
+    let (facts, position) = guarded.admit_shape(&sign);
+    guarded.observe(&key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(id),
+        Some(FeedMode::S1Only)
+    );
+    assert_eq!(
+        ended(&guarded),
+        [(
+            Some(guarded.caller),
+            "joint_fallback_staging_full".to_string()
+        )],
+        "the capacity fallback is named once, for its caller"
+    );
+
+    // An unsealable call behind a queued call: ordered fallback first.
+    let mut guarded = GuardedScene::new();
+    let (key, id) = queued_joint(&mut guarded, 1);
+    let info = ShapedS1::shaped("C_GetSessionInfo", CkRv::OK.0, 0, 0);
+    let (facts, position) = guarded.admit_shape(&info);
+    guarded.observe(&key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(id),
+        Some(FeedMode::S1Only)
+    );
+    assert_eq!(
+        ended(&guarded),
+        [(
+            Some(guarded.caller),
+            "joint_fallback_unsealable".to_string()
+        )],
+        "the unsealable fallback is named once, for its caller"
+    );
+}

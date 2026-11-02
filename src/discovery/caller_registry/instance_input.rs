@@ -2247,16 +2247,14 @@ impl CallerRegistry {
                 }
             {
                 // Fail-visible: the seal failure that ended this Joint
-                // feed is named, so the section's `authority_lost` or
-                // `proof_refused_fallback` never stands without a cause.
-                self.record_gap(RegistryGap {
-                    caller: Some(caller),
-                    module: None,
-                    pid: None,
-                    subject: "Joint key operations unavailable; retained S1".into(),
-                    reason: format!("joint_seal_{gap:?}_{class}"),
-                    budget: None,
-                });
+                // feed is named. With the ordered staging fallback named
+                // in `fallback_joint_for_order`, every Joint ending
+                // carries a cause, so the section's `authority_lost` or
+                // `proof_refused_fallback` never stands without one.
+                self.record_gap(joint_ended_gap(
+                    caller,
+                    format!("joint_seal_{gap:?}_{class}"),
+                ));
             }
             if !was_joint && matches!(&outcome, FailureBatchProgress::NegativeDelivered(_)) {
                 // A negative-only history still publishes the canonical
@@ -2889,11 +2887,21 @@ impl CallerRegistry {
                     StageAction::Staged => return Ok(0),
                     StageAction::CarveOut => {}
                     StageAction::FallbackUncounted => {
-                        fallback_refused = self.fallback_joint_for_order(id, Some(ledger));
+                        fallback_refused = self.fallback_joint_for_order(
+                            id,
+                            input.caller,
+                            "unsealable",
+                            Some(ledger),
+                        );
                     }
                     StageAction::FallbackCounted => {
                         self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
-                        fallback_refused = self.fallback_joint_for_order(id, Some(ledger));
+                        fallback_refused = self.fallback_joint_for_order(
+                            id,
+                            input.caller,
+                            "staging_full",
+                            Some(ledger),
+                        );
                     }
                     StageAction::Drop => {
                         self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
@@ -2915,7 +2923,8 @@ impl CallerRegistry {
                     .staged_len()
                     > 0;
                 if queued {
-                    fallback_refused = self.fallback_joint_for_order(id, None);
+                    fallback_refused =
+                        self.fallback_joint_for_order(id, input.caller, "no_owner", None);
                 }
             }
         }
@@ -2945,10 +2954,15 @@ impl CallerRegistry {
     /// Ordered fallback for one Joint feed (C4): replay queued calls
     /// S1-direct in original order, degrade to S1Only, decrement the
     /// Joint count. Capture-wide accounting stays active for terminals.
-    /// Returns fallback per-edge bound refusals.
+    /// Fail-visible: the ending is named for `caller` as
+    /// `joint_fallback_<cause>` (`unsealable`, `staging_full`,
+    /// `no_owner`), so its `proof_refused_fallback` never stands without
+    /// a cause. Returns fallback per-edge bound refusals.
     fn fallback_joint_for_order(
         &mut self,
         id: RegistryInstanceId,
+        caller: CallerId,
+        cause: &'static str,
         ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> u64 {
         let mut outer = NoSink;
@@ -2970,6 +2984,7 @@ impl CallerRegistry {
         );
         debug_assert_eq!(feed.mode(), FeedMode::S1Only);
         self.joint_feeds = self.joint_feeds.saturating_sub(1);
+        self.record_gap(joint_ended_gap(caller, format!("joint_fallback_{cause}")));
         refused
     }
 
@@ -3450,6 +3465,20 @@ impl ConversionRefusal {
     /// object proof relies on, so it stays loss.
     pub(crate) const fn disposes_h3_position(self) -> bool {
         matches!(self, Self::CountOnlyIrrelevant)
+    }
+}
+
+/// The disclosure for one ended Joint feed: S1 stays, Joint key
+/// operations for `caller` are unavailable, and `reason` names the
+/// ending (`joint_seal_*` or `joint_fallback_*`).
+fn joint_ended_gap(caller: CallerId, reason: String) -> RegistryGap {
+    RegistryGap {
+        caller: Some(caller),
+        module: None,
+        pid: None,
+        subject: "Joint key operations unavailable; retained S1".into(),
+        reason,
+        budget: None,
     }
 }
 

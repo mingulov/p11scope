@@ -104,12 +104,26 @@ observations by recorded application path and module content; `--json` and
 Counts describe independent windows, and absence does not prove removal.
 See [offline comparison examples](docs/usage.md#offline-inventory-comparison).
 
+Two newer flags extend those commands. `--track-short-lived` (profile and run,
+default off) is extensive mode: the kernel records exec-time executable identity
+so unmatched exits gain bounded static-linkage hints, arming only on Detailed
+profile `--cgroup`/`--system` captures and refused beside `--counter-mode`
+([options](docs/usage.md#more-capture-options)). `--prearm-module
+<provider.so>` (profile, trace, run, inventory; repeatable) pins a provider file
+before any mapping and pre-arms its proved offsets; under inventory the inputs
+are pinned and retained while Detailed-subset activation still follows
+([pre-arming](docs/usage.md#pre-arming-providers-with---prearm-module)).
+
 Development inventory also accepts `--cgroup /sys/fs/cgroup/owned.scope`, including
 descendants, across scan/auto/native and the existing output modes. Discovery
 retains the selected root, requires initial PID numbering with matching procfs,
 and reports bounded partial work explicitly. Quiet cgroup usage remains unknown;
 endpoint membership samples do not prove continuous residency. Scoped native
-owner admission is still deferred; useful scan-pinned facts remain available.
+owner admission runs on `--cgroup` with `--capture auto` or `native`: while the
+native lane stays active, each completed cgroup transaction commits at most one
+staged native owner under its final-sample permit (activations first, refreshes
+after), and members that miss the permit or the transaction keep scan-pinned
+fallback. `--capture scan` starts no native lane, so nothing commits there.
 Public live cgroup qualification remains a development gate.
 
 ## Building from source

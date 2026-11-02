@@ -502,7 +502,14 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin 6641123f, the async control value flags: the default Detailed
+      # Pin 55101d3c, the journal READY writer (picked 54693889) plus its
+      # comment corrections: the default Detailed object differs from 6641123f
+      # only in .debug_line (comment-only edits in instance_epoch.c and
+      # journal_marker.h change their DWARF source checksums); both Inventory
+      # objects are byte-identical. The journal object, which this gate does
+      # not compare, gains p11_instance_exec_birth and its exec-root call.
+      # No other BPF input changed since 6641123f.
+      # Earlier pin 6641123f, the async control value flags: the default Detailed
       # object marks an unreadable C_AsyncJoin id argument at entry and an OK
       # C_AsyncGetID with a null output pointer at return as
       # ASYNC_VALUE_UNREADABLE (p11_entry +32 B, ordinary_return +160 B,
@@ -557,7 +564,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=6641123fdbd29a600da4f41b058afa6e6cd9c9fd
+          BASELINE=55101d3ca96b398ebca4f85f9e18eca058bb7a05
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

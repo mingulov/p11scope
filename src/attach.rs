@@ -676,6 +676,46 @@ fn validate_policy_maps(ebpf: &Ebpf, object_has_unsafe: bool) -> Result<()> {
     Ok(())
 }
 
+/// I4: the PID witness map verdict behind `validate_pid_start_tick_map`:
+/// a Detailed session requires the map exactly when this build enabled
+/// the birth marker; counter banks forbid it independently of the
+/// Detailed build selection.
+fn pid_start_tick_verdict(present: bool, roots: StaticRoots, expected: bool) -> Result<()> {
+    const NAME: &str = "PID_START_TICK";
+    match (roots, expected, present) {
+        (StaticRoots::CounterBanks, _, true) => {
+            bail!("{NAME} present in a counter bank object")
+        }
+        (StaticRoots::CounterBanks, _, false) | (StaticRoots::Detailed, false, false) => Ok(()),
+        (StaticRoots::Detailed, false, true) => {
+            bail!("{NAME} present in a marker-off Detailed object (stale build)")
+        }
+        (StaticRoots::Detailed, true, false) => {
+            bail!("{NAME} missing from the Detailed object (stale build)")
+        }
+        (StaticRoots::Detailed, true, true) => Ok(()),
+    }
+}
+
+/// I4: requires `PID_START_TICK` exactly when this build enabled the
+/// birth marker on Detailed roots, and validates its exact metadata.
+/// A present map always validates exactly; absence is decided by the
+/// verdict above.
+fn validate_pid_start_tick_map(ebpf: &Ebpf, roots: StaticRoots) -> Result<()> {
+    const NAME: &str = "PID_START_TICK";
+    let expected = cfg!(p11scope_birth_marker);
+    let map = ebpf.map(NAME);
+    pid_start_tick_verdict(map.is_some(), roots, expected)?;
+    if let Some(map) = map {
+        validate_map_metadata(
+            NAME,
+            policy_map_data(NAME, map)?,
+            map_metadata(MapType::Hash, 4, 8, 1_024, BPF_F_RDONLY_PROG),
+        )?;
+    }
+    Ok(())
+}
+
 fn freeze_map(name: &str, map: &Map) -> Result<()> {
     let data = if IDENTITY_MAPS
         .iter()
@@ -7024,6 +7064,8 @@ impl Session {
                 SessionPreparation::ValidatePolicy => {
                     validate_policy_maps(&ebpf, object_has_unsafe)
                         .context("validating exact policy-map metadata")?;
+                    validate_pid_start_tick_map(&ebpf, roots)
+                        .context("validating exact PID witness map metadata")?;
                     if journal {
                         journal::validate_journal_maps(&ebpf)
                             .context("validating exact journal map metadata")?;
@@ -7138,6 +7180,14 @@ impl Session {
                 }
                 SessionPreparation::FreezePublished => {
                     freeze_published_maps(&ebpf).context("freezing published policy maps")?;
+                    // I4: the witness content publishes at PublishScope
+                    // above; freeze it with the published maps exactly when
+                    // this build binds births. Validation already required
+                    // the map here, so a miss errors loudly.
+                    if roots == StaticRoots::Detailed && cfg!(p11scope_birth_marker) {
+                        let map = ebpf.map("PID_START_TICK").context("PID_START_TICK map")?;
+                        freeze_map("PID_START_TICK", map)?;
+                    }
                 }
                 SessionPreparation::SelectScope => {
                     uprobe_scope = if let Some(pin) = selected {
@@ -10491,6 +10541,58 @@ mod tests {
         publish_object_descriptors,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn pid_start_tick_detailed_marker_present_accepts() {
+        // I4: a marker Detailed session over an object carrying the
+        // witness map validates it; the freeze seals it before any link.
+        super::pid_start_tick_verdict(true, super::StaticRoots::Detailed, true)
+            .expect("present witness accepts");
+    }
+
+    #[test]
+    fn pid_start_tick_detailed_marker_absent_refuses() {
+        // I4: a marker Detailed object without the map is a stale
+        // build; the session refuses instead of binding blind.
+        assert!(super::pid_start_tick_verdict(false, super::StaticRoots::Detailed, true).is_err());
+    }
+
+    #[test]
+    fn pid_start_tick_detailed_marker_off_absent_accepts() {
+        // I4: a Detailed build compiled without birth markers accepts
+        // their absence.
+        super::pid_start_tick_verdict(false, super::StaticRoots::Detailed, false)
+            .expect("a marker-off Detailed object without the map accepts");
+    }
+
+    #[test]
+    fn pid_start_tick_detailed_marker_off_present_refuses() {
+        // I4: a marker-off Detailed object carrying the map is a stale
+        // build; the session refuses instead of trusting it.
+        assert!(super::pid_start_tick_verdict(true, super::StaticRoots::Detailed, false).is_err());
+    }
+
+    #[test]
+    fn pid_start_tick_counter_present_refuses() {
+        // I4: counter bank objects must not carry the witness map,
+        // whatever the Detailed build selection is.
+        for expected in [false, true] {
+            assert!(
+                super::pid_start_tick_verdict(true, super::StaticRoots::CounterBanks, expected)
+                    .is_err(),
+                "counter banks with the map refuse (marker {expected})"
+            );
+        }
+    }
+
+    #[test]
+    fn pid_start_tick_counter_absent_accepts() {
+        // I4: the healthy counter twin of the refusal above.
+        for expected in [false, true] {
+            super::pid_start_tick_verdict(false, super::StaticRoots::CounterBanks, expected)
+                .expect("counter banks without the map accept");
+        }
+    }
 
     #[test]
     fn return_admission_guards_cover_real_link_mutations_and_preserve_entry_only_paths() {

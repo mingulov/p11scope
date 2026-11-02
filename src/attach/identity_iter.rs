@@ -1976,9 +1976,12 @@ impl Drop for MappedChild {
 /// Fork a child that maps `paths` executable and reports the addresses.
 ///
 /// Fork-safety: the child touches only async-signal-safe calls (`open`,
-/// `mmap`, `close`, `write`, `pause`, `_exit`) and read-only inherited
+/// `mmap`, `close`, `write`, `pause`, `_exit`, plus a test-only
+/// parent-death arm: `prctl`, `getppid`) and read-only inherited
 /// memory (the pre-fork `CString`s); it never allocates, never touches a
-/// Rust lock, and never returns into the test harness. Failure modes exit
+/// Rust lock, and never returns into the test harness. The arm is
+/// `#[cfg(test)]` (every current caller is a test cell), so release
+/// builds keep the exact old child. Failure modes exit
 /// 11 (`open`), 12 (`mmap`), or 13 (report), which the parent reads back
 /// from the exit status on EOF. The parent reads exactly one address per
 /// path: the child either reports all of them or dies first, so the read
@@ -2002,6 +2005,11 @@ pub fn spawn_exec_mapping_child(paths: &[PathBuf]) -> io::Result<MappedChild> {
     }
     // SAFETY: `fork` in a multithreaded parent is sound when the child
     // issues only async-signal-safe calls and `_exit`s (documented above).
+    // Test-only parent-death owner (same body as
+    // `crate::fixture_guard::DieWithParent` below): `#[cfg(test)]` keeps
+    // release behavior identical.
+    #[cfg(test)]
+    let owner = std::process::id();
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let error = io::Error::last_os_error();
@@ -2012,6 +2020,15 @@ pub fn spawn_exec_mapping_child(paths: &[PathBuf]) -> io::Result<MappedChild> {
         return Err(error);
     }
     if pid == 0 {
+        #[cfg(test)]
+        unsafe {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                libc::_exit(127);
+            }
+            if libc::getppid() != owner as libc::pid_t {
+                libc::_exit(127);
+            }
+        }
         unsafe {
             libc::close(pipe[0]);
             for cpath in &cpaths {
@@ -2112,6 +2129,11 @@ pub fn spawn_pause_children(count: u32) -> io::Result<Vec<MappedChild>> {
     if count == 0 {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
+    // Test-only parent-death owner (same body as
+    // `crate::fixture_guard::DieWithParent` below): `#[cfg(test)]` keeps
+    // release behavior identical.
+    #[cfg(test)]
+    let owner = std::process::id();
     let mut children = Vec::with_capacity(count as usize);
     for _ in 0..count {
         // SAFETY: like `spawn_exec_mapping_child`, but the child pauses
@@ -2121,6 +2143,15 @@ pub fn spawn_pause_children(count: u32) -> io::Result<Vec<MappedChild>> {
             return Err(io::Error::last_os_error());
         }
         if pid == 0 {
+            #[cfg(test)]
+            unsafe {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    libc::_exit(127);
+                }
+                if libc::getppid() != owner as libc::pid_t {
+                    libc::_exit(127);
+                }
+            }
             unsafe {
                 loop {
                     libc::pause();
@@ -8145,6 +8176,69 @@ mod tests {
             let gone = unsafe { libc::kill(child.pid() as libc::pid_t, 0) };
             assert_ne!(gone, 0, "child {} is reaped", child.pid());
         }
+    }
+
+    /// A mapping child must die with its spawner: without the
+    /// parent-death arm it parks in `pause()` forever after reporting
+    /// once its spawner is gone. A helper thread plays the spawner;
+    /// only the arm can kill the forgotten child.
+    #[test]
+    fn exec_mapping_child_dies_with_spawning_thread() {
+        // The mapped fixture stays alive until the test ends.
+        let (recorded, _dir) = std::thread::spawn(|| {
+            let dir = probe_tempdir();
+            let fixture = write_probe_fixture(dir.path()).expect("fixture");
+            let paths = [&fixture.hardlink, &fixture.b, &fixture.copy];
+            let child = spawn_exec_mapping_child(&paths.map(std::path::PathBuf::from))
+                .expect("the mapping child spawns");
+            let pid = child.pid();
+            let start = crate::process::process_start_time(pid)
+                .expect("the mapping child has a start time");
+            let recorded = vec![(pid, start)];
+            std::mem::forget(child);
+            (recorded, dir)
+        })
+        .join()
+        .expect("the spawner thread joins");
+        let survivors = crate::fixture_guard::poll_descendants_gone(
+            &recorded,
+            std::time::Duration::from_secs(2),
+        );
+        crate::fixture_guard::cleanup_descendants(&recorded);
+        assert!(
+            survivors.is_empty(),
+            "the mapping child {recorded:?} outlived its spawner"
+        );
+    }
+
+    /// Pause children must die with their spawner: without the
+    /// parent-death arm they park in `pause()` forever once their
+    /// spawner is gone. A helper thread plays the spawner; only the
+    /// arm can kill the forgotten children.
+    #[test]
+    fn pause_children_die_with_spawning_thread() {
+        let recorded = std::thread::spawn(|| {
+            let children = spawn_pause_children(2).expect("spawn 2");
+            let mut recorded = Vec::with_capacity(children.len());
+            for child in &children {
+                let start = crate::process::process_start_time(child.pid())
+                    .expect("the pause child has a start time");
+                recorded.push((child.pid(), start));
+            }
+            std::mem::forget(children);
+            recorded
+        })
+        .join()
+        .expect("the spawner thread joins");
+        let survivors = crate::fixture_guard::poll_descendants_gone(
+            &recorded,
+            std::time::Duration::from_secs(2),
+        );
+        crate::fixture_guard::cleanup_descendants(&recorded);
+        assert!(
+            survivors.is_empty(),
+            "the pause children {recorded:?} outlived their spawner"
+        );
     }
 
     /// Small-scale whole-system shape (privileged): 32 pause children, 3

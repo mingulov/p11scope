@@ -40,6 +40,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
 
 /// Retained children held across both snapshots: a sustained multi-child
 /// population without host-cost excess. The 256-request pressure shape is
@@ -103,6 +104,7 @@ fn spawn_loaded(driver: &Path, provider: &Path) -> support::ChildGuard {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );

@@ -36,6 +36,8 @@ use std::time::{Duration, Instant};
 #[allow(dead_code)]
 mod support;
 
+use support::DieWithParent as _;
+
 const NO_TABLE_MARKER: &str = "no function table was found in its file-backed data";
 const REGISTRY_FACTORIES: [&str; 5] = [
     "C_GetFunctionList",
@@ -298,6 +300,7 @@ impl HeldDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        command.die_with_parent();
         let mut guard = support::ChildGuard::new(command.spawn().unwrap());
         let stdin = guard.child.stdin.take();
         let stderr = guard.child.stderr.take().unwrap();

@@ -39,6 +39,7 @@ use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
 
 fn tmpdir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -242,6 +243,7 @@ impl Barrier {
                 .env_clear()
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
+                .die_with_parent()
                 .spawn()
                 .expect("start the owned loader behind its pre-load barrier"),
         );
@@ -317,6 +319,7 @@ fn sleep_child() -> support::ChildGuard {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     )

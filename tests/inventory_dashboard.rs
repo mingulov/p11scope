@@ -12,6 +12,10 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
+
+#[allow(dead_code)]
+mod support;
 
 fn tmp(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -88,6 +92,7 @@ impl Driver {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);

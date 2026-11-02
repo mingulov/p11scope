@@ -26,6 +26,19 @@ struct ZombieLeaderGroup {
 /// The raw-clone survivor: reports its TID over the pipe (whose write end
 /// arrives as the argument), then parks in `pause()`. Raw syscalls only.
 extern "C" fn clone_survivor_main(arg: *mut std::ffi::c_void) -> libc::c_int {
+    // Parent-death guard (same body as
+    // `crate::fixture_guard::DieWithParent`, with the owner from the
+    // pre-fork store): a test that dies abruptly must not strand the
+    // parking survivor. Async-signal-safe: atomic load, prctl, getppid.
+    let owner = crate::fixture_guard::SURVIVOR_OWNER_PID.load(std::sync::atomic::Ordering::Acquire);
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+            libc::_exit(127);
+        }
+        if libc::getppid() != owner as libc::pid_t {
+            libc::_exit(127);
+        }
+    }
     let wfd = arg as usize as libc::c_int;
     let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
     let bytes = tid.to_ne_bytes();
@@ -92,6 +105,10 @@ impl ZombieLeaderGroup {
         );
         // SAFETY: the child only makes raw syscalls (close, clone, exit) on
         // the COW-inherited stacks and pipe; no allocator, no pthread, no locks.
+        // The survivor's parent-death owner, stored before the fork it
+        // inherits (see `SURVIVOR_OWNER_PID`).
+        crate::fixture_guard::SURVIVOR_OWNER_PID
+            .store(std::process::id(), std::sync::atomic::Ordering::Release);
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
@@ -261,6 +278,7 @@ fn zombie_group_without_live_member_is_exited_at_sweep_seam() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .expect("sleep spawns");
     let mut io = OsConfirmIo::default();
@@ -281,6 +299,7 @@ fn zombie_group_without_live_member_is_exited_at_sweep_seam() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .expect("sleep spawns");
     let pid = dead.id();
@@ -471,6 +490,10 @@ impl ZombieMapperGroup {
         );
         // SAFETY: the child only calls open/fstat/mmap/write/close/clone
         // and exit on COW memory; no allocator, no pthread, no locks.
+        // The survivor's parent-death owner, stored before the fork it
+        // inherits (see `SURVIVOR_OWNER_PID`).
+        crate::fixture_guard::SURVIVOR_OWNER_PID
+            .store(std::process::id(), std::sync::atomic::Ordering::Release);
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
@@ -1304,10 +1327,21 @@ impl HelperHeldZombie {
         );
         // SAFETY: the child only runs the fork-safe group spawn, one
         // pipe write, and `pause()`; no pthread, no locks.
+        let owner = std::process::id();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "helper fork failed");
         if pid == 0 {
             unsafe {
+                // Parent-death guard (same body as
+                // `crate::fixture_guard::DieWithParent`): the helper
+                // parks in `pause()` below, and a spawner already gone
+                // exits before spawning the inner group.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    libc::_exit(127);
+                }
+                if libc::getppid() != owner as libc::pid_t {
+                    libc::_exit(127);
+                }
                 libc::close(pipes[0]);
             }
             let (tgid, survivors) = ZombieLeaderGroup::spawn_inner(1);
@@ -1618,6 +1652,7 @@ fn privileged_d4_btrfs_zombie_cold_admission_backend_parity() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .expect("sleep spawns");
     let live_id = adapter
@@ -2111,6 +2146,10 @@ impl BlockedChild {
         // SAFETY: the child only reads one go byte, mmaps a stack,
         // clones, and exits its leader thread; no allocator, no
         // pthread, no locks.
+        // The survivor's parent-death owner, stored before the fork it
+        // inherits (see `SURVIVOR_OWNER_PID`).
+        crate::fixture_guard::SURVIVOR_OWNER_PID
+            .store(std::process::id(), std::sync::atomic::Ordering::Release);
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "blocked fork failed");
         if pid == 0 {
@@ -2239,6 +2278,114 @@ impl Drop for WarmViewZombie {
             }
         }
     }
+}
+
+/// A zombie-leader group must die with its spawner: without the
+/// survivor's parent-death arm the parked survivor keeps the group
+/// alive forever once its spawner is gone (this covers `spawn`,
+/// `spawn_two` and `spawn_inner`: one clone entry). A helper thread
+/// plays the spawner; only the arm can kill the forgotten group.
+#[test]
+fn zombie_leader_group_dies_with_spawning_thread() {
+    let recorded = std::thread::spawn(|| {
+        let group = ZombieLeaderGroup::spawn();
+        let start = crate::process::process_start_time(group.tgid)
+            .expect("the group leader has a start time");
+        let recorded = vec![(group.tgid, start)];
+        std::mem::forget(group);
+        recorded
+    })
+    .join()
+    .expect("the spawner thread joins");
+    let survivors =
+        crate::fixture_guard::poll_descendants_gone(&recorded, std::time::Duration::from_secs(2));
+    crate::fixture_guard::cleanup_descendants(&recorded);
+    assert!(
+        survivors.is_empty(),
+        "the zombie-leader group {recorded:?} outlived its spawner"
+    );
+}
+
+/// A zombie mapper group must die with its spawner: without the
+/// survivor's parent-death arm the parked survivor keeps the group
+/// alive forever once its spawner is gone. A helper thread plays the
+/// spawner; only the arm can kill the forgotten group.
+#[test]
+fn zombie_mapper_group_dies_with_spawning_thread() {
+    // The mapped fixture stays alive until the test ends.
+    let (recorded, _dir) = std::thread::spawn(|| {
+        let dir = tempfile::tempdir().expect("mapper fixture tempdir creates");
+        let held = dir.path().join("held");
+        std::fs::write(&held, b"mapper-group startups\n").expect("held fixture writes");
+        let group = ZombieMapperGroup::spawn(&held, true);
+        let start = crate::process::process_start_time(group.tgid)
+            .expect("the group leader has a start time");
+        let recorded = vec![(group.tgid, start)];
+        std::mem::forget(group);
+        (recorded, dir)
+    })
+    .join()
+    .expect("the spawner thread joins");
+    let survivors =
+        crate::fixture_guard::poll_descendants_gone(&recorded, std::time::Duration::from_secs(2));
+    crate::fixture_guard::cleanup_descendants(&recorded);
+    assert!(
+        survivors.is_empty(),
+        "the zombie mapper group {recorded:?} outlived its spawner"
+    );
+}
+
+/// A helper-held zombie must die with its spawner: both the parking
+/// helper and the inner survivor need their own parent-death arm, or
+/// one of the two parks forever once the spawner is gone. A helper
+/// thread plays the spawner; only the arms can kill the forgotten
+/// helper and group.
+#[test]
+fn helper_held_zombie_dies_with_spawning_thread() {
+    let recorded = std::thread::spawn(|| {
+        let group = HelperHeldZombie::spawn();
+        let helper_start =
+            crate::process::process_start_time(group.helper).expect("the helper has a start time");
+        let leader_start = crate::process::process_start_time(group.tgid)
+            .expect("the group leader has a start time");
+        let recorded = vec![(group.helper, helper_start), (group.tgid, leader_start)];
+        std::mem::forget(group);
+        recorded
+    })
+    .join()
+    .expect("the spawner thread joins");
+    let survivors =
+        crate::fixture_guard::poll_descendants_gone(&recorded, std::time::Duration::from_secs(2));
+    crate::fixture_guard::cleanup_descendants(&recorded);
+    assert!(
+        survivors.is_empty(),
+        "the helper-held zombie {recorded:?} outlived its spawner"
+    );
+}
+
+/// A go-gated zombie group must die with its spawner: without the
+/// survivor's parent-death arm the parked survivor keeps the group
+/// alive forever once its spawner is gone. A helper thread plays the
+/// spawner; only the arm can kill the forgotten group.
+#[test]
+fn blocked_child_group_dies_with_spawning_thread() {
+    let recorded = std::thread::spawn(|| {
+        let group = BlockedChild::fork().release();
+        let start = crate::process::process_start_time(group.tgid)
+            .expect("the group leader has a start time");
+        let recorded = vec![(group.tgid, start)];
+        std::mem::forget(group);
+        recorded
+    })
+    .join()
+    .expect("the spawner thread joins");
+    let survivors =
+        crate::fixture_guard::poll_descendants_gone(&recorded, std::time::Duration::from_secs(2));
+    crate::fixture_guard::cleanup_descendants(&recorded);
+    assert!(
+        survivors.is_empty(),
+        "the go-gated zombie group {recorded:?} outlived its spawner"
+    );
 }
 
 /// A view retained from while the leader lived scans the survivor's

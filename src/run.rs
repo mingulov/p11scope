@@ -8476,6 +8476,7 @@ mod cancellation_tests;
 mod tests {
     use super::*;
     use crate::attach::BackendSelection;
+    use crate::fixture_guard::DieWithParent as _;
     use std::ffi::OsString;
     use std::os::fd::{AsFd as _, BorrowedFd};
     use std::os::unix::fs::PermissionsExt as _;
@@ -17302,6 +17303,7 @@ mod tests {
                 .env(G7_SLEEPER_ENV, &sleeper)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                .die_with_parent()
                 .spawn()
                 .expect("spawning the fresh-registry observer run");
             // Bounded wait mirroring the fork-child reap: a wedged run
@@ -19224,6 +19226,7 @@ mod trace_identity_consumer_tests {
     use crate::attach::detailed_identity::ProofSession;
     use crate::discovery::engine::tests::detailed_proof_driver as driver;
     use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
+    use crate::fixture_guard::DieWithParent as _;
     use crate::trace_identity::TraceIdentityStore;
     use p11scope_ebpf_common::{Event, ImageIdentity, capture, event_type};
 
@@ -19645,6 +19648,7 @@ mod trace_identity_consumer_tests {
                 .args([std::ffi::OsStr::new("old"), successor.as_os_str()])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
+                .die_with_parent()
                 .spawn()
                 .unwrap();
             let mut owned = Self {

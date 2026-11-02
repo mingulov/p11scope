@@ -4,6 +4,7 @@
 use super::*;
 use crate::attach::image_query::{CompleteEpochs, acquire_test_scan};
 use crate::discovery::instances::MapRange;
+use crate::fixture_guard::DieWithParent as _;
 use p11scope_ebpf_common::{InstanceStamp, instance};
 
 mod current_receipts_tests {
@@ -4588,6 +4589,7 @@ mod authority_controls {
             let child = Self(
                 std::process::Command::new("sleep")
                     .arg("30")
+                    .die_with_parent()
                     .spawn()
                     .unwrap(),
             );

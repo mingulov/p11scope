@@ -94,6 +94,7 @@ mod tests {
     use super::super::PidPin;
     use super::*;
     use crate::caller_metadata::acquisition::{NumericAbsence, SampleValidity};
+    use crate::fixture_guard::DieWithParent as _;
     use std::time::Duration;
 
     fn generous_deadline() -> Instant {
@@ -144,6 +145,7 @@ mod tests {
     fn retained_exited_original_withholds() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
+            .die_with_parent()
             .spawn()
             .expect("sleep child");
         let pin = PidPin::open(child.id()).expect("child pin");

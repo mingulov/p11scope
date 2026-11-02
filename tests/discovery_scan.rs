@@ -21,6 +21,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 mod support;
 
+use support::DieWithParent as _;
+
 fn serial_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD
@@ -1163,6 +1165,7 @@ fn the_per_capture_byte_cap_accumulates_across_objects() {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );

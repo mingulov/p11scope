@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
+
+#[allow(dead_code)]
+mod support;
 
 #[path = "support/multi_host.rs"]
 mod multi_host;
@@ -161,6 +165,7 @@ fn ready_pid(ready_file: &Path) -> u32 {
 /// deadlocks a 64 KiB pipe nobody drains mid-run.
 fn spawn_with_peak(cmd: &mut Command, stderr_log: &Path) -> (std::process::Output, u64) {
     cmd.stderr(std::fs::File::create(stderr_log).unwrap());
+    cmd.die_with_parent();
     let mut child = cmd.spawn().unwrap();
     let pid = child.id();
     let mut peak = 0u64;
@@ -964,6 +969,7 @@ fn slow_stdout_reader_gets_exact_bytes() {
         // `cmd` drops here: the parent's copy of the child's stderr
         // file must not outlive the spawn (the FD scope below counts
         // it otherwise).
+        cmd.die_with_parent();
         cmd.spawn().unwrap()
     };
     let pid = child.id();
@@ -1160,6 +1166,7 @@ fn sigkill_mid_run_leaves_no_partial_report() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(std::fs::File::create(&stderr_log).unwrap())
+        .die_with_parent()
         .spawn()
         .unwrap();
     // Passes tick every second; at 4s the run is mid-observation with

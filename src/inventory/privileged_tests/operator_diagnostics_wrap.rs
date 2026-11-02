@@ -114,6 +114,7 @@ impl WrapWorkload {
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&out)?)
             .stderr(std::fs::File::create(dir.path().join("workload.err"))?)
+            .die_with_parent()
             .spawn()?;
         let process = LedgerProcess { child, out };
         process.wait_for("{\"event\":\"prepared\",", Duration::from_secs(5))?;
@@ -157,6 +158,7 @@ impl WrapWorkload {
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&out)?)
             .stderr(std::fs::File::create(dir.path().join("workload.err"))?)
+            .die_with_parent()
             .spawn()?;
         let process = LedgerProcess { child, out };
         process.wait_for("{\"event\":\"prepared\",", Duration::from_secs(5))?;

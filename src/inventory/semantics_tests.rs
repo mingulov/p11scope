@@ -7,6 +7,7 @@ use crate::discovery::engine::inventory_coordinator::semantics::{
 };
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
 use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
+use crate::fixture_guard::DieWithParent as _;
 use crate::inventory_semantics::{
     AttestedSubset, LaneDrainOutcome, SemanticCaptureStatus, SemanticCaptureSummary,
     SemanticRefusal, SemanticStopIo, SemanticStopQuiescence,
@@ -7270,6 +7271,7 @@ impl H6Child {
         let mut child = Self(
             std::process::Command::new("/bin/sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );

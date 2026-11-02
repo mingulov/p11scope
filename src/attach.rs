@@ -10783,6 +10783,7 @@ pub(crate) use tests::CollectedFinishQObserverForTest;
 mod tests {
     use super::publish_and_freeze_object_descriptors_with;
     use crate::attach::capture::NativeDomainId;
+    use crate::fixture_guard::DieWithParent as _;
     use crate::inventory_semantics::SemanticRefusal;
     use p11scope_ebpf_common::object_wire::{
         OBJECT_ACTION_ACCESS, OBJECT_ACTION_COPY, ObjectDescriptorWire, none_object_wire,
@@ -20158,6 +20159,7 @@ mod tests {
                 .arg(std::process::id().to_string())
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
+                .die_with_parent()
                 .spawn()?;
             let stdout = child.stdout.take().context("fixture output pipe")?;
             let mut cell = Self {

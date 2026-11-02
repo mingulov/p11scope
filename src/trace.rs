@@ -471,6 +471,7 @@ impl Tracer {
 mod trace_identity_renderer_tests {
     use super::*;
     use crate::discovery::engine::tests::detailed_proof_driver::verified_fixture_with_link;
+    use crate::fixture_guard::DieWithParent as _;
     use crate::trace_identity::TraceIdentityStore;
 
     fn event(key: ProcessKey, ts_ns: u64) -> Event {
@@ -649,6 +650,7 @@ with tempfile.TemporaryDirectory() as raw:
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );

@@ -8931,6 +8931,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::discovery::caller_registry::OsProcessSource;
     use crate::discovery::native_binding::{BoundImage, OwnerImages, ScanOnlyIdentity};
+    use crate::fixture_guard::DieWithParent as _;
     use p11scope_ebpf_common::ImageIdentity;
     use std::cell::Cell;
 
@@ -9635,6 +9636,7 @@ pub(crate) mod tests {
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
+                    .die_with_parent()
                     .spawn()
                     .unwrap(),
             );
@@ -10118,6 +10120,7 @@ pub(crate) mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );
@@ -10421,6 +10424,7 @@ pub(crate) mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let pid = child.id();
@@ -10563,6 +10567,7 @@ pub(crate) mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let driver_pid = child.id();
@@ -10695,6 +10700,7 @@ pub(crate) mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap();
         let driver_pid = child.id();
@@ -12405,6 +12411,7 @@ pub(crate) mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap();
         limit.restore();
@@ -12577,6 +12584,7 @@ exit 0
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(reaper_stderr))
+            .die_with_parent()
             .spawn()
             .unwrap();
         OrphanTwin {

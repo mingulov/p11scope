@@ -18,6 +18,7 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
 
 fn tmp(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -73,6 +74,7 @@ fn spawn_loaded(driver: &Path, provider: &Path) -> support::ChildGuard {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );

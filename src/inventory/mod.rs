@@ -8126,6 +8126,8 @@ pub(crate) fn render_text<Source: ProcessSource>(
 
 #[cfg(test)]
 mod tests {
+    use crate::fixture_guard::DieWithParent as _;
+
     #[test]
     fn owner_terminal_error_preserves_primary_and_typed_interruption() {
         let error = super::combine_semantic_terminal_errors(
@@ -8176,8 +8178,18 @@ mod tests {
             .env("P11SCOPE_CGROUP_STOP_TEST_CHILD", "1")
             .env("P11SCOPE_CGROUP_STOP_FD", fd.to_string());
         // Only the selected socket is inherited by this isolated test child.
+        // The parent-death guard is inlined: a second pre_exec hook would
+        // replace this fd-passing hook (same body as
+        // `crate::fixture_guard::DieWithParent`).
+        let owner = std::process::id();
         unsafe {
             command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != owner as libc::pid_t {
+                    libc::_exit(127);
+                }
                 if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -9671,6 +9683,7 @@ mod tests {
                 .stdin(Stdio::from(slave.try_clone().unwrap()))
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );
@@ -9826,7 +9839,7 @@ mod tests {
                     "--nocapture", "--test-threads=1"])
                 .env("P11SCOPE_NAMESPACE_OUTPUT_CHILD", dir.path())
                 .stdin(Stdio::from(slave.try_clone().unwrap()))
-                .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+                .stdout(Stdio::null()).stderr(Stdio::null()).die_with_parent().spawn().unwrap());
             let status = loop {
                 if !stopped {
                     while let Ok(n) = master.read(&mut buf) {

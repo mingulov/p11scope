@@ -10,6 +10,7 @@ use crate::discovery::instances::{
     UnknownReason,
 };
 use crate::discovery::scan::{CaptureWorkBudget, ScannedModule};
+use crate::fixture_guard::DieWithParent as _;
 use crate::plan::{AttachPlan, Slot};
 use crate::process::{PidPin, ProcessView, ProcessViewId};
 use crate::semantic_capture::{
@@ -102,6 +103,7 @@ impl Target {
         for (key, value) in env {
             command.env(key, value);
         }
+        command.die_with_parent();
         let mut child = command.spawn()?;
         let input = child.stdin.take().context("fixture stdin")?;
         let output = child.stdout.take().context("fixture stdout")?;

@@ -6,6 +6,7 @@ use super::*;
 use crate::attach::identity_iter::{
     ANCHOR_DUP, ANCHOR_OK, KIND_ANCHOR, KIND_END, RECORD_MAGIC, RECORD_VERSION,
 };
+use crate::fixture_guard::DieWithParent as _;
 use p11scope_manifest::maps::MapEntry;
 use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
@@ -4082,6 +4083,7 @@ impl SleepChild {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .die_with_parent()
             .spawn()
             .expect("sleep spawns");
         // A vfork-style spawn returns before the child switches to the new

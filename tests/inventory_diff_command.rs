@@ -7,6 +7,10 @@ use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
+
+#[allow(dead_code)]
+mod support;
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/inventory-diff/scan-current.json");
 
@@ -539,6 +543,7 @@ fn a_stopped_stdout_reader_hits_the_existing_inactivity_bound() {
         .arg("--json")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let started = Instant::now();

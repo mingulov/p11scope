@@ -14,6 +14,7 @@ use crate::attach::capture::{
 };
 use crate::discovery::caller_registry::UseCoverage;
 use crate::discovery::inventory_attach_set::TargetDelta;
+use crate::fixture_guard::DieWithParent as _;
 use crate::inventory_capture::{
     CaptureLane, Retirement, RetirementLoad, Stopped, ZERO_PASS_GAP_SUBJECT,
 };
@@ -129,6 +130,7 @@ impl Workload {
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&out)?)
             .stderr(std::fs::File::create(self.path(&format!("{cell}.err")))?)
+            .die_with_parent()
             .spawn()
             .context("spawning the ledger")?;
         let process = LedgerProcess { child, out };
@@ -1146,6 +1148,7 @@ impl DemotionWorkload {
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&out)?)
             .stderr(std::fs::File::create(dir.path().join("workload.err"))?)
+            .die_with_parent()
             .spawn()?;
         let process = LedgerProcess { child, out };
         process.wait_for("{\"event\":\"prepared\"", Duration::from_secs(5))?;
@@ -3251,6 +3254,7 @@ fn churn_phase(
         .env("SOFTHSM2_CONF", &workload.conf)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
+        .die_with_parent()
         .spawn()
         .context("spawning the idle mapper")?;
     let mapper_pid = mapper.id();
@@ -3266,6 +3270,7 @@ fn churn_phase(
                 .arg(&ledger)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
+                .die_with_parent()
                 .spawn()
             {
                 Ok(spawned) => *child.borrow_mut() = Some(spawned),
@@ -3835,6 +3840,7 @@ impl IdentitySweep {
                     .stdin(Stdio::null())
                     .stdout(Stdio::from(log.try_clone()?))
                     .stderr(Stdio::from(log))
+                    .die_with_parent()
                     .spawn()?,
             );
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -4493,6 +4499,7 @@ impl JointWorkload {
         for (key, value) in extra_env {
             command.env(key, value);
         }
+        command.die_with_parent();
         let child = command.spawn().context("spawning live-joint")?;
         let process = LedgerProcess { child, out };
         process.wait_for("READY ", Duration::from_secs(30))?;

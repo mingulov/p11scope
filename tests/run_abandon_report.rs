@@ -13,6 +13,10 @@ use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
+
+#[allow(dead_code)]
+mod support;
 
 /// Distinctive argv[0] for the signal-ignoring child, so the stray check can
 /// find a child the product failed to settle without matching anything else.
@@ -85,6 +89,7 @@ fn second_sigint_during_teardown_publishes_truthful_report_and_exits_130() {
         ])
         .stdout(Stdio::null())
         .stderr(stderr_file)
+        .die_with_parent()
         .spawn()
         .expect("spawn p11scope run");
     let pid = observer.id() as libc::pid_t;

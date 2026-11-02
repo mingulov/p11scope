@@ -4808,6 +4808,7 @@ mod promotion_lifecycle_tests {
         ImageAuthority, ModuleKey, OsProcessSource, RegistryLimits,
     };
     use crate::discovery::hooks::HookRegistry;
+    use crate::fixture_guard::DieWithParent as _;
     use crate::inventory_promotion::lifecycle::SessionNativeCompletion;
     use crate::inventory_promotion::{PromotionPair, PromotionRefusal};
     use crate::inventory_semantics::AttestedSemanticLane;
@@ -5361,6 +5362,7 @@ mod promotion_lifecycle_tests {
                     .arg("120")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
+                    .die_with_parent()
                     .spawn()
                     .expect("sleep spawns"),
             )

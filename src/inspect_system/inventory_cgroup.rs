@@ -1121,8 +1121,18 @@ mod tests {
         if pre_cancel {
             command.env("P11SCOPE_CGROUP_PRE_CANCEL_TEST", "1");
         }
+        // The parent-death guard is inlined: a second pre_exec hook would
+        // replace this fd-passing hook (same body as
+        // `crate::fixture_guard::DieWithParent`).
+        let owner = std::process::id();
         unsafe {
             command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != owner as libc::pid_t {
+                    libc::_exit(127);
+                }
                 if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }

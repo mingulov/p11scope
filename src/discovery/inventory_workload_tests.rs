@@ -15,6 +15,7 @@ use crate::discovery::engine::inventory::{ImageCheck, ImageGuard, UnavailableIma
 use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, InventoryScope};
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::native_binding::BoundImage;
+use crate::fixture_guard::DieWithParent as _;
 use p11scope_ebpf_common::ImageIdentity;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -65,6 +66,7 @@ fn run_workload_worker(mode: &str, timeout: std::time::Duration) -> WorkloadWork
         .stdout(std::fs::File::create(&stdout_path).unwrap())
         .stderr(std::fs::File::create(&stderr_path).unwrap())
         .process_group(0)
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();
@@ -348,6 +350,7 @@ fn workload_fd_deadline_guard_terminates_an_acknowledged_descendant() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .process_group(0)
+        .die_with_parent()
         .spawn()
         .unwrap();
     let mut worker = WorkloadWorker {
@@ -907,6 +910,7 @@ fn grow_native_owners_to_257() {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );
@@ -1029,6 +1033,7 @@ fn system_sweep_releases_its_pins() {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         ));
@@ -1109,6 +1114,7 @@ fn owned_pidfd_census_classifier() {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         ));
@@ -1808,6 +1814,7 @@ fn inject_native_owner_growth_failure() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();
@@ -1962,6 +1969,7 @@ fn inject_provider_mutation_case(invoke_getter: bool) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let driver_pid = child.id();

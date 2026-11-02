@@ -16,9 +16,13 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
 
 #[path = "support/multi_host.rs"]
 mod multi_host;
+
+#[allow(dead_code)]
+mod support;
 
 // libc's ptrace request type differs between the supported host libcs.
 #[cfg(target_env = "musl")]
@@ -161,6 +165,7 @@ fn a_stop_signal_during_startup_leaves_no_temp_file_and_names_the_interruption()
     let target = OwnedChild::new(
         Command::new("sleep")
             .arg("311.27")
+            .die_with_parent()
             .spawn()
             .expect("spawn sleep target"),
     );
@@ -188,6 +193,7 @@ fn a_stop_signal_during_startup_leaves_no_temp_file_and_names_the_interruption()
         .arg(&out)
         .stdout(Stdio::null())
         .stderr(diagnostics.try_clone().unwrap());
+    command.die_with_parent();
     if let Some(reason) = host_refusal {
         // This is the earlier admission contract, not an interruption claim:
         // exercise the real command and prove that it never opened its sink.
@@ -209,10 +215,20 @@ fn a_stop_signal_during_startup_leaves_no_temp_file_and_names_the_interruption()
         );
         return;
     }
-    // SAFETY: the child only makes an async-signal-safe ptrace syscall before
-    // exec; no allocation or synchronization with another parent thread.
+    // SAFETY: the child only makes async-signal-safe syscalls before exec;
+    // no allocation or synchronization with another parent thread.
+    // The parent-death guard is inlined: this pre_exec hook replaces the
+    // one `die_with_parent` registered above (same body as
+    // `support::DieWithParent`).
+    let owner = std::process::id();
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != owner as libc::pid_t {
+                libc::_exit(127);
+            }
             if libc::ptrace(
                 libc::PTRACE_TRACEME,
                 0,

@@ -12,6 +12,7 @@ use crate::discovery::inventory_attach_set::{AbsorbOutcome, AttachVerdict, Inven
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedInterface, ScannedModule, scan_process_view,
 };
+use crate::fixture_guard::DieWithParent as _;
 use crate::plan::AdmissionScope;
 use crate::plan::Slot;
 use crate::process::{PidPin, ProcessView, ProcessViewId};
@@ -842,6 +843,7 @@ impl OwnedCaller {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .die_with_parent()
             .spawn()?;
         let input = child.stdin.take().context("owned input")?;
         let output = child.stdout.take().context("owned output")?;

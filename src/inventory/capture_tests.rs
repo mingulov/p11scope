@@ -17,6 +17,7 @@ use crate::discovery::inventory_attach_set::AttachEndpoint;
 use crate::discovery::inventory_attach_set::tests as fx;
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::discovery::native_binding::UnboundReason;
+use crate::fixture_guard::DieWithParent as _;
 use p11scope_ebpf_common::ImageIdentity;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2727,6 +2728,7 @@ fn distinct_stop_deliveries_saturate_without_arming_force_exit() {
                 "--nocapture",
             ])
             .env("P11SCOPE_COUNT_CHILD", "1")
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );

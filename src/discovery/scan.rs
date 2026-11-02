@@ -12104,6 +12104,20 @@ mod tests {
     /// The raw-clone survivor for the scan cold-route twin: parks in
     /// `pause()`. Raw syscalls only (it runs on a COW-inherited stack).
     extern "C" fn pause_survivor_main(_arg: *mut std::ffi::c_void) -> libc::c_int {
+        // Parent-death guard (same body as
+        // `crate::fixture_guard::DieWithParent`, with the owner from the
+        // pre-fork store): a test that dies abruptly must not strand the
+        // parking survivor. Async-signal-safe: atomic load, prctl, getppid.
+        let owner =
+            crate::fixture_guard::SURVIVOR_OWNER_PID.load(std::sync::atomic::Ordering::Acquire);
+        unsafe {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                libc::_exit(127);
+            }
+            if libc::getppid() != owner as libc::pid_t {
+                libc::_exit(127);
+            }
+        }
         loop {
             // SAFETY: `pause()` takes no arguments and only returns on a signal.
             unsafe {
@@ -12135,6 +12149,10 @@ mod tests {
             // SAFETY: the child only closes one end, reads one go byte,
             // clones, and exits its leader thread; no allocator, no
             // pthread, no locks.
+            // The survivor's parent-death owner, stored before the fork
+            // it inherits (see `SURVIVOR_OWNER_PID`).
+            crate::fixture_guard::SURVIVOR_OWNER_PID
+                .store(std::process::id(), std::sync::atomic::Ordering::Release);
             let pid = unsafe { libc::fork() };
             assert!(pid >= 0, "warm-view fork failed");
             if pid == 0 {
@@ -12208,6 +12226,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A warm zombie view must die with its spawner: without the
+    /// survivor's parent-death arm the parked survivor keeps the group
+    /// alive forever once its spawner is gone. A helper thread plays
+    /// the spawner; only the arm can kill the forgotten group.
+    #[test]
+    fn warm_zombie_view_dies_with_spawning_thread() {
+        let recorded = std::thread::spawn(|| {
+            let warm = WarmZombieView::spawn();
+            let start = crate::process::process_start_time(warm.tgid)
+                .expect("the group leader has a start time");
+            let recorded = vec![(warm.tgid, start)];
+            std::mem::forget(warm);
+            recorded
+        })
+        .join()
+        .expect("the spawner thread joins");
+        let survivors = crate::fixture_guard::poll_descendants_gone(
+            &recorded,
+            std::time::Duration::from_secs(2),
+        );
+        crate::fixture_guard::cleanup_descendants(&recorded);
+        assert!(
+            survivors.is_empty(),
+            "the warm zombie view {recorded:?} outlived its spawner"
+        );
     }
 
     /// A scripted IO never mints a real cold member: with a warm view

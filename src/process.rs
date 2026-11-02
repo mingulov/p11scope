@@ -1145,6 +1145,7 @@ impl ProcPin<'_> {
 #[cfg(test)]
 mod proc_custody_tests {
     use super::acquire_proc_dir_with;
+    use crate::fixture_guard::DieWithParent as _;
     use std::cell::Cell;
 
     #[test]
@@ -1218,6 +1219,7 @@ mod proc_custody_tests {
         let mut child = ReapOnDrop(
             std::process::Command::new("sleep")
                 .arg("30")
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );
@@ -1675,6 +1677,7 @@ pub(crate) fn stat_flags_from_stat_text(stat: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_guard::DieWithParent as _;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::os::unix::process::CommandExt as _;
@@ -1900,6 +1903,7 @@ mod tests {
     fn live_pin_and_child() -> (PidPin, SleepChild) {
         let child = Command::new("sleep")
             .arg("30")
+            .die_with_parent()
             .spawn()
             .expect("a live child to pin");
         let pin = PidPin::open(child.id()).expect("pinning the live child");
@@ -1978,6 +1982,7 @@ int main(int argc, char **argv) {
             if two {
                 command.arg("two");
             }
+            command.die_with_parent();
             let child = SleepChild(command.spawn().unwrap());
             let pin = PidPin::open(child.0.id()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -2216,7 +2221,11 @@ int main(int argc, char **argv) {
 
     #[test]
     fn original_pidfd_is_the_only_signal_authority() {
-        let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("10")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let pin = PidPin::open(child.id()).unwrap();
         pin.probe_signal_authority().unwrap();
         assert_eq!(
@@ -2266,7 +2275,11 @@ int main(int argc, char **argv) {
 
     #[test]
     fn low_pidfd_budget_demotes_without_global_failure() {
-        let mut child = Command::new("sleep").arg("1").spawn().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("1")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let mut tracker = Tracker::with_limits(1, 4);
         tracker.identify(std::process::id());
         tracker.identify(child.id());
@@ -2278,7 +2291,11 @@ int main(int argc, char **argv) {
 
     #[test]
     fn whole_process_exit_becomes_a_retirement() {
-        let mut child = Command::new("sleep").arg("1").spawn().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("1")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let pid = child.id();
         let mut tracker = Tracker::with_limits(4, 4);
         let key = tracker.identify(pid).key;
@@ -2485,7 +2502,12 @@ int main(int argc, char **argv) {
         // argv[0] stays `sleep` for multi-call coreutils.
         let link = dir.path().join("a) Z 1 (b");
         std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
-        let mut child = Command::new(&link).arg0("sleep").arg("30").spawn().unwrap();
+        let mut child = Command::new(&link)
+            .arg0("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(5);
         let stat = loop {
@@ -2817,6 +2839,7 @@ int main(int argc, char **argv) {
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
                         .stderr(stderr.try_clone().expect("share the stderr capture"))
+                        .die_with_parent()
                         .spawn()
                         .expect("re-exec the pidfd-denial helper"),
                 ));
@@ -2974,6 +2997,7 @@ int main(int argc, char **argv) {
                 Command::new("cat")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::null())
+                    .die_with_parent()
                     .spawn()
                     .expect("spawn the ready target"),
             ));

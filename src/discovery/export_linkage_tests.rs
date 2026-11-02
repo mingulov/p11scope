@@ -17,6 +17,7 @@ use crate::discovery::identity::{
     PinnedObjects, ReconciledModule, pin_scanned_objects, reconcile_scanned_modules,
 };
 use crate::discovery::test_subject::OwnedMapper;
+use crate::fixture_guard::DieWithParent as _;
 use crate::plan::{AttachPlan, build_from_reconciled_modules};
 use p11scope_ebpf_common::SlotSemantics;
 use std::collections::BTreeMap;
@@ -172,6 +173,7 @@ impl Loaded {
             .arg(&path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .die_with_parent()
             .spawn()
             .expect("spawn owned load-only subject");
         let subject = OwnedMapper::from_child(child, std::time::Duration::from_secs(5))
@@ -374,6 +376,7 @@ fn export_loader_failure_reaps_the_owned_child() {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::fs::File::create(&stderr).unwrap())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();

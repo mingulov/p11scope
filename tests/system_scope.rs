@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 #[allow(dead_code)]
 mod support;
 
+use support::DieWithParent as _;
+
 fn tmp(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -69,6 +71,7 @@ fn spawn_loaded(driver: &Path, provider: &Path) -> support::ChildGuard {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -302,6 +305,7 @@ fn spawn_loaded_multi(driver: &Path, providers: &[PathBuf]) -> support::ChildGua
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );
@@ -524,6 +528,7 @@ fn system_scope_restricted_procfs_cross_uid_cell() {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            .die_with_parent()
             .spawn()
             .unwrap(),
     );

@@ -11,7 +11,11 @@
 #[path = "../build_support/clang_resolve.rs"]
 mod clang_resolve;
 
+#[allow(dead_code)]
+mod support;
+
 use p11scope::attach::identity_iter as ii;
+use support::DieWithParent as _;
 
 /// The clang-built identity object out of this package's `OUT_DIR`. This is
 /// the same artifact [`ii::IDENTITY_OBJECT`] embeds; reading it separately
@@ -1194,6 +1198,7 @@ fn identity_link_info_tid_only_selection() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .die_with_parent()
             .spawn()
             .expect("sleep spawns")
     }

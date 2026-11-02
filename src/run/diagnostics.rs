@@ -17,6 +17,7 @@ pub(super) fn terminal_diagnostics() -> Box<dyn Write> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture_guard::DieWithParent as _;
     use std::io::Read as _;
     use std::os::fd::FromRawFd as _;
     use std::process::{Command, Stdio};
@@ -81,6 +82,7 @@ mod tests {
         assert_eq!(flags & libc::O_NONBLOCK, 0);
         let mut process = command("full_stderr_cannot_hold_completed_cleanup_open")
             .stderr(Stdio::from(writer))
+            .die_with_parent()
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);

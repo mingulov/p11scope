@@ -2,6 +2,7 @@
 //! Reader contract tests use complete producer-shaped inputs and real files.
 
 use super::input::*;
+use crate::fixture_guard::DieWithParent as _;
 use serde_json::{Value, json};
 use std::{fs, os::unix::fs::MetadataExt};
 
@@ -544,6 +545,7 @@ fn fifo_without_writer_is_rejected_promptly() {
                     "--nocapture",
                 ])
                 .env(CHILD, &path)
+                .die_with_parent()
                 .spawn()
                 .unwrap(),
         );

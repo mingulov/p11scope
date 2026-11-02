@@ -10,6 +10,9 @@
 #[path = "support/multi_host.rs"]
 mod multi_host;
 
+#[allow(dead_code)]
+mod support;
+
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
@@ -17,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
+use support::DieWithParent as _;
 
 fn serial_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1045,6 +1049,7 @@ impl LiveDriver {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .die_with_parent()
             .spawn()
             .unwrap();
         Self::adopt(child, &ready, name, Duration::from_secs(30))
@@ -1098,6 +1103,7 @@ fn a_driver_that_never_becomes_ready_is_reaped_after_the_panic() {
     let child = Command::new("sleep")
         .arg("120")
         .stdin(Stdio::null())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id() as libc::pid_t;
@@ -1452,6 +1458,7 @@ fn a_classic_run_interrupted_by_sigint_commits_its_report_and_stream() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .die_with_parent()
         .spawn()
         .unwrap();
     let pid = observer.id();

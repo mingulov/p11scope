@@ -3170,6 +3170,7 @@ mod tests {
     use crate::discovery::hooks::HookAbi;
     use crate::discovery::identity::PinnedObjectId;
     use crate::discovery::loader::LoaderContextId;
+    use crate::fixture_guard::DieWithParent as _;
     use p11scope_ebpf_common::{
         COALESCED_NO_HELPER_RC, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_LOADER,
         DISCOVERY_STATUS_COALESCED_NO_HELPER, DiscoveryRecord, PAUSE_ARMED, PAUSE_REQUESTED,
@@ -3643,6 +3644,7 @@ mod tests {
         assert_eq!(parse_task_state(b"missing delimiter"), None);
         let mut child = std::process::Command::new("sleep")
             .arg("1")
+            .die_with_parent()
             .spawn()
             .unwrap();
         assert!(!read_task_states(child.id()).unwrap().is_empty());

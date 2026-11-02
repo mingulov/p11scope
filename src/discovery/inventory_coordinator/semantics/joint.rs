@@ -804,14 +804,23 @@ impl PreparedSemanticBatch {
 
     /// The staged caller and admission at the stage cursor, when the
     /// next `stage_next` call would stage an admitted call. Mirrors
-    /// the staging guard exactly; the pre-grant disclosure peeks
-    /// through this before the input moves into the registry.
-    pub(super) fn stage_peek(&self) -> Option<(Option<CallerId>, &AdmittedInstanceCall)> {
+    /// the staging guard exactly, custody conversion included: the
+    /// caller passes the same pending-exit verdict `stage_next` will
+    /// use, so the pre-grant disclosure peeks only inputs that will
+    /// actually stage as admitted calls — a custody-refused input
+    /// stages its single refusal, never a disclosure pair.
+    pub(super) fn stage_peek(
+        &self,
+        pending_exit: impl Fn(CallerId) -> bool,
+    ) -> Option<(Option<CallerId>, &AdmittedInstanceCall)> {
         if self.claim_cursor != self.entries.len() || self.stage_cursor >= self.claim_cursor {
             return None;
         }
         let entry = self.entries.get(self.stage_cursor)?;
         let input = entry.input.as_ref()?.as_ref().ok()?;
+        if entry.caller.is_some_and(pending_exit) {
+            return None;
+        }
         Some((entry.caller, input))
     }
 
@@ -1359,9 +1368,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         // Pre-grant staging discloses why each staged admission's Joint
         // bind refused, read-only through the adapter: the retained S1
-        // row carries the refusal the birth would have hit.
+        // row carries the refusal the birth would have hit. The peek
+        // takes the same pending-exit verdict the staging below will
+        // use, so a custody-refused input skips the disclosure.
         if pre_grant
-            && let Some((caller, input)) = batch.stage_peek()
+            && let Some((caller, input)) =
+                batch.stage_peek(|caller| self.adapter.leader_exit_pending(caller))
             && let Err(refusal) = self.joint_capture.adapter().probe_admitted_key(input)
         {
             disclose_s1_birth_refusal(
@@ -1560,5 +1572,83 @@ mod tests {
                 "the guard runs after the admission preamble ({anchor})"
             );
         }
+    }
+
+    /// F4 unit twin: the peek mirrors the staging guard exactly — a
+    /// custody-refused input is invisible to the peek (so the pre-grant
+    /// disclosure cannot fire for it) and stages exactly its custody
+    /// refusal, sealing no admission.
+    #[test]
+    fn stage_peek_skips_custody_refused_input() {
+        use crate::discovery::caller_registry::instance_input::{
+            AdmittedInstanceCall, InstanceKey, JointRegistrationWindow,
+        };
+        use crate::discovery::caller_registry::{CallerId, ModuleKey};
+        use crate::discovery::instances::InstanceId;
+        use crate::semantics_edge::SemanticCall;
+        use p11scope_ebpf_common::ImageIdentity;
+
+        let domain = NativeDomainId::mint();
+        let caller = CallerId(7);
+        let key = InstanceKey::scripted(
+            domain,
+            ImageIdentity {
+                task_cookie: 101,
+                exec_id: 1,
+            },
+            InstanceId::from_raw(1),
+            ModuleKey::Physical {
+                dev_major: 1,
+                dev_minor: 2,
+                ino: 3,
+                sha256: None,
+            },
+        );
+        let input = AdmittedInstanceCall::scripted(
+            key,
+            caller,
+            1,
+            SemanticCall {
+                function: "C_Initialize".into(),
+                ..SemanticCall::default()
+            },
+        );
+        let mut batch = PreparedSemanticBatch::new(
+            domain,
+            vec![PreparedAdmission::new((Some(caller), 1, Ok(input)))],
+            Vec::new(),
+            JointRegistrationWindow::scripted_empty(),
+            PreparedH3 {
+                negatives: Vec::new(),
+                staged_positions: Vec::new(),
+                awaiting_floor: None,
+                shed_floor: None,
+                exhausted: false,
+            },
+        );
+        batch.dispose_claims_s1();
+        assert!(
+            batch.stage_peek(|_| false).is_some(),
+            "no pending exit: the peek stages the admission"
+        );
+        assert!(
+            batch.stage_peek(|_| true).is_none(),
+            "a pending exit hides the input from the peek, so no D1 gap can stage"
+        );
+        let mut registry = empty_registry();
+        let mut seal_admission = None;
+        assert!(batch.stage_next(&mut registry, &mut seal_admission, |_| true));
+        assert!(seal_admission.is_none(), "a refusal seals no admission");
+        registry.publish();
+        let gaps: Vec<(String, String)> = registry
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![("semantic input refused".to_string(), "custody".to_string())],
+            "exactly the custody refusal stages"
+        );
     }
 }

@@ -59,6 +59,48 @@ const RAW_CAPACITY: usize = 4_096;
 // this long from the quantum's first poll. An engineering limit: it
 // may be raised, never lowered.
 pub(crate) const PREGRANT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Inputs to the pre-grant extension decision: the Collecting arm
+/// precomputes each scheduling fact, and [`should_extend`] conjoins
+/// them purely so unit tests pin every bound exactly.
+#[derive(Clone, Copy)]
+struct PregrantExtendInputs {
+    /// No grant minted yet: the quantum is still pre-grant.
+    pre_grant: bool,
+    /// The lane's producers carry a journal feed.
+    journal_linked: bool,
+    /// Collection failed: a failed quantum never extends.
+    failed: bool,
+    /// Stop, request or Q: a request always closes.
+    requested: bool,
+    /// Total wire rows attempted by this quantum.
+    attempted: usize,
+    /// Pending H0 records held by this quantum.
+    pending_h0: usize,
+    /// The BEGIN table is full, or a record already refused.
+    begin_table_full_or_refused: bool,
+    /// An in-flight journaled START, or only count-only setup calls.
+    hold_open: bool,
+    /// The wall-time bound expired (or was never stamped).
+    timed_out: bool,
+}
+
+/// Pure pre-grant close decision (R1): a pre-grant quantum on a linked
+/// lane stays open while a journaled affecting START is in flight or
+/// only count-only setup calls are present — within the wire
+/// (RAW_CAPACITY), H0 (MAX_PENDING), BEGIN-table and wall-time bounds,
+/// and never past a failed collection, a request, or Q.
+fn should_extend(inputs: PregrantExtendInputs) -> bool {
+    inputs.pre_grant
+        && inputs.journal_linked
+        && !inputs.failed
+        && !inputs.requested
+        && inputs.attempted < RAW_CAPACITY
+        && inputs.pending_h0 < MAX_PENDING
+        && !inputs.begin_table_full_or_refused
+        && inputs.hold_open
+        && !inputs.timed_out
+}
 // The actual shared binder selects at most four caller/provider pairs. Its
 // no-call receipts join the same original H0 report, never a second stage.
 const REFRESHES_PER_BIND: usize = 4;
@@ -2721,16 +2763,18 @@ impl LiveJointMachine {
                                 Instant::now().duration_since(since) >= PREGRANT_CLOSE_TIMEOUT
                             })
                     };
-                    let pregrant_extend = self.grant.is_none()
-                        && self.producers.journal_linked()
-                        && !failed
-                        && !requested
-                        && original.attempted < RAW_CAPACITY
-                        && original.raw.pending_h0_records() < MAX_PENDING
-                        && !original.raw.begin_table_full_or_refused()
-                        && (original.raw.has_open_affecting_start()
-                            || original.raw.h0_records_all_count_only(lane.subset().plan()))
-                        && !pregrant_timed_out();
+                    let pregrant_extend = should_extend(PregrantExtendInputs {
+                        pre_grant: self.grant.is_none(),
+                        journal_linked: self.producers.journal_linked(),
+                        failed,
+                        requested,
+                        attempted: original.attempted,
+                        pending_h0: original.raw.pending_h0_records(),
+                        begin_table_full_or_refused: original.raw.begin_table_full_or_refused(),
+                        hold_open: original.raw.has_open_affecting_start()
+                            || original.raw.h0_records_all_count_only(lane.subset().plan()),
+                        timed_out: pregrant_timed_out(),
+                    });
                     if !unrequested_empty && !needs_first_end && !pregrant_extend {
                         // A requested transaction must not bind on a stale
                         // no-backlog poll: rows may have landed since idle
@@ -4989,5 +5033,74 @@ mod binding_reservation_tests {
     #[test]
     fn pregrant_close_timeout_floor() {
         assert!(super::PREGRANT_CLOSE_TIMEOUT >= std::time::Duration::from_secs(2));
+    }
+
+    fn extend_open_inputs() -> super::PregrantExtendInputs {
+        super::PregrantExtendInputs {
+            pre_grant: true,
+            journal_linked: true,
+            failed: false,
+            requested: false,
+            attempted: 0,
+            pending_h0: 0,
+            begin_table_full_or_refused: false,
+            hold_open: true,
+            timed_out: false,
+        }
+    }
+
+    /// F1: the wire-capacity bound closes at exactly RAW_CAPACITY —
+    /// one row below extends, the bound itself closes.
+    #[test]
+    fn pregrant_extend_closes_at_raw_capacity() {
+        let mut below = extend_open_inputs();
+        below.attempted = super::RAW_CAPACITY - 1;
+        assert!(
+            super::should_extend(below),
+            "one row below the wire bound extends"
+        );
+        let mut at = extend_open_inputs();
+        at.attempted = super::RAW_CAPACITY;
+        assert!(
+            !super::should_extend(at),
+            "the wire bound closes at exactly RAW_CAPACITY"
+        );
+    }
+
+    /// Every other close conjunct is exact too: all green extends, any
+    /// single red closes, and the H0 bound is exact like the wire one.
+    #[test]
+    fn pregrant_extend_conjoins_every_close_condition() {
+        assert!(
+            super::should_extend(extend_open_inputs()),
+            "all green extends"
+        );
+        let mut red = extend_open_inputs();
+        red.pre_grant = false;
+        assert!(!super::should_extend(red), "a grant closes");
+        let mut red = extend_open_inputs();
+        red.journal_linked = false;
+        assert!(!super::should_extend(red), "an unlinked lane closes");
+        let mut red = extend_open_inputs();
+        red.failed = true;
+        assert!(!super::should_extend(red), "a failed collection closes");
+        let mut red = extend_open_inputs();
+        red.requested = true;
+        assert!(!super::should_extend(red), "a request closes");
+        let mut red = extend_open_inputs();
+        red.pending_h0 = super::MAX_PENDING;
+        assert!(
+            !super::should_extend(red),
+            "the H0 bound closes at exactly MAX_PENDING"
+        );
+        let mut red = extend_open_inputs();
+        red.begin_table_full_or_refused = true;
+        assert!(!super::should_extend(red), "a full table closes");
+        let mut red = extend_open_inputs();
+        red.hold_open = false;
+        assert!(!super::should_extend(red), "no hold closes");
+        let mut red = extend_open_inputs();
+        red.timed_out = true;
+        assert!(!super::should_extend(red), "an expired bound closes");
     }
 }

@@ -3163,6 +3163,98 @@ fn joint_pregrant_timeout_closes_and_discloses_tainted_birth() {
     assert_eq!(api_total, 1, "the modeled call still reduces S1");
 }
 
+/// F4: a pre-grant admission whose caller has a pending exit stages
+/// no D1 gap — the custody conversion wins and the peek skips the
+/// disclosure, so the input stages exactly the custody refusal and
+/// reduces no S1. Same taint setup as the timeout twin.
+#[test]
+fn joint_pregrant_custody_refused_input_stages_no_d1_gap() {
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    let init_end = push_begin(&mut scene, pid, "C_Initialize", 2);
+    assert_eq!(
+        drive_collecting_quiescent(&mut scene),
+        "Collecting",
+        "the START holds first"
+    );
+    scene.machine.pose_pregrant_close_timeout_for_test(true);
+    assert!(
+        drive_until_closed(&mut scene, 64),
+        "the expired bound closes the extended quantum"
+    );
+    scene.published();
+    scene
+        .scene
+        .drain
+        .source_mut()
+        .push_record(init_end.to_vec());
+    assert_eq!(reach_any(&mut scene, &["BindingKeys"]), "BindingKeys");
+    let input = cloned_only_admission(&mut scene);
+    assert!(
+        bind_probe_outcome(&mut scene, &input).is_err(),
+        "the disposed quantum tainted the image, so the peek would disclose"
+    );
+    // The exit lands after admission but before staging — the F4
+    // conjunction: the staged input is Ok, the probe refuses, and the
+    // staging conversion turns custody at the same time.
+    let caller = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .adapter()
+        .live_id(pid)
+        .expect("an admitted caller");
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .adapter_mut()
+        .mark_leader_exit_pending(caller, true);
+    scene.published();
+    assert!(
+        scene.machine.retained_drain_grant_for_test().is_none(),
+        "the tainted bind mints no grant"
+    );
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let d1: Vec<&str> = coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "Joint birth unavailable; retained S1")
+        .map(|gap| gap.reason.as_str())
+        .collect();
+    assert!(
+        d1.is_empty(),
+        "a custody-refused input stages no D1 gap: {d1:?}"
+    );
+    // The quantum-1 setup staging also refuses with Slot (pre-existing,
+    // unasserted in the timeout twin too); the F4 shape is the custody
+    // reason appearing exactly once, with no D1 companion.
+    let custody: Vec<&str> = coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "semantic input refused" && gap.reason == "custody")
+        .map(|gap| gap.reason.as_str())
+        .collect();
+    assert_eq!(
+        custody,
+        vec!["custody"],
+        "exactly one custody refusal stages"
+    );
+    let api_total: u64 = crate::semantic_capture::tests::custody_chain_tests::operation_edge_rows(
+        &scene.scene.real.scene,
+    )
+    .iter()
+    .filter_map(|row| row.0)
+    .sum();
+    assert_eq!(api_total, 0, "the refused call reduces no S1");
+}
+
 /// The H0 pending cap closes an extending quantum at the bound: the
 /// open START holds below it, and the close lands exactly on it.
 #[test]

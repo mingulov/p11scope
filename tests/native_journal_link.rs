@@ -13,7 +13,9 @@ use std::{
 static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
-    SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SPAWN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 const OUTPUT: &str = "journal-proof-v1/p11scope-ebpf-journal-proof-v1";

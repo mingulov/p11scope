@@ -11451,10 +11451,6 @@ mod tests {
             crate::discovery::pause::read_task_starts(pid)
         }
 
-        fn boot_ns(&mut self) -> std::result::Result<u64, String> {
-            crate::discovery::pause::boot_ns().ok_or_else(|| "boot clock read failed".into())
-        }
-
         fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
             crate::discovery::pause::last_hook_attach_boot_ns()
         }

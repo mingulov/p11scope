@@ -1377,15 +1377,16 @@ keep no exe identity.
 ## Pause thread-birth dating (v0.6.0)
 
 **Status: IMPLEMENTED in v0.6.0 by owner decision 2026-11-02
-(ruling PT-1): `run --pause` dates threads that appear after
-preflight by kernel start time instead of reporting a blanket
-partial.** It adds no publication: the only new userspace read is
-one more field of the `/proc` task `stat` file the pause stop
-check already reads, plus the observer's own boot-clock instant
-beside the arm it already records. Output still carries only the
+(rulings PT-1, PT-2): `run --pause` dates threads that appear
+after preflight by kernel start time against the last completed
+provider hook attach instead of reporting a blanket partial.** It
+adds no publication: the only new userspace read is one more field
+of the `/proc` task `stat` file the pause stop check already reads,
+plus the observer's own boot-clock stamp when each of its provider
+hook attaches completes. Output still carries only the
 v1 pause aggregate (`none`/`sigstop`/`partial` and the three
 counters); allowlist-v1 bytes are unchanged.
 
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
-| Owned-child thread start time (`starttime`) | `/proc/<pid>/task/<tid>/stat` field 22 (boot-relative clock ticks) of the observer's own owned child only, read beside the existing state-letter sample at pause preflight and at each stopped sample; the whole stat line is parsed around the `comm` field, which is discarded. The arm instant is stamped in the same boot domain (`CLOCK_BOOTTIME`) beside the existing monotonic arm stamp. No `cmdline`, `environ`, argument, payload or memory read. | Private to the capture: a new thread counts as covered only when its earliest possible birth (tick floor) is strictly more than one tick after the arm instant, and a reused tid (same tid, different start time) never counts as the preflight thread. Start times never enter output, logs or errors. | An unreadable, missing, equal-tick or within-one-tick birth, a reused tid, or an unrecorded arm instant keeps the existing `task set changed` partial with its existing diagnostic; nothing is guessed. Required evidence: covered/before-boundary/unreadable/reuse twins at the pause seam plus the OpenSC live cell before/after counts. |
+| Owned-child thread start time (`starttime`) | `/proc/<pid>/task/<tid>/stat` field 22 (boot-relative clock ticks) of the observer's own owned child only, read beside the existing state-letter sample at pause preflight and at each stopped sample; the whole stat line is parsed around the `comm` field, which is discarded. The observer stamps each of its own provider hook attach completions (static targets, dynamic exports, multi-group rebuilds) in the same boot domain (`CLOCK_BOOTTIME`) and keeps one process-wide latest stamp plus an in-flight count; the pause arm is not stamped. No `cmdline`, `environ`, argument, payload or memory read. | Private to the capture: a new thread counts as covered only when its earliest possible birth (tick floor) is strictly more than one tick after the last completed attach, and a reused tid (same tid, different start time) never counts as the preflight thread. Start times and attach stamps never enter output, logs or errors. | An unreadable, missing, equal-tick or within-one-tick birth, a reused tid, no recorded attach or an attach in flight keeps the existing `task set changed` partial with its existing diagnostic; nothing is guessed. Required evidence: covered/before-boundary/unreadable/reuse twins at the pause seam plus the OpenSC live cell before/after counts. |

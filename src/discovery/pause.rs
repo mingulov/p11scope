@@ -258,7 +258,7 @@ impl std::error::Error for PauseError {}
 
 /// The coordinator owns policy, not Aya. This fixed-purpose seam is also the
 /// complete failure-injection surface: one clock, task reader, task-start
-/// reader, boot clock, discovery owner, authorization map, Engine batch
+/// reader, hook-attach clock, discovery owner, authorization map, Engine batch
 /// application, marker, pidfd resume, and terminal detach action.
 pub(crate) trait PauseIo {
     fn now_ns(&mut self) -> Result<u64, String>;
@@ -268,9 +268,6 @@ pub(crate) trait PauseIo {
     /// (`/proc/<pid>/task/<tid>/stat` field 22). A task absent from the map
     /// has an unreadable start time and is never treated as covered.
     fn task_starts(&mut self, pid: u32) -> Result<BTreeMap<u32, u64>, String>;
-    /// `CLOCK_BOOTTIME` in nanoseconds: the clock domain of the start-time
-    /// ticks, so thread births date against the pause arm.
-    fn boot_ns(&mut self) -> Result<u64, String>;
     /// When the last provider hook attach completed, in `CLOCK_BOOTTIME`
     /// nanoseconds (the start-time-tick domain). `None` when no attach has
     /// completed or one is still in flight: then no thread born after
@@ -395,10 +392,6 @@ pub(crate) struct PauseCoordinator {
     /// first see it. `None` when no arm recorded one, which keeps every record
     /// a candidate.
     armed_at_ns: Option<u64>,
-    /// Boot clock read beside `armed_at_ns`: the same arm instant in the
-    /// start-time-tick domain, so threads born after the arm date as covered.
-    /// `None` (no arm, or an unreadable boot clock) dates nothing as covered.
-    armed_boot_ns: Option<u64>,
     rearming_enabled: bool,
     may_be_stopped: bool,
     attempt_open: bool,
@@ -512,7 +505,6 @@ impl PauseCoordinator {
             epoch: PauseEpoch::default(),
             armed: false,
             armed_at_ns: None,
-            armed_boot_ns: None,
             rearming_enabled: policy != PausePolicy::Never,
             may_be_stopped: false,
             attempt_open: false,
@@ -584,7 +576,6 @@ impl PauseCoordinator {
             }
         };
         let armed_at = io.now_ns().ok();
-        let armed_boot = io.boot_ns().ok();
         if let Err(error) = io.arm() {
             return self.arm_cleanup_failed(io, error, false);
         }
@@ -592,7 +583,6 @@ impl PauseCoordinator {
             Ok(Some(PAUSE_ARMED)) => {
                 self.armed = true;
                 self.armed_at_ns = armed_at;
-                self.armed_boot_ns = armed_boot;
                 self.successors_left = MAX_SUCCESSORS_PER_ARM;
                 Ok(ArmResult::Armed)
             }
@@ -1157,7 +1147,6 @@ impl PauseCoordinator {
                 return self.fail_cycle(io, error.to_string(), lifecycle);
             }
             let armed_at = io.now_ns().ok();
-            let armed_boot = io.boot_ns().ok();
             if let Err(error) = io.arm() {
                 return self.fail_cycle(io, error, true);
             }
@@ -1169,7 +1158,6 @@ impl PauseCoordinator {
                 return self.fail_cycle(io, "successor was consumed before prior resume", true);
             }
             self.armed_at_ns = armed_at;
-            self.armed_boot_ns = armed_boot;
             successor_baseline = match io.ring_loss() {
                 Ok(loss) => Some(loss),
                 Err(error) => return self.fail_cycle(io, error, true),
@@ -1425,11 +1413,13 @@ impl PauseCoordinator {
     fn sample_stopped(&mut self, io: &mut impl PauseIo, deadline: u64) -> Result<u64, String> {
         let states = io.task_states(self.pid)?;
         let starts = io.task_starts(self.pid)?;
+        // Read after the starts: a later read can only see a later attach.
+        let last_attach = io.last_hook_attach_boot_ns();
         let now = io.now_ns()?;
         if now > deadline {
             return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
         }
-        let births = self.covered_births(&states, &starts)?;
+        let births = self.covered_births(&states, &starts, last_attach)?;
         if states.values().any(|state| *state != b'T') {
             return Err(MSG_TASK_SET_CHANGED.into());
         }
@@ -1442,15 +1432,22 @@ impl PauseCoordinator {
         Ok(now)
     }
 
-    /// Threads born after the arm, by more than one tick of margin, that this
-    /// sample may adopt into the expected set. Every other change — a missing
-    /// expected tid, a reused tid (same tid, different start time), a birth at
-    /// or within one tick of the arm, an unreadable start time, or no recorded
-    /// arm boot instant — keeps today's task-set refusal.
+    /// Threads born after the last completed provider hook attach, by more
+    /// than one tick of margin, that this sample may adopt into the expected
+    /// set. Uprobes are per file: once attached they fire for every thread,
+    /// so such a thread never ran with a provider unhooked. The pause arm is
+    /// deliberately not the instant: a frame or successor re-arm is no attach.
+    /// Every other change — a missing expected tid, a reused tid (same tid,
+    /// different start time), a birth at or within one tick of the attach, an
+    /// unreadable start time, no recorded attach or one in flight — keeps
+    /// today's task-set refusal. An adopted thread is then held to every later
+    /// sample like a preflight thread, so this stop's own attach (which it was
+    /// verified stopped through) does not undo it.
     fn covered_births(
         &self,
         states: &BTreeMap<u32, u8>,
         starts: &BTreeMap<u32, u64>,
+        last_attach_boot_ns: Option<u64>,
     ) -> Result<Vec<(u32, u64)>, String> {
         for tid in self.expected_tasks.keys() {
             if !states.contains_key(tid) {
@@ -1466,24 +1463,13 @@ impl PauseCoordinator {
                 starts.get(tid).copied(),
             ) {
                 (true, Some(recorded), Some(start)) if start == *recorded => {}
-                (false, None, Some(start)) if self.birth_covered(start) => {
+                (false, None, Some(start)) if birth_covered(start, last_attach_boot_ns) => {
                     births.push((*tid, start));
                 }
                 _ => return Err(MSG_TASK_SET_CHANGED.into()),
             }
         }
         Ok(births)
-    }
-
-    /// Whether a start-time tick dates strictly more than one tick after the
-    /// arm. The tick floor is a lower bound on the true birth, so a satisfied
-    /// check proves the margin; an unrecorded arm instant covers nothing.
-    fn birth_covered(&self, start_ticks: u64) -> bool {
-        let Some(armed_boot) = self.armed_boot_ns else {
-            return false;
-        };
-        let tick = clock_tick_ns();
-        start_ticks.saturating_mul(tick) > armed_boot.saturating_add(tick)
     }
 
     fn observe_resumed(
@@ -2200,10 +2186,6 @@ impl PauseIo for SessionPauseIo<'_> {
         read_task_starts(pid)
     }
 
-    fn boot_ns(&mut self) -> Result<u64, String> {
-        boot_ns().ok_or_else(|| "boot clock read failed".into())
-    }
-
     fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
         last_hook_attach_boot_ns()
     }
@@ -2840,6 +2822,18 @@ pub(crate) fn read_task_starts(pid: u32) -> Result<BTreeMap<u32, u64>, String> {
     Ok(starts)
 }
 
+/// Whether a start-time tick dates strictly more than one tick after the last
+/// completed provider hook attach. The tick floor is a lower bound on the true
+/// birth, so a satisfied check proves the margin; no recorded attach (or one in
+/// flight) covers nothing, and a saturated instant covers nothing either.
+fn birth_covered(start_ticks: u64, last_attach_boot_ns: Option<u64>) -> bool {
+    let Some(attach) = last_attach_boot_ns else {
+        return false;
+    };
+    let tick = clock_tick_ns();
+    start_ticks.saturating_mul(tick) > attach.saturating_add(tick)
+}
+
 fn parse_task_start(stat: &[u8]) -> Option<u64> {
     let close = stat.iter().rposition(|byte| *byte == b')')?;
     let tail = stat.get(close + 1..)?;
@@ -2867,8 +2861,8 @@ fn clock_tick_ns() -> u64 {
 
 /// `CLOCK_BOOTTIME` in nanoseconds: the clock domain of `/proc` starttime
 /// ticks (field 22 counts boot-relative ticks), so thread births date against
-/// the pause arm without a suspend-sensitive conversion. Returns `None`
-/// exactly when the clock read fails.
+/// hook attach completions without a suspend-sensitive conversion. Returns
+/// `None` exactly when the clock read fails.
 pub(crate) fn boot_ns() -> Option<u64> {
     let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
     // SAFETY: `clock_gettime` initializes `timestamp` on success.
@@ -3038,8 +3032,6 @@ mod tests {
         stable_states: Option<BTreeMap<u32, u8>>,
         starts: VecDeque<Result<BTreeMap<u32, u64>, String>>,
         last_states: BTreeMap<u32, u8>,
-        boot: VecDeque<Result<u64, String>>,
-        fallback_boot: u64,
         /// Scripted last-attach instants, one per read; the last one
         /// repeats. Default: none recorded.
         attach_instants: VecDeque<Option<u64>>,
@@ -3097,8 +3089,6 @@ mod tests {
                 stable_states: None,
                 starts: VecDeque::new(),
                 last_states: BTreeMap::new(),
-                boot: VecDeque::new(),
-                fallback_boot: 0,
                 attach_instants: VecDeque::new(),
                 fallback_attach: None,
                 queue: VecDeque::new(),
@@ -3205,20 +3195,6 @@ mod tests {
             // Unscripted tasks date at tick zero, matching the default test
             // baseline; a scripted birth must beat the arm by two ticks.
             Ok(self.last_states.keys().map(|tid| (*tid, 0)).collect())
-        }
-
-        fn boot_ns(&mut self) -> Result<u64, String> {
-            match self.boot.pop_front() {
-                Some(Ok(now)) => {
-                    self.fallback_boot = now;
-                    Ok(now)
-                }
-                Some(Err(error)) => Err(error),
-                None => {
-                    self.fallback_boot = self.fallback_boot.saturating_add(1);
-                    Ok(self.fallback_boot)
-                }
-            }
         }
 
         fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
@@ -4065,11 +4041,14 @@ mod tests {
 
     /// A stop whose current epoch was armed at `arm_boot_ns` (a fresh frame or
     /// successor re-arm), with the preflight threads 41 and 42 born at tick 50.
+    /// The arm no longer dates births and the coordinator keeps no boot-clock
+    /// arm stamp; the twins still state where the arm lies, so each shows the
+    /// outcome follows the attach instant alone.
     fn birth_dating_coordinator(arm_boot_ns: u64) -> PauseCoordinator {
+        let _ = arm_boot_ns;
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.arm_for_test();
         coordinator.expected_starts = [(41, 50), (42, 50)].into_iter().collect();
-        coordinator.armed_boot_ns = Some(arm_boot_ns);
         coordinator
     }
 
@@ -4230,6 +4209,49 @@ mod tests {
         coordinator.service(&mut io).unwrap();
 
         assert_covered(&coordinator);
+    }
+
+    /// A successor re-arm installed during the stop does not date births:
+    /// threads first seen after it (the post-arm sample) still date against
+    /// the last attach. Covered past the margin; at one tick, partial.
+    #[test]
+    fn births_first_seen_after_a_successor_rearm_date_against_the_last_attach() {
+        let tick = test_tick_ns();
+        let preflight: BTreeMap<u32, u64> = [(41, 50), (42, 50)].into_iter().collect();
+        for (attach_tick, covered) in [(100, true), (101, false)] {
+            let (grown, starts) = grown_by_one(102);
+            let mut io = birth_dating_io(grown.clone(), starts.clone(), Some(attach_tick * tick));
+            io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(stopped()), Ok(grown)]);
+            io.starts = VecDeque::from([
+                Ok(preflight.clone()),
+                Ok(preflight.clone()),
+                Ok(preflight.clone()),
+                Ok(starts),
+            ]);
+            let mut coordinator = birth_dating_coordinator(0);
+
+            coordinator.service(&mut io).unwrap();
+
+            if covered {
+                assert_covered(&coordinator);
+                assert!(coordinator.is_armed(), "the successor stays installed");
+            } else {
+                assert_partial(&coordinator);
+            }
+        }
+    }
+
+    /// The covered check itself: strict whole-tick margin, nothing without
+    /// an instant, and nothing after a saturated (unreadable-clock) instant.
+    #[test]
+    fn birth_covered_needs_an_instant_and_more_than_one_tick() {
+        let tick = test_tick_ns();
+        assert!(!birth_covered(102, None));
+        assert!(!birth_covered(100, Some(100 * tick)));
+        assert!(!birth_covered(101, Some(100 * tick)));
+        assert!(birth_covered(102, Some(100 * tick)));
+        assert!(!birth_covered(u64::MAX, Some(u64::MAX)));
+        assert!(!birth_covered(u64::MAX / tick, Some(u64::MAX - tick)));
     }
 
     /// The attach clock keeps the latest completion, stamps it in the boot

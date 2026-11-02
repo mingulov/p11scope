@@ -407,6 +407,79 @@ class JudgeTests(unittest.TestCase):
                  "reason": "module needs 6530 against the 512 ceiling"}]
         self.run_case(mutate, extra=present)
 
+    def test_expect_skip_verified_before_layer_failure(self):
+        # Both a layer failure and a missing pin: the pin error must win,
+        # proving the pin is verified, not vacuous behind the layer raise.
+        def mutate(report, ledger, receipt, spy):
+            report["functions"] = [row for row in report["functions"]
+                                   if row["module"] != OWNED]
+            report["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["modules_skipped"]}
+        result = self.run_case(
+            mutate,
+            extra=("--exact-only", "provider", "C_GetSlotList",
+                   "--expect-skip", "libp11-kit.so.0", "kept its 410 attached endpoints"),
+            want=1)
+        self.assertIn("pinned skip text absent", result["detail"])
+
+        # Control: pin present plus the same layer failure reports the
+        # layer error, so pins never mask a genuine crowding verdict.
+        def mutate_present(report, ledger, receipt, spy):
+            report["functions"] = [row for row in report["functions"]
+                                   if row["module"] != OWNED]
+            report["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["modules_skipped"]}
+            report["evidence"]["modules_skipped"] = [
+                {"name": "/usr/lib/libp11-kit.so.0.4.8",
+                 "reason": "admitted module needs 6120 more; kept its 410 attached endpoints"}]
+        result = self.run_case(
+            mutate_present,
+            extra=("--exact-only", "provider", "C_GetSlotList",
+                   "--expect-skip", "libp11-kit.so.0", "kept its 410 attached endpoints"),
+            want=1)
+        self.assertIn("exact-subset", result["detail"])
+
+    def test_expect_skip_any_disjunction(self):
+        pins = ("--expect-skip-any", "liba.so", "pre-text",
+                "--expect-skip-any", "liba.so", "post-text")
+        result = self.run_case(extra=pins, want=1)
+        self.assertIn("any of", result["detail"])
+
+        def mutate_pre(report, ledger, receipt, spy):
+            report["evidence"]["modules_skipped"] = [
+                {"name": "/usr/lib/liba.so", "reason": "blah pre-text blah"}]
+        self.run_case(mutate_pre, extra=pins)
+
+        def mutate_post(report, ledger, receipt, spy):
+            report["evidence"]["modules_skipped"] = [
+                {"name": "/usr/lib/liba.so", "reason": "blah post-text blah"}]
+        result = self.run_case(mutate_post, extra=pins)
+        self.assertIn("provider: exact", result["detail"])
+
+    def test_t5_post_fix_fake_flips_to_qualified(self):
+        # Fake shaped like post-fix T5: providers exact, closure refused
+        # whole with the admission lane's text. The disjunctive pins accept
+        # it and the layers pass, so rc=0 (the shell maps rc=0 on an
+        # expected cell to qualified: the flip is automatic).
+        post = "a proxy closure array is admitted whole or not at all"
+
+        def mutate(report, ledger, receipt, spy):
+            report["evidence"]["modules_skipped"] = [
+                {"name": "/usr/lib/x86_64-linux-gnu/libp11-kit.so.0.4.8",
+                 "reason": "module needs 6400 more; only 512 attach slots are "
+                           "available; 400 are in use - refusing to attach a prefix "
+                           "of its 64 lookalike function tables (%s)" % post}]
+            report["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["modules_skipped"]}
+        result = self.run_case(
+            mutate, cell="p11kit-proxy-pid-merge",
+            extra=("--exact-only", "provider", "C_GetSlotList,C_GetSlotInfo",
+                   "--spy-binding", "provider", "--forbid-unknown",
+                   "--expect-skip-any", "libp11-kit.so.0.4.8",
+                   "kept its 410 attached endpoints",
+                   "--expect-skip-any", "libp11-kit.so.0.4.8", post))
+        self.assertIn("provider: exact", result["detail"])
+
     def test_exact_only_subset_deficit_covered(self):
         def mutate(report, ledger, receipt, spy):
             target = next(row for row in report["functions"]
@@ -748,6 +821,76 @@ class InventoryTests(unittest.TestCase):
     def test_admitted_when_refusal_expected_fails(self):
         modules = [inventory_entry(PROXY, "admitted", 410)]
         self.run_inventory(modules, refused=(("proxy", "needs"),), want=1)
+
+
+SHELL = ROOT / "scripts/ci/p11kit-transparency.sh"
+
+JUDGE_HARNESS = r"""
+set -u
+SH=%s; CELL="$1"; STUB_RC="$2"; STUB_DETAIL="$3"; MODE="$4"; shift 4
+P11KIT_EXPECT_LEGACY32=1
+eval "$(sed -n '/^declare -A EXPECTED_FAIL=(/,/^fi/p' "$SH")"
+eval "$(sed -n '/^judge() {/,/^}/p' "$SH")"
+eval "$(sed -n '/^judge_composite() {/,/^}/p' "$SH")"
+result() { printf 'QUAL=%%s\n' "$4"; }
+judge_capture() { JUDGE_RC="$STUB_RC"; JUDGE_DETAIL="$STUB_DETAIL"; }
+if [ "$MODE" = judge ]; then
+  judge "$CELL" dummy
+else
+  judge_composite "$CELL" "$STUB_DETAIL" "$@"
+fi
+""" % repr(str(SHELL))
+
+
+class JudgeSignatureTests(unittest.TestCase):
+    """The shell judge marks expected-failure only for the named bug's
+    signature (EXPECTED_DETAIL); any other rc=1 stays failed. The real
+    judge() and judge_composite() bodies are extracted verbatim from the
+    script and run with a stubbed capture, so the test follows the code."""
+
+    def run_judge(self, cell, rc, detail, mode="judge", rcs=()):
+        proc = subprocess.run(
+            ["bash", "-c", JUDGE_HARNESS, "_", cell, str(rc), detail, mode, *rcs],
+            capture_output=True, text=True, timeout=10)
+        return proc
+
+    def test_t5_wrong_reason_stays_failed(self):
+        proc = self.run_judge("p11kit-proxy-pid-merge", 1,
+                              "gate was not safely released")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("QUAL=failed", proc.stdout)
+        # Positive control: the crowding signature still maps as expected.
+        proc = self.run_judge(
+            "p11kit-proxy-pid-merge", 1,
+            "provider: observed {} differs from ledger {x} (exact-subset delta {y})")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("QUAL=expected-failure", proc.stdout)
+
+    def test_t5b_wrong_reason_stays_failed(self):
+        proc = self.run_judge("p11kit-real-trust", 1,
+                              "gate was not safely released")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("QUAL=failed", proc.stdout)
+        proc = self.run_judge(
+            "p11kit-real-trust", 1,
+            "trust: observed {} differs from ledger {x} (delta {y})")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("QUAL=expected-failure", proc.stdout)
+
+    def test_t7_legacy32_wrong_reason_stays_failed(self):
+        proc = self.run_judge(
+            "p11kit-remote", 1,
+            "client(rc=0): ok || server(rc=1): gate was not safely released",
+            mode="composite", rcs=("0", "1"))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("QUAL=failed", proc.stdout)
+        proc = self.run_judge(
+            "p11kit-remote", 1,
+            "client(rc=0): ok || server(rc=1): unattributed calls where none "
+            "are allowed: unknown=68 ambiguous=0 unresolved=0",
+            mode="composite", rcs=("0", "1"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("QUAL=expected-failure", proc.stdout)
 
 
 if __name__ == "__main__":

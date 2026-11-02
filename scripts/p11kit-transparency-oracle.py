@@ -486,6 +486,17 @@ def judge(report_text, ledger_text, spy_text, receipt, args):
 
     strict = args.strict
     gaps = gap_inventory(evidence)
+    # Pinned gap text is verified before any layer verdict: a missing pin
+    # fails even when the layers also fail, so the pin is never vacuous.
+    for basename, substring in args.expect_skip:
+        require(any(basename in text and substring in text for text in gaps),
+                "pinned skip text absent: %s / %s" % (basename, substring))
+    if args.expect_skip_any:
+        require(any(basename in text and substring in text
+                    for text in gaps
+                    for basename, substring in args.expect_skip_any),
+                "pinned skip text absent (any of): %s"
+                % ("; ".join("%s / %s" % pair for pair in args.expect_skip_any),))
     exact_only = {}
     for role, names in args.exact_only:
         exact_only.setdefault(role, set()).update(names.split(","))
@@ -597,9 +608,6 @@ def judge(report_text, ledger_text, spy_text, receipt, args):
     if strict:
         require(exact and observation.get("causes") == [],
                 "lossy or unknown observation gap class")
-    for basename, substring in args.expect_skip:
-        require(any(basename in text and substring in text for text in gaps),
-                "pinned skip text absent: %s / %s" % (basename, substring))
 
     notes.append("layer totals %r; unknown=%d ambiguous=%d unresolved=%d" % (
         totals, len(unknown), len(ambiguous), len(unresolved)))
@@ -696,7 +704,12 @@ def main(argv=None):
                         help="pin file the workload TARGET lines must point at")
     parser.add_argument("--expect-skip", action="append", default=[], nargs=2,
                         metavar=("BASENAME", "SUBSTRING"),
-                        help="pinned gap text that must appear (repeatable)")
+                        help="pinned gap text that must appear (repeatable; every "
+                             "pair is required)")
+    parser.add_argument("--expect-skip-any", action="append", default=[], nargs=2,
+                        metavar=("BASENAME", "SUBSTRING"),
+                        help="pinned gap text of which at least one pair must "
+                             "appear (repeatable; for pre/post-fix disjunctions)")
     parser.add_argument("--module-name", action="append", default=[], nargs=2,
                         metavar=("ROLE", "NAME"),
                         help="gap-text name for a layer role (repeatable)")
@@ -717,6 +730,7 @@ def main(argv=None):
                              "and no partial (run cells)")
     args = parser.parse_args(argv)
     args.expect_skip = [tuple(pair) for pair in args.expect_skip]
+    args.expect_skip_any = [tuple(pair) for pair in args.expect_skip_any]
     args.module_name = dict(args.module_name)
     args.expect_refused = [tuple(pair) for pair in args.expect_refused]
     result = {"cell": args.cell, "pass": False, "detail": "", "qualification": "failed"}

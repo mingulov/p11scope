@@ -169,9 +169,17 @@ HARNESS_ERROR=0
 pin() { python3 -I "$HERE/mapped-provider-pin.py" "$1"; }
 
 # --- expected failures: cell -> reason (a fix landing shows as a pass) ---
+# EXPECTED_DETAIL names the bug's failure signature: an rc=1 becomes
+# expected-failure only when its detail carries that cell's signature;
+# any other rc=1 is a failed row, never green-washed as the known bug.
 declare -A EXPECTED_FAIL=(
   [p11kit-proxy-pid-merge]='closure array crowds out backends; task/v060-p11kit-admission'
   [p11kit-real-trust]='closure array crowds out backends; task/v060-p11kit-admission'
+)
+declare -A EXPECTED_DETAIL=(
+  [p11kit-proxy-pid-merge]='provider: observed {}'
+  [p11kit-real-trust]='trust: observed {}'
+  [p11kit-remote]='unattributed calls'
 )
 if [ "${P11KIT_EXPECT_LEGACY32:-0}" = 1 ]; then
   EXPECTED_FAIL[p11kit-remote]='stock SoftHSM 2.7 server rows unnamed; exec-scan-legacy32'
@@ -200,8 +208,9 @@ judge() {
   # judge CELL ...: judge_capture, then map the verdict to a contract
   # results.jsonl row honoring EXPECTED_FAIL. Oracle rc 0 (property holds)
   # becomes qualification qualified; rc 1 on an expected-failure cell becomes
-  # expected-failure (pass false: the property genuinely did not hold);
-  # anything else is a failed row.
+  # expected-failure only when the detail carries EXPECTED_DETAIL[cell]
+  # (pass false: the property genuinely did not hold); anything else is a
+  # failed row.
   local cell=$1
   judge_capture "$@"
   if [ "$JUDGE_RC" = 0 ]; then
@@ -212,9 +221,11 @@ judge() {
     fi
     return 0
   fi
-  if [ -n "${EXPECTED_FAIL[$cell]:-}" ] && [ "$JUDGE_RC" = 1 ]; then
-    result "$cell" 0 "expected-failure (${EXPECTED_FAIL[$cell]}): $JUDGE_DETAIL" expected-failure
-    return 0
+  if [ -n "${EXPECTED_FAIL[$cell]:-}" ] && [ "$JUDGE_RC" = 1 ] && [ -n "${EXPECTED_DETAIL[$cell]:-}" ]; then
+    if printf '%s' "$JUDGE_DETAIL" | grep -F -q -- "${EXPECTED_DETAIL[$cell]}"; then
+      result "$cell" 0 "expected-failure (${EXPECTED_FAIL[$cell]}): $JUDGE_DETAIL" expected-failure
+      return 0
+    fi
   fi
   result "$cell" 0 "$JUDGE_DETAIL" failed
   return 1
@@ -222,8 +233,9 @@ judge() {
 judge_composite() {
   # judge_composite CELL DETAIL RC...: map a composite verdict (T6, T7) to
   # a contract row honoring EXPECTED_FAIL, like judge(). Expected-failure
-  # needs a genuine property failure (rc 1) with no harness error (rc 2):
-  # a harness failure must never be swallowed as expected.
+  # needs a genuine property failure (rc 1) with no harness error (rc 2)
+  # and the detail carrying EXPECTED_DETAIL[cell]: a harness failure or a
+  # wrong reason must never be swallowed as expected.
   local cell=$1 detail=$2; shift 2
   local r prop_fail=0 harness_fail=0
   for r in "$@"; do
@@ -238,9 +250,11 @@ judge_composite() {
     fi
     return 0
   fi
-  if [ -n "${EXPECTED_FAIL[$cell]:-}" ] && [ "$harness_fail" = 0 ]; then
-    result "$cell" 0 "expected-failure (${EXPECTED_FAIL[$cell]}): $detail" expected-failure
-    return 0
+  if [ -n "${EXPECTED_FAIL[$cell]:-}" ] && [ "$harness_fail" = 0 ] && [ -n "${EXPECTED_DETAIL[$cell]:-}" ]; then
+    if printf '%s' "$detail" | grep -F -q -- "${EXPECTED_DETAIL[$cell]}"; then
+      result "$cell" 0 "expected-failure (${EXPECTED_FAIL[$cell]}): $detail" expected-failure
+      return 0
+    fi
   fi
   result "$cell" 0 "$detail" failed
   return 1
@@ -359,9 +373,10 @@ pid_cell() {
   # gated --pid capture through the proxy (XDG isolated|merge). PROXYWIRE is
   # exact (proxy loop must equal) or cover (proxy loop may be refused when
   # the closure array crowds it, as long as the gap is named). SKIPS pins
-  # gap text as "basename:substring;..." (empty for none). The workload runs
-  # as $RUNUID with the cell's p11-kit/spy environment; the observer runs
-  # as root.
+  # gap text as "basename:substring;..." (empty for none); an entry prefixed
+  # "any:" joins the --expect-skip-any disjunction instead (at least one
+  # must appear). The workload runs as $RUNUID with the cell's p11-kit/spy
+  # environment; the observer runs as root.
   local cell=$1 mode=$2 duration=$3 xdg=$4 proxywire=$5 skipspec=$6 providerwire=$7; shift 7
   local gate=$OUT/$cell.gate
   rm -f -- "$gate" "$cell.json" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json" "$cell.spy.log"
@@ -399,7 +414,12 @@ pid_cell() {
   if [ -n "$skipspec" ]; then
     local IFS=';'
     for pair in $skipspec; do
-      skips+=(--expect-skip "${pair%%:*}" "${pair#*:}")
+      if [[ "$pair" == any:* ]]; then
+        pair=${pair#any:}
+        skips+=(--expect-skip-any "${pair%%:*}" "${pair#*:}")
+      else
+        skips+=(--expect-skip "${pair%%:*}" "${pair#*:}")
+      fi
     done
     unset IFS
   fi
@@ -412,6 +432,7 @@ pid_cell() {
 }
 
 # --- T1: profile --pid through the proxy, isolated config ---
+# Brief T1 "exact" is implemented as loop-exact + setup-covered per the timing contract in through-proxy.c; spy whole-covered as harness infra.
 t1() { pid_cell p11kit-proxy-pid-isolated profile 20 isolated exact "" loop; }
 
 # --- T2: same as T1, metrics mode ---
@@ -594,10 +615,17 @@ PY
 # The owned backend must be admitted whole (loop exact); the libp11-kit
 # closure array may be refused as a named gap. Expected failure until the
 # admission fix lands (closure array crowds out backends). The closure pin
-# below is per p11-kit version (0.26.2 / libp11-kit.so.0.4.8 here): a version
-# change that moves the counts fails loudly for re-pinning.
-t5() { pid_cell p11kit-proxy-pid-merge profile 20 merge cover \
-  "libp11-kit.so.0.4.8:needs 6120 more;libp11-kit.so.0.4.8:kept its 410 attached endpoints" loop; }
+# accepts either the pre-fix K4 prefix text (per p11-kit version: 410
+# endpoints on 0.26.x, basename derived from the probed library) or the
+# post-fix whole-refusal text (task/v060-p11kit-admission), so the cell
+# flips automatically when the fix lands; a version change that moves the
+# counts fails loudly for re-pinning.
+t5() {
+  local base
+  base=$(basename "$LIBP11KIT")
+  pid_cell p11kit-proxy-pid-merge profile 20 merge cover \
+    "any:$base:kept its 410 attached endpoints;any:$base:a proxy closure array is admitted whole or not at all" loop
+}
 
 # --- T8: T1 with --prearm-module <owned copy> ---
 # The first calls after the late load must be counted exactly: the owned

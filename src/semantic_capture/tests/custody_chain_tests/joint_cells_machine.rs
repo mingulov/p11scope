@@ -3848,3 +3848,54 @@ fn assert_unlinked_lane_disclosure(
             .sum();
     assert_eq!(api_total, 1, "the modeled call still reduces S1");
 }
+
+/// A real client's count-only setup calls (`C_GetFunctionList`,
+/// `C_GetSlotList`: ordinary H0 calls on COUNT_ONLY slots, never
+/// journaled) precede its modeled work in the first linked quantum.
+/// Conversion refuses them because they carry no semantic facts, but
+/// the journal proves them irrelevant to object proof, so H3 disposes
+/// their positions: the first seal certifies, the feed stays Joint and
+/// the section populates. A shed barrier here voided the first live
+/// linked `--system` seal as H3Loss and left a silent `authority_lost`.
+#[test]
+fn joint_machine_count_only_setup_calls_seal_populated() {
+    use crate::key_operation_projection::ObsStatus;
+    use crate::semantics_objects::journal::JournalGap;
+
+    let mut scene = MachineScene::with_initial_files_and_functions(
+        1,
+        &[0],
+        &["C_GetFunctionList", "C_GetSlotList", "C_SignInit"],
+        true,
+    );
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    push_ordinary_payload(&mut scene, pid, "C_GetSlotList", 2);
+    scene.scene.push(pid, 0, "C_SignInit", 3);
+    scene.scene.push(pid, 0, "C_SignInit", 4);
+    scene.machine.begin_commit(true).unwrap();
+    assert_eq!(reach_any(&mut scene, &["Audited"]), "Audited");
+    let audit = scene
+        .machine
+        .diagnostic_audit_for_test()
+        .map(|(gap, h3, _, floor, _)| (gap, h3, floor));
+    assert!(
+        !matches!(
+            audit,
+            Some((Some(JournalGap::H3Loss), _, _)) | Some((_, "StagedLoss", _))
+        ),
+        "count-only setup calls are disposed, never an H3 loss barrier: {audit:?}"
+    );
+    scene.published_labeled("count-only-setup", None);
+    let registry = scene.scene.real.scene.coordinator.registry();
+    let observations = registry.joint_observations(registry.published_revision());
+    assert_eq!(
+        (
+            registry.joint_feeds(),
+            observations.status,
+            observations.reason
+        ),
+        (1, ObsStatus::Populated, "none"),
+        "the first seal certifies across the setup calls: audit {audit:?}"
+    );
+}

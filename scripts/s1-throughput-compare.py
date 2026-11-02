@@ -19,8 +19,12 @@ Gates, in order; the first failure refuses with its own reason:
 2. Conservation: issued == observed exactly, at the finest granularity
    the v0.5.0 S1 contract publishes (docs/schema/inventory-v1.md):
    exact call and error totals per mechanism - the physical edge's
-   entries.count and its owned semantic child's operations.calls and api_returns
-   each equal issued, and every mechanism row's calls / errors equal
+   entries.count equals issued, and its owned semantic child's
+   operations.calls and api_returns each equal issued minus the
+   driver's named slot-refused count-only conversions ("semantic
+   input refused"/"slot" repeats scoped to the driver; the product
+   refuses COUNT_ONLY calls at conversion and counts one repeat per
+   refused call) - and every mechanism row's calls / errors equal
    the ledgered totals of its evidence functions - with the observed
    function-name and return-code sets equal to the ledger's hot-loop
    sets. The driver's ledgered teardown calls (C_CloseSession,
@@ -75,7 +79,10 @@ mechanism pair is 0x251/CKM_SHA256_HMAC/sign plus
 0x350/CKM_GENERIC_SECRET_KEY_GEN/generate_key, with the ledgered
 setup calls (C_Initialize, C_GetSlotList, C_OpenSession) and the
 key close (C_DestroyObject) conserved in the exact totals but
-exempt from the evidence sets, like teardown; and the
+exempt from the evidence sets, like teardown - except the two
+COUNT_ONLY slot probes, which the product refuses at conversion
+and which conservation accounts through the named slot-refused
+term above; and the
 capture-wide refused_endpoints/continuity_cuts counts are recorded,
 never gated (they count foreign admissions). Gate 4 becomes the
 Joint-active proof: object_observations populated with reason none
@@ -588,15 +595,60 @@ def record_latency(view, series):
             "max_ns": samples[-1], "unmapped": unmapped}
 
 
-def check_conservation(view, selected, joint=False):
+def driver_slot_refused(doc, caller_id, module_id, pid):
+    """Driver-scoped count-only conversion refusals, exactly counted.
+
+    The product refuses COUNT_ONLY calls (the keyed setup's slot
+    probes) at conversion with the named gap "semantic input
+    refused"/"slot" and discloses one repeat per refused call, so the
+    repeats of the driver's rows are the exact refused-call count
+    (the product's own entered == api + shed + slot + inst
+    equation). Only rows scoped exactly to the driver count; anything
+    else fails closed in the caller. Malformed gap rows refuse here
+    (this gate runs before the loss gate validates them).
+    """
+    gaps = doc.get("gaps")
+    _require(type(gaps) is list, "inventory gaps must be a list")
+    total = 0
+    for gap in gaps:
+        _require(type(gap) is dict, "gap entry must be an object")
+        subject = gap.get("subject")
+        reason = gap.get("reason")
+        _require(type(subject) is str and subject
+                 and type(reason) is str and reason,
+                 "gap entry without subject/reason")
+        _require(_u64(gap.get("repeats")) and gap["repeats"] > 0,
+                 "gap entry without a positive repeat count")
+        if subject != "semantic input refused" or reason != "slot":
+            continue
+        if gap.get("caller") != caller_id:
+            continue
+        if gap.get("module") not in (None, module_id):
+            continue
+        if gap.get("pid") is not None and gap.get("pid") != pid:
+            continue
+        total += gap["repeats"]
+    return total
+
+
+def check_conservation(view, selected, doc, joint=False):
     """Issued == observed: totals, mechanism rows, function and rv sets.
 
     In --joint mode the pinned pair is HMAC sign plus keygen, and the
     ledgered setup and key-close calls join teardown in the
     evidence-set exemption (conserved in the exact totals only).
+    The physical edge counts every observed call, including the
+    count-only setup probes the product refuses at conversion; the
+    semantic child counts only applied calls, so its exact totals
+    equal issued minus the driver's named slot-refused count above.
     """
     issued = view["issued"]
     edge = selected["edge"]
+    slot = driver_slot_refused(doc, edge.get("caller"),
+                               edge.get("module"), selected["pid"])
+    _require(slot <= issued,
+             f"slot-refused {slot} exceeds issued {issued}")
+    want = issued - slot
     entries = edge.get("entries")
     _require(type(entries) is dict, "driver edge without entries")
     _require(_u64(entries.get("count")) and entries["count"] == issued,
@@ -605,8 +657,9 @@ def check_conservation(view, selected, joint=False):
     operations = child.get("operations")
     _require(type(operations) is dict,
              "no S1 operations on the owned semantic child")
-    _require(_u64(operations.get("calls")) and operations["calls"] == issued,
-             f"operations.calls {operations.get('calls')} != issued {issued}")
+    _require(_u64(operations.get("calls")) and operations["calls"] == want,
+             f"operations.calls {operations.get('calls')} != issued {issued} "
+             f"minus slot-refused {slot}")
     api_total = 0
     for row in selected["sem_rows"]:
         returns = row.get("api_returns")
@@ -615,8 +668,9 @@ def check_conservation(view, selected, joint=False):
         _require(_u64(count),
                  f"api_returns {count!r} unusable with issued {issued}")
         api_total += count
-    _require(api_total == issued,
-             f"api_returns {api_total} != issued {issued}")
+    _require(api_total == want,
+             f"api_returns {api_total} != issued {issued} "
+             f"minus slot-refused {slot}")
     mechanisms = child.get("mechanisms")
     _require(type(mechanisms) is list and mechanisms,
              f"no S1 mechanism rows on the owned semantic child "
@@ -712,7 +766,7 @@ def check_conservation(view, selected, joint=False):
     }
     return {"entries": entries["count"], "operations": operations["calls"],
             "api_returns": api_total, "mechanisms": checked,
-            "teardown": teardown}
+            "teardown": teardown, "slot_refused": slot}
 
 
 def _gap_loss_reason(subject, reason):
@@ -1076,7 +1130,7 @@ def compare(ledger_paths, event_paths, inventory_path,
     series = driver_series(events, selected["edge"])
     check_stream_matches_snapshot(series, selected["edge"])
     latency = record_latency(view, series)
-    conservation = check_conservation(view, selected, joint=joint)
+    conservation = check_conservation(view, selected, doc, joint=joint)
     loss = check_loss(selected, doc, events, joint=joint)
     result = {"verdict": "pass", "pid": view["pid"],
               "ledgers": view["ledgers"], "issued": view["issued"],

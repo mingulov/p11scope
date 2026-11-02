@@ -9473,3 +9473,120 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     );
     Ok(())
 }
+
+/// Joint init latches the lane's journal linkage from its drain
+/// producers before any traffic or birth: a linked lane reads
+/// `bootstrap_unavailable` at first publication, an unlinked lane
+/// reads `journal_unavailable`, and neither stages a gap. Root BPF
+/// lane, serial.
+#[test]
+#[ignore = "privileged: joint init latches producer linkage before traffic"]
+fn privileged_joint_init_latches_producer_linkage() -> Result<()> {
+    use anyhow::Context as _;
+    let workload = JointWorkload::build()?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-latch-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-latch-held.dr37.json",
+    )?;
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        let mut coordinator =
+            system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+        refuse_linked_without_journal(
+            &mut coordinator,
+            vec![manifest_soft.clone(), manifest_held.clone()],
+            "KEY_OPS_LATCH",
+        )?;
+    } else {
+        let mut coordinator =
+            system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+        // Linked attach without init (mirrors
+        // `start_joint_lane_with_journal` up to the init call), so the
+        // twin can model the production unlatched default first: test
+        // registries default latched, which would prove nothing.
+        coordinator.set_semantic_manifests(vec![manifest_soft.clone(), manifest_held.clone()]);
+        let attach_subset = coordinator
+            .prepare_semantic_subset()
+            .subset
+            .context("the attach subset prepares")?;
+        let convert_subset = coordinator
+            .prepare_semantic_subset()
+            .subset
+            .context("the conversion subset prepares")?;
+        let scope = Scope::System;
+        let spec = crate::attach::journal::JournalSpec;
+        let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
+            attach_subset,
+            convert_subset,
+            &scope,
+            crate::attach::BackendSelection::Auto,
+            Some(&spec),
+        )
+        .map_err(|refusal| anyhow::anyhow!("linked live lane attaches: {refusal}"))?;
+        ensure!(lane.is_live(), "the lane owns its live session");
+        coordinator.registry_mut().note_journal_linked(false);
+        lane.initialize_joint(&mut coordinator)
+            .map_err(|refusal| anyhow::anyhow!("the joint machine initializes: {refusal}"))?;
+        ensure!(lane.has_joint_machine(), "the machine initializes live");
+        let registry = coordinator.registry();
+        ensure!(
+            registry.journal_linked(),
+            "init latches the linked lane before any traffic"
+        );
+        let observations = registry.joint_observations(registry.published_revision());
+        ensure!(
+            observations.reason == "bootstrap_unavailable",
+            "a linked lane reads bootstrap at first publication: {}",
+            observations.reason
+        );
+        assert_init_stages_no_birth_gap(registry, "linked");
+        eprintln!("KEY_OPS_LATCH linked latch=true reason=bootstrap_unavailable");
+        drop(lane);
+    }
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let lane = start_joint_lane(&mut coordinator, vec![manifest_soft, manifest_held])?;
+    let registry = coordinator.registry();
+    ensure!(
+        !registry.journal_linked(),
+        "init leaves the unlinked lane unlatched"
+    );
+    let observations = registry.joint_observations(registry.published_revision());
+    ensure!(
+        observations.reason == "journal_unavailable",
+        "an unlinked lane reads journal_unavailable: {}",
+        observations.reason
+    );
+    assert_init_stages_no_birth_gap(registry, "unlinked");
+    eprintln!("KEY_OPS_LATCH unlinked latch=false reason=journal_unavailable");
+    drop(lane);
+    Ok(())
+}
+
+/// The init latch stages no gap: it only arms the label the first
+/// birth disclosure will carry.
+fn assert_init_stages_no_birth_gap(
+    registry: &crate::discovery::caller_registry::CallerRegistry,
+    which: &str,
+) {
+    let staged = registry.staged_scope_gaps_for_test();
+    assert!(
+        !staged
+            .iter()
+            .any(|(subject, _)| subject == "Joint birth unavailable; retained S1"),
+        "{which}: init stages no retained-S1 gap"
+    );
+    assert!(
+        !staged
+            .iter()
+            .any(|(_, reason)| reason == "joint_journal_unavailable"),
+        "{which}: init stages no unlinked gap"
+    );
+}

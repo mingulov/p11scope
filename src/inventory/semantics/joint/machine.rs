@@ -55,6 +55,10 @@ fn reborrow_acquisition<'a, 'b: 'a>(
 }
 
 const RAW_CAPACITY: usize = 4_096;
+// Wall-time bound on a pre-grant linked quantum's extension: at most
+// this long from the quantum's first poll. An engineering limit: it
+// may be raised, never lowered.
+pub(crate) const PREGRANT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 // The actual shared binder selects at most four caller/provider pairs. Its
 // no-call receipts join the same original H0 report, never a second stage.
 const REFRESHES_PER_BIND: usize = 4;
@@ -444,6 +448,9 @@ struct Collected {
     /// The guard trip cause, set when the bound expires the stall and
     /// cleared by the next progressing merge.
     h0_guard_trip: Option<&'static str>,
+    /// First-poll timestamp of this quantum: the pre-grant extension
+    /// bound starts here. `None` closes like an expired bound.
+    pregrant_first_poll: Option<Instant>,
 }
 
 impl Collected {
@@ -1156,6 +1163,11 @@ pub(crate) struct LiveJointMachine {
     // a live no-progress poll. Production never sets this.
     #[cfg(test)]
     pose_no_progress_poll: bool,
+    // Posed pre-grant extension timeout for the bound twin: the
+    // Collecting arm closes as if the wall-time bound expired, without
+    // waiting it out. Production never sets this.
+    #[cfg(test)]
+    pose_pregrant_close_timeout: bool,
     // All original phase buffers and birth leases drop before inline storage.
     _storage: ResourceLease,
 }
@@ -1225,6 +1237,8 @@ impl LiveJointMachine {
             inject: None,
             #[cfg(test)]
             pose_no_progress_poll: false,
+            #[cfg(test)]
+            pose_pregrant_close_timeout: false,
             _storage: storage,
         })
     }
@@ -1236,6 +1250,14 @@ impl LiveJointMachine {
     #[cfg(test)]
     pub(crate) fn pose_no_progress_poll_for_test(&mut self, on: bool) {
         self.pose_no_progress_poll = on;
+    }
+
+    /// Pose (or clear) an expired pre-grant extension bound: while
+    /// posed, the Collecting arm closes as if the wall-time bound
+    /// expired, so the bound twin never waits it out.
+    #[cfg(test)]
+    pub(crate) fn pose_pregrant_close_timeout_for_test(&mut self, on: bool) {
+        self.pose_pregrant_close_timeout = on;
     }
 
     /// Backdate (or clear) the current stall-clock start, so the twin
@@ -2641,6 +2663,7 @@ impl LiveJointMachine {
                             request_pulled: false,
                             h0_idle_passes: 0,
                             h0_guard_trip: None,
+                            pregrant_first_poll: Some(Instant::now()),
                         }),
                         Err(SemanticRefusal::Unavailable),
                     );
@@ -2655,6 +2678,7 @@ impl LiveJointMachine {
                         request_pulled: false,
                         h0_idle_passes: 0,
                         h0_guard_trip: None,
+                        pregrant_first_poll: Some(Instant::now()),
                     }),
                     Ok(Step::Continue),
                 )
@@ -4931,5 +4955,12 @@ mod binding_reservation_tests {
         assert!(kept.reload_not_excluded().is_empty());
         assert_eq!(kept.continued_across_global(), 0);
         assert_eq!(kept.joined_across_global(), 0);
+    }
+
+    /// The pre-grant extension bound is an engineering limit: it may
+    /// be raised, never lowered.
+    #[test]
+    fn pregrant_close_timeout_floor() {
+        assert!(super::PREGRANT_CLOSE_TIMEOUT >= std::time::Duration::from_secs(2));
     }
 }

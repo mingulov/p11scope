@@ -2867,3 +2867,550 @@ fn plain_and_machine_polls_share_one_ring_loss_baseline() {
     assert_eq!(gaps.len(), 1, "rises coalesce onto one gap row: {gaps:?}");
     assert_eq!(gaps[0].1, 2, "two rises surface twice: {gaps:?}");
 }
+
+// Pre-grant linked-quantum extension: on a linked lane with no grant
+// yet, a quantum stays open while a journaled START is in flight or
+// its H0 records are only count-only setup calls, within wall-time,
+// table and capacity bounds. Stop, failure and unlinked lanes close
+// exactly as before.
+
+/// One provider with a setup call and a modeled lifecycle call.
+fn pregrant_scene() -> MachineScene {
+    MachineScene::with_initial_files_and_functions(
+        1,
+        &[0],
+        &["C_GetFunctionList", "C_Initialize"],
+        true,
+    )
+}
+
+/// Stage one completed call as a bare H0 record, with no journal row.
+fn push_ordinary_payload(scene: &mut MachineScene, pid: u32, name: &str, sequence: u64) {
+    use crate::events::record_bytes;
+    use p11scope_ebpf_common::object_journal::{JournalRecord, decode_journal_record};
+    use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+    let rows = publish_object_descriptors();
+    let (_, end) = scene.scene.encoded(pid, 0, name, sequence);
+    let payload = match decode_journal_record(&end, &rows) {
+        Some(JournalRecord::End(end)) => end.payload_base(),
+        other => panic!("{name} END decodes, got {other:?}"),
+    };
+    scene
+        .scene
+        .drain
+        .source_mut()
+        .push_record(record_bytes(&payload));
+}
+
+/// Stage one journaled START now; the caller holds the END bytes for
+/// a later poll.
+fn push_begin(scene: &mut MachineScene, pid: u32, name: &str, sequence: u64) -> [u8; 632] {
+    let (begin, end) = scene.scene.encoded(pid, 0, name, sequence);
+    scene.scene.drain.source_mut().push_record(begin.to_vec());
+    end
+}
+
+/// Publish one empty requested quantum, leaving the demand
+/// published: later quanta collect unrequested, like live traffic
+/// quanta after the commit's first.
+fn publish_empty_first_quantum(scene: &mut MachineScene) {
+    scene.machine.begin_commit(true).unwrap();
+    scene.published();
+}
+
+/// Drive until the machine leaves Collecting or 64 polls pass.
+/// The first poll runs even from Idle, so a fresh quantum starts.
+fn drive_collecting_quiescent(scene: &mut MachineScene) -> &'static str {
+    for _ in 0..64 {
+        scene.service(1).expect("quiescent service succeeds");
+        if phase_of(scene) != "Collecting" {
+            break;
+        }
+    }
+    phase_of(scene)
+}
+
+/// Drive until the machine leaves Collecting; true when it closes
+/// within the bound. The first poll runs even from Idle.
+fn drive_until_closed(scene: &mut MachineScene, polls: usize) -> bool {
+    for _ in 0..polls {
+        scene.service(1).expect("close poll succeeds");
+        if phase_of(scene) != "Collecting" {
+            return true;
+        }
+    }
+    false
+}
+
+/// The one staged admission, cloned before the machine consumes it.
+fn cloned_only_admission(
+    scene: &mut MachineScene,
+) -> crate::discovery::caller_registry::instance_input::AdmittedInstanceCall {
+    let coordinator = &mut scene.scene.real.scene.coordinator;
+    let (prepared, _) = coordinator
+        .prepared_joint_parts()
+        .expect("a prepared batch stages");
+    assert_eq!(
+        prepared.admissions().count(),
+        1,
+        "exactly the modeled call admits"
+    );
+    prepared.admissions().next().expect("modeled call").clone()
+}
+
+/// Re-run the admission's key bind read-only in effect: success is a
+/// no-op on an already-bound key, and refusal mutates nothing.
+fn bind_probe_outcome(
+    scene: &mut MachineScene,
+    input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+) -> Result<
+    crate::semantics_objects::journal::JournalDomainProof,
+    crate::semantics_objects::journal::AttestationRefusal,
+> {
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .bind_admitted_key(input)
+}
+
+/// A skewed END joins the quantum its START opened: the in-flight
+/// START holds the pre-grant quantum, one quantum holds both rows,
+/// the bind mints the grant, Births runs, the lane latches, and the
+/// image stays untainted.
+#[test]
+fn joint_pregrant_skewed_end_joins_one_quantum() {
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    // Model the pre-birth unlatched world (production starts
+    // unlatched; test registries default latched), so the later
+    // latch assertion proves the birth path latched.
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .note_journal_linked(false);
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    let init_end = push_begin(&mut scene, pid, "C_Initialize", 2);
+    assert_eq!(
+        drive_collecting_quiescent(&mut scene),
+        "Collecting",
+        "the in-flight START holds the pre-grant quantum open"
+    );
+    let held = raw_identity_of(&scene).expect("a held raw");
+    scene
+        .scene
+        .drain
+        .source_mut()
+        .push_record(init_end.to_vec());
+    assert_eq!(reach_any(&mut scene, &["BindingKeys"]), "BindingKeys");
+    let input = cloned_only_admission(&mut scene);
+    assert!(
+        raw_identity_of(&scene) == Some(held),
+        "one quantum holds both rows"
+    );
+    assert_eq!(reach_any(&mut scene, &["Births"]), "Births");
+    assert!(
+        scene.machine.retained_drain_grant_for_test().is_some(),
+        "the bind mints the grant"
+    );
+    assert!(
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .journal_linked(),
+        "the birth path latches the linked lane"
+    );
+    scene.published();
+    assert!(
+        bind_probe_outcome(&mut scene, &input).is_ok(),
+        "the image stays untainted"
+    );
+}
+
+/// Count-only setup records hold the pre-grant quantum across idle
+/// polls until modeled work arrives, then one quantum binds it.
+#[test]
+fn joint_pregrant_count_only_prefix_holds_for_late_begin() {
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    assert_eq!(
+        drive_collecting_quiescent(&mut scene),
+        "Collecting",
+        "count-only setup records hold the pre-grant quantum open"
+    );
+    let held = raw_identity_of(&scene).expect("a held raw");
+    for _ in 0..8 {
+        scene.service(1).expect("idle poll succeeds");
+    }
+    assert_eq!(
+        phase_of(&scene),
+        "Collecting",
+        "the pause extends, never closes"
+    );
+    assert!(
+        raw_identity_of(&scene) == Some(held),
+        "the pause keeps one quantum"
+    );
+    let init_end = push_begin(&mut scene, pid, "C_Initialize", 2);
+    scene
+        .scene
+        .drain
+        .source_mut()
+        .push_record(init_end.to_vec());
+    assert_eq!(reach_any(&mut scene, &["BindingKeys"]), "BindingKeys");
+    let input = cloned_only_admission(&mut scene);
+    assert!(
+        raw_identity_of(&scene) == Some(held),
+        "one quantum holds the late call"
+    );
+    assert_eq!(reach_any(&mut scene, &["Births"]), "Births");
+    assert!(
+        scene.machine.retained_drain_grant_for_test().is_some(),
+        "the late bind mints the grant"
+    );
+    scene.published();
+    assert!(
+        bind_probe_outcome(&mut scene, &input).is_ok(),
+        "the image stays untainted"
+    );
+}
+
+/// The wall-time bound closes an extended quantum: disposal taints,
+/// the next bind discloses its taint refusal, the label reads
+/// linked-bootstrap, S1 still reduces, and no grant mints.
+#[test]
+fn joint_pregrant_timeout_closes_and_discloses_tainted_birth() {
+    use crate::semantics_objects::journal::AttestationRefusal;
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    let init_end = push_begin(&mut scene, pid, "C_Initialize", 2);
+    assert_eq!(
+        drive_collecting_quiescent(&mut scene),
+        "Collecting",
+        "the START holds first"
+    );
+    scene.machine.pose_pregrant_close_timeout_for_test(true);
+    assert!(
+        drive_until_closed(&mut scene, 64),
+        "the expired bound closes the extended quantum"
+    );
+    scene.published();
+    scene
+        .scene
+        .drain
+        .source_mut()
+        .push_record(init_end.to_vec());
+    assert_eq!(reach_any(&mut scene, &["BindingKeys"]), "BindingKeys");
+    let input = cloned_only_admission(&mut scene);
+    scene.published();
+    assert!(
+        scene.machine.retained_drain_grant_for_test().is_none(),
+        "the tainted bind mints no grant"
+    );
+    let outcome = bind_probe_outcome(&mut scene, &input);
+    assert!(
+        matches!(outcome, Err(AttestationRefusal::ImageTainted)),
+        "disposal tainted the image: {outcome:?}"
+    );
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let reasons: Vec<String> = coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "Joint birth unavailable; retained S1")
+        .map(|gap| gap.reason.clone())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec!["joint_birth_claim_ImageTainted".to_string()],
+        "the refused bind discloses its cause"
+    );
+    // The init-time latch with the producers' value. The machine twin
+    // cannot run the live init path, so it replicates the latch input
+    // exactly; the privileged twin pins the production call site.
+    let linked = scene.scene.producers.journal_linked();
+    assert!(linked, "the twin runs linked producers");
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .note_journal_linked(linked);
+    let registry = scene.scene.real.scene.coordinator.registry();
+    let observations = registry.joint_observations(registry.published_revision());
+    assert_eq!(observations.reason, "bootstrap_unavailable");
+    let api_total: u64 = crate::semantic_capture::tests::custody_chain_tests::operation_edge_rows(
+        &scene.scene.real.scene,
+    )
+    .iter()
+    .filter_map(|row| row.0)
+    .sum();
+    assert_eq!(api_total, 1, "the modeled call still reduces S1");
+}
+
+/// The H0 pending cap closes an extending quantum at the bound: the
+/// open START holds below it, and the close lands exactly on it.
+#[test]
+fn joint_pregrant_pending_capacity_closes_during_extension() {
+    use crate::discovery::instances::MAX_PENDING;
+    use crate::events::record_bytes;
+    use p11scope_ebpf_common::object_journal::{JournalRecord, decode_journal_record};
+    use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+    let mut scene = pregrant_scene();
+    let pid = std::process::id();
+    let rows = publish_object_descriptors();
+    let (_, end) = scene.scene.encoded(pid, 0, "C_GetFunctionList", 1);
+    let payload = match decode_journal_record(&end, &rows) {
+        Some(JournalRecord::End(end)) => end.payload_base(),
+        other => panic!("setup END decodes, got {other:?}"),
+    };
+    let bytes = record_bytes(&payload);
+    publish_empty_first_quantum(&mut scene);
+    scene.scene.drain.source_mut().bound = 4_096;
+    let _init_end = push_begin(&mut scene, pid, "C_Initialize", 2);
+    for chunk in 0..5 {
+        for _ in 0..200 {
+            scene.scene.drain.source_mut().push_record(bytes.clone());
+        }
+        scene.service(100_000).expect("chunk collects");
+        assert_eq!(
+            phase_of(&scene),
+            "Collecting",
+            "chunk {chunk} extends below the bound"
+        );
+    }
+    for _ in 0..24 {
+        scene.scene.drain.source_mut().push_record(bytes.clone());
+    }
+    assert!(
+        drive_until_closed(&mut scene, 256),
+        "the pending cap closes the extended quantum"
+    );
+    let raw = scene
+        .machine
+        .retained_raw_for_test()
+        .expect("a retained raw");
+    assert_eq!(
+        raw.pending_h0_records(),
+        MAX_PENDING,
+        "the close lands exactly on the bound"
+    );
+    assert!(
+        raw.has_open_affecting_start(),
+        "the START was open: the bound closed, not idleness"
+    );
+}
+
+/// A filled BEGIN table closes an extending quantum even with a
+/// thousand open STARTs and no H0 record at all.
+#[test]
+fn joint_pregrant_begin_table_full_closes_during_extension() {
+    use crate::semantics_objects::journal::tests::{begin_bytes, function_id};
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    scene.scene.drain.source_mut().bound = 4_096;
+    for (chunk, threads) in [1..=400, 401..=800].into_iter().enumerate() {
+        for thread in threads {
+            let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
+            scene.scene.drain.source_mut().push_record(begin.to_vec());
+        }
+        scene.service(100_000).expect("chunk collects");
+        assert_eq!(
+            phase_of(&scene),
+            "Collecting",
+            "chunk {chunk} extends below the table bound"
+        );
+    }
+    for thread in 801..=1_024 {
+        let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
+        scene.scene.drain.source_mut().push_record(begin.to_vec());
+    }
+    for _ in 0..512 {
+        scene.service(1).expect("close poll succeeds");
+        if phase_of(&scene) != "Collecting" {
+            break;
+        }
+    }
+    assert_ne!(
+        phase_of(&scene),
+        "Collecting",
+        "the full BEGIN table closes despite open STARTs"
+    );
+    let raw = scene
+        .machine
+        .retained_raw_for_test()
+        .expect("a retained raw");
+    assert!(raw.begin_table_full_or_refused(), "the table bound engaged");
+    assert!(
+        raw.has_open_affecting_start(),
+        "STARTs were open: the bound closed, not idleness"
+    );
+}
+
+/// A refused record closes an extending quantum: the open START and
+/// the count-only record would hold, but the refusal wins.
+#[test]
+fn joint_pregrant_refused_record_closes_during_extension() {
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    let _init_end = push_begin(&mut scene, pid, "C_Initialize", 2);
+    let (dup_begin, _) = scene.scene.encoded(pid, 0, "C_GetFunctionList", 3);
+    scene
+        .scene
+        .drain
+        .source_mut()
+        .push_record(dup_begin.to_vec());
+    scene
+        .scene
+        .drain
+        .source_mut()
+        .push_record(dup_begin.to_vec());
+    assert!(
+        drive_until_closed(&mut scene, 64),
+        "the refused record closes despite the open START"
+    );
+    let raw = scene
+        .machine
+        .retained_raw_for_test()
+        .expect("a retained raw");
+    assert!(raw.begin_table_full_or_refused(), "the refusal latched");
+    assert!(
+        raw.has_open_affecting_start(),
+        "the START was open: the bound closed it"
+    );
+}
+
+/// A failed collection never extends: the quantum closes on
+/// today's unlocalized path — published S1-only with the adapter
+/// invalidated, never tainted.
+#[test]
+fn joint_pregrant_failed_collection_closes_without_extension() {
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    let _init_end = push_begin(&mut scene, pid, "C_Initialize", 2);
+    scene.scene.drain.source_mut().push_record(vec![0x5A; 100]);
+    assert!(
+        drive_until_closed(&mut scene, 64),
+        "a failed collection never extends"
+    );
+    scene.published();
+    assert!(
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .invalidated_for_test(),
+        "the failed quantum takes today's unlocalized path: invalidated, never tainted"
+    );
+}
+
+/// Stop overrides the extension at once, and the finish still
+/// publishes within its bound.
+#[test]
+fn joint_pregrant_stop_closes_and_finishes_bounded() {
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    let _init_end = push_begin(&mut scene, pid, "C_Initialize", 1);
+    assert_eq!(
+        drive_collecting_quiescent(&mut scene),
+        "Collecting",
+        "the open START extends first"
+    );
+    scene.enable_finish_fixture(Vec::new());
+    scene.begin_finish().expect("stop begins the finish");
+    for _ in 0..8 {
+        scene.poll_finish(1).expect("stop poll succeeds");
+    }
+    assert_ne!(
+        phase_of(&scene),
+        "Collecting",
+        "stop overrides the extension at once"
+    );
+    for _ in 0..512 {
+        if matches!(scene.poll_finish(1), Ok(JointCommitProgress::Published(_))) {
+            return;
+        }
+    }
+    panic!("the finish publishes within its bound");
+}
+
+/// An unlinked lane never extends: the skewed quantum closes at
+/// once with the same boundary, mints no grant, and keeps the
+/// unlinked label.
+#[test]
+fn joint_pregrant_unlinked_lane_closes_without_extension() {
+    let mut scene = MachineScene::with_initial_files_and_functions(
+        1,
+        &[0],
+        &["C_GetFunctionList", "C_Initialize"],
+        true,
+    );
+    {
+        let events = scene
+            .scene
+            .drain
+            .consumption_cut()
+            .unwrap()
+            .events()
+            .clone();
+        scene.scene.producers = crate::attach::SessionDrainProducers::test_pair_unlinked(
+            scene.scene.real.lane.domain(),
+            events,
+        );
+        let reserve = scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .semantic_storage_reserver();
+        scene.machine =
+            crate::inventory_semantics::LiveJointMachine::new(&scene.scene.producers, &reserve)
+                .unwrap();
+    }
+    assert!(
+        !scene.scene.producers.journal_linked(),
+        "the twin runs unlinked producers"
+    );
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    let _init_end = push_begin(&mut scene, pid, "C_Initialize", 2);
+    assert!(
+        drive_until_closed(&mut scene, 64),
+        "an unlinked lane never extends"
+    );
+    assert_eq!(
+        scene.machine.diagnostic_snapshot_for_test().2,
+        Some((2, 1)),
+        "the boundary is unchanged: two wire rows, one H0 record"
+    );
+    scene.published();
+    assert!(
+        scene.machine.retained_drain_grant_for_test().is_none(),
+        "no grant mints"
+    );
+}

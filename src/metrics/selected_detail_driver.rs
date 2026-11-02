@@ -1358,8 +1358,14 @@ pub(crate) fn open_k0_production(
     pins: &PinnedObjects,
     before_facts: K0Facts,
     before_losses: [u64; 4],
+    owned: bool,
     ledger: &mut SelectionLedger,
 ) -> Option<K0Window> {
+    let comparable = clock_origins_comparable();
+    if let Some(refusal) = k0_owned_clock_refusal(owned, comparable) {
+        ledger.mark_selection_refused(refusal.name());
+        return None;
+    }
     let limits = CounterLimits { rows, rv_keys };
     let before = k0_broad_read(session, plan, pins, limits, &reserve);
     let mut window = open_k0_window_with_losses(
@@ -1373,11 +1379,26 @@ pub(crate) fn open_k0_production(
     )?;
     // The selection stamp bounds lifecycle by kernel-vs-userspace
     // monotonic comparison; without comparable clock origins the bound
-    // is unprovable, so no observation is ignored.
-    if !clock_origins_comparable() {
+    // is unprovable, so no observation is ignored (a `--pid` target's
+    // window still opens; owned `run` refused above).
+    if !comparable {
         window.selection_stamp = None;
     }
     Some(window)
+}
+
+/// K0-3 fallback: owned `run` needs the selection stamp to ignore the
+/// child's own startup exec, which always precedes the window. Without
+/// comparable kernel and userspace monotonic clock origins (a time
+/// namespace offset, or a kernel without the timens files) the stamp is
+/// unprovable and that exec would void every window as caller-changed,
+/// so the selection refuses up front by name instead: the scope cannot
+/// carry a detail here. A `--pid` target needs no stamp (it predates
+/// the window), so its window opens without one.
+fn k0_owned_clock_refusal(owned: bool, comparable: bool) -> Option<SelectedDriverRefusal> {
+    (owned && !comparable).then_some(SelectedDriverRefusal::Promotion(
+        PromotionRefusal::ScopeUnsupported,
+    ))
 }
 
 /// Everything `run_terminal` needs to close an opened K0 window: the
@@ -6653,6 +6674,34 @@ mod tests {
                 .refusal,
             Some("promotion_caller_changed"),
             "zero-ts tail records void instead of hiding in the window"
+        );
+    }
+
+    #[test]
+    fn k0_owned_run_refuses_by_name_without_comparable_clocks() {
+        // K0-3 fallback: owned `run` without comparable clock origins
+        // refuses up front as scope-unsupported (its startup exec could
+        // not be bounded); with comparable clocks it opens, and a
+        // `--pid` target opens either way.
+        assert_eq!(
+            k0_owned_clock_refusal(true, false).map(|refusal| refusal.name()),
+            Some("promotion_scope_unsupported"),
+            "owned run without comparable clocks refuses by name"
+        );
+        assert_eq!(
+            k0_owned_clock_refusal(true, true).map(|refusal| refusal.name()),
+            None,
+            "owned run with comparable clocks opens"
+        );
+        assert_eq!(
+            k0_owned_clock_refusal(false, false).map(|refusal| refusal.name()),
+            None,
+            "--pid opens without comparable clocks (no stamp needed)"
+        );
+        assert_eq!(
+            k0_owned_clock_refusal(false, true).map(|refusal| refusal.name()),
+            None,
+            "--pid opens with comparable clocks"
         );
     }
 }

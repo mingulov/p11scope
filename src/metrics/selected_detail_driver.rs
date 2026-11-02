@@ -32,7 +32,7 @@ use super::selected_detail::{
 };
 use crate::attach::Scope;
 use crate::attach::counter_banks::{BankRefusal, CounterDetailWindow, DetailToggleRefusal};
-use crate::attach::{LifecycleFacts, PidContinuityRefusal, Session};
+use crate::attach::{LifecycleFacts, PidContinuityRefusal, Session, clock_origins_comparable};
 use crate::discovery::engine::inventory_coordinator::semantics::PromotionInstallCapacity;
 use crate::discovery::identity::PinnedObjects;
 use crate::inventory_promotion::lifecycle::{
@@ -1114,25 +1114,35 @@ pub(super) fn close_k0_window_with_losses(
 }
 
 /// Scan the shutdown-tail discovery records for a lifecycle hit on
-/// the selected caller: an EXEC, a leader exit, or a tap fault
-/// (malformed tail). PID-matched like the tap: other PIDs never hit.
-/// An EXEC voids as caller-changed whatever its case (a faulting case
-/// fails closed the same way); a leader exit voids as caller-retired
-/// unless its timestamp is zero, which fails closed as caller-changed
-/// like the tap's zero-timestamp fault. A malformed tail fails closed
-/// as caller-changed: the witness would have faulted on it.
+/// the selected caller: an EXEC or a tap fault (malformed tail).
+/// PID-matched like the tap: other PIDs never hit. Records stamped
+/// at or before the selection read are outside the window and are
+/// ignored; a zero timestamp never is (clock fault, fail closed). An
+/// in-window EXEC voids as caller-changed whatever its case (a
+/// faulting case fails closed the same way). A leader exit never
+/// voids: the counter bank's probes are bound to the original task in
+/// the kernel, so a later process reusing the PID cannot add counts
+/// and the exit ends the window cleanly; a zero-timestamp exit still
+/// fails closed as caller-changed like the tap's fault. A malformed
+/// tail fails closed as caller-changed.
 fn scan_k0_tail(
     pid: u32,
     records: &[DiscoveryRecord],
     malformed: u64,
+    selection_stamp: Option<u64>,
 ) -> Option<SelectedDriverRefusal> {
     use SelectedDriverRefusal::Promotion;
     if malformed > 0 {
         return Some(Promotion(PromotionRefusal::CallerChanged));
     }
-    let mut saw_exit = false;
     for record in records {
         if (record.pid_tgid >> 32) as u32 != pid {
+            continue;
+        }
+        if record.hook_ts_ns != 0
+            && let Some(stamp) = selection_stamp
+            && record.hook_ts_ns <= stamp
+        {
             continue;
         }
         match record.kind {
@@ -1143,12 +1153,11 @@ fn scan_k0_tail(
                 if record.hook_ts_ns == 0 {
                     return Some(Promotion(PromotionRefusal::CallerChanged));
                 }
-                saw_exit = true;
             }
             _ => {}
         }
     }
-    saw_exit.then_some(Promotion(PromotionRefusal::CallerRetired))
+    None
 }
 
 /// Close the K0 window with its shutdown-tail records: the shared
@@ -1205,7 +1214,7 @@ pub(super) fn close_k0_window_with_tail_and_losses(
         mut collector,
         before,
         before_losses,
-        selection_stamp: _selection_stamp,
+        selection_stamp,
         limits: _,
     } = window;
     // Discovery loss inside the window voids the detail: a missed
@@ -1251,20 +1260,36 @@ pub(super) fn close_k0_window_with_tail_and_losses(
         ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
         return;
     }
-    if after_witness.fault_serial != before.fault_serial
-        || after_witness.latest_exec != before.latest_exec
-    {
+    if after_witness.fault_serial != before.fault_serial {
         ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
         return;
     }
-    if let Some(refusal) = scan_k0_tail(resolved.original.pid(), tail_records, tail_malformed) {
+    // An exec stamped at or before the selection read is outside the
+    // window (the owned child's own startup exec); only a later exec
+    // voids. A zero timestamp never is outside (fail closed).
+    if after_witness.latest_exec != before.latest_exec {
+        let outside = match (after_witness.latest_exec, selection_stamp) {
+            (Some(exec), Some(stamp)) => exec.hook_ts_ns != 0 && exec.hook_ts_ns <= stamp,
+            _ => false,
+        };
+        if !outside {
+            ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerChanged).name());
+            return;
+        }
+    }
+    if let Some(refusal) = scan_k0_tail(
+        resolved.original.pid(),
+        tail_records,
+        tail_malformed,
+        selection_stamp,
+    ) {
         ledger.mark_selection_refused(refusal.name());
         return;
     }
-    if after_witness.greatest_break_ns != before.greatest_break_ns {
-        ledger.mark_selection_refused(Promotion(PromotionRefusal::CallerRetired).name());
-        return;
-    }
+    // A leader exit never voids: the counter bank's probes are bound
+    // to the original task, so the exit ends the window cleanly and a
+    // later PID reuse cannot add counts. Any later exec still voids
+    // above; greatest_break growth is ignored.
     let mut deltas = match collector.observe(after) {
         CounterObservation::Advanced { deltas, .. } => deltas,
         CounterObservation::ReadFailed(stage) => {
@@ -1333,7 +1358,7 @@ pub(crate) fn open_k0_production(
 ) -> Option<K0Window> {
     let limits = CounterLimits { rows, rv_keys };
     let before = k0_broad_read(session, plan, pins, limits, &reserve);
-    open_k0_window_with_losses(
+    let mut window = open_k0_window_with_losses(
         resolved,
         limits,
         reserve,
@@ -1341,7 +1366,14 @@ pub(crate) fn open_k0_production(
         before_facts,
         before_losses,
         ledger,
-    )
+    )?;
+    // The selection stamp bounds lifecycle by kernel-vs-userspace
+    // monotonic comparison; without comparable clock origins the bound
+    // is unprovable, so no observation is ignored.
+    if !clock_origins_comparable() {
+        window.selection_stamp = None;
+    }
+    Some(window)
 }
 
 /// Everything `run_terminal` needs to close an opened K0 window: the
@@ -4613,9 +4645,12 @@ mod tests {
     }
 
     #[test]
-    fn k0_break_without_exec_voids_as_retired() {
-        // A pure break (leader exit with no exec record) voids as a
-        // retirement, not a change: the caller is gone, not replaced.
+    fn k0_break_without_exec_renders_clean_end() {
+        // K0-4: a pure break (leader exit with no exec record) ends the
+        // window cleanly and renders, because the counter bank's probes
+        // are bound to the original task — a later PID reuse cannot add
+        // counts. (Was promotion_caller_retired before the task-binding
+        // ruling.)
         let pool = test_pool();
         let scene = stage_single_provider(pool, 4);
         let mut ledger = SelectionLedger::new();
@@ -4667,11 +4702,10 @@ mod tests {
             &mut ledger,
         );
         let record = ledger.selection.as_ref().expect("selection records");
-        assert_eq!(record.refusal, Some("promotion_caller_retired"));
+        assert_eq!(record.refusal, None, "a break ends cleanly");
         let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
         let section = &composed["evidence"]["selected_detail"];
-        assert!(section.get("detail").is_none());
-        assert!(section.get("aggregate").is_none());
+        assert!(section.get("detail").is_some());
     }
 
     #[test]
@@ -5377,9 +5411,11 @@ mod tests {
     }
 
     #[test]
-    fn k0_tail_exit_voids_as_retired() {
-        // A tail leader exit for the selected caller voids as a
-        // retirement, not a change: the caller is gone, not replaced.
+    fn k0_tail_exit_renders_clean_end() {
+        // K0-4: a tail leader exit ends the window cleanly and renders,
+        // because the counter bank's probes are bound to the original
+        // task. (Was promotion_caller_retired before the task-binding
+        // ruling.)
         let pool = test_pool();
         let scene = stage_single_provider(pool, 4);
         let mut ledger = SelectionLedger::new();
@@ -5429,13 +5465,12 @@ mod tests {
                 .as_ref()
                 .expect("selection records")
                 .refusal,
-            Some("promotion_caller_retired"),
-            "a tail exit retires the detail"
+            None,
+            "a tail exit ends cleanly"
         );
         let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
         let section = &composed["evidence"]["selected_detail"];
-        assert!(section.get("detail").is_none());
-        assert!(section.get("aggregate").is_none());
+        assert!(section.get("detail").is_some());
     }
 
     #[test]
@@ -5980,11 +6015,11 @@ mod tests {
     }
 
     #[test]
-    fn k0_witness_retired_and_tail_exec_voids_as_caller_changed() {
-        // Within-step-3 precedence: a tail exec beats a witnessed
-        // break — the contract checks the changed bullet before the
-        // "only ... retired" bullet, first hit wins, so the word
-        // pins the order.
+    fn k0_witness_break_and_tail_exec_voids_as_caller_changed() {
+        // K0-4: the witnessed break is ignored (exit ends cleanly) and
+        // the tail exec voids as caller-changed. (Was within-step-3
+        // precedence before the task-binding ruling removed the
+        // retired bullet.)
         let pool = test_pool();
         let scene = stage_single_provider(pool, 4);
         let mut ledger = SelectionLedger::new();
@@ -6488,5 +6523,65 @@ mod tests {
                 assert!(section.get("detail").is_some(), "{label}: detail renders");
             }
         }
+    }
+
+    #[test]
+    fn k0_tail_exit_then_exec_voids_as_changed() {
+        // PID reuse: the original exits and a later process with the
+        // same PID execs. The exit ends cleanly (K0-4) but the later
+        // exec still voids as caller-changed — any later record for
+        // the PID after the exit voids.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let pid = resolved.original.pid();
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let tail = vec![k0_exit_record(pid, 100), k0_exec_record(pid, 200)];
+        close_k0_window_with_tail(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &tail,
+            0,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("promotion_caller_changed"),
+            "a later exec after an exit still voids"
+        );
     }
 }

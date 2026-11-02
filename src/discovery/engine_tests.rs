@@ -29419,7 +29419,11 @@ fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
         .collect();
     let mut plan = plan::build_from_reconciled_modules(&reconciled);
     record_object_skips(&mut plan, &mixed);
-    assert_eq!(plan.skipped, [expected, other]);
+    // Canonical (subject, reason) order matches the merge's losses-map
+    // order, so a commit reproduces its predecessor instead of
+    // flip-flopping against projection; the dedupe still collapses the
+    // doubled skip while keeping the distinct loss.
+    assert_eq!(plan.skipped, [other, expected]);
 }
 
 fn plan_with(slots: usize, refused: usize) -> plan::AttachPlan {

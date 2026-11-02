@@ -6849,10 +6849,21 @@ fn record_object_skips(plan: &mut plan::AttachPlan, skips: &[Skipped]) {
     let modules = std::mem::take(&mut plan.modules);
     plan.skipped
         .retain(|skip| !scan_gap_this_capture_attached(&modules, skip));
-    for skip in skips {
-        if scan_gap_this_capture_attached(&modules, skip) || plan.skipped.contains(skip) {
-            continue;
-        }
+    // Newly visible loss records in canonical (subject, reason) order —
+    // the merge folds counters into a keyed losses map and projection
+    // emits that map's order, so arrival order here would flip-flop
+    // against projection order every arm and no commit could ever
+    // reproduce its predecessor. Already-recorded entries keep their
+    // positions; a late out-of-order arrival heals with one publish.
+    let mut new: Vec<&Skipped> = skips
+        .iter()
+        .filter(|skip| {
+            !scan_gap_this_capture_attached(&modules, skip) && !plan.skipped.contains(skip)
+        })
+        .collect();
+    new.sort_by(|a, b| (&a.subject, &a.reason).cmp(&(&b.subject, &b.reason)));
+    new.dedup();
+    for skip in new {
         plan.skipped.push(skip.clone());
     }
     plan.modules = modules;
@@ -11582,11 +11593,15 @@ impl Engine {
     fn record_selection_loss(&mut self, reason: &str) {
         self.capture_facts.record_selection_loss(reason);
         self.invalidate_silent_selection_coverage();
+        // Selection history feeds the merge: recording dirties the
+        // publication inputs like any other merge-input mutation.
+        self.note_facts_mutated();
     }
 
     fn record_selection_loss_for(&mut self, id: u64, reason: &str) {
         self.capture_facts.record_selection_loss(reason);
         self.invalidate_selection_coverage(id);
+        self.note_facts_mutated();
     }
 
     fn record_lifecycle_tracking_unavailable(&mut self, fact: Option<&str>) {
@@ -12734,6 +12749,8 @@ impl Engine {
         if !invalidated_modules.is_empty() || !invalidated_fallbacks.is_empty() {
             self.capture_facts
                 .invalidate_discovery_proofs(invalidated_modules, invalidated_fallbacks);
+            // Proof invalidation rewrites merge-input history mid-build.
+            self.note_facts_mutated();
             // The projection below records its own span: close the merge
             // tail before it and reopen after, so stages never overlap.
             self.stage_timings.span(
@@ -16123,6 +16140,9 @@ impl Engine {
                 record(entry.name, Some((provider.clone(), entry.file_offset)));
             }
         }
+        // Recording mutates merge-input history unconditionally (a
+        // re-recorded occurrence still re-inserts), so it dirties.
+        self.note_facts_mutated();
         if invalidates {
             self.invalidate_selection_provider_coverage(module);
         }
@@ -16134,6 +16154,7 @@ impl Engine {
             history.selection_truncated = true;
             insert_selection_loss(history, reason);
         }
+        self.note_facts_mutated();
         self.invalidate_selection_table_coverage(key);
     }
 
@@ -16183,6 +16204,7 @@ impl Engine {
                         "conflicting selection tables shared one returned version and flags",
                     );
                 }
+                self.note_facts_mutated();
                 self.invalidate_selection_coverage(binding.id);
                 return None;
             }
@@ -16696,6 +16718,9 @@ impl Engine {
         let selection_became_truncated = self
             .capture_facts
             .record_selection(tuple, matches_truncated);
+        // Recording always mutates history (a re-recorded tuple still
+        // bumps its count), so selection evidence dirties the inputs.
+        self.note_facts_mutated();
         if selection_became_truncated {
             self.invalidate_silent_selection_coverage();
         }
@@ -26328,6 +26353,7 @@ impl Engine {
                     let fallbacks = std::mem::take(&mut graph.facts.invalidated_fallbacks);
                     self.capture_facts
                         .invalidate_discovery_proofs(modules, fallbacks);
+                    self.note_facts_mutated();
                     if self.capture_facts.staged.is_none() {
                         self.project_capture_facts();
                     }

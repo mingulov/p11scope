@@ -9810,7 +9810,7 @@ fn script_dirs() -> Vec<String> {
     found.sort();
     assert_eq!(
         found,
-        ["fixtures", "matrix", "native"],
+        ["ci", "fixtures", "matrix", "native"],
         "a new directory under scripts/: teach the UNRUN and self-test derivations \
          about it, or a privileged lane there is invisible to both"
     );
@@ -9828,7 +9828,7 @@ fn script_dirs() -> Vec<String> {
 fn every_admitted_script_directory_is_scanned() {
     assert_eq!(
         script_dirs(),
-        ["scripts", "scripts/matrix", "scripts/native"],
+        ["scripts", "scripts/ci", "scripts/matrix", "scripts/native"],
         "every admitted non-fixture directory must participate in the lane derivations"
     );
 }

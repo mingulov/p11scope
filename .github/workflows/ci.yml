@@ -727,6 +727,7 @@ jobs:
           UNRUN: scripts/late-provider-negative.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-live-discovery-preflight.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-receipt-lane02.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/ci/joint-throughput.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/verify-receipt-lane16.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/matrix/verify-abi-routing.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-fork-scope.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)

@@ -180,6 +180,7 @@ S1_INCOMPATIBLE_GAPS = frozenset({
     "native capture retirement unsettled", "joint machine unavailable",
     "native capture scope custody unproven", "native capture refused an extend",
     "rejected demoted count", "semantic admission refused",
+    "native capture events lost", "native capture events loss unknown",
 })
 S1_MECHANISMS = (
     {"id": 0x0, "name": "CKM_RSA_PKCS_KEY_PAIR_GEN",

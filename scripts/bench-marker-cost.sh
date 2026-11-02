@@ -522,6 +522,17 @@ EOF
     if bpf_delta "200 2010" "100 10" 2000 test >/dev/null 2>&1; then
         echo "self-test: backwards delta accepted" >&2; exit 1
     fi
+    # bpf_check_prog_stable twins: the mid-window guard. A stable
+    # program passes; a flip fails the sample with the same message.
+    bpf_check_prog_stable p11_journal_pair p11_journal_pair >/dev/null \
+        || { echo "self-test: stable prog refused" >&2; exit 1; }
+    if bpf_check_prog_stable p11_journal_pair p11_entry >/dev/null 2>&1; then
+        echo "self-test: changed prog accepted" >&2; exit 1
+    fi
+    BCS_OUT=$(bpf_check_prog_stable p11_journal_pair p11_entry 2>&1 >/dev/null || true)
+    case $BCS_OUT in *"changed mid-sample"*) : ;; *)
+        echo "self-test: bad prog-change message: $BCS_OUT" >&2; exit 1 ;;
+    esac
     # resolve_commit twins: outside a repo the env commit is required
     # and the tree reads unknown-no-git; inside a repo git stays.
     RC_DIR=$(mktemp -d "$SELF_TEST_WORK/norepo-XXXXXX") \

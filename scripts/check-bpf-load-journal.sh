@@ -14,7 +14,9 @@
 # --budgets defaults to the checked-in tests/bpf-verifier-budgets.json when
 # that file exists. The journal rows are scored against it only when it
 # carries journal/ keys for the kernel; otherwise the gate is loaded +
-# stats + 5% headroom and the row says unbudgeted.
+# stats + 5% headroom and the row says unbudgeted. A corrupt or
+# unreadable budgets file is a harness error (exit 2), never a silent
+# unbudgeted pass.
 #
 # Per kernel one throwaway guest runs a bounded linked inventory,
 # `inventory --system --capture native --key-operations --manifest
@@ -137,6 +139,44 @@ if ! MODULE=$(python3 -I "$SELECTOR" --select-module 2>/dev/null); then
     exit 77
 fi
 [ -f "$MODULE" ] || { echo "provider module not found: $MODULE" >&2; exit 77; }
+if [ -n "$BUDGETS" ]; then
+    # A corrupt or unreadable budgets file is a harness error, never
+    # a silent unbudgeted pass: require the same shape the report
+    # requires before any guest runs. This sits past the
+    # prerequisite checks so a missing tool still reports 77 first.
+    if ! BUDGETS_ERROR=$(python3 - "$BUDGETS" 2>&1 <<'PY'
+import json,sys
+path = sys.argv[1]
+try:
+    document = json.loads(open(path, encoding="ascii").read())
+except (OSError, UnicodeError, ValueError) as error:
+    print(f"cannot read budgets ({error})")
+    sys.exit(1)
+if type(document) is not dict or type(document.get("programs")) is not dict:
+    print("budgets need a programs mapping")
+    sys.exit(1)
+limit = document.get("limit", 1000000)
+headroom = document.get("min_headroom_percent", 5.0)
+if type(limit) is not int or limit <= 0:
+    print(f"bad budgets limit {limit!r}")
+    sys.exit(1)
+if type(headroom) not in (int, float) or not 0 < headroom < 100:
+    print(f"bad min_headroom_percent {headroom!r}")
+    sys.exit(1)
+for root, per_kernel in document["programs"].items():
+    if type(per_kernel) is not dict:
+        print(f"bad budgets entry for {root!r}")
+        sys.exit(1)
+    for kernel, budget in per_kernel.items():
+        if type(budget) is not int or budget <= 0:
+            print(f"bad budget for {root} on {kernel}")
+            sys.exit(1)
+PY
+); then
+        echo "budgets invalid: $BUDGETS: $BUDGETS_ERROR" >&2
+        exit 2
+    fi
+fi
 
 OBSERVER_SHA=$(sha256sum "$OBSERVER" | cut -d' ' -f1)
 echo "# observer: $OBSERVER"

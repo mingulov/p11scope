@@ -101,6 +101,80 @@ fn should_extend(inputs: PregrantExtendInputs) -> bool {
         && inputs.hold_open
         && !inputs.timed_out
 }
+
+/// Why one pre-grant linked quantum declined extension: the first
+/// failing [`should_extend`] conjunct. Diagnostic only (F4); the R2
+/// decision reads these counts instead of inferring the trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PregrantCloseReason {
+    /// The wall-time bound expired.
+    Timeout,
+    /// The wire-capacity bound filled.
+    RawCapacity,
+    /// The H0 pending bound filled.
+    MaxPending,
+    /// A finish Q stood in front of the quantum.
+    Q,
+    /// A stop or publication request stood in front of it.
+    Request,
+    /// The collection failed audit (malformed, discarded, counter or
+    /// fault): the quantum lost custody of a clean stream.
+    Custody,
+    /// The BEGIN table filled, or a record already refused.
+    BeginTable,
+    /// No hold stood: the END arrived or nothing journaled was open.
+    NoHold,
+}
+
+/// Diagnostic close-reason counts for pre-grant linked quanta.
+/// Increments are the only production effect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PregrantCloseCounts {
+    pub(crate) timeout: u64,
+    pub(crate) raw_capacity: u64,
+    pub(crate) max_pending: u64,
+    pub(crate) q: u64,
+    pub(crate) request: u64,
+    pub(crate) custody: u64,
+    pub(crate) begin_table: u64,
+    pub(crate) no_hold: u64,
+}
+
+/// The first failing [`should_extend`] conjunct for a pre-grant
+/// linked quantum that declined extension, `None` when it would
+/// extend. Callers gate on pre-grant + linked; `q_present` splits a
+/// request into Q vs demand.
+fn pregrant_close_reason(
+    inputs: PregrantExtendInputs,
+    q_present: bool,
+) -> Option<PregrantCloseReason> {
+    if should_extend(inputs) {
+        return None;
+    }
+    Some(if inputs.failed {
+        PregrantCloseReason::Custody
+    } else if inputs.requested {
+        if q_present {
+            PregrantCloseReason::Q
+        } else {
+            PregrantCloseReason::Request
+        }
+    } else if inputs.attempted >= RAW_CAPACITY {
+        PregrantCloseReason::RawCapacity
+    } else if inputs.pending_h0 >= MAX_PENDING {
+        PregrantCloseReason::MaxPending
+    } else if inputs.begin_table_full_or_refused {
+        PregrantCloseReason::BeginTable
+    } else if !inputs.hold_open {
+        PregrantCloseReason::NoHold
+    } else {
+        debug_assert!(
+            inputs.timed_out,
+            "a declined extension names its cause"
+        );
+        PregrantCloseReason::Timeout
+    })
+}
 // The actual shared binder selects at most four caller/provider pairs. Its
 // no-call receipts join the same original H0 report, never a second stage.
 const REFRESHES_PER_BIND: usize = 4;
@@ -1159,6 +1233,10 @@ pub(crate) struct LiveJointMachine {
     absence_entry: usize,
     demand: Option<Demand>,
     prepared_base: u64,
+    /// Diagnostic close-reason counts for pre-grant linked quanta
+    /// (F4). Read by tests and the debug taint line.
+    #[cfg_attr(not(any(test, debug_assertions)), allow(dead_code))]
+    pregrant_close_counts: PregrantCloseCounts,
     // A request-attempt latch only; it proves no Q, Stop or publication.
     // Its inline bytes are included in the existing size_of::<Self>() lease.
     finish: Option<FinishControl>,
@@ -1260,6 +1338,7 @@ impl LiveJointMachine {
             absence_entry: 0,
             demand: None,
             prepared_base: 0,
+            pregrant_close_counts: PregrantCloseCounts::default(),
             finish: None,
             finish_original: None,
             finish_disposed: None,
@@ -2129,6 +2208,35 @@ impl LiveJointMachine {
         Ok(())
     }
 
+    /// Count one pre-grant linked close under its reason. Callers
+    /// gate on pre-grant + linked; the only production effect is the
+    /// increment.
+    fn note_pregrant_close(&mut self, reason: PregrantCloseReason) {
+        let counts = &mut self.pregrant_close_counts;
+        match reason {
+            PregrantCloseReason::Timeout => counts.timeout = counts.timeout.saturating_add(1),
+            PregrantCloseReason::RawCapacity => {
+                counts.raw_capacity = counts.raw_capacity.saturating_add(1);
+            }
+            PregrantCloseReason::MaxPending => {
+                counts.max_pending = counts.max_pending.saturating_add(1);
+            }
+            PregrantCloseReason::Q => counts.q = counts.q.saturating_add(1),
+            PregrantCloseReason::Request => counts.request = counts.request.saturating_add(1),
+            PregrantCloseReason::Custody => counts.custody = counts.custody.saturating_add(1),
+            PregrantCloseReason::BeginTable => {
+                counts.begin_table = counts.begin_table.saturating_add(1);
+            }
+            PregrantCloseReason::NoHold => counts.no_hold = counts.no_hold.saturating_add(1),
+        }
+    }
+
+    /// The diagnostic pre-grant close-reason counts (F4).
+    #[cfg(test)]
+    pub(crate) fn pregrant_close_counts_for_test(&self) -> PregrantCloseCounts {
+        self.pregrant_close_counts
+    }
+
     #[cfg(test)]
     pub(crate) fn retained_drain_grant_for_test(&self) -> Option<&SessionDrainGrant> {
         self.grant.as_ref()
@@ -2779,25 +2887,24 @@ impl LiveJointMachine {
                     // open-START and count-only scans, the wall-time
                     // read) evaluate only behind the cheap gate, so
                     // unlinked, post-grant, failed and requested lanes
-                    // pay nothing here.
+                    // pay nothing here. The inputs are retained for
+                    // the close-reason counter below.
                     let pre_grant = self.grant.is_none();
                     let journal_linked = self.producers.journal_linked();
-                    let pregrant_extend = pre_grant
-                        && journal_linked
-                        && !failed
-                        && !requested
-                        && should_extend(PregrantExtendInputs {
-                            pre_grant,
-                            journal_linked,
-                            failed,
-                            requested,
-                            attempted: original.attempted,
-                            pending_h0: original.raw.pending_h0_records(),
-                            begin_table_full_or_refused: original.raw.begin_table_full_or_refused(),
-                            hold_open: original.raw.has_open_affecting_start()
-                                || original.raw.h0_records_all_count_only(lane.subset().plan()),
-                            timed_out: pregrant_timed_out(),
-                        });
+                    let cheap_open = pre_grant && journal_linked && !failed && !requested;
+                    let pregrant_inputs = cheap_open.then(|| PregrantExtendInputs {
+                        pre_grant,
+                        journal_linked,
+                        failed,
+                        requested,
+                        attempted: original.attempted,
+                        pending_h0: original.raw.pending_h0_records(),
+                        begin_table_full_or_refused: original.raw.begin_table_full_or_refused(),
+                        hold_open: original.raw.has_open_affecting_start()
+                            || original.raw.h0_records_all_count_only(lane.subset().plan()),
+                        timed_out: pregrant_timed_out(),
+                    });
+                    let pregrant_extend = pregrant_inputs.is_some_and(should_extend);
                     if !unrequested_empty && !needs_first_end && !pregrant_extend {
                         // A requested transaction must not bind on a stale
                         // no-backlog poll: rows may have landed since idle
@@ -2809,6 +2916,30 @@ impl LiveJointMachine {
                         if requested && original.attempted == 0 && !original.request_pulled {
                             original.request_pulled = true;
                         } else {
+                            // F4: count the pre-grant linked close under
+                            // its first failing conjunct. Behind the
+                            // cheap gate the retained inputs name it;
+                            // before the gate only the cheap facts can
+                            // have failed.
+                            if pre_grant && journal_linked {
+                                let reason = match pregrant_inputs {
+                                    Some(inputs) => pregrant_close_reason(inputs, q.is_some())
+                                        .expect("a declined extension names its cause"),
+                                    None if failed => PregrantCloseReason::Custody,
+                                    None => {
+                                        debug_assert!(
+                                            requested,
+                                            "the cheap gate names its cause"
+                                        );
+                                        if q.is_some() {
+                                            PregrantCloseReason::Q
+                                        } else {
+                                            PregrantCloseReason::Request
+                                        }
+                                    }
+                                };
+                                self.note_pregrant_close(reason);
+                            }
                             budget.spend(1);
                             return (Phase::Binding(original), Ok(Step::Continue));
                         }
@@ -3160,14 +3291,32 @@ impl LiveJointMachine {
                     &self.producers,
                     reason,
                 ) {
-                    Ok(disposed) => (
-                        Phase::Negative {
-                            original: disposed,
-                            identity,
-                            base: self.prepared_base,
-                        },
-                        Ok(Step::Continue),
-                    ),
+                    Ok(disposed) => {
+                        // F4: one debug line whenever a pre-grant
+                        // disposal taints an image, with the
+                        // close-reason counts for the R2 decision.
+                        #[cfg(debug_assertions)]
+                        if self.grant.is_none()
+                            && disposed.failure().is_some_and(|failure| {
+                                failure.gap
+                                    == crate::semantics_objects::journal::JournalGap::ImageTainted
+                            })
+                        {
+                            eprintln!(
+                                "p11scope: pre-grant disposal tainted an image: \
+                                 reason={reason:?} closes={:?}",
+                                self.pregrant_close_counts,
+                            );
+                        }
+                        (
+                            Phase::Negative {
+                                original: disposed,
+                                identity,
+                                base: self.prepared_base,
+                            },
+                            Ok(Step::Continue),
+                        )
+                    }
                     Err((raw, _)) => (
                         Phase::StagingNegative(Collected { raw, ..original }),
                         Err(SemanticRefusal::Unavailable),
@@ -5131,5 +5280,86 @@ mod binding_reservation_tests {
         let mut red = extend_open_inputs();
         red.timed_out = true;
         assert!(!super::should_extend(red), "an expired bound closes");
+    }
+
+    /// F4: the close reason names the first failing conjunct in
+    /// `should_extend` order, splits Q from demand requests, and is
+    /// `None` when the quantum would extend.
+    #[test]
+    fn pregrant_close_reason_names_first_failing_conjunct() {
+        use super::PregrantCloseReason;
+        assert_eq!(
+            super::pregrant_close_reason(extend_open_inputs(), false),
+            None,
+            "an extending quantum names no close reason"
+        );
+        let mut red = extend_open_inputs();
+        red.failed = true;
+        assert_eq!(
+            super::pregrant_close_reason(red, false),
+            Some(PregrantCloseReason::Custody),
+            "a failed collection loses custody"
+        );
+        let mut red = extend_open_inputs();
+        red.requested = true;
+        assert_eq!(
+            super::pregrant_close_reason(red, true),
+            Some(PregrantCloseReason::Q),
+            "a finish Q names Q"
+        );
+        assert_eq!(
+            super::pregrant_close_reason(red, false),
+            Some(PregrantCloseReason::Request),
+            "a demand names request"
+        );
+        let mut red = extend_open_inputs();
+        red.attempted = super::RAW_CAPACITY;
+        assert_eq!(
+            super::pregrant_close_reason(red, false),
+            Some(PregrantCloseReason::RawCapacity),
+            "the wire bound names RAW"
+        );
+        let mut red = extend_open_inputs();
+        red.pending_h0 = super::MAX_PENDING;
+        assert_eq!(
+            super::pregrant_close_reason(red, false),
+            Some(PregrantCloseReason::MaxPending),
+            "the H0 bound names MAX_PENDING"
+        );
+        let mut red = extend_open_inputs();
+        red.begin_table_full_or_refused = true;
+        assert_eq!(
+            super::pregrant_close_reason(red, false),
+            Some(PregrantCloseReason::BeginTable),
+            "a full table names the table"
+        );
+        let mut red = extend_open_inputs();
+        red.hold_open = false;
+        assert_eq!(
+            super::pregrant_close_reason(red, false),
+            Some(PregrantCloseReason::NoHold),
+            "no hold names idleness"
+        );
+        let mut red = extend_open_inputs();
+        red.timed_out = true;
+        assert_eq!(
+            super::pregrant_close_reason(red, false),
+            Some(PregrantCloseReason::Timeout),
+            "an expired bound names timeout"
+        );
+        // Order: an early conjunct wins over every later one.
+        let mut red = extend_open_inputs();
+        red.failed = true;
+        red.requested = true;
+        red.attempted = super::RAW_CAPACITY;
+        red.pending_h0 = super::MAX_PENDING;
+        red.begin_table_full_or_refused = true;
+        red.hold_open = false;
+        red.timed_out = true;
+        assert_eq!(
+            super::pregrant_close_reason(red, true),
+            Some(PregrantCloseReason::Custody),
+            "the first failing conjunct wins"
+        );
     }
 }

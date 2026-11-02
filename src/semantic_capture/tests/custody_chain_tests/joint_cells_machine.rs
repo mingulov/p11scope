@@ -3300,6 +3300,38 @@ fn joint_pregrant_real_timeout_closes_and_taints() {
     assert_eq!(api_total, 1, "the modeled call still reduces S1");
 }
 
+/// Close-reason counter (Opus F4): it names each pre-grant linked
+/// close. The timeout flow closes twice: the empty first quantum by
+/// request, the held quantum by timeout; nothing else counts, and
+/// the counts change no decision.
+#[test]
+fn joint_pregrant_close_reasons_counted() {
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    let _init_end = push_begin(&mut scene, pid, "C_Initialize", 2);
+    assert_eq!(
+        drive_collecting_quiescent(&mut scene),
+        "Collecting",
+        "the START holds first"
+    );
+    scene.machine.pose_pregrant_close_timeout_for_test(true);
+    assert!(
+        drive_until_closed(&mut scene, 64),
+        "the expired bound closes the extended quantum"
+    );
+    let counts = scene.machine.pregrant_close_counts_for_test();
+    assert_eq!(counts.request, 1, "the empty first quantum closes by request");
+    assert_eq!(counts.timeout, 1, "the held quantum closes by timeout");
+    assert_eq!(counts.raw_capacity, 0, "no RAW close");
+    assert_eq!(counts.max_pending, 0, "no MAX_PENDING close");
+    assert_eq!(counts.q, 0, "no Q close");
+    assert_eq!(counts.custody, 0, "no custody close");
+    assert_eq!(counts.begin_table, 0, "no table close");
+    assert_eq!(counts.no_hold, 0, "no idle close");
+}
+
 /// F4: a pre-grant admission whose caller has a pending exit stages
 /// no D1 gap — the custody conversion wins and the peek skips the
 /// disclosure, so the input stages exactly the custody refusal and

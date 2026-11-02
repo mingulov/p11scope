@@ -795,13 +795,17 @@ Limits that matter in pods:
   resolves against the live broad plan: zero matches refuse as unknown,
   two or more refuse as ambiguous (narrow providers with `--module`),
   never first-match. Only `--pid` and owned-`run` scopes resolve to one
-  original; `--cgroup` and `--system` refuse by name. The detail is the
-  function's own broad-counter cells between a selection-time read and
-  the close read, in the measurement's own mode (counts, timestamps or
-  latency cells). If the watched process replaces itself (exec) between
-  the two reads, the slot retires, or the close boundary cannot be
-  proven clean, the detail is withheld with a named reason; a window
-  with no calls still renders explicit zero rows. The selection
+  original; `--cgroup` and `--system` refuse by name. The name
+  resolves once at start against the plan then live; a provider that
+  loads after selection needs `--module` to be selected. The detail
+  is the function's own broad-counter cells between a selection-time
+  read and the close read, in the measurement's own mode (counts,
+  timestamps or latency cells). If the watched process replaces
+  itself (exec) between the two reads, the slot retires, or the close
+  boundary cannot be proven clean, the detail is withheld with a named
+  reason; a leader exit that is the last lifecycle record ends the
+  window cleanly and the detail renders the counts up to the exit. A
+  window with no calls still renders explicit zero rows. The selection
   attempt — resolved slot or named refusal — is recorded in the
   report's additive `selected_detail` evidence object; unrelated
   endpoints stay aggregate-only, and aggregate and detail counts are

@@ -457,6 +457,10 @@ pub struct Engine {
     /// The equivalence twin compares both modes engine against engine.
     #[cfg(test)]
     disable_empty_tick_fast_path_for_test: bool,
+    /// Test-only kill switch for per-commit publication deferral. The
+    /// equivalence twin compares both modes engine against engine.
+    #[cfg(test)]
+    disable_publish_deferral_for_test: bool,
     /// Whether the committed plan, modules, pins and evidence equal what a
     /// full rebuild would produce, as verified by comparison at the last
     /// commit. The rebuild reads committed-plan reuse state, so a commit can
@@ -943,7 +947,7 @@ enum TableOccurrence {
     },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct CaptureHistory {
     modules: BTreeMap<plan::ModuleId, render::DiscoveredModule>,
     decoded: BTreeSet<DecodedOccurrence>,
@@ -6845,10 +6849,21 @@ fn record_object_skips(plan: &mut plan::AttachPlan, skips: &[Skipped]) {
     let modules = std::mem::take(&mut plan.modules);
     plan.skipped
         .retain(|skip| !scan_gap_this_capture_attached(&modules, skip));
-    for skip in skips {
-        if scan_gap_this_capture_attached(&modules, skip) || plan.skipped.contains(skip) {
-            continue;
-        }
+    // Newly visible loss records in canonical (subject, reason) order —
+    // the merge folds counters into a keyed losses map and projection
+    // emits that map's order, so arrival order here would flip-flop
+    // against projection order every arm and no commit could ever
+    // reproduce its predecessor. Already-recorded entries keep their
+    // positions; a late out-of-order arrival heals with one publish.
+    let mut new: Vec<&Skipped> = skips
+        .iter()
+        .filter(|skip| {
+            !scan_gap_this_capture_attached(&modules, skip) && !plan.skipped.contains(skip)
+        })
+        .collect();
+    new.sort_by(|a, b| (&a.subject, &a.reason).cmp(&(&b.subject, &b.reason)));
+    new.dedup();
+    for skip in new {
         plan.skipped.push(skip.clone());
     }
     plan.modules = modules;
@@ -9832,6 +9847,8 @@ impl Engine {
             counter_cpus_override: None,
             #[cfg(test)]
             disable_empty_tick_fast_path_for_test: false,
+            #[cfg(test)]
+            disable_publish_deferral_for_test: false,
             plan_rebuild_stable: false,
             graph_backing: None,
             retired_files: None,
@@ -11576,11 +11593,15 @@ impl Engine {
     fn record_selection_loss(&mut self, reason: &str) {
         self.capture_facts.record_selection_loss(reason);
         self.invalidate_silent_selection_coverage();
+        // Selection history feeds the merge: recording dirties the
+        // publication inputs like any other merge-input mutation.
+        self.note_facts_mutated();
     }
 
     fn record_selection_loss_for(&mut self, id: u64, reason: &str) {
         self.capture_facts.record_selection_loss(reason);
         self.invalidate_selection_coverage(id);
+        self.note_facts_mutated();
     }
 
     fn record_lifecycle_tracking_unavailable(&mut self, fact: Option<&str>) {
@@ -12381,11 +12402,13 @@ impl Engine {
         counters.object_skips
     }
 
-    fn publish_current_capture_facts(&mut self) -> Result<()> {
-        // A failed or staged publication cannot keep an earlier planning
-        // proof alive. Successful stationary loader finalization may reseed.
-        self.loader_plan_cache = None;
+    /// Records the capture's object skips into the committed plan, reporting
+    /// whether the plan's skip list changed. Deferred publication shares
+    /// this with the full path: a changed list means the merge would fold
+    /// newly visible loss, so the commit must publish.
+    fn record_publication_skips(&mut self) -> bool {
         let skips_start = crate::attach::monotonic_ns();
+        let before = self.plan.skipped.clone();
         record_object_skips(&mut self.plan, &self.counters.object_skips);
         self.stage_timings.span(
             crate::timing::StageKind::Projection,
@@ -12393,6 +12416,21 @@ impl Engine {
             skips_start,
             crate::attach::monotonic_ns(),
         );
+        self.plan.skipped != before
+    }
+
+    fn publish_current_capture_facts(&mut self) -> Result<()> {
+        // A failed or staged publication cannot keep an earlier planning
+        // proof alive. Successful stationary loader finalization may reseed.
+        self.loader_plan_cache = None;
+        self.record_publication_skips();
+        self.merge_and_project_capture_facts()
+    }
+
+    /// Merges committed state into the capture history and projects it onto
+    /// the plan and discovery evidence. Deferred publication skips this when
+    /// its gate proves the merge a no-op; every other path runs it.
+    fn merge_and_project_capture_facts(&mut self) -> Result<()> {
         let merge_start = crate::attach::monotonic_ns();
         let merged = self.capture_facts.merge_current(
             &self.plan,
@@ -12728,6 +12766,8 @@ impl Engine {
         if !invalidated_modules.is_empty() || !invalidated_fallbacks.is_empty() {
             self.capture_facts
                 .invalidate_discovery_proofs(invalidated_modules, invalidated_fallbacks);
+            // Proof invalidation rewrites merge-input history mid-build.
+            self.note_facts_mutated();
             // The projection below records its own span: close the merge
             // tail before it and reopen after, so stages never overlap.
             self.stage_timings.span(
@@ -12898,8 +12938,14 @@ impl Engine {
         pinned: &PinnedObjects,
         loader: PinnedObjectId,
     ) -> bool {
+        // The merge renders pre-arm watches, but watch transitions
+        // re-render discovery directly without dirtying the facts
+        // revision — so a proved commit could defer and leave the stored
+        // history watch stale. Deny the proof while any watch exists:
+        // pre-arm captures merge per commit, exactly as before deferral.
         self.capture_facts.staged.is_none()
             && self.facts_revision == self.published_facts_revision
+            && self.prearm.is_empty()
             && self.inventory.is_none()
             && self.manifests.is_empty()
             && self.manifest_ordinals.is_empty()
@@ -12947,17 +12993,26 @@ impl Engine {
             .is_some_and(|candidate_loader| {
                 loader_pins.exactly_matches(local_loader, &candidate_pins, candidate_loader)
             });
-        // Probe on a disposable clone: fallback retains the original exact
-        // loader restoration and global canonicalization path unchanged.
+        // Canonicalize the candidate pins directly instead of a probe
+        // clone. With no folds the canonicalizer is the identity (empty
+        // remaps mutate nothing), so the stationary path below commits
+        // exactly what the probe would have approved; with folds the miss
+        // path re-canonicalizes idempotently, and the lost skips join the
+        // derivation inputs so the same skips record in the same order.
         let stationary = if skipped.is_empty() && had_exact_loader {
-            let mut probe = candidate_pins.clone();
-            let (folds, lost) = canonicalize_scanned_overlays(&mut probe);
-            probe
+            let (folds, lost) = canonicalize_scanned_overlays(&mut candidate_pins);
+            let clean = folds == 0 && lost.is_empty();
+            skipped.extend(lost);
+            candidate_pins
                 .id_for_scanned(loader_module, loader_module.key, &loader_module.path)
                 .is_some_and(|loader| {
-                    folds == 0
-                        && lost.is_empty()
-                        && self.loader_inputs_are_stationary(view, loader_module, &probe, loader)
+                    clean
+                        && self.loader_inputs_are_stationary(
+                            view,
+                            loader_module,
+                            &candidate_pins,
+                            loader,
+                        )
                 })
         } else {
             false
@@ -12998,7 +13053,14 @@ impl Engine {
                 manifest_selection_admissions: Vec::new(),
                 // No manifest/selection admission can use rollback inventory.
                 manifest_inventory_slots: BTreeMap::new(),
-                loader_plan_proof: None,
+                // The cache hit implies stationary, and this literal
+                // constructs every proof conjunct: the delta is built
+                // empty, modules/corroboration/tables are clones of `Eq`
+                // types (reflexive), and stationary's empty
+                // manifest-fallback and selection-claim requirements match
+                // the empty constructed maps. Attach the proof (always
+                // `Some` here) without re-walking the structures.
+                loader_plan_proof: proof,
                 exec_preservations: Vec::new(),
                 exec_completions: Vec::new(),
                 built_by_full_rebuild: false,
@@ -13010,19 +13072,20 @@ impl Engine {
                 .iter()
                 .map(|module| module.scanned.clone())
                 .collect();
-            self.live_candidate(candidate_pins, raw_modules, skipped)?
+            let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
+            if candidate.delta.new.is_empty()
+                && candidate.delta.replace.is_empty()
+                && candidate.delta.retire.is_empty()
+                && candidate.modules == self.modules
+                && candidate.corroboration == self.counters.corroboration
+                && candidate.manifest_fallbacks == self.counters.manifest_fallbacks
+                && candidate.selection_claims == self.selection_claims
+                && candidate.selection_tables == self.selection_tables
+            {
+                candidate.loader_plan_proof = proof;
+            }
+            candidate
         };
-        if candidate.delta.new.is_empty()
-            && candidate.delta.replace.is_empty()
-            && candidate.delta.retire.is_empty()
-            && candidate.modules == self.modules
-            && candidate.corroboration == self.counters.corroboration
-            && candidate.manifest_fallbacks == self.counters.manifest_fallbacks
-            && candidate.selection_claims == self.selection_claims
-            && candidate.selection_tables == self.selection_tables
-        {
-            candidate.loader_plan_proof = proof;
-        }
         candidate.views.insert(view);
         let loader = candidate
             .pinned
@@ -14314,6 +14377,50 @@ impl Engine {
             })
     }
 
+    /// Deferral pin identity: every committed pin must be present and
+    /// identical (identity plus sources) in the candidate. Candidate
+    /// extras are ignored: the loader derivation retains pins the
+    /// committed store never holds (its loader pin), and extras are
+    /// merge-invisible — the merge folds only plan-referenced pins,
+    /// every one of which the last merge read from the committed
+    /// store, and the plan itself is compared identical separately.
+    /// Store-level flags stay whole-store: an extra that flips
+    /// overlay uncertainty or rejects a key still publishes.
+    fn pins_match_for_deferral(candidate: &PinnedObjects, committed: &PinnedObjects) -> bool {
+        candidate.has_overlay_uncertainty() == committed.has_overlay_uncertainty()
+            && candidate.newly_rejected_keys(committed).is_empty()
+            && committed.newly_rejected_keys(candidate).is_empty()
+            && committed.pinned().all(|pin| {
+                candidate.exactly_matches(pin.id, committed, pin.id)
+                    && candidate.sources(pin.id) == committed.sources(pin.id)
+            })
+    }
+
+    /// Deferral module-table flag identity: `ScannedTable::eq` deliberately
+    /// ignores `live_return`/`manifest_supported` (admission-union
+    /// semantics), but the merge reads them, so leg 2 compares them
+    /// separately. Stability needs no such conjunct: flags only grow by
+    /// union over the same raw modules, which is already a rebuild
+    /// fixpoint, and stability gates the rebuild, never the merge.
+    fn table_flags_match_for_deferral(
+        candidate: &[ReconciledModule],
+        committed: &[ReconciledModule],
+    ) -> bool {
+        candidate.len() == committed.len()
+            && candidate.iter().zip(committed.iter()).all(|(left, right)| {
+                left.scanned.tables.len() == right.scanned.tables.len()
+                    && left
+                        .scanned
+                        .tables
+                        .iter()
+                        .zip(right.scanned.tables.iter())
+                        .all(|(left, right)| {
+                            left.live_return == right.live_return
+                                && left.manifest_supported == right.manifest_supported
+                        })
+            })
+    }
+
     /// The one complete finalization for a candidate whose links were already
     /// mutated. It never short-circuits and never returns: a lost generation
     /// downgrades the disposition and cleans up, it does not unwind.
@@ -14349,6 +14456,14 @@ impl Engine {
             .loader_plan_proof
             .take()
             .map(|proof| (proof, candidate.plan.clone()));
+        // Publication-deferral leg 1: nothing dirtied the merge inputs
+        // between the last merge and this commit. Every merge-input
+        // mutation (scans, loss markers, evictions, selection recording,
+        // counter pushes, snapshot restores) bumps the revision, so
+        // equality with the last published revision proves the inputs
+        // below are still what that merge folded. Snapshotted at entry:
+        // this commit's own dirty must not satisfy its own gate.
+        let revision_before_commit = self.facts_revision;
         let selection_pending = candidate.selection_admission.take();
         outcome.stale_views = stale_process_views(&self.views, extra_views, &candidate.views);
         let retired = !outcome.stale_views.is_empty();
@@ -14673,23 +14788,65 @@ impl Engine {
         }
         let withdrew = candidate.plan.slots.len() != slots_before_withdraw;
         record_object_skips(&mut candidate.plan, &self.counters.object_skips);
-        outcome.changed |= candidate.plan != self.plan;
+        let plan_reproduced = candidate.plan == self.plan;
+        outcome.changed |= !plan_reproduced;
+        // Publication-deferral leg 2: this commit reproduces every merge
+        // input it installs, compared after all finalize mutations
+        // (retirement, selection, manifest rollback, withdrawal and the
+        // counter fold above) so none of them can escape the gate. The
+        // plan comparison is full equality, synced fields included.
+        // The deep comparisons are shared with the stability check
+        // below; each side's provenance short-circuits first so plain
+        // inventory candidates skip them entirely.
+        let stabilizes_provenance = candidate.built_by_full_rebuild
+            && !withdrew
+            && candidate.plan.matches_for_stability(&self.plan);
+        let commit_provenance = loader_plan.is_some();
+        let (
+            modules_reproduced,
+            corroboration_reproduced,
+            fallbacks_reproduced,
+            claims_reproduced,
+            tables_reproduced,
+        ) = if stabilizes_provenance || commit_provenance {
+            (
+                candidate.modules == self.modules,
+                candidate.corroboration == self.counters.corroboration,
+                candidate.manifest_fallbacks == self.counters.manifest_fallbacks,
+                candidate.selection_claims == self.selection_claims,
+                candidate.selection_tables == self.selection_tables,
+            )
+        } else {
+            (false, false, false, false, false)
+        };
+        // The pin walks differ: stability needs the whole store to
+        // match, deferral only the committed pins (the derivation
+        // retains merge-invisible extras). Each runs under its own
+        // provenance so neither side pays for the other.
+        let pins_reproduced =
+            commit_provenance && Self::pins_match_for_deferral(&candidate.pinned, &self.pinned);
+        let table_flags_reproduced = commit_provenance
+            && Self::table_flags_match_for_deferral(&candidate.modules, &self.modules);
+        let commit_reproduced = commit_provenance
+            && plan_reproduced
+            && modules_reproduced
+            && corroboration_reproduced
+            && fallbacks_reproduced
+            && claims_reproduced
+            && tables_reproduced
+            && pins_reproduced
+            && table_flags_reproduced;
         // Committing a full rebuild with no post-build withdrawal installs
         // rebuild output only when the candidate actually converged: the
         // rebuild reads committed-plan reuse state, so a commit can move it
         // (surfaces, ordinals) and the next rebuild may differ. Verify by
         // comparison instead of assuming a fixpoint.
-        // The provenance flags short-circuit first: loader, cached and
-        // withdrawn candidates can never stabilize, so the deep comparisons
-        // below (plan clones, pin walks) are skipped for them.
-        let stabilizes = candidate.built_by_full_rebuild
-            && !withdrew
-            && candidate.plan.matches_for_stability(&self.plan)
-            && candidate.modules == self.modules
-            && candidate.corroboration == self.counters.corroboration
-            && candidate.manifest_fallbacks == self.counters.manifest_fallbacks
-            && candidate.selection_claims == self.selection_claims
-            && candidate.selection_tables == self.selection_tables
+        let stabilizes = stabilizes_provenance
+            && modules_reproduced
+            && corroboration_reproduced
+            && fallbacks_reproduced
+            && claims_reproduced
+            && tables_reproduced
             && Self::pins_match_for_stability(&candidate.pinned, &self.pinned);
         self.pinned = candidate.pinned;
         self.modules = candidate.modules;
@@ -14713,7 +14870,54 @@ impl Engine {
         self.selection_claims = candidate.selection_claims;
         self.selection_tables = candidate.selection_tables;
         self.plan_rebuild_stable = stabilizes;
-        let publication = self.publish_current_capture_facts();
+        // Publication deferral: a proved loader transaction whose commit
+        // reproduces every merge input it installs (leg 2 above), with
+        // nothing else dirtied since the last merge (leg 1: the revision
+        // is still what that merge published), leaves the post-commit
+        // merge inputs identical to the last merge's. The merge folds are
+        // idempotent on identical inputs, so the merge and projection are
+        // redundant with the batch tail's. With nothing retired or
+        // unpublished, its links attached, merge inputs resolvable and no
+        // newly recorded loss, invalidate the planning proof and mark the
+        // revision published exactly as a no-op merge would. Anything else
+        // publishes per commit, and skip recording runs on both paths.
+        let skips_changed = self.record_publication_skips();
+        #[cfg(not(test))]
+        let deferral_disabled = false;
+        #[cfg(test)]
+        let deferral_disabled = self.publish_deferral_disabled();
+        let defer_publication = commit_reproduced
+            && revision_before_commit == self.published_facts_revision
+            && self.capture_facts.staged.is_none()
+            && outcome.stale_views.is_empty()
+            && outcome.unpublished_views.is_empty()
+            && new_targets_attached
+            && !skips_changed
+            && self
+                .capture_facts
+                .resolve_merge_inputs(
+                    &self.plan,
+                    &self.pinned,
+                    &self.modules,
+                    &self.manifests,
+                    &self.manifest_ordinals,
+                )
+                .is_ok()
+            && !deferral_disabled;
+        // A failed or staged publication cannot keep an earlier planning
+        // proof alive. Successful stationary loader finalization may reseed.
+        self.loader_plan_cache = None;
+        let publication = if defer_publication {
+            // Tripwire: the only revision bump between the leg-1 snapshot
+            // and this gate is the commit's own install, so a future bump
+            // inserted in between fails loudly instead of deferring over
+            // dirtied inputs.
+            debug_assert_eq!(self.facts_revision, revision_before_commit + 1);
+            self.published_facts_revision = self.facts_revision;
+            Ok(())
+        } else {
+            self.merge_and_project_capture_facts()
+        };
         outcome.disposition = candidate_publication_disposition(retired, &publication);
         if publication.is_err() {
             // The preflight proved this for the whole candidate, so only the
@@ -14889,6 +15093,9 @@ impl Engine {
             return false;
         }
         self.note_facts_mutated();
+        // The latch mutates plan state outside commits; the committed plan
+        // is no longer rebuild output, so stability must not survive it.
+        self.plan_rebuild_stable = false;
         self.discovery.module_ambiguous = self.plan.module_ambiguous as u64;
         true
     }
@@ -16117,6 +16324,9 @@ impl Engine {
                 record(entry.name, Some((provider.clone(), entry.file_offset)));
             }
         }
+        // Recording mutates merge-input history unconditionally (a
+        // re-recorded occurrence still re-inserts), so it dirties.
+        self.note_facts_mutated();
         if invalidates {
             self.invalidate_selection_provider_coverage(module);
         }
@@ -16128,6 +16338,7 @@ impl Engine {
             history.selection_truncated = true;
             insert_selection_loss(history, reason);
         }
+        self.note_facts_mutated();
         self.invalidate_selection_table_coverage(key);
     }
 
@@ -16177,6 +16388,7 @@ impl Engine {
                         "conflicting selection tables shared one returned version and flags",
                     );
                 }
+                self.note_facts_mutated();
                 self.invalidate_selection_coverage(binding.id);
                 return None;
             }
@@ -16690,6 +16902,9 @@ impl Engine {
         let selection_became_truncated = self
             .capture_facts
             .record_selection(tuple, matches_truncated);
+        // Recording always mutates history (a re-recorded tuple still
+        // bumps its count), so selection evidence dirties the inputs.
+        self.note_facts_mutated();
         if selection_became_truncated {
             self.invalidate_silent_selection_coverage();
         }
@@ -21130,6 +21345,22 @@ impl Engine {
         self.disable_empty_tick_fast_path_for_test = disabled;
     }
 
+    /// Whether per-commit publication deferral is disabled. Tests only:
+    /// production always defers proved-unchanged loader transactions. The
+    /// per-engine flag drives the equivalence twin; the process-wide
+    /// environment variable reruns whole suites against full publication.
+    #[cfg(test)]
+    fn publish_deferral_disabled(&self) -> bool {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DISABLED.get_or_init(|| std::env::var_os("P11SCOPE_DISABLE_PUBLISH_DEFERRAL").is_some())
+            || self.disable_publish_deferral_for_test
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_disable_publish_deferral_for_test(&mut self, disabled: bool) {
+        self.disable_publish_deferral_for_test = disabled;
+    }
+
     /// Builds the candidate for a tick that changed nothing: no removals,
     /// rescans, admissions or declined views. The caller holds only while
     /// committed state is rebuild-stable — the last commit installed a built
@@ -21797,7 +22028,10 @@ impl Engine {
     /// ordinary rotation only fills free view slots and never displaces,
     /// while reconcile passes rotate exploratory (never-owned, currently
     /// empty) views to reach unscanned processes within a finite bound.
-    fn select_over_cap_desired(&mut self, pids: &[u32]) -> BTreeSet<u32> {
+    /// Desired pids plus whether this pass evicted: the newcomer ordering
+    /// below admits pending waiters first after an eviction, so freed slots
+    /// reach event-driven work instead of refilling in rotation order.
+    fn select_over_cap_desired(&mut self, pids: &[u32]) -> (BTreeSet<u32>, bool) {
         let known: BTreeSet<u32> = self.views.iter().map(|view| view.pid()).collect();
         let enumerated: BTreeSet<u32> = pids.iter().copied().collect();
         let pending: BTreeSet<u32> = enumerated
@@ -21840,7 +22074,7 @@ impl Engine {
                         ),
                     );
                 }
-                desired
+                (desired, false)
             }
             InventoryCadence::Reconcile => {
                 // Exploratory rotation: the slice selects into the free
@@ -21852,7 +22086,31 @@ impl Engine {
                 let evictable = self.exploratory_evictable_views();
                 let evict_budget = evictable.len().min(self.scheduler.max_evictions_per_pass());
                 let selected = self.reconcile_slice(pids, &known, free_slots + evict_budget);
-                let need = selected.len().saturating_sub(free_slots);
+                // Waiter-driven eviction: viewless enumerated waiters
+                // (event-driven refresh requests with no view yet) count
+                // as eviction demand even when the slice did not select
+                // them, so a waiter outside the current slice still gains
+                // room within a sweep instead of waiting for the cursor to
+                // wrap all the way around. Demand is one slot per waiter
+                // (never double-counting slice-selected waiters), bounded
+                // by the eviction budget; cooling waiters sit out (their
+                // bounded delay beats evict-rerequest churn), and no
+                // waiter's own view is ever a victim (the classifier
+                // shields requested pids).
+                let selected_set: BTreeSet<u32> = selected.iter().copied().collect();
+                let waiter_demand = pending
+                    .iter()
+                    .filter(|pid| {
+                        !known.contains(*pid)
+                            && !selected_set.contains(*pid)
+                            && !self.scheduler.cooling_down(**pid)
+                    })
+                    .count();
+                let need = selected
+                    .len()
+                    .saturating_add(waiter_demand)
+                    .saturating_sub(free_slots)
+                    .min(evict_budget);
                 let victims: BTreeSet<ProcessViewId> = evictable.into_iter().take(need).collect();
                 // Evicted pids leave the desired set with their views: they
                 // were desired as retained views, and re-selecting them as
@@ -21893,7 +22151,7 @@ impl Engine {
                         ),
                     );
                 }
-                desired
+                (desired, !victims.is_empty())
             }
         }
     }
@@ -22390,36 +22648,37 @@ impl Engine {
         // `desired` only narrows which new pids get deep-scanned. A zero cap
         // short-circuits to empty: selection could only ever take nothing,
         // so the sweep reads are skipped outright.
-        let desired: BTreeSet<_> = if let Some(selected) = self.pressure_selected {
-            // Selected transaction: serve only the selected pid. No polling
-            // round, no over-cap reconcile turn, no sweep: the pass neither
-            // reads maps beyond this enumeration nor advances any scheduler
-            // cursor of its own (H1 accounting is checkpointed around it).
-            // At view capacity the selected pid still makes its own room —
-            // one guarded exploratory eviction, else a probationary probe —
-            // both scoped to the selection inside newcomer admission.
-            if pids.contains(&selected.pid) {
-                BTreeSet::from([selected.pid])
+        let (desired, reconcile_evicted): (BTreeSet<_>, bool) =
+            if let Some(selected) = self.pressure_selected {
+                // Selected transaction: serve only the selected pid. No polling
+                // round, no over-cap reconcile turn, no sweep: the pass neither
+                // reads maps beyond this enumeration nor advances any scheduler
+                // cursor of its own (H1 accounting is checkpointed around it).
+                // At view capacity the selected pid still makes its own room —
+                // one guarded exploratory eviction, else a probationary probe —
+                // both scoped to the selection inside newcomer admission.
+                if pids.contains(&selected.pid) {
+                    (BTreeSet::from([selected.pid]), false)
+                } else {
+                    (BTreeSet::new(), false)
+                }
+            } else if max_scan_pids == 0 {
+                (BTreeSet::new(), false)
+            } else if pids.len() > max_scan_pids {
+                self.select_over_cap_desired(&pids)
             } else {
-                BTreeSet::new()
-            }
-        } else if max_scan_pids == 0 {
-            BTreeSet::new()
-        } else if pids.len() > max_scan_pids {
-            self.select_over_cap_desired(&pids)
-        } else {
-            // Under-cap polling round, every second under-cap tick: retained
-            // exploratory views carry no loader context, so without this a
-            // process that gains a provider while the capture sits under the
-            // cap would never re-scan. Queued here so the requests flow into
-            // `refreshed` below and are served same-tick. The zero cap
-            // short-circuits above and never polls. `scope_pids` guarantees
-            // pid order for the poll cursor.
-            if self.scheduler.begin_under_cap_tick() {
-                self.queue_polling_rescans(&pids);
-            }
-            pids.into_iter().collect()
-        };
+                // Under-cap polling round, every fourth under-cap tick: retained
+                // exploratory views carry no loader context, so without this a
+                // process that gains a provider while the capture sits under the
+                // cap would never re-scan. Queued here so the requests flow into
+                // `refreshed` below and are served same-tick. The zero cap
+                // short-circuits above and never polls. `scope_pids` guarantees
+                // pid order for the poll cursor.
+                if self.scheduler.begin_under_cap_tick() {
+                    self.queue_polling_rescans(&pids);
+                }
+                (pids.into_iter().collect(), false)
+            };
         // Only new candidates count: known views are retained, not selected.
         // The zero-cap short-circuit keeps its exact historical skip; the
         // scheduler publishes the ordinary/reconcile gaps itself.
@@ -22548,10 +22807,13 @@ impl Engine {
         // consume the same first window forever and starve later processes.
         // Deferred requests and their explicit evidence are retained.
         let max_new_views = self.scheduler.max_new_views_per_tick();
-        let mut new_pids = if self.views.len() >= self.max_scan_pids {
+        let mut new_pids = if self.views.len() >= self.max_scan_pids || reconcile_evicted {
             // Lane-A P2a: view slots are scarce, so event-driven newcomers
-            // sort ahead of rotation candidates for whatever frees up. With
-            // free slots the plain pid order stands (fairness pins).
+            // sort ahead of rotation candidates for whatever frees up. A
+            // reconcile pass that just evicted dropped the count below the
+            // cap, but the freed slots still belong to event-driven work
+            // first. With free slots the plain pid order stands (fairness
+            // pins).
             let pending: BTreeSet<u32> = serviced_requests.keys().copied().collect();
             self.scheduler
                 .new_view_order_pending_first(&new_pids, &pending)
@@ -26306,6 +26568,7 @@ impl Engine {
                     let fallbacks = std::mem::take(&mut graph.facts.invalidated_fallbacks);
                     self.capture_facts
                         .invalidate_discovery_proofs(modules, fallbacks);
+                    self.note_facts_mutated();
                     if self.capture_facts.staged.is_none() {
                         self.project_capture_facts();
                     }

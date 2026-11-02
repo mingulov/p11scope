@@ -26,6 +26,12 @@ pub(crate) const MAX_PENDING_REFRESH: usize = 256;
 /// often. The 256 view cap and the 120 s guard stay as they are.
 pub(crate) const RECONCILE_EVERY_N_OVER_CAP_PASSES: u64 = 2;
 
+/// Under-cap polling cadence: every Nth under-cap inventory tick runs a
+/// polling round. Kept at the old value 4, decoupled from the over-cap
+/// reconcile cadence: under-cap captures have no eviction pressure, so
+/// they keep their historical I/O rate (round 3, I1).
+pub(crate) const UNDER_CAP_POLL_EVERY_N_TICKS: u64 = 4;
+
 /// Reconcile slice size: at most this many maps snapshots per sweep.
 /// Provisional — ratify by measurement.
 pub(crate) const RECONCILE_SLICE_PIDS: usize = 64;
@@ -64,7 +70,7 @@ pub(crate) const MAX_NEW_VIEWS_PER_TICK: usize = 64;
 /// exploratory views are queued for a same-tick refresh rescan, so a
 /// retained process that gains a provider is re-examined within a finite
 /// number of rounds even though it carries no loader context. A round runs
-/// on every over-cap reconcile sweep and every second under-cap tick; the
+/// on every over-cap reconcile sweep and every fourth under-cap tick; the
 /// poll cursor round-robins the eligible set and the tick quantum still
 /// bounds the rescan phase. Provisional — ratify by measurement.
 pub(crate) const MAX_POLLING_RESCANS: usize = 8;
@@ -313,12 +319,12 @@ impl DiscoveryScheduler {
     }
 
     /// Counts one under-cap inventory tick and reports whether it runs a
-    /// polling round: every second, mirroring the reconcile cadence, so
-    /// quiet under-cap ticks keep their no-op behavior between rounds.
+    /// polling round: every fourth, on its own cadence, so quiet
+    /// under-cap ticks keep their no-op behavior between rounds.
     pub(crate) fn begin_under_cap_tick(&mut self) -> bool {
         self.under_cap_ticks = self.under_cap_ticks.saturating_add(1);
         self.under_cap_ticks
-            .is_multiple_of(RECONCILE_EVERY_N_OVER_CAP_PASSES)
+            .is_multiple_of(UNDER_CAP_POLL_EVERY_N_TICKS)
     }
 
     /// The pids rotated to start after the poll cursor, for fair
@@ -834,11 +840,13 @@ mod tests {
         assert!(!scheduler.newcomers_first(true, true));
     }
 
-    /// Under-cap ticks poll every second, mirroring the reconcile cadence,
-    /// and the poll cursor round-robins queueing past the last queued pid.
+    /// Under-cap ticks poll every fourth, on their own cadence, and the
+    /// poll cursor round-robins queueing past the last queued pid.
     #[test]
-    fn under_cap_ticks_poll_every_second_in_poll_cursor_order() {
+    fn under_cap_ticks_poll_every_fourth_in_poll_cursor_order() {
         let mut scheduler = DiscoveryScheduler::new();
+        assert!(!scheduler.begin_under_cap_tick());
+        assert!(!scheduler.begin_under_cap_tick());
         assert!(!scheduler.begin_under_cap_tick());
         assert!(scheduler.begin_under_cap_tick());
         assert!(!scheduler.begin_under_cap_tick());

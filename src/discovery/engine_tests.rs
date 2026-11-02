@@ -21368,11 +21368,13 @@ fn loader_pin_reuse_does_not_carry_across_a_later_dirty_mutation() {
 /// An over-cap inventory tick that admits nothing must not rebuild any
 /// candidate once committed state is rebuild-stable. Two provider-free peers
 /// fill a 2-view cgroup capture; a third live peer holds a refresh request
-/// but no slot. The first ordinary tick builds twice and its commit
-/// stabilizes; the second admits nothing and must rebuild nothing. The
-/// request must stay queued with its serial on both ticks: an early return
-/// would complete it, so that proves each tick ran the full admission path
-/// rather than skipping the builds by skipping the tick.
+/// but no slot, and sits out reconcile selection on cooldown so no sweep
+/// admits it. The first ordinary tick builds twice and its commit
+/// stabilizes; the second tick reconciles over an empty pool and admits
+/// nothing; a fourth peer joins for the third tick, which stays ordinary
+/// and idle and must rebuild nothing. The tick twin pins the third tick's
+/// shape at (0, 2), which excludes the early return there and proves the
+/// fast path did the skipping.
 #[test]
 fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
     let mut first = std::process::Command::new("sleep")
@@ -21387,8 +21389,13 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
         .arg("30")
         .spawn()
         .unwrap();
-    let (p1, p2, p3) = (first.id(), second.id(), waiting.id());
-    let (mut engine, _dir) = engine_over_cgroup_naming(&[p1, p2, p3]);
+    let mut fourth = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let (p1, p2, p3, p4) = (first.id(), second.id(), waiting.id(), fourth.id());
+    assert!(p3 < p4, "spawn order pins pid order");
+    let (mut engine, dir) = engine_over_cgroup_naming(&[p1, p2, p3]);
     // Rebuild counts, not wall-time budgets, are under test: an infinite
     // tick quantum keeps deep-scan admission deterministic under load.
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
@@ -21401,6 +21408,10 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
         .push(ProcessView::open(ProcessViewId(1), p2).unwrap());
     engine.next_view_id = 2;
     assert!(engine.request_refresh_consumed(p3, Some(1_000)));
+    // The waiter sits out reconcile selection on cooldown (reconcile pools
+    // exclude cooling pids without bypass), so sweeps find an empty pool
+    // while ordinary ticks still see its queued request.
+    engine.scheduler.note_evicted(p3);
     let serial = engine.refresh_requested[&p3].serial;
     let before = loader_planning_operation_counts(&engine);
     let scans_before = engine.deep_scans;
@@ -21411,6 +21422,38 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
         "the first tick builds twice and its commit stabilizes"
     );
     let settled = loader_planning_operation_counts(&engine);
+    // The second tick reconciles over an empty pool: the cooling waiter
+    // sits out the selection, the sweep admits nothing, and the tick takes
+    // the early return without building or probing.
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        loader_planning_operation_counts(&engine),
+        settled,
+        "an empty-handed reconcile takes the early return"
+    );
+    assert_eq!(
+        engine.deep_scans, scans_before,
+        "the reconcile selects nothing from the empty pool"
+    );
+    assert_eq!(engine.probationary_completions, 0, "nobody probed");
+    assert_eq!(
+        engine
+            .refresh_requested
+            .get(&p3)
+            .map(|request| request.serial),
+        Some(serial),
+        "the waiter's request survives the sweep unconsumed"
+    );
+    // A fourth peer joins for the third tick, which is ordinary and idle
+    // with rebuild stability verified: it runs the build phase and the fast
+    // path skips both rebuilds. The tick twin pins the same shape at
+    // (0, 2): early return is excluded.
+    let listing: String = [p1, p2, p3, p4]
+        .iter()
+        .map(|pid| format!("{pid}\n"))
+        .collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    assert!(engine.request_refresh_consumed(p4, Some(1_500)));
     refresh_inventory_once(&mut engine);
     assert_eq!(
         loader_planning_operation_counts(&engine),
@@ -21419,7 +21462,7 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
     );
     assert_eq!(
         engine.deep_scans, scans_before,
-        "no scan ran without a slot"
+        "the ordinary tick selects nothing without free slots"
     );
     assert_eq!(
         engine
@@ -21427,12 +21470,20 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
             .get(&p3)
             .map(|request| request.serial),
         Some(serial),
-        "the slotless request stays queued with its serial"
+        "the waiter's request stays queued with its serial"
+    );
+    assert_eq!(
+        engine
+            .refresh_requested
+            .get(&p4)
+            .map(|request| request.serial),
+        Some(serial + 1),
+        "the fresh slotless request stays queued with its serial"
     );
     assert_eq!(engine.views.len(), 2);
     assert!(engine.views.iter().any(|view| view.pid() == p1));
     assert!(engine.views.iter().any(|view| view.pid() == p2));
-    for child in [&mut first, &mut second, &mut waiting] {
+    for child in [&mut first, &mut second, &mut waiting, &mut fourth] {
         child.kill().unwrap();
         child.wait().unwrap();
     }
@@ -21561,6 +21612,11 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
         // The twin compares decisions, not wall-time budgets: an infinite
         // tick quantum keeps deep-scan admission deterministic under load.
         engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+        // The waiter sits out reconcile selection on cooldown (reconcile
+        // pools exclude cooling pids without bypass), so the first sweep
+        // finds an empty pool and admits nothing. The cooldown expires at
+        // the second sweep, which admits both waiters.
+        engine.scheduler.note_evicted(p3);
         engine.max_scan_pids = 2;
         engine
             .views
@@ -21608,8 +21664,9 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
         2,
         2,
     );
-    // Tick 2: an ordinary idle tick. Nothing admits; only the full path
-    // rebuilds.
+    // Tick 2 reconciles over an empty pool: the cooling waiter sits out
+    // the selection and the sweep admits nothing, but the queued request
+    // still reaches the build phase, so only the fast path skips.
     tick_both(
         &mut fast,
         &mut full,
@@ -21618,18 +21675,21 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
         0,
         2,
     );
-    assert_eq!(
-        fast.refresh_requested
-            .get(&p3)
-            .map(|request| request.serial),
-        full.refresh_requested
-            .get(&p3)
-            .map(|request| request.serial),
-        "the slotless request stays queued on both engines"
-    );
+    for engine in [&fast, &full] {
+        assert_eq!(engine.probationary_completions, 0, "nobody probed");
+        assert_eq!(
+            engine
+                .refresh_requested
+                .get(&p3)
+                .map(|request| request.serial),
+            Some(1),
+            "the waiter's request survives the sweep unconsumed"
+        );
+    }
     // Tick 3: a fourth peer joins the enumeration with its own request. Both
-    // newcomers find no slot, so the tick stays idle but merges fresh skip
-    // texts through the fast path too.
+    // newcomers find no slot, so the ordinary tick stays idle: only the full
+    // path rebuilds. (The waiters' skip texts are static, so the fast-path
+    // merge sees no fresh input here; the builder twin covers freshness.)
     let mut fourth = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
@@ -21658,6 +21718,7 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
                 .get(&p3)
                 .map(|request| request.serial),
             Some(1),
+            "the cooling waiter's request stays queued"
         );
         assert_eq!(
             engine
@@ -21667,7 +21728,8 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
             Some(2),
         );
     }
-    // Tick 4: reconcile evicts both holders and admits both waiters.
+    // Tick 4: the cooldown expired at the second sweep, so reconcile evicts
+    // both holders and admits both viewless peers.
     tick_both(
         &mut fast,
         &mut full,
@@ -33696,7 +33758,7 @@ fn polling_rescan_upgrades_retained_view_that_gains_a_provider() {
 }
 
 /// F1 (kind pod lane): an under-cap cgroup capture polls its provider-free
-/// processes (a pod's pause container, `sleep infinity`) every fourth frame,
+/// processes (a pod's pause container, `sleep infinity`) every second frame,
 /// and every poll published "queued N retained exploratory views for polling
 /// rescan" as a `discovery unavailable` skip. An exact capture (136/136
 /// probes, exact counts) then read `concrete_gap`, depending only on how

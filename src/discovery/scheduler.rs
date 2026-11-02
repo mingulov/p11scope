@@ -19,8 +19,12 @@ pub(crate) const MAX_PENDING_REFRESH: usize = 256;
 
 /// Reconciliation cadence: every Nth over-cap inventory pass runs the
 /// bounded maps slice; the passes between serve queued and rotated work
-/// without reading maps. Provisional — ratify by measurement.
-pub(crate) const RECONCILE_EVERY_N_OVER_CAP_PASSES: u64 = 4;
+/// without reading maps. Ratified at 2 by the unparked-head settle
+/// measurement (round 2): at 4, sweeps average ~4 of the 16-eviction
+/// budget and 256 owned cannot settle within the guard; the slice,
+/// eviction budget and cooldown are unchanged, only sweeps run twice as
+/// often. The 256 view cap and the 120 s guard stay as they are.
+pub(crate) const RECONCILE_EVERY_N_OVER_CAP_PASSES: u64 = 2;
 
 /// Reconcile slice size: at most this many maps snapshots per sweep.
 /// Provisional — ratify by measurement.
@@ -58,7 +62,7 @@ pub(crate) const MAX_NEW_VIEWS_PER_TICK: usize = 64;
 /// exploratory views are queued for a same-tick refresh rescan, so a
 /// retained process that gains a provider is re-examined within a finite
 /// number of rounds even though it carries no loader context. A round runs
-/// on every over-cap reconcile sweep and every fourth under-cap tick; the
+/// on every over-cap reconcile sweep and every second under-cap tick; the
 /// poll cursor round-robins the eligible set and the tick quantum still
 /// bounds the rescan phase. Provisional — ratify by measurement.
 pub(crate) const MAX_POLLING_RESCANS: usize = 8;
@@ -307,7 +311,7 @@ impl DiscoveryScheduler {
     }
 
     /// Counts one under-cap inventory tick and reports whether it runs a
-    /// polling round: every fourth, mirroring the reconcile cadence, so
+    /// polling round: every second, mirroring the reconcile cadence, so
     /// quiet under-cap ticks keep their no-op behavior between rounds.
     pub(crate) fn begin_under_cap_tick(&mut self) -> bool {
         self.under_cap_ticks = self.under_cap_ticks.saturating_add(1);
@@ -522,9 +526,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     /// The reconciliation cadence: ordinary passes serve queued and rotated
-    /// work; every Nth over-cap pass runs the bounded maps slice instead.
+    /// work; every second over-cap pass runs the bounded maps slice instead,
+    /// so owned processes waiting on evictions settle within the guard.
     #[test]
-    fn cadence_is_ordinary_until_every_nth_over_cap_pass() {
+    fn cadence_is_ordinary_until_every_second_over_cap_pass() {
         let mut scheduler = DiscoveryScheduler::new();
         let cadences: Vec<InventoryCadence> =
             (0..8).map(|_| scheduler.begin_over_cap_pass()).collect();
@@ -532,11 +537,11 @@ mod tests {
             cadences,
             [
                 InventoryCadence::Ordinary,
-                InventoryCadence::Ordinary,
+                InventoryCadence::Reconcile,
                 InventoryCadence::Ordinary,
                 InventoryCadence::Reconcile,
                 InventoryCadence::Ordinary,
-                InventoryCadence::Ordinary,
+                InventoryCadence::Reconcile,
                 InventoryCadence::Ordinary,
                 InventoryCadence::Reconcile,
             ]
@@ -829,13 +834,11 @@ mod tests {
         assert!(!scheduler.newcomers_first(true, true));
     }
 
-    /// Under-cap ticks poll every fourth, mirroring the reconcile cadence,
+    /// Under-cap ticks poll every second, mirroring the reconcile cadence,
     /// and the poll cursor round-robins queueing past the last queued pid.
     #[test]
-    fn under_cap_ticks_poll_every_fourth_in_poll_cursor_order() {
+    fn under_cap_ticks_poll_every_second_in_poll_cursor_order() {
         let mut scheduler = DiscoveryScheduler::new();
-        assert!(!scheduler.begin_under_cap_tick());
-        assert!(!scheduler.begin_under_cap_tick());
         assert!(!scheduler.begin_under_cap_tick());
         assert!(scheduler.begin_under_cap_tick());
         assert!(!scheduler.begin_under_cap_tick());
@@ -851,13 +854,13 @@ mod tests {
     fn exploration_bound_frames_round_up_whole_sweeps() {
         assert_eq!(DiscoveryScheduler::exploration_bound_frames(0, 8), 0);
         assert_eq!(DiscoveryScheduler::exploration_bound_frames(5, 0), u64::MAX);
-        assert_eq!(DiscoveryScheduler::exploration_bound_frames(1, 8), 4);
-        assert_eq!(DiscoveryScheduler::exploration_bound_frames(8, 8), 4);
-        assert_eq!(DiscoveryScheduler::exploration_bound_frames(9, 8), 8);
+        assert_eq!(DiscoveryScheduler::exploration_bound_frames(1, 8), 2);
+        assert_eq!(DiscoveryScheduler::exploration_bound_frames(8, 8), 2);
+        assert_eq!(DiscoveryScheduler::exploration_bound_frames(9, 8), 4);
         assert_eq!(
             DiscoveryScheduler::exploration_bound_frames(44, 8),
-            24,
-            "six sweeps at the four-frame cadence"
+            12,
+            "six sweeps at the two-frame cadence"
         );
     }
 }

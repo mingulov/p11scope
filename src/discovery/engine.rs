@@ -14679,14 +14679,18 @@ impl Engine {
         // rebuild reads committed-plan reuse state, so a commit can move it
         // (surfaces, ordinals) and the next rebuild may differ. Verify by
         // comparison instead of assuming a fixpoint.
-        let converged = candidate.plan.matches_for_stability(&self.plan)
+        // The provenance flags short-circuit first: loader, cached and
+        // withdrawn candidates can never stabilize, so the deep comparisons
+        // below (plan clones, pin walks) are skipped for them.
+        let stabilizes = candidate.built_by_full_rebuild
+            && !withdrew
+            && candidate.plan.matches_for_stability(&self.plan)
             && candidate.modules == self.modules
             && candidate.corroboration == self.counters.corroboration
             && candidate.manifest_fallbacks == self.counters.manifest_fallbacks
             && candidate.selection_claims == self.selection_claims
             && candidate.selection_tables == self.selection_tables
             && Self::pins_match_for_stability(&candidate.pinned, &self.pinned);
-        let stabilizes = candidate.built_by_full_rebuild && !withdrew && converged;
         self.pinned = candidate.pinned;
         self.modules = candidate.modules;
         self.plan = candidate.plan;
@@ -22404,7 +22408,7 @@ impl Engine {
         } else if pids.len() > max_scan_pids {
             self.select_over_cap_desired(&pids)
         } else {
-            // Under-cap polling round, every fourth under-cap tick: retained
+            // Under-cap polling round, every second under-cap tick: retained
             // exploratory views carry no loader context, so without this a
             // process that gains a provider while the capture sits under the
             // cap would never re-scan. Queued here so the requests flow into

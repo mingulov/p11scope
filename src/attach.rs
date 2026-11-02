@@ -125,9 +125,10 @@ pub(crate) use instance::{AbsenceBirthSource, observe_absence_birth};
 #[allow(unused_imports)]
 pub(crate) use instance::{
     BirthAdmissionBinding, BirthObservationRefusal, BirthRowError, BirthRowReader,
-    EXEC_RELEASE_MMAP_PROGRAM, ExecBirthSource, ExecReleaseTarget, HookStats, INSTANCE_PROGRAMS,
-    InstanceMaps, InstanceTracking, LiveBirthRows, SessionGrantToken, WatchedFile,
-    active_instance_programs, observe_exec_birth, observe_retained_birth,
+    COPY_VMA_RET_PROGRAM, CopyVmaTarget, EXEC_RELEASE_MMAP_PROGRAM, ExecBirthSource,
+    ExecReleaseTarget, HookStats, HookTargets, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking,
+    LiveBirthRows, SessionGrantToken, WatchedFile, active_instance_programs, observe_exec_birth,
+    observe_retained_birth,
 };
 mod cleanup_worker;
 pub mod identity_iter;
@@ -5929,8 +5930,9 @@ fn validate_program_inventory_with_roots(
     let mut expected = expected_programs(unsafe_enabled);
     // The continuity hooks are present in every Detailed object but load
     // before deferred freezes, optionally (`InstanceTracking::prepare`).
-    // Both exec-release variants are present; one loads per kernel.
+    // Both variants of each hook slot are present; one loads per kernel.
     expected.extend(INSTANCE_PROGRAMS.iter().map(|(program, _)| *program));
+    expected.insert(instance::COPY_VMA_RET_PROGRAM);
     expected.insert(instance::EXEC_RELEASE_MMAP_PROGRAM);
     expected.insert("p11_image_query");
     expected.extend(selected_detailed::PROGRAMS);

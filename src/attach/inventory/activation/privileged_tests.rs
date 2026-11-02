@@ -4548,10 +4548,13 @@ fn task4_replay_registration(bytes: &[u8], offsets_bytes: &[u8], phase: &str) ->
             .map(|(name, _)| *name)
             .collect();
         let mmap_names: BTreeSet<_> =
-            crate::attach::active_instance_programs(crate::attach::ExecReleaseTarget::ExecMmap)
-                .iter()
-                .map(|(name, _)| *name)
-                .collect();
+            crate::attach::active_instance_programs(crate::attach::HookTargets {
+                copy: crate::attach::CopyVmaTarget::Legacy,
+                exec: crate::attach::ExecReleaseTarget::ExecMmap,
+            })
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
         for (position, row) in kernel_rows.iter().enumerate() {
             let id = row["link_id"].as_u64().context("kernel link ID")?;
             let program_id = row["program_id"].as_u64().context("kernel program ID")?;

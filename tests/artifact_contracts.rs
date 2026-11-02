@@ -6194,14 +6194,16 @@ fn frozen_policy_inventory_matches_embedded_object() {
     // The birth-marker control map adds one map without a new program in
     // carriable builds; journalless builds omit it, and the unsafe
     // decoder maps add two more maps with five extra programs.
+    // The 7.3+ exec-release and 6/7-argument copy_vma variants add one
+    // program each; one of each pair loads.
     let (maps, programs) = if unsafe_build {
-        (44, 26)
+        (44, 27)
     } else if wide {
-        (42, 21)
+        (42, 22)
     } else if marker {
-        (43, 21)
+        (43, 22)
     } else {
-        (42, 21)
+        (42, 22)
     };
     let report = run_ok(
         "python3",

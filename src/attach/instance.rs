@@ -2,8 +2,10 @@
 //! Task 3 Stage A: the Session side of the load-instance continuity witness.
 //!
 //! - Loads the four native continuity hooks (`uprobe_mmap`, `uprobe_munmap`,
-//!   `copy_vma`, and the exec-release hook: `exec_mm_release` through 7.2,
-//!   `exec_mmap` from 7.3) before deferred policy freezes, and attaches
+//!   `copy_vma` (fixed-slot through the 5-argument shape, `bpf_get_func_ret`
+//!   on the 6/7-argument shapes), and the exec-release hook:
+//!   `exec_mm_release` through 7.2, `exec_mmap` from 7.3) before deferred
+//!   policy freezes, and attaches
 //!   them after all freezes and mandatory lifecycle links. Any
 //!   load or attach failure leaves the capture running with instance routing
 //!   **refused** and a named reason; it never degrades the proof. An LTO
@@ -52,7 +54,11 @@ pub(crate) const INSTANCE_PROGRAMS: [(&str, &str); 4] = [
 ];
 
 /// Hooks attached as fexit; every other instance hook is fentry.
-const EXIT_PROGRAMS: [&str; 2] = ["p11_inst_vma_copy", EXEC_RELEASE_MMAP_PROGRAM];
+const EXIT_PROGRAMS: [&str; 3] = [
+    "p11_inst_vma_copy",
+    COPY_VMA_RET_PROGRAM,
+    EXEC_RELEASE_MMAP_PROGRAM,
+];
 
 /// The 7.3+ exec-release hook program and its kernel attach target. Kernels
 /// through 7.2 carry `exec_mm_release`; 7.3 removed it, merging exit and exec
@@ -84,21 +90,26 @@ pub(crate) enum CopyVmaTarget {
     FuncRet,
 }
 
-/// The four instance-hook (program, target) triples for a resolved target.
-/// The legacy set is [`INSTANCE_PROGRAMS`]; the 7.3+ set swaps only the
-/// exec-release slot.
-pub(crate) fn active_instance_programs(
-    target: ExecReleaseTarget,
-) -> [(&'static str, &'static str); 4] {
-    match target {
-        ExecReleaseTarget::ExecMmRelease => INSTANCE_PROGRAMS,
-        ExecReleaseTarget::ExecMmap => [
-            INSTANCE_PROGRAMS[0],
-            INSTANCE_PROGRAMS[1],
-            INSTANCE_PROGRAMS[2],
-            (EXEC_RELEASE_MMAP_PROGRAM, EXEC_RELEASE_MMAP_TARGET),
-        ],
-    }
+/// The resolved kernel hook set: one `copy_vma` slot, one exec-release slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HookTargets {
+    pub(crate) copy: CopyVmaTarget,
+    pub(crate) exec: ExecReleaseTarget,
+}
+
+/// The four instance-hook (program, target) triples for resolved targets.
+/// The legacy set is [`INSTANCE_PROGRAMS`]; each variant slot swaps only
+/// its own program, so four sets exist (two slots of two).
+pub(crate) fn active_instance_programs(targets: HookTargets) -> [(&'static str, &'static str); 4] {
+    let copy = match targets.copy {
+        CopyVmaTarget::Legacy => INSTANCE_PROGRAMS[2],
+        CopyVmaTarget::FuncRet => (COPY_VMA_RET_PROGRAM, "copy_vma"),
+    };
+    let exec = match targets.exec {
+        ExecReleaseTarget::ExecMmRelease => INSTANCE_PROGRAMS[3],
+        ExecReleaseTarget::ExecMmap => (EXEC_RELEASE_MMAP_PROGRAM, EXEC_RELEASE_MMAP_TARGET),
+    };
+    [INSTANCE_PROGRAMS[0], INSTANCE_PROGRAMS[1], copy, exec]
 }
 
 /// Resolve the exec-release hook from the host BTF: the exact legacy
@@ -125,14 +136,13 @@ fn resolve_exec_release_target(
 /// Resolve the `copy_vma` hook from the host BTF: the exact 5-argument
 /// legacy prototype keeps the fixed-slot program; the exact 6/7-argument
 /// extended shapes select the `bpf_get_func_ret` program. Anything else
-/// refuses with the named shapes. Only the legacy target resolves yet;
-/// kernels without it refuse exactly as the extended branch will.
+/// refuses with the named shapes.
 fn resolve_copy_vma_target(host: &super::host_btf::HostBtf, btf: &Btf) -> Result<CopyVmaTarget> {
     let raw = host
         .original_bytes_for(btf)
         .context("instance hook BTF differs from cached host BTF")?;
-    if copy_vma_proto_kind(raw) == Some(CopyVmaTarget::Legacy) {
-        return Ok(CopyVmaTarget::Legacy);
+    if let Some(kind) = copy_vma_proto_kind(raw) {
+        return Ok(kind);
     }
     validate_copy_vma_proto(host, btf)?;
     bail!(
@@ -144,16 +154,16 @@ fn resolve_copy_vma_target(host: &super::host_btf::HostBtf, btf: &Btf) -> Result
 /// preparation/activation path and is consumed by attachment.
 struct LoadedInstancePrograms {
     program_ids: BTreeMap<&'static str, u32>,
-    target: ExecReleaseTarget,
+    targets: HookTargets,
 }
 
 fn load_instance_programs_with<S>(
     state: &mut S,
-    target: ExecReleaseTarget,
+    targets: HookTargets,
     mut load: impl FnMut(&mut S, &'static str, &'static str) -> Result<u32>,
 ) -> Result<LoadedInstancePrograms> {
     let mut program_ids = BTreeMap::new();
-    for (program, hook_target) in active_instance_programs(target) {
+    for (program, hook_target) in active_instance_programs(targets) {
         let id = load(state, program, hook_target)?;
         ensure!(
             id != 0 && !program_ids.values().any(|existing| *existing == id),
@@ -163,7 +173,7 @@ fn load_instance_programs_with<S>(
     }
     Ok(LoadedInstancePrograms {
         program_ids,
-        target,
+        targets,
     })
 }
 
@@ -172,7 +182,7 @@ fn attach_loaded_instance_programs_with<S>(
     state: &mut S,
     mut attach: impl FnMut(&mut S, &'static str, &'static str) -> Result<()>,
 ) -> Result<()> {
-    for (program, target) in active_instance_programs(loaded.target) {
+    for (program, target) in active_instance_programs(loaded.targets) {
         attach(state, program, target)?;
     }
     Ok(())
@@ -268,8 +278,8 @@ pub(crate) struct HookStats {
 pub(crate) struct InstanceTracking {
     /// `None` while active; the refusal reason otherwise.
     refused: Option<String>,
-    /// The resolved exec-release target; `None` until hooks attach.
-    active_target: Option<ExecReleaseTarget>,
+    /// The resolved hook targets; `None` until hooks attach.
+    active_targets: Option<HookTargets>,
     links: Vec<(&'static str, HookLink)>,
     watched: BTreeMap<PinnedObjectId, Result<WatchedFile, String>>,
     keys: BTreeMap<InstanceFileKey, u32>,
@@ -529,8 +539,10 @@ impl InstanceTracking {
     fn load_hooks(ebpf: &mut Ebpf, btf: &Btf) -> Result<LoadedInstancePrograms> {
         let host =
             super::host_btf::shared().context("loading required vmlinux BTF for instance hooks")?;
-        let target = resolve_exec_release_target(host, btf)?;
-        load_instance_programs_with(ebpf, target, |ebpf, program, target| {
+        let exec = resolve_exec_release_target(host, btf)?;
+        let copy = resolve_copy_vma_target(host, btf)?;
+        let targets = HookTargets { copy, exec };
+        load_instance_programs_with(ebpf, targets, |ebpf, program, target| {
             let hook = ebpf
                 .program_mut(program)
                 .with_context(|| format!("program {program} missing from object"))?;
@@ -552,7 +564,7 @@ impl InstanceTracking {
     }
 
     fn attach_hooks(&mut self, ebpf: &mut Ebpf, loaded: LoadedInstancePrograms) -> Result<()> {
-        self.active_target = Some(loaded.target);
+        self.active_targets = Some(loaded.targets);
         attach_loaded_instance_programs_with(loaded, ebpf, |ebpf, program, target| {
             let hook = ebpf
                 .program_mut(program)
@@ -683,10 +695,10 @@ impl InstanceTracking {
     /// The active instance-hook program names: the legacy set until hooks
     /// attach, the resolved set after.
     pub(crate) fn active_program_names(&self) -> [&'static str; 4] {
-        let triples = active_instance_programs(
-            self.active_target
-                .unwrap_or(ExecReleaseTarget::ExecMmRelease),
-        );
+        let triples = active_instance_programs(self.active_targets.unwrap_or(HookTargets {
+            copy: CopyVmaTarget::Legacy,
+            exec: ExecReleaseTarget::ExecMmRelease,
+        }));
         [triples[0].0, triples[1].0, triples[2].0, triples[3].0]
     }
 
@@ -2450,11 +2462,13 @@ mod tests {
 
     #[test]
     fn hook_health_accepts_the_resolved_mmap_set() {
-        let names: Vec<&'static str> =
-            super::active_instance_programs(super::ExecReleaseTarget::ExecMmap)
-                .iter()
-                .map(|(program, _)| *program)
-                .collect();
+        let names: Vec<&'static str> = super::active_instance_programs(super::HookTargets {
+            copy: super::CopyVmaTarget::Legacy,
+            exec: super::ExecReleaseTarget::ExecMmap,
+        })
+        .iter()
+        .map(|(program, _)| *program)
+        .collect();
         assert_eq!(names[3], super::EXEC_RELEASE_MMAP_PROGRAM);
         let stats = healthy_hook_stats_for(&names);
         let expected = stats
@@ -2575,7 +2589,10 @@ mod tests {
             let mut loaded_count = 0;
             let prepared = super::load_instance_programs_with(
                 &mut calls,
-                super::ExecReleaseTarget::ExecMmRelease,
+                super::HookTargets {
+                    copy: super::CopyVmaTarget::Legacy,
+                    exec: super::ExecReleaseTarget::ExecMmRelease,
+                },
                 |calls, program, _| {
                     assert!(calls.iter().all(|(operation, _)| *operation == "load"));
                     calls.push(("load", program));
@@ -2632,7 +2649,10 @@ mod tests {
         let mut next = 0;
         let loaded = super::load_instance_programs_with(
             &mut next,
-            super::ExecReleaseTarget::ExecMmRelease,
+            super::HookTargets {
+                copy: super::CopyVmaTarget::Legacy,
+                exec: super::ExecReleaseTarget::ExecMmRelease,
+            },
             |next, _, _| {
                 *next += 1;
                 Ok(*next)

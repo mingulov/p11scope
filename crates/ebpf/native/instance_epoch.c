@@ -135,6 +135,8 @@ static long (*inst_probe_read_kernel)(void *dst, u32 size, const void *src) = (v
 static struct instance_record *(*inst_storage_get)(void *map, void *task, void *value,
                                                    u64 flags) = (void *)156;
 static void *(*inst_current_task)(void) = (void *)158;
+/* bpf_get_func_ret: the fexit return value on any arity (helper 184, 5.17+). */
+static u64 (*inst_get_func_ret)(void *ctx) = (void *)184;
 
 /* Stores LLVM must not merge into a memset call: the Rust `memset` is a
  * global function that 5.15 refuses a stack pointer argument from here. */
@@ -463,12 +465,27 @@ int p11_inst_vma_unmap(u64 *ctx)
  * returns the new VMA (same vm_file, same vm_mm), or NULL when nothing was
  * created. The kernel admits no pointer-to-pointer fentry argument, so this
  * is an fexit on the return slot (ctx[5]); it still runs under mremap's mmap
- * write lock, before any locked maps reader can see the move. A different
- * argument count makes the verifier refuse the load: fail closed. */
+ * write lock, before any locked maps reader can see the move. This slot is
+ * right only for the 5-argument shape: longer prototypes verify fine (the
+ * slot exists) but hand an argument to the VMA reader instead of the
+ * return, so the resolver selects this program only for the exact
+ * 5-argument BTF shape, the ret-based program below for the exact
+ * 6/7-argument shapes, and refuses the hooks on anything else. */
 INST_SEC("fexit/copy_vma")
 int p11_inst_vma_copy(u64 *ctx)
 {
     return inst_note_vma(ctx[5], 0);
+}
+
+/* copy_vma on 6/7-argument kernels: the 6.18.58+ stable backports append
+ * keep_source, 7.3 adds anon_pgoff too, and the fexit return slot moves
+ * with the arity (ctx[6], ctx[7]). bpf_get_func_ret reads the returned
+ * new VMA on any arity. Same note as the legacy hook above; a separate
+ * program so the legacy bytes never move. */
+INST_SEC("fexit/copy_vma")
+int p11_inst_vma_retcopy(u64 *ctx)
+{
+    return inst_note_vma(inst_get_func_ret(ctx), 0);
 }
 
 /* Fork: a CLONE_VM child that is not a thread shares its parent's mm, so

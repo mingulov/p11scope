@@ -1064,6 +1064,8 @@ fn build_variant_with_proof(
             "-C",
             "link-arg=--export=p11_inst_vma_copy",
             "-C",
+            "link-arg=--export=p11_inst_vma_retcopy",
+            "-C",
             "link-arg=--export=p11_image_exec_release",
             "-C",
             "link-arg=--export=p11_image_mmap_release",

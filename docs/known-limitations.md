@@ -105,6 +105,20 @@ starting its own program is marked as not covered. With `multi` the kernel drops
 such a call before p11scope sees it, so the child is simply not observed.
 (`auto` can pick either.) Neither case is verified live yet.
 
+At very high call rates the kernel's event ring of a native inventory capture
+can fill before p11scope reads it. The kernel then drops new records but counts
+them, and p11scope reports every drop: the report carries a
+`native capture events lost` gap, and the lost count is included in
+`unrouted_returns` and in the shed count of the stop line. Two limits apply.
+In an ordinary native inventory capture this exact count comes only from
+reading the kernel's drop counter: the prompt draining of a full ring applies
+only when the capture has fallen back to its older path (after a
+`joint machine unavailable` gap), so it does not raise the call rate an
+ordinary capture keeps up with. The counter also counts records, not calls:
+under `--cgroup` or `--system`, a dropped process-start (fork) record counts as
+one lost call, so the reported loss can be higher than the number of calls
+actually lost, never lower.
+
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are
 missed, with no marker in the output; restarting such processes is the

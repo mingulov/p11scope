@@ -2848,6 +2848,14 @@ pub(crate) trait EngineSession {
     /// DISCOVERY items currently held in the session FIFO: staged items
     /// hold shared-allowance credits until a dequeue transfers them.
     fn staged_discovery_len(&self) -> usize;
+    /// One DISCOVERY quantum bounded by the Q `stop` position: the
+    /// collected records, the malformed count, and the
+    /// `(post_q_record, backlog)` contract of the bounded drains.
+    fn collect_discovery_to_position(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)>;
 
     /// Only the actual Session implementation can expose its original
     /// Q-bounded drain here. Other native leaves refuse by default.
@@ -3104,6 +3112,14 @@ impl EngineSession for Session {
 
     fn staged_discovery_len(&self) -> usize {
         Session::staged_discovery_len(self)
+    }
+
+    fn collect_discovery_to_position(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
+        Session::collect_discovery_to_position(self, stop, quantum)
     }
 
     fn collect_collected_finish_discovery(
@@ -23855,7 +23871,7 @@ impl Engine {
     /// the post-Q invariant violation.
     pub(crate) fn drain_discovery_terminal_to_position(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         stop: usize,
         post_q_record: &mut bool,
     ) -> Result<bool> {
@@ -23875,7 +23891,7 @@ impl Engine {
     /// while nested malformed (via the dequeue path) does.
     pub(crate) fn drain_discovery_terminal_to_position_observed<F, G>(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         stop: usize,
         post_q_record: &mut bool,
         mut observe_record: F,
@@ -23901,7 +23917,7 @@ impl Engine {
 
     fn drain_discovery_terminal_to_position_inner<F, G>(
         &mut self,
-        session: &mut Session,
+        session: &mut dyn EngineSession,
         stop: usize,
         post_q_record: &mut bool,
         observe_record: &mut F,
@@ -23951,7 +23967,7 @@ impl Engine {
                 )
             };
             let outcome = self.apply_discovery_batch_with(
-                session,
+                &mut *session,
                 records,
                 malformed,
                 false,
@@ -29901,6 +29917,35 @@ pub(crate) mod session_fixture {
 
         fn staged_discovery_len(&self) -> usize {
             self.staged.len()
+        }
+
+        fn collect_discovery_to_position(
+            &mut self,
+            _stop: usize,
+            quantum: usize,
+        ) -> Result<(Vec<DiscoveryRecord>, u64, bool, bool)> {
+            // The script is the Q-bounded content: staged items first
+            // (ring order, like the session FIFO), then scripted
+            // dequeues, up to one quantum. The scripted Q never moves,
+            // so post-Q never fires; backlog reports scripted items
+            // past the quantum exactly.
+            if quantum == 0 {
+                return Ok((Vec::new(), 0, false, true));
+            }
+            let mut records = Vec::new();
+            let mut malformed = 0u64;
+            for _ in 0..quantum {
+                match EngineSession::discovery_dequeue(self)? {
+                    Some(crate::events::DiscoveryItem::Record(record)) => records.push(record),
+                    Some(crate::events::DiscoveryItem::Malformed) => {
+                        malformed = malformed.saturating_add(1);
+                    }
+                    None => return Ok((records, malformed, false, false)),
+                }
+            }
+            let backlog = !self.staged.is_empty()
+                || matches!(self.dequeues.front(), Some(Ok(Some(_))) | Some(Err(_)));
+            Ok((records, malformed, false, backlog))
         }
 
         fn prepare_collected_static_retirement(

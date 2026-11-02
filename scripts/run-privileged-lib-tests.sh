@@ -744,8 +744,12 @@ binary_ignored_list() {
 }
 
 # True when the binary's ignored set contains the exact full path.
+# No `-q`: under pipefail an early-exiting grep SIGPIPEs the upstream
+# sort, returning 141 ("not present") at random and silently dropping
+# the cell. Without -q grep consumes the whole list; matches go to
+# /dev/null and only the exit status (0/1) is used.
 binary_has_ignored() {
-    binary_ignored_list "$1" | grep -qxF "$2"
+    binary_ignored_list "$1" | grep -xF -- "$2" >/dev/null
 }
 
 # Static skips pair each test with its reason by index. A length mismatch

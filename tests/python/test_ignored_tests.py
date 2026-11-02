@@ -841,6 +841,35 @@ class IgnoredTestsTests(unittest.TestCase):
             result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("differ in length", result.stderr)
 
+    def test_binary_has_ignored_reports_present_on_large_early_match_lists(self):
+        # The membership probe once ran `... | grep -qxF` under pipefail,
+        # so grep's early exit SIGPIPE'd the upstream sort and the
+        # pipeline returned 141 ("not present") at random, silently
+        # dropping the alternative cell from --list and the campaign. A
+        # large ignored list whose match sorts first must report
+        # present on every iteration, and a missing name must report
+        # absent (exit 1, never 141).
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "libtest-large"
+            write_fake_binary(
+                binary,
+                ["aaa_match"] + [f"zzz_fill_{i:06d}" for i in range(20000)],
+            )
+            script = (
+                f'source "{RUNNER}" --help >/dev/null 2>&1; '
+                f"for i in 1 2 3 4 5; do "
+                f'binary_has_ignored "{binary}" aaa_match '
+                f"|| exit $((100 + i)); done; "
+                f'binary_has_ignored "{binary}" absent_cell; '
+                f"test $? -eq 1 || exit 106"
+            )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True, text=True, cwd=ROOT,
+            )
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+
     def test_checker_prints_exact_per_list_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

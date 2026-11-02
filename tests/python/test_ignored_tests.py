@@ -87,6 +87,13 @@ BTRFS_EXPECTED = [
     "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins",
     "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_cold_admission_backend_parity",
     "discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors",
+]
+
+# The two D3d forced-kernel cells fail their positive gate (observed on
+# loop and physical btrfs alike) and wait for the owning file's
+# stale-vs-product verdict, so they run as expected failures with the
+# btrfs TMPDIR provisioned.
+BTRFS_TMPDIR_XFAIL_EXPECTED = [
     "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64",
     "inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64",
 ]
@@ -96,6 +103,8 @@ XFAIL_EXPECTED = [
     "discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once",
     "discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent",
     "discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation",
+    "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64",
+    "inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64",
 ]
 
 COUNTER_FIXTURE_EXPECTED = [
@@ -225,6 +234,7 @@ def write_fixture(root, sources, entries, registered, wide_registered=(),
             ("EXPECTED_FAILURE_TESTS", []),
             ("SKIP_TESTS", skip_registered),
             ("COUNTER_FIXTURE_TESTS", []),
+            ("BTRFS_TMPDIR_XFAIL_TESTS", []),
             ("WIDE_DETAILED_2112_TESTS", wide_registered),
             ("INTEGRATION_TESTS", integration_registered),
             ("COUNTER_BANK_PROOF_TESTS", counter_proof_registered),
@@ -1055,6 +1065,10 @@ class IgnoredTestsTests(unittest.TestCase):
                          set(XFAIL_EXPECTED))
         self.assertEqual(set(lists["COUNTER_FIXTURE_TESTS"]),
                          set(COUNTER_FIXTURE_EXPECTED))
+        self.assertEqual(set(lists["BTRFS_TMPDIR_XFAIL_TESTS"]),
+                         set(BTRFS_TMPDIR_XFAIL_EXPECTED))
+        self.assertTrue(set(BTRFS_TMPDIR_XFAIL_EXPECTED)
+                        <= lists["EXPECTED_FAILURE_TESTS"])
         for group in ("BTRFS_TESTS",
                       "EXPECTED_FAILURE_TESTS"):
             with self.subTest(group=group):
@@ -1114,8 +1128,8 @@ class IgnoredTestsTests(unittest.TestCase):
         # The fake lists both load-gate alternatives (a real binary has
         # exactly one), so the default section shows 182 + 2.
         self.assertIn("default (184)", result.stdout)
-        self.assertIn("btrfs (16, --include-btrfs only)", result.stdout)
-        self.assertIn("expected-failures (4, --include-expected-failures "
+        self.assertIn("btrfs (14, --include-btrfs only)", result.stdout)
+        self.assertIn("expected-failures (6, --include-expected-failures "
                       "only)", result.stdout)
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
@@ -1295,7 +1309,8 @@ class IgnoredTestsTests(unittest.TestCase):
             "ignored-tests counts: DEFAULT_TESTS=2 ALTERNATIVE_TESTS=0 "
             "LONG_TESTS=0 BTRFS_TESTS=0 "
             "EXPECTED_FAILURE_TESTS=0 SKIP_TESTS=0 "
-            "COUNTER_FIXTURE_TESTS=0 WIDE_DETAILED_2112_TESTS=1 "
+            "COUNTER_FIXTURE_TESTS=0 BTRFS_TMPDIR_XFAIL_TESTS=0 "
+            "WIDE_DETAILED_2112_TESTS=1 "
             "COUNTER_BANK_PROOF_TESTS=0 COUNTER_ARTIFACTS_TESTS=0 "
             "INTEGRATION_TESTS=0",
             result.stdout,
@@ -1308,10 +1323,11 @@ class IgnoredTestsTests(unittest.TestCase):
             "DEFAULT_TESTS=182",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
-            "BTRFS_TESTS=16",
-            "EXPECTED_FAILURE_TESTS=4",
+            "BTRFS_TESTS=14",
+            "EXPECTED_FAILURE_TESTS=6",
             "SKIP_TESTS=37",
             "COUNTER_FIXTURE_TESTS=27",
+            "BTRFS_TMPDIR_XFAIL_TESTS=2",
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",

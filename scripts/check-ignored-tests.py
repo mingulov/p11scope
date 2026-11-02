@@ -77,6 +77,9 @@ RUNNER_LISTS = (
 # members need runner-built inputs. Sized in the counts line; it never
 # curates by itself.
 FIXTURE_LIST = "COUNTER_FIXTURE_TESTS"
+# Btrfs provisioning for expected failures, not a campaign list either:
+# the xfail members that also need the loop-mounted btrfs TMPDIR.
+BTRFS_XFAIL_LIST = "BTRFS_TMPDIR_XFAIL_TESTS"
 WIDE_LIST = "WIDE_DETAILED_2112_TESTS"
 WIDE_OWNER = "wide-detailed-2112 runner"
 COUNTER_PROOF_LIST = "COUNTER_BANK_PROOF_TESTS"
@@ -98,6 +101,7 @@ INTEGRATION_CELLS = ("live-kernel", "privileged")
 COUNT_LISTS = (
     *RUNNER_LISTS,
     FIXTURE_LIST,
+    BTRFS_XFAIL_LIST,
     *(name for _, name, _ in OWNER_LISTS),
     INTEGRATION_LIST,
 )

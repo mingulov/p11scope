@@ -89,11 +89,13 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Btrfs group (--include-btrfs): the 16 cells that assert TMPDIR is on
+# Btrfs group (--include-btrfs): the 14 cells that assert TMPDIR is on
 # btrfs. The runner loop-mounts one btrfs image for the group
 # (scripts/ci/prepare-btrfs-tmpdir.sh), runs those cells with TMPDIR
 # pointed at the mount, and unmounts it afterwards. Without mkfs.btrfs
-# (or loop/btrfs support) the cells SKIP with a reason.
+# (or loop/btrfs support) the cells SKIP with a reason. The same mount
+# is also provided to the two btrfs-needing expected-failure cells so
+# their XFAIL reflects the named gate failure.
 #
 # Expected-failure group (--include-expected-failures): known-failing
 # reproducers. A failing cell records XFAIL (counts as passed); a passing
@@ -650,6 +652,13 @@ discovery::sweep_attribution::tests::privileged_d4_btrfs_zombie_leader_single_su
 discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins
 discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_cold_admission_backend_parity
 discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors
+)
+
+# Btrfs TMPDIR provisioning also covers these expected-failure cells,
+# so their recorded XFAIL reflects the named gate failure rather than
+# a missing-btrfs setup failure. Every member must also be curated in
+# EXPECTED_FAILURE_TESTS.
+BTRFS_TMPDIR_XFAIL_TESTS=(
 inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
 inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
 )
@@ -664,12 +673,16 @@ discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admit
 discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
 discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
 discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation
+inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
+inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
 )
 XFAIL_REASONS=(
 "expected failure: lane-A runtime does not converge, the rotation stalls (doc Known limit 2026-10-19); an unexpected pass promotes the cell to the runnable campaign"
 "expected failure: lane-A view-capacity stall (doc Known limit; the post-settle refusal asserts unreachable until the runtime fix); an unexpected pass promotes the cell to the runnable campaign"
 "expected failure: RED by design while the post-copy-up D-C7-3 re-edge stands (investigation target); an unexpected pass gets noticed for promotion"
 "expected failure: R57 future positive, RED until a provider-free settlement receipt lands (unprivileged, no BPF or root); an unexpected pass un-ignores the cell"
+"expected failure: D3d forced-kernel positive gate fails at exactly-one-module for gate-k1.so on loop and physical btrfs alike (stale-vs-product verdict belongs to src/inventory/privileged_tests.rs); an unexpected pass promotes the cell to the btrfs group"
+"expected failure: D3d forced-kernel positive gate fails at exactly-one-module for gate-k2.so on loop and physical btrfs alike (stale-vs-product verdict belongs to src/inventory/privileged_tests.rs); an unexpected pass promotes the cell to the btrfs group"
 )
 
 # Wide-Detailed campaign: the ignored tests that exist only in a
@@ -1321,7 +1334,7 @@ main() {
     # mkfs.btrfs) SKIPs the affected cells with a reason; a failure with
     # the tools present fails the run loudly.
     for name in "${COUNTER_FIXTURE_TESTS[@]}"; do counter_fixture_set[$name]=1; done
-    for name in "${BTRFS_TESTS[@]}"; do btrfs_set[$name]=1; done
+    for name in "${BTRFS_TESTS[@]}" "${BTRFS_TMPDIR_XFAIL_TESTS[@]}"; do btrfs_set[$name]=1; done
     for i in "${!EXPECTED_FAILURE_TESTS[@]}"; do
         xfail_reason[${EXPECTED_FAILURE_TESTS[$i]}]=${XFAIL_REASONS[$i]}
     done

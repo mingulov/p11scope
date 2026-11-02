@@ -117,10 +117,9 @@ mod tests {
         for line in text.lines() {
             let mut parts = line.split_whitespace();
             if let (Some(role), Some(pid), Some(start)) = (parts.next(), parts.next(), parts.next())
+                && let Ok(pid) = pid.parse::<u32>()
             {
-                if let Ok(pid) = pid.parse::<u32>() {
-                    out.insert(role.to_string(), (pid, start.to_string()));
-                }
+                out.insert(role.to_string(), (pid, start.to_string()));
             }
         }
         out
@@ -130,6 +129,11 @@ mod tests {
     /// the guarded tree (an intermediate plus a direct sleeper), records
     /// it, then sleeps until the orchestrator SIGKILLs it. Without
     /// [`VICTIM_ENV`] this is an ordinary passing test.
+    ///
+    /// The children are never reaped: the victim dies by SIGKILL and its
+    /// children reparent away, so no `wait` is possible; `/proc` polling
+    /// is the assertion.
+    #[allow(clippy::zombie_processes)]
     #[test]
     fn victim_main() {
         let Ok(pidfile) = std::env::var(VICTIM_ENV) else {
@@ -175,6 +179,10 @@ mod tests {
     /// Re-executed intermediate mode: the middle of the tree. Spawns one
     /// forked grandchild (a sleep), records it, then sleeps until killed.
     /// Without [`INTERMEDIATE_ENV`] this is an ordinary passing test.
+    ///
+    /// The grandchild is never reaped (see `victim_main`): it reparents
+    /// away when the tree dies, so no `wait` is possible.
+    #[allow(clippy::zombie_processes)]
     #[test]
     fn intermediate_main() {
         let Ok(pidfile) = std::env::var(INTERMEDIATE_ENV) else {

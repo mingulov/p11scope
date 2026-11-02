@@ -5,6 +5,7 @@
 //! about 2 s. The unguarded twin is the negative control. Single level:
 //! two-level chaining is proven by the unit cell in `src/fixture_guard.rs`.
 
+#[allow(dead_code)]
 mod support;
 
 use std::process::{Command, Stdio};
@@ -31,6 +32,11 @@ fn proc_matches(pid: u32, start: &str) -> bool {
 /// guarded sleeper through the support helper, records it, then sleeps
 /// until the orchestrator SIGKILLs it. Without [`VICTIM_ENV`] this is an
 /// ordinary passing test.
+///
+/// The sleeper is never reaped: the victim dies by SIGKILL and the
+/// sleeper reparents away, so no `wait` is possible; `/proc` polling is
+/// the assertion.
+#[allow(clippy::zombie_processes)]
 #[test]
 fn victim_main() {
     let Ok(pidfile) = std::env::var(VICTIM_ENV) else {
@@ -82,10 +88,10 @@ impl Tree {
         let (pid, start) = loop {
             if let Ok(text) = std::fs::read_to_string(&pidfile) {
                 let mut parts = text.split_whitespace();
-                if let (Some(pid), Some(start)) = (parts.next(), parts.next()) {
-                    if let Ok(pid) = pid.parse::<u32>() {
-                        break (pid, start.to_string());
-                    }
+                if let (Some(pid), Some(start)) = (parts.next(), parts.next())
+                    && let Ok(pid) = pid.parse::<u32>()
+                {
+                    break (pid, start.to_string());
                 }
             }
             assert!(

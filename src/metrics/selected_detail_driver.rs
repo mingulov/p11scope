@@ -6582,4 +6582,64 @@ mod tests {
             "a later exec after an exit still voids"
         );
     }
+
+    #[test]
+    fn k0_tail_zero_ts_records_void_as_changed() {
+        // A clock fault (zero timestamp) never hides inside the
+        // selection window: both zero-ts tail records must void as
+        // caller-changed even though 0 <= stamp. The exec voids on
+        // its kind; the exit voids on its zero stamp (K0-4 arm).
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let pid = resolved.original.pid();
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let before = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits_for(&scene.plan),
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 110, 110),
+            window_of(20, 30),
+        );
+        let tail = vec![k0_exec_record(pid, 0), k0_exit_record(pid, 0)];
+        close_k0_window_with_tail(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &tail,
+            0,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("promotion_caller_changed"),
+            "zero-ts tail records void instead of hiding in the window"
+        );
+    }
 }

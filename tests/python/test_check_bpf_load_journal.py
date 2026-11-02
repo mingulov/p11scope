@@ -415,6 +415,24 @@ class JournalGateTests(unittest.TestCase):
         self.assertIn("budgeted", row["detail"])
         self.assertNotIn("unbudgeted", row["detail"])
 
+    def test_corrupt_budgets_is_a_harness_error(self):
+        # An explicitly-passed corrupt or unreadable budgets file
+        # is a harness error (exit 2 naming budgets), never a
+        # silent unbudgeted pass: no kernel leg runs.
+        cases = {
+            "corrupt.json": b'{"programs": "CORRUPT"\n',
+            "binary.json": b'\xff\xfe\x00bad\n',
+            "unmapped.json": b'{"programs": "CORRUPT"}\n',
+        }
+        for name, payload in cases.items():
+            path = self.work / name
+            path.write_bytes(payload)
+            result, _ = self.run_gate(KERNEL, budgets=path)
+            self.assertEqual(result.returncode, 2, (name, result.stdout))
+            self.assertIn("budgets", result.stderr, name)
+            self.assertNotIn("## kernel", result.stdout, name)
+            shutil.rmtree(self.work / "out")
+
     def test_refusal_control_passes(self):
         # 5.15 is a refusal control: the finite pre-Multi refusal with
         # no journal load passes the cell.

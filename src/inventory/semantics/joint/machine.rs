@@ -2763,18 +2763,29 @@ impl LiveJointMachine {
                                 Instant::now().duration_since(since) >= PREGRANT_CLOSE_TIMEOUT
                             })
                     };
-                    let pregrant_extend = should_extend(PregrantExtendInputs {
-                        pre_grant: self.grant.is_none(),
-                        journal_linked: self.producers.journal_linked(),
-                        failed,
-                        requested,
-                        attempted: original.attempted,
-                        pending_h0: original.raw.pending_h0_records(),
-                        begin_table_full_or_refused: original.raw.begin_table_full_or_refused(),
-                        hold_open: original.raw.has_open_affecting_start()
-                            || original.raw.h0_records_all_count_only(lane.subset().plan()),
-                        timed_out: pregrant_timed_out(),
-                    });
+                    // Short-circuit: the expensive inputs (the
+                    // open-START and count-only scans, the wall-time
+                    // read) evaluate only behind the cheap gate, so
+                    // unlinked, post-grant, failed and requested lanes
+                    // pay nothing here.
+                    let pre_grant = self.grant.is_none();
+                    let journal_linked = self.producers.journal_linked();
+                    let pregrant_extend = pre_grant
+                        && journal_linked
+                        && !failed
+                        && !requested
+                        && should_extend(PregrantExtendInputs {
+                            pre_grant,
+                            journal_linked,
+                            failed,
+                            requested,
+                            attempted: original.attempted,
+                            pending_h0: original.raw.pending_h0_records(),
+                            begin_table_full_or_refused: original.raw.begin_table_full_or_refused(),
+                            hold_open: original.raw.has_open_affecting_start()
+                                || original.raw.h0_records_all_count_only(lane.subset().plan()),
+                            timed_out: pregrant_timed_out(),
+                        });
                     if !unrequested_empty && !needs_first_end && !pregrant_extend {
                         // A requested transaction must not bind on a stale
                         // no-backlog poll: rows may have landed since idle

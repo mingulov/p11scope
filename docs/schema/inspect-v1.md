@@ -84,6 +84,11 @@ which checks executable identity around maps and physical proof reads. A missing
 retained path still withholds the name. Unreadable, Exited and NotSelected rows
 remain visible with unknown application identity.
 
+The system document root also carries the additive `excluded_modules` and
+`unmatched_excludes` fields with the same shapes as above, present only when
+`--exclude-module` is passed; system text lists them after the gap rows with
+the same "excluded by you" wording.
+
 System text uses the same retained receipts for mapped-by labels and the process
 table, which also shows full executable paths and physical identity detail.
 Rendering never repairs a missing identity using current process state. Host

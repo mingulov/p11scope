@@ -75,6 +75,7 @@ use crate::discovery::loader::{
     MAX_LOADER_CONTEXTS,
 };
 use crate::discovery::scheduler::MAX_PENDING_REFRESH;
+use crate::fixture_guard::DieWithParent as _;
 use crate::process::ProcessView;
 use p11scope_ebpf_common::DISCOVERY_POINTERS;
 use sha2::{Digest as _, Sha256};
@@ -335,6 +336,7 @@ impl Population {
                     .stdin(Stdio::null())
                     .stdout(out)
                     .stderr(err)
+                    .die_with_parent()
                     .spawn()
                     .unwrap_or_else(|error| panic!("spawn {role} {name}: {error}"));
                 LiveChild { role, child, log }
@@ -385,6 +387,7 @@ impl Population {
                 .stdin(Stdio::null())
                 .stdout(head_out)
                 .stderr(head_err)
+                .die_with_parent()
                 .spawn()
                 .expect("spawn static head");
             head_pid = head.id();
@@ -1045,6 +1048,7 @@ impl Population {
                 .stdin(Stdio::null())
                 .stdout(out)
                 .stderr(err)
+                .die_with_parent()
                 .spawn()
                 .expect("spawn late owner"),
             log,
@@ -1086,6 +1090,7 @@ impl Population {
                 .stdin(Stdio::null())
                 .stdout(out)
                 .stderr(err)
+                .die_with_parent()
                 .spawn()
                 .expect("spawn static head"),
             log,
@@ -1506,6 +1511,7 @@ impl SmallGroup {
                 .stdin(Stdio::null())
                 .stdout(out)
                 .stderr(err)
+                .die_with_parent()
                 .spawn()
                 .unwrap_or_else(|error| panic!("{what}: spawn {name}: {error}"));
             children.push(LiveChild { role, child, log });
@@ -1519,6 +1525,7 @@ impl SmallGroup {
             .stdin(Stdio::null())
             .stdout(head_out)
             .stderr(head_err)
+            .die_with_parent()
             .spawn()
             .unwrap_or_else(|error| panic!("{what}: spawn head: {error}"));
         children.push(LiveChild {

@@ -772,11 +772,13 @@ enum OwnedChild {
     Held,
     /// No `--hold`: the child exits after DONE, inside the window, and
     /// the capture ends on that exit. `--delay-ms` keeps it alive
-    /// after the gate for that long before its calls, so the observer
-    /// has processed the child's provider-load records while the child
-    /// still runs (a child that exits before that leaves the
-    /// observer's loader discovery for it unfinished: the documented
-    /// `broad_stopping` known issue, not what this shape pins).
+    /// after the gate for that long before its calls, so the
+    /// observer's discovery frames process the child's provider-load
+    /// records while the child still runs. Without the delay the
+    /// exit still voids intermittently: loader hits processed after
+    /// the view retires reject as real truncation (only the
+    /// exit-ended scan count renders), so the immediate shape cannot
+    /// pin a render.
     ExitsAfter { delay_ms: u32 },
     /// No gate at all (`--gate -`): the short-program shape. The child
     /// runs at release, signs four times and exits on its own,
@@ -971,10 +973,13 @@ fn k0_live_run_exit_in_window_counts_lp64() -> Result<()> {
     let module = softhsm_path()?;
     let observer = observer_binary()?;
     let workload = K0Workload::build_owned(&module)?;
-    // A three-second pause after the gate is a short program's shape:
-    // the observer processes the child's provider-load records while
-    // the child runs (its ticks are tens of milliseconds), then the
-    // child signs four times and exits inside the window.
+    // The delayed-exit shape: the child waits three seconds after the
+    // gate so the observer's ~1 s discovery frames process its
+    // provider-load records while it still runs; then it signs four
+    // times and exits inside the window. An immediate exit would
+    // race loader-hit processing against view retirement and void
+    // intermittently (see the `ExitsAfter` docs), so the delay pins
+    // the exit-cleanly contract deterministically.
     let outcome = k0_owned_run(
         &workload,
         &module,

@@ -6867,6 +6867,110 @@ pub(crate) mod tests {
         }
     }
 
+    /// Test-only refused-BEGIN mirror of the production capacity-refusal
+    /// path: the same cut and identity the adapter would retain.
+    fn refused_of_begin(begin: &ValidatedJournalBegin, cut: u64) -> RefusedBegin {
+        RefusedBegin {
+            cut,
+            image: (begin.image_cookie(), begin.image_exec()),
+            pid_tgid: begin.pid_tgid(),
+            function: begin.descriptor() - 1,
+            slot: begin.slot(),
+            session: begin.session_word(),
+            mechanism: begin.entry_mechanism(),
+            slot_id: begin.slot_id(),
+            user_type: begin.user_type(),
+            capture: begin.capture(),
+            flags: begin.call_flags(),
+            entry_ns: begin.entry_ns(),
+            corroborated_return: None,
+        }
+    }
+
+    /// Decode one producer pair into its BEGIN plus the preserved CALL
+    /// (the END's embedded ordinary return event) for the ordinary
+    /// corroboration twins.
+    fn ordinary_match_pair(
+        name: &str,
+        rewrite: impl FnOnce(
+            &mut p11scope_ebpf_common::CallStart,
+            &mut p11scope_ebpf_common::object_flow::ReturnEventFacts,
+        ),
+    ) -> (ValidatedJournalBegin, Event) {
+        let (begin_bytes, end_bytes) = producer_agreement_pair(name, rewrite);
+        let rows = publish_object_descriptors();
+        let JournalRecord::Begin(begin) = decode_journal_record(&begin_bytes, &rows).unwrap()
+        else {
+            panic!("BEGIN")
+        };
+        let JournalRecord::End(end) = decode_journal_record(&end_bytes, &rows).unwrap() else {
+            panic!("END")
+        };
+        (begin, end.payload_base().event)
+    }
+
+    #[test]
+    fn object_journal_ordinary_matching_accepts_get_id_value_unreadable_on_ok() {
+        // A GetID whose END was lost carries bit 6 only on its preserved
+        // CALL; it must still corroborate its BEGIN (open or refused)
+        // instead of stalling the seal on BoundNotReady. Unreachable in
+        // production today: async controls are negative-only, never
+        // journaled.
+        assert_eq!(
+            endpoint_class(function_id("C_AsyncGetID")),
+            Some(EndpointClass::NegativeOnlyAffecting),
+            "the exemption is a no-op until async controls are tracked"
+        );
+        let (begin, event) = ordinary_match_pair("C_AsyncGetID", |_, facts| {
+            facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+        });
+        assert!(ordinary_matches_begin(&event, 2, &begin, 1));
+        assert!(ordinary_matches_refused(
+            &event,
+            2,
+            &refused_of_begin(&begin, 1)
+        ));
+    }
+
+    #[test]
+    fn object_journal_ordinary_matching_refuses_value_unreadable_elsewhere() {
+        // The bit-6 allowance is GetID+OK with the mechanism word
+        // unchanged: any other function, a failed return, bit 6 beside
+        // another change, or a changed mechanism still refuses on both
+        // ordinary matchers.
+        for shape in [
+            "other-function",
+            "failed-get-id",
+            "bit-beside-another-change",
+            "changed-mechanism",
+        ] {
+            let name = if shape == "other-function" {
+                "C_GetSessionInfo"
+            } else {
+                "C_AsyncGetID"
+            };
+            let (begin, event) = ordinary_match_pair(name, |_, facts| {
+                facts.capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
+                match shape {
+                    "failed-get-id" => facts.rv = 5,
+                    "bit-beside-another-change" => {
+                        facts.capture_flags |= capture::ARG_READ_FAILURE;
+                    }
+                    "changed-mechanism" => facts.mechanism ^= 1,
+                    _ => {}
+                }
+            });
+            assert!(
+                !ordinary_matches_begin(&event, 2, &begin, 1),
+                "open BEGIN: {shape}"
+            );
+            assert!(
+                !ordinary_matches_refused(&event, 2, &refused_of_begin(&begin, 1)),
+                "refused BEGIN: {shape}"
+            );
+        }
+    }
+
     #[test]
     fn object_journal_agreement_refuses_unrelated_return_capture_changes() {
         let (begin, end) = producer_agreement_pair("C_CreateObject", |_, facts| {

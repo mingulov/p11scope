@@ -4410,6 +4410,7 @@ fn capture_return_facts<const DEFER_ROUTING: bool>(
     let mut async_value = start.async_value;
     // An OK GetID with a null output pointer produced no id: mark the
     // value unreadable instead of leaving a valid-looking default.
+    // A failed entry arg read also leaves out_ptr zeroed, so that unreachable corner double-counts the evidence below.
     if accounting.rv == 0
         && semantics.lifecycle == lifecycle::ASYNC_GET_ID
         && start.out_ptr == 0

@@ -11,7 +11,9 @@
 //! pins the caller-changed void; the two exit cells let the watched
 //! process exit inside the window (owned `run` without `--hold`, and a
 //! `--pid` target that ends before the duration) and pin what an exit
-//! does to the detail.
+//! does to the detail; the gate-less cell runs a short owned child
+//! with no test synchronization and pins that the detail sees every
+//! call the main report saw.
 //!
 //! Gate discipline (no sleeps on the critical path): every phase the
 //! test drives waits on a workload line (`READY`, `WATCH_READY`,
@@ -697,6 +699,7 @@ fn spawn_run_observer(
     ledger: &Path,
     conf: &Path,
     gate: &Path,
+    pause: Option<&str>,
     child_tail: &[&str],
 ) -> Result<Child> {
     let log_file = std::fs::File::create(log)?;
@@ -717,6 +720,13 @@ fn spawn_run_observer(
         &duration_secs.to_string(),
         "-o",
         out.to_str().context("out path")?,
+    ]);
+    // The gate-less probe overrides the pause policy through the
+    // environment; every other shape runs the default (`never`).
+    if let Some(mode) = pause {
+        command.args(["--pause", mode]);
+    }
+    command.args([
         "--",
         ledger.to_str().context("ledger path")?,
         "mech",
@@ -750,7 +760,7 @@ fn k0_live_run_detail_matches_ledger_counts_lp64() -> Result<()> {
 }
 
 fn k0_run_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result<()> {
-    let document = k0_owned_run(workload, module, observer, "k0r", OwnedChild::Held)?;
+    let document = k0_owned_run(workload, module, observer, "k0r", OwnedChild::Held, None)?;
     require_four_sign_detail(&document)
 }
 
@@ -768,21 +778,32 @@ enum OwnedChild {
     /// observer's loader discovery for it unfinished: the documented
     /// `broad_stopping` known issue, not what this shape pins).
     ExitsAfter { delay_ms: u32 },
+    /// No gate at all (`--gate -`): the short-program shape. The child
+    /// runs at release, signs four times and exits on its own,
+    /// possibly before the K0 window opens; the capture ends on that
+    /// exit. Whether the detail still sees every call the aggregate
+    /// saw is what the gate-less cell pins.
+    Gateless,
 }
 
-/// Drive one owned `run --select-endpoint C_Sign` over a gated `mech`
-/// child doing four clean C_Sign calls, and return the `-o` report.
+/// Drive one owned `run --select-endpoint C_Sign` over a `mech` child
+/// doing four clean C_Sign calls, and return the `-o` report. The
+/// child is gated unless the shape is `Gateless`; `pause` overrides
+/// the observer's `--pause` policy for the gate-less probe only.
 fn k0_owned_run(
     workload: &K0Workload,
     module: &str,
     observer: &Path,
     tag: &str,
     shape: OwnedChild,
+    pause: Option<&str>,
 ) -> Result<serde_json::Value> {
     let out = workload.path(&format!("{tag}.json"));
     let log = workload.path(&format!("{tag}.observer.log"));
     let gate = workload.path(&format!("{tag}.gate"));
-    ensure!(!gate.exists(), "gate {} pre-exists", gate.display());
+    if shape != OwnedChild::Gateless {
+        ensure!(!gate.exists(), "gate {} pre-exists", gate.display());
+    }
     // Four main-phase iterations, one clean C_Sign each; setup and
     // teardown never call C_Sign, so the window count is exactly 4.
     // The owned child maps its provider after the observer attaches,
@@ -815,6 +836,14 @@ fn k0_owned_run(
             delay = delay_ms.to_string();
             vec!["--delay-ms", &delay]
         }
+        OwnedChild::Gateless => vec![],
+    };
+    // The ledger takes `--gate -` for no gate; the gate-less child
+    // runs at release without any test synchronization.
+    let spawn_gate: &Path = if shape == OwnedChild::Gateless {
+        Path::new("-")
+    } else {
+        &gate
     };
     let mut child = spawn_run_observer(
         observer,
@@ -824,7 +853,8 @@ fn k0_owned_run(
         &log,
         &workload.ledger,
         &workload.conf,
-        &gate,
+        spawn_gate,
+        pause,
         &child_tail,
     )?;
     wait_for_observer_row(
@@ -835,7 +865,9 @@ fn k0_owned_run(
         Duration::from_secs(120),
     )?;
     require_attached_probes(&log, &out)?;
-    std::fs::write(&gate, b"open\n")?;
+    if shape != OwnedChild::Gateless {
+        std::fs::write(&gate, b"open\n")?;
+    }
     wait_for_observer_row(&log, "DONE ", &mut child, &out, Duration::from_secs(60))?;
     let status = wait_for_observer_stop(&mut child, &log, &out, Duration::from_secs(180))?;
     // A held child stays alive past the observer's duration handoff;
@@ -949,9 +981,85 @@ fn k0_live_run_exit_in_window_counts_lp64() -> Result<()> {
         &observer,
         "k0re",
         OwnedChild::ExitsAfter { delay_ms: 3000 },
+        None,
     )
     .and_then(|document| require_exit_outcome(&document));
     keep_workload_on_failure(workload, outcome, "K0RE")
+}
+
+#[test]
+#[ignore = "privileged K0 cell (root with gcc, softhsm2-util, SoftHSM2 and an observer binary): run --select-endpoint counts on a gate-less short owned child that signs four times and exits at once"]
+fn k0_live_run_gateless_exit_matches_main_counts_lp64() -> Result<()> {
+    let module = softhsm_path()?;
+    let observer = observer_binary()?;
+    let workload = K0Workload::build_owned(&module)?;
+    // P11SCOPE_K0_PAUSE=always probes the pause hypothesis (the child
+    // pauses at its load until the observer processes it); the
+    // default campaign leaves it unset, which is `--pause never`.
+    let pause = std::env::var("P11SCOPE_K0_PAUSE").ok();
+    let outcome = k0_owned_run(
+        &workload,
+        &module,
+        &observer,
+        "k0g",
+        OwnedChild::Gateless,
+        pause.as_deref(),
+    )
+    .and_then(|document| require_detail_matches_main_counts(&document));
+    keep_workload_on_failure(workload, outcome, "K0G")
+}
+
+/// The gate-less short-run shape: the selection names C_Sign without
+/// a refusal, the detail renders, and its entered/returned counts
+/// equal the main report's C_Sign calls — no call the aggregate saw
+/// may fall outside the window. The ledger count (four clean signs,
+/// already ensured by the driver) and the aggregate count (also
+/// four: the uprobes attach before the child is released) keep the
+/// comparison non-vacuous.
+fn require_detail_matches_main_counts(document: &serde_json::Value) -> Result<()> {
+    let selected = &document["evidence"]["selected_detail"];
+    let record = &selected["selection"];
+    ensure!(
+        record["endpoint"] == serde_json::json!("C_Sign"),
+        "selection names C_Sign: {record}"
+    );
+    let slot = record["slot"].as_u64().context("selection slot")?;
+    ensure!(
+        record.get("refusal").is_none(),
+        "the short window succeeds: {record}"
+    );
+    let detail = selected.get("detail").context("detail renders")?;
+    let rows = detail["rows"].as_array().context("detail rows")?;
+    ensure!(rows.len() == 1, "Detail carries only the selected slot");
+    ensure!(rows[0]["slot"] == serde_json::json!(slot), "detail slot");
+    let entered = rows[0]["entered"].as_u64().context("detail entered")?;
+    let returned = rows[0]["returned"].as_u64().context("detail returned")?;
+    let errors = rows[0]["errors"].as_u64().context("detail errors")?;
+    let functions = document["functions"]
+        .as_array()
+        .context("functions array")?;
+    let row = functions
+        .iter()
+        .find(|function| {
+            function["names"]
+                .as_array()
+                .is_some_and(|names| names.iter().any(|name| name == "C_Sign"))
+        })
+        .context("main report carries C_Sign")?;
+    let main_calls = row["calls"].as_u64().context("main C_Sign calls")?;
+    let main_errors = row["errors"].as_u64().context("main C_Sign errors")?;
+    eprintln!(
+        "k0-live-gateless-cell: main={main_calls}/{main_errors} detail={entered}/{returned}/{errors}"
+    );
+    ensure!(
+        main_calls == 4 && main_errors == 0,
+        "the aggregate saw all four ledger calls: {row}"
+    );
+    ensure!(
+        entered == main_calls && returned == main_calls && errors == 0,
+        "detail equals the main report: detail={entered}/{returned}/{errors} main={main_calls}"
+    );
+    Ok(())
 }
 
 #[test]

@@ -7112,6 +7112,10 @@ fn final_view_guarded(
     {
         let mut view = prior.clone();
         view.semantic_capture = driver.semantic_summary();
+        // Terminal pre-arm rows are a pure coordinator read, not a
+        // registry publication: the hook already ended the watches, so
+        // the pending final shows them terminal, like every fresh final.
+        view.prearm = driver.coordinator.prearm_rows();
         return view;
     }
     let mut presentation = Presentation::capture(

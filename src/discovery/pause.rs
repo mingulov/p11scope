@@ -3260,7 +3260,7 @@ mod tests {
                 return starts;
             }
             // Unscripted tasks date at tick zero, matching the default test
-            // baseline; a scripted birth must beat the arm by two ticks.
+            // baseline; a scripted birth dates against the scripted attach.
             Ok(self.last_states.keys().map(|tid| (*tid, 0)).collect())
         }
 
@@ -3619,6 +3619,31 @@ mod tests {
         assert_eq!(
             coordinator.expected_tasks,
             [(child.pid(), b'S')].into_iter().collect()
+        );
+    }
+
+    /// Preflight dates every thread it freezes: a thread whose start time
+    /// cannot be read refuses the pause instead of joining the expected set
+    /// undated.
+    #[test]
+    fn preflight_refuses_a_thread_without_a_start_time() {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let expected = [(child.pid(), b'S')].into_iter().collect();
+        let mut io = FakeIo {
+            states: VecDeque::from([Ok(expected)]),
+            starts: VecDeque::from([Ok(BTreeMap::new())]),
+            ..FakeIo::default()
+        };
+
+        let error = PauseCoordinator::preflight(PausePolicy::Always, &child, &mut io)
+            .err()
+            .expect("an undated preflight thread must refuse");
+
+        assert!(
+            error
+                .to_string()
+                .contains("start time during pause preflight"),
+            "{error}"
         );
     }
 
@@ -4106,13 +4131,12 @@ mod tests {
         io
     }
 
-    /// A stop whose current epoch was armed at `arm_boot_ns` (a fresh frame or
-    /// successor re-arm), with the preflight threads 41 and 42 born at tick 50.
-    /// The arm no longer dates births and the coordinator keeps no boot-clock
-    /// arm stamp; the twins still state where the arm lies, so each shows the
-    /// outcome follows the attach instant alone.
-    fn birth_dating_coordinator(arm_boot_ns: u64) -> PauseCoordinator {
-        let _ = arm_boot_ns;
+    /// An armed stop with the preflight threads 41 and 42 born at tick 50.
+    /// The coordinator keeps no arm instant in the boot clock, so no arm (a
+    /// fresh frame or a successor re-arm) is an input to birth dating; only
+    /// `birth_first_seen_after_a_successor_rearm_keeps_partial` runs a real
+    /// successor re-arm.
+    fn birth_dating_coordinator() -> PauseCoordinator {
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.arm_for_test();
         coordinator.expected_starts = [(41, 50), (42, 50)].into_iter().collect();
@@ -4127,13 +4151,9 @@ mod tests {
         )
     }
 
-    /// Runs one stop that sees thread 43 born at `birth_tick` under an arm at
-    /// `arm_tick` and a last completed attach at `attach_tick`.
-    fn birth_dating_stop(
-        birth_tick: u64,
-        arm_tick: u64,
-        attach_tick: Option<u64>,
-    ) -> PauseCoordinator {
+    /// Runs one stop that sees thread 43 born at `birth_tick` against a last
+    /// completed attach at `attach_tick`.
+    fn birth_dating_stop(birth_tick: u64, attach_tick: Option<u64>) -> PauseCoordinator {
         let tick = test_tick_ns();
         let (grown, starts) = grown_by_one(birth_tick);
         let mut io = birth_dating_io(
@@ -4141,7 +4161,7 @@ mod tests {
             starts,
             attach_tick.map(|attach| attach.saturating_mul(tick)),
         );
-        let mut coordinator = birth_dating_coordinator(arm_tick.saturating_mul(tick));
+        let mut coordinator = birth_dating_coordinator();
         coordinator.service(&mut io).unwrap();
         coordinator
     }
@@ -4160,9 +4180,9 @@ mod tests {
         assert!(!coordinator.rearming_enabled());
     }
 
-    /// A thread born after the last hook attach, by more than one tick of
-    /// margin, only ever ran with the hooks in place: the stop adopts it into
-    /// the expected set and confirms instead of reporting partial.
+    /// A thread whose floored birth is after the last hook attach is no more
+    /// exposed than a preflight thread: the stop adopts it into the expected
+    /// set and confirms instead of reporting partial.
     #[test]
     fn thread_born_after_last_attach_is_adopted_and_the_stop_confirms() {
         let tick = test_tick_ns();
@@ -4170,7 +4190,7 @@ mod tests {
         let grown: BTreeMap<u32, u8> = [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
         let starts: BTreeMap<u32, u64> = [(41, 50), (42, 50), (43, 102)].into_iter().collect();
         let mut io = birth_dating_io(grown, starts, Some(instant));
-        let mut coordinator = birth_dating_coordinator(instant);
+        let mut coordinator = birth_dating_coordinator();
 
         coordinator.service(&mut io).unwrap();
 
@@ -4181,24 +4201,23 @@ mod tests {
         );
     }
 
-    /// The OpenSC shape: worker threads born well after the provider's hooks
-    /// attached but in the same tick as (or one tick after) a fresh frame or
-    /// successor re-arm. The re-arm does not date births; the attach does, so
-    /// the threads are covered and the stop confirms.
+    /// The OpenSC shape: worker threads born ten ticks or more after the
+    /// provider's hooks attached are covered and the stop confirms. Births
+    /// date against the attach alone; no arm is an input.
     #[test]
-    fn birth_after_last_attach_within_a_tick_of_a_fresh_rearm_is_covered() {
+    fn birth_well_after_the_last_attach_is_covered() {
         for birth_tick in [100, 101] {
-            let coordinator = birth_dating_stop(birth_tick, 100, Some(90));
+            let coordinator = birth_dating_stop(birth_tick, Some(90));
             assert_covered(&coordinator);
         }
     }
 
     /// A thread born before the last hook attach completed might have run
     /// provider code before that provider's hooks were live: the stop keeps
-    /// today's partial, however old the arm is.
+    /// today's partial.
     #[test]
     fn thread_born_before_last_attach_keeps_partial() {
-        assert_partial(&birth_dating_stop(99, 50, Some(100)));
+        assert_partial(&birth_dating_stop(99, Some(100)));
     }
 
     /// A thread born after one provider attached (tick 90) but before a later
@@ -4206,15 +4225,15 @@ mod tests {
     /// keeps today's partial.
     #[test]
     fn later_module_attach_after_the_birth_keeps_partial() {
-        assert_partial(&birth_dating_stop(102, 50, Some(110)));
+        assert_partial(&birth_dating_stop(102, Some(110)));
     }
 
     /// Runs one stop that sees thread 43 born at `birth_tick` against a last
-    /// completed attach at `attach_ns` (an old arm at tick 50).
+    /// completed attach at `attach_ns`.
     fn birth_dating_stop_at(birth_tick: u64, attach_ns: u64) -> PauseCoordinator {
         let (grown, starts) = grown_by_one(birth_tick);
         let mut io = birth_dating_io(grown, starts, Some(attach_ns));
-        let mut coordinator = birth_dating_coordinator(50 * test_tick_ns());
+        let mut coordinator = birth_dating_coordinator();
         coordinator.service(&mut io).unwrap();
         coordinator
     }
@@ -4250,7 +4269,7 @@ mod tests {
     }
 
     /// An attach still in flight reports no completed instant: nothing born
-    /// after preflight dates as covered, however old the arm is.
+    /// after preflight dates as covered.
     #[test]
     fn attach_in_flight_keeps_partial() {
         let clock = HookAttachClock::new();
@@ -4264,7 +4283,7 @@ mod tests {
 
         let (grown, starts) = grown_by_one(completed / tick + 1_000);
         let mut io = birth_dating_io(grown, starts, in_flight);
-        let mut coordinator = birth_dating_coordinator(50u64.saturating_mul(tick));
+        let mut coordinator = birth_dating_coordinator();
         coordinator.service(&mut io).unwrap();
         drop(open);
 
@@ -4272,11 +4291,11 @@ mod tests {
     }
 
     /// With no attach completion recorded, nothing born after preflight dates
-    /// as covered, however old the arm is.
+    /// as covered.
     #[test]
     fn no_attach_instant_recorded_keeps_partial() {
         assert_eq!(HookAttachClock::new().completed(), None);
-        assert_partial(&birth_dating_stop(102, 50, None));
+        assert_partial(&birth_dating_stop(102, None));
     }
 
     /// A thread adopted before this stop's own attach was verified stopped
@@ -4294,42 +4313,116 @@ mod tests {
             Some(110u64.saturating_mul(tick)),
             Some(110u64.saturating_mul(tick)),
         ]);
-        let mut coordinator = birth_dating_coordinator(50u64.saturating_mul(tick));
+        let mut coordinator = birth_dating_coordinator();
 
         coordinator.service(&mut io).unwrap();
 
         assert_covered(&coordinator);
     }
 
-    /// A successor re-arm installed during the stop does not date births:
-    /// threads first seen after it (the post-arm sample) still date against
-    /// the last attach. A floor after the attach is covered; a floor equal to
-    /// it keeps today's partial.
+    /// Births are adopted only in the stop's first (settling) sample. A stopped
+    /// group cannot clone, so a thread first seen after the successor re-arm
+    /// means something ran under the stop: today's partial, even when its
+    /// floored birth is after the last attach (ruling PT-5).
     #[test]
-    fn births_first_seen_after_a_successor_rearm_date_against_the_last_attach() {
+    fn birth_first_seen_after_a_successor_rearm_keeps_partial() {
         let tick = test_tick_ns();
+        for attach_tick in [100, 101, 102] {
+            let coordinator = birth_first_seen_at(3, 102, attach_tick * tick);
+            assert_partial(&coordinator);
+        }
+    }
+
+    /// Runs one stop whose thread 43 (born at `birth_tick`) is first seen at
+    /// sample `first_seen`: 0 settling, 1 the second sample, 2 post-apply,
+    /// 3 post-successor-arm. Earlier samples see only the preflight threads.
+    fn birth_first_seen_at(first_seen: usize, birth_tick: u64, attach_ns: u64) -> PauseCoordinator {
         let preflight: BTreeMap<u32, u64> = [(41, 50), (42, 50)].into_iter().collect();
-        for (attach_tick, covered) in [(100, true), (101, true), (102, false)] {
+        let (grown, starts) = grown_by_one(birth_tick);
+        let mut io = birth_dating_io(grown.clone(), starts.clone(), Some(attach_ns));
+        io.states = (0..4)
+            .map(|sample| {
+                Ok(if sample < first_seen {
+                    stopped()
+                } else {
+                    grown.clone()
+                })
+            })
+            .collect();
+        io.starts = (0..4)
+            .map(|sample| {
+                Ok(if sample < first_seen {
+                    preflight.clone()
+                } else {
+                    starts.clone()
+                })
+            })
+            .collect();
+        let mut coordinator = birth_dating_coordinator();
+        coordinator.service(&mut io).unwrap();
+        coordinator
+    }
+
+    /// The strict samples admit no new thread (ruling PT-5): a covered birth
+    /// first seen at the second or the post-attach sample keeps today's
+    /// partial; the same birth first seen while the stop settles confirms.
+    #[test]
+    fn birth_first_seen_at_a_strict_sample_keeps_partial() {
+        let tick = test_tick_ns();
+        assert_covered(&birth_first_seen_at(0, 102, 90 * tick));
+        for first_seen in [1, 2] {
+            let coordinator = birth_first_seen_at(first_seen, 102, 90 * tick);
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "first seen at sample {first_seen}"
+            );
+            assert!(!coordinator.expected_tasks.contains_key(&43));
+        }
+    }
+
+    /// An adopted thread is held to the later samples like a preflight one:
+    /// a changed start time (a reused tid) or a running state at a strict
+    /// sample keeps today's partial.
+    #[test]
+    fn adopted_thread_is_held_to_the_strict_samples() {
+        let tick = test_tick_ns();
+        for change in ["reused", "running"] {
             let (grown, starts) = grown_by_one(102);
-            let mut io = birth_dating_io(grown.clone(), starts.clone(), Some(attach_tick * tick));
-            io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(stopped()), Ok(grown)]);
-            io.starts = VecDeque::from([
-                Ok(preflight.clone()),
-                Ok(preflight.clone()),
-                Ok(preflight.clone()),
-                Ok(starts),
-            ]);
-            let mut coordinator = birth_dating_coordinator(0);
+            let mut io = birth_dating_io(grown.clone(), starts.clone(), Some(90 * tick));
+            if change == "reused" {
+                let mut reused = starts;
+                reused.insert(43, 103);
+                io.starts[1] = Ok(reused);
+            } else {
+                let mut running = grown;
+                running.insert(43, b'R');
+                io.states[1] = Ok(running);
+            }
+            let mut coordinator = birth_dating_coordinator();
 
             coordinator.service(&mut io).unwrap();
 
-            if covered {
-                assert_covered(&coordinator);
-                assert!(coordinator.is_armed(), "the successor stays installed");
-            } else {
-                assert_partial(&coordinator);
-            }
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "adopted thread {change} at the second sample"
+            );
         }
+    }
+
+    /// A preflight thread whose start time becomes unreadable at a later
+    /// sample can no longer be identified: today's partial.
+    #[test]
+    fn known_thread_whose_start_becomes_unreadable_keeps_partial() {
+        let preflight: BTreeMap<u32, u64> = [(41, 50), (42, 50)].into_iter().collect();
+        let mut io = birth_dating_io(stopped(), preflight, Some(90 * test_tick_ns()));
+        io.starts[1] = Ok([(41, 50)].into_iter().collect());
+        let mut coordinator = birth_dating_coordinator();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_partial(&coordinator);
     }
 
     /// The covered check itself (ruling PT-3): covered exactly when the
@@ -4398,7 +4491,7 @@ mod tests {
             let starts: BTreeMap<u32, u64> =
                 [(41, 50), (42, 50), (43, birth_tick)].into_iter().collect();
             let mut io = birth_dating_io(grown, starts, Some(instant));
-            let mut coordinator = birth_dating_coordinator(instant);
+            let mut coordinator = birth_dating_coordinator();
 
             coordinator.service(&mut io).unwrap();
 
@@ -4456,7 +4549,7 @@ mod tests {
         let mut io = birth_dating_io(grown, starts.clone(), Some(100 * tick));
         io.states.push_front(Ok(first));
         io.starts.push_front(Ok(starts));
-        let mut coordinator = birth_dating_coordinator(50 * tick);
+        let mut coordinator = birth_dating_coordinator();
 
         coordinator.service(&mut io).unwrap();
 
@@ -4528,6 +4621,64 @@ mod tests {
         );
     }
 
+    /// While the stop settles, only a thread on its way into the stop (`R`,
+    /// `S` or `D`) is waited for. A zombie, a dead or a traced thread can never
+    /// reach the group stop: today's partial at once, without re-sampling
+    /// (ruling PT-5).
+    #[test]
+    fn settling_fails_fast_on_a_state_that_cannot_reach_the_stop() {
+        for state in [b'Z', b'X', b'x', b't'] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            let unreachable: BTreeMap<u32, u8> = [(41, b'T'), (42, state)].into_iter().collect();
+            io.states = std::iter::repeat_with(|| Ok(unreachable.clone()))
+                .take(2_000)
+                .collect();
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_partial(&coordinator);
+            assert_eq!(io.state_reads, 1, "state {}", state as char);
+        }
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.states = VecDeque::from([
+            Ok([(41, b'D'), (42, b'T')].into_iter().collect()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+            Ok(stopped()),
+        ]);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+    }
+
+    /// A settling sample that finds every thread stopped but lands after the
+    /// deadline (an overslept wait on a loaded host) is a late boundary, not a
+    /// task-set change: it keeps the deadline message and its
+    /// `later_pause_boundary` category.
+    #[test]
+    fn settled_but_late_first_sample_reports_the_deadline() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            states: VecDeque::from([Ok(running_42()), Ok(stopped())]),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut io, SAMPLE_NS / 2),
+            Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
+        );
+        assert_eq!(waits(&io), 1);
+        assert_eq!(
+            diagnostic_for_message(MSG_PAUSE_CONFIRMATION_DEADLINE),
+            Some(PauseDiagnostic::LaterPauseBoundary)
+        );
+    }
+
     /// A thread that vanishes while the stop settles changes the task set:
     /// today's partial, without waiting out the deadline.
     #[test]
@@ -4550,11 +4701,12 @@ mod tests {
     }
 
     /// Only the first sample settles. Once every thread was seen stopped, a
-    /// thread seen running at the second (pre-apply) or the post-apply sample
-    /// was continued under the stop: today's partial, no re-sampling.
+    /// thread seen running at the second (pre-apply), the post-apply or the
+    /// post-successor-arm sample was continued under the stop: today's
+    /// partial, no re-sampling.
     #[test]
     fn thread_running_after_the_stop_was_seen_stopped_keeps_partial() {
-        for running_at in [1usize, 2] {
+        for running_at in [1usize, 2, 3] {
             let mut io = successful_io(vec![record(10, 0, false)]);
             let mut states: VecDeque<_> = (0..6).map(|_| Ok(stopped())).collect();
             states[running_at] = Ok(running_42());
@@ -4581,7 +4733,7 @@ mod tests {
         let grown: BTreeMap<u32, u8> = [(41, b'T'), (42, b'T'), (43, b'T')].into_iter().collect();
         let starts: BTreeMap<u32, u64> = [(41, 50), (42, 50)].into_iter().collect();
         let mut io = birth_dating_io(grown, starts, Some(instant));
-        let mut coordinator = birth_dating_coordinator(instant);
+        let mut coordinator = birth_dating_coordinator();
 
         coordinator.service(&mut io).unwrap();
 
@@ -4598,7 +4750,7 @@ mod tests {
         let instant = 100u64.saturating_mul(tick);
         let starts: BTreeMap<u32, u64> = [(41, 49), (42, 50)].into_iter().collect();
         let mut io = birth_dating_io(stopped(), starts, Some(instant));
-        let mut coordinator = birth_dating_coordinator(instant);
+        let mut coordinator = birth_dating_coordinator();
 
         coordinator.service(&mut io).unwrap();
 
@@ -4615,7 +4767,7 @@ mod tests {
         let instant = 100u64.saturating_mul(tick);
         let starts: BTreeMap<u32, u64> = [(41, 150), (42, 50)].into_iter().collect();
         let mut io = birth_dating_io(stopped(), starts, Some(instant));
-        let mut coordinator = birth_dating_coordinator(instant);
+        let mut coordinator = birth_dating_coordinator();
 
         coordinator.service(&mut io).unwrap();
 
@@ -4987,9 +5139,12 @@ mod tests {
 
     #[test]
     fn ordinary_auto_failures_are_sticky_and_disable_rearming_after_safe_resume() {
-        for failure in ["tasks", "attach"] {
+        for failure in ["tasks", "changed", "attach"] {
             let mut io = successful_io(vec![record(10, 0, false)]);
-            if failure == "tasks" {
+            if failure == "changed" {
+                // A changed task set fails at once, inside the deadline.
+                io.states = VecDeque::from([Ok([(41, b'T'), (43, b'T')].into_iter().collect())]);
+            } else if failure == "tasks" {
                 // A thread that never reaches the stop: the first sample now
                 // re-samples until the stop deadline (ruling PT-3), so the
                 // ordinary task failure is one that persists through it.
@@ -5547,6 +5702,31 @@ mod tests {
 
         coordinator.service(&mut io).unwrap();
         assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+    }
+
+    #[test]
+    fn stale_record_apply_failure_keeps_its_apply_diagnostic() {
+        // Opening the attempt for a failed stale-record apply must not clear
+        // the category that apply recorded.
+        let mut io = FakeIo {
+            authorization: Some(PAUSE_ARMED),
+            queue: VecDeque::from([Ok(Some(DiscoveryItem::Record(record(9, 0, false))))]),
+            fail_apply: true,
+            apply_error_diagnostic: Some(PauseDiagnostic::DeadlineDuringEngineApply),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.armed_at_ns = Some(10);
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("[pause_diag=deadline_during_engine_apply]"),
+            "{error}"
+        );
     }
 
     #[test]

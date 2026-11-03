@@ -1938,6 +1938,17 @@ class AttachDrainGateTests(unittest.TestCase):
                          (20, "pass_committed", {"pass": 3, "final": True}))
         self.assertFalse(drained(rows))
 
+    def test_closeout_flush_repeats_are_not_backlog(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "gap_recorded", gap),
+                         (20, "pass_committed", {"pass": 0}),
+                         (30, "pass_committed", {"pass": 1}),
+                         (40, "gap_repeated", {"index": 4, "repeats": 3}),
+                         (40, "ended", {}))
+        self.assertTrue(drained(rows))
+
 
 def parse_native_row(line):
     return dict(token.split("=", 1) for token in line.split()[1:])

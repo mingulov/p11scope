@@ -13,7 +13,11 @@ edge-less envelopes leave the mechanism dimension unknown. The oracle
 re-sums observed completed/failed outcomes from the per-row counters
 itself, pins the frozen H9 key/enum contract and the row equation, and
 refuses any unattributed, cancelled, unknown, active, lost, gapped or
-otherwise unsettled sign/verify outcome. It never trusts the product's own
+otherwise unsettled sign/verify outcome. The one exception follows the
+ledger: when the application itself could not establish a key's modulus
+size, that category's outcomes must sit under `metadata_unknown` with the
+ledger's exact counts (and generation under `not_applicable`), never under
+a size label. It never trusts the product's own
 accounting (`done`, `budgets.occupied`, `encoded_bytes`): occupancy is
 cross-checked against the rows the oracle counted, never used as a tally.
 Secondary `wrapped_object` rows and `message_contexts` units never count

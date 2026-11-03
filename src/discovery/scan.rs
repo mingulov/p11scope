@@ -1610,8 +1610,8 @@ impl CaptureWorkBudget {
         self.kernel_thread_absences = self.kernel_thread_absences.saturating_add(1);
     }
 
-    /// Deep scans this pass classified as kernel threads with no user
-    /// memory (0 when none ran).
+    /// Processes this pass examined and classified as kernel threads
+    /// with no user memory (0 when none ran).
     pub(crate) fn kernel_thread_absences(&self) -> u64 {
         self.kernel_thread_absences
     }

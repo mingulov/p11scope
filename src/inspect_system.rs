@@ -2323,8 +2323,8 @@ fn assemble(
         }));
     }
     let (skipped, mut notes) = split_gaps(gaps);
-    // Kernel threads classified during the deep scans: one counted note,
-    // never one gap per thread.
+    // Kernel threads examined this pass: one counted note, never one gap
+    // per thread.
     if let Some(note) = kernel_thread_absence_note(collection.budget.kernel_thread_absences()) {
         notes.push(note);
     }

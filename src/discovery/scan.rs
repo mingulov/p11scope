@@ -5272,8 +5272,14 @@ fn scan_view_examined_mode(
         if !request.hints.is_empty() && !hinted {
             continue;
         }
-        for (index, _) in &matched {
-            hint_matched[*index] = true;
+        // Path equality in the target view already confirms the hint
+        // here. An inode-only candidate confirms only after the gate
+        // below accepts it, so an unopenable or refused alias still
+        // owes its miss instead of masking it.
+        for (index, kind) in &matched {
+            if *kind == HintMatch::Path {
+                hint_matched[*index] = true;
+            }
         }
         let subject = match &named {
             Some((_, raw_path)) => String::from_utf8_lossy(raw_path).into_owned(),
@@ -5324,6 +5330,19 @@ fn scan_view_examined_mode(
                 }
             }
         });
+        // Each accepted inode candidate confirms its hint; a refused one
+        // keeps its miss. The gates re-run here because `any` above
+        // short-circuits on the first acceptance (path gates are free, so
+        // only inode candidates repeat their hint open).
+        if attributable {
+            for (index, kind) in &matched {
+                if *kind == HintMatch::Inode
+                    && hint_gate(*kind, &request.hints[*index], &file).is_ok()
+                {
+                    hint_matched[*index] = true;
+                }
+            }
+        }
         if hinted && !attributable {
             skipped.push(Skipped {
                 subject,

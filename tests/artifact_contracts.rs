@@ -612,14 +612,16 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
         "- name: Install packaged bpftool",
         "set -euo pipefail",
-        // Pinned baseline 8b7ee11a: the 7.3 exec-release and 6/7-argument
-        // copy_vma hooks on top of the journal READY writer (55101d3c), the
+        // Pinned baseline d0bfdfcf: the verifier-cost series (7.4-rc1 load
+        // fix, outlined GetID facts, bpf_loop directory scan and cleanup
+        // sweep) on top of the 7.3 exec-release and 6/7-argument copy_vma
+        // hooks (8b7ee11a), the journal READY writer (55101d3c), the
         // async control value flags (6641123f), the default journal and birth
         // marker (16a7bd53), the exec-witness
         // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=8b7ee11ab03c9b0f4a56c9ea88fee22d063a7260",
+        "BASELINE=d0bfdfcfc52be1e71e98b7f614048630c272fdea",
         "python3 -I scripts/check-bpf-noninterference.py \\",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
@@ -9790,14 +9792,16 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         "needs: [dedupe, tests]",
         "!cancelled() && needs.dedupe.outputs.run == 'true'",
         "fetch-depth: 0",
-        // Pinned baseline 8b7ee11a: the 7.3 exec-release and 6/7-argument
-        // copy_vma hooks on top of the journal READY writer (55101d3c), the
+        // Pinned baseline d0bfdfcf: the verifier-cost series (7.4-rc1 load
+        // fix, outlined GetID facts, bpf_loop directory scan and cleanup
+        // sweep) on top of the 7.3 exec-release and 6/7-argument copy_vma
+        // hooks (8b7ee11a), the journal READY writer (55101d3c), the
         // async control value flags (6641123f), the default journal and birth
         // marker (16a7bd53), the exec-witness
         // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=8b7ee11ab03c9b0f4a56c9ea88fee22d063a7260",
+        "BASELINE=d0bfdfcfc52be1e71e98b7f614048630c272fdea",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"\n",

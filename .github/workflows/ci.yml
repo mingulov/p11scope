@@ -502,7 +502,21 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin 8b7ee11a, the 7.3 exec-release and 6/7-argument copy_vma hooks
+      # Pin d0bfdfcf, the verifier-cost series on top of 8b7ee11a: the
+      # 7.4-rc1 Detailed load fix (87fd5ed0, getter slots classified by one
+      # outlined helper with a packed scalar result), the outlined GetID
+      # return facts (f7553014), the bpf_loop discovery-directory scan
+      # (cb5f4c35) and the bpf_loop default cleanup sweep (d0bfdfcf). The
+      # default Detailed object changes code in .text (+992 B) and uprobe
+      # (+6848 B); uretprobe and the sched, task, iter, fentry and fexit
+      # sections keep their instructions and differ only in subprogram call
+      # offsets, .maps is unchanged, and no map or program is added. Both
+      # Inventory objects change .text (-232 B; the directory scan becomes a
+      # bpf_loop callback) and uprobe (+24 B); their other code sections
+      # differ only in call offsets and .maps is unchanged. The journal
+      # object, which this gate does not compare, takes the same changes.
+      # No other BPF input changed since 8b7ee11a.
+      # Earlier pin 8b7ee11a, the 7.3 exec-release and 6/7-argument copy_vma hooks
       # (the picked hook-set series 9fb2c1fb..df782cfc plus the refused-helper
       # fault 8b7ee11a): the default Detailed object gains the fexit/exec_mmap
       # section (p11_image_mmap_release) and p11_inst_vma_retcopy in
@@ -576,7 +590,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=8b7ee11ab03c9b0f4a56c9ea88fee22d063a7260
+          BASELINE=d0bfdfcfc52be1e71e98b7f614048630c272fdea
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

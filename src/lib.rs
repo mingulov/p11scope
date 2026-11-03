@@ -100,6 +100,7 @@ pub mod timing;
 pub mod trace;
 pub(crate) mod trace_identity;
 pub(crate) mod uretprobe_hazard;
+pub mod vendor_mechanisms;
 
 /// Best-effort frontend diagnostic through the existing bounded stderr sink.
 /// A full or closed descriptor may drop some or all text; successful return

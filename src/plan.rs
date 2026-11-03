@@ -292,8 +292,8 @@ pub(crate) fn is_growth_omission(reason: &str) -> bool {
 /// calls are counted instead of suggesting `--module` for it.
 pub(crate) fn is_closure_array_refusal(reason: &str) -> bool {
     reason.contains(
-        "(a proxy closure array is admitted whole, as a prefix when first seen, \
-         or as published tables)",
+        "(a proxy closure array is admitted whole, as a prefix when mapped before the \
+         capture's first plan, or as published tables)",
     )
 }
 
@@ -572,6 +572,7 @@ struct CapacityRefusal<'a> {
     reserve: Option<usize>,
     closure_tables: Option<usize>,
     aim_hint: bool,
+    naming_hint: bool,
     counter_hint: bool,
 }
 
@@ -593,7 +594,8 @@ impl CapacityRefusal<'_> {
         if let Some(tables) = self.closure_tables {
             reason.push_str(&format!(
                 " of its {tables} lookalike function tables (a proxy closure array is \
-                 admitted whole, as a prefix when first seen, or as published tables)"
+                 admitted whole, as a prefix when mapped before the capture's first \
+                 plan, or as published tables)"
             ));
         }
         if self.closure_tables.is_none() {
@@ -609,6 +611,10 @@ impl CapacityRefusal<'_> {
             }
         } else if self.aim_hint {
             reason.push_str("; to capture one provider, name it with --module <path>");
+        } else if self.naming_hint {
+            reason.push_str(
+                "; to capture its leading-templates prefix, name it with --module <path>",
+            );
         }
         reason
     }
@@ -3280,6 +3286,10 @@ fn merge(
                     reserve: reserved.then_some(reserve),
                     closure_tables: (class == AdmissionClass::ClosureArray).then_some(table_count),
                     aim_hint: shared,
+                    naming_hint: is_detailed_closure
+                        && !shared
+                        && !closure_late_start
+                        && !closure_named,
                     counter_hint,
                 };
                 decisions[position] = Some(AdmissionDecision::Refused(Skipped {
@@ -12364,8 +12374,10 @@ mod tests {
         assert!(refusal_of(&named, SOFTHSM).is_some());
         let refusal = refusal_of(&named, P11_KIT).expect("closure refused whole");
         assert!(
-            refusal.reason.contains("as a prefix when first seen"),
-            "M2 reword: {}",
+            refusal
+                .reason
+                .contains("as a prefix when mapped before the capture's first plan"),
+            "closure wording names the first plan: {}",
             refusal.reason
         );
         assert!(

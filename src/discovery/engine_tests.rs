@@ -2823,12 +2823,12 @@ fn a_larger_whole_refusal_replaces_the_published_whole_refusal() {
 #[test]
 fn a_later_closure_prefix_replaces_the_earlier_whole_refusal() {
     // Real planner reason shapes (from `plan::tests`): a whole refusal names
-    // the lookalike tables with the M2 wording, and a prefix names its
-    // covered templates. Same subject, same module.
+    // the lookalike tables with the first-plan wording, and a prefix names
+    // its covered templates. Same subject, same module.
     let whole = "module needs 6283 more; only 512 attach slots are available; 68 are in use \
          (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a prefix \
          of its 64 lookalike function tables (a proxy closure array is admitted whole, as a prefix \
-         when first seen, or as published tables)";
+         when mapped before the capture's first plan, or as published tables)";
     let prefix = "2 of 64 template tables attached; calls through the others are not counted";
     assert!(
         plan::is_closure_array_refusal(whole),

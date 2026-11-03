@@ -47,7 +47,9 @@ use crate::discovery::scheduler::{
 };
 use crate::discovery::sweep_shards;
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
-use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId, ViewAdmission};
+use crate::process::{
+    self, OriginalGenerationState, PidPin, ProcessView, ProcessViewId, ViewAdmission,
+};
 use crate::run::OwnedChild;
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourcePool, SemanticResourceReserver,
@@ -84,7 +86,6 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::sync::Arc;
 
 #[path = "inventory.rs"]
@@ -626,6 +627,14 @@ pub struct Engine {
     // Original custody and exact Session endpoint proof survive only the
     // existing bounded conservative retirement/replay transaction.
     ended_pid_retirement: Option<PendingEndedPidRetirement>,
+    /// Recently ended loader origins for late-record binding (R-1): on
+    /// ExpectedRemoval the view's pid, admission time and pin are
+    /// retained (bounded FIFO). A loader record with no retained view
+    /// counts exit-only only when it matches one of these by pid and
+    /// `hook_ts_ns >= admitted_ns` with the pin still proving exit.
+    /// Never pid alone (reuse). Populated at view removal; the pin
+    /// holds the original task, so a reused number cannot match.
+    ended_loader_origins: VecDeque<EndedLoaderOrigin>,
     expected_target_exit_pending: Option<ProcessViewId>,
     expected_target_exit: bool,
     /// When the expected-target-exit wait armed (wall clock): bounds the
@@ -2740,6 +2749,17 @@ struct PendingEndedPidRetirement {
     owner: ProcessView,
     proof: crate::attach::EndedPidRetirement,
 }
+/// One ended loader origin (R-1): the pid, admission time and pin of a
+/// view removed as ExpectedRemoval. The pin holds the original task.
+struct EndedLoaderOrigin {
+    pid: u32,
+    admitted_ns: u64,
+    pin: Arc<PidPin>,
+}
+/// Bound for the ended-loader-origin ledger: one suffices for Pid
+/// scope; cgroup/system churn evicts oldest first (fail-closed: a
+/// late record without its origin stays a real loss).
+const MAX_ENDED_LOADER_ORIGINS: usize = 32;
 type TerminalSelectionHandoffs = BTreeMap<u16, Vec<DiscoveryRecord>>;
 type DiscoveryCollector<'a> =
     dyn FnMut(&mut dyn EngineSession) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
@@ -10004,6 +10024,7 @@ impl Engine {
             retirement_intents: PendingViewRetirements::new(),
             ready_expected_removals: BTreeSet::new(),
             ended_pid_retirement: None,
+            ended_loader_origins: VecDeque::new(),
             expected_target_exit_pending: None,
             expected_target_exit: false,
             expected_target_exit_since: None,
@@ -11802,6 +11823,19 @@ impl Engine {
         false
     }
 
+    /// An exit-caused loader reject (R-1): the registry's
+    /// `context_failures` grows (one summand of the truncation total)
+    /// and the exit-only count grows in the same step, so exit-only
+    /// stays a subset of the total. The live loss is kept: a reject
+    /// costs its causal timing proof even when an exit explains it.
+    #[track_caller]
+    fn reject_loader_record_exit_ended(&mut self, reason: &str) -> bool {
+        self.loader_registry.reject_hit();
+        self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
+        self.mark_live_loss("live loader discovery", reason);
+        false
+    }
+
     fn invalidate_causal_timing(&mut self) {
         self.timings.invalidate();
     }
@@ -12434,6 +12468,16 @@ impl Engine {
         self.discovery_truncated = self.discovery_truncated.saturating_add(1);
         self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
         self.mark_partial("live loader memory discovery", reason);
+    }
+
+    /// A zero-state scan whose process provably exited before the scan
+    /// resolved (R-1): counted exit-only like the deferred-scan end
+    /// above, but the live loss is kept — the RT_CONSISTENT code may
+    /// have run, so causal timing stays unproven.
+    fn record_pending_loader_scan_end_with_live_loss(&mut self, reason: &str) {
+        self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
+        self.mark_live_loss("live loader memory discovery", reason);
     }
 
     fn settle_pending_loader_scan(
@@ -16222,7 +16266,16 @@ impl Engine {
         let pid = (record.pid_tgid >> 32) as u32;
         let Some(position) = self.views.iter().position(|view| view.pid() == pid) else {
             self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
-            self.reject_loader_record("a loader hit had no retained process generation");
+            // A late record bound to a recorded proven-ended original by
+            // pid and hook time counts exit-only; anything else stays a
+            // real loss. Never pid alone (reuse).
+            if self.late_loader_record_ended(pid, record.hook_ts_ns) {
+                self.reject_loader_record_exit_ended(
+                    "a loader hit had no retained process generation",
+                );
+            } else {
+                self.reject_loader_record("a loader hit had no retained process generation");
+            }
             return Ok(DiscoveryRecordOutcome::Rejected(
                 RecordRejection::LoaderNoRetainedView,
             ));
@@ -16256,6 +16309,13 @@ impl Engine {
             if self.exec_replaced_the_armed_image(&context.spec, view_id, pid, &maps, pending_views)
             {
                 self.invalidate_causal_timing();
+            } else if self.original_exited(view_id) {
+                // The hook's process provably ended: the unmapped address
+                // is exit fallout, counted exit-only with the live loss
+                // kept.
+                self.reject_loader_record_exit_ended(
+                    "a loader hook address no longer resolved to a mapping",
+                );
             } else {
                 self.reject_loader_record("a loader hook address no longer resolved to a mapping");
             }
@@ -16379,9 +16439,18 @@ impl Engine {
                 pending_views,
             );
             if resolving_pending && result.is_err() {
-                self.record_pending_loader_scan_loss(
-                    "a zero-state opportunity did not complete its deferred loader memory scan",
-                );
+                // A zero-state scan that failed after its process provably
+                // ended counts exit-only, but the RT_CONSISTENT code may
+                // have run, so the live loss is kept.
+                if self.original_exited(view_id) {
+                    self.record_pending_loader_scan_end_with_live_loss(
+                        "a zero-state opportunity did not complete its deferred loader memory scan",
+                    );
+                } else {
+                    self.record_pending_loader_scan_loss(
+                        "a zero-state opportunity did not complete its deferred loader memory scan",
+                    );
+                }
             } else if resolving_pending && let Some(reason) = self.budget.stopped_now() {
                 self.record_pending_loader_scan_loss(&format!(
                     "a deferred loader memory scan was unresolved at budget exhaustion: {reason}"
@@ -19448,6 +19517,39 @@ impl Engine {
             .any(|view| view.original_exited() == Ok(true))
     }
 
+    /// Retains one ended loader origin (R-1): called with a view being
+    /// removed as ExpectedRemoval. Only a pin that still proves exit is
+    /// recorded; anything else stays unrecorded (fail-closed). Bounded
+    /// FIFO: an evicted origin's late records stay real losses.
+    fn note_ended_loader_origin(&mut self, view: &ProcessView) {
+        if view.original_exited() != Ok(true) {
+            return;
+        }
+        if self.ended_loader_origins.len() >= MAX_ENDED_LOADER_ORIGINS {
+            self.ended_loader_origins.pop_front();
+        }
+        self.ended_loader_origins.push_back(EndedLoaderOrigin {
+            pid: view.pid(),
+            admitted_ns: view.admitted_ns(),
+            pin: view.retained_pin_arc().clone(),
+        });
+    }
+
+    /// Whether a loader record with no retained view belongs to a
+    /// recorded, proven-ended original (R-1): some retained origin
+    /// matches by pid **and** `hook_ts_ns >= admitted_ns`, with its
+    /// pin still proving exit. Never pid alone (reuse): a hook from
+    /// before admission, or from a live generation, matches nothing.
+    /// Uses the live pin only (no test script): twins use genuinely
+    /// dead or live children.
+    fn late_loader_record_ended(&self, pid: u32, hook_ts_ns: u64) -> bool {
+        self.ended_loader_origins.iter().any(|origin| {
+            origin.pid == pid
+                && hook_ts_ns >= origin.admitted_ns
+                && origin.pin.original_exited() == Ok(true)
+        })
+    }
+
     /// Whether this view's retained original pin *proves* its process exited.
     /// A poll failure or a dropped view is not exit evidence and stays false,
     /// so an unprovable loss is never downgraded.
@@ -21298,6 +21400,7 @@ impl Engine {
                     self.settle_leader_exits_at_removal([view]);
                     if let Some(index) = self.views.iter().position(|owner| owner.id() == view) {
                         let owner = self.views.remove(index);
+                        self.note_ended_loader_origin(&owner);
                         if let Some(proof) = ended {
                             self.ended_pid_retirement =
                                 Some(PendingEndedPidRetirement { owner, proof });
@@ -27186,7 +27289,8 @@ impl Engine {
             self.settle_leader_exits_at_removal([view]);
             if let Some(index) = self.views.iter().position(|owner| owner.id() == view) {
                 // Never at Q: no ended-PID proof is taken here.
-                self.views.remove(index);
+                let owner = self.views.remove(index);
+                self.note_ended_loader_origin(&owner);
             }
             self.release_view_id(view);
             self.scan_inputs.remove(&view);

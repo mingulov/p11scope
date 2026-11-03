@@ -17267,12 +17267,16 @@ fn exit_ended_loader_scan_counts_exit_only_on_fallback_after_exit() {
     assert!(engine.original_exited(ProcessViewId(0)));
 
     let before = engine.capture_facts().discovery_losses()[3];
-    let due: BTreeSet<PendingLoaderScanKey> =
-        engine.pending_loader_scans.keys().copied().collect();
+    let due: BTreeSet<PendingLoaderScanKey> = engine.pending_loader_scans.keys().copied().collect();
     let mut additions_allowed = true;
     let mut pending_views = PendingViewRetirements::new();
     engine
-        .service_pending_loader_scans(due, &mut session, &mut additions_allowed, &mut pending_views)
+        .service_pending_loader_scans(
+            due,
+            &mut session,
+            &mut additions_allowed,
+            &mut pending_views,
+        )
         .unwrap();
 
     assert!(engine.pending_loader_scans.is_empty());
@@ -17472,6 +17476,304 @@ fn loader_scan_loss_routes_do_not_count_exit_only() {
         assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
         assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
     }
+}
+
+/// R-1 missing-mapping positive: a loader hook address that no longer
+/// resolves, with its process proven exited (scripted), counts
+/// exit-only: the registry's `context_failures` and the exit-only
+/// count grow in the same step, with the live loss kept.
+#[test]
+fn missing_mapping_reject_counts_exit_only_when_proven_exited() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.table_ptr = 0;
+    record.announced_count = 0;
+    engine
+        .pin_probe_script
+        .borrow_mut()
+        .extend([PinProbeAnswer::Exited(Ok(true))]);
+
+    let before = engine.capture_facts().discovery_losses()[3];
+    let before_exit = engine.capture_facts().exit_ended_truncations();
+    let before_failures = engine.loader_registry.context_failures();
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(
+        engine.capture_facts().exit_ended_truncations(),
+        before_exit + 1
+    );
+    assert_eq!(
+        engine.loader_registry.context_failures(),
+        before_failures + 1,
+        "exit-only grows with its context-failure total"
+    );
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live loader discovery"
+            && skip.reason.contains("no longer resolved to a mapping")
+    }));
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "the reject consumed its scripted exit probe: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+}
+
+/// R-1 missing-mapping negative: without exit proof the same reject
+/// stays a real loss with no exit-only growth.
+#[test]
+fn missing_mapping_reject_stays_loss_without_exit_proof() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.table_ptr = 0;
+    record.announced_count = 0;
+    engine
+        .pin_probe_script
+        .borrow_mut()
+        .extend([PinProbeAnswer::Exited(Ok(false))]);
+
+    let before = engine.capture_facts().discovery_losses()[3];
+    let before_failures = engine.loader_registry.context_failures();
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+    assert_eq!(
+        engine.loader_registry.context_failures(),
+        before_failures + 1
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "the reject consumed its scripted exit probe: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+}
+
+/// R-1 no-retained-view positive: a loader record arriving after its
+/// view retired, bound to a recorded proven-ended original by pid
+/// and `hook_ts_ns >= admitted_ns`, counts exit-only.
+#[test]
+fn no_retained_view_reject_counts_exit_only_for_ended_origin() {
+    let (mut fixture, mut engine, context, _record, mut session) = armed_seed_route(1);
+    let pid = engine.views[0].pid();
+    let admitted_ns = engine.views[0].admitted_ns();
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let view = engine.views.remove(0);
+    engine.note_ended_loader_origin(&view);
+    // Settled removal: the empty view set is the expected end, so the
+    // batch processes the late record instead of bailing.
+    engine.expected_target_exit_pending = Some(view.id());
+    assert_eq!(engine.ended_loader_origins.len(), 1);
+
+    let mut late = loader_record_for(context, pid);
+    late.hook_ts_ns = admitted_ns;
+    late.announced_count = 0;
+    let before = engine.capture_facts().discovery_losses()[3];
+    let before_exit = engine.capture_facts().exit_ended_truncations();
+    let before_failures = engine.loader_registry.context_failures();
+    apply_ordinary_batch(&mut engine, &mut session, vec![late]).unwrap();
+
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(
+        engine.capture_facts().exit_ended_truncations(),
+        before_exit + 1
+    );
+    assert_eq!(
+        engine.loader_registry.context_failures(),
+        before_failures + 1,
+        "exit-only grows with its context-failure total"
+    );
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live loader discovery"
+            && skip.reason.contains("no retained process generation")
+    }));
+}
+
+/// R-1 no-retained-view negative: with no recorded origin (the live
+/// view was removed without exit proof) the same reject stays loss.
+#[test]
+fn no_retained_view_reject_stays_loss_without_recorded_origin() {
+    let (_fixture, mut engine, context, _record, mut session) = armed_seed_route(1);
+    let pid = engine.views[0].pid();
+    let admitted_ns = engine.views[0].admitted_ns();
+    let view = engine.views.remove(0);
+    engine.note_ended_loader_origin(&view);
+    engine.expected_target_exit_pending = Some(view.id());
+    assert!(
+        engine.ended_loader_origins.is_empty(),
+        "a live view records no ended origin"
+    );
+
+    let mut late = loader_record_for(context, pid);
+    late.hook_ts_ns = admitted_ns;
+    late.announced_count = 0;
+    let before = engine.capture_facts().discovery_losses()[3];
+    apply_ordinary_batch(&mut engine, &mut session, vec![late]).unwrap();
+
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+}
+
+/// R-1 pid-reuse negative: same pid as a recorded ended origin, but
+/// the hook predates admission (a stale record from an older
+/// generation that used the number first), so it stays loss. Never
+/// pid alone.
+#[test]
+fn no_retained_view_reject_stays_loss_when_hook_predates_admission() {
+    let (mut fixture, mut engine, context, _record, mut session) = armed_seed_route(1);
+    let pid = engine.views[0].pid();
+    let admitted_ns = engine.views[0].admitted_ns();
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let view = engine.views.remove(0);
+    engine.note_ended_loader_origin(&view);
+    engine.expected_target_exit_pending = Some(view.id());
+    assert_eq!(engine.ended_loader_origins.len(), 1);
+
+    let mut stale = loader_record_for(context, pid);
+    stale.hook_ts_ns = admitted_ns.saturating_sub(1);
+    stale.announced_count = 0;
+    let before = engine.capture_facts().discovery_losses()[3];
+    apply_ordinary_batch(&mut engine, &mut session, vec![stale]).unwrap();
+
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+}
+
+/// R-1 no-retained-view negative: a different pid than any recorded
+/// origin stays loss.
+#[test]
+fn no_retained_view_reject_stays_loss_for_unknown_pid() {
+    let (mut fixture, mut engine, context, _record, mut session) = armed_seed_route(1);
+    let admitted_ns = engine.views[0].admitted_ns();
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let view = engine.views.remove(0);
+    engine.note_ended_loader_origin(&view);
+    engine.expected_target_exit_pending = Some(view.id());
+    assert_eq!(engine.ended_loader_origins.len(), 1);
+
+    let foreign_pid = view.pid().wrapping_add(1);
+    let mut late = loader_record_for(context, foreign_pid);
+    late.hook_ts_ns = admitted_ns;
+    late.announced_count = 0;
+    let before = engine.capture_facts().discovery_losses()[3];
+    apply_ordinary_batch(&mut engine, &mut session, vec![late]).unwrap();
+
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+}
+
+/// R-1 zero-state positive (direct): an exit-ended zero-state
+/// settlement grows the total and the exit-only count together and
+/// keeps the live loss (causal timing stays unproven).
+#[test]
+fn zero_state_settlement_with_exit_proof_counts_exit_only_and_keeps_loss() {
+    let mut engine = Engine::empty();
+    assert!(!engine.timings.invalidated);
+    let before = engine.capture_facts().discovery_losses()[3];
+
+    engine.record_pending_loader_scan_end_with_live_loss("test zero-state exit");
+
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(engine.capture_facts().exit_ended_truncations(), 1);
+    assert!(
+        engine.timings.invalidated,
+        "the exit-only zero-state keeps its live loss"
+    );
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live loader memory discovery"
+            && skip.reason.contains("test zero-state exit")
+    }));
+}
+
+/// R-1 zero-state negative (direct): without exit proof the same
+/// settlement stays a plain loss with no exit-only growth.
+#[test]
+fn zero_state_settlement_without_exit_proof_stays_loss() {
+    let mut engine = Engine::empty();
+    let before = engine.capture_facts().discovery_losses()[3];
+
+    engine.record_pending_loader_scan_loss("test zero-state loss");
+
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+}
+
+/// R-1 zero-state predicate pin: the zero-state settlement checks
+/// `original_exited(view)` and settles exit-only on proof, loss
+/// otherwise. A live exit race is the only production trigger, so
+/// the predicate is pinned in source order like route 2. The
+/// `if`-form distinguishes it from route 2's `let ended` check.
+#[test]
+fn zero_state_settlement_consults_the_exit_predicate() {
+    let source = include_str!("engine.rs");
+    let route = source
+        .split_once("    fn process_loader_record(")
+        .unwrap()
+        .1
+        .split_once("    fn record_selection_occurrences(")
+        .unwrap()
+        .0;
+    let marker = route
+        .find("a zero-state opportunity did not complete its deferred loader memory scan")
+        .expect("the zero-state settlement exists");
+    let window = &route[..marker];
+    let predicate = window
+        .rfind("if self.original_exited(view_id)")
+        .expect("the zero-state checks the exit predicate");
+    let exit_call = window
+        .rfind("record_pending_loader_scan_end_with_live_loss")
+        .expect("the zero-state settles exit-only on proof");
+    assert!(
+        predicate < exit_call,
+        "the exit check precedes the exit arm"
+    );
+    assert!(
+        route[marker..].contains("record_pending_loader_scan_loss"),
+        "the zero-state settles loss otherwise"
+    );
+}
+
+/// R-1 mixed: one exit-only reject plus one real loss grow the total
+/// by two and exit-only by one, so the comparable growth is one and
+/// K0 still voids (per the driver's mixed-growth twin).
+#[test]
+fn mixed_exit_only_and_real_rejects_leave_comparable_growth() {
+    let (_fixture, mut engine, _context, record, mut session) = armed_seed_route(2);
+    let mut exited = record;
+    exited.table_ptr = 0;
+    exited.announced_count = 0;
+    let mut live = record;
+    live.table_ptr = 0;
+    live.announced_count = 0;
+    live.hook_ts_ns += 1;
+    engine.pin_probe_script.borrow_mut().extend([
+        PinProbeAnswer::Exited(Ok(true)),
+        PinProbeAnswer::Exited(Ok(false)),
+    ]);
+
+    let before = engine.capture_facts().discovery_losses()[3];
+    let before_exit = engine.capture_facts().exit_ended_truncations();
+    apply_ordinary_batch(&mut engine, &mut session, vec![exited, live]).unwrap();
+
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 2);
+    assert_eq!(
+        engine.capture_facts().exit_ended_truncations(),
+        before_exit + 1
+    );
+    let comparable_before = before.saturating_sub(before_exit);
+    let comparable_after = engine.capture_facts().discovery_losses()[3]
+        .saturating_sub(engine.capture_facts().exit_ended_truncations());
+    assert_eq!(
+        comparable_after,
+        comparable_before + 1,
+        "one real loss still voids"
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "both rejects consumed their probes: {:?}",
+        engine.pin_probe_script.borrow()
+    );
 }
 
 #[test]

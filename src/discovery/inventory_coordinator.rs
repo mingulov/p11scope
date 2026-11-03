@@ -371,6 +371,15 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// attach, successor/name admission, or retry starts afterwards; staged
     /// facts still drain through `commit_batch`.
     stopped: bool,
+    /// Distinct pids with EXEC hooks that drained since the last
+    /// completed scan pass (`apply_catalog` clears): the post-pass
+    /// newcomers the terminal disclosure names. Arrival order, not hook
+    /// stamps, so no clock comparison is needed. Cgroup scope never
+    /// inserts (transaction coverage, not scan passes).
+    post_pass_exec_newcomers: BTreeSet<u32>,
+    /// At least one scan pass completed: the terminal disclosure reads
+    /// against the last completed scan, never a zero-pass run.
+    completed_scan_pass: bool,
     cgroup_fence: CgroupFence,
     pending_cgroup: Option<(CgroupCollection, u64)>,
     completed_cgroup: Option<CgroupCompletion>,
@@ -661,6 +670,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             exit_clock_gap_noted: false,
             staged_retirements: BTreeSet::new(),
             stopped: false,
+            post_pass_exec_newcomers: BTreeSet::new(),
+            completed_scan_pass: false,
             cgroup_fence: CgroupFence::default(),
             pending_cgroup: None,
             completed_cgroup: None,
@@ -2998,6 +3009,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let native_callers = native.len();
         let pass = self.passes;
         self.passes += 1;
+        // The scan completed: hooks that drained before it are covered
+        // (or pre-pass), so only later arrivals count as post-pass.
+        // Hooks drained between this collection's end and this apply
+        // (a pending publication's service window) clear as covered
+        // though the catalog could not hold them — a known narrow miss.
+        self.post_pass_exec_newcomers.clear();
+        self.completed_scan_pass = true;
         PassReport {
             pass,
             scanned,
@@ -4738,6 +4756,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let hook_ts_ns = record.hook_ts_ns;
         let original_ticket = record.exec_task_ticket();
         let Some(caller) = self.adapter.live_id(pid) else {
+            // A hook for a process no pass ever admitted: after the last
+            // completed scan it is a newcomer the capture will never
+            // scan, so the terminal disclosure counts it. Cgroup scope
+            // stays out (transaction coverage, not scan passes).
+            if !matches!(self.engine.scope, Scope::Cgroup { .. }) {
+                self.post_pass_exec_newcomers.insert(pid);
+            }
             return Vec::new();
         };
         if self.binder.holds_image(domain, caller) {
@@ -7442,7 +7467,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // predate the stop; the drop happened while stopping.
                 self.note_scope_gap(
                     "live inventory transaction".into(),
-                    "a new process mapping a provider was dropped while the capture was stopping; its calls were not observed".into(),
+                    "a process mapping a provider was dropped before it was admitted, while the capture was stopping; its calls were not observed".into(),
                 );
                 return;
             }
@@ -7452,11 +7477,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// EXEC hooks for never-admitted pids that drained after the last
     /// completed scan pass: those processes started too late to be
     /// scanned, so one scope gap names their unknown provider
-    /// mappings. Silent when nothing drained post-pass. Cgroup scope
-    /// stays unjudged (transaction coverage, not scan passes).
-    /// (Seam wiring: the disclosure lands with the fix; until then the
-    /// RED tests fail on the missing gap.)
-    pub(crate) fn note_post_pass_exec_newcomers(&mut self) {}
+    /// mappings. Silent when nothing drained post-pass or no scan
+    /// completed (the zero-pass diagnostic owns that run). Cgroup
+    /// scope stays unjudged (transaction coverage, not scan passes).
+    /// Drains the set, so a repeated terminal call stays silent.
+    pub(crate) fn note_post_pass_exec_newcomers(&mut self) {
+        let pending = std::mem::take(&mut self.post_pass_exec_newcomers);
+        if !self.completed_scan_pass || pending.is_empty() {
+            return;
+        }
+        self.note_scope_gap(
+            "discovery coverage ended before stop".into(),
+            format!(
+                "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown",
+                pending.len()
+            ),
+        );
+    }
 
     /// The physical tail and registry share the actual publication boundary.
     pub(crate) fn commit_batch(&mut self, engine_changed: bool) -> Result<BatchReceipt> {

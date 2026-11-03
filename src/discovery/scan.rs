@@ -3133,6 +3133,24 @@ fn detect_tables_for_layout(
     )
 }
 
+/// Whether a kept decode dominates an anchor candidate, mirroring the
+/// overlap pass below (validated desc, length desc, start asc). A
+/// candidate covered by a validated table, or by an overlapping longer
+/// decode, adds no coverage; equal-length unvalidated ties go to the
+/// earlier start.
+fn anchor_kept_dominates(
+    kept_start: usize,
+    kept_len: usize,
+    kept_validated: bool,
+    candidate: usize,
+    candidate_len: usize,
+) -> bool {
+    candidate != kept_start
+        && candidate < kept_start.saturating_add(kept_len)
+        && kept_start < candidate.saturating_add(candidate_len)
+        && (kept_validated || kept_len >= candidate_len)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     layout: LinuxLayout,
@@ -3324,10 +3342,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                 // so version-readable tables always decode.
                 let candidate_len = table_bytes(layout, count).expect("bounded catalog");
                 let dominated = found.iter().any(|(start, kept_len, validated, _)| {
-                    candidate != *start
-                        && candidate < start.saturating_add(*kept_len)
-                        && *start < candidate.saturating_add(candidate_len)
-                        && (*validated || *kept_len >= candidate_len)
+                    anchor_kept_dominates(*start, *kept_len, *validated, candidate, candidate_len)
                 });
                 if dominated {
                     continue;
@@ -8103,6 +8118,30 @@ mod tests {
             budget.table_candidates_count(),
             2,
             "one kept adjacent decode, no cascade"
+        );
+    }
+
+    #[test]
+    fn anchor_skip_equal_length_tie_goes_to_the_earlier_start() {
+        // D1: unvalidated dominator with equal length but later start,
+        // scanned first. The overlap pass (validated desc, length desc,
+        // start asc) keeps the earlier start; the skip must mirror it,
+        // so the later-scanned earlier candidate is not dominated.
+        assert!(
+            !super::anchor_kept_dominates(100, 64, false, 90, 64),
+            "later start must not dominate an overlapping earlier start of equal length"
+        );
+        assert!(
+            super::anchor_kept_dominates(90, 64, false, 100, 64),
+            "earlier start dominates a later start of equal length"
+        );
+        assert!(
+            super::anchor_kept_dominates(100, 72, false, 90, 64),
+            "longer decode still dominates a shorter overlap"
+        );
+        assert!(
+            !super::anchor_kept_dominates(90, 64, false, 100, 72),
+            "shorter decode never dominates a longer overlap"
         );
     }
 

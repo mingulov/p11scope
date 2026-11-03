@@ -6291,33 +6291,34 @@ fn capture_profile(
         poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
         let maps_start = Instant::now();
-        let snapshot = match context
-            .6
-            .terminal(context.1, context.0.plan(), context.0.pinned(), profile)
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                // K0 on the terminal-failure path (m5): the close
-                // boundary is unprovable and no report seals, but the
-                // opted-in debug line still prints, so a quiesce-error
-                // void shows its counts instead of failing the live
-                // cells with a parse error. Best-effort facts: the
-                // terminal read never landed.
-                if let Some(close) = &k0
-                    && std::env::var_os("P11SCOPE_K0_DEBUG").is_some()
-                {
-                    let failed_facts = context.0.capture_facts();
-                    let failed_losses =
-                        metrics::selected_detail_driver::k0_comparable_losses(&failed_facts);
-                    emit_capture_diagnostic(&format_k0_debug_line(
-                        &close.window.before_losses(),
-                        &failed_facts,
-                        &failed_losses,
-                    ));
+        let snapshot =
+            match context
+                .6
+                .terminal(context.1, context.0.plan(), context.0.pinned(), profile)
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    // K0 on the terminal-failure path (m5): the close
+                    // boundary is unprovable and no report seals, but the
+                    // opted-in debug line still prints, so a quiesce-error
+                    // void shows its counts instead of failing the live
+                    // cells with a parse error. Best-effort facts: the
+                    // terminal read never landed.
+                    if let Some(close) = &k0
+                        && std::env::var_os("P11SCOPE_K0_DEBUG").is_some()
+                    {
+                        let failed_facts = context.0.capture_facts();
+                        let failed_losses =
+                            metrics::selected_detail_driver::k0_comparable_losses(&failed_facts);
+                        emit_capture_diagnostic(&format_k0_debug_line(
+                            &close.window.before_losses(),
+                            &failed_facts,
+                            &failed_losses,
+                        ));
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         let reports = snapshot.reports();
         let kernel_evidence = snapshot.kernel_evidence();
         // K0: close the detail window after the broad terminal read,

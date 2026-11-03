@@ -1324,7 +1324,11 @@ pub(super) fn close_k0_window_with_tail_and_losses(
     // either direction: refuse the detail as a topology mismatch
     // rather than render rows that disagree with the main report.
     if deltas.iter().any(|delta| {
-        delta.rv_counts.values().map(|&count| u128::from(count)).sum::<u128>()
+        delta
+            .rv_counts
+            .values()
+            .map(|&count| u128::from(count))
+            .sum::<u128>()
             != u128::from(delta.returned)
     }) {
         ledger.mark_selection_refused(Detail(SelectedDetailRefusal::BroadPlanTopology).name());
@@ -1753,8 +1757,7 @@ mod tests {
                 )
             });
             rows.push(
-                CounterRow::fold(slot, mode, cells, slot_rvs, limits)
-                    .expect("explicit cells fold"),
+                CounterRow::fold(slot, mode, cells, slot_rvs, limits).expect("explicit cells fold"),
             );
         }
         let reservation =
@@ -6744,7 +6747,12 @@ mod tests {
             generation,
             CounterMode::Counts,
             &[(110, 110, 0), (110, 110, 0), (104, 104, 0), (110, 110, 0)],
-            &vec![vec![(0, 110)], vec![(0, 110)], vec![(0, 104)], vec![(0, 110)]],
+            &vec![
+                vec![(0, 110)],
+                vec![(0, 110)],
+                vec![(0, 104)],
+                vec![(0, 110)],
+            ],
             window_of(20, 30),
         );
         close_k0_window(

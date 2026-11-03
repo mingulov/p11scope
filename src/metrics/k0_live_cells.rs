@@ -1196,10 +1196,7 @@ fn require_detail_matches_main_counts(document: &serde_json::Value, log: &str) -
     );
     eprintln!(
         "k0-live-gateless-cell: main={main_calls}/{main_errors} detail={entered}/{returned}/{errors} (discovery_truncated={truncated} exit={} routes={:?} comparable={:?}->{:?})",
-        debug.after_exit,
-        debug.after_exit_routes,
-        debug.before_comparable,
-        debug.after_comparable,
+        debug.after_exit, debug.after_exit_routes, debug.before_comparable, debug.after_comparable,
     );
     ensure!(
         main_calls == 4 && main_errors == 0,

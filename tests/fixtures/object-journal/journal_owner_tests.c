@@ -409,6 +409,23 @@ static long controlled_owner_loop(u32 count, long (*callback)(u32, void *),
 }
 #endif
 
+/* Only helper 181 is replaced. The callback remains the real native find
+ * body, including its occupancy, cookie and domain checks. Unlike the
+ * sweep loop, the find loop runs in every build, so this stub is
+ * unconditional. */
+static long controlled_find_loop(u32 count, long (*callback)(u32, void *),
+                                 void *context, u64 flags)
+{
+    assert(count == 64 && flags == 0);
+    for (u32 i = 0; i < count; i++) {
+        long stop = callback(i, context);
+        assert(stop == 0 || stop == 1);
+        if (stop)
+            return i + 1;
+    }
+    return count;
+}
+
 static void reset(void)
 {
     unsigned i;
@@ -431,6 +448,7 @@ static void reset(void)
     owner_storage_delete = storage_delete;
     owner_current_task = current_task;
     owner_pid_tgid = pid_tgid;
+    find_loop = controlled_find_loop;
 #if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
     owner_loop_calls = 0;
     owner_loop = controlled_owner_loop;

@@ -903,16 +903,53 @@ static __always_inline int discovery_key_valid(struct thread_owner *owner,
         (key->domain == 1 || key->domain == 2);
 }
 
+/* directory_find scans the 64 discovery cells through bpf_loop (helper
+ * 181): the callback body is verified once, instead of the branchy
+ * 64-iteration scan being explored in each inlined copy of every
+ * discovery accessor. Capture requires uprobe_multi (Linux 6.6+), which
+ * always has the helper. The first match wins and -1 means absent,
+ * exactly as the plain loop. */
+static long (*find_loop)(u32, long (*)(u32, void *), void *, u64) = (void *)181;
+
+struct discovery_find_ctx {
+    struct thread_owner *owner;
+    u64 cookie;
+    u32 domain_is_two;
+    u32 found;
+};
+
+static long discovery_find_callback(u32 slot, void *opaque)
+{
+    struct discovery_find_ctx *context = opaque;
+    if (slot >= 64)
+        return 1;
+    u64 bit = 1ULL << slot;
+    if ((context->owner->occupied & bit) != 0 &&
+        context->owner->discovery_cookies[slot] == context->cookie &&
+        ((context->owner->selection_domains & bit) != 0) == (context->domain_is_two != 0)) {
+        context->found = slot;
+        return 1;
+    }
+    return 0;
+}
+
 static __always_inline int directory_find(struct thread_owner *owner,
                                          const struct owner_discovery_key *key)
 {
-    for (u32 i = 0; i < 64; i++) {
-        u64 bit = 1ULL << i;
-        if ((owner->occupied & bit) && owner->discovery_cookies[i] == key->cookie &&
-            ((owner->selection_domains & bit) != 0) == (key->domain == 2))
-            return (int)i;
-    }
-    return -1;
+    struct discovery_find_ctx context;
+    context.owner = owner;
+    context.cookie = key->cookie;
+    context.domain_is_two = (key->domain == 2) ? 1U : 0U;
+    context.found = 64;
+    find_loop(64, discovery_find_callback, &context, 0);
+    /* The callback wrote the cell through its context, so the verifier
+     * only knows an unbounded u32 here. Bound it before it becomes an
+     * index: older verifiers (6.6) do not carry a later range check on a
+     * reloaded copy back to the spilled value, and refuse the cell write
+     * as an unbounded access. 64 (no match) and anything else out of
+     * range is absent. */
+    u32 found = context.found;
+    return found < 64 ? (int)found : -1;
 }
 
 static __always_inline void directory_clear(struct thread_owner *owner, u32 index)

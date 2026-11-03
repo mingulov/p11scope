@@ -519,11 +519,19 @@ struct LsChild {
 }
 
 impl LsChild {
-    fn spawn(lshold: &Path, provider: &Path, log: &Path, ords: &str) -> Self {
-        let mut child = Command::new(lshold)
-            .arg(provider)
-            .arg(log)
-            .arg(ords)
+    fn spawn(
+        lshold: &Path,
+        provider: &Path,
+        log: &Path,
+        ords: &str,
+        preload: Option<&Path>,
+    ) -> Self {
+        let mut command = Command::new(lshold);
+        command.arg(provider).arg(log).arg(ords);
+        if let Some(preload) = preload {
+            command.env("LD_PRELOAD", preload);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -2903,8 +2911,38 @@ fn stale_ls_manifest(
 fn legacy_static_table_scan_manifest_and_live() {
     let build = pub_build();
     let dir = pub_tmp("t9-ls");
+    // PA-9/C1 sidecar: one small provider preloaded into the holder, so the
+    // first plan holds a non-closure provider beside the five-table closure
+    // array and whole admission applies; the closure stays unnamed. The
+    // sidecar makes no calls, so the exact call bytes below are unaffected.
+    let sidecar_c =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-static/sidecar.c");
+    let sidecar = dir.join("sidecar.so");
+    let mut args: Vec<std::ffi::OsString> = [
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-fPIC",
+        "-shared",
+        "-Wl,-z,defs",
+        "-o",
+    ]
+    .iter()
+    .map(std::ffi::OsString::from)
+    .collect();
+    args.push(sidecar.clone().into());
+    args.push(sidecar_c.into());
+    pub_gcc(&args);
     let log = dir.join("ls.log");
-    let holder = LsChild::spawn(&build.lshold, &build.ls_provider, &log, "0,1,2,0,43");
+    let holder = LsChild::spawn(
+        &build.lshold,
+        &build.ls_provider,
+        &log,
+        "0,1,2,0,43",
+        Some(&sidecar),
+    );
     assert_eq!(
         holder.calls,
         vec![(0, 0), (1, 0), (2, 0), (0, 0), (43, 0)],
@@ -2941,11 +2979,17 @@ fn legacy_static_table_scan_manifest_and_live() {
         .collect();
 
     // 9a: scan-only. Five heuristic tables, a closure array that fits,
-    // so the family admits whole.
+    // so the family admits whole beside the preloaded sidecar provider.
     let started = Instant::now();
     let engine_a = engine_over_pids(&[holder.pid]);
-    assert_eq!(engine_a.modules.len(), 1);
-    let scan_tables = &engine_a.modules[0].scanned.tables;
+    assert_eq!(engine_a.modules.len(), 2);
+    let scan_tables = &engine_a
+        .modules
+        .iter()
+        .find(|module| module.scanned.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar")
+        .scanned
+        .tables;
     assert_eq!(scan_tables.len(), 5, "all five static tables decode");
     for table in scan_tables {
         assert_eq!(table.version, (2, 40));
@@ -2958,9 +3002,16 @@ fn legacy_static_table_scan_manifest_and_live() {
     scan_addrs.sort();
     scan_addrs.dedup();
     assert_eq!(scan_addrs.len(), 5, "five distinct instances");
-    assert_eq!(engine_a.plan().slots.len(), 68);
+    // Slot targets for the ls closure only; the sidecar's 68 land under
+    // its own path.
+    let ls_targets: BTreeSet<(String, u64)> = slot_targets(&engine_a)
+        .into_iter()
+        .filter(|(path, _)| path.ends_with("ls/provider.so"))
+        .collect();
+    // 68 ls targets plus the sidecar's 68.
+    assert_eq!(engine_a.plan().slots.len(), 68 + 68);
     assert_eq!(
-        slot_targets(&engine_a),
+        ls_targets,
         printed_targets(&maps, std::slice::from_ref(&table0))
     );
     assert!(
@@ -2971,7 +3022,12 @@ fn legacy_static_table_scan_manifest_and_live() {
             .all(|slot| slot.names.as_slice() == ["unknown"]),
         "scan-only heuristic tables stay unknown"
     );
-    let linkage_a: Vec<&str> = engine_a.plan().modules[0]
+    let linkage_a: Vec<&str> = engine_a
+        .plan()
+        .modules
+        .iter()
+        .find(|module| module.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar")
         .tables
         .iter()
         .map(|table| table.linkage)
@@ -2982,14 +3038,15 @@ fn legacy_static_table_scan_manifest_and_live() {
         0,
         "the fitting family admits whole, nothing spills"
     );
-    assert_eq!(engine_a.plan().entries_seen, 5 * 68);
-    assert_eq!(engine_a.budget.table_candidates_count(), 5);
-    assert_eq!(engine_a.budget.decoded_table_entries_count(), 5 * 68);
+    // Five ls tables plus the sidecar's one, 68 entries each.
+    assert_eq!(engine_a.plan().entries_seen, 6 * 68);
+    assert_eq!(engine_a.budget.table_candidates_count(), 6);
+    assert_eq!(engine_a.budget.decoded_table_entries_count(), 6 * 68);
     // The scripted calls land on admitted slots.
     for ord in [0, 1, 2, 43] {
         let (path, offset, _) = MapLite::file_target(&maps, table0.entries[ord].0);
         assert!(
-            slot_targets(&engine_a).contains(&(path, offset)),
+            ls_targets.contains(&(path, offset)),
             "called ordinal {ord} is admitted"
         );
     }
@@ -2997,7 +3054,13 @@ fn legacy_static_table_scan_manifest_and_live() {
 
     // 9b: a stale manifest's exact-target fallback supports all five.
     let mut engine_b = engine_over_pids(&[holder.pid]);
-    let scanned_key = engine_b.modules[0].scanned.key;
+    let scanned_key = engine_b
+        .modules
+        .iter()
+        .find(|module| module.scanned.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar")
+        .scanned
+        .key;
     let metadata = std::fs::metadata(&build.ls_provider).unwrap();
     assert_eq!(
         scanned_key.inode,
@@ -3026,8 +3089,13 @@ fn legacy_static_table_scan_manifest_and_live() {
         stale: pinning.stale,
     });
     rebuild_discovered(&mut engine_b).expect("fallback proof completes");
-    let supported: Vec<u64> = engine_b.modules[0]
-        .scanned
+    let ls_scanned_b = &engine_b
+        .modules
+        .iter()
+        .find(|module| module.scanned.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar")
+        .scanned;
+    let supported: Vec<u64> = ls_scanned_b
         .tables
         .iter()
         .filter(|table| table.manifest_supported)
@@ -3039,18 +3107,16 @@ fn legacy_static_table_scan_manifest_and_live() {
         "the single surface binds exactly one table"
     );
     assert!(
-        engine_b.modules[0]
-            .scanned
-            .tables
-            .iter()
-            .all(|table| !table.live_return),
+        ls_scanned_b.tables.iter().all(|table| !table.live_return),
         "no live evidence was observed"
     );
-    let mut linkage_b: Vec<&str> = engine_b.plan().modules[0]
-        .tables
+    let ls_plan_b = engine_b
+        .plan()
+        .modules
         .iter()
-        .map(|table| table.linkage)
-        .collect();
+        .find(|module| module.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar");
+    let mut linkage_b: Vec<&str> = ls_plan_b.tables.iter().map(|table| table.linkage).collect();
     linkage_b.sort();
     assert_eq!(
         linkage_b,
@@ -3068,8 +3134,15 @@ fn legacy_static_table_scan_manifest_and_live() {
         0,
         "the bound table plus four heuristic tables all admit"
     );
-    assert_eq!(engine_b.plan().slots.len(), 68);
-    for slot in &engine_b.plan().slots {
+    // 68 ls targets plus the sidecar's 68; only the ls slots carry
+    // manifest-authorized names.
+    assert_eq!(engine_b.plan().slots.len(), 68 + 68);
+    for slot in engine_b
+        .plan()
+        .slots
+        .iter()
+        .filter(|slot| slot.module_ids.contains(&ls_plan_b.id))
+    {
         assert_eq!(slot.names.len(), 1, "one ordinal label per target");
         assert_ne!(slot.names[0], "unknown", "manifest authorizes names");
     }
@@ -3081,8 +3154,13 @@ fn legacy_static_table_scan_manifest_and_live() {
     let hooks = HookRegistry::builtin();
     let session_c = drain_records(&mut engine_c, vec![gfl_record(holder.pid, &table0, &hooks)]);
     let wall = started.elapsed();
-    let at_published: Vec<&ScannedTable> = engine_c.modules[0]
-        .scanned
+    let ls_scanned_c = &engine_c
+        .modules
+        .iter()
+        .find(|module| module.scanned.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar")
+        .scanned;
+    let at_published: Vec<&ScannedTable> = ls_scanned_c
         .tables
         .iter()
         .filter(|table| table.address == table0.addr)
@@ -3094,12 +3172,14 @@ fn legacy_static_table_scan_manifest_and_live() {
     );
     assert!(at_published[0].live_return);
     assert!(at_published[0].file_offset.is_some());
-    assert_eq!(engine_c.modules[0].scanned.tables.len(), 5);
-    let mut linkage_c: Vec<&str> = engine_c.plan().modules[0]
-        .tables
+    assert_eq!(ls_scanned_c.tables.len(), 5);
+    let ls_plan_c = engine_c
+        .plan()
+        .modules
         .iter()
-        .map(|table| table.linkage)
-        .collect();
+        .find(|module| module.tables.len() == 5)
+        .expect("the five-table closure beside the sidecar");
+    let mut linkage_c: Vec<&str> = ls_plan_c.tables.iter().map(|table| table.linkage).collect();
     linkage_c.sort();
     assert_eq!(
         linkage_c,
@@ -3113,14 +3193,21 @@ fn legacy_static_table_scan_manifest_and_live() {
         "the published table bypasses; the rest stay heuristic"
     );
     assert_eq!(engine_c.plan().uncorroborated_candidates, 0);
-    assert_eq!(engine_c.plan().slots.len(), 68);
-    for slot in &engine_c.plan().slots {
+    // 68 ls targets plus the sidecar's 68; only the ls slots carry
+    // live-authorized names.
+    assert_eq!(engine_c.plan().slots.len(), 68 + 68);
+    for slot in engine_c
+        .plan()
+        .slots
+        .iter()
+        .filter(|slot| slot.module_ids.contains(&ls_plan_c.id))
+    {
         assert_eq!(slot.names.len(), 1);
         assert_ne!(slot.names[0], "unknown", "the live return authorizes names");
     }
     assert_eq!(
         engine_c.budget.table_candidates_count(),
-        5,
+        6,
         "the live lower deduplicates on the scan's file identity"
     );
     assert_eq!(

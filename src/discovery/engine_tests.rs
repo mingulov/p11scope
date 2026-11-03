@@ -35130,6 +35130,8 @@ fn p11kit_like_64_table_module() -> ScannedModule {
 /// Part 0: the admitted prefix is reported as a partial-coverage record
 /// naming the covered templates, not as silence; the reported total counts
 /// the linked table beside the heuristic ones.
+/// PA-9/C1: the closure holds a sidecar provider in the first plan, so the
+/// prefix applies; closure-alone would take published-only and spill nothing.
 #[test]
 fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     let admitted_heuristics = if cfg!(feature = "wide-detailed-2112") {
@@ -35139,11 +35141,15 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     };
     // Reported attached tables: heuristic plus the linked one.
     let reported_attached = admitted_heuristics + 1;
-    let expected_slots = ((admitted_heuristics + 1) * 104) as usize;
+    // Plus the sidecar provider's single slot: a closure alone in the first
+    // plan takes no prefix (PA-9/C1), so the prefix mechanics under test
+    // hold a provider beside the closure; the closure stays unnamed.
+    let expected_slots = ((admitted_heuristics + 1) * 104) as usize + 1;
     let expected_spill = 63 - admitted_heuristics;
     let raw = p11kit_like_64_table_module();
-    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
-    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    let sidecar = overlay_module(overlay_key(58));
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
 
@@ -35155,7 +35161,9 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     );
     assert!(
         plan.modules_skipped[0].reason.contains(&format!(
-            "{reported_attached} of 63 template tables attached"
+            // M counts every distinct table, linked included (stale "63"
+            // predates that redefinition); the doc above already says so.
+            "{reported_attached} of 64 template tables attached"
         )) && plan.modules_skipped[0]
             .reason
             .contains("calls through the others are not counted"),
@@ -35172,8 +35180,8 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
         "resource-bound spill is counted, never slotted"
     );
     assert_eq!(
-        plan.entries_seen, 6656,
-        "seen counts every decoded record under the resource bound, admitted or spilled"
+        plan.entries_seen, 6657,
+        "seen counts every decoded record under the resource bound, admitted or spilled, plus the sidecar's one"
     );
 
     // Evidence order, not discovery order: the linked table (index 63,
@@ -35200,7 +35208,11 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
         .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
         .unwrap();
     engine.publish_current_capture_facts().unwrap();
-    assert_eq!(engine.discovery.modules.len(), 1);
+    assert_eq!(
+        engine.discovery.modules.len(),
+        2,
+        "closure plus the sidecar provider"
+    );
     assert_eq!(
         engine.discovery.modules_skipped.len(),
         1,
@@ -35224,16 +35236,22 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
 /// unlinked tables' slots are named `unknown` — never the ordinal PKCS#11
 /// labels — while the linked table keeps its names. Every table carries
 /// (file_offset, entry count, linkage kind) into published evidence.
+/// PA-9/C1: the closure holds a sidecar provider in the first plan, so the
+/// prefix (whose labels this guards) applies; the closure stays unnamed.
 #[test]
 fn admitted_heuristic_tables_are_unknown_with_provenance() {
+    // Two, like the resource-bound twin: the reserve-capped 384-slot prefix
+    // ceiling fits the linked table plus two heuristics (stale "3" predates
+    // the reserve cap, which updated the twin's count but missed this one).
     let admitted_heuristics = if cfg!(feature = "wide-detailed-2112") {
         4u64
     } else {
-        3u64
+        2u64
     };
     let raw = p11kit_like_64_table_module();
-    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
-    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    let sidecar = overlay_module(overlay_key(58));
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
 
@@ -35254,8 +35272,12 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
             );
         }
     }
-    assert_eq!(unknown.len(), (admitted_heuristics * 104) as usize);
-    assert_eq!(plan.slots.len(), ((admitted_heuristics + 1) * 104) as usize);
+    // Plus the sidecar's one heuristic slot, unknown like the rest.
+    assert_eq!(unknown.len(), (admitted_heuristics * 104) as usize + 1);
+    assert_eq!(
+        plan.slots.len(),
+        ((admitted_heuristics + 1) * 104) as usize + 1
+    );
 
     // Table 63 is interface-linked: ordinal 63*104 % 8 == 0 keeps C_Initialize.
     let linked = plan
@@ -35265,7 +35287,12 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
         .unwrap();
     assert_eq!(linked.names, ["C_Initialize"]);
 
-    let tables = &plan.modules[0].tables;
+    let closure = plan
+        .modules
+        .iter()
+        .find(|module| module.tables.len() == 64)
+        .expect("the 64-table closure beside the sidecar provider");
+    let tables = &closure.tables;
     assert_eq!(tables.len(), 64);
     for (index, table) in tables.iter().enumerate() {
         assert_eq!(
@@ -35295,7 +35322,13 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
         .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
         .unwrap();
     engine.publish_current_capture_facts().unwrap();
-    let published = &engine.discovery.modules[0].tables;
+    let published = &engine
+        .discovery
+        .modules
+        .iter()
+        .find(|module| module.tables.len() == 64)
+        .expect("the 64-table closure beside the sidecar provider")
+        .tables;
     assert_eq!(published.len(), 64);
     for (index, table) in published.iter().enumerate() {
         assert_eq!(table.file_offset, Some(0x1caf20 + index as u64 * 840));
@@ -35599,6 +35632,8 @@ fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_modu
 /// indexes, and exact target pins are preserved per view. Six tables are a
 /// closure array by the classifier, so round 1 admits the fitting union
 /// whole rather than through the per-object K=4 cap.
+/// PA-9/C1: whole needs a provider beside the closure in the first plan,
+/// so the build holds a sidecar provider; the union stays unnamed.
 #[test]
 fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
     const TABLES: u64 = 6;
@@ -35681,10 +35716,11 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
         .collect();
     view2.interfaces = vec![];
 
-    let mut pins = overlay_pins(&[(key, OVERLAY_SHA, 1)]);
-    let (modules, skipped) = bind_scanned_modules(&[view1, view2], &mut pins);
+    let sidecar = overlay_module(overlay_key(58));
+    let mut pins = overlay_pins(&[(key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[view1, view2, sidecar], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
-    assert_eq!(modules.len(), 2);
+    assert_eq!(modules.len(), 3);
     assert_eq!(
         modules[0].object, modules[1].object,
         "two views of one provider bind one pinned object"
@@ -35692,7 +35728,8 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
     let object = modules[0].object;
 
     // Entry bindings preserved per view: 6 tables x 10 entries, same object.
-    for (view, module) in modules.iter().enumerate() {
+    // The sidecar (modules[2]) is not part of the union under test.
+    for (view, module) in modules[..2].iter().enumerate() {
         assert_eq!(
             module.entry_objects.len(),
             6,
@@ -35722,7 +35759,11 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
 
     let plan = plan::build_from_reconciled_modules(&modules);
 
-    assert_eq!(plan.modules.len(), 1, "one object is one module");
+    assert_eq!(
+        plan.modules.len(),
+        2,
+        "one object is one module; the sidecar is the second"
+    );
     assert!(
         plan.modules_skipped.is_empty(),
         "fitting union admits, never refuses: {:?}",
@@ -35730,19 +35771,24 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
     );
     assert_eq!(
         plan.slots.len(),
-        60,
-        "6 distinct tables x 10 admit once as one union across views"
+        61,
+        "6 distinct tables x 10 admit once as one union across views, plus the sidecar's one"
     );
     assert_eq!(
         plan.uncorroborated_candidates, 0,
         "fitting union spills nothing"
     );
     assert_eq!(
-        plan.entries_seen, 60,
-        "seen counts distinct records once across views"
+        plan.entries_seen, 61,
+        "seen counts distinct records once across views, plus the sidecar's one"
     );
+    let union = plan
+        .modules
+        .iter()
+        .find(|module| module.object == object)
+        .expect("the union module beside the sidecar provider");
     assert_eq!(
-        plan.modules[0].interfaces, 1,
+        union.interfaces, 1,
         "interfaces take the max across views, never the sum"
     );
     assert!(
@@ -35762,18 +35808,24 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
             "table {table} admission follows the shared evidence order"
         );
     }
-    for slot in &plan.slots {
+    for slot in plan.slots.iter().filter(|slot| slot.object == object) {
         assert_eq!(
             slot.object, object,
             "every slot pins the exact provider object"
         );
     }
+    assert!(
+        plan.slots.iter().any(|slot| slot.object != object),
+        "the sidecar provider holds its slot beside the union"
+    );
 }
 
 // Audit F5/F7 spill-then-settle publication pair: five distinct one-target
 // heuristic tables, four admitted under K=4, one omitted; the second
 // publication corroborates the fifth table with a live return and rebuilds
 // through the same stable-ID extension path the engine uses.
+// PA-9/C1: every build holds a sidecar provider beside the closure, so the
+// fitting five admit whole; closure-alone would take published-only.
 fn spill_history_engine() -> (Engine, ScannedModule) {
     let mut raw = p11kit_like_64_table_module();
     raw.tables.truncate(5);
@@ -35781,9 +35833,10 @@ fn spill_history_engine() -> (Engine, ScannedModule) {
         table.entries.truncate(1);
     }
     raw.interfaces.clear();
+    let sidecar = overlay_module(overlay_key(58));
     let mut engine = Engine::empty();
-    engine.pinned = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
-    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut engine.pinned);
+    engine.pinned = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[raw.clone(), sidecar], &mut engine.pinned);
     assert!(skipped.is_empty());
     engine.plan = plan::build_from_reconciled_modules(&modules);
     engine.modules = modules;
@@ -35797,7 +35850,8 @@ fn spill_history_engine() -> (Engine, ScannedModule) {
 
 fn publish_fifth_table_live(engine: &mut Engine, mut raw: ScannedModule) {
     raw.tables[4].live_return = true;
-    let (modules, skipped) = bind_scanned_modules(&[raw], &mut engine.pinned);
+    let sidecar = overlay_module(overlay_key(58));
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut engine.pinned);
     assert!(skipped.is_empty());
     let mut rebuilt = plan::build_from_reconciled_modules(&modules);
     engine
@@ -35819,15 +35873,17 @@ fn publish_fifth_table_live(engine: &mut Engine, mut raw: ScannedModule) {
 /// the growth-omission (G-03) tests. What remains here is the live half: a
 /// later live publication settles through the same stable-ID extension path
 /// with no spill at any point, and upgrades the table's linkage.
+/// PA-9/C1: whole needs a provider beside the closure in the first plan;
+/// the pair holds a sidecar provider, so six slots admit, none spill.
 #[test]
 fn whole_closure_module_settles_live_publication_without_spill() {
     let (mut engine, raw) = spill_history_engine();
     assert_eq!(engine.plan.uncorroborated_candidates, 0);
     assert_eq!(engine.discovery.uncorroborated_candidates, 0);
-    assert_eq!(engine.plan.slots.len(), 5);
+    assert_eq!(engine.plan.slots.len(), 6);
     let offset = raw.tables[4].file_offset;
     publish_fifth_table_live(&mut engine, raw);
-    assert_eq!(engine.plan.slots.len(), 5);
+    assert_eq!(engine.plan.slots.len(), 6);
     assert_eq!(
         engine.plan.uncorroborated_candidates, 0,
         "the live merge settles with no spill"
@@ -35836,9 +35892,11 @@ fn whole_closure_module_settles_live_publication_without_spill() {
         engine.discovery.uncorroborated_candidates, 0,
         "lifetime evidence carries no spill that never happened"
     );
-    let current = engine.plan.modules[0]
-        .tables
+    let current = engine
+        .plan
+        .modules
         .iter()
+        .flat_map(|module| &module.tables)
         .find(|table| table.file_offset == offset)
         .unwrap();
     assert_eq!(current.linkage, "live_return");
@@ -35853,14 +35911,18 @@ fn public_linkage_reflects_later_live_publication() {
     let (mut engine, raw) = spill_history_engine();
     let offset = raw.tables[4].file_offset;
     publish_fifth_table_live(&mut engine, raw);
-    let current = engine.plan.modules[0]
-        .tables
+    let current = engine
+        .plan
+        .modules
         .iter()
+        .flat_map(|module| &module.tables)
         .find(|table| table.file_offset == offset)
         .unwrap();
-    let public = engine.discovery.modules[0]
-        .tables
+    let public = engine
+        .discovery
+        .modules
         .iter()
+        .flat_map(|module| &module.tables)
         .find(|table| table.file_offset == offset)
         .unwrap();
     assert_eq!(current.linkage, "live_return");
@@ -35878,16 +35940,20 @@ fn public_linkage_never_downgrades_after_proof_retires() {
     let (mut engine, raw) = spill_history_engine();
     let offset = raw.tables[4].file_offset;
     publish_fifth_table_live(&mut engine, raw.clone());
-    let public = engine.discovery.modules[0]
-        .tables
+    let public = engine
+        .discovery
+        .modules
         .iter()
+        .flat_map(|module| &module.tables)
         .find(|table| table.file_offset == offset)
         .unwrap();
     assert_eq!(public.linkage, "live_return");
     republish_all_heuristic(&mut engine, raw);
-    let public = engine.discovery.modules[0]
-        .tables
+    let public = engine
+        .discovery
+        .modules
         .iter()
+        .flat_map(|module| &module.tables)
         .find(|table| table.file_offset == offset)
         .unwrap();
     assert_eq!(
@@ -35897,7 +35963,8 @@ fn public_linkage_never_downgrades_after_proof_retires() {
 }
 
 fn republish_all_heuristic(engine: &mut Engine, raw: ScannedModule) {
-    let (modules, skipped) = bind_scanned_modules(&[raw], &mut engine.pinned);
+    let sidecar = overlay_module(overlay_key(58));
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut engine.pinned);
     assert!(skipped.is_empty());
     let mut rebuilt = plan::build_from_reconciled_modules(&modules);
     engine

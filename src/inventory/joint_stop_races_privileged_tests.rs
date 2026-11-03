@@ -1221,14 +1221,14 @@ fn run_stop_offset(
     let release = workload.path(&format!("release{index}"));
     let go = workload.path(&format!("go{index}"));
     let _ = std::fs::remove_file(&release);
+    let release_c = std::ffi::CString::new(release.to_str().context("release path")?)
+        .context("release path holds NUL")?;
+    let mkfifo_rc = unsafe { libc::mkfifo(release_c.as_ptr(), 0o600) };
     ensure!(
-        unsafe {
-            libc::mkfifo(
-                release.to_str().context("release path")?.as_ptr() as *const libc::c_char,
-                0o600,
-            )
-        } == 0,
-        "mkfifo the release gate"
+        mkfifo_rc == 0,
+        "mkfifo {}: {}",
+        release.display(),
+        std::io::Error::last_os_error()
     );
     let go_arg = go.to_str().context("go path")?.to_string();
     let release_arg = release.to_str().context("release path")?.to_string();

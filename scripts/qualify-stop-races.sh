@@ -60,7 +60,7 @@ command -v gcc >/dev/null 2>&1 || refuse 'gcc not installed'
 command -v stdbuf >/dev/null 2>&1 || refuse 'stdbuf not installed'
 command -v softhsm2-util >/dev/null 2>&1 || refuse 'softhsm2-util not installed'
 command -v setpriv >/dev/null 2>&1 || refuse 'setpriv not installed'
-P=$(realpath -e -- "$P") || refuse "observer not found: $1"
+P=$(realpath -e -- "$P") || refuse "observer not found: $P"
 [ -x "$P" ] || refuse "observer not executable: $P"
 DISCOVER=$(dirname "$P")/p11scope-discover
 [ -x "$DISCOVER" ] || refuse "p11scope-discover missing beside observer: $DISCOVER"

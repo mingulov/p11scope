@@ -79,10 +79,8 @@ elif [ ! -x "$LIBTEST" ]; then
 elif ! "$LIBTEST" --list 2>/dev/null | grep -qx "$JOINT_CELL: test"; then
   joint_detail="harness: joint cell missing from test binary: $JOINT_CELL"
 else
-  set +e
-  "$LIBTEST" --exact "$JOINT_CELL" --ignored > joint-cell.log 2>&1
-  joint_rc=$?
-  set -e
+  joint_rc=0
+  "$LIBTEST" --exact "$JOINT_CELL" --ignored > joint-cell.log 2>&1 || joint_rc=$?
   if [ "$joint_rc" = 0 ] && [ "$EXPECT_JOINT_FAIL" = 0 ]; then
     joint_pass=1; joint_qual='qualified'; joint_detail='joint stop after last waiter resolves reaches Published then WoundDown'
   elif [ "$joint_rc" = 0 ]; then
@@ -91,7 +89,7 @@ else
     joint_detail='expected failure: joint finish wedges without the joint-wedge fix (task/v060-joint-wedge 244ac82ec); see joint-cell.log'
     joint_qual='expected-failure'
   elif grep -q 'P11SCOPE_CELL_BRANCH=.*:s1-precluded' joint-cell.log; then
-    joint_detail='environment-precluded: S1-only host without joint feeds; wedge path unevaluated; see joint-cell.log'
+    joint_detail='environment-precluded: S1 seal without joint feeds; wedge needs a journal-build libtest; see joint-cell.log'
     joint_qual='environment-precluded'
   else
     joint_detail='joint cell failed without the wedge signature (regression or new failure); see joint-cell.log'

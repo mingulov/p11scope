@@ -7806,6 +7806,7 @@ pub(crate) mod test_fixture {
 
     pub(crate) fn module(key: ObjectKey) -> ScannedModule {
         ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
             view: ProcessViewId(key.device.minor as u32),
@@ -8937,6 +8938,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
             view: view.id(),
@@ -9049,6 +9051,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
             view: view.id(),
@@ -9123,6 +9126,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
             view: view.id(),
@@ -10903,6 +10907,7 @@ mod tests {
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let read = FileIdentity { dev: 37, ino: 9 };
         let module = |mapped_identity| ScannedModule {
+            module_hint: None,
             mapped_identity,
             double_loaded: false,
             view: view.id(),

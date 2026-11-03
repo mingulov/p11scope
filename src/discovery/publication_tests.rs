@@ -3353,6 +3353,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         getter_present: false,
         witness_fault: false,
         scanned: ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
             view: ProcessViewId(0),
@@ -3418,6 +3419,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         getter_present: false,
         witness_fault: false,
         scanned: ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
             view: ProcessViewId(0),

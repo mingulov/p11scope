@@ -849,6 +849,7 @@ mod tests {
             getter_present: false,
             witness_fault: false,
             scanned: ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
                 view: ProcessViewId(0),

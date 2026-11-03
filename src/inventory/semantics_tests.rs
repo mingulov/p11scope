@@ -121,6 +121,7 @@ impl ProviderFixture {
                 .unwrap();
         ReconciledModule {
             scanned: ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 view: view.id(),
                 mount_namespace: view.mount_namespace(),

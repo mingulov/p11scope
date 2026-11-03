@@ -2132,6 +2132,13 @@ pub struct ScannedModule {
     /// without group evidence (heap-lowered records, loader prearm,
     /// single-mapping projections) carry `false`.
     pub double_loaded: bool,
+    /// The operator-named `--module` input this opened file matched (same
+    /// match as [`exclude_match`]: identity, resolved basename, soname),
+    /// evaluated at scan time while the file is open. `None` with no
+    /// `--module` inputs, on no match, or for modules synthesized without
+    /// scan evidence. The planner reads it for the operator-named closure
+    /// exception only; it changes no scan filtering.
+    pub module_hint: Option<PathBuf>,
     pub path: String,
     /// ABI used by the userspace memory decoder. Present only when this module
     /// came from `scan_process_view`; mapping and kernel-record projections do
@@ -5633,6 +5640,7 @@ fn scan_view_examined_mode(
             continue;
         }
         let mut module = ScannedModule {
+            module_hint: None,
             mapped_identity: scanned_identity,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
@@ -8695,6 +8703,7 @@ mod tests {
                 getter_present: false,
                 witness_fault: false,
                 scanned: ScannedModule {
+                    module_hint: None,
                     mapped_identity: None,
                     view: ProcessViewId(object),
                     mount_namespace: MountNamespaceId {

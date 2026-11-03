@@ -4032,6 +4032,7 @@ impl ScannedModuleCopy {
             // Base shell: scalars plus exact-capacity vectors.
             0 => {
                 rows.push(ScannedModule {
+                    module_hint: None,
                     mapped_identity: source.mapped_identity,
                     view: source.view,
                     mount_namespace: source.mount_namespace,
@@ -8828,6 +8829,7 @@ fn publication_module(
         _ => Vec::new(),
     };
     ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
         view: view.id(),
@@ -10056,6 +10058,7 @@ fn validate_loader_record_context<'a>(
 
 fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> ScannedModule {
     ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
         view: view.id(),
@@ -15581,6 +15584,7 @@ impl Engine {
             observed.walk = "known_prefix";
             let view = &self.views[position];
             let module = ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
                 view: view.id(),
@@ -18478,6 +18482,7 @@ impl Engine {
         )
         .map_err(anyhow::Error::msg)?;
         let loader_module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
             view: view_id,

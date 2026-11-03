@@ -1179,6 +1179,7 @@ fn retiring_one_shared_namespace_view_keeps_only_the_stable_views_claims() {
     let target_b = cc_so(&d, "target_b", "int target_b(void){return 3;}\n");
     let namespace = current_mount_namespace();
     let module = |view, name, target: &Path| ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
         view,
@@ -1263,6 +1264,7 @@ fn retiring_a_rejected_provider_view_removes_its_unplanned_pins_and_raw_aliases(
     let mut rejected_provider = manifest_key(&provider);
     rejected_provider.inode = rejected_provider.inode.wrapping_add(1);
     let module = ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
         view: view_id,
@@ -2314,6 +2316,7 @@ fn a_retargeted_path_is_skipped_as_an_identity_mismatch() {
     // reported. That is what a retargeted path looks like, and it must never be pinned.
     let exe = std::env::current_exe().unwrap();
     let module = ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
         view: ProcessViewId(0),
@@ -2369,6 +2372,7 @@ fn a_memfd_magic_link_is_refused_before_target_identity() {
     let memfd_path = format!("/proc/self/fd/{}", memfd.as_raw_fd());
     let metadata = memfd.metadata().unwrap();
     let module = ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
         view: ProcessViewId(0),
@@ -2582,6 +2586,7 @@ fn a_failed_hash_attempt_still_consumes_the_capture_budget() {
     let len = std::fs::metadata(&valid).unwrap().len();
     assert_eq!(len, std::fs::metadata(&invalid).unwrap().len());
     let module = |path: &Path| ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
         view: ProcessViewId(0),

@@ -285,6 +285,9 @@ pub(crate) trait PauseIo {
     /// completed or one is still in flight: then no thread born after
     /// preflight dates as covered.
     fn last_hook_attach_boot_ns(&mut self) -> Option<u64>;
+    /// The `CLOCK_BOOTTIME` reading, in nanoseconds (the hook-attach clock's
+    /// domain); `None` when it cannot be read.
+    fn boot_now_ns(&mut self) -> Option<u64>;
     fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String>;
     fn arm(&mut self) -> Result<(), String>;
     fn authorization(&mut self) -> Result<Option<u64>, String>;
@@ -2280,6 +2283,10 @@ impl PauseIo for SessionPauseIo<'_> {
         last_hook_attach_boot_ns()
     }
 
+    fn boot_now_ns(&mut self) -> Option<u64> {
+        boot_ns()
+    }
+
     fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
         // Shared allowance, enforced structurally: a staged pop is a
         // credit transfer and always proceeds, but a ring read needs a
@@ -3145,6 +3152,10 @@ mod tests {
         /// repeats. Default: none recorded.
         attach_instants: VecDeque<Option<u64>>,
         fallback_attach: Option<u64>,
+        /// Scripted boot-clock readings, one per read; then `fallback_boot`.
+        /// Default: unreadable.
+        boot_clock: VecDeque<Option<u64>>,
+        fallback_boot: Option<u64>,
         state_reads: u64,
         queue: VecDeque<Result<Option<DiscoveryItem>, String>>,
         authorization: Option<u64>,
@@ -3201,6 +3212,8 @@ mod tests {
                 last_states: BTreeMap::new(),
                 attach_instants: VecDeque::new(),
                 fallback_attach: None,
+                boot_clock: VecDeque::new(),
+                fallback_boot: None,
                 state_reads: 0,
                 queue: VecDeque::new(),
                 authorization: None,
@@ -3329,6 +3342,10 @@ mod tests {
                 self.fallback_attach = instant;
             }
             self.fallback_attach
+        }
+
+        fn boot_now_ns(&mut self) -> Option<u64> {
+            self.boot_clock.pop_front().unwrap_or(self.fallback_boot)
         }
 
         fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
@@ -4679,6 +4696,84 @@ mod tests {
             coordinator.sample_until_stopped(&mut failing, CYCLE_NS),
             Err(("wait".into(), true))
         );
+    }
+
+    /// The `wait` events immediately before the resume.
+    fn waits_before_resume(io: &FakeIo) -> usize {
+        let resume = io
+            .events
+            .iter()
+            .position(|event| *event == "resume")
+            .expect("the stop resumed");
+        io.events[..resume]
+            .iter()
+            .rev()
+            .take_while(|event| **event == "wait")
+            .count()
+    }
+
+    /// A thread the child starts once resumed dates by its floored tick,
+    /// which cannot prove a birth inside the last attach's own tick. The
+    /// resume therefore waits, at the 1 ms cadence, until the boot clock has
+    /// crossed into the tick after the last completed attach; then every such
+    /// birth floors strictly after the attach.
+    #[test]
+    fn resume_waits_for_the_tick_after_the_last_attach() {
+        let tick = test_tick_ns();
+        let attach = 100 * tick + tick / 2;
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = Some(attach);
+        io.boot_clock = VecDeque::from([Some(attach + 1), Some(101 * tick - 1), Some(101 * tick)]);
+        io.fallback_boot = Some(101 * tick + 1);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 2);
+        assert!(
+            io.boot_clock.is_empty(),
+            "the boundary reading ended the wait"
+        );
+    }
+
+    /// The hold never delays a stop without a reason or past its bound: no
+    /// wait once the boot clock is already past the attach's tick, none with
+    /// no recorded attach or an unreadable boot clock, and at most one tick of
+    /// 1 ms waits when the boot clock never gets there.
+    #[test]
+    fn resume_hold_is_skipped_or_bounded() {
+        let tick = test_tick_ns();
+        for (attach, boot, max_waits) in [
+            (Some(100 * tick), Some(101 * tick), 0),
+            (None, Some(100 * tick), 0),
+            (Some(100 * tick), None, 0),
+            (
+                Some(100 * tick),
+                Some(100 * tick),
+                (tick / SAMPLE_NS) as usize + 1,
+            ),
+        ] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.fallback_attach = attach;
+            io.fallback_boot = boot;
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::confirmed(1),
+                "attach {attach:?} boot {boot:?}"
+            );
+            assert_eq!(
+                waits_before_resume(&io),
+                max_waits,
+                "attach {attach:?} boot {boot:?}"
+            );
+        }
     }
 
     /// While the stop settles, only a thread on its way into the stop (`R`,

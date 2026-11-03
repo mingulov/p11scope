@@ -6227,13 +6227,20 @@ fn assert_quiet_twins_except_stopped(
         }
         let subject = gap.subject.to_lowercase();
         let reason = gap.reason.to_lowercase();
-        ensure!(
-            !subject.contains("loss")
+        // Gap labels judge loss; a bare file-path subject (an absolute
+        // path, such as a hint gap's `.so` under TMPDIR) is not a
+        // label, so a temp dir containing "loss" must not fail a
+        // quiet cell. Labels with an embedded path still count, and
+        // the reason check applies to every gap.
+        let subject_is_path = gap.subject.starts_with('/');
+        let subject_quiet = subject_is_path
+            || (!subject.contains("loss")
                 && !subject.contains("lost")
                 && !subject.contains("refused")
                 && !subject.contains("shed")
-                && !subject.contains("unsettled")
-                && !reason.contains("loss"),
+                && !subject.contains("unsettled"));
+        ensure!(
+            subject_quiet && !reason.contains("loss"),
             "{tag}: unexpected gap {}: {} (caller={:?} pid={:?} module={:?} repeats={:?})",
             gap.subject,
             gap.reason,

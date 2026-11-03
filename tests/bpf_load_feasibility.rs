@@ -66,15 +66,60 @@ fn rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
-fn bpf_stats_enabled() -> Option<String> {
-    fs::read_to_string("/proc/sys/kernel/bpf_stats_enabled")
+/// Sysctl exposing verifier-stats collection; cells toggle it 0→1→0.
+const BPF_STATS_SYSCTL: &str = "/proc/sys/kernel/bpf_stats_enabled";
+
+fn read_sysctl(path: &str) -> Option<String> {
+    fs::read_to_string(path)
         .ok()
         .map(|value| value.trim().to_string())
 }
 
-fn set_bpf_stats_enabled(value: &str) -> std::io::Result<()> {
-    fs::write("/proc/sys/kernel/bpf_stats_enabled", value)?;
+fn write_sysctl(path: &str, value: &str) -> std::io::Result<()> {
+    fs::write(path, value)?;
     Ok(())
+}
+
+fn bpf_stats_enabled() -> Option<String> {
+    read_sysctl(BPF_STATS_SYSCTL)
+}
+
+/// RAII owner of the 0→1 stats toggle: enables at construction and
+/// restores the prior value on drop — including on panic — so a
+/// mid-cell failure cannot leak collection on for other lanes.
+struct StatsGuard {
+    path: String,
+    restore: Option<String>,
+}
+
+impl StatsGuard {
+    fn engage() -> Self {
+        Self::engage_at(BPF_STATS_SYSCTL)
+    }
+
+    fn engage_at(path: &str) -> Self {
+        let before = read_sysctl(path);
+        if before.as_deref() == Some("0") {
+            write_sysctl(path, "1").expect("enable bpf_stats for verified_insns");
+            Self {
+                path: path.to_string(),
+                restore: before,
+            }
+        } else {
+            Self {
+                path: path.to_string(),
+                restore: None,
+            }
+        }
+    }
+}
+
+impl Drop for StatsGuard {
+    fn drop(&mut self) {
+        if let Some(prior) = self.restore.take() {
+            let _ = write_sysctl(&self.path, &prior);
+        }
+    }
 }
 
 fn kernel_release() -> String {
@@ -375,10 +420,7 @@ fn per_program_load_times() {
     let id = run_id();
     let kernel = kernel_release();
     let mut sink = Sink::open(CELL);
-    let stats_before = bpf_stats_enabled();
-    if stats_before.as_deref() == Some("0") {
-        set_bpf_stats_enabled("1").expect("enable bpf_stats for verified_insns");
-    }
+    let _stats = StatsGuard::engage();
     let stats_label = bpf_stats_enabled().unwrap_or_else(|| "?".to_string());
 
     let btf_start = Instant::now();
@@ -452,9 +494,6 @@ fn per_program_load_times() {
             }
         }
     }
-    if stats_before.as_deref() == Some("0") {
-        let _ = set_bpf_stats_enabled("0");
-    }
     println!("{CELL}: mean load wall per program over {trials} trials (both variants):");
     let mut means: Vec<(String, String, f64)> = totals
         .iter()
@@ -507,10 +546,7 @@ fn parallel_load_measures_kernel_overlap() {
     let id = run_id();
     let kernel = kernel_release();
     let mut sink = Sink::open(CELL);
-    let stats_before = bpf_stats_enabled();
-    if stats_before.as_deref() == Some("0") {
-        set_bpf_stats_enabled("1").expect("enable bpf_stats for verified_insns");
-    }
+    let _stats = StatsGuard::engage();
     let stats_label = bpf_stats_enabled().unwrap_or_else(|| "?".to_string());
 
     let bytes = p11scope::EBPF_OBJECT;
@@ -658,9 +694,6 @@ fn parallel_load_measures_kernel_overlap() {
                 serial_sum.as_secs_f64(),
             );
         }
-    }
-    if stats_before.as_deref() == Some("0") {
-        let _ = set_bpf_stats_enabled("0");
     }
 }
 
@@ -878,10 +911,7 @@ fn resident_service_cost_parts() {
     let id = run_id();
     let kernel = kernel_release();
     let mut sink = Sink::open(CELL);
-    let stats_before = bpf_stats_enabled();
-    if stats_before.as_deref() == Some("0") {
-        set_bpf_stats_enabled("1").expect("enable bpf_stats for verified_insns");
-    }
+    let _stats = StatsGuard::engage();
     let stats_label = bpf_stats_enabled().unwrap_or_else(|| "?".to_string());
 
     let bytes = p11scope::EBPF_OBJECT;
@@ -949,9 +979,6 @@ fn resident_service_cost_parts() {
         "after_fds": after_fds, "after_rss_kb": after_rss,
     });
     sink.row(&summary);
-    if stats_before.as_deref() == Some("0") {
-        let _ = set_bpf_stats_enabled("0");
-    }
     println!(
         "{CELL}: btf={:.3}s maps-only={:.3}s full={:.3}s (maps {:.3}s + programs {:.3}s); RSS {} -> {} -> {} kB; FDs {} -> {} -> {}",
         btf_wall.as_secs_f64(),
@@ -966,4 +993,50 @@ fn resident_service_cost_parts() {
         idle_fds,
         after_fds,
     );
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn fake_sysctl(initial: &str) -> (tempfile::NamedTempFile, String) {
+        let mut file = tempfile::NamedTempFile::new().expect("temp sysctl");
+        file.write_all(initial.as_bytes()).expect("seed sysctl");
+        file.flush().expect("flush sysctl");
+        let path = file.path().to_str().expect("utf8 temp path").to_string();
+        (file, path)
+    }
+
+    #[test]
+    fn stats_guard_restores_zero_on_drop() {
+        let (_file, path) = fake_sysctl("0\n");
+        {
+            let _guard = StatsGuard::engage_at(&path);
+            assert_eq!(read_sysctl(&path).as_deref(), Some("1"));
+        }
+        assert_eq!(read_sysctl(&path).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn stats_guard_restores_zero_on_panic() {
+        let (_file, path) = fake_sysctl("0\n");
+        let result = std::panic::catch_unwind(|| {
+            let _guard = StatsGuard::engage_at(&path);
+            assert_eq!(read_sysctl(&path).as_deref(), Some("1"));
+            panic!("injected mid-cell panic");
+        });
+        assert!(result.is_err(), "the injected panic must propagate");
+        assert_eq!(read_sysctl(&path).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn stats_guard_leaves_nonzero_alone() {
+        let (_file, path) = fake_sysctl("1\n");
+        {
+            let _guard = StatsGuard::engage_at(&path);
+            assert_eq!(read_sysctl(&path).as_deref(), Some("1"));
+        }
+        assert_eq!(read_sysctl(&path).as_deref(), Some("1"));
+    }
 }

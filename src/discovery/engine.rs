@@ -2558,7 +2558,13 @@ impl CaptureFacts {
                 ),
                 (Some(known), Some(refused)) if refused > known
             );
+            // PA-5 I1: a later prefix record replaces an earlier whole-refusal
+            // record for the same closure module. Without this the report says
+            // "not attached" while the prefix is counting calls.
+            let prefix_replaces_whole = plan::is_closure_array_refusal(&known.reason)
+                && plan::is_closure_array_prefix(&refused.reason);
             if larger_whole
+                || prefix_replaces_whole
                 || (plan::is_growth_omission(&known.reason)
                     && rank(&refused.reason) >= rank(&known.reason))
             {

@@ -130,6 +130,17 @@ capture promises. Missing metadata is not evidence that the application used
 none. Scan-only function slots remain semantics-unverified/count-only; an
 accepted explicit manifest attests only its exact object/name/offset claims.
 
+Every `mechanisms[]` entry carries `registered`: `true` for an id the
+BPF return path found in `MECH_SHAPE`, `false` for an unregistered
+publication. Unregistered ids are public constants, so v3 documents
+list each one as a bare hex number with its call/error counts
+(`params: null`, never decoded, never named) instead of only the
+`evidence.unregistered_mechanisms`
+total, which still counts every occurrence. Like `selected_detail`,
+this is a v3-additive disclosure that introduces no new schema
+revision; historical v2 documents list registered ids only and lack
+the `registered` key.
+
 The observer and `p11scope inspect` make zero PKCS #11 calls. Only the explicit
 offline `p11scope-discover` helper loads a provider and makes exactly ten
 pre-initialization `C_GetInterface` calls. Selection evidence is therefore a

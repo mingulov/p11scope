@@ -4067,6 +4067,18 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8, const JOURNAL: b
                             let parameter_shape = unsafe { MECH_SHAPE.get(&mechanism) }
                                 .copied()
                                 .unwrap_or(shape::NONE);
+                            // Unsafe diagnostic entry publishes any
+                            // readable id (the allowlisted return gate
+                            // is off in this policy): flag membership
+                            // misses like the return path does. A
+                            // second lookup — the statement above is
+                            // pinned by the decode-params source
+                            // contract. Unsafe builds never carry the
+                            // journal object, so no BEGIN can carry
+                            // this bit.
+                            if unsafe { MECH_SHAPE.get(&mechanism) }.is_none() {
+                                start.capture |= capture::MECHANISM_UNREGISTERED;
+                            }
                             if parameter_shape != shape::NONE {
                                 // Project the narrow output from the whole
                                 // CallStart pointer. No additional stack object
@@ -4534,12 +4546,27 @@ fn capture_return_facts<const DEFER_ROUTING: bool>(
         && start.mechanism_ptr != 0
     {
         match read_word(start.mechanism_ptr, layout) {
-            Ok(value) if unsafe { MECH_SHAPE.get(&value) }.is_some() => {
-                mechanism = value;
-                capture_flags =
-                    (capture_flags & !capture::MECHANISM_MASK) | capture::MECHANISM_VALUE;
+            Ok(value) => {
+                // Mechanism ids are public constants: outside the
+                // journal lane, publish the id with its call/error
+                // counts even without registry membership, flagged
+                // unregistered. The journal lane keeps withholding
+                // (its validator pins the capture transition set).
+                // Parameters stay undecoded in both; the evidence
+                // total counts every occurrence in both.
+                let member = unsafe { MECH_SHAPE.get(&value) }.is_some();
+                if member || !DEFER_ROUTING {
+                    mechanism = value;
+                    capture_flags = (capture_flags & !capture::MECHANISM_MASK)
+                        | capture::MECHANISM_VALUE;
+                    if !member {
+                        capture_flags |= capture::MECHANISM_UNREGISTERED;
+                    }
+                }
+                if !member {
+                    bump_evidence(EVIDENCE_UNREGISTERED_MECHANISMS);
+                }
             }
-            Ok(_) => bump_evidence(EVIDENCE_UNREGISTERED_MECHANISMS),
             Err(_) => {
                 capture_flags = (capture_flags & !capture::MECHANISM_MASK)
                     | capture::MECHANISM_UNREADABLE

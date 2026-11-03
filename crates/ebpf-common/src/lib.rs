@@ -1420,6 +1420,17 @@ pub mod capture {
     pub const ARG_READ_FAILURE: u32 = 1 << 4;
     pub const ASYNC_SESSION: u32 = 1 << 5;
     pub const ASYNC_VALUE_UNREADABLE: u32 = 1 << 6;
+    /// The published mechanism id is outside `MECH_SHAPE` (no registry
+    /// membership, no parameter shape). Set by the Detailed return path
+    /// only (the journal lane keeps withholding), beside
+    /// `MECHANISM_VALUE`: the id and its call/error counts are
+    /// published, parameters stay undecoded, and the
+    /// `EVIDENCE_UNREGISTERED_MECHANISMS` total still counts every
+    /// occurrence in both lanes. Orthogonal to the state enums above:
+    /// masked comparisons are unaffected. Never set at entry (the
+    /// frozen journal BEGIN `CAPTURE_MASK` refuses it) and never
+    /// cleared.
+    pub const MECHANISM_UNREGISTERED: u32 = 1 << 7;
 }
 
 /// Ring buffer capacity in bytes. Must be a power of two and page-aligned.

@@ -212,7 +212,7 @@ Kernel/event loss:
 | `rv_update_failures` | Failed `RV_COUNTS` updates. |
 | `cgroup_scope_failures` | Native cgroup-membership helper failures. |
 | `semantic_capture_failures` | Descriptor-selected argument or bounded user-memory reads that failed. |
-| `unregistered_mechanisms` | Calls for mechanism ids that are readable but unapproved: not in the allowlisted capture policy, so never decoded. Forces `PARTIAL`. |
+| `unregistered_mechanisms` | Calls for mechanism ids that are readable but unapproved: not in the allowlisted capture policy, so never decoded. Counts every occurrence, including any lost later. v3 documents also list each such id with its counts in `mechanisms[]` rows with `registered: false`. Forces `PARTIAL`. |
 | `template_tail_failures` | Internal second-template handoff failed; the first template may remain available, but the key-pair request is incomplete. |
 | `malformed_records` | Event records rejected for ABI size mismatch. |
 
@@ -466,7 +466,8 @@ statement, and it forces `PARTIAL` so the count is never read as attributed.
 
 | Field | Meaning |
 | --- | --- |
-| `mechanism`, `mechanism_hex` | 64-bit mechanism id admitted by the capture policy; the default policy permits only finite published registry membership. |
+| `mechanism`, `mechanism_hex` | 64-bit mechanism id. Registered ids are admitted by the capture policy (finite published registry membership); v3 documents additionally list unregistered ids as bare numbers with counts (see `registered`). Historical v2 documents list registered ids only. |
+| `registered` | v3 only: `true` when the BPF return path found the id in `MECH_SHAPE`, `false` for an unregistered publication (numeric id plus call/error counts only, never decoded, never named). Absent from historical v2 documents. |
 | `ops` | Operation categories observed for this id. |
 | `calls`, `errors` | Event-derived semantic calls and non-success final results. |
 | `latency_ns` | Always the histogram object shape, independent of function timing availability; async semantic latency spans pending entry to completion. |

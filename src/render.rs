@@ -3020,6 +3020,11 @@ struct MechanismOut {
     /// Verbatim id — vendor ids survive unchanged, never renamed or dropped.
     mechanism: u64,
     mechanism_hex: String,
+    /// The BPF return path found this id in `MECH_SHAPE` (registry
+    /// membership, parameter shape published). `false` marks an
+    /// unregistered publication: numeric id plus call/error counts
+    /// only, never decoded, never named.
+    registered: bool,
     /// Operation categories (`"sign"`, `"encrypt"`, ...) this id was seen
     /// initializing. Empty when only ever seen as an orphan operational
     /// call (no `*Init` observed in this capture).
@@ -3333,6 +3338,7 @@ pub fn profile_json(
             MechanismOut {
                 mechanism: *id,
                 mechanism_hex: format!("0x{id:x}"),
+                registered: !m.unregistered,
                 ops: m.ops.iter().cloned().collect(),
                 calls: m.calls,
                 errors: m.errors,
@@ -7906,12 +7912,6 @@ pub(crate) mod tests {
     /// it (see `vendor_mechanisms::unassigned_vendor_ids_stay_withheld`).
     const UNREGISTERED_SENTINEL: u64 = 0xCE53_43A9;
 
-    /// Wire value of the `MECHANISM_UNREGISTERED` capture bit the BPF
-    /// return path sets beside `MECHANISM_VALUE` when it publishes an
-    /// id outside `MECH_SHAPE`. Spelled literally until the named
-    /// constant lands with the implementation.
-    const UNREGISTERED_BIT: u32 = 1u32 << 7;
-
     fn profile_mechanisms(state: &crate::semantics::State) -> serde_json::Value {
         let mut ev = evidence();
         ev.verdict();
@@ -7926,8 +7926,8 @@ pub(crate) mod tests {
             crate::attach::CapturePolicy::Allowlisted,
         );
         let mut first = init_event(0, UNREGISTERED_SENTINEL, shape::NONE, 0, 0, 0);
-        first.capture |= UNREGISTERED_BIT;
-        let mut second = first.clone();
+        first.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        let mut second = first;
         second.duration_ns = 200;
         state.observe(&first);
         state.observe(&second);
@@ -8011,7 +8011,7 @@ pub(crate) mod tests {
             crate::attach::CapturePolicy::Allowlisted,
         );
         let mut init = init_event(0, UNREGISTERED_SENTINEL, shape::NONE, 0, 0, 0);
-        init.capture |= UNREGISTERED_BIT;
+        init.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
         state.observe(&init);
         state.observe(&sign_op_event());
 
@@ -8032,7 +8032,7 @@ pub(crate) mod tests {
             crate::attach::CapturePolicy::Allowlisted,
         );
         let mut init = init_event(0, UNREGISTERED_SENTINEL, shape::NONE, 0, 0, 0);
-        init.capture |= UNREGISTERED_BIT;
+        init.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
         state.observe(&init);
         let mut modules = std::collections::BTreeSet::new();
         modules.insert(crate::plan::ModuleId(99));

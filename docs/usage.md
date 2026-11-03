@@ -80,23 +80,29 @@ There is no decoder or dump flag for PINs, key material, `CKA_VALUE`, labels,
 operation-state blobs, raw mechanism byte arrays, raw session handles, or
 ordinary buffers.
 
-Public profile evidence covers functions, registered mechanisms, return
+Public profile evidence covers functions, mechanisms, return
 codes, latency and admitted lifecycle observations. Key creation, derivation
 and destruction are shown the same way: calls such as `C_CreateObject`,
 `C_GenerateKey`, `C_GenerateKeyPair`, `C_DeriveKey`, `C_UnwrapKey`,
 `C_CopyObject` and `C_DestroyObject` appear as function rows with their
 mechanism id and call count, including named vendor key-generation
 mechanisms (for example NSS `CKM_NSS_*` ids); parameters and key material
-are never decoded. Profile, trace and metrics publish no object handles
+are never decoded. Mechanism ids outside the registry are shown as bare
+hex numbers with their call/error counts, marked unregistered
+(`registered: false` in JSON), instead of only a total. Profile, trace
+and metrics publish no object handles
 or object attribute facts. `evidence.object_capture`
 reports build availability, not an observed attribute. The unsafe diagnostic
 build described below does not enlarge the default allowlist.
 
-The default capture policy is `allowlisted`. For function and mechanism
-metadata, pointer-derived bytes reach output only by exact membership in a
-finite published set — a mechanism id in the registry, or one of the 104
-published function names. Other values in those fields are dropped even when
-a caller aliases a metadata pointer into unrelated readable memory. `metrics`
+The default capture policy is `allowlisted`. For function metadata,
+pointer-derived bytes reach output only by exact membership in a
+finite published set — one of the 104 published function names. Other
+values in that field are dropped even when
+a caller aliases a metadata pointer into unrelated readable memory.
+Mechanism ids are public constants: registered ids resolve by registry
+membership, and unregistered ids publish as numeric id plus counts
+only, never decoded into parameters. `metrics`
 mode uses `aggregate-only`, which reads no call arguments in the kernel at all.
 
 Release builds default to FULL. For attested object calls under `allowlisted`,

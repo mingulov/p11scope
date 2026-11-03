@@ -47,6 +47,13 @@ pub struct MechStat {
     /// mechanism simply has no decodable shape (or none observed), which
     /// is not a failure.
     pub init_no_shape: u64,
+    /// The Detailed return path published this id with
+    /// `capture::MECHANISM_UNREGISTERED`: outside `MECH_SHAPE`, so no
+    /// registry membership and no parameter shape, but the id and its
+    /// call/error counts are published. Sticky once set: membership is
+    /// fixed for the capture, so a later observation without the bit
+    /// would indicate a producer bug, surfaced as unregistered.
+    pub unregistered: bool,
 }
 
 #[cfg(test)]
@@ -58,10 +65,6 @@ mod corrective_tests {
     /// sentinel (see `vendor_mechanisms::unassigned_vendor_ids_stay_withheld`).
     const UNREGISTERED_SENTINEL: u64 = 0xCE53_43A9;
 
-    /// Wire value of the `MECHANISM_UNREGISTERED` capture bit. Spelled
-    /// literally until the named constant lands with the implementation.
-    const UNREGISTERED_BIT: u32 = 1u32 << 7;
-
     #[test]
     fn unregistered_mechanism_id_is_listed_with_its_call_count() {
         // The per-mechanism stats path aggregates by verbatim id; an
@@ -70,8 +73,8 @@ mod corrective_tests {
         let p = plan(&["C_SignInit"]);
         let mut state = State::new(&p);
         let mut first = mechanism(&p, "C_SignInit", 7, UNREGISTERED_SENTINEL, 0);
-        first.capture |= UNREGISTERED_BIT;
-        let mut second = first.clone();
+        first.capture |= capture::MECHANISM_UNREGISTERED;
+        let mut second = first;
         second.duration_ns = 200;
         state.observe(&first);
         state.observe(&second);
@@ -83,6 +86,20 @@ mod corrective_tests {
     }
 
     #[test]
+    fn unregistered_flag_is_sticky_once_observed() {
+        // Membership is fixed per capture; if one id were ever observed
+        // both ways, the row stays unregistered — surfacing the producer
+        // inconsistency toward the evidence total, never hiding it.
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::new(&p);
+        let mut flagged = mechanism(&p, "C_SignInit", 7, UNREGISTERED_SENTINEL, 0);
+        flagged.capture |= capture::MECHANISM_UNREGISTERED;
+        state.observe(&flagged);
+        state.observe(&mechanism(&p, "C_SignInit", 7, UNREGISTERED_SENTINEL, 0));
+        assert!(state.mechanisms()[&UNREGISTERED_SENTINEL].unregistered);
+    }
+
+    #[test]
     fn unregistered_mechanism_refused_by_state_budget_counts_a_disclosed_drop() {
         // The mechanisms map shares the capture's monotonic key budget:
         // a refused unregistered id never appears, and the refusal is
@@ -91,7 +108,7 @@ mod corrective_tests {
         let p = plan(&["C_SignInit"]);
         let mut state = State::with_limit(&p, 0);
         let mut init = mechanism(&p, "C_SignInit", 7, UNREGISTERED_SENTINEL, 0);
-        init.capture |= UNREGISTERED_BIT;
+        init.capture |= capture::MECHANISM_UNREGISTERED;
         state.observe(&init);
 
         assert!(state.mechanisms().is_empty());
@@ -578,6 +595,7 @@ mod corrective_tests {
             Binding {
                 mechanism: 9,
                 fork_safe: true,
+                unregistered: false,
             },
         );
         state.active_ops.insert(
@@ -585,6 +603,7 @@ mod corrective_tests {
             Binding {
                 mechanism: 9,
                 fork_safe: false,
+                unregistered: false,
             },
         );
         state.active_ops.insert(
@@ -592,6 +611,7 @@ mod corrective_tests {
             Binding {
                 mechanism: 9,
                 fork_safe: true,
+                unregistered: false,
             },
         );
         state.find_active.insert((parent, sess(7)));
@@ -661,6 +681,7 @@ mod corrective_tests {
                     Binding {
                         mechanism: 1,
                         fork_safe: true,
+                        unregistered: false,
                     },
                 );
             }
@@ -1180,6 +1201,7 @@ mod corrective_tests {
                     Binding {
                         mechanism: 1,
                         fork_safe: true,
+                        unregistered: false,
                     },
                 );
             }
@@ -1934,6 +1956,10 @@ struct SessionInfo {
 struct Binding {
     mechanism: u64,
     fork_safe: bool,
+    /// The binding Init carried `capture::MECHANISM_UNREGISTERED`.
+    /// Operational calls attributed through this binding recreate the
+    /// mechanism row (after a row purge) with the flag intact.
+    unregistered: bool,
 }
 
 #[derive(Clone)]
@@ -2558,6 +2584,7 @@ impl State {
             return;
         }
         let stat = self.mechanisms.entry(mechanism).or_default();
+        stat.unregistered |= ev.capture & capture::MECHANISM_UNREGISTERED != 0;
         record_call(stat, ev);
         // E19: skip the `String` allocation when the operation name is
         // already recorded. `BTreeSet<String>::contains` borrows `&str`,
@@ -2607,6 +2634,7 @@ impl State {
                             Binding {
                                 mechanism,
                                 fork_safe: meta.fork_safe,
+                                unregistered: ev.capture & capture::MECHANISM_UNREGISTERED != 0,
                             },
                         );
                     }
@@ -2626,19 +2654,23 @@ impl State {
     }
 
     fn apply_operations(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
-        let mut mechanisms = BTreeSet::new();
+        // One entry per attributed mechanism id; the flag OR-merges
+        // across bindings (bindings for one id always agree in
+        // production — membership is fixed per capture — so a set bit
+        // anywhere wins, exactly like the sticky row flag).
+        let mut mechanisms = BTreeMap::new();
         for (operation, _) in operation_bits(meta.semantics.operations) {
             match self
                 .active_ops
                 .get(&(process, meta.session(ev.session), operation))
             {
                 Some(binding) => {
-                    mechanisms.insert(binding.mechanism);
+                    *mechanisms.entry(binding.mechanism).or_insert(false) |= binding.unregistered;
                 }
                 None => self.orphan_ops += 1,
             }
         }
-        for mechanism in mechanisms {
+        for (mechanism, unregistered) in mechanisms {
             // E19: same fused admission-before-insertion as
             // `record_requested_mechanism`: one probe plus one entry. A
             // refused mechanism cell still records cgroup attribution,
@@ -2648,7 +2680,9 @@ impl State {
                 self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
                 continue;
             }
-            record_call(self.mechanisms.entry(mechanism).or_default(), ev);
+            let stat = self.mechanisms.entry(mechanism).or_default();
+            stat.unregistered |= unregistered;
+            record_call(stat, ev);
             self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv);
         }
 

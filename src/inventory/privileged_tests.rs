@@ -6941,7 +6941,61 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
     // are counted but refused from semantic conversion by design, each
     // refusal disclosed; `api_returns`/`reduced` cover the semantic
     // side only, never the raw entered total.
-    let q2_polls = service_to_published(&mut lane, &mut coordinator, false, "r16-q2")?;
+    //
+    // A demandless idle collection still in flight at the release binds
+    // q2's demand and publishes first, without A's END: its collection
+    // began pre-release, and service_to_published returns at that first
+    // publish. Keep driving publishes until every entered call is
+    // accounted (attributed, refused or disclosed-shed), so the asserts
+    // below read the post-release publication. Bounded: a product that
+    // never accounts the END fails here with its name on it.
+    let caller_a = caller_of(&coordinator, process_a.pid())?;
+    let caller_b = caller_of(&coordinator, process_b.pid())?;
+    let q2_accounted_by = Instant::now() + Duration::from_secs(60);
+    let mut q2_polls = 0u64;
+    let mut q2_drives = 0u64;
+    loop {
+        q2_polls += service_to_published(&mut lane, &mut coordinator, false, "r16-q2")?;
+        q2_drives += 1;
+        let api_a_probe = joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so")
+            .ok()
+            .and_then(|edge| edge.api_returns)
+            .unwrap_or(0);
+        let api_b_probe = joint_edge_snapshot(&coordinator, process_b.pid(), "soft-copy.so")
+            .ok()
+            .and_then(|edge| edge.api_returns)
+            .unwrap_or(0);
+        let slot_probe = count_disclosed_gaps(
+            &coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_a),
+        ) + count_disclosed_gaps(
+            &coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_b),
+        );
+        let inst_probe = coordinator.registry().instance_calls_refused(caller_a)
+            + coordinator.registry().instance_calls_refused(caller_b);
+        let shed_probe = lane.shed_calls_disclosed();
+        let api_probe = api_a_probe + api_b_probe;
+        eprintln!(
+            "JOINT_R16 r16-q2-drive n={q2_drives} revision={} entered={} api={api_probe} \
+             shed={shed_probe} slot={slot_probe} inst={inst_probe}",
+            coordinator.registry().published_revision(),
+            a_total + b_total,
+        );
+        if a_total + b_total == api_probe + shed_probe + slot_probe + inst_probe {
+            break;
+        }
+        ensure!(
+            Instant::now() < q2_accounted_by,
+            "r16-q2: calls still unaccounted after {q2_drives} post-release publishes: entered {} \
+             vs api {api_probe} + shed {shed_probe} + slot {slot_probe} + inst {inst_probe}",
+            a_total + b_total,
+        );
+    }
     s1_feed_check(
         &coordinator,
         "r16-q2",
@@ -6971,8 +7025,6 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         "soft-copy.so",
         &b_by_fn,
     );
-    let caller_a = caller_of(&coordinator, process_a.pid())?;
-    let caller_b = caller_of(&coordinator, process_b.pid())?;
     let api_a = edge_a.api_returns.unwrap_or(0);
     let api_b = edge_b.api_returns.unwrap_or(0);
     let slot_a = count_disclosed_gaps(
@@ -7219,7 +7271,7 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
     }
     assert_quiet_twins_except(&coordinator, "r16-q2", &exemptions)?;
     eprintln!(
-        "JOINT_R16 r16-q2 polls={q2_polls} revision={revision} feeds={} receipts={} key_aggs={} \
+        "JOINT_R16 r16-q2 polls={q2_polls} drives={q2_drives} revision={revision} feeds={} receipts={} key_aggs={} \
          key_rows={} a_api={:?} b_api={:?}",
         coordinator.registry().joint_feeds(),
         receipts.len(),

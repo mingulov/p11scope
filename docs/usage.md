@@ -476,10 +476,12 @@ count `pid_descendant_gaps` through the same bounded unmatched-exit ledger
 as cgroup scope (overflow latches one lower-bound increment and `PARTIAL`).
 With `--track-short-lived`, each novel unmatched exit also gains an
 exit-time mapping verdict (`gap_exit_mappings` beside the gap count):
-whether the kernel saw a watched provider file mapped when the process
-exited (`mapped`) or cannot tell (`unknown`). Multi-threaded exits and
-late watches read `unknown`; nothing here proves a process did not map
-a watched provider.
+whether the kernel recorded a localized mapping of a watched provider
+file by the process at some point while watched (`mapped`) or cannot
+tell (`unknown`); the cells persist across unmap and exec, so `mapped`
+never means the file was still mapped at the exit instant.
+Multi-threaded exits and late watches read `unknown`; nothing here
+proves a process did not map a watched provider.
 `p11scope doctor` needs no scope flags for a system capture: its host
 program preflight already covers the whole-machine lane.
 `--duration` (bare
@@ -570,10 +572,12 @@ coalescing overflow marks `PARTIAL` without another increment. Replayed or
 further unremembered exits do not increment again. With
 `--track-short-lived`, each novel unmatched exit also gains an exit-time
 mapping verdict (`gap_exit_mappings` beside `pid_descendant_gaps`):
-whether the kernel saw a watched provider file mapped when the process
-exited (`mapped`) or cannot tell (`unknown`). Multi-threaded exits and
-late watches read `unknown`; nothing here proves a process did not map
-a watched provider.
+whether the kernel recorded a localized mapping of a watched provider
+file by the process at some point while watched (`mapped`) or cannot
+tell (`unknown`); the cells persist across unmap and exec, so `mapped`
+never means the file was still mapped at the exit instant.
+Multi-threaded exits and late watches read `unknown`; nothing here
+proves a process did not map a watched provider.
 Arbitrary enter-then-migrate-out before refresh or exit remains outside the
 `COMPLETE` and runtime-qualified claims; no migration subsystem is provided.
 PID scope remains exact and does not attach process-creation tracking.

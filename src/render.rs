@@ -651,17 +651,21 @@ pub struct DiscoveryEvidence {
     pub scan_ms: u64,
     /// 6.14 Option A exit-time mapping split, `None` unless extensive
     /// mode armed. Serde-skipped carrier: the profile lane hoists it to
-    /// the top-level `gap_exit_mappings` key in `versioned_evidence`,
-    /// while metrics and trace embed `Evidence` directly and never see
-    /// it. Stamped from live engine state on every `capture_facts()`.
+    /// the top-level `gap_exit_mappings` key in `versioned_evidence`;
+    /// metrics embeds `Evidence` directly and never sees it, while
+    /// trace shares the hoist but never arms, so the key is absent in
+    /// both. Stamped from live engine state on every `capture_facts()`.
     #[serde(skip)]
     pub gap_exit_mappings: Option<GapExitMappings>,
 }
 
 /// 6.14 Option A exit-time split of the novel unmatched-exit
-/// subpopulation: leaders that had a watched provider file mapped at
-/// exit (`mapped`) vs every other shape (`unknown`). Nominally `pub`
-/// for the `DiscoveryEvidence` carrier; only the two counts render.
+/// subpopulation: leaders for which the kernel recorded a localized
+/// mapping of a watched provider file at some point while watched
+/// (`mapped`; the cells persist across unmap and exec, so this never
+/// means the file was still mapped at the exit instant) vs every
+/// other shape (`unknown`). Nominally `pub` for the
+/// `DiscoveryEvidence` carrier; only the two counts render.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GapExitMappings {
     pub mapped: u64,
@@ -3835,6 +3839,34 @@ pub(crate) mod tests {
             &capture_fixture(),
         );
         assert!(profile["evidence"].get("gap_exit_mappings").is_none());
+    }
+
+    // The trace lane renders through the shared `versioned_evidence`
+    // hoist (not a direct `Evidence` embed like metrics), so an armed
+    // `Evidence` publishes the split key in a trace terminal record
+    // too; absence in real traces holds only via the arming gate
+    // (trace never arms: `extensive_effective` requires
+    // `Kind::Profile`).
+    #[test]
+    fn trace_evidence_line_hoists_armed_gap_exit_mappings() {
+        let line_for = |ev: &Evidence| {
+            let line = crate::trace::evidence_line(ev, crate::attach::CapturePolicy::Allowlisted);
+            serde_json::from_str::<serde_json::Value>(line.strip_prefix("EVIDENCE ").unwrap())
+                .unwrap()
+        };
+        let mut armed = evidence();
+        armed.discovery.gap_exit_mappings = Some(GapExitMappings {
+            mapped: 1,
+            unknown: 2,
+        });
+        assert_eq!(
+            line_for(&armed)["gap_exit_mappings"],
+            serde_json::json!({"mapped": 1, "unknown": 2})
+        );
+        assert!(
+            line_for(&evidence()).get("gap_exit_mappings").is_none(),
+            "unarmed evidence omits the key in trace too"
+        );
     }
 
     // The exit-mapping split is informational, never a call, share,

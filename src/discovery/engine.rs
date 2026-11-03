@@ -11212,7 +11212,7 @@ impl Engine {
     /// the gap counter it never moves calls or attribution; unlike
     /// it, the split is `None` (key omitted) unless armed.
     pub(crate) fn gap_exit_mappings(&self) -> Option<render::GapExitMappings> {
-        self.extensive.enabled().then(|| render::GapExitMappings {
+        self.extensive.enabled().then_some(render::GapExitMappings {
             mapped: self.exit_map.mapped,
             unknown: self.exit_map.unknown,
         })

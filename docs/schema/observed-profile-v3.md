@@ -292,11 +292,14 @@ invisible by design and reads `no_static_link_within_scope`.
 profile `--cgroup`/`--system` captures only; absent, never null,
 otherwise). It splits the same novel unmatched-exit subpopulation of
 `pid_descendant_gaps` (admissions and overflow sentinels carry no
-verdict) by the kernel's exit-time answer: `mapped` (the exiting
-leader had a watched provider file mapped when it exited, with no
-disqualifying refusal) and `unknown` (no record, shared mm, refused
-hooks, late watch, local fault, or empty slots). It is a kernel
-observation, not a static hint, so it carries no label or scope: the
+verdict) by the kernel's exit-time answer: `mapped` (the kernel
+recorded a localized mapping of a watched provider file by the
+exiting leader at some point while watched, with no disqualifying
+refusal; the cells persist across unmap and exec, so this never
+means the file was still mapped at the exit instant) and `unknown`
+(no record, shared mm, refused hooks, late watch, local fault, or
+empty slots). It is a kernel observation, not a static hint, so
+it carries no label or scope: the
 value is exactly `{"mapped", "unknown"}` as saturating u64s summing
 to the classified subpopulation, never to `pid_descendant_gaps`
 itself. Multi-threaded exits read `unknown`: a process with more

@@ -199,6 +199,7 @@ jobs:
             echo "refusing: a gate-1 build-script output is present" >&2
             exit 1
           fi
+          shopt -s nullglob
           detailed=(target/debug/build/p11scope-*/out/p11scope-ebpf)
           test "${#detailed[@]}" -ge 1
           for obj in "${detailed[@]}"; do

@@ -2465,10 +2465,11 @@ fn sealed_fingerprint(
     )
 }
 
-/// One staged END to its sealed completion fact. Session outputs are never
-/// observed (no session-result protocol exists): session-creating lifecycle
-/// calls report their output unreadable, honestly unknown rather than
-/// absent; everything else reports no output.
+/// One staged END to its sealed completion fact. A successful
+/// `C_OpenSession` END carries the handle the return read from the
+/// application's output cell (allowlist v1; the BEGIN/END agreement admits
+/// that rewrite only on an OK or pending return with a non-null output);
+/// see [`session_output_of`]. Everything else reports no session output.
 fn completed_of(end_ordinal: u64, function: u32, end: &ValidatedJournalEnd) -> CompletedFact {
     let base = end.payload_base();
     let tail = end.payload_tail();
@@ -2488,7 +2489,7 @@ fn completed_of(end_ordinal: u64, function: u32, end: &ValidatedJournalEnd) -> C
         rv: event.rv,
         return_mechanism: mechanism_evidence(event.capture, event.mechanism),
         results,
-        session_out: session_output_of(function),
+        session_out: session_output_of(function, event),
         found: find_of(action, &tail, end.tail_absent()),
         attributes: attributes_of(action, &tail, end.tail_absent()),
     }
@@ -2507,11 +2508,25 @@ fn tail_u64(tail: &[u8; 240], offset: usize) -> u64 {
     ])
 }
 
-fn session_output_of(function: u32) -> HandleInput<SessionHandle> {
-    if Some(function) == crate::kinds::function_id("C_OpenSession") {
-        HandleInput::Unreadable
+/// The session output of one sealed END, by the same rule S1 applies to
+/// the same return event: a `CKR_OK` `C_OpenSession` whose return read
+/// produced a word (not `SESSION_NONE`, the unread or failed-read value)
+/// names its new session. Any other `C_OpenSession` outcome stays
+/// honestly unreadable rather than absent; other calls have no output.
+fn session_output_of(
+    function: u32,
+    event: &p11scope_ebpf_common::Event,
+) -> HandleInput<SessionHandle> {
+    if Some(function) != crate::kinds::function_id("C_OpenSession") {
+        return HandleInput::Absent;
+    }
+    if event.rv == pkcs11_types::CkRv::OK.0
+        && event.session != p11scope_ebpf_common::SESSION_NONE
+        && let Some(handle) = SessionHandle::new(event.session)
+    {
+        HandleInput::Value(handle)
     } else {
-        HandleInput::Absent
+        HandleInput::Unreadable
     }
 }
 

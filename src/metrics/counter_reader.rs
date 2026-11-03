@@ -6138,9 +6138,9 @@ mod tests {
         })
     }
 
-    /// The root cells run by hand with CARGO_TARGET_TMPDIR set (cargo
-    /// sets it only while compiling integration tests, never for this
-    /// lib test at run time).
+    /// The runner sets CARGO_TARGET_TMPDIR to an owned-child-writable
+    /// dir for this cell (cargo sets it only while compiling
+    /// integration tests, never for this lib test at run time).
     fn counter_cli_run_marker_path(id: u32) -> std::path::PathBuf {
         counter_cli_run_marker_path_from(|name| std::env::var_os(name), id)
             .expect("CARGO_TARGET_TMPDIR for owned-child marker")

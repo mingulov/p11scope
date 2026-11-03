@@ -2990,11 +2990,10 @@ fn privileged_instance_zombie_leader_sharer_globalizes() -> Result<()> {
 /// executing from untouched text while the header page's VMAs are
 /// zapped through `unmap_mapping_range`, which must still reach the
 /// munmap hook — a miss there stays a hook-completeness finding, not
-/// a soft control. Static skip: needs punch-hole support under TMPDIR
-/// (btrfs/ext4/xfs; tmpfs refuses); run by hand as root with a suitable
-/// TMPDIR.
+/// a soft control. Default campaign cell: needs punch-hole support under
+/// the runner's TMPDIR (btrfs/ext4/xfs; tmpfs refuses).
 #[test]
-#[ignore = "privileged: loads BPF; needs punch-hole-capable TMPDIR, run by hand"]
+#[ignore = "privileged: loads BPF; needs punch-hole-capable runner TMPDIR"]
 fn privileged_instance_cross_process_punch_hole_renews() -> Result<()> {
     let CmdSetup {
         _directory,

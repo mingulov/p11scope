@@ -10439,6 +10439,7 @@ fn prearm_finish_closes_watches_and_merges_assembly_keys() {
         &crate::metrics::KernelEvidence::default(),
         0,
         None,
+        false,
     );
     assert_eq!(engine.discovery.modules.len(), 1);
     let record = &engine.discovery.modules[0];
@@ -10489,6 +10490,7 @@ fn finish_prearm_terminal_health(
         &kernel,
         malformed_records,
         None,
+        false,
     );
     assert_eq!(engine.discovery.modules.len(), 1);
     *engine.discovery.modules[0]
@@ -10575,6 +10577,7 @@ fn prearm_scope_identity_refusal_ends_scope_uncertain() {
         &crate::metrics::KernelEvidence::default(),
         0,
         None,
+        false,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10626,6 +10629,7 @@ fn prearm_link_gaps_refuse_idle() {
         &crate::metrics::KernelEvidence::default(),
         0,
         None,
+        false,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10694,6 +10698,7 @@ fn prearm_object_change_detected_after_stop_never_exceeds_first_stop() {
         &crate::metrics::KernelEvidence::default(),
         0,
         None,
+        false,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10777,6 +10782,7 @@ fn prearm_unknown_first_stop_keeps_end_unknown_after_object_change() {
         &crate::metrics::KernelEvidence::default(),
         0,
         None,
+        false,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10824,6 +10830,7 @@ fn prearm_unknown_first_stop_healthy_watch_ends_unknown() {
         &crate::metrics::KernelEvidence::default(),
         0,
         None,
+        false,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10883,6 +10890,7 @@ fn prearm_unknown_first_stop_preserves_pre_stop_close() {
         &crate::metrics::KernelEvidence::default(),
         0,
         None,
+        false,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10949,6 +10957,7 @@ fn generic_terminal_assembly_discloses_late_discovery_window() {
         &crate::metrics::KernelEvidence::default(),
         0,
         None,
+        false,
     );
     let record = &engine.discovery.modules[0];
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11064,6 +11073,7 @@ fn prearm_pause_hold_across_window_empties_windows() {
         &crate::metrics::KernelEvidence::default(),
         0,
         Some(scripted_hold(Some(50), Some(900), true)),
+        true,
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11085,6 +11095,7 @@ fn prearm_pause_hold_gap_keeps_window() {
         &crate::metrics::KernelEvidence::default(),
         0,
         Some(scripted_hold(Some(50), Some(900), false)),
+        true,
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11107,6 +11118,7 @@ fn prearm_pause_hold_released_before_last_stamp_keeps_window() {
         &crate::metrics::KernelEvidence::default(),
         0,
         Some(scripted_hold(Some(50), Some(800), true)),
+        true,
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11134,6 +11146,7 @@ fn prearm_pause_hold_missing_clock_keeps_window() {
             &crate::metrics::KernelEvidence::default(),
             0,
             Some(hold),
+            true,
         );
         let record = watched_prearm_record(&engine);
         assert_eq!(record.attached_at_ns, Some(Some(900)), "hold {hold:?}");
@@ -11165,6 +11178,7 @@ fn prearm_pause_hold_unstamped_member_discloses_nothing() {
         &crate::metrics::KernelEvidence::default(),
         0,
         Some(scripted_hold(Some(50), Some(900), true)),
+        true,
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(None));
@@ -11186,6 +11200,7 @@ fn prearm_no_pause_hold_keeps_window() {
         &crate::metrics::KernelEvidence::default(),
         0,
         None,
+        false,
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11235,6 +11250,7 @@ fn pause_gate_proofs_need_every_declared_stamp_per_object() {
         &plan,
         &BTreeMap::from([(0, 900), (1, 1200)]),
         hold,
+        true,
     );
     assert_eq!(proofs.len(), 1);
     assert_eq!(
@@ -11248,9 +11264,19 @@ fn pause_gate_proofs_need_every_declared_stamp_per_object() {
 
     // Either member unstamped: no proof for the object.
     for stamps in [BTreeMap::from([(0, 900)]), BTreeMap::from([(1, 1200)])] {
-        let proofs = Engine::pause_gate_exactness_proofs(&watches, &plan, &stamps, hold);
+        let proofs = Engine::pause_gate_exactness_proofs(&watches, &plan, &stamps, hold, true);
         assert!(proofs.is_empty(), "stamps {stamps:?}");
     }
+
+    // A non-`run` scope emits no proof however complete the hold.
+    let proofs = Engine::pause_gate_exactness_proofs(
+        &watches,
+        &plan,
+        &BTreeMap::from([(0, 900), (1, 1200)]),
+        hold,
+        false,
+    );
+    assert!(proofs.is_empty());
 }
 
 /// A hold naming a later start than the scope start mismatches the
@@ -11269,6 +11295,30 @@ fn prearm_pause_hold_late_start_keeps_window() {
         &crate::metrics::KernelEvidence::default(),
         0,
         Some(scripted_hold(Some(60), Some(900), true)),
+        true,
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
+}
+
+/// A non-`run` scope with identical stamps and a complete scripted hold
+/// still keeps the window: only the owned child's hold proves exactness.
+#[test]
+fn prearm_non_run_scope_with_hold_keeps_window() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(900), true)),
+        false,
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));

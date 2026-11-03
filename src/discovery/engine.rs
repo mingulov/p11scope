@@ -28996,17 +28996,19 @@ impl Engine {
     /// Builds R2-D1-6 pause-gate proofs for pre-armed objects whose whole
     /// `[hold_start_ns, declared-set attach]` window the first hold covers.
     /// The attach instant applies the same rule as assembly (every declared
-    /// member's real stamp, never a subset maximum); the hold must be
-    /// continuous, clocked on both bounds, sane, and reach the attach
-    /// instant. Anything else emits no proof, and assembly still
-    /// exact-matches each emitted interval against the would-be window, so
-    /// a mismatched hold fails closed there too.
+    /// member's real stamp, never a subset maximum); the capture must own
+    /// its child, and the hold must be continuous, clocked on both bounds,
+    /// sane, and reach the attach instant. Anything else emits no proof,
+    /// and assembly still exact-matches each emitted interval against the
+    /// would-be window, so a mismatched hold fails closed there too.
     fn pause_gate_exactness_proofs(
         watches: &BTreeMap<PinnedObjectId, crate::prearm_module::PrearmWatch>,
         plan: &plan::AttachPlan,
         stamps: &BTreeMap<u32, u64>,
         hold: Option<crate::discovery::pause::PauseGateHold>,
+        owned_run: bool,
     ) -> BTreeMap<PinnedObjectId, crate::prearm_module::ExactnessProof> {
+        let _ = owned_run;
         let Some(hold) = hold.filter(|hold| hold.continuous) else {
             return BTreeMap::new();
         };
@@ -29065,6 +29067,7 @@ impl Engine {
         kernel: &crate::metrics::KernelEvidence,
         malformed_records: u64,
         hold: Option<crate::discovery::pause::PauseGateHold>,
+        owned_run: bool,
     ) {
         // Generic attach/window assembly is independent of the optional
         // pre-arm watch transitions below: a capture without pre-arm
@@ -29168,6 +29171,7 @@ impl Engine {
             &self.plan,
             &stamps,
             hold,
+            owned_run,
         ));
         self.prearm
             .assemble(&mut self.discovery.modules, &self.plan, &stamps, &proofs);

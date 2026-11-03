@@ -2357,17 +2357,23 @@ fn prearm_terminal_kernel(session: &Session) -> Result<metrics::KernelEvidence> 
     metrics::kernel_evidence(session)
 }
 
-/// The pre-arm hold claim for the terminal proofs builder, if this capture
-/// is an owned `run` whose pause gate proved a hold: the run's own
-/// pre-spawn scope start (spawn order plus the pre-exec barrier bridge the
-/// prefix before the pause segment) composed with the coordinator's proven
-/// end and gap flag. Every other capture threads nothing, so its windows
-/// stay disclosed.
-fn owned_prearm_hold(owned: Option<&Owned>) -> Option<crate::discovery::pause::PauseGateHold> {
-    let owned = owned?;
-    let mut hold = owned.coordinator.pause_hold()?;
+/// The pre-arm hold claim for the terminal proofs builder: whether this
+/// capture owns its child (the only scope whose pre-spawn start, barrier,
+/// and pause segment compose the from-start claim), plus the run's own
+/// pre-spawn scope start composed with the coordinator's proven end and gap
+/// flag when the pause gate proved a hold. Captures without an owned child
+/// thread `(None, false)`, so their windows stay disclosed.
+fn owned_prearm_hold(
+    owned: Option<&Owned>,
+) -> (Option<crate::discovery::pause::PauseGateHold>, bool) {
+    let Some(owned) = owned else {
+        return (None, false);
+    };
+    let Some(mut hold) = owned.coordinator.pause_hold() else {
+        return (None, true);
+    };
     hold.start_ns = owned.prearm_scope_start_ns;
-    Some(hold)
+    (Some(hold), true)
 }
 
 /// Closes pre-arm watches at terminal publication (packet 6.13, R2-D1-4/7):
@@ -2388,6 +2394,7 @@ fn finish_prearm_terminal(
     malformed_records: u64,
     stop_ns: Option<u64>,
     hold: Option<crate::discovery::pause::PauseGateHold>,
+    owned_run: bool,
 ) {
     let used = if engine.has_prearm_watches() {
         prearm_used_modules(reports, engine.plan(), engine.pinned())
@@ -2403,6 +2410,7 @@ fn finish_prearm_terminal(
         kernel,
         malformed_records,
         hold,
+        owned_run,
     );
 }
 
@@ -6384,6 +6392,7 @@ fn capture_profile(
             .pinned()
             .check_unchanged()
             .map_err(anyhow::Error::msg)?;
+        let (prearm_hold, prearm_owned_run) = owned_prearm_hold(context.2.as_deref());
         finish_prearm_terminal(
             context.0,
             &*context.1,
@@ -6393,7 +6402,8 @@ fn capture_profile(
             &kernel_evidence,
             *consumers.malformed_records,
             stop_ns,
-            owned_prearm_hold(context.2.as_deref()),
+            prearm_hold,
+            prearm_owned_run,
         );
         let settle_start = crate::attach::monotonic_ns();
         context.0.settle_terminal_drain();
@@ -7243,6 +7253,7 @@ fn capture_trace(
                     // watch health only; the publication sample stays after
                     // `settle_terminal_drain` (trace terminal-order contract).
                     let watch_kernel = prearm_terminal_kernel(context.1)?;
+                    let (prearm_hold, prearm_owned_run) = owned_prearm_hold(context.2.as_deref());
                     finish_prearm_terminal(
                         context.0,
                         &*context.1,
@@ -7252,7 +7263,8 @@ fn capture_trace(
                         &watch_kernel,
                         *consumers.malformed_records,
                         watch_stop_ns,
-                        owned_prearm_hold(context.2.as_deref()),
+                        prearm_hold,
+                        prearm_owned_run,
                     );
                     let settle_start = crate::attach::monotonic_ns();
                     context.0.settle_terminal_drain();
@@ -13703,6 +13715,7 @@ mod tests {
                 0,
                 Some(1000),
                 None,
+                false,
             );
             let watch = engine.discovery().modules[0]
                 .watch
@@ -13711,6 +13724,13 @@ mod tests {
             assert_eq!(watch.until_ns, Some(1000));
             assert_eq!(watch.ended_by, Some(cause));
         }
+    }
+
+    #[test]
+    fn owned_prearm_hold_without_owned_child_threads_no_claim() {
+        // A non-`run` scope has no owned child: no hold and no owned-run
+        // claim, so the terminal builder keeps every window.
+        assert_eq!(owned_prearm_hold(None), (None, false));
     }
 
     #[test]
@@ -13796,6 +13816,7 @@ mod tests {
                 end_ns: Some(900),
                 continuous: true,
             }),
+            true,
         );
         let record = &engine.discovery().modules[0];
         assert_eq!(record.attached_at_ns, Some(Some(900)));

@@ -504,3 +504,59 @@ fn presentation_without_semantic_calls_adds_no_bootstrap_gap() {
             .all(|gap| gap.reason != "joint_birth_unoffered")
     );
 }
+
+/// The middle twin: one registered instance with zero reduced calls
+/// still yields a semantic row, so its silent `bootstrap_unavailable`
+/// is named. The gap fires on registration, not on observed calls.
+#[test]
+fn presentation_with_registered_instance_and_no_calls_names_bootstrap_gap() {
+    use crate::attach::capture::NativeDomainId;
+    use crate::discovery::caller_registry::ModuleKey;
+    use crate::discovery::caller_registry::instance_input as instance;
+    use crate::discovery::instances::InstanceId;
+    use p11scope_ebpf_common::ImageIdentity;
+    let mut harness = Harness::new(RegistryLimits::default_limits()).unwrap();
+    harness.stage_scale(&ScaleSpec {
+        name: "idle-registered",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 94_000,
+    });
+    harness.commit();
+    let caller = harness
+        .coordinator()
+        .adapter()
+        .live_id(94_000)
+        .expect("live caller");
+    let module = ModuleKey::physical(8, 1, 100_000, Some("sha000000".into()), "/scale/m0.so");
+    let domain = NativeDomainId::mint();
+    let key = instance::key(
+        domain,
+        ImageIdentity {
+            task_cookie: 1000,
+            exec_id: 0,
+        },
+        InstanceId::from_raw(1),
+        module,
+    );
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_instance(instance::registration(key, caller, 100, None));
+    harness.commit();
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    assert_eq!(
+        presentation.object_observations.reason,
+        "bootstrap_unavailable"
+    );
+    assert_eq!(presentation.semantic_edges.len(), 1);
+    assert!(
+        presentation
+            .gaps
+            .iter()
+            .any(|gap| gap.reason == "joint_birth_unoffered"),
+        "a registered instance with no calls is still owed a name"
+    );
+}

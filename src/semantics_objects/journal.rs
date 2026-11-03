@@ -4718,7 +4718,9 @@ impl JournalAdapter {
     /// producer's rewrite rules against the BEGIN, exact against a staged
     /// END). A claim on the same entry-time identity that reports a return
     /// this entry cannot have made is a different call: no claimant
-    /// attributes, so the entry stays Unclaimed and the seal holds.
+    /// attributes, so the entry stays Unclaimed and the seal ends
+    /// `ClaimUnmatched` (a second claim on the identity would taint); it
+    /// holds only while no claim sits on the identity.
     fn claimants_naming(
         &self,
         shape: &StagedShape,

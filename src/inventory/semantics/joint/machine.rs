@@ -168,10 +168,7 @@ fn pregrant_close_reason(
     } else if !inputs.hold_open {
         PregrantCloseReason::NoHold
     } else {
-        debug_assert!(
-            inputs.timed_out,
-            "a declined extension names its cause"
-        );
+        debug_assert!(inputs.timed_out, "a declined extension names its cause");
         PregrantCloseReason::Timeout
     })
 }
@@ -2927,10 +2924,7 @@ impl LiveJointMachine {
                                         .expect("a declined extension names its cause"),
                                     None if failed => PregrantCloseReason::Custody,
                                     None => {
-                                        debug_assert!(
-                                            requested,
-                                            "the cheap gate names its cause"
-                                        );
+                                        debug_assert!(requested, "the cheap gate names its cause");
                                         if q.is_some() {
                                             PregrantCloseReason::Q
                                         } else {

@@ -3322,7 +3322,10 @@ fn joint_pregrant_close_reasons_counted() {
         "the expired bound closes the extended quantum"
     );
     let counts = scene.machine.pregrant_close_counts_for_test();
-    assert_eq!(counts.request, 1, "the empty first quantum closes by request");
+    assert_eq!(
+        counts.request, 1,
+        "the empty first quantum closes by request"
+    );
     assert_eq!(counts.timeout, 1, "the held quantum closes by timeout");
     assert_eq!(counts.raw_capacity, 0, "no RAW close");
     assert_eq!(counts.max_pending, 0, "no MAX_PENDING close");

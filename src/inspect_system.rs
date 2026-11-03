@@ -6141,6 +6141,96 @@ mod tests {
             )
         }
 
+        /// A provider with `tables` bare heuristic tables of
+        /// `entries_per_table` endpoints each, for admission-wiring twins.
+        fn heuristic_provider(tables: usize, entries_per_table: usize) -> ScannedModule {
+            use crate::discovery::scan::{ScannedEntry, ScannedTable};
+            let mut provider = module(PROVIDER);
+            provider.view = ProcessViewId(0);
+            provider.tables = (0..tables)
+                .map(|table| ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries: (0..entries_per_table)
+                        .map(|entry| ScannedEntry {
+                            name: "C_Initialize",
+                            object: PROVIDER,
+                            object_path: PATH.into(),
+                            file_offset: 0x1000 + (table * entries_per_table + entry) as u64 * 8,
+                        })
+                        .collect(),
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000 + table as u64 * 0x1000,
+                    file_offset: Some(table as u64 * 0x1000),
+                    live_return: false,
+                    manifest_supported: false,
+                })
+                .collect();
+            provider
+        }
+
+        /// Lower `provider` over the standard over-cap collection under a
+        /// 32-endpoint Inventory budget, with the scope the collector
+        /// derives from `hints`.
+        fn inventory_catalog(provider: ScannedModule, hints: &[PathBuf]) -> Catalog {
+            let mut collection = over_cap(&[]);
+            collection.members[0].modules = vec![provider];
+            let snapshots: HashMap<u32, Vec<MapEntry>> = collection.sweep.iter().cloned().collect();
+            let bound = bind_collection(&mut collection);
+            let mut probe = Probe(snapshots, HashMap::new());
+            let checks = Checks {
+                changed: false,
+                nonunique: None,
+            };
+            let attributed = attribute_sweep(&mut collection, &bound, &mut probe, &checks);
+            assemble(
+                collection,
+                bound,
+                attributed,
+                AdmissionPolicy::Inventory(crate::capacity::InventoryBudget::new(32, 256).unwrap()),
+                collector_admission_scope(hints, false),
+            )
+        }
+
+        fn catalog_admission(catalog: &Catalog) -> &AdmissionRecord {
+            &catalog
+                .objects
+                .iter()
+                .find(|object| object.path == PATH)
+                .expect("the provider object")
+                .admission
+        }
+
+        #[test]
+        fn unaimed_inventory_capture_refuses_heuristic_module_at_the_reserve() {
+            // No hints: Shared scope, so a 32 budget reserves all 32 and
+            // the 32-endpoint heuristic module is refused whole.
+            let catalog = inventory_catalog(heuristic_provider(1, 32), &[]);
+            match catalog_admission(&catalog) {
+                AdmissionRecord::Refused { class, reason } => {
+                    assert_eq!(*class, "heuristic");
+                    assert!(reason.contains("reserved"), "{reason}");
+                }
+                other => panic!("the reserve must refuse the module, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn aimed_inventory_capture_admits_heuristic_module_first_come() {
+            // One hint: Named scope, first-come with no reserve, so the
+            // same 32 endpoints admit.
+            let hints = [PathBuf::from(PATH)];
+            let catalog = inventory_catalog(heuristic_provider(1, 32), &hints);
+            match catalog_admission(&catalog) {
+                AdmissionRecord::Admitted { class, endpoints } => {
+                    assert_eq!(*class, "heuristic");
+                    assert_eq!(*endpoints, 32);
+                }
+                other => panic!("an aimed module must admit first-come, got {other:?}"),
+            }
+        }
+
         fn capped_gaps(catalog: &Catalog) -> Vec<&PidGap> {
             catalog
                 .skipped

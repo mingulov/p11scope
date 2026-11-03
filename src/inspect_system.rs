@@ -1924,6 +1924,16 @@ fn unexamined_maps_gap(pid: u32, count: usize) -> PidGap {
     )
 }
 
+/// The GT-5 admission rule for a collected catalog, mirroring the engine: a
+/// named process, or a capture the operator aimed with `--module`, admits
+/// first-come; any other system capture admits in value order with a reserve
+/// for late corroborated providers.
+///
+/// STUB (RED): always Shared.
+fn collector_admission_scope(_hints: &[PathBuf], _pid_scope: bool) -> AdmissionScope {
+    AdmissionScope::Shared
+}
+
 /// Lower one shared-scope plan over collected evidence and validated inputs,
 /// and project the catalog records — deep-scanned and maps-matched
 /// members alike. Pure: no `/proc` reads.
@@ -4388,6 +4398,31 @@ mod tests {
     };
     use crate::cli::IdentityBackendSelection;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn aimed_system_capture_lowers_without_shared_reserve() {
+        let hints = vec![std::path::PathBuf::from("/opt/provider.so")];
+        assert_eq!(
+            super::collector_admission_scope(&hints, false),
+            crate::plan::AdmissionScope::Named
+        );
+    }
+
+    #[test]
+    fn unaimed_system_capture_keeps_shared_reserve() {
+        assert_eq!(
+            super::collector_admission_scope(&[], false),
+            crate::plan::AdmissionScope::Shared
+        );
+    }
+
+    #[test]
+    fn pid_capture_is_always_named() {
+        assert_eq!(
+            super::collector_admission_scope(&[], true),
+            crate::plan::AdmissionScope::Named
+        );
+    }
 
     fn shared_with(
         selection: IdentityBackendSelection,

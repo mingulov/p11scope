@@ -6840,6 +6840,85 @@ fn r16_q1_dump_stuck(
     Ok(())
 }
 
+/// Scan published gaps for the disclosed q1 coverage-fault
+/// shape: the `semantic calls unrouted` subject whose reason names
+/// `coverage_fault` (the `record_gap` call in
+/// `inventory_coordinator/semantics.rs` with the
+/// `UnknownReason::CoverageFault` label). Returns the last matching
+/// reason for the refusal's evidence detail, or `None` when the shed
+/// is undisclosed. Pinned below: a producer rename turns the pin red
+/// instead of silently losing the named refusal.
+fn r16_q1_coverage_fault_gap(
+    gaps: &[crate::discovery::caller_registry::RegistryGap],
+) -> Option<String> {
+    let mut disclosed = None;
+    for gap in gaps {
+        if gap.subject == "semantic calls unrouted" && gap.reason.contains("coverage_fault") {
+            disclosed = Some(gap.reason.clone());
+        }
+    }
+    disclosed
+}
+
+// Pin: the q1 refusal fires only on the producer-shaped
+// coverage-fault gap (the `semantic calls unrouted` subject plus
+// `coverage_fault` in the reason); anything else waits. A renamed
+// subject or a shed without the fault disclosure returns None, so
+// the wiring cannot silently stop matching the producer.
+#[test]
+fn r16_q1_coverage_fault_gap_matches_only_the_disclosed_shape() {
+    use crate::discovery::caller_registry::RegistryGap;
+    fn gap(subject: &str, reason: &str) -> RegistryGap {
+        RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: subject.into(),
+            reason: reason.into(),
+            budget: None,
+        }
+    }
+    // Exact producer shape (the `record_gap` call in
+    // `inventory_coordinator/semantics.rs` with the
+    // `UnknownReason::CoverageFault` label).
+    let disclosed = "17 calls shed without a route (coverage_fault=17) with 0 bindings";
+    let gaps = [gap("semantic calls unrouted", disclosed)];
+    assert_eq!(
+        r16_q1_coverage_fault_gap(&gaps),
+        Some(disclosed.to_string())
+    );
+    // Wrong subject: the fault label alone never matches.
+    let gaps = [gap("semantic call outcome capacity", disclosed)];
+    assert_eq!(r16_q1_coverage_fault_gap(&gaps), None);
+    // An unrouted shed without the fault disclosure never matches.
+    let gaps = [gap(
+        "semantic calls unrouted",
+        "17 calls shed without a route (sticky=17) with 0 bindings",
+    )];
+    assert_eq!(r16_q1_coverage_fault_gap(&gaps), None);
+    // No gaps: nothing disclosed.
+    assert_eq!(r16_q1_coverage_fault_gap(&[]), None);
+    // A later plain unrouted row never clears an earlier disclosure.
+    let gaps = [
+        gap("semantic calls unrouted", disclosed),
+        gap(
+            "semantic calls unrouted",
+            "1 calls shed without a route (sticky=1) with 1 bindings",
+        ),
+    ];
+    assert_eq!(
+        r16_q1_coverage_fault_gap(&gaps),
+        Some(disclosed.to_string())
+    );
+    // Two disclosures: the last one wins (the refusal's evidence detail).
+    let later = "5 calls shed without a route (coverage_fault=5) with 2 bindings";
+    let gaps = [
+        gap("semantic calls unrouted", disclosed),
+        gap("semantic calls unrouted", later),
+    ];
+    assert_eq!(r16_q1_coverage_fault_gap(&gaps), Some(later.to_string()));
+}
+
 /// Dump-and-refuse for a stuck q1 drain. When the proven cross-talk
 /// shape holds (balanced with visible shed, an edge missing, the
 /// lane's coverage latched failed, and the shed disclosing its
@@ -6873,21 +6952,9 @@ fn r16_q1_refuse_if_proven_stuck(
     if !(balanced && edges_missing && shed > 0 && capture_failed) {
         return Ok(());
     }
-    let mut coverage_fault_disclosed = false;
-    let mut unrouted = String::from("none");
-    for gap in coordinator.registry().gaps() {
-        if gap.subject == "semantic calls unrouted" {
-            if gap.reason.contains("coverage_fault") {
-                coverage_fault_disclosed = true;
-                unrouted = gap.reason.clone();
-            } else if !coverage_fault_disclosed {
-                unrouted = gap.reason.clone();
-            }
-        }
-    }
-    if !coverage_fault_disclosed {
+    let Some(unrouted) = r16_q1_coverage_fault_gap(coordinator.registry().gaps()) else {
         return Ok(());
-    }
+    };
     r16_q1_dump_stuck(coordinator, lane, pid_a, pid_b)?;
     let cells = match lane.instance_fault_cells_for_test() {
         Some((fault, sticky)) => format!("fault_cell={fault} sticky_cell={sticky}"),

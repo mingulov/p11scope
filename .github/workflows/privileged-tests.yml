@@ -253,7 +253,7 @@ jobs:
           chmod +x "$in/lib-tests" "$in/bin/p11scope" "$in/bin/p11scope-discover"
           # Selectors come from the curated --list sections, never from a
           # hand-kept copy: a renamed cell fails the count check loudly.
-          awk '/^btrfs \(/{f=1;next} /^(marker|overlay|expected-failures) \(/{f=0} f' "$in/list.txt" \
+          awk '/^btrfs \(/{f=1;next} /^(overlay|expected-failures) \(/{f=0} f' "$in/list.txt" \
             | sed 's/ :: .*//' | grep -v '^$' >"$RUNNER_TEMP/btrfs-cells.txt"
           count=$(wc -l <"$RUNNER_TEMP/btrfs-cells.txt")
           declared=$(sed -n 's/^btrfs (\([0-9]*\)).*/\1/p' "$in/list.txt")

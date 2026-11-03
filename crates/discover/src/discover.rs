@@ -56,8 +56,13 @@ fn is_bare_library_name(name: &str) -> bool {
 /// symlinks (which could point outside the directory), directories and
 /// anything else are skipped, and names absent from the directory stay for
 /// the normal loader search. No environment is read or set: the loader
-/// environment stays sanitized. Any failure aborts the fallback; the caller
-/// keeps the original loader diagnosis.
+/// environment stays sanitized. One unloadable file never aborts the whole
+/// fallback: an open, parse, or `dlopen` failure skips that sibling and its
+/// transitive-only closure (a file that cannot load cannot run, and direct
+/// needs are still parsed from the provider itself), while a genuinely
+/// missing library still fails the retry with an accurate diagnosis. Only
+/// the preload cap below aborts the fallback; the caller then keeps the
+/// original loader diagnosis.
 fn preload_sibling_dependencies(module_path: &Path) -> Result<Vec<Library>, String> {
     let dir = module_path
         .parent()
@@ -68,9 +73,12 @@ fn preload_sibling_dependencies(module_path: &Path) -> Result<Vec<Library>, Stri
     let mut queue = vec![module_path.to_path_buf()];
     visited.insert(module_path.to_path_buf());
     while let Some(next) = queue.pop() {
-        let file = std::fs::File::open(&next)
-            .map_err(|error| format!("cannot open {} for reuse: {error}", next.display()))?;
-        let needed = p11scope_manifest::elf::needed_libraries(&file)?;
+        let Ok(file) = std::fs::File::open(&next) else {
+            continue;
+        };
+        let Ok(needed) = p11scope_manifest::elf::needed_libraries(&file) else {
+            continue;
+        };
         for name in needed {
             if !is_bare_library_name(&name) {
                 continue;
@@ -91,8 +99,10 @@ fn preload_sibling_dependencies(module_path: &Path) -> Result<Vec<Library>, Stri
                     "provider directory holds more than {MAX_SIBLING_PRELOADS} needed siblings"
                 ));
             }
-            let sibling = unsafe { Library::new(&candidate) }
-                .map_err(|error| format!("cannot dlopen {}: {error}", candidate.display()))?;
+            let sibling = match unsafe { Library::new(&candidate) } {
+                Ok(sibling) => sibling,
+                Err(_) => continue,
+            };
             preloads.push(sibling);
             queue.push(candidate);
         }

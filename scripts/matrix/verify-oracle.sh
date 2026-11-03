@@ -41,7 +41,7 @@ if [ -z "${P11SCOPE_ORACLE_SOURCE_ONLY-}" ]; then
 fi
 . scripts/lib.sh
 
-MODULE=/usr/lib/softhsm/libsofthsm2.so
+MODULE=${MODULE-}
 PKCS11_CHECK_DIR=${PKCS11_CHECK_DIR:-$HOME/src/m/pkcs11-check-ws/pkcs11-check}
 # Invoke the venv's own installed console script directly, NOT `uv run`.
 # Measured directly while building this script: `uv` here is a snap
@@ -558,7 +558,20 @@ receipt_receipt_run() {
     RECEIPT_SOURCE_HASH=$(receipt_digest "$RECEIPT_ROOT/artifacts/source.start.tsv")
     receipt_fact source_input_ledger_sha256 "$RECEIPT_SOURCE_HASH"
     sudo -n true >/dev/null 2>&1 || exit 77
-    [ -f "$MODULE" ] || exit 77
+    # Probe SoftHSM provider paths (Debian + Fedora); an explicit MODULE is
+    # honored strictly. A missing prerequisite exits 77.
+    if [ -z "${MODULE-}" ]; then
+        if command -v python3 >/dev/null 2>&1 && MODULE_PROBED=$(python3 -I scripts/release-matrix-contract.py --select-module 2>/dev/null); then
+            MODULE=$MODULE_PROBED
+        else
+            for candidate in /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so /usr/lib/softhsm/libsofthsm2.so /usr/lib64/softhsm/libsofthsm2.so /usr/lib64/pkcs11/libsofthsm2.so; do
+                if [ -f "$candidate" ]; then MODULE=$candidate; break; fi
+            done
+            unset candidate
+        fi
+        unset MODULE_PROBED
+    fi
+    [ -f "${MODULE-}" ] || exit 77
     [ ! -e "$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state.json" ] \
         && [ ! -L "$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state.json" ] || exit 77
     [ ! -e "$PKCS11_CHECK_DIR/.pkcs11-check-isolation-state-policy.json" ] \

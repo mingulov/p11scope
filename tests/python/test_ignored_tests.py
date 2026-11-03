@@ -101,8 +101,6 @@ BTRFS_TMPDIR_XFAIL_EXPECTED = [
 ]
 
 XFAIL_EXPECTED = [
-    "discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head",
-    "discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once",
     "discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent",
     "discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation",
     "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64",
@@ -115,8 +113,6 @@ XFAIL_EXPECTED = [
 # run); the owner is the source file that owns the pin. Pinned
 # literally so a weakened signature fails here, not silently.
 XFAIL_SIGNATURE_EXPECTED = [
-    "t8-live256: unsettled after",
-    "t8-twin: unsettled after",
     "D-C7-3 stands: upper mapper re-edged to the stale anchor",
     "R57: balanced benign exit-time work needs a strong settlement receipt",
     "exactly one module for gate-k1.so",
@@ -124,8 +120,6 @@ XFAIL_SIGNATURE_EXPECTED = [
 ]
 
 XFAIL_OWNER_EXPECTED = [
-    "src/discovery/pressure_native_tests.rs",
-    "src/discovery/pressure_native_tests.rs",
     "src/discovery/d4_overlay_cells.rs",
     "src/discovery/engine_tests.rs",
     "src/inventory/privileged_tests.rs",
@@ -1085,7 +1079,7 @@ class IgnoredTestsTests(unittest.TestCase):
         # `grep -F ''` matches every line, so the gate refuses an
         # empty signature outright instead of XFAILing everything.
         excerpt = (XFAIL_EXCERPT_DIR
-                   / "pressure_live256_all_blocked_twin_refuses_once.log")
+                   / "overlay_copy_up_userspace_edge_absent.log")
         self.assertFalse(xfail_log_matches("", excerpt))
 
     def test_xfail_excerpts_contain_no_home_or_worktree_paths(self):
@@ -1101,22 +1095,6 @@ class IgnoredTestsTests(unittest.TestCase):
                 with self.subTest(excerpt=path.name, marker=marker):
                     self.assertNotIn(marker, text)
 
-    def test_pressure_failure_excerpts_have_distinct_run_footers(self):
-        # The two pressure excerpts are distinct privileged runs with
-        # distinct panic timings; an identical "finished in" footer
-        # means one was copied onto the other.
-        footers = []
-        for stem in ("pressure_live256_genuine_episode_admits_late_then_head",
-                     "pressure_live256_all_blocked_twin_refuses_once"):
-            path = XFAIL_EXCERPT_DIR / (stem + ".log")
-            lines = [line for line in
-                     path.read_text(encoding="utf-8").splitlines()
-                     if line.startswith("test result:")]
-            self.assertEqual(len(lines), 1, f"{stem} has no footer")
-            footers.append(lines[0])
-        self.assertNotEqual(footers[0], footers[1],
-                            "both pressure excerpts share one footer")
-
     def test_xfail_known_limit_citations_resolve_in_tree(self):
         # A reason that cites a known limit must name the in-tree file
         # that carries it, so the citation can be checked; a bare
@@ -1124,7 +1102,8 @@ class IgnoredTestsTests(unittest.TestCase):
         reasons = runner_array_lines(RUNNER, "XFAIL_REASONS")
         cited = [reason for reason in reasons
                  if "Known limit" in reason]
-        self.assertGreater(len(cited), 0, "no cited limits to check")
+        # No reason cites a limit today (the pressure cells were
+        # promoted); the loop still guards every future citation.
         for reason in cited:
             with self.subTest(reason=reason[:60]):
                 match = re.search(
@@ -1548,16 +1527,16 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
         # The fake lists both load-gate alternatives (a real binary has
-        # exactly one), so the default section shows 182 + 2.
-        self.assertIn("default (184)", result.stdout)
+        # exactly one), so the default section shows 184 + 2.
+        self.assertIn("default (186)", result.stdout)
         self.assertIn("btrfs (14, --include-btrfs only)", result.stdout)
         self.assertIn("overlay (2, --include-overlay only)", result.stdout)
-        self.assertIn("expected-failures (6, --include-expected-failures "
+        self.assertIn("expected-failures (4, --include-expected-failures "
                       "only)", result.stdout)
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
-        self.assertIn("verify: curation matches the binary (243 tests)",
+        self.assertIn("verify: curation matches the binary (244 tests)",
                       result.stdout)
 
     def test_real_tree_skip_entries_carry_until(self):
@@ -1751,13 +1730,13 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=182",
+            "DEFAULT_TESTS=184",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
             "BTRFS_TESTS=14",
             "OVERLAY_TESTS=2",
-            "EXPECTED_FAILURE_TESTS=6",
-            "SKIP_TESTS=35",
+            "EXPECTED_FAILURE_TESTS=4",
+            "SKIP_TESTS=36",
             "COUNTER_FIXTURE_TESTS=27",
             "BTRFS_TMPDIR_XFAIL_TESTS=2",
             "WIDE_DETAILED_2112_TESTS=9",

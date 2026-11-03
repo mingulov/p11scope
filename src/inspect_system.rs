@@ -6173,7 +6173,13 @@ mod tests {
         /// Lower `provider` over the standard over-cap collection under a
         /// 32-endpoint Inventory budget, with the scope the collector
         /// derives from `hints`.
-        fn inventory_catalog(provider: ScannedModule, hints: &[PathBuf]) -> Catalog {
+        /// Lower `provider` over the standard over-cap collection under
+        /// `policy`, with the scope the collector derives from `hints`.
+        fn scoped_catalog(
+            provider: ScannedModule,
+            policy: AdmissionPolicy,
+            hints: &[PathBuf],
+        ) -> Catalog {
             let mut collection = over_cap(&[]);
             collection.members[0].modules = vec![provider];
             let snapshots: HashMap<u32, Vec<MapEntry>> = collection.sweep.iter().cloned().collect();
@@ -6188,8 +6194,16 @@ mod tests {
                 collection,
                 bound,
                 attributed,
-                AdmissionPolicy::Inventory(crate::capacity::InventoryBudget::new(32, 256).unwrap()),
+                policy,
                 collector_admission_scope(hints, false),
+            )
+        }
+
+        fn inventory_catalog(provider: ScannedModule, hints: &[PathBuf]) -> Catalog {
+            scoped_catalog(
+                provider,
+                AdmissionPolicy::Inventory(crate::capacity::InventoryBudget::new(32, 256).unwrap()),
+                hints,
             )
         }
 
@@ -6228,6 +6242,41 @@ mod tests {
                     assert_eq!(*endpoints, 32);
                 }
                 other => panic!("an aimed module must admit first-come, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn inspect_aimed_system_capture_admits_heuristic_prefix_first_come() {
+            // `inspect --system` lowers under the Detailed policy with the
+            // same aim rule the capture engine keeps: an aimed capture
+            // admits first-come with no reserve, so a 600-endpoint
+            // heuristic provider admits its strongest 450-endpoint prefix
+            // and discloses the spilled table, where the unaimed capture
+            // refuses the module whole at the reserve.
+            let aimed = scoped_catalog(
+                heuristic_provider(4, 150),
+                AdmissionPolicy::detailed(),
+                &[PathBuf::from(PATH)],
+            );
+            match catalog_admission(&aimed) {
+                AdmissionRecord::Admitted { class, endpoints } => {
+                    assert_eq!(*class, "heuristic");
+                    assert_eq!(*endpoints, 450);
+                }
+                other => panic!("an aimed inspect must admit the prefix, got {other:?}"),
+            }
+            assert_eq!(
+                aimed.admission.uncorroborated_candidates, 1,
+                "the spilled table stays disclosed"
+            );
+            let unaimed =
+                scoped_catalog(heuristic_provider(4, 150), AdmissionPolicy::detailed(), &[]);
+            match catalog_admission(&unaimed) {
+                AdmissionRecord::Refused { class, reason } => {
+                    assert_eq!(*class, "heuristic");
+                    assert!(reason.contains("reserved"), "{reason}");
+                }
+                other => panic!("the unaimed inspect must refuse whole, got {other:?}"),
             }
         }
 

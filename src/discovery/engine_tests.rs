@@ -6179,6 +6179,14 @@ fn refresh_inventory_once(engine: &mut Engine) {
 }
 
 fn refresh_inventory_with(engine: &mut Engine, session: &mut ScriptedSession) {
+    refresh_inventory_with_changed(engine, session);
+}
+
+fn refresh_inventory_once_changed(engine: &mut Engine) -> bool {
+    refresh_inventory_with_changed(engine, &mut ScriptedSession::with_records([], 0))
+}
+
+fn refresh_inventory_with_changed(engine: &mut Engine, session: &mut ScriptedSession) -> bool {
     let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
     let mut tick_now = crate::attach::monotonic_ns;
     engine
@@ -6191,7 +6199,7 @@ fn refresh_inventory_with(engine: &mut Engine, session: &mut ScriptedSession) {
             &mut PauseClosure::new(true),
             &mut tick_now,
         )
-        .expect("an inventory refresh over a cgroup scope");
+        .expect("an inventory refresh over a cgroup scope")
 }
 
 /// Task 9.2-fix5 item A. A `--cgroup` capture re-enumerates its members
@@ -21615,8 +21623,9 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
 /// Tick-level evidence equality for the unchanged-tick twin: every admission,
 /// refusal and gap decision the two engines reached. Timing-derived evidence
 /// (stage spans, newcomer ages) and pure performance memos (the loader plan
-/// cache) are excluded by design: the fast path records fewer spans and
-/// preserves the cache across unchanged ticks.
+/// cache) are excluded by design: the fast path records fewer spans, and the
+/// cache is cleared on both paths (at build on the fast path, at commit on
+/// the full path), so it carries no tick decision.
 fn assert_tick_evidence_equal(fast: &Engine, full: &Engine) {
     assert_eq!(fast.plan, full.plan);
     let mut fast_discovery = serde_json::to_value(&fast.discovery).unwrap();
@@ -21667,10 +21676,14 @@ fn assert_tick_evidence_equal(fast: &Engine, full: &Engine) {
     }
     assert_eq!(fast.facts_revision, full.facts_revision);
     assert_eq!(fast.published_facts_revision, full.published_facts_revision);
-    assert_eq!(
-        fast.capture_facts.history.decoded,
-        full.capture_facts.history.decoded
-    );
+    // Whole-struct: a later added field is compared automatically. Scan
+    // durations are wall time, not decisions; each engine scanned for real
+    // on its own clock.
+    let mut fast_history = fast.capture_facts.history.clone();
+    let mut full_history = full.capture_facts.history.clone();
+    fast_history.scan_ms = 0;
+    full_history.scan_ms = 0;
+    assert_eq!(fast_history, full_history);
 }
 
 /// Rotation eviction displaces views outside the candidate's `removed` set
@@ -21762,8 +21775,12 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
                      full_counts: &mut (u64, u64),
                      fast_builds: u64,
                      full_builds: u64| {
-        refresh_inventory_once(fast);
-        refresh_inventory_once(full);
+        let fast_changed = refresh_inventory_once_changed(fast);
+        let full_changed = refresh_inventory_once_changed(full);
+        assert_eq!(
+            fast_changed, full_changed,
+            "the tick's changed return is a decision too"
+        );
         assert_tick_evidence_equal(fast, full);
         assert_eq!(
             loader_planning_operation_counts(fast),
@@ -23137,6 +23154,120 @@ fn publish_deferral_matches_full_publication_step_for_step() {
         assert_eq!(ended.ended_by, Some(PrearmWatchEnd::ScopeEnd));
         assert_eq!(ended.until_ns, Some(9_000));
     }
+    // Step 14: without the attach mutation the gate's new-targets conjunct
+    // denies deferral on both: the cleaned candidate publishes identically.
+    let fixture = LoaderPlanningFixture::new();
+    let (mut deferred, mut full) = clean_deferral_pair(&fixture);
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    let mut outcomes = Vec::new();
+    for engine in [&mut deferred, &mut full] {
+        let (candidate, _) = fixture.candidate(engine, false);
+        assert!(
+            candidate.loader_plan_proof.is_some(),
+            "stationary inputs still prove without the attach mutation"
+        );
+        let mut additions_allowed = false;
+        outcomes.push(
+            engine
+                .apply_candidate(
+                    &mut ScriptedSession::default(),
+                    candidate,
+                    &mut additions_allowed,
+                    false,
+                    &[],
+                )
+                .unwrap(),
+        );
+    }
+    assert_eq!(outcomes[0].changed, outcomes[1].changed);
+    assert_eq!(outcomes[0].disposition, outcomes[1].disposition);
+    assert_publish_deferral_evidence_equal(&deferred, &full);
+    assert_publish_deferral_cache_equal(&deferred, &full);
+    assert_eq!(
+        publish_operation_counts(&deferred),
+        (deferred_counts.0 + 1, deferred_counts.1 + 1),
+    );
+    assert_eq!(
+        publish_operation_counts(&full),
+        (full_counts.0 + 1, full_counts.1 + 1),
+    );
+    // Step 15: a converged manifest fallback denies the proof on both: the
+    // fallback conjunct, not leg 1 (the revision is clean), forces the
+    // publish. The proof binds a real plan module with no required tables
+    // or targets, so the rebuild preserves it (an unbound proof would be
+    // invalidated with its own re-projection instead).
+    let fixture = LoaderPlanningFixture::new();
+    let (mut deferred, mut full) = clean_deferral_pair(&fixture);
+    for engine in [&mut deferred, &mut full] {
+        let module = engine.plan.modules[0].object;
+        assert!(
+            engine
+                .plan
+                .modules
+                .iter()
+                .filter(|m| m.object == module)
+                .count()
+                == 1,
+            "the proof module is unique in the plan"
+        );
+        engine.counters.manifest_fallbacks.push(ManifestFallback {
+            manifest: 0,
+            object: 0,
+            reason: ManifestStaleReason::IdentityMismatch,
+            replacement: engine.modules[0].object,
+            proof: BoundFallbackProof {
+                module,
+                tables: Vec::new(),
+                required_targets: BTreeMap::new(),
+            },
+        });
+        engine.publish_current_capture_facts().unwrap();
+    }
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    apply_both(
+        &fixture,
+        &mut deferred,
+        &mut full,
+        &mut deferred_counts,
+        &mut full_counts,
+        1,
+        1,
+        1,
+        1,
+    );
+    for engine in [&deferred, &full] {
+        assert_eq!(
+            engine.counters.manifest_fallbacks.len(),
+            1,
+            "the bound fallback survives the rebuild (no invalidation path)"
+        );
+    }
+    // Step 16: pressure selection is transparent to the twin: this tree's
+    // stationary check has no pressure inputs, so the proof still attaches
+    // and both sides defer identically over the selected state.
+    let fixture = LoaderPlanningFixture::new();
+    let (mut deferred, mut full) = clean_deferral_pair(&fixture);
+    for engine in [&mut deferred, &mut full] {
+        engine.pressure_selected = Some(PressureSelection {
+            pid: 4242,
+            serial: 7,
+        });
+    }
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    apply_both(
+        &fixture,
+        &mut deferred,
+        &mut full,
+        &mut deferred_counts,
+        &mut full_counts,
+        0,
+        0,
+        1,
+        1,
+    );
 }
 
 #[test]

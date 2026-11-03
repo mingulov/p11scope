@@ -502,17 +502,34 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin cf46fc5e, the gate-1 loader frame and bank series on top of
-      # b200e06f: the image-bank allocator narrowing, the bank-B cookie
-      # qualification at the image query seam, the verifier-visible bank
-      # indexes, the 512-byte p11_return fit and the witness-pass refusal
-      # count are all inside the gate-1 (P11SCOPE_LOADER_GATE) regions of
-      # image_identity.c, image_identity.h and image_identity_query.c. The
-      # default objects keep every allocated and executable section,
-      # symbol, relocation and .BTF byte (scripts/check-gate0-identity.py,
-      # journal object included); only .BTF.ext line info and .debug_*
-      # move with the shifted source lines. No other BPF input changed
-      # since b200e06f.
+      # Pin 873adf5c4, the round-9 integration tip, on top of cf46fc5e:
+      # the 6.14 Option A exit-time mapping summaries (3107325eb) add a
+      # Detailed-only kind-7 arm to emit_lifecycle, a kind selection to
+      # the exit hook, and link the native exit-summary reader. The
+      # default Detailed object gains .text (+424 B) and
+      # raw_tp/sched_process_exit (+32 B), one new symbol and a grown
+      # .text relocation table; every other Detailed code section is
+      # identical modulo subprogram call offsets, .maps is unchanged,
+      # and no map or program is added. Both Inventory objects keep
+      # byte-identical code, maps and BTF meaning; only .debug_* (+80 B)
+      # and .BTF.ext line info move with the added source lines, and
+      # five statics rename by crate disambiguator only. a670f5599 is
+      # test-only. The pkcs11 0.2.3 repin (559cf089e) changes no code
+      # bytes or BTF meaning; it does not itself build (mid-round
+      # call-site drift, repaired by 1048aad51), so the pin absorbs
+      # through this tip instead. No other BPF input changed since
+      # cf46fc5e.
+      # Earlier pin cf46fc5e, the gate-1 loader frame and bank series on
+      # top of b200e06f: the image-bank allocator narrowing, the bank-B
+      # cookie qualification at the image query seam, the verifier-visible
+      # bank indexes, the 512-byte p11_return fit and the witness-pass
+      # refusal count are all inside the gate-1 (P11SCOPE_LOADER_GATE)
+      # regions of image_identity.c, image_identity.h and
+      # image_identity_query.c. The default objects keep every allocated
+      # and executable section, symbol, relocation and .BTF byte
+      # (scripts/check-gate0-identity.py, journal object included); only
+      # .BTF.ext line info and .debug_* move with the shifted source
+      # lines. No other BPF input changed since b200e06f.
       # Earlier pin b200e06f, the PID-scope birth witness on top of 4dbdf106 (the
       # picked d0bfdfcf, which is not an ancestor of this pin): the birth
       # marker compares the target leader's start time with the
@@ -615,7 +632,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=cf46fc5edc705f0f337f418d92db8214dc0f8f4b
+          BASELINE=873adf5c4af8726129c0e95ee5dfa22a498c5155
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

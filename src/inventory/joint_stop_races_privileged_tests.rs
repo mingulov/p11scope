@@ -359,6 +359,7 @@ fn system_joint_coordinator(modules: &[PathBuf]) -> Result<InventoryCoordinator<
         Scope::System,
         HookRegistry::builtin(),
         modules.to_vec(),
+        vec![],
         OsProcessSource,
         RegistryLimits::default_limits(),
     )

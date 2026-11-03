@@ -5200,6 +5200,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             track_short_lived: armed,
             kind: crate::cli::Kind::Profile,
             modules: vec![fixtures.provider.clone()],
+            exclude_modules: vec![],
             manifests: vec![fixtures.manifest.clone()],
             prearm_modules: vec![],
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
@@ -9633,6 +9634,7 @@ fn reconcile_waiter_outside_slice_settles_within_one_sweep() {
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
+        exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
         hooks: HookRegistry::builtin(),
@@ -25814,6 +25816,7 @@ fn clean_deferral_pair(fixture: &LoaderPlanningFixture) -> (Engine, Engine) {
             &pins,
             false,
             plan::AdmissionScope::Shared,
+            false,
         );
         engine.pinned = pins;
         engine.modules = modules;
@@ -27872,6 +27875,7 @@ fn incomplete_rescan_unions_the_extension_proof() {
     // outright — replaces it. This needs a writable table and lasts until
     // that rescan.
     let module = |extension_impossible| ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         double_loaded: false,
         view: ProcessViewId(0),

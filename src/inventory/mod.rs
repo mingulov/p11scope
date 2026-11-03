@@ -8806,6 +8806,7 @@ mod tests {
                     InspectScope::Pid(std::process::id()),
                     &[PathBuf::from("/definitely/not/mapped-prearm-t8.so")],
                     &[],
+                    &[],
                     &[provider],
                     &HookRegistry::builtin(),
                     true,
@@ -8865,6 +8866,7 @@ mod tests {
             || {
                 run_with_terminal_budget(
                     InspectScope::Pid(pid),
+                    &[],
                     &[],
                     &[],
                     prearm,
@@ -9373,6 +9375,7 @@ mod tests {
         let code = run_with_terminal_budget(
             InspectScope::Pid(std::process::id()),
             &[PathBuf::from("/missing/p11scope-provider")],
+            &[],
             &[],
             &[],
             &HookRegistry::builtin(),
@@ -24441,6 +24444,7 @@ mod seal_readiness_tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 &HookRegistry::builtin(),
                 true,
                 None,
@@ -24478,6 +24482,7 @@ mod seal_readiness_tests {
         std::fs::write(&shared, b"existing event log\n").unwrap();
         let error = super::run(
             ScopeArg::Pid(std::process::id()),
+            &[],
             &[],
             &[],
             &[],
@@ -24520,6 +24525,7 @@ mod seal_readiness_tests {
         use crate::cli::{CallerMetadataMode, IdentityBackendSelection, ScopeArg};
         let error = super::run(
             ScopeArg::Pid(std::process::id()),
+            &[],
             &[],
             &[],
             &[],

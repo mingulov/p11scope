@@ -9911,6 +9911,7 @@ mod tests {
             track_short_lived: false,
             kind: crate::cli::Kind::Profile,
             modules: Vec::new(),
+            exclude_modules: vec![],
             manifests: Vec::new(),
             prearm_modules: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),

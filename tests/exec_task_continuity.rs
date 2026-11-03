@@ -472,7 +472,11 @@ assert emit[0] not in m.reachable(root_graph, [refused]), 'refused scope emitted
 /// clear; the compiler may merge the bit with other flag tests (Detailed
 /// folds it into the tracking/aggregate test as one mask). Any PID-set
 /// value takes the not-equal arm, which cannot reach the call; the equal
-/// arm (cgroup/system) still does. Counter objects carry no ticket call;
+/// arm (cgroup/system) still does. The scope value may cross one
+/// callee-saved frame slot (3107325eb grew the emitter frame, so the
+/// Detailed/journal scope pointer is spilled and reloaded); the scan
+/// follows only a slot with exactly one same-shape store and no other
+/// overlapping store. Counter objects carry no ticket call;
 /// `exec_ticket_absent_from_counter_flavors` pins that absence.
 #[test]
 fn exec_generation_ticket_is_never_acquired_under_pid_scope() {
@@ -513,22 +517,51 @@ assert ticket in m.reachable(graph, [entry]), 'the EXEC ticket call is unreachab
 
 def names_scope_flags(index, register):
     # Straight-line definitions back to the third argument: the flags
-    # scalar itself, or one u64 load of the ScopeAuth word at offset 0.
+    # scalar itself, one u64 load of the ScopeAuth word at offset 0, or
+    # one frame-spill round trip in between. The spilled slot must have
+    # exactly one same-shape store, preceding the reload, and no other
+    # overlapping store anywhere, so the reloaded value is unambiguous
+    # on every path; anything else fails closed (no gate, the test fails).
     loaded = False
-    for _, text in reversed(insns[:index]):
+    pos = index - 1
+    while pos >= 0:
+        text = insns[pos][1]
         if text.startswith('call') and register in {'r0', 'r1', 'r2', 'r3', 'r4', 'r5'}:
             return False
-        if not re.match(register + r' [^ ]*= ', text):
-            continue
-        copy = re.fullmatch(register + r' = (r\d+)', text)
-        if copy:
-            register = copy.group(1)
-            continue
-        load = re.fullmatch(register + r' = \*\(u64 \*\)\((r\d+) \+ 0x0\)', text)
-        if load and not loaded:
-            register, loaded = load.group(1), True
-            continue
-        return False
+        if re.match(register + r' [^ ]*= ', text):
+            copy = re.fullmatch(register + r' = (r\d+)', text)
+            if copy:
+                register = copy.group(1)
+                pos -= 1
+                continue
+            load = re.fullmatch(register + r' = \*\(u64 \*\)\((r\d+) \+ 0x0\)', text)
+            if load and not loaded:
+                register, loaded = load.group(1), True
+                pos -= 1
+                continue
+            spill = re.fullmatch(register + r' = \*\(u64 \*\)\(r10 - (0x[0-9a-f]+)\)', text)
+            if spill:
+                slot = int(spill.group(1), 16)
+                same, overlapping, stored, placed = 0, 0, None, None
+                for other, (_, candidate) in enumerate(insns):
+                    store = re.fullmatch(r'\*\(u(\d+) \*\)\(r10 - (0x[0-9a-f]+)\) = (r\d+)', candidate)
+                    if not store:
+                        continue
+                    start, width = int(store.group(2), 16), int(store.group(1)) // 8
+                    if start > slot + 7 or start + width - 1 < slot:
+                        continue
+                    overlapping += 1
+                    if width == 8 and start == slot and other < pos:
+                        same += 1
+                        stored, placed = store.group(3), other
+                if same != 1 or overlapping != 1:
+                    return False
+                # The stored value flows from before the store: later
+                # calls cannot affect it, so the walk resumes there.
+                register, pos = stored, placed - 1
+                continue
+            return False
+        pos -= 1
     return register == 'r3'
 
 gates = []

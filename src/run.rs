@@ -13954,6 +13954,7 @@ mod tests {
         let args = CaptureArgs {
             kind: Kind::Profile,
             modules: Vec::new(),
+            exclude_modules: vec![],
             manifests: Vec::new(),
             prearm_modules: vec![provider],
             hooks: HookRegistry::builtin(),
@@ -14049,6 +14050,7 @@ mod tests {
         let args = CaptureArgs {
             kind: Kind::Profile,
             modules: Vec::new(),
+            exclude_modules: vec![],
             manifests: Vec::new(),
             prearm_modules: vec![provider],
             hooks: HookRegistry::builtin(),
@@ -14137,6 +14139,7 @@ mod tests {
         let args = CaptureArgs {
             kind: Kind::Profile,
             modules: Vec::new(),
+            exclude_modules: vec![],
             manifests: Vec::new(),
             prearm_modules: vec![provider],
             hooks: HookRegistry::builtin(),

@@ -191,9 +191,11 @@ mod tests {
 
     #[test]
     fn approvals_are_the_exact_official_and_registered_union() {
-        // This count belongs to the dependency pinned in Cargo.toml at
-        // a2aab6cd67d21d140277a4584942e06c903f165b. A revision change is a
-        // deliberate catalog decision, not a number to update casually.
+        // This count belongs to pkcs11-types 0.2.3 from crates.io (Cargo.toml).
+        // A version change is a deliberate catalog decision, not a number
+        // to update casually. The official 3.2 catalog is unchanged at 463;
+        // the approved union adds the two proposed 3.3 external-mu
+        // registrations (0x403b/0x403c) from the embedded default registry.
         let official = PKCS11_3_2_OFFICIAL_MECHANISMS
             .iter()
             .map(|mechanism| mechanism.0)
@@ -204,7 +206,7 @@ mod tests {
         let approved = approved_mechanisms(&registry);
         assert_eq!(
             approved.len(),
-            463,
+            465,
             "official/registered overlap must deduplicate"
         );
         assert!(official.iter().all(|id| approved.contains_key(id)));

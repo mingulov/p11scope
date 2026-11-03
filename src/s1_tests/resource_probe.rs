@@ -837,12 +837,14 @@ fn native_semantic_resource_final_types_pinned() {
     // 40 -> 48), measured 1184.
     pin!(crate::inventory_present::PresentationRenderIndex, 8);
     pin!(crate::inventory_semantics::SemanticCaptureSummary, 48);
-    // v0.6.0 `--exclude-module`: two inline Vecs (excluded files, unmatched
-    // inputs), +48.
+    // +24 (c9e1dd977): one inline Vec of pre-arm interval rows, one row
+    // per `--prearm-module` input; the pin was never re-measured for it.
+    // v0.6.0 `--exclude-module`: two more inline Vecs (excluded files,
+    // unmatched inputs), +48.
     pin!(
         crate::inventory_present::Presentation,
         1176 + size_of::<crate::inventory_present::PresentationRenderIndex>()
-            + 2 * size_of::<Vec<u8>>()
+            + 3 * size_of::<Vec<u8>>()
     );
     // Supporting payload: RoutedCall carries one EventRecord.
     pin!(p11scope_ebpf_common::EventRecord, 368);

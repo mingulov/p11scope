@@ -83,24 +83,20 @@ describing an old CI run as an exact-new-commit result.
   GPL-3.0-only or Apache-2.0-only code has entered the BPF build
   (`cargo tree -e normal` in `crates/ebpf`).
 
-## 2. Confirm the dependency revision is tagged
+## 2. Confirm the dependency versions are released
 
-The pinned `pkcs11-components` revision must stay fetchable, so it must be
-reachable from a published tag, not only from a branch a later force-push
-could rewrite. The pinned `d0a47c7` is an ancestor of the published tags
-`v0.2.0` and `v0.2.1`:
+The `pkcs11-types`/`pkcs11-module` crates come from crates.io (there is no
+Git dependency left to keep fetchable). The released version in every
+manifest that names them (`Cargo.toml`, `crates/discover/Cargo.toml`,
+`crates/ebpf-common/Cargo.toml`) must match both lockfiles (`Cargo.lock`,
+`crates/ebpf/Cargo.lock`), including the registry checksums:
 
 ```sh
-git ls-remote --tags https://github.com/mingulov/pkcs11-components
-git -C <pkcs11-components checkout> fetch --tags origin
-git -C <pkcs11-components checkout> merge-base --is-ancestor \
-  d0a47c71d34294466bc41100ae6b5a5a329029d2 v0.2.0 && echo reachable
+grep -h 'name = "pkcs11-' -A3 Cargo.lock crates/ebpf/Cargo.lock
 ```
 
-The revision must match the `rev =` in `Cargo.toml` and both lockfiles. The
-crates.io releases of `pkcs11-types` and `pkcs11-module` (0.2.0, 0.2.1) are
-later revisions with source changes, not `d0a47c7`. Moving to them is a
-dependency upgrade that needs the full checks and qualification again.
+Moving to a newer crates.io release is a dependency upgrade that needs the
+full checks and qualification again.
 
 ## 3. Get a green hosted CI run on the exact commit
 

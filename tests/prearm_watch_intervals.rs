@@ -836,6 +836,7 @@ fn inventory_prearm_section_empty_without_flag() {
         &[],
         &[],
         &[],
+        &[],
         &HookRegistry::builtin(),
         true,
         None,

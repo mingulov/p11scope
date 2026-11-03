@@ -49,62 +49,111 @@ fn is_bare_library_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
+/// Whether the sibling fallback may `dlopen` `candidate`: a regular file
+/// beside the provider, or a symlink whose fully-resolved target is a
+/// regular file staying inside the provider's canonical directory
+/// (SONAME links like `libfoo.so.1 -> libfoo.so.1.2.3`). Anything else —
+/// directories, outside links, unresolvable names — stays for the normal
+/// loader search. A swap between this check and the load is outside the
+/// model: a writer in the provider's own directory already owns it.
+fn sibling_is_usable(dir_canonical: Option<&Path>, candidate: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(candidate) else {
+        return false;
+    };
+    if meta.is_file() {
+        return true;
+    }
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    let Some(dir) = dir_canonical else {
+        return false;
+    };
+    std::fs::canonicalize(candidate).is_ok_and(|target| target.starts_with(dir) && target.is_file())
+}
+
 /// Preload this provider's own-directory dependencies: for every DT_NEEDED
-/// bare name (transitively, from the provider and every preloaded sibling),
-/// `dlopen` the same-directory regular file by absolute path, keeping each
-/// handle alive in the returned vector. Only regular files are loaded —
-/// symlinks (which could point outside the directory), directories and
-/// anything else are skipped, and names absent from the directory stay for
-/// the normal loader search. No environment is read or set: the loader
-/// environment stays sanitized. One unloadable file never aborts the whole
-/// fallback: an open, parse, or `dlopen` failure skips that sibling and its
-/// transitive-only closure (a file that cannot load cannot run, and direct
-/// needs are still parsed from the provider itself), while a genuinely
-/// missing library still fails the retry with an accurate diagnosis. Only
-/// the preload cap below aborts the fallback; the caller then keeps the
-/// original loader diagnosis.
+/// bare name — transitively, the provider's needs plus every discovered
+/// sibling's needs, whether or not that sibling loaded yet — `dlopen` the
+/// same-directory file by absolute path, keeping each handle alive in the
+/// returned vector. Loads retry to a fixpoint after every success, so
+/// dependency order never matters (P → A → B loads B, then A on retry,
+/// then the provider retry). Only regular files and in-directory symlinks
+/// resolving inside the directory are loaded (see `sibling_is_usable`);
+/// directories, outside links and anything else are skipped, and names
+/// absent from the directory stay for the normal loader search. No
+/// environment is read or set: the loader environment stays sanitized. One
+/// unloadable file never aborts the whole fallback: an open, parse, or
+/// `dlopen` failure skips that sibling (its own needs are still parsed, so
+/// a dependency it names can load first), while a genuinely missing library
+/// still fails the retry with an accurate diagnosis. Only the preload cap
+/// below aborts the fallback; the caller then keeps the original loader
+/// diagnosis.
 fn preload_sibling_dependencies(module_path: &Path) -> Result<Vec<Library>, String> {
     let dir = module_path
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .ok_or_else(|| "--module names no directory".to_string())?;
+    let dir_canonical = std::fs::canonicalize(dir).ok();
     let mut preloads = Vec::new();
-    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut queue = vec![module_path.to_path_buf()];
-    visited.insert(module_path.to_path_buf());
-    while let Some(next) = queue.pop() {
-        let Ok(file) = std::fs::File::open(&next) else {
-            continue;
-        };
-        let Ok(needed) = p11scope_manifest::elf::needed_libraries(&file) else {
-            continue;
-        };
-        for name in needed {
-            if !is_bare_library_name(&name) {
+    // Needs are parsed once per file; loads retry until a full round
+    // loads nothing new.
+    let mut parsed: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut loaded: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut failed: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut to_parse = vec![module_path.to_path_buf()];
+    loop {
+        while let Some(next) = to_parse.pop() {
+            if !parsed.insert(next.clone()) {
                 continue;
             }
-            let candidate = dir.join(&name);
-            if !visited.insert(candidate.clone()) {
+            let Ok(file) = std::fs::File::open(&next) else {
                 continue;
-            }
-            // `symlink_metadata` does not follow links, so `is_file` is
-            // false for a symlink however valid its target: only a real
-            // regular file beside the provider is ever loaded.
-            let usable = std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.is_file());
-            if !usable {
+            };
+            let Ok(needed) = p11scope_manifest::elf::needed_libraries(&file) else {
                 continue;
+            };
+            for name in needed {
+                if !is_bare_library_name(&name) {
+                    continue;
+                }
+                let candidate = dir.join(&name);
+                if candidate == *module_path || loaded.contains(&candidate) {
+                    continue;
+                }
+                if !sibling_is_usable(dir_canonical.as_deref(), &candidate) {
+                    continue;
+                }
+                failed.insert(candidate.clone());
+                to_parse.push(candidate);
             }
+        }
+        // Retry every failure: a sibling unloadable for a missing
+        // same-directory dependency may load now that its dependency did.
+        // Each round that continues loads at least one new sibling, and
+        // loads are capped below, so this terminates.
+        let mut progress = false;
+        let retry: Vec<PathBuf> = failed.iter().cloned().collect();
+        failed.clear();
+        for candidate in retry {
             if preloads.len() >= MAX_SIBLING_PRELOADS {
                 return Err(format!(
                     "provider directory holds more than {MAX_SIBLING_PRELOADS} needed siblings"
                 ));
             }
-            let sibling = match unsafe { Library::new(&candidate) } {
-                Ok(sibling) => sibling,
-                Err(_) => continue,
-            };
-            preloads.push(sibling);
-            queue.push(candidate);
+            match unsafe { Library::new(&candidate) } {
+                Ok(sibling) => {
+                    preloads.push(sibling);
+                    loaded.insert(candidate);
+                    progress = true;
+                }
+                Err(_) => {
+                    failed.insert(candidate);
+                }
+            }
+        }
+        if !progress {
+            break;
         }
     }
     Ok(preloads)

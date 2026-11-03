@@ -44,7 +44,7 @@
 # Apt prerequisites on Ubuntu (CI installs these; Fedora names in brackets):
 #   opensc (opensc), p11-kit (p11-kit), softhsm2 (softhsm),
 #   libnss3-tools (nss-tools), gnutls-bin (gnutls-utils),
-#   opencryptoki (opencryptoki), binutils (binutils).
+#   opencryptoki (opencryptoki), binutils (binutils), python3 (python3).
 # Plus root (passwordless sudo), BTF and the release observer binary.
 #
 # Results: OUTDIR/results.jsonl, one row per cell:
@@ -64,11 +64,11 @@ ORACLE=$HERE/real-provider-oracle.py
 EXPECTS=$HERE/../tests/fixtures/real-providers/expected-causes.json
 TIMEOUT=${REAL_PROVIDERS_TIMEOUT:-180}
 [ $# = 2 ] || { echo 'usage: qualify-real-providers.sh P11SCOPE OUTDIR' >&2; exit 64; }
-P=$(realpath -e -- "$1") || exit 64
+P=$(realpath -e -- "$1") || { echo 'observer not found' >&2; exit 2; }
 OUT=$2
 [ "$(id -u)" = 0 ] || [ -n "${SUDO_UID:-}" ] || sudo -n true || {
   echo 'passwordless sudo required' >&2; exit 77; }
-mkdir -p "$OUT" && OUT=$(realpath -e -- "$OUT") || exit 64
+mkdir -p "$OUT" && OUT=$(realpath -e -- "$OUT") || { echo 'cannot create OUTDIR' >&2; exit 2; }
 WORK=$OUT/work; mkdir -p "$WORK"
 : > "$OUT/results.jsonl"
 FAILED=0; SKIPPED=0; HARNESS=0

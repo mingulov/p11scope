@@ -938,7 +938,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// not returned again). A newly detected change also stages the run's
     /// changed-identity gap: the global disclosure beside the per-module
     /// bracket. An `fstat` failure records nothing here — the attach path's
-    /// global check is the backstop that surfaces it.
+    /// global check is the backstop that surfaces it. Tests only: production
+    /// closes through `finish_prearm_watches`, which threads the unknown-stop
+    /// flag.
+    #[cfg(test)]
     pub(crate) fn refresh_prearm_object_changes(
         &mut self,
     ) -> Vec<crate::discovery::identity::PinnedObjectId> {
@@ -2500,7 +2503,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// passes): the lane's activation extend carries it instead of waiting
     /// for the first pass.
     pub(crate) fn has_pending_targets(&self) -> bool {
-        !self.pending_targets.is_empty()
+        !self.pending_targets.endpoints.is_empty() || !self.pending_targets.objects.is_empty()
     }
 
     /// Native capture starts: from now on each scan projection stages a

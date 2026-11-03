@@ -502,7 +502,21 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin d0bfdfcf, the verifier-cost series on top of 8b7ee11a: the
+      # Pin b200e06f, the PID-scope birth witness on top of 4dbdf106 (the
+      # picked d0bfdfcf, which is not an ancestor of this pin): the birth
+      # marker compares the target leader's start time with the
+      # published PID_START_TICK value before it mints a READY row, so a
+      # process that reuses the target PID number gets no record. The
+      # default Detailed object gains the PID_START_TICK map (.maps +28 B),
+      # raw_tp/sched_process_exec passes the PID-scope tgid to the birth
+      # (+144 B) and .text takes the witness inside p11_instance_exec_birth
+      # (+272 B); uprobe, uretprobe and sched_process_exit differ only in
+      # subprogram call offsets, and no program is added. Both Inventory
+      # objects keep their code, symbols and .maps; only debug line data
+      # and .BTF.ext line info move. The journal object, which this gate
+      # does not compare, gains the same map and witness. No other BPF
+      # input changed since 4dbdf106.
+      # Earlier pin d0bfdfcf, the verifier-cost series on top of 8b7ee11a: the
       # 7.4-rc1 Detailed load fix (87fd5ed0, getter slots classified by one
       # outlined helper with a packed scalar result), the outlined GetID
       # return facts (f7553014), the bpf_loop discovery-directory scan
@@ -590,7 +604,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=d0bfdfcfc52be1e71e98b7f614048630c272fdea
+          BASELINE=b200e06fa3f45e4f69ee63c098f9fb1c9adfaf7d
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

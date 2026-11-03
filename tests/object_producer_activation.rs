@@ -3189,6 +3189,12 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// become one `#[inline(never)] async_get_id_fact` helper with the same
 /// four cases, plus its comment lines): 144694 B, measured with this same
 /// lexer; the previous pin matches its parent.
+/// Re-baselined for the PID-scope birth identity (the only BPF source
+/// change: the `PID_START_TICK` witness map and its cfg, the
+/// `pid_scope_tgid` helper, and the exec root passing it as the native
+/// birth's one argument, plus their comment lines): 145238 B, measured
+/// with this same lexer on the integrated source; the previous pin
+/// matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3198,8 +3204,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            144694,
-            "fa28cd112317383bc55fc3cb96aed098a9acb700fd734da61ff5dd574fdbce18"
+            145238,
+            "bd971f2f6c7295e4080097cd2720cd45c650f9d5d124e8c2ae179edc61a3a3e9"
         ),
         "stripped BPF dump must stay byte-identical"
     );

@@ -106,6 +106,34 @@ else
     echo "# budgets: none (gate is loaded + stats + 5% headroom)"
 fi
 
+# Guest release match: the tag without its leading v must equal uname -r
+# or prefix it, except release candidates, whose tag (v7.4-rc1) boots the
+# dotted triplet (7.4.0-070400rc1-generic): there the triplet prefix plus
+# the same rc marker must match, never another rc number.
+release_ok() {
+    _release_expected=${1#v}
+    _release_guest=$2
+    case "$_release_guest" in
+        "$_release_expected"|"$_release_expected"-*)
+            return 0
+            ;;
+    esac
+    case "$_release_expected" in
+        *-rc[0-9]*)
+            _release_base=${_release_expected%-rc*}
+            _release_tag=${_release_expected##*-rc}
+            case "$_release_guest" in
+                "$_release_base.0-"*rc"$_release_tag")
+                    return 0
+                    ;;
+                "$_release_base.0-"*rc"$_release_tag"[!0-9]*)
+                    return 0
+                    ;;
+            esac
+            ;;
+    esac
+    return 1
+}
 # Single-quote a path for the guest shell.
 q() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
@@ -211,16 +239,13 @@ for KERNEL in "$@"; do
     fi
     grep -E '^(staged-boot-config|boot-config-present)-' "$VNG_LOG" | tail -1
     GUEST_RELEASE=$(grep '^guest-release=' "$VNG_LOG" | tail -1 | cut -d= -f2)
-    case "$GUEST_RELEASE" in
-        "${KERNEL#v}"|"${KERNEL#v}-"*)
-            echo "# guest release $GUEST_RELEASE (expected $KERNEL)"
-            ;;
-        *)
-            echo "# error: guest booted $GUEST_RELEASE, expected $KERNEL"
-            FAILED=1
-            continue
-            ;;
-    esac
+    if release_ok "$KERNEL" "$GUEST_RELEASE"; then
+        echo "# guest release $GUEST_RELEASE (expected $KERNEL)"
+    else
+        echo "# error: guest booted $GUEST_RELEASE, expected $KERNEL"
+        FAILED=1
+        continue
+    fi
     DOCTOR_RC=$(grep '^doctor-rc=' "$VNG_LOG" | tail -1 | cut -d= -f2)
     echo "# doctor rc=$DOCTOR_RC"
     if [ ! -f "$DOCTOR_TXT" ] || ! grep -q 'host program preflight' "$DOCTOR_TXT"; then

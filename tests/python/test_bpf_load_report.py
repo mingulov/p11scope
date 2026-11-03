@@ -35,9 +35,14 @@ EXPECTED_BUDGET_KERNELS = frozenset({
 # exactly one member of each group, and a missing row for the other member
 # is accepted (it simply does not load there). Mirrors
 # EXCLUSIVE_VARIANT_GROUPS in scripts/bpf-load-report.py.
+# The gate-1 Detailed and journal objects carry the same hook slots
+# under their own key prefixes.
 EXCLUSIVE_VARIANT_GROUPS = [
-    frozenset({"detailed/p11_image_exec_release", "detailed/p11_image_mmap_release"}),
-    frozenset({"detailed/p11_inst_vma_copy", "detailed/p11_inst_vma_retcopy"}),
+    frozenset({f"{prefix}/p11_image_exec_release", f"{prefix}/p11_image_mmap_release"})
+    for prefix in ("detailed", "detailed-gate1", "journal-gate1")
+] + [
+    frozenset({f"{prefix}/p11_inst_vma_copy", f"{prefix}/p11_inst_vma_retcopy"})
+    for prefix in ("detailed", "detailed-gate1", "journal-gate1")
 ]
 # Counter objects load only where the verifier accepts them (6.6+); the
 # old kernels keep the specified refusal, so the counter file pins its
@@ -537,6 +542,25 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(result.returncode == 0, expected,
                              (tag, release, result.returncode, result.stderr))
 
+    def test_gate1_and_journal_drivers_share_the_release_match(self):
+        # The gate-1 and journal drivers boot the same kernel tags, so
+        # a release-candidate guest (v7.4-rc1 boots 7.4.0-070400rc1-*)
+        # must match there too, through the identical release_ok, and
+        # each driver's one guest must use it.
+        text = DRIVER.read_text(encoding="ascii")
+        start = text.index("release_ok() {\n")
+        reference = text[start:text.index("\n}\n", start) + 3]
+        for name in ("check-bpf-load-gate1.sh", "check-bpf-load-journal.sh"):
+            other = (ROOT / "scripts" / name).read_text(encoding="ascii")
+            with self.subTest(driver=name):
+                self.assertEqual(other.count("release_ok() {"), 1)
+                start = other.index("release_ok() {\n")
+                end = other.index("\n}\n", start) + 3
+                self.assertEqual(other[start:end], reference)
+                self.assertEqual(
+                    other[end:].count('if release_ok "$KERNEL" "$GUEST_RELEASE"; then'), 1)
+                self.assertNotIn('"${KERNEL#v}"|"${KERNEL#v}-"*)', other)
+
     def test_driver_scores_inventory_side_against_budgets(self):
         # The 72 inventory budget cells exist (pinned by the budgets-shape
         # test above); the driver must pass them on the inventory side so
@@ -1004,6 +1028,34 @@ class ReportTests(unittest.TestCase):
         self.assertIn("84937", result.stdout)
         self.assertNotIn("83350", result.stdout)
         self.assertNotIn("p11_entry_journal", result.stdout)
+
+    def test_journal_gate1_selects_journal_groups_only(self):
+        # A gate-1 build gates the journal object too: --object
+        # journal-gate1 scores exactly the journal BTF groups under
+        # journal-gate1/ keys, never the Inventory copies, and a
+        # journal/ key does not stand in for a missing gate-1 key.
+        loads = self.mixed_journal_loads()
+        budgets = self.write_budgets({
+            "journal-gate1/p11_entry_journal": {KERNEL: 120000},
+            "journal-gate1/p11_return_journal": {KERNEL: 300000},
+            "journal-gate1/p11_image_query": {KERNEL: 512},
+            "journal-gate1/interface_entry": {KERNEL: 95853},
+            "journal-gate1/interface_return": {KERNEL: 863427},
+        })
+        result = self.run_report(self.write_loads("journal.jsonl", loads),
+                                 budgets=budgets, object_name="journal-gate1")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("journal-gate1/p11_return_journal", result.stdout)
+        self.assertIn("83350", result.stdout)
+        self.assertNotIn("84937", result.stdout)
+        self.assertNotIn("p11_usage_entry", result.stdout)
+        loads = [load for load in loads if load["root"] != "p11_return_journal"]
+        result = self.run_report(self.write_loads("journal.jsonl", loads),
+                                 budgets=budgets, object_name="journal-gate1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("journal-gate1/p11_return_journal", result.stdout)
+        self.assertIn("missing from probe rows", result.stdout)
 
     def test_journal_group_does_not_supply_detailed_coverage(self):
         # The journal group carries p11_image_query, a Detailed-only

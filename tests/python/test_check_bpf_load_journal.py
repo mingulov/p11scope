@@ -239,7 +239,8 @@ class JournalGateTests(unittest.TestCase):
         self.manifest = self.work / "manifest.json"
         self.manifest.write_text('{"schema": "owned-test"}\n')
 
-    def run_gate(self, *kernels, mode="linked", budgets=None, extra=None):
+    def run_gate(self, *kernels, mode="linked", budgets=None, extra=None,
+                 object_name=None):
         out = self.work / "out"
         out.mkdir()
         env = {**os.environ,
@@ -253,6 +254,8 @@ class JournalGateTests(unittest.TestCase):
         command = [str(SCRIPT)]
         if budgets is not None:
             command += ["--budgets", str(budgets)]
+        if object_name is not None:
+            command += ["--object", object_name]
         command += [str(self.bin / "observer"), str(self.probe),
                     str(self.manifest), str(out), *kernels]
         result = subprocess.run(command, capture_output=True, text=True,
@@ -450,6 +453,52 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(row["qualification"], "qualified")
         self.assertIn("budgeted", row["detail"])
         self.assertNotIn("unbudgeted", row["detail"])
+
+    def test_gate1_object_scores_gate1_keys(self):
+        # A gate-1 observer's journal object scores against
+        # journal-gate1/ keys: budgeted when they exist, over budget
+        # named under the gate-1 key, and plain journal/ keys never
+        # stand in for them (the cell is then unbudgeted).
+        gate1 = {name.replace("journal/", "journal-gate1/", 1): cells
+                 for name, cells in json.loads(
+                     self.owned_budgets().read_text())["programs"].items()}
+        budgets = self.write_budgets(gate1)
+        result, out = self.run_gate(KERNEL, budgets=budgets,
+                                    object_name="journal-gate1")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("# object: journal-gate1", result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertTrue(row["pass"])
+        self.assertIn("budgeted", row["detail"])
+        self.assertNotIn("unbudgeted", row["detail"])
+        self.assertIn("journal-gate1/", row["detail"])
+
+    def test_gate1_object_over_budget_fails(self):
+        gate1 = {name.replace("journal/", "journal-gate1/", 1): cells
+                 for name, cells in json.loads(
+                     self.owned_budgets(returned=200000).read_text())["programs"].items()}
+        budgets = self.write_budgets(gate1)
+        result, out = self.run_gate(KERNEL, mode="over-budget",
+                                    budgets=budgets,
+                                    object_name="journal-gate1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertIn("over budget", row["detail"])
+        self.assertIn("journal-gate1/p11_return_journal", row["detail"])
+
+    def test_gate1_object_ignores_gate0_keys(self):
+        budgets = self.owned_budgets()
+        result, out = self.run_gate(KERNEL, budgets=budgets,
+                                    object_name="journal-gate1")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertIn("unbudgeted", row["detail"])
+
+    def test_unknown_object_is_a_harness_error(self):
+        result, out = self.run_gate(KERNEL, object_name="detailed")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("unknown object", result.stderr)
 
     def test_corrupt_budgets_is_a_harness_error(self):
         # An explicitly-passed corrupt or unreadable budgets file

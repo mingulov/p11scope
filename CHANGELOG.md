@@ -34,9 +34,12 @@ versioned separately and are opaque, exact dispatch keys.
   attached templates; the report names the covered tables. The prefix is
   admitted only when the capture's first plan held the closure beside a
   non-closure provider, or when the closure is operator-named, and never
-  takes the reserve's slots, so a provider needing up to the remaining
-  budget still fits; a closure alone in the first plan, or first mapped
-  mid-capture, admits only its published tables, unless the `--module`
+  takes the reserve's slots: at least the reserve (128 of 512 slots) stays
+  free, so one later standard function list (at most 104 entries) always
+  fits, while a second later provider may be refused by name; a closure
+  alone in the first plan, or first mapped mid-capture, admits only its
+  published tables (with none published yet, a named capture still starts,
+  `PARTIAL`, and attaches the providers below it as they load), unless the `--module`
   narrowing attributed its opened file to a named path (verbatim path
   string, or an inode alias confirmed against the opened files), in which
   case it may take the reserve-capped prefix after the named non-closure

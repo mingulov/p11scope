@@ -674,7 +674,11 @@ impl Engine {
             .collect();
         let mut candidate = self.live_candidate(pinned, modules, Vec::new())?;
         self.preflight_candidate_publication(&candidate)?;
-        record_object_skips(&mut candidate.plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut candidate.plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
         self.pinned = candidate.pinned;
         self.modules = candidate.modules;
         self.plan = candidate.plan;
@@ -1313,7 +1317,11 @@ impl Engine {
             complete,
             mut candidate,
         } = prepared;
-        record_object_skips(&mut candidate.plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut candidate.plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
         let changed = candidate.plan != self.plan;
         // Fallible eligibility before any fact mutation: a stale or
         // retired receipt refuses here and replaces nothing.

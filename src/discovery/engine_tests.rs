@@ -81,7 +81,14 @@ fn lifecycle_tier_gap_uses_existing_public_discovery_evidence() {
     session.lifecycle_tracking_unavailable =
         Some("live lifecycle tracking unavailable: tracefs not found");
     engine.record_session_lifecycle_tracking(&session);
-    record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+    record_object_skips(
+        &mut engine.plan,
+        &engine.counters.object_skips,
+        &mut engine
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
+    );
     engine.publish_current_capture_facts().unwrap();
 
     assert_eq!(engine.plan.skipped.len(), 1);
@@ -2110,13 +2117,15 @@ fn shared_scope_capture_starts_when_every_module_is_refused() {
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
-    let build = |scope| {
+    let mut tombstones = BTreeSet::new();
+    let mut build = |scope| {
         build_current_plan(
             &modules,
             &[],
             &[],
             &pins,
             &mut DiscoveryCounters::default(),
+            &mut tombstones,
             &BTreeSet::new(),
             0,
             0,
@@ -2142,6 +2151,164 @@ fn shared_scope_capture_starts_when_every_module_is_refused() {
         ),
         "{:?}",
         shared.modules_skipped[0]
+    );
+}
+
+/// A proxy closure array with no published table, mapped alone in a
+/// running process before the proxy loads any provider below it (`profile
+/// --pid` on such a process). The startup build goes through
+/// `build_current_plan`: the capture must start with the closure named as a
+/// PARTIAL gap — never a capacity refusal, since nothing is in use — and a
+/// provider the process loads later is admitted whole while the closure
+/// stays at zero slots.
+#[test]
+fn named_capture_starts_beside_an_unpublished_closure_alone() {
+    let mut closure = p11kit_like_64_table_module();
+    // No interface links any table: nothing is published, every table is
+    // an unresolved lookalike.
+    closure.interfaces.clear();
+    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut engine = Engine::empty();
+    engine.pinned = pins;
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let closure_object = modules[0].object;
+    let mut counters = DiscoveryCounters::default();
+    let plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    assert!(plan.slots.is_empty(), "the closure takes no slot");
+    assert_eq!(plan.modules_skipped.len(), 1, "{:?}", plan.modules_skipped);
+    let gap = &plan.modules_skipped[0];
+    assert!(
+        plan::is_closure_array_refusal(&gap.reason),
+        "named as a closure gap: {}",
+        gap.reason
+    );
+    assert!(
+        !gap.reason.contains("attach slots are available") && !gap.reason.contains("more;"),
+        "nothing is in use, so the gap is not a capacity refusal: {}",
+        gap.reason
+    );
+    assert!(
+        gap.reason.contains("is published yet"),
+        "names why nothing attached: {}",
+        gap.reason
+    );
+    assert_eq!(
+        evidence_verdict(&plan, &engine.pinned, &counters).completeness,
+        "PARTIAL",
+        "the named gap forces PARTIAL"
+    );
+    engine.plan = plan;
+    engine.modules = modules;
+    engine.counters = counters;
+
+    // The process loads a provider below the proxy: a later live rebuild
+    // admits it whole, and the closure stays at zero slots.
+    let mut provider = overlay_module(overlay_key(58));
+    provider.tables[0].entries = overlay_entries(&provider, first_offsets(68));
+    let mut candidate_pins = engine.pinned.clone();
+    let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    let candidate = engine
+        .live_candidate(
+            candidate_pins,
+            vec![closure.clone(), provider.clone()],
+            skipped,
+        )
+        .expect("the later provider's rebuild");
+    let provider_object = candidate
+        .pinned
+        .id_for_scanned(&provider, provider.key, &provider.path)
+        .expect("the provider is pinned");
+    assert_ne!(provider_object, closure_object, "two distinct objects");
+    let slots_of = |object| {
+        candidate
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object == object)
+            .count()
+    };
+    assert_eq!(
+        slots_of(provider_object),
+        68,
+        "the provider is admitted whole"
+    );
+    assert_eq!(slots_of(closure_object), 0, "the closure stays at zero");
+    assert!(
+        candidate
+            .plan
+            .modules_skipped
+            .iter()
+            .any(|skip| plan::is_closure_array_refusal(&skip.reason)
+                && skip.reason.contains("is published yet")),
+        "the closure gap stays named: {:?}",
+        candidate.plan.modules_skipped
+    );
+}
+
+/// Healthy twins of the startup rule above. With nothing mapped a named
+/// capture starts empty, as before; a real capacity refusal that leaves
+/// nothing to attach still stops the capture, even beside an unpublished
+/// closure, and names that refusal rather than the closure.
+#[test]
+fn named_capture_startup_twins_beside_an_unpublished_closure() {
+    let build = |modules: &[ReconciledModule], pins: &PinnedObjects| {
+        build_current_plan(
+            modules,
+            &[],
+            &[],
+            pins,
+            &mut DiscoveryCounters::default(),
+            &mut BTreeSet::new(),
+            &BTreeSet::new(),
+            0,
+            0,
+            false,
+            plan::AdmissionScope::Named,
+            false,
+        )
+    };
+    let empty = build(&[], &PinnedObjects::empty()).expect("nothing mapped still starts");
+    assert!(empty.slots.is_empty() && empty.modules_skipped.is_empty());
+
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut oversized = overlay_module(overlay_key(58));
+    oversized.tables[0].entries = overlay_entries(
+        &oversized,
+        first_offsets(p11scope_ebpf_common::MAX_SLOTS + 1),
+    );
+    let mut pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    assert!(
+        pins.absorb(overlay_pins(&[(oversized.key, "c3a91d07", 1)]))
+            .is_empty()
+    );
+    let (modules, skipped) = bind_scanned_modules(&[oversized, closure], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let error = build(&modules, &pins).expect_err("a real capacity refusal leaves nothing");
+    let text = error.to_string();
+    assert!(text.contains("leaving nothing to attach"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "module needs {} more",
+            p11scope_ebpf_common::MAX_SLOTS + 1
+        )),
+        "names the provider's capacity refusal, not the closure: {text}"
     );
 }
 
@@ -2175,6 +2342,10 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
         &[],
         &engine.pinned,
         &mut counters,
+        &mut engine
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
         &BTreeSet::new(),
         0,
         0,
@@ -7843,20 +8014,90 @@ fn an_empty_scan_pass_is_not_a_loss_once_the_capture_attaches_that_table() {
     let attached = empty_scan("/opt/p11.so");
     let never_attached = empty_scan("/opt/other.so");
 
-    record_object_skips(&mut plan, &[attached.clone(), never_attached.clone()]);
+    let mut tombstones = BTreeSet::new();
+    record_object_skips(
+        &mut plan,
+        &[attached.clone(), never_attached.clone()],
+        &mut tombstones,
+    );
     assert_eq!(
         plan.skipped,
         vec![never_attached.clone()],
         "a module this capture attached a table in has no empty scan to show; \
              one it never attached still does"
     );
+    assert!(
+        tombstones.contains(&scan_gap_key(&attached))
+            && !tombstones.contains(&scan_gap_key(&never_attached)),
+        "only the contradicted gap is tombstoned: {tombstones:?}"
+    );
 
     // …and the plan's skip list is only rebuilt when its sources are, so a
     // record an earlier batch made while the module was still empty has to
     // be re-judged, not just kept out.
     plan.skipped = vec![attached, never_attached.clone()];
-    record_object_skips(&mut plan, &[]);
+    record_object_skips(&mut plan, &[], &mut tombstones);
     assert_eq!(plan.skipped, vec![never_attached]);
+
+    // …and the suppression outlives the retirement that empties the terminal
+    // plan: a terminal record of the gap the counters still carry must not
+    // resurrect it.
+    plan.modules.clear();
+    plan.slots.clear();
+    record_object_skips(&mut plan, &[empty_scan("/opt/p11.so")], &mut tombstones);
+    assert_eq!(
+        plan.skipped,
+        vec![empty_scan("/opt/other.so")],
+        "a retired attached table keeps its gap suppressed"
+    );
+}
+
+/// M4 twin (proxy-lane flake): an early empty scan gap for a module the
+/// capture later attached in full retires at publish time. When the
+/// process ends and retirement empties the terminal plan, the terminal
+/// settle must not resurrect the gap: once fully attached, always
+/// suppressed. Reproduced live: 1 run in 10 published `function table
+/// unavailable in file-backed data` beside the fully attached module.
+#[test]
+fn terminal_settle_does_not_resurrect_a_retired_scan_gap() {
+    let (mut engine, module, _, _) = engine_with_overlay(77);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    // The overlay module carries one scanned table with one entry: the
+    // capture attached this module in full, the gap's contradiction.
+    assert!(
+        engine
+            .plan
+            .modules
+            .iter()
+            .any(|module| module.tables.iter().any(|table| table.entries > 0)),
+        "the overlay plan attaches a nonempty table: {:?}",
+        engine.plan.modules
+    );
+    let gap = Skipped {
+        subject: module.path.clone(),
+        reason: crate::discovery::scan::no_table_found_reason(&module.path, false),
+    };
+    engine.counters.object_skips = vec![gap.clone()];
+    // Attached at publish time: the gap retires.
+    engine.publish_current_capture_facts().unwrap();
+    assert!(
+        !engine.plan.skipped.contains(&gap),
+        "publish retires the gap for the attached module: {:?}",
+        engine.plan.skipped
+    );
+    // The process ends; retirement empties the terminal plan.
+    engine.plan.modules.clear();
+    engine.plan.slots.clear();
+    // The terminal settle must not resurrect the retired gap.
+    engine.settle_terminal_drain();
+    assert!(
+        !engine.plan.skipped.contains(&gap),
+        "terminal settle keeps the retired gap suppressed: {:?}",
+        engine.plan.skipped
+    );
 }
 
 /// A cgroup whose `cgroup.procs` names one process that no longer exists —
@@ -31888,12 +32129,14 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
     let first = module(ProcessViewId(0), PinnedObjectId(100), "/first.so", 0x10);
     let second = module(ProcessViewId(0), PinnedObjectId(200), "/second.so", 0x20);
     let mut counters = DiscoveryCounters::default();
+    let mut tombstones = BTreeSet::new();
     let plan = build_current_plan(
         &[first, second],
         &[],
         &[],
         &PinnedObjects::empty(),
         &mut counters,
+        &mut tombstones,
         // The exact final object, not its equal-key peer, owns the outcome.
         &[PinnedObjectId(200)].into_iter().collect(),
         0,
@@ -32698,8 +32941,9 @@ fn p2_retained_scan_error_keeps_counters_and_survives_attachment() {
             },
             exports_agreeing: (source != "manifest").then_some(0),
         });
-        record_object_skips(&mut plan, std::slice::from_ref(&refusal));
-        record_object_skips(&mut plan, &[]);
+        let mut tombstones = BTreeSet::new();
+        record_object_skips(&mut plan, std::slice::from_ref(&refusal), &mut tombstones);
+        record_object_skips(&mut plan, &[], &mut tombstones);
         assert_eq!(
             plan.skipped.as_slice(),
             std::slice::from_ref(&refusal),
@@ -32750,7 +32994,8 @@ fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
         plan.skipped
     );
 
-    record_object_skips(&mut plan, &skips);
+    let mut tombstones = BTreeSet::new();
+    record_object_skips(&mut plan, &skips, &mut tombstones);
     assert_eq!(
         plan.skipped, skips,
         "the actual skip is transferred exactly"
@@ -32770,7 +33015,7 @@ fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
         .chain([other.clone()])
         .collect();
     let mut plan = plan::build_from_reconciled_modules(&reconciled);
-    record_object_skips(&mut plan, &mixed);
+    record_object_skips(&mut plan, &mixed, &mut tombstones);
     // Canonical (subject, reason) order matches the merge's losses-map
     // order, so a commit reproduces its predecessor instead of
     // flip-flopping against projection; the dedupe still collapses the
@@ -35043,6 +35288,8 @@ fn p11kit_like_64_table_module() -> ScannedModule {
 /// Part 0: the admitted prefix is reported as a partial-coverage record
 /// naming the covered templates, not as silence; the reported total counts
 /// the linked table beside the heuristic ones.
+/// PA-9/C1: the closure holds a sidecar provider in the first plan, so the
+/// prefix applies; closure-alone would take published-only and spill nothing.
 #[test]
 fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     let admitted_heuristics = if cfg!(feature = "wide-detailed-2112") {
@@ -35052,11 +35299,15 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     };
     // Reported attached tables: heuristic plus the linked one.
     let reported_attached = admitted_heuristics + 1;
-    let expected_slots = ((admitted_heuristics + 1) * 104) as usize;
+    // Plus the sidecar provider's single slot: a closure alone in the first
+    // plan takes no prefix (PA-9/C1), so the prefix mechanics under test
+    // hold a provider beside the closure; the closure stays unnamed.
+    let expected_slots = ((admitted_heuristics + 1) * 104) as usize + 1;
     let expected_spill = 63 - admitted_heuristics;
     let raw = p11kit_like_64_table_module();
-    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
-    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    let sidecar = overlay_module(overlay_key(58));
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
 
@@ -35068,7 +35319,9 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     );
     assert!(
         plan.modules_skipped[0].reason.contains(&format!(
-            "{reported_attached} of 63 template tables attached"
+            // M counts every distinct table, linked included (stale "63"
+            // predates that redefinition); the doc above already says so.
+            "{reported_attached} of 64 template tables attached"
         )) && plan.modules_skipped[0]
             .reason
             .contains("calls through the others are not counted"),
@@ -35085,8 +35338,8 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
         "resource-bound spill is counted, never slotted"
     );
     assert_eq!(
-        plan.entries_seen, 6656,
-        "seen counts every decoded record under the resource bound, admitted or spilled"
+        plan.entries_seen, 6657,
+        "seen counts every decoded record under the resource bound, admitted or spilled, plus the sidecar's one"
     );
 
     // Evidence order, not discovery order: the linked table (index 63,
@@ -35113,7 +35366,11 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
         .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
         .unwrap();
     engine.publish_current_capture_facts().unwrap();
-    assert_eq!(engine.discovery.modules.len(), 1);
+    assert_eq!(
+        engine.discovery.modules.len(),
+        2,
+        "closure plus the sidecar provider"
+    );
     assert_eq!(
         engine.discovery.modules_skipped.len(),
         1,
@@ -35137,16 +35394,22 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
 /// unlinked tables' slots are named `unknown` — never the ordinal PKCS#11
 /// labels — while the linked table keeps its names. Every table carries
 /// (file_offset, entry count, linkage kind) into published evidence.
+/// PA-9/C1: the closure holds a sidecar provider in the first plan, so the
+/// prefix (whose labels this guards) applies; the closure stays unnamed.
 #[test]
 fn admitted_heuristic_tables_are_unknown_with_provenance() {
+    // Two, like the resource-bound twin: the reserve-capped 384-slot prefix
+    // ceiling fits the linked table plus two heuristics (stale "3" predates
+    // the reserve cap, which updated the twin's count but missed this one).
     let admitted_heuristics = if cfg!(feature = "wide-detailed-2112") {
         4u64
     } else {
-        3u64
+        2u64
     };
     let raw = p11kit_like_64_table_module();
-    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
-    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+    let sidecar = overlay_module(overlay_key(58));
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
 
@@ -35167,8 +35430,12 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
             );
         }
     }
-    assert_eq!(unknown.len(), (admitted_heuristics * 104) as usize);
-    assert_eq!(plan.slots.len(), ((admitted_heuristics + 1) * 104) as usize);
+    // Plus the sidecar's one heuristic slot, unknown like the rest.
+    assert_eq!(unknown.len(), (admitted_heuristics * 104) as usize + 1);
+    assert_eq!(
+        plan.slots.len(),
+        ((admitted_heuristics + 1) * 104) as usize + 1
+    );
 
     // Table 63 is interface-linked: ordinal 63*104 % 8 == 0 keeps C_Initialize.
     let linked = plan
@@ -35178,7 +35445,12 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
         .unwrap();
     assert_eq!(linked.names, ["C_Initialize"]);
 
-    let tables = &plan.modules[0].tables;
+    let closure = plan
+        .modules
+        .iter()
+        .find(|module| module.tables.len() == 64)
+        .expect("the 64-table closure beside the sidecar provider");
+    let tables = &closure.tables;
     assert_eq!(tables.len(), 64);
     for (index, table) in tables.iter().enumerate() {
         assert_eq!(
@@ -35208,7 +35480,13 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
         .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
         .unwrap();
     engine.publish_current_capture_facts().unwrap();
-    let published = &engine.discovery.modules[0].tables;
+    let published = &engine
+        .discovery
+        .modules
+        .iter()
+        .find(|module| module.tables.len() == 64)
+        .expect("the 64-table closure beside the sidecar provider")
+        .tables;
     assert_eq!(published.len(), 64);
     for (index, table) in published.iter().enumerate() {
         assert_eq!(table.file_offset, Some(0x1caf20 + index as u64 * 840));
@@ -35512,6 +35790,8 @@ fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_modu
 /// indexes, and exact target pins are preserved per view. Six tables are a
 /// closure array by the classifier, so round 1 admits the fitting union
 /// whole rather than through the per-object K=4 cap.
+/// PA-9/C1: whole needs a provider beside the closure in the first plan,
+/// so the build holds a sidecar provider; the union stays unnamed.
 #[test]
 fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
     const TABLES: u64 = 6;
@@ -35594,10 +35874,11 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
         .collect();
     view2.interfaces = vec![];
 
-    let mut pins = overlay_pins(&[(key, OVERLAY_SHA, 1)]);
-    let (modules, skipped) = bind_scanned_modules(&[view1, view2], &mut pins);
+    let sidecar = overlay_module(overlay_key(58));
+    let mut pins = overlay_pins(&[(key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[view1, view2, sidecar], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
-    assert_eq!(modules.len(), 2);
+    assert_eq!(modules.len(), 3);
     assert_eq!(
         modules[0].object, modules[1].object,
         "two views of one provider bind one pinned object"
@@ -35605,7 +35886,8 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
     let object = modules[0].object;
 
     // Entry bindings preserved per view: 6 tables x 10 entries, same object.
-    for (view, module) in modules.iter().enumerate() {
+    // The sidecar (modules[2]) is not part of the union under test.
+    for (view, module) in modules[..2].iter().enumerate() {
         assert_eq!(
             module.entry_objects.len(),
             6,
@@ -35635,7 +35917,11 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
 
     let plan = plan::build_from_reconciled_modules(&modules);
 
-    assert_eq!(plan.modules.len(), 1, "one object is one module");
+    assert_eq!(
+        plan.modules.len(),
+        2,
+        "one object is one module; the sidecar is the second"
+    );
     assert!(
         plan.modules_skipped.is_empty(),
         "fitting union admits, never refuses: {:?}",
@@ -35643,19 +35929,24 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
     );
     assert_eq!(
         plan.slots.len(),
-        60,
-        "6 distinct tables x 10 admit once as one union across views"
+        61,
+        "6 distinct tables x 10 admit once as one union across views, plus the sidecar's one"
     );
     assert_eq!(
         plan.uncorroborated_candidates, 0,
         "fitting union spills nothing"
     );
     assert_eq!(
-        plan.entries_seen, 60,
-        "seen counts distinct records once across views"
+        plan.entries_seen, 61,
+        "seen counts distinct records once across views, plus the sidecar's one"
     );
+    let union = plan
+        .modules
+        .iter()
+        .find(|module| module.object == object)
+        .expect("the union module beside the sidecar provider");
     assert_eq!(
-        plan.modules[0].interfaces, 1,
+        union.interfaces, 1,
         "interfaces take the max across views, never the sum"
     );
     assert!(
@@ -35675,18 +35966,24 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
             "table {table} admission follows the shared evidence order"
         );
     }
-    for slot in &plan.slots {
+    for slot in plan.slots.iter().filter(|slot| slot.object == object) {
         assert_eq!(
             slot.object, object,
             "every slot pins the exact provider object"
         );
     }
+    assert!(
+        plan.slots.iter().any(|slot| slot.object != object),
+        "the sidecar provider holds its slot beside the union"
+    );
 }
 
 // Audit F5/F7 spill-then-settle publication pair: five distinct one-target
 // heuristic tables, four admitted under K=4, one omitted; the second
 // publication corroborates the fifth table with a live return and rebuilds
 // through the same stable-ID extension path the engine uses.
+// PA-9/C1: every build holds a sidecar provider beside the closure, so the
+// fitting five admit whole; closure-alone would take published-only.
 fn spill_history_engine() -> (Engine, ScannedModule) {
     let mut raw = p11kit_like_64_table_module();
     raw.tables.truncate(5);
@@ -35694,9 +35991,10 @@ fn spill_history_engine() -> (Engine, ScannedModule) {
         table.entries.truncate(1);
     }
     raw.interfaces.clear();
+    let sidecar = overlay_module(overlay_key(58));
     let mut engine = Engine::empty();
-    engine.pinned = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
-    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut engine.pinned);
+    engine.pinned = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[raw.clone(), sidecar], &mut engine.pinned);
     assert!(skipped.is_empty());
     engine.plan = plan::build_from_reconciled_modules(&modules);
     engine.modules = modules;
@@ -35710,7 +36008,8 @@ fn spill_history_engine() -> (Engine, ScannedModule) {
 
 fn publish_fifth_table_live(engine: &mut Engine, mut raw: ScannedModule) {
     raw.tables[4].live_return = true;
-    let (modules, skipped) = bind_scanned_modules(&[raw], &mut engine.pinned);
+    let sidecar = overlay_module(overlay_key(58));
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut engine.pinned);
     assert!(skipped.is_empty());
     let mut rebuilt = plan::build_from_reconciled_modules(&modules);
     engine
@@ -35732,15 +36031,17 @@ fn publish_fifth_table_live(engine: &mut Engine, mut raw: ScannedModule) {
 /// the growth-omission (G-03) tests. What remains here is the live half: a
 /// later live publication settles through the same stable-ID extension path
 /// with no spill at any point, and upgrades the table's linkage.
+/// PA-9/C1: whole needs a provider beside the closure in the first plan;
+/// the pair holds a sidecar provider, so six slots admit, none spill.
 #[test]
 fn whole_closure_module_settles_live_publication_without_spill() {
     let (mut engine, raw) = spill_history_engine();
     assert_eq!(engine.plan.uncorroborated_candidates, 0);
     assert_eq!(engine.discovery.uncorroborated_candidates, 0);
-    assert_eq!(engine.plan.slots.len(), 5);
+    assert_eq!(engine.plan.slots.len(), 6);
     let offset = raw.tables[4].file_offset;
     publish_fifth_table_live(&mut engine, raw);
-    assert_eq!(engine.plan.slots.len(), 5);
+    assert_eq!(engine.plan.slots.len(), 6);
     assert_eq!(
         engine.plan.uncorroborated_candidates, 0,
         "the live merge settles with no spill"
@@ -35749,9 +36050,11 @@ fn whole_closure_module_settles_live_publication_without_spill() {
         engine.discovery.uncorroborated_candidates, 0,
         "lifetime evidence carries no spill that never happened"
     );
-    let current = engine.plan.modules[0]
-        .tables
+    let current = engine
+        .plan
+        .modules
         .iter()
+        .flat_map(|module| &module.tables)
         .find(|table| table.file_offset == offset)
         .unwrap();
     assert_eq!(current.linkage, "live_return");
@@ -35766,14 +36069,18 @@ fn public_linkage_reflects_later_live_publication() {
     let (mut engine, raw) = spill_history_engine();
     let offset = raw.tables[4].file_offset;
     publish_fifth_table_live(&mut engine, raw);
-    let current = engine.plan.modules[0]
-        .tables
+    let current = engine
+        .plan
+        .modules
         .iter()
+        .flat_map(|module| &module.tables)
         .find(|table| table.file_offset == offset)
         .unwrap();
-    let public = engine.discovery.modules[0]
-        .tables
+    let public = engine
+        .discovery
+        .modules
         .iter()
+        .flat_map(|module| &module.tables)
         .find(|table| table.file_offset == offset)
         .unwrap();
     assert_eq!(current.linkage, "live_return");
@@ -35791,16 +36098,20 @@ fn public_linkage_never_downgrades_after_proof_retires() {
     let (mut engine, raw) = spill_history_engine();
     let offset = raw.tables[4].file_offset;
     publish_fifth_table_live(&mut engine, raw.clone());
-    let public = engine.discovery.modules[0]
-        .tables
+    let public = engine
+        .discovery
+        .modules
         .iter()
+        .flat_map(|module| &module.tables)
         .find(|table| table.file_offset == offset)
         .unwrap();
     assert_eq!(public.linkage, "live_return");
     republish_all_heuristic(&mut engine, raw);
-    let public = engine.discovery.modules[0]
-        .tables
+    let public = engine
+        .discovery
+        .modules
         .iter()
+        .flat_map(|module| &module.tables)
         .find(|table| table.file_offset == offset)
         .unwrap();
     assert_eq!(
@@ -35810,7 +36121,8 @@ fn public_linkage_never_downgrades_after_proof_retires() {
 }
 
 fn republish_all_heuristic(engine: &mut Engine, raw: ScannedModule) {
-    let (modules, skipped) = bind_scanned_modules(&[raw], &mut engine.pinned);
+    let sidecar = overlay_module(overlay_key(58));
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut engine.pinned);
     assert!(skipped.is_empty());
     let mut rebuilt = plan::build_from_reconciled_modules(&modules);
     engine
@@ -46600,7 +46912,14 @@ fn automatic_exec_named_pid_end_receipt_refuses_foreign_stale_or_stopped_detach(
                 .is_empty()
         );
         engine.sync_physical_gap(&session);
-        record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+        record_object_skips(
+            &mut engine.plan,
+            &engine.counters.object_skips,
+            &mut engine
+                .capture_facts
+                .visible_history_mut()
+                .scan_gap_tombstones,
+        );
         assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
     }
 }
@@ -46650,7 +46969,14 @@ fn automatic_exec_named_pid_end_receipt_refuses_replacement_endpoint_selection()
     assert_eq!(session.physical_gap_summary().episodes, 1);
     assert!(session.physical_gap_summary().open);
     engine.sync_physical_gap(&session);
-    record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+    record_object_skips(
+        &mut engine.plan,
+        &engine.counters.object_skips,
+        &mut engine
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
+    );
     assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
 }
 
@@ -47254,7 +47580,14 @@ fn automatic_exec_physical_gap_public_terminal_only_cannot_publish_recovered_his
             .is_empty()
     );
     engine.sync_physical_gap(&session);
-    record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+    record_object_skips(
+        &mut engine.plan,
+        &engine.counters.object_skips,
+        &mut engine
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
+    );
     assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
 }
 
@@ -50925,7 +51258,14 @@ fn global_retirement_unknown_without_count_remains_concrete_partial_in_public_ou
             open,
             unknown,
         });
-        record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+        record_object_skips(
+            &mut engine.plan,
+            &engine.counters.object_skips,
+            &mut engine
+                .capture_facts
+                .visible_history_mut()
+                .scan_gap_tombstones,
+        );
         assert_eq!(engine.capture_facts().attach_gap_ms(), None);
         assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
     }

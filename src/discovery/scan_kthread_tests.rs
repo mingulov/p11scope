@@ -248,6 +248,110 @@ fn completed_scan_marks_hints_examined() {
     );
 }
 
+/// A `--module` hint file plus scripted maps whose one executable group
+/// carries the hint's inode under the given raw path spelling: the
+/// inode-alias shape, with no path equality.
+fn inode_alias_fixture(raw_path: &str) -> (tempfile::TempDir, PathBuf, EmptyMapsFixture) {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let hint = dir.path().join("libtok.so");
+    std::fs::write(&hint, b"provider bytes").unwrap();
+    let inode = std::fs::metadata(&hint).unwrap().ino();
+    let maps = format!("7f0000000000-7f0000001000 r-xp 00000000 08:01 {inode} {raw_path}\n");
+    let fixture = EmptyMapsFixture {
+        maps: maps.into_bytes(),
+        stat: Err(io::ErrorKind::NotFound),
+        exe: Err(io::ErrorKind::NotFound),
+    };
+    (dir, hint, fixture)
+}
+
+fn hint_missed(outcome: &ScanOutcome, hint: &Path) -> bool {
+    outcome.skipped().iter().any(|skip| {
+        skip.subject == hint.display().to_string() && skip.reason == HINT_NOT_MAPPED_REASON
+    })
+}
+
+#[test]
+fn inode_match_without_usable_path_still_misses_the_hint() {
+    // An inode alias the scan cannot open (memfd, deleted mapping) is
+    // unconfirmed: it must not mask the hint's miss.
+    for raw_path in ["[memfd:jit-cache]", "/opt/stale/libtok.so (deleted)"] {
+        let (_dir, hint, mut fixture) = inode_alias_fixture(raw_path);
+        let mut budget = CaptureWorkBudget::default();
+        let (outcome, _, hints_examined) =
+            run_examined(&mut fixture, &mut budget, std::slice::from_ref(&hint))
+                .expect("the scan must complete, not error");
+        assert!(
+            hints_examined,
+            "the scan reached the hint loop ({raw_path})"
+        );
+        assert!(
+            hint_missed(&outcome, &hint),
+            "an unconfirmed inode alias must not mask the miss ({raw_path}), got {:?}",
+            outcome.skipped()
+        );
+    }
+}
+
+#[test]
+fn inode_match_with_unopenable_object_still_misses_the_hint() {
+    // Same, when the aliased path exists in maps but cannot be opened in
+    // the target: the gate never runs, so the hint stays unmatched.
+    let (_dir, hint, mut fixture) = inode_alias_fixture("/nonexistent-dir/unopenable.so");
+    let mut budget = CaptureWorkBudget::default();
+    let (outcome, _, hints_examined) =
+        run_examined(&mut fixture, &mut budget, std::slice::from_ref(&hint))
+            .expect("the scan must complete, not error");
+    assert!(hints_examined, "the scan reached the hint loop");
+    assert!(
+        hint_missed(&outcome, &hint),
+        "an unconfirmed inode alias must not mask the miss, got {:?}",
+        outcome.skipped()
+    );
+}
+
+#[test]
+fn path_match_counts_as_matched_without_further_confirmation() {
+    // Healthy twin: exact path equality in the target view is the
+    // confirmation, so the hint is mapped here even when the object
+    // itself cannot be corroborated afterwards (here the opened identity
+    // cannot match the scripted maps key). The object stays disclosed
+    // as its own skip; only the hint miss is not owed.
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let hint = dir.path().join("libtok.so");
+    std::fs::write(&hint, b"provider bytes").unwrap();
+    let inode = std::fs::metadata(&hint).unwrap().ino();
+    let maps = format!(
+        "7f0000000000-7f0000001000 r-xp 00000000 ff:fe {inode} {}\n",
+        hint.display()
+    );
+    let mut fixture = EmptyMapsFixture {
+        maps: maps.into_bytes(),
+        stat: Err(io::ErrorKind::NotFound),
+        exe: Err(io::ErrorKind::NotFound),
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let (outcome, _, hints_examined) =
+        run_examined(&mut fixture, &mut budget, std::slice::from_ref(&hint))
+            .expect("the scan must complete, not error");
+    assert!(hints_examined, "the scan reached the hint loop");
+    assert!(
+        !hint_missed(&outcome, &hint),
+        "a path-matched hint is mapped, got {:?}",
+        outcome.skipped()
+    );
+    assert!(
+        outcome
+            .skipped()
+            .iter()
+            .any(|skip| skip.reason.contains("does not match mapped object")),
+        "the unconfirmed object stays disclosed, got {:?}",
+        outcome.skipped()
+    );
+}
+
 #[test]
 fn scan_empty_maps_zombie_is_not_absence() {
     let mut fixture = EmptyMapsFixture {

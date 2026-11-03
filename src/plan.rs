@@ -13231,8 +13231,8 @@ mod tests {
 
     /// Operator-named exception with several `--module` paths: the named
     /// non-closure module is admitted first and in full, and the named
-    /// closure's prefix fits only the remaining reserve — in either
-    /// discovery order.
+    /// closure's prefix fits only the remaining budget outside the
+    /// reserve — in either discovery order.
     #[test]
     fn two_module_paths_admit_provider_first_then_closure_prefix() {
         for order in ["closure-first", "provider-first"] {

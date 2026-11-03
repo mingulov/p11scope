@@ -2948,6 +2948,8 @@ def exact_capture_modules(document):
 ADMITTED_GROWTH_PREFIX = "admitted module needs "
 
 
+# Live caller outside this file: scripts/matrix/verify-proxy-stack.sh's nested
+# exports lane calls this with growth_path=None (no growth record allowed).
 def exact_admitted_growth_skips(evidence, growth_path=None):
     """`modules_skipped` holds only G-03 growth records for `growth_path`.
 

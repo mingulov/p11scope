@@ -8,7 +8,8 @@ use crate::events::DiscoveryDomain;
 use crate::plan::Slot;
 use p11scope_ebpf_common::{
     DISCOVERY_EXEC_SAME_TASK_CANDIDATE, DISCOVERY_EXEC_TASK_REPLACED, DISCOVERY_EXEC_UNKNOWN,
-    DISCOVERY_KIND_EXEC, DISCOVERY_KIND_LEADER_EXIT, DiscoveryRecord,
+    DISCOVERY_KIND_EXEC, DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LEADER_EXIT_MAPPINGS,
+    DiscoveryRecord,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -665,7 +666,9 @@ impl PidLifecycleTap {
         if (record.pid_tgid >> 32) as u32 != self.0.pid.get()
             || !matches!(
                 record.kind,
-                DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT
+                DISCOVERY_KIND_EXEC
+                    | DISCOVERY_KIND_LEADER_EXIT
+                    | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
             )
         {
             return;

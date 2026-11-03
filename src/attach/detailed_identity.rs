@@ -481,7 +481,8 @@ impl ProofTap {
                 self.proof
                     .lifecycle((record.pid_tgid >> 32) as u32, record.hook_ts_ns, true)
             }
-            p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT => {
+            p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT
+            | p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT_MAPPINGS => {
                 self.proof
                     .lifecycle((record.pid_tgid >> 32) as u32, record.hook_ts_ns, false)
             }

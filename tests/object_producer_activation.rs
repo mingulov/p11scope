@@ -3195,6 +3195,12 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// birth's one argument, plus their comment lines): 145238 B, measured
 /// with this same lexer on the integrated source; the previous pin
 /// matches its parent.
+/// Re-baselined for the kind-7 exit-time mapping summary (the only BPF
+/// source change: the `InstanceExitSummary` struct plus remap consts,
+/// the `emit_lifecycle` kind-7 arm, the Detailed-only kind selection
+/// in the exit hook, and the `p11_instance_exit_summary` declaration):
+/// 147609 B, measured with this same lexer on the integrated source;
+/// the previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3204,8 +3210,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            145238,
-            "bd971f2f6c7295e4080097cd2720cd45c650f9d5d124e8c2ae179edc61a3a3e9"
+            147609,
+            "4f4424e357cf9075aa034c8931db39ae6db728b7ad04b4395096bde5662d61c7"
         ),
         "stripped BPF dump must stay byte-identical"
     );

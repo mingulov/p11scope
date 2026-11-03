@@ -4278,6 +4278,93 @@ fn exit_mappings_unarmed_counts_gap_without_split() {
     assert!(engine.exit_mapping_reasons_for_test().is_empty());
 }
 
+/// Classifier priority: a shared-mm summary with overflow and
+/// named slots voids to shared-mm unknown, not `mapped`.
+#[test]
+fn exit_mappings_shared_mm_beats_overflow_and_slots() {
+    let mut state = ExitMappingState::default();
+    state.set_enabled(true);
+    state.note_exec(100, 5);
+    let mut exit = exit_mappings_record(100, 11);
+    exit.pointers[0] = 3;
+    exit.status_flags = DISCOVERY_STATUS_EXIT_MAP_SHARED_MM | DISCOVERY_STATUS_EXIT_MAP_OVERFLOW;
+    state.classify(&exit, false);
+    assert_eq!((state.mapped, state.unknown), (0, 1));
+    assert_eq!(state.reasons, vec![ExitMappingReason::UnknownSharedMm]);
+}
+
+/// Classifier priority: shared-mm is checked before local fault.
+#[test]
+fn exit_mappings_shared_mm_beats_local_fault() {
+    let mut state = ExitMappingState::default();
+    state.set_enabled(true);
+    state.note_exec(101, 5);
+    let mut exit = exit_mappings_record(101, 11);
+    exit.pointers[0] = 3;
+    exit.status_flags = DISCOVERY_STATUS_EXIT_MAP_SHARED_MM | DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT;
+    state.classify(&exit, false);
+    assert_eq!((state.mapped, state.unknown), (0, 1));
+    assert_eq!(state.reasons, vec![ExitMappingReason::UnknownSharedMm]);
+}
+
+/// A reordered EXEC (stashed at or past the exit timestamp) fails
+/// closed into the late-watch arm, like a missing EXEC.
+#[test]
+fn exit_mappings_reordered_exec_reads_late_watch() {
+    let mut state = ExitMappingState::default();
+    state.set_enabled(true);
+    state.note_exec(102, 11);
+    let exit = exit_mappings_record(102, 11);
+    state.classify(&exit, false);
+    assert_eq!((state.mapped, state.unknown), (0, 1));
+    assert_eq!(state.reasons, vec![ExitMappingReason::UnknownLateWatch]);
+}
+
+/// An out-of-range slot cell names nothing: with a timely EXEC it
+/// reads empty unknown, never `mapped`.
+#[test]
+fn exit_mappings_out_of_range_slot_names_nothing() {
+    let mut state = ExitMappingState::default();
+    state.set_enabled(true);
+    state.note_exec(103, 5);
+    let mut exit = exit_mappings_record(103, 11);
+    exit.pointers[0] = u64::from(p11scope_ebpf_common::instance::FILE_SLOTS) + 1;
+    state.classify(&exit, false);
+    assert_eq!((state.mapped, state.unknown), (0, 1));
+    assert_eq!(state.reasons, vec![ExitMappingReason::UnknownEmpty]);
+}
+
+/// Unarmed classification is a no-op: no counts, no reasons.
+#[test]
+fn exit_mappings_unarmed_classify_records_nothing() {
+    let mut state = ExitMappingState::default();
+    state.note_exec(104, 5);
+    let mut exit = exit_mappings_record(104, 11);
+    exit.pointers[0] = 3;
+    state.classify(&exit, false);
+    assert_eq!((state.mapped, state.unknown), (0, 0));
+    assert!(state.reasons.is_empty());
+    assert!(state.execs.is_empty());
+}
+
+/// The exec-timing table is bounded: past the stash bound the
+/// smallest PID evicts first, deterministically.
+#[test]
+fn exit_mappings_exec_table_evicts_smallest_pid_when_full() {
+    let mut state = ExitMappingState::default();
+    state.set_enabled(true);
+    for pid in 0..=p11scope_ebpf_common::instance::FILE_SLOTS {
+        state.note_exec(pid, u64::from(pid));
+    }
+    assert_eq!(state.execs.len(), 256);
+    assert!(!state.execs.contains_key(&0));
+    assert!(
+        state
+            .execs
+            .contains_key(&p11scope_ebpf_common::instance::FILE_SLOTS)
+    );
+}
+
 #[test]
 fn system_scope_admits_new_generations_and_counts_unmatched_exits() {
     let first = ProcessView::open(ProcessViewId(41), std::process::id()).unwrap();

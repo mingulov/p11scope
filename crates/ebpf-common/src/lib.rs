@@ -503,11 +503,11 @@ pub const DISCOVERY_KIND_LEADER_EXIT: u8 = 6;
 /// `status_flags` projects the record refusal bits below. Kind 6 stays
 /// byte-identical; inventory-only builds keep emitting it.
 ///
-/// STAGED: no producer emits kind 7 (BPF exit emits kind 6; the native
-/// summary helper runs only in fixtures), and the engine rejects it as
-/// unknown-kind with live-loss. The kind-7 producer and its engine
-/// consumer must land atomically: emitting without the consumer turns
-/// every leader exit into recorded loss.
+/// Landed with 6.14 Option A: the Detailed BPF exit hook emits kind
+/// 7 in extensive captures (kind 6 elsewhere and in every other
+/// flavor), and the engine routes it as a leader exit. Producer and
+/// consumer landed atomically: emitting without the consumer would
+/// turn every leader exit into recorded loss.
 pub const DISCOVERY_KIND_LEADER_EXIT_MAPPINGS: u8 = 7;
 
 /// Private EXEC classification: candidacy alone never proves paired links.
@@ -1080,10 +1080,9 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
                 && record.send_signal_rc == 0
                 && zero_discovery_payload(record)
         }
-        // STAGED (kind 7): validated here so the payload rules are
-        // pinned, but no producer emits it and the engine rejects it
-        // as unknown-kind with live-loss. Producer and consumer land
-        // atomically; see the constant docs.
+        // Kind 7 (6.14 Option A): the payload rules below are the
+        // producer/consumer contract; producer and consumer landed
+        // atomically, see the constant docs.
         DISCOVERY_KIND_LEADER_EXIT_MAPPINGS => {
             record.status_flags
                 & !(DISCOVERY_STATUS_EXIT_MAP_SHARED_MM
@@ -2805,7 +2804,10 @@ mod tests {
         };
         assert_eq!(native("INST_RECORD_SHARED_MM"), instance::RECORD_SHARED_MM);
         assert_eq!(native("INST_RECORD_OVERFLOW"), instance::RECORD_OVERFLOW);
-        assert_eq!(native("INST_RECORD_LOCAL_FAULT"), instance::RECORD_LOCAL_FAULT);
+        assert_eq!(
+            native("INST_RECORD_LOCAL_FAULT"),
+            instance::RECORD_LOCAL_FAULT
+        );
         assert_eq!(
             u64::from(DISCOVERY_STATUS_EXIT_MAP_SHARED_MM),
             instance::RECORD_SHARED_MM << 1

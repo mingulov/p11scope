@@ -994,12 +994,17 @@ class JournalMarkerInventoryTests(unittest.TestCase):
         return errors.getvalue()
 
     def test_release_detailed_marker_absence_accepts(self):
+        # The PID-scope birth witness ships only with the marker birth.
         maps = {name: value for name, value in checker.SAFE_MAPS.items()
-                if name != "JOURNAL_MARKER_CTL"}
+                if name not in {"JOURNAL_MARKER_CTL", "PID_START_TICK"}}
         symbols = self.detailed_symbols(missing=set(checker.REQUIRED_GLOBAL_MARKER_HELPERS)
                                         | {"JOURNAL_MARKER_CTL"})
         self.quiet(checker.validate_inventory, "default-no-marker", maps,
                    checker.SAFE_PROGRAMS, symbols)
+        reason = self.refused(checker.validate_inventory, "default-no-marker",
+                              maps | {"PID_START_TICK": checker.SAFE_MAPS["PID_START_TICK"]},
+                              checker.SAFE_PROGRAMS, symbols)
+        self.assertIn("map added: PID_START_TICK", reason)
         with self.assertRaisesRegex(RuntimeError, "forbidden birth marker symbols"):
             checker.validate_inventory("default-no-marker", maps,
                                        checker.SAFE_PROGRAMS,

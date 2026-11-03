@@ -11458,6 +11458,10 @@ mod tests {
             crate::discovery::pause::last_hook_attach_boot_ns()
         }
 
+        fn boot_now_ns(&mut self) -> Option<u64> {
+            crate::discovery::pause::boot_ns()
+        }
+
         fn dequeue(
             &mut self,
         ) -> std::result::Result<Option<crate::discovery::pause::DiscoveryItem>, String> {

@@ -285,6 +285,9 @@ pub(crate) trait PauseIo {
     /// completed or one is still in flight: then no thread born after
     /// preflight dates as covered.
     fn last_hook_attach_boot_ns(&mut self) -> Option<u64>;
+    /// The `CLOCK_BOOTTIME` reading, in nanoseconds (the hook-attach clock's
+    /// domain); `None` when it cannot be read.
+    fn boot_now_ns(&mut self) -> Option<u64>;
     fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String>;
     fn arm(&mut self) -> Result<(), String>;
     fn authorization(&mut self) -> Result<Option<u64>, String>;
@@ -1205,6 +1208,9 @@ impl PauseCoordinator {
             return self.fail_cycle(io, error.to_string(), lifecycle);
         }
 
+        if let Err(error) = hold_until_the_attach_tick_passes(io, deadline) {
+            return self.fail_cycle(io, error, true);
+        }
         match io.cancelled() {
             Ok(false) => {}
             Ok(true) => return self.fail_cycle(io, "pause coordination cancelled", true),
@@ -1464,8 +1470,8 @@ impl PauseCoordinator {
     /// be woken into the group stop when the record is serviced. Re-sample at
     /// the existing 1 ms cadence until every thread is stopped, inside the
     /// stop's existing deadline and never more than one cycle of samples. A
-    /// thread still not stopped then keeps today's task-set refusal; a
-    /// changed set (vanished, reused or undated thread) or a thread that can
+    /// thread still on its way at the deadline, or when the samples run out,
+    /// reports the deadline; a changed set (vanished, reused or undated thread) or a thread that can
     /// never reach the stop refuses at once. Nothing is attached before this
     /// returns, so a thread that ran while the stop settled only ran before
     /// the hooks changed. The error carries whether it is a lifecycle failure
@@ -1484,16 +1490,19 @@ impl PauseCoordinator {
             }
             io.wait_one_ms().map_err(|error| (error, true))?;
         }
-        Err((MSG_TASK_SET_CHANGED.into(), false))
+        // Every sample found the threads on their way into the stop: running
+        // out of samples is the deadline's twin.
+        Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
     }
 
     /// One task sample, a single `stat` read per thread. The task set and
-    /// thread states are judged before the deadline: a sample that is not
-    /// fully stopped is today's task-set refusal (or, only while `settling`
-    /// and still inside the deadline, `Ok(None)`: wait for a thread that is
-    /// on its way into the stop), and a fully stopped sample past the deadline
-    /// keeps the deadline message. New threads are adopted only by a fully
-    /// stopped settling sample.
+    /// thread states are judged before the deadline. A strict sample that is
+    /// not fully stopped, or any sample with a thread that can never reach the
+    /// stop, is today's task-set refusal. While `settling`, a sample whose
+    /// threads are all in `T`, `R`, `S` or `D` waits (`Ok(None)`) for the
+    /// ones on their way into the stop, and once past the deadline reports
+    /// the deadline message, as a fully stopped sample past the deadline does.
+    /// New threads are adopted only by a fully stopped settling sample.
     fn sample_tasks(
         &mut self,
         io: &mut impl PauseIo,
@@ -1507,10 +1516,13 @@ impl PauseCoordinator {
         let births = self.covered_births(&samples, last_attach, settling)?;
         if samples.values().any(|sample| sample.state != b'T') {
             let settles = |sample: &TaskSample| matches!(sample.state, b'T' | b'R' | b'S' | b'D');
-            if settling && now <= deadline && samples.values().all(settles) {
-                return Ok(None);
+            if !settling || !samples.values().all(settles) {
+                return Err(MSG_TASK_SET_CHANGED.into());
             }
-            return Err(MSG_TASK_SET_CHANGED.into());
+            if now > deadline {
+                return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
+            }
+            return Ok(None);
         }
         if now > deadline {
             return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
@@ -2280,6 +2292,10 @@ impl PauseIo for SessionPauseIo<'_> {
         last_hook_attach_boot_ns()
     }
 
+    fn boot_now_ns(&mut self) -> Option<u64> {
+        boot_ns()
+    }
+
     fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
         // Shared allowance, enforced structurally: a staged pop is a
         // credit transfer and always proceeds, but a ring read needs a
@@ -2943,6 +2959,61 @@ fn birth_covered(start_ticks: u64, last_attach_boot_ns: Option<u64>) -> bool {
     start_ticks.saturating_mul(clock_tick_ns()) > attach
 }
 
+/// Holds a confirmed stop's resume until the boot clock has crossed into the
+/// clock tick after the last completed provider hook attach. A thread the
+/// child starts once resumed is dated by its floored tick ([`birth_covered`]),
+/// and a birth inside the attach's own tick floors at or before the attach, so
+/// it would keep the stop partial although it came after the hooks. Every
+/// such thread is born after the resume, so once the resume is past the next
+/// tick boundary its floor is at or past that boundary, strictly after the
+/// attach. This changes only when the child resumes, never which births are
+/// covered. The hold makes at most one tick's worth of the existing 1 ms
+/// waits (each may oversleep). A resume observed after the stop `deadline`
+/// fails the run, so the hold only starts a wait while the wait, plus one
+/// clock tick of headroom for oversleep, the resume and the observer's first
+/// read, still fits before the deadline; otherwise, or when the stop clock
+/// cannot be read or the margin overflows, it resumes at once. This makes a
+/// late observation unlikely, not impossible: a wait that oversleeps by more
+/// than the headroom can still end past the deadline. A birth inside the
+/// attach's tick then stays partial at the next stop, the safe direction. With no recorded attach, an unreadable boot
+/// clock, a saturated instant or a zero tick there is nothing to wait for.
+/// Only a failed wait is an error.
+fn hold_until_the_attach_tick_passes(io: &mut impl PauseIo, deadline: u64) -> Result<(), String> {
+    let Some(mut boot) = io.boot_now_ns() else {
+        return Ok(());
+    };
+    let Some(attach) = io.last_hook_attach_boot_ns() else {
+        return Ok(());
+    };
+    let tick = clock_tick_ns();
+    let Some(boundary) = attach
+        .checked_div(tick)
+        .and_then(|ticks| ticks.checked_add(1))
+        .and_then(|ticks| ticks.checked_mul(tick))
+    else {
+        return Ok(());
+    };
+    for _ in 0..=tick / SAMPLE_NS {
+        if boot >= boundary {
+            return Ok(());
+        }
+        let wait_end = io.now_ns().ok().and_then(|now| {
+            now.checked_add(SAMPLE_NS)
+                .and_then(|end| end.checked_add(tick))
+        });
+        match wait_end {
+            Some(end) if end <= deadline => {}
+            _ => return Ok(()),
+        }
+        io.wait_one_ms()?;
+        let Some(read) = io.boot_now_ns() else {
+            return Ok(());
+        };
+        boot = read;
+    }
+    Ok(())
+}
+
 fn parse_task_start(stat: &[u8]) -> Option<u64> {
     let close = stat.iter().rposition(|byte| *byte == b')')?;
     let tail = stat.get(close + 1..)?;
@@ -3036,7 +3107,9 @@ impl HookAttachClock {
 /// One provider hook attach in flight. Its completion is stamped when it
 /// drops, on every return path (success, error or unwind): whatever the
 /// attach made live was live by then, so the stamp is an upper bound on
-/// every hook it installed.
+/// every hook it installed. Bind it to a named variable for the whole attach:
+/// `let _ =` drops it at once and stamps an instant before the attach.
+#[must_use = "the window stamps the attach completion when it drops"]
 pub(crate) struct HookAttachWindow<'a> {
     clock: &'a HookAttachClock,
 }
@@ -3145,6 +3218,10 @@ mod tests {
         /// repeats. Default: none recorded.
         attach_instants: VecDeque<Option<u64>>,
         fallback_attach: Option<u64>,
+        /// Scripted boot-clock readings, one per read; then `fallback_boot`.
+        /// Default: unreadable.
+        boot_clock: VecDeque<Option<u64>>,
+        fallback_boot: Option<u64>,
         state_reads: u64,
         queue: VecDeque<Result<Option<DiscoveryItem>, String>>,
         authorization: Option<u64>,
@@ -3164,6 +3241,13 @@ mod tests {
         unvalidated_records: u64,
         required_complete: bool,
         fail_wait: bool,
+        /// Waits that succeed before every later wait fails. Default: no limit.
+        fail_wait_after: Option<usize>,
+        waits_done: usize,
+        /// Fails the first stop-clock read after the first boot-clock read
+        /// (the resume hold's), once.
+        fail_first_now_after_boot: bool,
+        boot_read: bool,
         cancelled: bool,
         same_generation: bool,
         same_generation_results: VecDeque<Result<bool, String>>,
@@ -3201,6 +3285,8 @@ mod tests {
                 last_states: BTreeMap::new(),
                 attach_instants: VecDeque::new(),
                 fallback_attach: None,
+                boot_clock: VecDeque::new(),
+                fallback_boot: None,
                 state_reads: 0,
                 queue: VecDeque::new(),
                 authorization: None,
@@ -3220,6 +3306,10 @@ mod tests {
                 unvalidated_records: 0,
                 required_complete: true,
                 fail_wait: false,
+                fail_wait_after: None,
+                waits_done: 0,
+                fail_first_now_after_boot: false,
+                boot_read: false,
                 cancelled: false,
                 same_generation: true,
                 same_generation_results: VecDeque::new(),
@@ -3262,6 +3352,10 @@ mod tests {
 
     impl PauseIo for FakeIo {
         fn now_ns(&mut self) -> Result<u64, String> {
+            if self.fail_first_now_after_boot && self.boot_read {
+                self.fail_first_now_after_boot = false;
+                return Err("clock".into());
+            }
             if self.resumed
                 && let Some(now) = self.post_resume_now.pop_front()
             {
@@ -3285,9 +3379,10 @@ mod tests {
 
         fn wait_one_ms(&mut self) -> Result<(), String> {
             self.events.push("wait");
-            if self.fail_wait {
+            if self.fail_wait || self.fail_wait_after.is_some_and(|n| self.waits_done >= n) {
                 return Err("wait".into());
             }
+            self.waits_done += 1;
             self.fallback_now = self.fallback_now.saturating_add(SAMPLE_NS);
             Ok(())
         }
@@ -3329,6 +3424,11 @@ mod tests {
                 self.fallback_attach = instant;
             }
             self.fallback_attach
+        }
+
+        fn boot_now_ns(&mut self) -> Option<u64> {
+            self.boot_read = true;
+            self.boot_clock.pop_front().unwrap_or(self.fallback_boot)
         }
 
         fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
@@ -4617,8 +4717,8 @@ mod tests {
     }
 
     /// The settling is bounded by the stop's existing deadline: a thread still
-    /// running when it passes keeps today's task-set partial, after at most
-    /// one wait per millisecond of the cycle.
+    /// running when it passes ends the stop partial on the deadline message
+    /// (ruling PT-7), after at most one wait per millisecond of the cycle.
     #[test]
     fn thread_still_running_at_the_stop_deadline_keeps_partial() {
         let mut io = successful_io(vec![record(10, 0, false)]);
@@ -4643,11 +4743,11 @@ mod tests {
     }
 
     /// The settling sample itself: a thread still running when the deadline
-    /// passes returns today's task-set refusal (not the deadline message), a
-    /// first sample already past the deadline keeps the deadline message, and
-    /// a failed wait is a lifecycle failure.
+    /// passes reports the deadline message (ruling PT-7), a first sample
+    /// already past the deadline keeps the deadline message, and a failed wait
+    /// is a lifecycle failure.
     #[test]
-    fn settling_sample_reports_todays_refusal_at_the_deadline() {
+    fn settling_sample_reports_the_deadline_when_it_runs_out_of_time() {
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         let mut io = FakeIo {
             states: std::iter::repeat_with(|| Ok(running_42()))
@@ -4657,7 +4757,7 @@ mod tests {
         };
         assert_eq!(
             coordinator.sample_until_stopped(&mut io, 5 * SAMPLE_NS),
-            Err((MSG_TASK_SET_CHANGED.into(), false))
+            Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
         );
         assert!((4..=6).contains(&waits(&io)), "{} waits", waits(&io));
 
@@ -4679,6 +4779,304 @@ mod tests {
             coordinator.sample_until_stopped(&mut failing, CYCLE_NS),
             Err(("wait".into(), true))
         );
+    }
+
+    /// The `wait` events immediately before the resume.
+    fn waits_before_resume(io: &FakeIo) -> usize {
+        let resume = io
+            .events
+            .iter()
+            .position(|event| *event == "resume")
+            .expect("the stop resumed");
+        io.events[..resume]
+            .iter()
+            .rev()
+            .take_while(|event| **event == "wait")
+            .count()
+    }
+
+    /// A thread the child starts once resumed dates by its floored tick,
+    /// which cannot prove a birth inside the last attach's own tick. The
+    /// resume therefore waits, at the 1 ms cadence, until the boot clock has
+    /// crossed into the tick after the last completed attach; then every such
+    /// birth floors strictly after the attach.
+    #[test]
+    fn resume_waits_for_the_tick_after_the_last_attach() {
+        let tick = test_tick_ns();
+        let attach = 100 * tick + tick / 2;
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = Some(attach);
+        io.boot_clock = VecDeque::from([Some(attach + 1), Some(101 * tick - 1), Some(101 * tick)]);
+        io.fallback_boot = Some(101 * tick + 1);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 2);
+        assert!(
+            io.boot_clock.is_empty(),
+            "the boundary reading ended the wait"
+        );
+    }
+
+    /// The hold never delays a stop without a reason or past its bound: no
+    /// wait once the boot clock is already past the attach's tick, none with
+    /// no recorded attach or an unreadable boot clock, and at most one tick of
+    /// 1 ms waits when the boot clock never gets there.
+    #[test]
+    fn resume_hold_is_skipped_or_bounded() {
+        let tick = test_tick_ns();
+        for (attach, boot, max_waits) in [
+            (Some(100 * tick), Some(101 * tick), 0),
+            (None, Some(100 * tick), 0),
+            (Some(100 * tick), None, 0),
+            (
+                Some(100 * tick),
+                Some(100 * tick),
+                (tick / SAMPLE_NS) as usize + 1,
+            ),
+        ] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.fallback_attach = attach;
+            io.fallback_boot = boot;
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::confirmed(1),
+                "attach {attach:?} boot {boot:?}"
+            );
+            assert_eq!(
+                waits_before_resume(&io),
+                max_waits,
+                "attach {attach:?} boot {boot:?}"
+            );
+        }
+    }
+
+    /// The hold never costs the stop its deadline: a confirmed stop whose
+    /// next 1 ms wait could cross the deadline resumes at once, because a
+    /// resume observed late fails the whole run. A birth inside the attach's
+    /// tick then stays partial at the next stop, the safe direction.
+    #[test]
+    fn resume_hold_never_waits_past_the_stop_deadline() {
+        let tick = test_tick_ns();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.now = [10, 11, 496_999_997].into_iter().map(Ok).collect();
+        io.fallback_attach = Some(100 * tick + 1);
+        io.fallback_boot = Some(100 * tick + 2);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0, "{:?}", io.events);
+    }
+
+    /// A 1 ms wait started with exactly 1 ms left ends past the deadline once
+    /// the resume and the observer's first read follow it, so the hold also
+    /// keeps a clock tick of headroom: with 1 ms plus less than a tick left it
+    /// resumes at once.
+    #[test]
+    fn resume_hold_keeps_a_tick_of_headroom_before_the_deadline() {
+        let tick = test_tick_ns();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.now = [10, 11, 495_999_999].into_iter().map(Ok).collect();
+        io.fallback_attach = Some(100 * tick + 1);
+        io.fallback_boot = Some(100 * tick + 2);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0, "{:?}", io.events);
+    }
+
+    /// The hold resumes at once when it cannot read the stop's clock: it has
+    /// no way to know the next wait is inside the deadline.
+    #[test]
+    fn resume_hold_resumes_at_once_without_the_stop_clock() {
+        let tick = test_tick_ns();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = Some(100 * tick);
+        io.fallback_boot = Some(100 * tick);
+        io.fail_first_now_after_boot = true;
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0, "{:?}", io.events);
+    }
+
+    /// A saturated attach instant has no next tick: nothing to wait for.
+    #[test]
+    fn resume_hold_skips_a_saturated_attach_instant() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = Some(u64::MAX);
+        io.fallback_boot = Some(0);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0);
+    }
+
+    /// A wait that fails inside the hold is a lifecycle failure like every
+    /// other wait in the cycle, and the stopped child is still resumed.
+    #[test]
+    fn a_failed_wait_inside_the_resume_hold_is_lifecycle_and_still_resumes() {
+        let tick = test_tick_ns();
+        let held = |fail_wait_after| {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.fallback_attach = Some(100 * tick);
+            io.fallback_boot = Some(100 * tick);
+            io.fail_wait_after = fail_wait_after;
+            io
+        };
+        let mut reference = held(None);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.service(&mut reference).unwrap();
+        let hold_waits = waits_before_resume(&reference);
+        assert!(hold_waits > 2);
+        let resume = reference
+            .events
+            .iter()
+            .position(|e| *e == "resume")
+            .unwrap();
+        let waits_before_hold = waits(&FakeIo {
+            events: reference.events[..resume - hold_waits].to_vec(),
+            ..FakeIo::default()
+        });
+
+        let mut io = held(Some(waits_before_hold + 2));
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(
+            error.lifecycle(),
+            "a failed hold wait is lifecycle: {error}"
+        );
+        assert_eq!(io.waits_done, waits_before_hold + 2);
+        let last_wait = io.events.iter().rposition(|e| *e == "wait").unwrap();
+        assert!(
+            io.events[last_wait..].contains(&"resume"),
+            "the child is resumed after the failed wait: {:?}",
+            io.events
+        );
+    }
+
+    /// While the stop settles, a thread still on its way into the stop when
+    /// the deadline passes is a late boundary: the deadline message and its
+    /// `later_pause_boundary` category, as for a late fully stopped sample.
+    #[test]
+    fn settling_sample_out_of_time_with_a_thread_on_its_way_reports_the_deadline() {
+        for state in *b"RSD" {
+            let on_its_way: BTreeMap<u32, u8> = [(41, b'T'), (42, state)].into_iter().collect();
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            let mut io = FakeIo {
+                states: VecDeque::from([Ok(on_its_way.clone()), Ok(on_its_way)]),
+                ..FakeIo::default()
+            };
+            assert_eq!(
+                coordinator.sample_until_stopped(&mut io, SAMPLE_NS / 2),
+                Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false)),
+                "state {}",
+                state as char
+            );
+            assert_eq!(waits(&io), 1);
+        }
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.states = std::iter::repeat_with(|| Ok(running_42()))
+            .take(600)
+            .collect();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.required());
+        assert!(
+            format!("{error}").contains(MSG_PAUSE_CONFIRMATION_DEADLINE),
+            "{error}"
+        );
+    }
+
+    /// The settle loop's sample cap is the deadline's twin: a stop whose
+    /// threads are all still on their way into it when the samples run out
+    /// reports the deadline message, as when the deadline passes first, while
+    /// a thread that can never reach the stop still refuses at once on the
+    /// task set.
+    #[test]
+    fn settle_samples_running_out_report_the_deadline() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            states: std::iter::repeat_with(|| Ok(running_42()))
+                .take(2_000)
+                .collect(),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut io, u64::MAX / 2),
+            Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
+        );
+        assert_eq!(waits(&io), MAX_SETTLE_SAMPLES as usize + 1);
+
+        let unreachable: BTreeMap<u32, u8> = [(41, b'T'), (42, b'Z')].into_iter().collect();
+        let mut io = FakeIo {
+            states: std::iter::repeat_with(|| Ok(unreachable.clone()))
+                .take(2_000)
+                .collect(),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut io, u64::MAX / 2),
+            Err((MSG_TASK_SET_CHANGED.into(), false))
+        );
+        assert_eq!(waits(&io), 0);
+    }
+
+    /// The other direction: a strict sample with a running thread, and a
+    /// settling sample with a thread that can never reach the stop, keep the
+    /// task-set refusal even past the deadline (ruling PT-6).
+    #[test]
+    fn late_strict_or_unreachable_samples_keep_the_task_set_refusal() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            states: VecDeque::from([Ok(running_42())]),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_stopped(&mut io, 0),
+            Err(MSG_TASK_SET_CHANGED.into())
+        );
+        for state in *b"ZXxt" {
+            let unreachable: BTreeMap<u32, u8> = [(41, b'T'), (42, state)].into_iter().collect();
+            let mut io = FakeIo {
+                states: VecDeque::from([Ok(unreachable)]),
+                ..FakeIo::default()
+            };
+            assert_eq!(
+                coordinator.sample_until_stopped(&mut io, 0),
+                Err((MSG_TASK_SET_CHANGED.into(), false)),
+                "state {}",
+                state as char
+            );
+            assert_eq!(waits(&io), 0);
+        }
     }
 
     /// While the stop settles, only a thread on its way into the stop (`R`,
@@ -5206,8 +5604,9 @@ mod tests {
                 io.states = VecDeque::from([Ok([(41, b'T'), (43, b'T')].into_iter().collect())]);
             } else if failure == "tasks" {
                 // A thread that never reaches the stop: the first sample now
-                // re-samples until the stop deadline (ruling PT-3), so the
-                // ordinary task failure is one that persists through it.
+                // re-samples until the stop deadline (ruling PT-3) and then
+                // ends on the deadline message (ruling PT-7), an ordinary
+                // failure all the same.
                 let running: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
                 io.states = std::iter::repeat_with(|| Ok(running.clone()))
                     .take(2_000)

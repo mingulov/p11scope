@@ -256,7 +256,7 @@ jobs:
           awk '/^btrfs \(/{f=1;next} /^(overlay|expected-failures) \(/{f=0} f' "$in/list.txt" \
             | sed 's/ :: .*//' | grep -v '^$' >"$RUNNER_TEMP/btrfs-cells.txt"
           count=$(wc -l <"$RUNNER_TEMP/btrfs-cells.txt")
-          declared=$(sed -n 's/^btrfs (\([0-9]*\)).*/\1/p' "$in/list.txt")
+          declared=$(sed -n 's/^btrfs (\([0-9][0-9]*\)[,)].*/\1/p' "$in/list.txt")
           echo "btrfs cells: $count (declared $declared)"
           test "$count" -gt 0
           test "$count" -eq "$declared"
@@ -332,7 +332,7 @@ jobs:
           awk '/^overlay \(/{f=1;next} /^expected-failures \(/{f=0} f' "$in/list.txt" \
             | sed 's/ :: .*//' | grep -v '^$' >"$RUNNER_TEMP/overlay-cells.txt"
           count=$(wc -l <"$RUNNER_TEMP/overlay-cells.txt")
-          declared=$(sed -n 's/^overlay (\([0-9]*\)).*/\1/p' "$in/list.txt")
+          declared=$(sed -n 's/^overlay (\([0-9][0-9]*\)[,)].*/\1/p' "$in/list.txt")
           echo "overlay cells: $count (declared $declared)"
           test "$count" -gt 0
           test "$count" -eq "$declared"

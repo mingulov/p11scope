@@ -115,8 +115,12 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                 self.assertIn(flag, body)
                 self.assertIn(package, body)
                 # Selectors derive from the curated --list section with
-                # a count check, never from a hand-kept copy.
+                # a count check, never from a hand-kept copy. The
+                # declared-count parse must accept the header's
+                # `, …` suffix after the number.
                 self.assertIn(f"/^{section} \\(/", body)
+                self.assertIn(
+                    "s/^" + section + r" (\([0-9][0-9]*\)[,)].*/", body)
                 self.assertIn('test "$count" -eq "$declared"', body)
                 # Failures, skips and leaked mounts fail the job.
                 self.assertIn("grep -E '^(FAIL|SKIP) '", body)

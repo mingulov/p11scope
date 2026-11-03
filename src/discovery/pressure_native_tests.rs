@@ -3274,11 +3274,12 @@ fn image_quota_16385_births_are_counted_identity_refusals() {
 /// original head, and settles with zero unexplained loss; burst 2
 /// ledgers post-admission independent calls.
 ///
-/// Known limit (lane-A runtime, 2026-10-19): does not converge yet. The
-/// 256-view capacity is shared with ambient in System scope, so reconcile
-/// evicts unadmitted owned views faster than pressure admits them; the
-/// viewless requests strand and the rotation stalls. Repro preserved for
-/// the runtime fix; see the T8 report.
+/// Former known limit (lane-A runtime, 2026-10-19, fixed by waiter-
+/// driven eviction): the 256-view capacity is shared with ambient in
+/// System scope, so reconcile used to evict unadmitted owned views faster
+/// than pressure admitted them; the viewless requests stranded and the
+/// rotation stalled. The cell now converges (14-tick settle) and runs in
+/// the privileged campaign; see the T8 report.
 #[test]
 #[ignore = "privileged: live BPF 256-request pressure episode; run as root with --ignored --test-threads=1 under the privileged lane"]
 fn pressure_live256_genuine_episode_admits_late_then_head() {

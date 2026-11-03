@@ -327,11 +327,20 @@ class OracleTests(unittest.TestCase):
     def test_bool_count_fails(self):
         self.run_case(lambda d, l, r: d["functions"][0].update(calls=True), want=1)
 
-    def test_run_smoke_nonqualifying(self):
-        self.run_case(cell="run-short", want=2)
+    def test_run_exact_requires_confirmed_pause(self):
+        # WP-4: run-short/run-cover are exact, not smoke. Default inputs carry
+        # pause none and must fail; a confirmed pause with an exited child passes.
+        self.run_case(cell="run-short", want=1)
+        def confirmed(d, l, r):
+            d["evidence"].update(pause="sigstop", pause_attempts=1, pause_confirmed=1, pause_partial=0)
+            d["evidence"]["child_still_running"] = False
+        self.run_case(confirmed, cell="run-short", want=0)
 
-    def test_trace_smoke_nonqualifying(self):
-        self.run_case(cell="trace-pid", want=2)
+    def test_trace_malformed_stream_fails(self):
+        # WP-4: trace-pid applies the loss identity; the old arrow-only smoke
+        # text without CAPTURE/COUNT_EVIDENCE/EVIDENCE must fail. Valid streams
+        # that satisfy the identity remain nonqualifying (see breadth suite).
+        self.run_case(cell="trace-pid", want=1)
 
     def test_real_clean_verdict_passes(self):
         self.run_case(cell="verdict-pid")
@@ -746,7 +755,7 @@ else:
  stat=pathlib.Path('/proc/%d/stat'%child.pid).read_text().rsplit(') ',1)[1].split()
  (root/'actual-child.json').write_text(json.dumps({'pid':child.pid,'generation':int(stat[19])}))
 while received<2: time.sleep(.02)
-out.write_text('{}')
+out.write_text(json.dumps({'schema':'p11scope/observed-profile/v3','evidence':{'completeness':'PARTIAL','drain_proven':True,'stop_quiescence':{'state':'proven','post_q_events':False,'post_q_discovery':False},'scheduling':{'inter_drain_gap':{'samples':5}},'child_still_running':False}}))
 print('p11scope: cleanup incomplete',file=sys.stderr,flush=True)
 sys.exit(130)
 '''
@@ -964,7 +973,7 @@ class ShellControls(unittest.TestCase):
             fixture.write_text('#!/usr/bin/python3\nimport os,signal,time\nprint("READY pid=%d"%os.getpid(),flush=True)\nsignal.signal(signal.SIGTERM,lambda a,b:exit(0))\nwhile True: time.sleep(.02)\n')
             fixture.chmod(0o755)
             observer=root/'observer'
-            observer.write_text('#!/usr/bin/python3\nimport json,os,pathlib,stat,sys\np=pathlib.Path(sys.argv[sys.argv.index("-o")+1])\npathlib.Path(os.environ["CONTROL_OUT"],"selected-output.json").write_text(json.dumps(str(p)))\nif stat.S_ISFIFO(p.stat().st_mode):\n print("refusing FIFO output",file=sys.stderr);sys.exit(1)\np.write_text("{}");sys.exit(0)\n')
+            observer.write_text('#!/usr/bin/python3\nimport json,os,pathlib,stat,sys\np=pathlib.Path(sys.argv[sys.argv.index("-o")+1])\npathlib.Path(os.environ["CONTROL_OUT"],"selected-output.json").write_text(json.dumps(str(p)))\nif stat.S_ISFIFO(p.stat().st_mode):\n print(f"output {p} exists and is a FIFO; refusing to replace it",file=sys.stderr);sys.exit(1)\np.write_text("{}");sys.exit(0)\n')
             observer.chmod(0o755)
             env=dict(os.environ,CONTROL_OUT=str(out),P11SCOPE_LOCAL_OUTPUT_ROOT=str(local))
             result=subprocess.run(['bash',str(SHELL),'--control-fifo',str(observer),str(out),str(fixture)],

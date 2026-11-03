@@ -227,6 +227,19 @@ class CellFilterValidationTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 64, proc.stderr)
             self.assertIn("cannot be combined", proc.stderr)
 
+    def test_the_filter_cannot_combine_with_the_ia32_only_mode(self):
+        observer = ROOT / "nonexistent-observer-for-filter-test"
+        self.assertFalse(observer.exists())
+        with tempfile.TemporaryDirectory(prefix="filter-") as tmp:
+            proc = run_qualify(
+                [str(observer), tmp],
+                cells="profile-pid",
+                env_extra={"P11SCOPE_PUBLIC_CLI_ONLY_IA32": "1"},
+            )
+            self.assertEqual(proc.returncode, 64, proc.stderr)
+            self.assertIn("cannot be combined", proc.stderr)
+            self.assertIn("P11SCOPE_PUBLIC_CLI_ONLY_IA32", proc.stderr)
+
     def test_supported_names_pass_validation(self):
         # A nonexistent observer fails after validation, so reaching its
         # error proves the names were accepted; no campaign can start.

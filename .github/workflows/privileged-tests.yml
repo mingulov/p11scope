@@ -653,17 +653,60 @@ jobs:
           cells = {row["cell"]: row for row in rows}
           need = {"doctor", "profile-pid", "names-pid", "verdict-pid", "metrics-pid", "trace-pid",
                   "run-short", "run-cover", "run-prearm", "mt-exact", "system", "sigint", "second-sigint",
-                  "fifo-refused"}
+                  "fifo-refused", "profile-cgroup", "metrics-cgroup", "trace-cgroup", "inventory-cgroup",
+                  "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",
+                  "counter-counts-system", "counter-timestamps-system", "counter-latency-system",
+                  "select-endpoint-pid", "select-endpoint-system",
+                  "profile-pid-ia32", "run-ia32", "startup-to-capturing"}
           problems = sorted("missing cell " + name for name in need - set(cells))
-          # The script marks these three as nonqualifying smoke by design;
-          # any other nonqualifying or failed row fails the job.
-          smoke_cells = {"run-short", "run-cover", "trace-pid"}
+          # trace-pid stays nonqualifying smoke; the gap cells below are
+          # declared expected-failures with named product reasons.
+          smoke_cells = {"trace-pid"}
+          expected_cells = {"run-short", "run-cover", "profile-cgroup", "metrics-cgroup",
+                            "trace-cgroup", "profile-pid-ia32", "run-ia32"}
+          if "${{ matrix.kernel }}" == "v7.3.1":
+              # inventory-cgroup fails on 7.x with owned-module gaps and
+              # passes on 6.x/host; the harness emits expected only on the
+              # known signature, qualified on pass.
+              expected_cells.add("inventory-cgroup")
+          actual_expected = set()
+          actual_smoke = set()
           for row in rows:
-              smoke = row["cell"] in smoke_cells and row["qualification"] == "nonqualifying"
-              status = "PASS" if row["pass"] else ("SMOKE" if smoke else "FAIL")
-              print(status, row["cell"], row["detail"][:200])
-              if not row["pass"] and not smoke:
-                  problems.append("failed cell " + row["cell"])
+              cell, qual = row["cell"], row["qualification"]
+              if qual == "expected-failure":
+                  actual_expected.add(cell)
+                  if row["pass"]:
+                      status = "UNEXPECTED PASS"
+                      problems.append("unexpected pass " + cell)
+                  elif cell in expected_cells:
+                      status = "EXPECTED"
+                  else:
+                      status = "UNDECLARED EXPECTED"
+                      problems.append("undeclared expected " + cell)
+              elif qual == "nonqualifying":
+                  if cell in smoke_cells:
+                      actual_smoke.add(cell)
+                      status = "SMOKE"
+                  else:
+                      status = "FAIL"
+                      problems.append("non-smoke nonqualifying " + cell)
+              elif row["pass"] and qual == "failed":
+                  status = "INCONSISTENT"
+                  problems.append("inconsistent row " + cell)
+              elif not row["pass"]:
+                  status = "FAIL"
+                  problems.append("failed cell " + cell)
+              else:
+                  status = "PASS"
+              print(status, cell, row["detail"][:200])
+          for name in sorted(expected_cells - actual_expected):
+              problems.append("missing expected " + name)
+          for name in sorted(actual_expected - expected_cells):
+              problems.append("extra expected " + name)
+          for name in sorted(smoke_cells - actual_smoke):
+              problems.append("missing smoke " + name)
+          for name in sorted(actual_smoke - smoke_cells):
+              problems.append("extra smoke " + name)
           if problems:
               raise SystemExit("\n".join(problems))
           PY
@@ -680,6 +723,65 @@ jobs:
             ${{ github.workspace }}/cli-out/qual.log
             ${{ github.workspace }}/cli-out/vng-console.log
             ${{ runner.temp }}/qual.log
+          if-no-files-found: warn
+          retention-days: 7
+  # The two ia32 public-CLI cells with a real i386 provider: this job
+  # installs libsofthsm2:i386, which cannot coexist with the amd64
+  # provider the main legs use, so it stays separate. The main legs
+  # keep both ia32 cells as declared expected-failures.
+  public-cli-ia32:
+    needs: release-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo -n dpkg --add-architecture i386 && sudo -n apt-get update && sudo -n apt-get install -y gcc jq procps python3 libsofthsm2:i386 gcc-multilib libc6-dev-i386
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Run the ia32 cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          out="$GITHUB_WORKSPACE/cli-ia32-out"
+          sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_PUBLIC_CLI_ONLY_IA32=1 scripts/qualify-public-cli.sh "$in/p11scope" "$out/cells"
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          python3 -I - "$out/cells/results.jsonl" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+          cells = {row["cell"]: row for row in rows}
+          need = {"profile-pid-ia32", "run-ia32"}
+          problems = sorted("missing cell " + name for name in need - set(cells))
+          problems += sorted("extra cell " + name for name in set(cells) - need)
+          for row in rows:
+              status = "PASS" if row["pass"] else "FAIL"
+              print(status, row["cell"], row["qualification"], row["detail"][:200])
+              if not row["pass"] or row["qualification"] != "qualified":
+                  problems.append("unqualified cell " + row["cell"])
+          if problems:
+              raise SystemExit("\n".join(problems))
+          PY
+      - name: Upload the ia32 results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: public-cli-ia32
+          path: |
+            ${{ github.workspace }}/cli-ia32-out/cells/results.jsonl
+            ${{ github.workspace }}/cli-ia32-out/cells/summary.txt
+            ${{ github.workspace }}/cli-ia32-out/cells/*.stderr
+            ${{ github.workspace }}/cli-ia32-out/cells/*.json
           if-no-files-found: warn
           retention-days: 7
   # SoftHSM 2.7 table-shape exact cells: a synthetic 68-slot provider

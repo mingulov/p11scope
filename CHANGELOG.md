@@ -13,6 +13,13 @@ versioned separately and are opaque, exact dispatch keys.
   `exec_mmap` exit) and the 7-argument `copy_vma` from host BTF, and the
   BPF kernel matrix loads every program on 7.3.1. A kernel whose hook
   shapes match none of the known prototypes refuses the hooks by name.
+- Native inventory captures now report kernel event-ring loss. The report's
+  `observation.semantic_capture.events_lost` holds the cumulative total, the
+  `semantic calls:` stop line carries the same total as `lost`, and a
+  `native capture events lost` gap names the loss. If the kernel's loss
+  counter cannot be read, the report carries a
+  `native capture events loss unknown` gap instead, and the count catches up
+  on the next successful read.
 
 ### Fixed
 

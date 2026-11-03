@@ -15,6 +15,16 @@ cell pid). A gated cell never counts as positive. The delay-indexed bound
 table stays an input document: the measured bounds land with the installed
 cells, so this module only checks cells against a given table. Twins live
 in tests/python/test_first_use_oracle.py and import this module.
+
+With --exact, one more document joins the verdict: the sweep-side
+exact-arm evidence (``{"prearmed", "module", "verdict"}``), where the
+module is the judged evidence.discovery[] record projection (sources,
+watch, attached_at_ns, unobserved_windows) and the verdict is the
+terminal completeness plus gap_classes. The pre-armed arm passes only on
+explicitly empty windows with exact counts, an armed watch at the
+declared attach maximum and an exact verdict-cause allowlist; the
+passive twin passes only on a disclosed pre_attach/late_discovery window
+with no invented count. An absent key is never read as exact.
 """
 
 import argparse
@@ -27,6 +37,14 @@ COPY_MODES = ("equal-bytes-new-inode", "unseen-provider")
 DELAYS_US = (0, 10, 100, 1000)
 ARMS = ("ungated", "prearmed", "gated")
 UNKNOWN_LABEL = "Unknown executable"
+# Exact-arm verdict vocabulary (evidence.discovery[] + gap_classes shapes).
+EXACT_NATURAL_ENDS = ("scope_end", "stop")
+TWIN_WINDOW_REASONS = ("pre_attach", "late_discovery")
+# Bare pre-arm attribution in the product's fixed cause order: every
+# pre-arm slot is count-only (never semantic-authorized), and the bare
+# module reads uncorroborated.
+BARE_ATTRIBUTION_CAUSES = ["semantic_unverified_slots",
+                           "discovery_uncorroborated"]
 MAX_ROWS = 1024
 MAX_LINE_BYTES = 65536
 MAX_LEDGER_BYTES = 1024 * 1024
@@ -261,8 +279,18 @@ def validate_report(report):
     return {"verdict": "pass"}
 
 
-def cell_verdict(cell, observer):
-    """Verdict for one cell: gated and incomplete cells stay non-positive."""
+def cell_verdict(cell, observer, exact=None):
+    """Verdict for one cell: gated and incomplete cells stay non-positive.
+
+    With ``exact`` evidence (a real ``--prearm-module`` cell or its
+    passive twin), the verdict additionally judges the pre-arm proof
+    shape: an explicitly empty window list with exact counts, an armed
+    watch at the declared attach maximum and an exact verdict-cause
+    allowlist on the pre-armed arm, or a disclosed pre_attach /
+    late_discovery window with no invented count on the twin. Any
+    deviation is refused; only full exactness (or full disclosure on
+    the twin) counts as positive.
+    """
     context = {"mode": cell["mode"], "delay_us": cell["delay_us"],
                "armed": cell["armed"]}
     if cell["armed"] == "gated":
@@ -273,8 +301,187 @@ def cell_verdict(cell, observer):
     missed = missed_calls(cell, observer)
     attributed = attribution(cell, observer)
     validate_report({"missed": missed, "attribution": attributed})
-    return {"positive": True, "missed": missed,
-            "attribution": attributed, **context}
+    if exact is None:
+        return {"positive": True, "missed": missed,
+                "attribution": attributed, **context}
+    return _exact_cell_verdict(missed, attributed, exact, context)
+
+
+def _exact_shape(exact):
+    """Split exact evidence into its arm flag, module and verdict records."""
+    _require(type(exact) is dict, "exact evidence must be an object")
+    prearmed = exact.get("prearmed")
+    _require(type(prearmed) is bool,
+             "exact evidence must name a prearmed arm")
+    allowed = {"prearmed", "module", "verdict"} if prearmed else {
+        "prearmed", "module"}
+    _require(set(exact) <= allowed,
+             "exact evidence carries unexpected keys")
+    module = exact.get("module")
+    _require(type(module) is dict,
+             "exact arm without its module record" if prearmed
+             else "twin without its module record")
+    verdict = exact.get("verdict")
+    if prearmed:
+        _require(type(verdict) is dict,
+                 "exact arm without its verdict record")
+    return prearmed, module, verdict
+
+
+def _exact_watch(module):
+    """The judged watch state of a pre-armed exact module record.
+
+    The armed interval reads ``armed``/``armed_idle`` while open; the
+    terminal close of a used watch voids ``armed`` into ``ended``, so a
+    natural close (``scope_end``/``stop``) with the arm instant intact
+    proves the same interval. Anything else never armed.
+    """
+    watch = module.get("watch")
+    _require(type(watch) is dict, "exact arm without its watch")
+    _require(watch.get("changed") is None,
+             "pinned object changed under its watch")
+    state = watch.get("state")
+    ended_by = watch.get("ended_by")
+    until_ns = watch.get("until_ns")
+    if state == "armed":
+        _require(ended_by is None and until_ns is None,
+                 "armed watch carries an end")
+    elif state == "armed_idle":
+        _require(ended_by is None or ended_by in EXACT_NATURAL_ENDS,
+                 f"watch ended by {_shown(ended_by)} instead of a "
+                 "natural close")
+    elif state == "ended":
+        _require(ended_by in EXACT_NATURAL_ENDS,
+                 f"watch ended by {_shown(ended_by)} instead of a "
+                 "natural close")
+    else:
+        raise MeasureError(f"watch state {_shown(state)} is not an "
+                           "armed interval")
+    since_ns = watch.get("since_ns")
+    _require(_integer(since_ns), "watch without its since_ns arm instant")
+    attached_at_ns = module.get("attached_at_ns")
+    _require(_integer(attached_at_ns),
+             "module without its attached_at_ns instant")
+    _require(since_ns == attached_at_ns,
+             f"watch since_ns {since_ns} disagrees with attached_at_ns "
+             f"{attached_at_ns}")
+    return state
+
+
+def _exact_class(classes, name, status, causes):
+    """One gap class against its exact status and cause list."""
+    group = classes.get(name)
+    _require(type(group) is dict, f"verdict without its {name} class")
+    _require(group.get("status") == status,
+             f"{name} status {_shown(group.get('status'))} outside the "
+             "exact allowlist")
+    got = group.get("causes")
+    _require(type(got) is list and
+             all(type(cause) is str for cause in got) and got == causes,
+             f"{name} causes outside the exact allowlist")
+
+
+def _exact_causes(module, verdict):
+    """The judged completeness of a pre-armed exact verdict record.
+
+    The variant follows the module sources: bare pre-arm reads PARTIAL
+    solely for its expected attribution pair, while a manifest-backed
+    module reads COMPLETE with every cause list empty. Observation stays
+    exact, semantics stay clean, no call is left open and the terminal
+    drain stays proven on both.
+    """
+    sources = module.get("sources")
+    _require(type(sources) is list and
+             all(type(source) is str for source in sources),
+             "module sources must be a string list")
+    _require("prearm" in sources, "module without a prearm source")
+    manifest_backed = "manifest" in sources
+    completeness = verdict.get("completeness")
+    detail = verdict.get("verdict_detail")
+    classes = verdict.get("gap_classes")
+    _require(type(classes) is dict, "verdict without gap_classes")
+    if manifest_backed:
+        _require(completeness == "COMPLETE",
+                 f"completeness {_shown(completeness)} outside the "
+                 "manifest-backed allowlist")
+        _require(detail == "clean_proven",
+                 f"verdict_detail {_shown(detail)} outside the "
+                 "manifest-backed allowlist")
+        _exact_class(classes, "observation", "exact", [])
+        _exact_class(classes, "attribution", "attested", [])
+        _exact_class(classes, "semantics", "complete", [])
+    else:
+        _require(completeness == "PARTIAL",
+                 f"completeness {_shown(completeness)} outside the "
+                 "bare pre-arm allowlist")
+        _require(detail == "attribution_only",
+                 f"verdict_detail {_shown(detail)} outside the bare "
+                 "pre-arm allowlist")
+        _exact_class(classes, "observation", "exact", [])
+        _exact_class(classes, "attribution", "withheld",
+                     BARE_ATTRIBUTION_CAUSES)
+        _exact_class(classes, "semantics", "not_applicable", [])
+    open_calls = classes.get("open_calls")
+    _require(type(open_calls) is int and open_calls == 0,
+             f"open_calls {_shown(open_calls)} outside the exact "
+             "allowlist")
+    settlement = classes.get("settlement")
+    _require(settlement == "proven",
+             f"settlement {_shown(settlement)} outside the exact "
+             "allowlist")
+    return completeness
+
+
+def _twin_window(window, attached_at_ns):
+    """One disclosed twin window against the attach instant."""
+    _require(type(window) is dict, "twin window must be an object")
+    start_ns = window.get("start_ns")
+    end_ns = window.get("end_ns")
+    _require(_integer(start_ns) and _integer(end_ns),
+             "twin window without integer bounds")
+    _require(start_ns <= end_ns,
+             f"twin window ends {end_ns} before it starts {start_ns}")
+    _require(end_ns == attached_at_ns,
+             f"twin window end {end_ns} disagrees with attached_at_ns "
+             f"{attached_at_ns}")
+    reason = window.get("reason")
+    _require(reason in TWIN_WINDOW_REASONS,
+             f"twin window reason {_shown(reason)} outside "
+             "pre_attach/late_discovery")
+
+
+def _exact_cell_verdict(missed, attributed, exact, context):
+    """Exact-arm verdict over judged counts: refuse any deviation."""
+    prearmed, module, verdict = _exact_shape(exact)
+    _require("unobserved_windows" in module,
+             "module without its unobserved_windows key")
+    windows = module["unobserved_windows"]
+    _require(type(windows) is list, "unobserved_windows must be a list")
+    if prearmed:
+        _require(not windows,
+                 f"exact arm discloses {len(windows)} unobserved windows")
+        _require(missed["missed_calls"] == 0,
+                 f"exact arm missed {missed['missed_calls']} of "
+                 f"{missed['body_calls']} calls")
+        state = _exact_watch(module)
+        completeness = _exact_causes(module, verdict)
+        return {"positive": True, "missed": missed,
+                "attribution": attributed,
+                "exactness": {"prearmed": True, "windows": 0,
+                              "watch_state": state,
+                              "completeness": completeness}, **context}
+    _require(windows, "passive arm claims exact windows")
+    attached_at_ns = module.get("attached_at_ns")
+    _require(_integer(attached_at_ns),
+             "twin without its attached_at_ns instant")
+    for window in windows:
+        _twin_window(window, attached_at_ns)
+    _require(module.get("watch") is None,
+             "passive module carries a watch")
+    return {"positive": True, "missed": missed, "attribution": attributed,
+            "exactness": {"prearmed": False, "windows": len(windows),
+                          "watch_state": None, "completeness": None},
+            **context}
 
 
 def check_bounds(entries, bound_table):
@@ -328,6 +535,8 @@ def main(argv=None):
     parser.add_argument("observer", help="observer record JSON file")
     parser.add_argument("--bounds", default=None,
                         help="delay-indexed bound table JSON file")
+    parser.add_argument("--exact", default=None,
+                        help="exact-arm evidence JSON file")
     args = parser.parse_args(argv)
     try:
         with open(args.ledger, encoding="utf-8") as stream:
@@ -335,8 +544,10 @@ def main(argv=None):
         observer = _read_object(args.observer, "observer record")
         bounds = (_read_object(args.bounds, "bound table")
                   if args.bounds is not None else None)
+        exact = (_read_object(args.exact, "exact evidence")
+                 if args.exact is not None else None)
         cell = validate_cell(rows)
-        verdict = cell_verdict(cell, observer)
+        verdict = cell_verdict(cell, observer, exact)
         if bounds is not None and verdict["positive"]:
             check_bounds([{"mode": cell["mode"],
                            "delay_us": cell["delay_us"],

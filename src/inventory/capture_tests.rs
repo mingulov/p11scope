@@ -924,6 +924,7 @@ impl Scene {
             file_offset: Some(0x200),
             live_return: false,
             manifest_supported: false,
+            extension_impossible: false,
         }
     }
 

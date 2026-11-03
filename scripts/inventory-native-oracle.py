@@ -6786,12 +6786,24 @@ ATTACH_DEFERRED_MARKER = "still deferred"
 
 
 def capacity_attach_drained(rows):
-    """True once a pass committed after the last deferred-attach gap activity."""
+    """True once a pass committed after the last deferred-attach gap activity.
+
+    Gap rows stamped at `ended` are the shutdown flush (retained gap
+    identities re-bumped without new backlog); the live gate never sees
+    them, but post-hoc checks must not mistake them for backlog. A final
+    receipt's own deferred records stamp earlier and still count.
+    """
+    ended_ns = next((row.get("at_ns") for row in rows if row.get("kind") == "ended"), None)
     deferred_indexes = set()
     last_deferred_ns = None
     last_pass_ns = None
     for row in rows:
+        if row.get("kind") == "ended":
+            break
         at_ns = row.get("at_ns") or 0
+        if ended_ns is not None and at_ns >= ended_ns \
+                and row.get("kind") in ("gap_recorded", "gap_repeated"):
+            continue
         event = row.get("event") or {}
         if row.get("kind") == "gap_recorded":
             if event.get("subject") == ATTACH_DEFERRED_SUBJECT \

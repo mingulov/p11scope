@@ -4501,13 +4501,17 @@ fn exit_mapping_children_guard_reaps_remainder_after_mid_reap_panic() {
         // Mirror the spawn window: each child is reaped, then a
         // mid-loop panic unwinds through the reap helper.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            reap_owned_children(&mut batch, &["first", "second", "third"], |mut child, role| {
-                child.kill().expect("reap the reached child");
-                child.wait().expect("wait for the reached child");
-                if role == "second" {
-                    panic!("simulated mid-reap panic");
-                }
-            });
+            reap_owned_children(
+                &mut batch,
+                &["first", "second", "third"],
+                |mut child, role| {
+                    child.kill().expect("reap the reached child");
+                    child.wait().expect("wait for the reached child");
+                    if role == "second" {
+                        panic!("simulated mid-reap panic");
+                    }
+                },
+            );
         }));
         assert!(outcome.is_err(), "the simulated panic must unwind");
         drop(batch);
@@ -4982,9 +4986,9 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
                 "{what}: the test must move back out of the owned cgroup"
             );
             let origin_members = std::fs::read_to_string(cgroup.origin.join("cgroup.procs"))
-                .unwrap_or_else(
-                    |error| panic!("{what}: reading the origin cgroup failed: {error}"),
-                );
+                .unwrap_or_else(|error| {
+                    panic!("{what}: reading the origin cgroup failed: {error}")
+                });
             assert!(
                 cgroup_still_holds(&origin_members, this),
                 "{what}: the test must move back to its origin cgroup {}",

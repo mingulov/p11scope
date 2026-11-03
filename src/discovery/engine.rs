@@ -727,6 +727,13 @@ pub struct Engine {
     probationary_completions: u64,
     #[cfg(test)]
     loader_memory_scan_attempts: usize,
+    /// Test-only one-shot: the next `Memory` loader scan fails without
+    /// touching the target. Production reaches a failing resolving scan
+    /// only through a live exit race (a dead child fails earlier at maps
+    /// validation), so the zero-state settle twins force the failure and
+    /// drive the real branch, predicate and settlement past it.
+    #[cfg(test)]
+    fail_next_loader_memory_scan: bool,
     #[cfg(test)]
     loader_arm_scan_after_scan: Option<fn(&mut Engine)>,
     /// Scripted pin-probe answers, consumed in order by the next matching
@@ -10057,6 +10064,8 @@ impl Engine {
             #[cfg(test)]
             loader_memory_scan_attempts: 0,
             #[cfg(test)]
+            fail_next_loader_memory_scan: false,
+            #[cfg(test)]
             loader_arm_scan_after_scan: None,
             #[cfg(test)]
             pin_probe_script: RefCell::new(VecDeque::new()),
@@ -15844,6 +15853,9 @@ impl Engine {
         #[cfg(test)]
         if mode == LoaderScanMode::Memory {
             self.loader_memory_scan_attempts = self.loader_memory_scan_attempts.saturating_add(1);
+            if std::mem::take(&mut self.fail_next_loader_memory_scan) {
+                return Err(anyhow!("test-forced loader memory scan failure"));
+            }
         }
         let broad_admit = self.broad_admit;
         let (scan_result, scan_counters) = match mode {

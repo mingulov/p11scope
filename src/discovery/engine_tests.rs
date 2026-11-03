@@ -17686,24 +17686,72 @@ fn zero_state_settlement_with_exit_proof_counts_exit_only_and_keeps_loss() {
     }));
 }
 
-/// R-1 zero-state negative (direct): without exit proof the same
-/// settlement stays a plain loss with no exit-only growth.
+/// R-1 zero-state negative (end to end): a resolving scan that fails
+/// without exit proof settles as plain loss with no exit-only growth.
+/// Drives the real zero-state path: one deferred record, then a
+/// resolving record whose memory scan fails, with the exit probe
+/// scripted false. (The failure itself is the test-only one-shot — a
+/// dead child fails earlier at maps validation — but the branch, the
+/// predicate and the settlement are all production.) Kills the
+/// always-exit-only mutants through the exit count, the reason text
+/// and the consumed probe.
 #[test]
 fn zero_state_settlement_without_exit_proof_stays_loss() {
-    let mut engine = Engine::empty();
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(2);
+    record.announced_count = 1;
+    let mut resolving = record;
+    resolving.announced_count = 0;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+
+    engine.fail_next_loader_memory_scan = true;
+    engine
+        .pin_probe_script
+        .borrow_mut()
+        .extend([PinProbeAnswer::Exited(Ok(false))]);
     let before = engine.capture_facts().discovery_losses()[3];
+    let scans_before = engine.loader_memory_scan_attempts;
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![resolving])
+        .expect("the batch absorbs the record failure into its outcome");
+    assert!(
+        !outcome.required_complete,
+        "the failing resolving scan stays unresolved"
+    );
 
-    engine.record_pending_loader_scan_loss("test zero-state loss");
-
+    assert_eq!(
+        engine.loader_memory_scan_attempts,
+        scans_before + 1,
+        "the resolving record attempted its memory scan"
+    );
+    assert!(engine.pending_loader_scans.is_empty());
     assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
     assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+    assert!(engine.counters.object_skips.iter().any(|skip| {
+        skip.subject == "live loader memory discovery"
+            && skip.reason.contains(
+                "a zero-state opportunity did not complete its deferred loader memory scan",
+            )
+    }));
+    assert!(
+        engine.timings.invalidated,
+        "the zero-state loss keeps its live loss"
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "the zero-state branch consumed its scripted exit probe: {:?}",
+        engine.pin_probe_script.borrow()
+    );
 }
 
 /// R-1 zero-state predicate pin: the zero-state settlement checks
 /// `original_exited(view)` and settles exit-only on proof, loss
-/// otherwise. A live exit race is the only production trigger, so
-/// the predicate is pinned in source order like route 2. The
-/// `if`-form distinguishes it from route 2's `let ended` check.
+/// otherwise. Anchored on the zero-state block itself — from
+/// `if resolving_pending && result.is_err() {` to
+/// `} else if resolving_pending` — so a mutant here cannot hide
+/// behind the missing-mapping route's same-text predicate above
+/// (a backwards search from the reason text would match that
+/// earlier site and stay green). Inside the block the order is
+/// pinned: the exit check, the exit arm, the else, the loss arm.
 #[test]
 fn zero_state_settlement_consults_the_exit_predicate() {
     let source = include_str!("engine.rs");
@@ -17714,23 +17762,29 @@ fn zero_state_settlement_consults_the_exit_predicate() {
         .split_once("    fn record_selection_occurrences(")
         .unwrap()
         .0;
-    let marker = route
-        .find("a zero-state opportunity did not complete its deferred loader memory scan")
-        .expect("the zero-state settlement exists");
-    let window = &route[..marker];
-    let predicate = window
-        .rfind("if self.original_exited(view_id)")
+    let start = route
+        .find("if resolving_pending && result.is_err() {")
+        .expect("the zero-state branch exists");
+    let end = route[start..]
+        .find("} else if resolving_pending")
+        .expect("the zero-state branch ends")
+        + start;
+    let block = &route[start..end];
+    let predicate = block
+        .find("if self.original_exited(view_id) {")
         .expect("the zero-state checks the exit predicate");
-    let exit_call = window
-        .rfind("record_pending_loader_scan_end_with_live_loss")
+    let exit_arm = block
+        .find("record_pending_loader_scan_end_with_live_loss(")
         .expect("the zero-state settles exit-only on proof");
+    let else_arm = block
+        .find("} else {")
+        .expect("the zero-state has a loss arm");
+    let loss_arm = block
+        .find("record_pending_loader_scan_loss(")
+        .expect("the zero-state settles loss otherwise");
     assert!(
-        predicate < exit_call,
-        "the exit check precedes the exit arm"
-    );
-    assert!(
-        route[marker..].contains("record_pending_loader_scan_loss"),
-        "the zero-state settles loss otherwise"
+        predicate < exit_arm && exit_arm < else_arm && else_arm < loss_arm,
+        "the exit check precedes the exit arm, which precedes the loss arm"
     );
 }
 

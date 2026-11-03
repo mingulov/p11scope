@@ -4368,6 +4368,583 @@ fn exit_mappings_capture_facts_stamp_carries_live_split() {
     );
 }
 
+/// Privileged live cell (6.14 Option A): a real extensive capture
+/// classifies three owned short-lived children, and the unarmed twin
+/// records byte-identical kind 6.
+///
+/// Armed: the single-threaded mapper (dlopen cycles over the watched
+/// fixture provider, then exit before any admission) reads `mapped`;
+/// the plain child (exits without mapping) and the threaded mapper
+/// (a live second thread spans its dlopen cycles, so every mapping
+/// event globalizes) read `unknown`, never `mapped`. Twin: the same
+/// three children under a default capture record kind-6 exits with
+/// zeroed payload words and no split.
+///
+/// Cgroup-scoped by determinism, not by product need (the same call
+/// the pressure cells make): under system scope ambient processes
+/// share the 256 view slots, so the holder's admission — and with it
+/// the fixture's watch — is host-churn luck. The owned cgroup holds
+/// exactly this test's processes, so the end state (three gaps,
+/// mapped 1, unknown 2) is forced on every host; the engine paths
+/// are scope-independent. Per-child exit shapes are asserted exactly
+/// from the drained records, which also prove kind 7 is never live
+/// loss.
+///
+/// A holder loops dlopen/dlclose over the fixture after the session
+/// starts: its EXEC lands in scope, so admission plans slots for it
+/// and the session watches the file before the short-lived children
+/// map it. The fixture builds its tables at run time, so a manifest
+/// prepared by the discover helper (its own process, never this
+/// observer) resolves them; without it the scan skips the provider
+/// and no slot — hence no watch — ever exists. Children
+/// spawn after the watch gate and die before the next tick, so they
+/// are deterministically unmatched (never enumerated alive, never
+/// admitted). No ticks run inside the spawn window, so the session's
+/// own scans cannot inflate mm_users at map time; the mapper's five
+/// dlopen/dlclose cycles (slots are sticky) retire the residual
+/// transient-mmget flake. Runs as root with host BTF and gcc; registers
+/// in `scripts/run-privileged-lib-tests.sh`.
+#[ignore = "privileged: live BPF exit-mapping split over owned short-lived children; run as root with --ignored --test-threads=1 under the privileged lane"]
+#[test]
+fn exit_mappings_live_cgroup_split_and_default_twin() {
+    use std::process::{Command, Stdio};
+
+    const WHAT: &str = "exit-mappings-live";
+    // SAFETY: geteuid only reads this process's effective user identity.
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "{WHAT}: run as root under the privileged lane"
+    );
+    assert!(
+        std::path::Path::new("/sys/kernel/btf/vmlinux").exists(),
+        "{WHAT}: the live lane needs host vmlinux BTF"
+    );
+    assert!(
+        Command::new("gcc")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success()),
+        "{WHAT}: gcc must be installed"
+    );
+
+    struct OwnedCgroup {
+        path: std::path::PathBuf,
+    }
+
+    impl OwnedCgroup {
+        fn create(tag: &str, what: &str) -> Self {
+            let path = std::path::PathBuf::from(format!(
+                "/sys/fs/cgroup/p11scope-{tag}-{}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::fs::remove_dir(&path).unwrap_or_else(|error| {
+                        panic!(
+                            "{what}: stale cgroup {} is live, refusing: {error}",
+                            path.display()
+                        )
+                    });
+                    std::fs::create_dir(&path).unwrap_or_else(|error| {
+                        panic!("{what}: creating cgroup {} failed: {error}", path.display())
+                    });
+                }
+                Err(error) => panic!("{what}: creating cgroup {} failed: {error}", path.display()),
+            }
+            assert!(
+                path.join("cgroup.procs").is_file(),
+                "{what}: {} is not a live cgroup (no cgroup.procs)",
+                path.display()
+            );
+            Self { path }
+        }
+
+        fn move_in(&self, pid: u32, what: &str) {
+            std::fs::write(self.path.join("cgroup.procs"), pid.to_string()).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "{what}: moving {pid} into {} failed: {error}",
+                        self.path.display()
+                    )
+                },
+            );
+        }
+
+        fn members(&self, what: &str) -> std::collections::BTreeSet<u32> {
+            let text =
+                std::fs::read_to_string(self.path.join("cgroup.procs")).unwrap_or_else(|error| {
+                    panic!("{what}: reading {} failed: {error}", self.path.display())
+                });
+            text.lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .collect()
+        }
+
+        fn remove(&self, what: &str) {
+            std::fs::remove_dir(&self.path).unwrap_or_else(|error| {
+                panic!(
+                    "{what}: removing cgroup {} failed: {error}",
+                    self.path.display()
+                )
+            });
+        }
+    }
+
+    impl Drop for OwnedCgroup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir(&self.path);
+        }
+    }
+
+    struct MoveOutGuard {
+        pid: u32,
+        armed: bool,
+    }
+
+    impl MoveOutGuard {
+        fn arm(pid: u32) -> Self {
+            Self { pid, armed: true }
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+
+        fn move_out(&mut self, what: &str) {
+            std::fs::write("/sys/fs/cgroup/cgroup.procs", self.pid.to_string())
+                .unwrap_or_else(|error| panic!("{what}: moving {} out failed: {error}", self.pid));
+            self.disarm();
+        }
+    }
+
+    impl Drop for MoveOutGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = std::fs::write("/sys/fs/cgroup/cgroup.procs", self.pid.to_string());
+            }
+        }
+    }
+
+    fn gcc_fixture(output: &std::path::Path, extra: &[&str], source: &std::path::Path, what: &str) {
+        let status = std::process::Command::new("gcc")
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .args(extra)
+            .arg("-o")
+            .arg(output)
+            .arg(source)
+            .status()
+            .unwrap_or_else(|error| {
+                panic!("{what}: gcc {} failed to spawn: {error}", output.display())
+            });
+        assert!(
+            status.success(),
+            "{what}: gcc {} exited {status}",
+            output.display()
+        );
+    }
+
+    // Fixtures compile before capture: no forks inside the window.
+    let dir = tempfile::Builder::new()
+        .prefix("exit-mappings-live-")
+        .tempdir()
+        .expect("disk-backed TMPDIR must accept the fixture dir");
+    // The discover helper drops privileges before executing provider
+    // code and writing -o, so its output dir must stay writable to
+    // the dropped user; the sticky bit keeps the helper's own
+    // safe-output check green. Test-local only; removed with the dir.
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o1777),
+    )
+    .expect("fixture dir must accept the helper output");
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let provider = dir.path().join("provider.so");
+    gcc_fixture(
+        &provider,
+        &["-shared", "-fPIC", "-DMATRIX_INTERFACES=1"],
+        &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+        WHAT,
+    );
+    let live = manifest.join("tests/fixtures/exit-mapping");
+    let mapper = dir.path().join("mapper");
+    gcc_fixture(&mapper, &["-ldl"], &live.join("mapper.c"), WHAT);
+    let plain = dir.path().join("plain");
+    gcc_fixture(&plain, &[], &live.join("plain.c"), WHAT);
+    let threaded = dir.path().join("threaded");
+    gcc_fixture(
+        &threaded,
+        &["-ldl", "-pthread"],
+        &live.join("threaded.c"),
+        WHAT,
+    );
+    let holder = dir.path().join("holder");
+    gcc_fixture(&holder, &["-ldl"], &live.join("holder.c"), WHAT);
+    // The fixture builds its function tables at run time, outside the
+    // memory scan's reach, so the designed manifest flow prepares
+    // them: the helper executes provider code in its own process
+    // (never in this observer). The lane builds the helper beside
+    // this test binary; delivery layouts keep them side by side.
+    let discover = {
+        let deps = std::env::current_exe().expect("test binary path");
+        let sibling = deps.parent().expect("deps dir").join("p11scope-discover");
+        let cargo = deps
+            .parent()
+            .expect("deps dir")
+            .parent()
+            .expect("profile dir")
+            .join("p11scope-discover");
+        [sibling, cargo]
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{WHAT}: build the discover helper first (`cargo build -p p11scope-discover`)"
+                )
+            })
+    };
+    let manifest_path = dir.path().join("manifest.json");
+    let status = Command::new(&discover)
+        .arg("--module")
+        .arg(&provider)
+        .arg("-o")
+        .arg(&manifest_path)
+        .status()
+        .unwrap_or_else(|error| panic!("{WHAT}: discover helper failed to spawn: {error}"));
+    assert!(
+        status.success() && manifest_path.is_file(),
+        "{WHAT}: discover helper exited {status}"
+    );
+
+    struct LiveExits {
+        gaps: u64,
+        split: Option<(u64, u64)>,
+        records: Vec<DiscoveryRecord>,
+        pids: [u32; 3],
+    }
+
+    fn spawn_holder(
+        what: &str,
+        holder: &std::path::Path,
+        provider: &std::path::Path,
+    ) -> std::process::Child {
+        let mut child = std::process::Command::new(holder)
+            .arg(provider)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn holder");
+        {
+            use std::io::BufRead as _;
+            let mut ready = String::new();
+            std::io::BufReader::new(child.stdout.take().expect("holder stdout"))
+                .read_line(&mut ready)
+                .expect("holder readiness");
+            assert!(
+                ready.starts_with("READY pid="),
+                "{what}: holder must map first"
+            );
+        }
+        child
+    }
+
+    fn run_capture(
+        what: &str,
+        tag: &str,
+        provider: &std::path::Path,
+        manifest: &std::path::Path,
+        mapper: &std::path::Path,
+        plain: &std::path::Path,
+        threaded: &std::path::Path,
+        holder: &std::path::Path,
+        armed: bool,
+    ) -> (LiveExits, Vec<crate::discovery::scan::Skipped>) {
+        let cgroup = OwnedCgroup::create(tag, what);
+        let args = crate::cli::CaptureArgs {
+            track_short_lived: armed,
+            kind: crate::cli::Kind::Profile,
+            modules: vec![provider.to_path_buf()],
+            manifests: vec![manifest.to_path_buf()],
+            prearm_modules: vec![],
+            hooks: crate::discovery::hooks::HookRegistry::builtin(),
+            scope: crate::cli::ScopeArg::Cgroup(cgroup.path.clone()),
+            metrics: false,
+            counter_mode: None,
+            select_endpoint: None,
+            duration: None,
+            out: None,
+            max_events: None,
+            max_scan_pids: None,
+            ring_bytes: None,
+            drain_interval: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            attach_backend: crate::attach::BackendSelection::default(),
+        };
+        let scope = crate::scope::capture_cgroup(&cgroup.path)
+            .unwrap_or_else(|error| panic!("{what}: cgroup scope failed: {error:#}"));
+        let mut engine = Engine::discover(&args, &scope, None).expect("live discovery");
+        if armed {
+            engine.arm_extensive(true);
+        }
+        let mut session = engine
+            .start_session(
+                crate::attach::CapturePolicy::Allowlisted,
+                None,
+                crate::attach::BackendSelection::default(),
+            )
+            .unwrap_or_else(|error| panic!("{what}: start_session failed: {error:#}"));
+        if armed {
+            assert!(
+                session.instance_tracking().refused().is_none(),
+                "{what}: the armed cell needs live instance hooks"
+            );
+        }
+        // Born inside the scope: the test moves itself in, spawns the
+        // holder there, then moves itself back out. No tick runs
+        // until the settle loop, so enumeration never observes the
+        // test itself.
+        let this = std::process::id();
+        cgroup.move_in(this, what);
+        let mut move_out = MoveOutGuard::arm(this);
+        assert!(
+            cgroup.members(what).contains(&this),
+            "{what}: the test must spawn from inside the cgroup"
+        );
+        let mut holder_child = spawn_holder(what, holder, provider);
+        move_out.move_out(what);
+        // Settle: tick the production cadence until a slot carries
+        // a watch for exactly the fixture file. Only then can a
+        // short-lived mapping name a slot.
+        use std::os::unix::fs::MetadataExt as _;
+        let fixture_meta = std::fs::metadata(provider).expect("stat fixture");
+        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            engine
+                .drain_discovery_shallow(&mut session, false)
+                .unwrap_or_else(|error| panic!("{what}: settle drain failed: {error:#}"));
+            engine
+                .service_backlog_quantum(&mut session)
+                .unwrap_or_else(|error| panic!("{what}: settle service failed: {error:#}"));
+            let watched = engine.plan.slots.iter().any(|slot| {
+                session
+                    .instance_tracking()
+                    .watched(slot.object)
+                    .is_some_and(|watched| {
+                        watched.identity.dev == fixture_meta.dev()
+                            && watched.identity.ino == fixture_meta.ino()
+                    })
+            });
+            if watched {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < settle_deadline,
+                "{what}: fixture unwatched after 120s: views={} slots={} members={:?}",
+                engine.views.len(),
+                engine.plan.slots.len(),
+                cgroup.members(what)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // The window: born in scope, reaped before the next tick, so
+        // all three stay deterministically unmatched.
+        cgroup.move_in(this, what);
+        let mut move_out = MoveOutGuard::arm(this);
+        let mapper_child = std::process::Command::new(mapper)
+            .arg(provider)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn mapper");
+        let mapper_pid = mapper_child.id();
+        let plain_child = std::process::Command::new(plain)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn plain child");
+        let plain_pid = plain_child.id();
+        let threaded_child = std::process::Command::new(threaded)
+            .arg(provider)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn threaded mapper");
+        let threaded_pid = threaded_child.id();
+        for (child, role) in [
+            (mapper_child, "mapper"),
+            (plain_child, "plain"),
+            (threaded_child, "threaded"),
+        ] {
+            let output = child.wait_with_output().expect("reap owned child");
+            assert!(
+                output.status.success(),
+                "{what}: owned {role} child exited {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        move_out.move_out(what);
+        let owned = [mapper_pid, plain_pid, threaded_pid];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let mut exits = Vec::new();
+        loop {
+            let (records, malformed, _empty) = engine
+                .collect_frame_discovery(&mut session)
+                .unwrap_or_else(|error| panic!("{what}: drain failed: {error:#}"));
+            for record in &records {
+                if matches!(
+                    record.kind,
+                    DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+                ) && owned.contains(&((record.pid_tgid >> 32) as u32))
+                {
+                    exits.push(*record);
+                }
+            }
+            engine
+                .with_live_frame(|live| {
+                    live.apply_discovery_batch(&mut session, records, malformed)
+                })
+                .unwrap_or_else(|error| panic!("{what}: apply failed: {error:#}"));
+            let settled = owned.iter().all(|pid| {
+                engine
+                    .unmatched_leader_exit_events
+                    .iter()
+                    .any(|(exit_pid, _)| exit_pid == pid)
+            });
+            if settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: owned exits unsettled after 90s: ledger has {:?}",
+                engine.unmatched_leader_exit_events
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // The window is closed: reap the holder before reading the
+        // outcome (its exit is never drained, so it cannot move the
+        // counts either way), then remove the cgroup.
+        holder_child.kill().expect("reap holder");
+        holder_child.wait().expect("wait holder");
+        let skips = engine.counters.object_skips.clone();
+        let outcome = (
+            LiveExits {
+                gaps: engine.pid_descendant_gaps(),
+                split: engine
+                    .gap_exit_mappings()
+                    .map(|split| (split.mapped, split.unknown)),
+                records: exits,
+                pids: owned,
+            },
+            skips,
+        );
+        cgroup.remove(what);
+        outcome
+    }
+
+    let slots = p11scope_ebpf_common::instance::RECORD_SLOTS;
+    let exit_for = |run: &LiveExits, pid: u32| {
+        run.records
+            .iter()
+            .find(|record| (record.pid_tgid >> 32) as u32 == pid)
+            .copied()
+            .unwrap_or_else(|| panic!("{WHAT}: no exit record for owned pid {pid}"))
+    };
+
+    let (armed_run, armed_skips) = run_capture(
+        WHAT,
+        "exitmap-armed",
+        &provider,
+        &manifest_path,
+        &mapper,
+        &plain,
+        &threaded,
+        &holder,
+        true,
+    );
+    let mapper_exit = exit_for(&armed_run, armed_run.pids[0]);
+    assert_eq!(
+        mapper_exit.kind, DISCOVERY_KIND_LEADER_EXIT_MAPPINGS,
+        "{WHAT}: the mapper exit must be kind 7"
+    );
+    assert!(
+        mapper_exit.pointers[..slots].iter().any(|cell| *cell != 0),
+        "{WHAT}: the mapper must name a watched slot"
+    );
+    assert_eq!(
+        mapper_exit.status_flags, 0,
+        "{WHAT}: the mapper summary carries no refusal"
+    );
+    for (pid, role) in [
+        (armed_run.pids[1], "plain"),
+        (armed_run.pids[2], "threaded"),
+    ] {
+        let exit = exit_for(&armed_run, pid);
+        assert_eq!(
+            exit.kind, DISCOVERY_KIND_LEADER_EXIT_MAPPINGS,
+            "{WHAT}: the {role} exit must be kind 7"
+        );
+        assert!(
+            exit.pointers[..slots].iter().all(|cell| *cell == 0),
+            "{WHAT}: the {role} exit must name no slot"
+        );
+    }
+    // Four gaps, exactly: the holder's admission plus the three
+    // owned exits (admissions carry no split entry).
+    assert_eq!(
+        armed_run.gaps, 4,
+        "{WHAT}: gaps must be the holder admission plus the three owned exits"
+    );
+    assert_eq!(
+        armed_run.split,
+        Some((1, 2)),
+        "{WHAT}: the armed split must read mapped 1, unknown 2"
+    );
+    assert!(
+        armed_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("unknown discovery kind")),
+        "{WHAT}: kind 7 must never be live loss: {armed_skips:?}"
+    );
+
+    let (twin_run, _) = run_capture(
+        WHAT,
+        "exitmap-twin",
+        &provider,
+        &manifest_path,
+        &mapper,
+        &plain,
+        &threaded,
+        &holder,
+        false,
+    );
+    for pid in twin_run.pids {
+        let exit = exit_for(&twin_run, pid);
+        assert_eq!(
+            exit.kind, DISCOVERY_KIND_LEADER_EXIT,
+            "{WHAT}: the default twin must record kind 6"
+        );
+        assert_eq!(
+            exit.status_flags, 0,
+            "{WHAT}: default kind 6 carries no status"
+        );
+        assert_eq!(exit.case_id, 0, "{WHAT}: default kind 6 carries no case");
+        assert!(
+            exit.pointers.iter().all(|cell| *cell == 0),
+            "{WHAT}: default kind 6 carries a zeroed payload"
+        );
+    }
+    assert_eq!(
+        twin_run.gaps, 4,
+        "{WHAT}: twin gaps must be the holder admission plus the three owned exits"
+    );
+    assert_eq!(twin_run.split, None, "{WHAT}: the twin publishes no split");
+}
+
 /// The exec-timing table is bounded: past the stash bound the
 /// smallest PID evicts first, deterministically.
 #[test]

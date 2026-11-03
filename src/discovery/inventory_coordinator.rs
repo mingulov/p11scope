@@ -587,13 +587,16 @@ const NATIVE_OWNER_SUSPENDED_LOST_REASON: &str = "the caller failed its final pe
 /// Every deep-scanned view reports each hint it does not map, so hints by
 /// views notes reach the registry: at system scale (121 hints, ~475 views)
 /// that drowns the gap store (~49k suppressed gaps) and hides real loss. A
-/// hint the scan matched in any inventoried view — or that maps identity
+/// hint the scan matched in any hint-examining view — or that maps identity
 /// attributed to a catalog object — is mapped: its miss notes are noise and
 /// drop. A hint missed everywhere is owed one pid-less scope answer. Match
 /// state comes from this pass's own notes and statuses, never from
 /// re-statting hints (fd and maps device domains must not be compared).
+/// Silence is a match only for views that evaluated hints: kernel threads
+/// and refused-initial scans are inventoried but hint-silent, so they
+/// never appear in `examining`.
 fn collapse_hint_misses(
-    inventoried: &BTreeSet<u32>,
+    examining: &BTreeSet<u32>,
     object_paths: &BTreeSet<&str>,
     notes: &[crate::inspect_system::PidGap],
 ) -> Vec<crate::inspect_system::PidGap> {
@@ -610,7 +613,7 @@ fn collapse_hint_misses(
     }
     for (subject, pids) in missed {
         let matched =
-            object_paths.contains(subject) || inventoried.iter().any(|pid| !pids.contains(pid));
+            object_paths.contains(subject) || examining.iter().any(|pid| !pids.contains(pid));
         if !matched {
             kept.push(crate::inspect_system::PidGap {
                 pid: None,
@@ -4584,10 +4587,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 budget: None,
             });
         }
-        let inventoried: BTreeSet<u32> = catalog
+        let examining: BTreeSet<u32> = catalog
             .processes
             .iter()
-            .filter(|process| process.status.inventoried())
+            .filter(|process| process.hints_examined)
             .map(|process| process.pid)
             .collect();
         let object_paths: BTreeSet<&str> = catalog
@@ -4595,7 +4598,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .iter()
             .map(|object| object.path.as_str())
             .collect();
-        let notes = collapse_hint_misses(&inventoried, &object_paths, &catalog.notes);
+        let notes = collapse_hint_misses(&examining, &object_paths, &catalog.notes);
         for gap in catalog.skipped.iter().chain(notes.iter()) {
             self.registry.record_gap(RegistryGap {
                 caller: gap.pid.and_then(|pid| self.adapter.live_id(pid)),
@@ -9109,7 +9112,7 @@ pub(crate) mod tests {
         // maps every hint (no miss notes), the other two map none: 242
         // per-view miss notes must collapse to nothing, or the gap store
         // drowns (~49k suppressed gaps at system scale) and hides real loss.
-        let inventoried: BTreeSet<u32> = [1, 2, 7].into_iter().collect();
+        let examining: BTreeSet<u32> = [1, 2, 7].into_iter().collect();
         let object_paths: BTreeSet<&str> = BTreeSet::new();
         let mut notes = Vec::new();
         for view in [1u32, 2] {
@@ -9126,23 +9129,46 @@ pub(crate) mod tests {
             reason: "matched a --module hint; no function table was found".into(),
             generic: false,
         });
-        let collapsed = collapse_hint_misses(&inventoried, &object_paths, &notes);
+        let collapsed = collapse_hint_misses(&examining, &object_paths, &notes);
         assert_eq!(collapsed.len(), 1, "only the non-hint note survives");
         assert_eq!(collapsed[0].pid, Some(7));
     }
 
     #[test]
     fn hint_matched_nowhere_collapses_to_one_scope_gap() {
-        // A hint missed in every inventoried view is owed one scope-level
+        // A hint missed in every examining view is owed one scope-level
         // answer, not one gap per view.
-        let inventoried: BTreeSet<u32> = [1, 2].into_iter().collect();
+        let examining: BTreeSet<u32> = [1, 2].into_iter().collect();
         let object_paths: BTreeSet<&str> = BTreeSet::new();
         let notes = vec![
             hint_miss_note(1, "/opt/typo.so"),
             hint_miss_note(2, "/opt/typo.so"),
         ];
-        let collapsed = collapse_hint_misses(&inventoried, &object_paths, &notes);
+        let collapsed = collapse_hint_misses(&examining, &object_paths, &notes);
         assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].pid, None);
+        assert_eq!(collapsed[0].subject, "/opt/typo.so");
+        assert_eq!(
+            collapsed[0].reason,
+            crate::discovery::scan::HINT_NOT_MAPPED_REASON
+        );
+    }
+
+    #[test]
+    fn hint_silent_inventoried_view_does_not_mask_unmatched_hint() {
+        // System-scope shape: inventoried is {1, 2, 3} with pid 3 a
+        // hint-silent view (kernel thread: Scanned with no hint-miss
+        // notes, never evaluated hints), so examining is {1, 2}. A hint
+        // missed in every examining view still owes one pid-less scope
+        // gap; silence is not a match.
+        let examining: BTreeSet<u32> = [1, 2].into_iter().collect();
+        let object_paths: BTreeSet<&str> = BTreeSet::new();
+        let notes = vec![
+            hint_miss_note(1, "/opt/typo.so"),
+            hint_miss_note(2, "/opt/typo.so"),
+        ];
+        let collapsed = collapse_hint_misses(&examining, &object_paths, &notes);
+        assert_eq!(collapsed.len(), 1, "silent pid 3 must not mask the miss");
         assert_eq!(collapsed[0].pid, None);
         assert_eq!(collapsed[0].subject, "/opt/typo.so");
         assert_eq!(
@@ -9155,10 +9181,10 @@ pub(crate) mod tests {
     fn hint_matched_by_maps_identity_collapses_to_no_gap() {
         // A hint no deep scan matched but maps identity attributed (a
         // catalog object carries its path) is mapped: drop the miss notes.
-        let inventoried: BTreeSet<u32> = [1].into_iter().collect();
+        let examining: BTreeSet<u32> = [1].into_iter().collect();
         let object_paths: BTreeSet<&str> = ["/opt/pinned.so"].into_iter().collect();
         let notes = vec![hint_miss_note(1, "/opt/pinned.so")];
-        let collapsed = collapse_hint_misses(&inventoried, &object_paths, &notes);
+        let collapsed = collapse_hint_misses(&examining, &object_paths, &notes);
         assert!(collapsed.is_empty(), "maps-matched hint is mapped");
     }
 
@@ -9948,13 +9974,14 @@ pub(crate) mod tests {
     fn private_count_table_without_manifest_keeps_the_shared_reserve() {
         let fixture = CountManifestFixture::new();
         let coordinator = fixture.scan(false);
-        assert_eq!(coordinator.attach_set().len(), 0);
-        assert!(coordinator.registry().modules().any(|module| {
-            module.admission == AdmissionState::Refused
+        // GT-5: pid-scope with --module hints is Named, first-come with no reserve.
+        assert_eq!(coordinator.attach_set().len(), 32);
+        assert!(coordinator.registry().modules().all(|module| {
+            module.admission == AdmissionState::Admitted
                 && module
                     .admission_reasons
                     .iter()
-                    .any(|reason| reason.contains("reserved"))
+                    .all(|reason| !reason.contains("reserved"))
         }));
     }
 
@@ -9981,7 +10008,8 @@ pub(crate) mod tests {
         );
         std::fs::write(&fixture.manifest, serde_json::to_vec(&document).unwrap()).unwrap();
         let coordinator = fixture.scan(true);
-        assert_eq!(coordinator.attach_set().len(), 0);
+        // GT-5: pid-scope with --module hints is Named, so raw scan targets admit first-come.
+        assert_eq!(coordinator.attach_set().len(), 32);
         assert!(
             coordinator
                 .registry()
@@ -10145,9 +10173,10 @@ pub(crate) mod tests {
             0,
         )
         .unwrap();
+        // GT-5: pid-scope with --module hints is Named, so raw scan targets admit first-come.
         assert_eq!(
             catalog.lowering.as_ref().unwrap().plan.slots.len(),
-            0,
+            32,
             "a valid but oversized-for-this-window document cannot bypass collection I/O"
         );
         assert!(
@@ -10156,6 +10185,12 @@ pub(crate) mod tests {
                 .iter()
                 .any(|gap| gap.reason.contains("count manifest refused"))
         );
+    }
+
+    #[test]
+    fn unaimed_capture_keeps_the_shared_reserve() {
+        // GT-5 twin: unaimed system scope stays Shared, so a 32 budget reserves all 32.
+        assert_eq!(crate::plan::shared_scope_reserve(32), 32);
     }
 
     #[test]
@@ -11147,6 +11182,7 @@ pub(crate) mod tests {
                     crate::inspect_identity::InspectIdentityUnknown::NotExamined,
                 ),
                 complete_scan: None,
+                hints_examined: true,
                 pid,
                 status: crate::inspect_system::MemberStatus::Scanned,
                 objects: (0..objects.len()).collect(),

@@ -2979,6 +2979,7 @@ mod c1b {
                     crate::inspect_identity::InspectIdentityUnknown::NotExamined,
                 ),
                 complete_scan: None,
+                hints_examined: pid == REP,
                 pid,
                 status: if pid == REP {
                     MemberStatus::Scanned
@@ -3001,6 +3002,7 @@ mod c1b {
                 crate::inspect_identity::InspectIdentityUnknown::NotExamined,
             ),
             complete_scan: None,
+            hints_examined: false,
             pid,
             status: MemberStatus::NotSelected { loss: None },
             objects: Vec::new(),

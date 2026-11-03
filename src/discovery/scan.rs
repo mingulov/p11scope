@@ -3133,6 +3133,29 @@ fn detect_tables_for_layout(
     )
 }
 
+/// Whether a kept decode dominates an anchor candidate, mirroring the
+/// overlap pass below (validated desc, length desc, start asc). A
+/// candidate covered by a validated table, or by an overlapping longer
+/// decode, adds no coverage; equal-length unvalidated ties go to the
+/// earlier start. Accepted residuals: same-start pairs where a future
+/// longer decode covers the shorter (the survivor covers the same words;
+/// admission dedups by object+offset), and validated discards that hide
+/// an overlapping candidate from a future validated survivor (contrived).
+fn anchor_kept_dominates(
+    kept_start: usize,
+    kept_len: usize,
+    kept_validated: bool,
+    candidate: usize,
+    candidate_len: usize,
+) -> bool {
+    candidate != kept_start
+        && candidate < kept_start.saturating_add(kept_len)
+        && kept_start < candidate.saturating_add(candidate_len)
+        && (kept_validated
+            || kept_len > candidate_len
+            || (kept_len == candidate_len && kept_start < candidate))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     layout: LinuxLayout,
@@ -3315,8 +3338,9 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                 let count = ((snapshot.len() - candidate - width) / width).min(limit);
                 // Skip anchor decodes the overlap pass below would discard:
                 // a candidate covered by a validated table, or by an
-                // overlapping decode at least as long, adds no coverage but
-                // burns a table candidate each. An aliased export tail
+                // overlapping longer (or equal-length earlier-start) decode,
+                // adds no coverage but burns a table candidate each. An
+                // aliased export tail
                 // otherwise spends ~36 candidates per provider and exhausts
                 // the per-pass budget at system scale. Same-start
                 // extensions, longer recoveries, and candidates touching a
@@ -3324,10 +3348,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                 // so version-readable tables always decode.
                 let candidate_len = table_bytes(layout, count).expect("bounded catalog");
                 let dominated = found.iter().any(|(start, kept_len, validated, _)| {
-                    candidate != *start
-                        && candidate < start.saturating_add(*kept_len)
-                        && *start < candidate.saturating_add(candidate_len)
-                        && (*validated || *kept_len >= candidate_len)
+                    anchor_kept_dominates(*start, *kept_len, *validated, candidate, candidate_len)
                 });
                 if dominated {
                     continue;
@@ -5001,19 +5022,21 @@ fn scan_process_view_with_io(
 /// [`scan_process_view`] plus the objects this scan examined: opened,
 /// identified, and found to export nothing wanted, read from this scan's
 /// own maps snapshot (never an earlier sweep's). Empty when the scan's
-/// final bracket failed. C1b uses them to call a key examined.
+/// final bracket failed. C1b uses them to call a key examined. The flag
+/// reports whether the scan reached its `--module` hint loop; kernel
+/// threads and refused-initial scans never do.
 pub(crate) fn scan_process_view_examined(
     request: &ScanRequest<'_>,
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
     let result =
         scan_view_with_examined(request, view, budget, &mut ProcScanIo { cold: None }, true);
     #[cfg(test)]
     {
         let probe = result
             .as_ref()
-            .map(|(outcome, _)| outcome.clone())
+            .map(|(outcome, _, _)| outcome.clone())
             .map_err(Clone::clone);
         crate::first_use_probe::scan_returned(view, true, budget, &probe);
     }
@@ -5027,7 +5050,8 @@ fn scan_process_view_with_io_mode(
     io: &mut impl ScanIo,
     scan_memory: bool,
 ) -> Result<ScanOutcome, String> {
-    scan_view_with_examined(request, view, budget, io, scan_memory).map(|(outcome, _)| outcome)
+    scan_view_with_examined(request, view, budget, io, scan_memory)
+        .map(|(outcome, _, _)| outcome)
 }
 
 /// Post-read pin check: the export facts read after `before` are trusted only
@@ -5051,7 +5075,7 @@ pub(crate) fn scan_process_view_held(
     budget: &mut CaptureWorkBudget,
     custody: &mut super::kernel_identity::ExaminedCustody,
     scan: u64,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
     scan_view_with_custody(
         request,
         view,
@@ -5072,7 +5096,7 @@ fn scan_view_with_custody(
     scan_memory: bool,
     custody: &mut super::kernel_identity::ExaminedCustody,
     scan: u64,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
     let result = scan_view_examined_mode(
         request,
         view,
@@ -5083,7 +5107,7 @@ fn scan_view_with_custody(
     );
     if !result
         .as_ref()
-        .is_ok_and(|(outcome, _)| outcome.mapping_scan_completed())
+        .is_ok_and(|(outcome, _, _)| outcome.mapping_scan_completed())
         || budget.stopped_reason().is_some()
     {
         custody.discard_scan(scan);
@@ -5097,7 +5121,7 @@ fn scan_view_with_examined(
     budget: &mut CaptureWorkBudget,
     io: &mut impl ScanIo,
     scan_memory: bool,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
     scan_view_examined_mode(request, view, budget, io, scan_memory, None)
 }
 
@@ -5108,7 +5132,7 @@ fn scan_view_examined_mode(
     io: &mut impl ScanIo,
     scan_memory: bool,
     mut custody: Option<(&mut super::kernel_identity::ExaminedCustody, u64)>,
-) -> Result<(ScanOutcome, Vec<ExaminedObject>), String> {
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
     if request.pid != view.pid() {
         return Err("scan request pid does not match its process view".into());
     }
@@ -5132,6 +5156,7 @@ fn scan_view_examined_mode(
                 scan_ms: started.elapsed().as_millis() as u64,
             },
             Vec::new(),
+            false,
         )
     };
     let maps = match acquire_scan_maps(view, budget, io) {
@@ -5146,6 +5171,7 @@ fn scan_view_examined_mode(
                         scan_ms: started.elapsed().as_millis() as u64,
                     },
                     Vec::new(),
+                    false,
                 ));
             }
             Ok(EmptyMapsClass::Refuse) => return Ok(refused_initial(error.reason)),
@@ -5603,7 +5629,7 @@ fn scan_view_examined_mode(
             skipped,
         },
     };
-    Ok((outcome, examined))
+    Ok((outcome, examined, true))
 }
 
 #[cfg(test)]
@@ -5651,7 +5677,7 @@ mod tests {
             let mut custody = ExaminedCustody::new(owner.clone(), BTreeMap::new());
             let scan = custody.begin_scan();
             let mut budget = CaptureWorkBudget::default();
-            let (outcome, examined) = scan_view_with_custody(
+            let (outcome, examined, _) = scan_view_with_custody(
                 &ScanRequest {
                     pid: view.pid(),
                     hints: &[],
@@ -6473,7 +6499,7 @@ mod tests {
         let mut fixture = BracketFixture::new(8, true);
         let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
         let mut budget = CaptureWorkBudget::with_work_ceiling(1);
-        let (outcome, examined) =
+        let (outcome, examined, _) =
             scan_view_with_examined(&request, &view, &mut budget, &mut fixture, true)
                 .expect("a bounded retained-view scan");
         assert!(
@@ -8098,6 +8124,30 @@ mod tests {
             budget.table_candidates_count(),
             2,
             "one kept adjacent decode, no cascade"
+        );
+    }
+
+    #[test]
+    fn anchor_skip_equal_length_tie_goes_to_the_earlier_start() {
+        // D1: unvalidated dominator with equal length but later start,
+        // scanned first. The overlap pass (validated desc, length desc,
+        // start asc) keeps the earlier start; the skip must mirror it,
+        // so the later-scanned earlier candidate is not dominated.
+        assert!(
+            !super::anchor_kept_dominates(100, 64, false, 90, 64),
+            "later start must not dominate an overlapping earlier start of equal length"
+        );
+        assert!(
+            super::anchor_kept_dominates(90, 64, false, 100, 64),
+            "earlier start dominates a later start of equal length"
+        );
+        assert!(
+            super::anchor_kept_dominates(100, 72, false, 90, 64),
+            "longer decode still dominates a shorter overlap"
+        );
+        assert!(
+            !super::anchor_kept_dominates(90, 64, false, 100, 72),
+            "shorter decode never dominates a longer overlap"
         );
     }
 

@@ -259,6 +259,7 @@ pub(crate) struct CgroupCollection {
     bound: Option<Bound>,
     attributed: Option<Attributed>,
     policy: AdmissionPolicy,
+    admission_scope: AdmissionScope,
     work: SharedCollectionWork,
     outcome: ScopedCollectionOutcome,
     end: Option<MembershipSamples>,
@@ -597,7 +598,13 @@ impl CgroupCollection {
         if outcome != ScopedCollectionOutcome::Complete {
             collection.scope_gaps.push(scope_gap(outcome.reason()));
         }
-        let mut catalog = assemble(collection, bound, attributed, self.policy);
+        let mut catalog = assemble(
+            collection,
+            bound,
+            attributed,
+            self.policy,
+            self.admission_scope,
+        );
         catalog.stage_timings = std::mem::take(&mut self.timings);
         catalog
     }
@@ -970,6 +977,7 @@ fn collect_with(
         bound: Some(bound),
         attributed,
         policy,
+        admission_scope: collector_admission_scope(hints, false),
         work,
         outcome,
         end: None,

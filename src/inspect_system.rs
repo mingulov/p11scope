@@ -302,6 +302,9 @@ struct MemberResult {
     application: InspectApplicationResult,
     /// Scanner-owned presentation fact, never an absence receipt or render input.
     mapping_scan_completed: bool,
+    /// Whether the scan reached its `--module` hint loop. Kernel threads
+    /// and refused-initial scans never do; their silence is not a match.
+    hints_examined: bool,
     modules: Vec<ScannedModule>,
     /// Objects this member's own deep scan examined without finding a
     /// module (C1b "examined" keys; empty unless the scan completed).
@@ -673,7 +676,7 @@ fn scan_pinned_member_inner(
         ),
         None => scan_process_view_examined(&request, view_handle, budget),
     };
-    let (outcome, examined) = match scanned {
+    let (outcome, examined, hints_examined) = match scanned {
         Ok(scanned) => scanned,
         Err(error) => {
             return member_not_scanned(
@@ -761,6 +764,7 @@ fn scan_pinned_member_inner(
         mapping_scan_completed,
         application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
         complete_scan,
+        hints_examined,
         pid,
         view,
         status,
@@ -818,6 +822,7 @@ fn member_not_scanned(
         mapping_scan_completed: false,
         application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
         complete_scan: None,
+        hints_examined: false,
         pid,
         view,
         status,
@@ -997,6 +1002,9 @@ pub(crate) struct ProcessRecord {
     pub complete_scan: Option<CompleteMemberScan>,
     /// Scan-local presentation only; never use this as event naming authority.
     pub application: InspectApplicationResult,
+    /// Whether the member's scan reached its `--module` hint loop.
+    /// Internal collapse input only; never rendered (schema-safe).
+    pub hints_examined: bool,
 }
 
 /// Both samples use the same retained reader and enclose the full physical
@@ -1284,7 +1292,13 @@ fn collect_identity(
         prior_bytes,
     );
     let assemble_start = monotonic_ns();
-    let mut catalog = assemble(collection, bound, attributed, policy);
+    let mut catalog = assemble(
+        collection,
+        bound,
+        attributed,
+        policy,
+        collector_admission_scope(hints, false),
+    );
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
     Ok((catalog, custody))
@@ -1403,7 +1417,13 @@ pub(crate) fn collect_pid_with_count_manifests(
         prior_objects,
         prior_bytes,
     );
-    Ok(assemble(collection, bound, None, policy))
+    Ok(assemble(
+        collection,
+        bound,
+        None,
+        policy,
+        collector_admission_scope(hints, true),
+    ))
 }
 
 /// The aggregate pin set and every module bound against it: the pure half
@@ -1924,14 +1944,29 @@ fn unexamined_maps_gap(pid: u32, count: usize) -> PidGap {
     )
 }
 
-/// Lower one shared-scope plan over collected evidence and validated inputs,
-/// and project the catalog records — deep-scanned and maps-matched
-/// members alike. Pure: no `/proc` reads.
+/// The GT-5 admission rule for a collected catalog, mirroring the engine: a
+/// named process, or a capture the operator aimed with `--module`, admits
+/// first-come; any other system capture admits in value order with a reserve
+/// for late corroborated providers.
+fn collector_admission_scope(hints: &[PathBuf], pid_scope: bool) -> AdmissionScope {
+    if pid_scope || !hints.is_empty() {
+        AdmissionScope::Named
+    } else {
+        AdmissionScope::Shared
+    }
+}
+
+/// Lower one plan over collected evidence and validated inputs, and project
+/// the catalog records — deep-scanned and maps-matched members alike.
+/// Pure: no `/proc` reads. The scope comes from
+/// [`collector_admission_scope`]: aimed captures admit first-come, unaimed
+/// system captures keep the shared reserve.
 fn assemble(
     mut collection: Collection,
     bound: Bound,
     attributed: Option<Attributed>,
     policy: AdmissionPolicy,
+    admission_scope: AdmissionScope,
 ) -> Catalog {
     let Bound {
         aggregate,
@@ -1988,7 +2023,7 @@ fn assemble(
         &count_manifests,
         &aggregate,
         policy,
-        AdmissionScope::Shared,
+        admission_scope,
     );
     let refused: BTreeMap<PinnedObjectId, &Skipped> = plan.refused_modules().collect();
     let admitted: BTreeMap<PinnedObjectId, usize> = plan
@@ -2206,6 +2241,9 @@ fn assemble(
             complete_scan: members_by_pid
                 .get(pid)
                 .and_then(|member| member.complete_scan.clone()),
+            hints_examined: members_by_pid
+                .get(pid)
+                .is_some_and(|member| member.hints_examined),
             pid: *pid,
             status,
             objects,
@@ -3976,7 +4014,13 @@ pub(crate) fn collect_system_with_identity(
         prior_bytes,
     );
     let assemble_start = monotonic_ns();
-    let mut catalog = assemble(collection, bound, attributed, policy);
+    let mut catalog = assemble(
+        collection,
+        bound,
+        attributed,
+        policy,
+        collector_admission_scope(hints, false),
+    );
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
     Ok(catalog)
@@ -4388,6 +4432,31 @@ mod tests {
     };
     use crate::cli::IdentityBackendSelection;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn aimed_system_capture_lowers_without_shared_reserve() {
+        let hints = vec![std::path::PathBuf::from("/opt/provider.so")];
+        assert_eq!(
+            super::collector_admission_scope(&hints, false),
+            crate::plan::AdmissionScope::Named
+        );
+    }
+
+    #[test]
+    fn unaimed_system_capture_keeps_shared_reserve() {
+        assert_eq!(
+            super::collector_admission_scope(&[], false),
+            crate::plan::AdmissionScope::Shared
+        );
+    }
+
+    #[test]
+    fn pid_capture_is_always_named() {
+        assert_eq!(
+            super::collector_admission_scope(&[], true),
+            crate::plan::AdmissionScope::Named
+        );
+    }
 
     fn shared_with(
         selection: IdentityBackendSelection,
@@ -5336,6 +5405,7 @@ mod tests {
         fn member(pid: u32) -> MemberResult {
             MemberResult {
                 mapping_scan_completed: true,
+                hints_examined: true,
                 pid,
                 view: ProcessViewId(0),
                 status: MemberStatus::Scanned,
@@ -5370,6 +5440,7 @@ mod tests {
                 generation: member.generation,
                 complete_scan: member.complete_scan,
                 application: member.application,
+                hints_examined: member.hints_examined,
             }];
             catalog.skipped = member.gaps;
             catalog
@@ -5798,6 +5869,7 @@ mod tests {
                         InspectIdentityUnknown::NotExamined,
                     ),
                     complete_scan: None,
+                    hints_examined: true,
                     pid: 100,
                     status: MemberStatus::Scanned,
                     objects: vec![0],
@@ -5808,6 +5880,7 @@ mod tests {
                         InspectIdentityUnknown::NotExamined,
                     ),
                     complete_scan: None,
+                    hints_examined: true,
                     pid: 200,
                     status: MemberStatus::Scanned,
                     objects: if objects.len() > 1 { vec![1] } else { vec![] },
@@ -5979,6 +6052,7 @@ mod tests {
                 mapping_scan_completed: true,
                 application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
                 complete_scan: None,
+                hints_examined: true,
                 pid,
                 view: ProcessViewId(view),
                 status: MemberStatus::Scanned,
@@ -6044,7 +6118,13 @@ mod tests {
                 nonunique: None,
             };
             let attributed = attribute_sweep(&mut collection, &bound, &mut probe, &checks);
-            assemble(collection, bound, attributed, AdmissionPolicy::detailed())
+            assemble(
+                collection,
+                bound,
+                attributed,
+                AdmissionPolicy::detailed(),
+                crate::plan::AdmissionScope::Shared,
+            )
         }
 
         fn catalog_with(mut collection: Collection, checks: &Checks) -> Catalog {
@@ -6052,7 +6132,13 @@ mod tests {
             let bound = bind_collection(&mut collection);
             let mut probe = Probe(snapshots, HashMap::new());
             let attributed = attribute_sweep(&mut collection, &bound, &mut probe, checks);
-            assemble(collection, bound, attributed, AdmissionPolicy::detailed())
+            assemble(
+                collection,
+                bound,
+                attributed,
+                AdmissionPolicy::detailed(),
+                crate::plan::AdmissionScope::Shared,
+            )
         }
 
         fn capped_gaps(catalog: &Catalog) -> Vec<&PidGap> {
@@ -6756,6 +6842,7 @@ mod tests {
                         InspectIdentityUnknown::NotExamined,
                     ),
                     complete_scan: None,
+                    hints_examined: false,
                     pid: 1,
                     view: ProcessViewId(0),
                     generation: None,
@@ -6776,6 +6863,7 @@ mod tests {
                         InspectIdentityUnknown::NotExamined,
                     ),
                     complete_scan: None,
+                    hints_examined: false,
                     pid: 2,
                     view: ProcessViewId(1),
                     status: MemberStatus::Exited,

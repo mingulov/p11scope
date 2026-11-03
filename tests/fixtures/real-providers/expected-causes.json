@@ -38,6 +38,39 @@
      "status": "sigstop"
     },
     "tool_version": "3.8.13-1.fc44"
+   },
+   {
+    "observation": [
+     {
+      "cause": "modules_skipped",
+      "owner": "exec-real-providers",
+      "reason": "capacity refusals: p11-kit closure array exceeds the 512-slot ceiling (count pinned separately) plus the runtime-built spy table"
+     },
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+     },
+     {
+      "cause": "surfaces",
+      "owner": "exec-real-providers",
+      "reason": "p11-kit closure templates read known_prefix (68-entry 3.2 tables)"
+     },
+     {
+      "cause": "interface_selection",
+      "owner": "exec-real-providers",
+      "reason": "selection loss beside unverified tables"
+     }
+    ],
+    "os": "ubuntu",
+    "p11kit_skip": 6120,
+    "p11kit_version": "0.26.2-2",
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "pause confirmed on every owner",
+     "status": "sigstop"
+    },
+    "tool_version": "3.8.12-2ubuntu1.1"
    }
   ],
   "real-gnutls-p11tool-metrics": [
@@ -148,6 +181,39 @@
      "status": "partial"
     },
     "tool_version": "0.26.5-1.fc44"
+   },
+   {
+    "observation": [
+     {
+      "cause": "modules_skipped",
+      "owner": "exec-real-providers",
+      "reason": "capacity refusals: p11-kit closure array exceeds the 512-slot ceiling (count pinned separately) plus the runtime-built spy table"
+     },
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+     },
+     {
+      "cause": "surfaces",
+      "owner": "exec-real-providers",
+      "reason": "p11-kit closure templates read known_prefix (68-entry 3.2 tables)"
+     },
+     {
+      "cause": "interface_selection",
+      "owner": "exec-real-providers",
+      "reason": "selection loss beside unverified tables"
+     }
+    ],
+    "os": "ubuntu",
+    "p11kit_skip": 6120,
+    "p11kit_version": "0.26.2-2",
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "pause confirmed on every owner",
+     "status": "sigstop"
+    },
+    "tool_version": "0.26.2-2"
    }
   ],
   "real-p11kit-trust-metrics": [
@@ -210,6 +276,44 @@
      "status": "sigstop"
     },
     "tool_version": "0.27.1-2.fc44"
+   },
+   {
+    "observation": [
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+     },
+     {
+      "cause": "unprotected_live_windows",
+      "owner": "exec-real-providers",
+      "reason": "a loader hit with no confirmed pause owner beside the partial pause"
+     },
+     {
+      "cause": "pause_partial",
+      "owner": "exec-real-providers",
+      "reason": "OpenSC partial pause; exec-real-providers lane"
+     },
+     {
+      "cause": "loader_discovery",
+      "owner": "exec-real-providers",
+      "reason": "live-loader timing gap beside the partial pause"
+     },
+     {
+      "cause": "interface_selection",
+      "owner": "exec-real-providers",
+      "reason": "selection loss beside unverified tables"
+     }
+    ],
+    "os": "ubuntu",
+    "p11kit_skip": null,
+    "p11kit_version": null,
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "OpenSC partial pause; exec-real-providers lane",
+     "status": "partial"
+    },
+    "tool_version": "0.27.0~rc1-1"
    }
   ],
   "real-pkcs11tool-softhsm-metrics": [

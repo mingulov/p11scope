@@ -86,7 +86,11 @@ use time). Registration is verified by listing, never by exit code
 (`modutil` exits 0 on failure). The observed command is `certutil -L -h
 all` alone: `run` does not track descendants, so a wrapper running two
 tools would hide both; `modutil -list` exercises the same registration
-unobserved in setup.
+unobserved in setup. An owned *empty* p11-kit user config
+(`user-config: only`, no modules) blinds NSS's second SoftHSM path:
+both distros ship `softhsm2.module`, and without blinding NSS executes
+SoftHSM calls through p11-kit behind the spy's back (observed 2x the
+ledger on Fedora).
 
 ## expected-causes.json: the ratchet
 

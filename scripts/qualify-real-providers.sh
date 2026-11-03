@@ -301,11 +301,18 @@ nss_cell() {
   # (pid_descendant_gaps is cgroup-only), so a shell wrapper running two
   # tools would hide both. modutil -list still exercises the same
   # registration unobserved in setup verification above.
+  # NSS also loads every p11-kit-registered module (both distros ship
+  # softhsm2.module), which would execute SoftHSM calls behind the spy's
+  # back and double the ledger; an owned empty p11-kit user config blinds
+  # that path (verified: only p11-kit-proxy.so opens, exit 0).
+  local xdg=$WORK/xdg-nss
+  rm -rf -- "$xdg"; mkdir -p "$xdg/pkcs11/modules"
+  printf 'user-config: only\n' > "$xdg/pkcs11/pkcs11.conf"
   local mode
   for mode in profile metrics; do
     CELL=$base; MODE=$mode; TOOL=certutil; TOOL_VERSION=$version; SPIED=$spied
     [ "$mode" = metrics ] && CELL=$base-metrics
-    ENV_ARGS=("SOFTHSM2_CONF=$SOFTHSM_CONF" "PKCS11SPY=$spied" "PKCS11SPY_OUTPUT=$OUT/$CELL.spy.log")
+    ENV_ARGS=("SOFTHSM2_CONF=$SOFTHSM_CONF" "XDG_CONFIG_HOME=$xdg" "PKCS11SPY=$spied" "PKCS11SPY_OUTPUT=$OUT/$CELL.spy.log")
     CMD_ARGS=("$certbin" -L -h all -d "sql:$nssdb")
     run_and_judge || true
   done

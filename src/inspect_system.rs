@@ -1284,7 +1284,13 @@ fn collect_identity(
         prior_bytes,
     );
     let assemble_start = monotonic_ns();
-    let mut catalog = assemble(collection, bound, attributed, policy);
+    let mut catalog = assemble(
+        collection,
+        bound,
+        attributed,
+        policy,
+        collector_admission_scope(hints, false),
+    );
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
     Ok((catalog, custody))
@@ -1403,7 +1409,13 @@ pub(crate) fn collect_pid_with_count_manifests(
         prior_objects,
         prior_bytes,
     );
-    Ok(assemble(collection, bound, None, policy))
+    Ok(assemble(
+        collection,
+        bound,
+        None,
+        policy,
+        collector_admission_scope(hints, true),
+    ))
 }
 
 /// The aggregate pin set and every module bound against it: the pure half
@@ -1928,20 +1940,25 @@ fn unexamined_maps_gap(pid: u32, count: usize) -> PidGap {
 /// named process, or a capture the operator aimed with `--module`, admits
 /// first-come; any other system capture admits in value order with a reserve
 /// for late corroborated providers.
-///
-/// STUB (RED): always Shared.
-fn collector_admission_scope(_hints: &[PathBuf], _pid_scope: bool) -> AdmissionScope {
-    AdmissionScope::Shared
+fn collector_admission_scope(hints: &[PathBuf], pid_scope: bool) -> AdmissionScope {
+    if pid_scope || !hints.is_empty() {
+        AdmissionScope::Named
+    } else {
+        AdmissionScope::Shared
+    }
 }
 
-/// Lower one shared-scope plan over collected evidence and validated inputs,
-/// and project the catalog records — deep-scanned and maps-matched
-/// members alike. Pure: no `/proc` reads.
+/// Lower one plan over collected evidence and validated inputs, and project
+/// the catalog records — deep-scanned and maps-matched members alike.
+/// Pure: no `/proc` reads. The scope comes from
+/// [`collector_admission_scope`]: aimed captures admit first-come, unaimed
+/// system captures keep the shared reserve.
 fn assemble(
     mut collection: Collection,
     bound: Bound,
     attributed: Option<Attributed>,
     policy: AdmissionPolicy,
+    admission_scope: AdmissionScope,
 ) -> Catalog {
     let Bound {
         aggregate,
@@ -1998,7 +2015,7 @@ fn assemble(
         &count_manifests,
         &aggregate,
         policy,
-        AdmissionScope::Shared,
+        admission_scope,
     );
     let refused: BTreeMap<PinnedObjectId, &Skipped> = plan.refused_modules().collect();
     let admitted: BTreeMap<PinnedObjectId, usize> = plan
@@ -3986,7 +4003,13 @@ pub(crate) fn collect_system_with_identity(
         prior_bytes,
     );
     let assemble_start = monotonic_ns();
-    let mut catalog = assemble(collection, bound, attributed, policy);
+    let mut catalog = assemble(
+        collection,
+        bound,
+        attributed,
+        policy,
+        collector_admission_scope(hints, false),
+    );
     timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
     catalog.stage_timings = timings;
     Ok(catalog)
@@ -6079,7 +6102,13 @@ mod tests {
                 nonunique: None,
             };
             let attributed = attribute_sweep(&mut collection, &bound, &mut probe, &checks);
-            assemble(collection, bound, attributed, AdmissionPolicy::detailed())
+            assemble(
+                collection,
+                bound,
+                attributed,
+                AdmissionPolicy::detailed(),
+                crate::plan::AdmissionScope::Shared,
+            )
         }
 
         fn catalog_with(mut collection: Collection, checks: &Checks) -> Catalog {
@@ -6087,7 +6116,13 @@ mod tests {
             let bound = bind_collection(&mut collection);
             let mut probe = Probe(snapshots, HashMap::new());
             let attributed = attribute_sweep(&mut collection, &bound, &mut probe, checks);
-            assemble(collection, bound, attributed, AdmissionPolicy::detailed())
+            assemble(
+                collection,
+                bound,
+                attributed,
+                AdmissionPolicy::detailed(),
+                crate::plan::AdmissionScope::Shared,
+            )
         }
 
         fn capped_gaps(catalog: &Catalog) -> Vec<&PidGap> {

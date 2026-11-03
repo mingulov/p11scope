@@ -15632,6 +15632,144 @@ mod tests {
         );
     }
 
+    /// Pre-arm pinning over one tiny proved-exports provider, compiled
+    /// like the coordinator twins' fixture: two standard-name functions
+    /// (proved) — enough to open a watch and end it terminally.
+    fn prearm_pinning_for_test(
+        dir: &tempfile::TempDir,
+        name: &str,
+    ) -> crate::discovery::identity::PrearmPinning {
+        let src = dir.path().join(format!("{name}.c"));
+        std::fs::write(
+            &src,
+            "unsigned long C_Initialize(void *p){(void)p;return 0;}\n\
+             unsigned long C_GetFunctionList(void *l){(void)l;return 0;}\n",
+        )
+        .unwrap();
+        let so = dir.path().join(format!("{name}.so"));
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&so)
+                .arg(&src)
+                .status()
+                .unwrap()
+                .success()
+        );
+        crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+            &[so],
+            &[],
+            None,
+            0,
+            0,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
+        )
+        .expect("test pre-arm pins")
+    }
+
+    #[test]
+    fn presentation_guard_final_refreshes_terminal_prearm_rows() {
+        // While a publication pends, the final keeps the prior view —
+        // except `prearm[]`, which refreshes to the terminal watches
+        // from the live coordinator: the terminal hook already ended
+        // them, and the row assembly is a pure read, not a registry
+        // publication. Every other section still reuses the prior.
+        let dir = tempfile::tempdir().unwrap();
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(prearm_pinning_for_test(&dir, "pending-final"));
+        coordinator.absorb_prearm_plan(1_000);
+        coordinator.take_target_delta();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        let mut state = StreamState::new();
+        let prior = stream_view_guarded(&driver, &mut state, "system", 1, 2)
+            .expect("the unpending pass publishes");
+        assert_eq!(
+            prior.prearm[0].watch.as_ref().unwrap().state,
+            crate::render::PrearmWatchState::PinnedUnarmed,
+            "the prior carries the live watch"
+        );
+        // The terminal close lands, then the publication pends behind
+        // it: the hook's commit refuses and the final keeps the prior.
+        driver
+            .coordinator
+            .finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(9_000));
+        driver.joint_commit_pending = true;
+        assert!(driver.publication_pending(), "the harness driver pends");
+        let final_view = final_view_guarded(&driver, &state, "system", 1, 9);
+        let watch = final_view.prearm[0].watch.as_ref().unwrap();
+        assert_eq!(
+            watch.state,
+            crate::render::PrearmWatchState::Ended,
+            "the pending final shows the terminal watch, not the prior's live one"
+        );
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::ScopeEnd)
+        );
+        assert_eq!(watch.until_ns, Some(9_000));
+        assert_eq!(
+            render_json_from_presentation(&final_view)["gaps"],
+            render_json_from_presentation(&prior)["gaps"],
+            "every other section still reuses the prior view"
+        );
+    }
+
+    #[test]
+    fn failed_startup_final_publishes_scope_end_watches_with_failure_gap() {
+        // The failure choke ends pre-arm watches `ScopeEnd` and stages
+        // the failure gap before the one commit, so the fresh final
+        // publishes both together.
+        let dir = tempfile::tempdir().unwrap();
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(prearm_pinning_for_test(&dir, "failed-startup"));
+        coordinator.absorb_prearm_plan(1_000);
+        coordinator.take_target_delta();
+        let output = private_tempdir();
+        let report_path = output.path().join("report.json");
+        let events_path = output.path().join("events.jsonl");
+        let writer = EventWriter::anonymous_test_sink(std::fs::File::create(&events_path).unwrap());
+        let mut stream = EventLogState::new(Some(writer));
+        let mut stdout: Vec<u8> = Vec::new();
+        let error = anyhow::anyhow!("scripted native failure");
+        let finalized = std::cell::Cell::new(false);
+        finish_failed_startup_guarded(
+            false,
+            None,
+            &mut coordinator,
+            "system",
+            1,
+            Some(crate::output::atomic_file_test_fixture(&report_path)),
+            &mut stream,
+            None,
+            true,
+            &mut crate::inventory_output::WriterStdout(&mut stdout),
+            &error,
+            &|| false,
+            &|| finalized.set(true),
+            None,
+        );
+        assert!(finalized.get(), "outputs were attempted");
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        let rows = document["prearm"]
+            .as_array()
+            .expect("the fresh final renders prearm[]");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["watch"]["state"], "ended");
+        assert_eq!(rows[0]["watch"]["ended_by"], "scope_end");
+        assert!(
+            rows[0]["watch"]["until_ns"].as_u64().unwrap() > 0,
+            "the choke ends the watch: {rows:?}"
+        );
+        let gaps = document["gaps"].as_array().unwrap();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap["subject"] == "inventory capture failed"),
+            "the failure gap publishes beside the watches: {gaps:?}"
+        );
+    }
+
     /// The D5 scene: a fresh substituted lane (no Joint seams) with a
     /// legacy-tick spy, seated on the driver. Returns the tick spy.
     fn seat_fresh_joint_candidate(

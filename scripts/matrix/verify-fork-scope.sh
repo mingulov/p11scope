@@ -39,10 +39,24 @@ set -eu
 cd "$(dirname "$0")/../.."
 . scripts/lib.sh
 
-MODULE=/usr/lib/softhsm/libsofthsm2.so
+MODULE=${MODULE-}
 WORK=${P11SCOPE_RECEIPT_WORK-}
 EXPECTED=scripts/matrix/fork-expected.txt
 PRODUCT=
+
+# Probe SoftHSM provider paths (Debian + Fedora); a missing prerequisite
+# exits 77. An explicit MODULE is honored strictly.
+if [ -z "$MODULE" ]; then
+    if command -v python3 >/dev/null 2>&1 && MODULE_PROBED=$(python3 -I scripts/release-matrix-contract.py --select-module 2>/dev/null); then
+        MODULE=$MODULE_PROBED
+    else
+        for candidate in /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so /usr/lib/softhsm/libsofthsm2.so /usr/lib64/softhsm/libsofthsm2.so /usr/lib64/pkcs11/libsofthsm2.so; do
+            if [ -f "$candidate" ]; then MODULE=$candidate; break; fi
+        done
+        unset candidate
+    fi
+    unset MODULE_PROBED
+fi
 
 receipt_prepare_root() {
     t4_candidate=$1
@@ -307,12 +321,12 @@ if [ -z "${P11SCOPE_BIN-}" ]; then
         && [ -n "${P11SCOPE_PREPARED_BPF_RUSTC-}" ] \
         || { echo "prepared stable/BPF Cargo/rustc handoff required" >&2; exit 1; }
 fi
-command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
-command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
-command -v systemd-run >/dev/null || { echo "systemd-run required"; exit 1; }
-command -v capsh >/dev/null || { echo "capsh required"; exit 1; }
-sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
-test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
+command -v gcc >/dev/null || { echo "gcc required" >&2; exit 77; }
+command -v softhsm2-util >/dev/null || { echo "softhsm2-util required" >&2; exit 77; }
+command -v systemd-run >/dev/null || { echo "systemd-run required" >&2; exit 77; }
+command -v capsh >/dev/null || { echo "capsh required" >&2; exit 77; }
+sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 77; }
+test -f "${MODULE-}" || { echo "SoftHSM2 not installed (probed Debian/Fedora paths)" >&2; exit 77; }
 
 # SoftHSM, systemd-run and the observer all receive paths under WORK, so it
 # must be absolute; a relative one under a group-writable checkout would also

@@ -30,10 +30,10 @@ SELF_TEST_ONLY=0
 # The self-test needs only a compiler: it proves the harness can still detect a
 # kill, which is the part that rots silently. The probe prerequisites are
 # checked after it, so the oracle runs on a plain hosted runner.
-command -v cc >/dev/null || { echo "SKIP: no cc to build the harness"; exit 0; }
+command -v cc >/dev/null || { echo "SKIP: no cc to build the harness" >&2; exit 77; }
 case "$(uname -m)" in
     x86_64) ;;
-    *) echo "SKIP: harness pins AUDIT_ARCH_X86_64 and nr 335"; exit 0 ;;
+    *) echo "SKIP: harness pins AUDIT_ARCH_X86_64 and nr 335" >&2; exit 77 ;;
 esac
 
 mkdir -p "$WORK"
@@ -100,8 +100,8 @@ if [ "$SELF_TEST_ONLY" = 1 ]; then
     echo "verify-uretprobe-seccomp self-test: OK"; exit 0
 fi
 
-command -v bpftrace >/dev/null || { echo "SKIP: bpftrace required to attach"; exit 0; }
-sudo -n true 2>/dev/null || { echo "SKIP: passwordless sudo required to attach"; exit 0; }
+command -v bpftrace >/dev/null || { echo "SKIP: bpftrace required to attach" >&2; exit 77; }
+sudo -n true 2>/dev/null || { echo "SKIP: passwordless sudo required to attach" >&2; exit 77; }
 
 # --- Entry-only uprobe: the documented fallback must be safe here. --------
 set -- $(run_case uprobe kill)

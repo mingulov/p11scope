@@ -24,8 +24,8 @@
 set -eu
 cd "$(dirname "$0")/../.."
 
-PROXY=/usr/lib/x86_64-linux-gnu/p11-kit-proxy.so
-MODULE=/usr/lib/softhsm/libsofthsm2.so
+PROXY=${PROXY-}
+MODULE=${MODULE-}
 WORK=target/matrix-proxy
 WPID=
 SPID=
@@ -35,10 +35,28 @@ NESTED=
 . scripts/lib.sh
 require_non_root_caller
 
-test -f "$PROXY" || { echo "SKIP: p11-kit proxy not installed at $PROXY"; exit 0; }
-test -f "$MODULE" || { echo "SKIP: SoftHSM2 not installed at $MODULE"; exit 0; }
-command -v gcc >/dev/null || { echo "gcc required"; exit 1; }
-command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; }
+# Probe provider paths (Debian + Fedora); a missing prerequisite exits 77.
+if [ -z "$PROXY" ]; then
+    for candidate in /usr/lib/x86_64-linux-gnu/p11-kit-proxy.so /usr/lib64/p11-kit-proxy.so /usr/lib/p11-kit-proxy.so; do
+        if [ -f "$candidate" ]; then PROXY=$candidate; break; fi
+    done
+    unset candidate
+fi
+test -f "${PROXY-}" || { echo "SKIP: p11-kit proxy not installed (probed Debian/Fedora paths)" >&2; exit 77; }
+if [ -z "$MODULE" ]; then
+    if command -v python3 >/dev/null 2>&1 && MODULE_PROBED=$(python3 -I scripts/release-matrix-contract.py --select-module 2>/dev/null); then
+        MODULE=$MODULE_PROBED
+    else
+        for candidate in /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so /usr/lib/softhsm/libsofthsm2.so /usr/lib64/softhsm/libsofthsm2.so /usr/lib64/pkcs11/libsofthsm2.so; do
+            if [ -f "$candidate" ]; then MODULE=$candidate; break; fi
+        done
+        unset candidate
+    fi
+    unset MODULE_PROBED
+fi
+test -f "${MODULE-}" || { echo "SKIP: SoftHSM2 not installed (probed Debian/Fedora paths)" >&2; exit 77; }
+command -v gcc >/dev/null || { echo "gcc required" >&2; exit 77; }
+command -v softhsm2-util >/dev/null || { echo "softhsm2-util required" >&2; exit 77; }
 mkdir -p "$WORK"
 
 cleanup() {
@@ -67,7 +85,7 @@ cleanup() {
 
 echo "=== build ==="
 scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --workspace --target-dir "$WORK/build"
-sudo -n true 2>/dev/null || { echo "passwordless sudo required"; exit 1; }
+sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 77; }
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
 echo "=== softhsm token (private, disposable) ==="

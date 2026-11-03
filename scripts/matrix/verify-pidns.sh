@@ -40,10 +40,30 @@ if [ "${1-}" = --inside ]; then INSIDE=1; shift; else INSIDE=0; fi
 P=$(realpath -e "$1"); OUT=$2
 SELF=$(realpath -e "$0")
 SRC=$(cd "$(dirname "$SELF")/../../tests/fixtures/public-cli" && pwd) || exit 64
-MODULE=${MODULE:-/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so}
+# Probe SoftHSM provider paths (Debian + Fedora); an explicit MODULE is
+# honored strictly. A missing prerequisite exits 77.
+if [ -z "${MODULE-}" ]; then
+  MODULE_PROBED=
+  if command -v python3 >/dev/null 2>&1; then
+    MODULE_PROBED=$(python3 -I "$(dirname "$SELF")/../../scripts/release-matrix-contract.py" --select-module 2>/dev/null) || MODULE_PROBED=
+  fi
+  if [ -n "$MODULE_PROBED" ]; then
+    MODULE=$MODULE_PROBED
+  else
+    for candidate in /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so /usr/lib/softhsm/libsofthsm2.so /usr/lib64/softhsm/libsofthsm2.so /usr/lib64/pkcs11/libsofthsm2.so; do
+      if [ -f "$candidate" ]; then MODULE=$candidate; break; fi
+    done
+    unset candidate
+  fi
+  unset MODULE_PROBED
+fi
+[ -f "${MODULE-}" ] || { echo "SoftHSM2 not installed (probed Debian/Fedora paths)" >&2; exit 77; }
 RUNUID=${RUNUID:-1000}; RUNGID=${RUNGID:-1000}
 ITERS=${ITERS:-100}
 [ "$(id -u)" = 0 ] || { echo "must run as root" >&2; exit 64; }
+for tool in gcc softhsm2-util setpriv unshare nsenter; do
+  command -v "$tool" >/dev/null || { echo "$tool required" >&2; exit 77; }
+done
 CG=/sys/fs/cgroup/p11scope-verify-pidns-$$
 
 asuser() { exec setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups env SOFTHSM2_CONF="$OUT/softhsm2.conf" "$@"; }
@@ -170,6 +190,7 @@ print(json.dumps({"call_lines":len(lines),"expected":6*n,"printed_pids":pids,"wo
 PY
 )
   result nested-trace $(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(1 if d["call_lines"]==d["expected"] and d["printed_pids"] and d["workload_nested_pid"] not in d["printed_pids"] and (d["pid_namespace"] or {}).get("observer")=="nested" and (d["pid_namespace"] or {}).get("kernel_pids")=="initial" else 0)' "$d") "$d"
+  python3 -c 'import json,sys; rows=[json.loads(l) for l in open(sys.argv[1])]; nested=[r for r in rows if r["cell"].startswith("nested-")]; sys.exit(0 if len(nested)==6 and all(r["pass"] for r in nested) else 1)' "$OUT/results.jsonl" || exit 1
   exit 0
 fi
 
@@ -218,4 +239,7 @@ d=$(refusal_detail foreign-proc-system "$OUT")
 result foreign-proc-system $(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t=" ".join(d["stderr_tail"]); print(1 if d["rc"]!=0 and d["named"] and not d["report_written"] and "no entry for this observer" in t and "allow-uretprobe" not in t else 0)' "$d") "$d"
 
 unshare --pid --fork --mount-proc "$SELF" --inside "$P" "$OUT"
+INSIDE_RC=$?
 python3 -c 'import json; r=[json.loads(l) for l in open("results.jsonl")]; print("SUMMARY pass=%d fail=%d failed=%s" % (sum(x["pass"] for x in r), sum(not x["pass"] for x in r), [x["cell"] for x in r if not x["pass"]]))' | tee summary.txt
+if [ "$INSIDE_RC" -ne 0 ]; then exit "$INSIDE_RC"; fi
+python3 -c 'import json,sys; rows=[json.loads(l) for l in open("results.jsonl")]; expected={"host-pid","foreign-proc","foreign-proc-system","nested-pid","nested-run","nested-inventory-pid","nested-doctor-pid","nested-cgroup","nested-trace"}; sys.exit(0 if set(r["cell"] for r in rows)==expected and all(r["pass"] for r in rows) else 1)' || exit 1

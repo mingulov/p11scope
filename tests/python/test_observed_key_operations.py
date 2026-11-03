@@ -783,6 +783,139 @@ def s1_current_doc():
     return doc
 
 
+def unsupported_private_size_rows():
+    """The live SoftHSM ledger: CKA_MODULUS_BITS is not an RSA private-key
+    attribute, so the private-key query returns CKR_ATTRIBUTE_TYPE_INVALID
+    and the application records the size as unsupported."""
+    rows = APP_TESTS.application_rows()
+    metadata = next(r for r in rows if r["kind"] == "metadata" and r["key"] == "private")
+    metadata["attributes"]["modulus_bits"] = {"status": "unsupported"}
+    call = next(r for r in rows if r["kind"] == "call" and r.get("key") == "private")
+    call["rv"] = 0x12
+    return rows
+
+
+def unknown_row(category, reason, completed=0, failed=0):
+    return {"category": category, "reason": reason, "unit": "operations",
+            "completed": completed, "failed": failed, "cancelled": 0, "unknown": 0,
+            "active": 0}
+
+
+def unlabeled_private_doc():
+    """The product's populated shape for that ledger: the private key keeps no
+    label, its signs land under metadata_unknown, and the key-pair generation
+    under not_applicable (generation binds no key)."""
+    doc = observed("clean.json")
+    doc["key_operations"] = [row for row in doc["key_operations"]
+                             if row["category"] != "sign"]
+    private = next(row for row in doc["objects"] if row["object"] == 11)
+    private["label"] = None
+    private["established"]["modulus_bits"] = {"status": "unknown", "value": None}
+    private["queries"]["modulus_bits"] = "unavailable"
+    doc["unknown_key_operations"] = [
+        unknown_row("generate_key_pair", "not_applicable", completed=1),
+        unknown_row("sign", "metadata_unknown", completed=10),
+    ]
+    doc["budgets"]["key_rows"]["occupied"] = len(doc["key_operations"])
+    doc["budgets"]["unknown_rows"]["occupied"] = 2
+    return doc
+
+
+class LedgerDerivedMetadataTests(unittest.TestCase):
+    """Expected key labels follow what the application itself established."""
+
+    def assert_refused(self, rows, doc, token):
+        with self.assertRaises(ORACLE.OracleRefusal) as caught:
+            ORACLE.compare(rows, doc)
+        self.assertIn(token, str(caught.exception))
+
+    def test_unestablished_private_size_qualifies_under_metadata_unknown(self):
+        result = ORACLE.compare(unsupported_private_size_rows(), unlabeled_private_doc())
+        self.assertTrue(result.get("match"))
+        seen = result["observed"]
+        self.assertEqual(seen["sign"], {"completed": 10, "failed": 0,
+                                        "unknown_reason": "metadata_unknown"})
+        self.assertEqual(seen["verify"], {"started": 12, "completed": 10, "failed": 2})
+
+    def test_keygen_not_applicable_row_matches_the_ledger(self):
+        rows = APP_TESTS.application_rows()
+        with self.subTest("labeled cell with the keygen row"):
+            doc = observed("clean.json")
+            doc["unknown_key_operations"] = [
+                unknown_row("generate_key_pair", "not_applicable", completed=1)]
+            doc["budgets"]["unknown_rows"]["occupied"] = 1
+            self.assertTrue(ORACLE.compare(rows, doc).get("match"))
+        for label, row, token in (
+                ("two generations", unknown_row("generate_key_pair", "not_applicable",
+                                                completed=2), "!= expected"),
+                ("failed generation", unknown_row("generate_key_pair", "not_applicable",
+                                                  completed=1, failed=1), "!= expected"),
+                ("generation unbound", unknown_row("generate_key_pair", "unbound",
+                                                   completed=1), "unattributed"),
+                ("other not_applicable", unknown_row("digest", "not_applicable",
+                                                     completed=1), "unattributed")):
+            with self.subTest(label):
+                doc = observed("clean.json")
+                doc["unknown_key_operations"] = [row]
+                doc["budgets"]["unknown_rows"]["occupied"] = 1
+                self.assert_refused(rows, doc, token)
+
+    def test_unknown_signs_refused_when_the_application_established_the_size(self):
+        self.assert_refused(APP_TESTS.application_rows(), unlabeled_private_doc(),
+                            "unattributed sign outcomes under metadata_unknown")
+
+    def test_label_the_application_could_not_establish_is_refused(self):
+        self.assert_refused(unsupported_private_size_rows(), observed("clean.json"),
+                            "under a key label the application could not establish")
+
+    def test_unlabeled_twins_are_refused(self):
+        rows = unsupported_private_size_rows()
+
+        def with_sign(**counts):
+            doc = unlabeled_private_doc()
+            doc["unknown_key_operations"][1] = unknown_row("sign", "metadata_unknown",
+                                                           **counts)
+            return doc
+
+        def private(doc):
+            return next(row for row in doc["objects"] if row["object"] == 11)
+
+        cases = []
+        cases.append(("short sign count", with_sign(completed=9), "!= expected"))
+        cases.append(("failed sign", with_sign(completed=9, failed=1), "!= expected"))
+        doc = unlabeled_private_doc()
+        doc["unknown_key_operations"].pop()
+        doc["budgets"]["unknown_rows"]["occupied"] = 1
+        cases.append(("missing bucket", doc, "missing from the metadata_unknown bucket"))
+        doc = unlabeled_private_doc()
+        private(doc)["successful_key_references"] = 9
+        cases.append(("unproved key references", doc, "key references 9 != expected 10"))
+        doc = unlabeled_private_doc()
+        private(doc)["label"] = "rsa_2048"
+        private(doc)["established"]["modulus_bits"] = {"status": "value", "value": 2048}
+        private(doc)["queries"]["modulus_bits"] = "established"
+        cases.append(("labeled key object", doc, "could not establish"))
+        doc = unlabeled_private_doc()
+        private(doc)["attribution"] = "downgraded"
+        private(doc)["attribution_reason"] = "handle_reuse"
+        cases.append(("downgraded key object", doc, "downgraded"))
+        doc = unlabeled_private_doc()
+        private(doc)["established"]["class"] = {"status": "value", "value": 2}
+        cases.append(("no private key object", doc, "not unique"))
+        doc = unlabeled_private_doc()
+        doc["unknown_key_operations"].append(
+            unknown_row("verify", "metadata_unknown", completed=1))
+        doc["budgets"]["unknown_rows"]["occupied"] = 3
+        cases.append(("verify unknown", doc, "unattributed verify"))
+        doc = unlabeled_private_doc()
+        doc["gaps"]["rows"] = [{"subject": "model", "reason": "output_unreadable",
+                                "repeats": 1}]
+        cases.append(("gap still refused", doc, "observation gap model/output_unreadable"))
+        for label, doc, token in cases:
+            with self.subTest(label):
+                self.assert_refused(rows, doc, token)
+
+
 class CurrentS1ModeTests(unittest.TestCase):
     """The actual stopped child topology, with no loss/identity fallback."""
     def check(self, doc):

@@ -115,12 +115,37 @@ mkdir -p "$BIN"
 OBSERVER_PID=
 DRIVER_PID=
 SEED_PID=
+
+# pid_alive PID: true while PID exists and has not exited. Not kill -0:
+# the observer runs under sudo, whose front-end briefly holds every uid
+# as root, and kill -0 from the caller then fails with EPERM although
+# the observer lives (a false "observer died" with an empty stderr).
+pid_alive() {
+    [ -n "$1" ] || return 1
+    state=$(sed -n 's/.*) \([A-Za-z]\) .*/\1/p' "/proc/$1/stat" 2>/dev/null)
+    [ -n "$state" ] && [ "$state" != Z ] && [ "$state" != X ]
+}
+
+# signal_observer SIG: deliver SIG to the observer exactly once. A send
+# refused with EPERM during sudo's root window was never delivered, so
+# it is retried while the observer lives; one delivered signal stays one.
+signal_observer() {
+    [ -n "$OBSERVER_PID" ] || return 0
+    tries=0
+    while ! kill "-$1" "$OBSERVER_PID" 2>/dev/null; do
+        pid_alive "$OBSERVER_PID" || return 0
+        tries=$((tries + 1))
+        [ "$tries" -lt 100 ] || { echo "could not signal observer $OBSERVER_PID with $1" >&2; return 1; }
+        sleep 0.05
+    done
+    return 0
+}
 cleanup() {
     status=$?
     trap - EXIT INT TERM
     [ -z "$SEED_PID" ] || kill -TERM "$SEED_PID" 2>/dev/null || true
     [ -z "$DRIVER_PID" ] || kill -TERM "$DRIVER_PID" 2>/dev/null || true
-    [ -z "$OBSERVER_PID" ] || kill -TERM "$OBSERVER_PID" 2>/dev/null || true
+    signal_observer TERM || true
     [ -z "$SEED_PID" ] || wait "$SEED_PID" 2>/dev/null || true
     [ -z "$DRIVER_PID" ] || wait "$DRIVER_PID" 2>/dev/null || true
     [ -z "$OBSERVER_PID" ] || wait "$OBSERVER_PID" 2>/dev/null || true
@@ -255,7 +280,7 @@ SUDO="sudo -n --preserve-env=SOFTHSM2_CONF"
 wait_for_line() {
     end=$(( $(date +%s) + $3 ))
     while ! grep -Fq "$2" "$1" 2>/dev/null; do
-        if [ -n "$OBSERVER_PID" ] && ! kill -0 "$OBSERVER_PID" 2>/dev/null; then
+        if [ -n "$OBSERVER_PID" ] && ! pid_alive "$OBSERVER_PID"; then
             echo "observer died before [$2]" >&2
             return 1
         fi
@@ -289,7 +314,8 @@ stop_seed() {
 # tracked child before the next cell starts so a failure cannot corrupt
 # it. TERM only; the one-SIGINT rule governs the observer's own stop.
 reap_leftovers() {
-    for pid in "$OBSERVER_PID" "$DRIVER_PID" "$SEED_PID"; do
+    signal_observer TERM || true
+    for pid in "$DRIVER_PID" "$SEED_PID"; do
         [ -n "$pid" ] || continue
         kill -TERM "$pid" 2>/dev/null || true
     done
@@ -310,9 +336,9 @@ reap_leftovers() {
 OBSERVER_STOP_EXIT=0
 stop_observer() {
     [ -n "$OBSERVER_PID" ] || return 0
-    kill -INT "$OBSERVER_PID" 2>/dev/null || true
+    signal_observer INT || true
     end=$(( $(date +%s) + 180 ))
-    while kill -0 "$OBSERVER_PID" 2>/dev/null; do
+    while pid_alive "$OBSERVER_PID"; do
         [ "$(date +%s)" -lt "$end" ] || { echo "observer did not stop within 180s" >&2; return 1; }
         sleep 0.5
     done
@@ -355,7 +381,7 @@ sync_and_release() {
             echo "driver exited before admission" >&2
             return 1
         fi
-        if ! kill -0 "$OBSERVER_PID" 2>/dev/null; then
+        if ! pid_alive "$OBSERVER_PID"; then
             echo "observer exited before admission" >&2
             return 1
         fi
@@ -380,7 +406,7 @@ sync_and_release() {
             cat "$dir/driver.stderr" >&2 2>/dev/null || true
             return 1
         fi
-        if ! kill -0 "$OBSERVER_PID" 2>/dev/null; then
+        if ! pid_alive "$OBSERVER_PID"; then
             echo "observer exited before done" >&2
             tail -n 20 "$dir/observer.stderr" >&2 2>/dev/null || true
             return 1
@@ -465,7 +491,7 @@ flow_reason() {
 # observer so the next cell's reap starts clean.
 refused_exit() {
     [ -n "$OBSERVER_PID" ] || return 1
-    if kill -0 "$OBSERVER_PID" 2>/dev/null; then
+    if pid_alive "$OBSERVER_PID"; then
         return 1
     fi
     if wait "$OBSERVER_PID" 2>/dev/null; then
@@ -496,11 +522,11 @@ run_no_manifest_cell() {
         > "$CELLDIR/observer.log" 2> "$CELLDIR/observer.stderr" &
     OBSERVER_PID=$!
     refuse_end=$(( $(date +%s) + REFUSE_WAIT_S ))
-    while kill -0 "$OBSERVER_PID" 2>/dev/null; do
+    while pid_alive "$OBSERVER_PID"; do
         [ "$(date +%s)" -lt "$refuse_end" ] || break
         sleep 0.5
     done
-    if kill -0 "$OBSERVER_PID" 2>/dev/null; then
+    if pid_alive "$OBSERVER_PID"; then
         NOMANIFEST_MODE=accept
         settle_end=$(( $(date +%s) + NOMANIFEST_CAP_S ))
         quiet_since=$(date +%s)
@@ -513,7 +539,7 @@ run_no_manifest_cell() {
                 last_size=$size
                 quiet_since=$now
             fi
-            if ! kill -0 "$OBSERVER_PID" 2>/dev/null; then
+            if ! pid_alive "$OBSERVER_PID"; then
                 echo "observer exited while observing" >&2
                 return 1
             fi
@@ -571,7 +597,7 @@ run_off_build_cell() {
         > "$CELLDIR/observer.log" 2> "$CELLDIR/observer.stderr" &
     OBSERVER_PID=$!
     sleep 2
-    if kill -0 "$OBSERVER_PID" 2>/dev/null; then
+    if pid_alive "$OBSERVER_PID"; then
         OFF_MODE=accept
         wait_for_line "$CELLDIR/observer.stderr" "$SEAL_LINE" 120 || return 1
         sleep "$SETTLE_S"

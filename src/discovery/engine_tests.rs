@@ -4450,6 +4450,71 @@ fn exit_mapping_spawn_guards_reap_dropped_children() {
     );
 }
 
+/// Reap helper for the live exit-mapping cell's spawn window: reaps
+/// each owned child in role order through `reap`.
+fn reap_owned_children(
+    owned: &mut ExitMappingChildrenGuard,
+    roles: &[&str],
+    mut reap: impl FnMut(std::process::Child, &str),
+) {
+    assert_eq!(
+        owned.0.len(),
+        roles.len(),
+        "one role per owned child: {} children, {} roles",
+        owned.0.len(),
+        roles.len()
+    );
+    for (child, role) in owned.0.drain(..).zip(roles.iter().copied()) {
+        reap(child, role);
+    }
+}
+
+/// A panic mid-reap must not leak the children the loop never
+/// reached: whatever the reap loop has not consumed stays in the
+/// guard and dies with it.
+#[test]
+fn exit_mapping_children_guard_reaps_remainder_after_mid_reap_panic() {
+    fn live(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    let pids = {
+        let mut batch = ExitMappingChildrenGuard(
+            (0..3)
+                .map(|_| {
+                    std::process::Command::new("sleep")
+                        .arg("30")
+                        .spawn()
+                        .expect("spawn sleep")
+                })
+                .collect(),
+        );
+        let pids: Vec<u32> = batch.0.iter().map(|child| child.id()).collect();
+        assert!(
+            pids.iter().all(|pid| live(*pid)),
+            "all batch children must be alive before the reap"
+        );
+        // Mirror the spawn window: each child is reaped, then a
+        // mid-loop panic unwinds through the reap helper.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reap_owned_children(&mut batch, &["first", "second", "third"], |mut child, role| {
+                child.kill().expect("reap the reached child");
+                child.wait().expect("wait for the reached child");
+                if role == "second" {
+                    panic!("simulated mid-reap panic");
+                }
+            });
+        }));
+        assert!(outcome.is_err(), "the simulated panic must unwind");
+        drop(batch);
+        pids
+    };
+    let leaked: Vec<u32> = pids.iter().copied().filter(|pid| live(*pid)).collect();
+    assert!(
+        leaked.is_empty(),
+        "the guard must reap the unreaped remainder, still live: {leaked:?}"
+    );
+}
+
 /// Privileged live cell (6.14 Option A): a real extensive capture
 /// classifies three owned short-lived children, and the unarmed twin
 /// records byte-identical kind 6.

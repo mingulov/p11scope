@@ -1358,6 +1358,19 @@ fn assert_live_discovery_host_contract(
         let arm = contract_section(start_inner, step, next)?;
         require_contract_marker(arm, operation, "session preparation operation")?;
     }
+    // The PrepareIdentity arm derives the gate from the object (counter
+    // sessions load the gate-free counter object even in gate-1 builds);
+    // a build-wide LOADER_GATE_BUILD here refused every counter mode.
+    let prepare_identity = contract_section(
+        start_inner,
+        "SessionPreparation::PrepareIdentity",
+        "SessionPreparation::PublishDescriptors",
+    )?;
+    require_contract_marker(
+        prepare_identity,
+        "identity_gate_required(counter.is_some())",
+        "per-object gate requirement",
+    )?;
     // A closed selected session pins the probe scope to its owned process;
     // without a selection the scope match below stays the fallback.
     let select_scope = contract_section(
@@ -6808,6 +6821,19 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         )
         .is_err(),
         "policy-map metadata must be validated before publication"
+    );
+    let build_wide_gate = attach.replacen(
+        "identity_gate_required(counter.is_some())",
+        "LOADER_GATE_BUILD",
+        1,
+    );
+    assert_ne!(
+        attach, build_wide_gate,
+        "build-wide gate mutation must apply"
+    );
+    assert_rejects_attach_mutation(
+        &build_wide_gate,
+        "the PrepareIdentity arm must derive the gate per object",
     );
     let second_start_route = engine.replacen(
         "                Session::start_for_capture(\n",

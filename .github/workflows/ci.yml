@@ -812,6 +812,31 @@ jobs:
           key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
       - if: steps.bpf-linker.outputs.cache-hit != 'true'
         run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      # Ubuntu 26 packages bpftool separately; older images use a versioned
+      # linux-tools executable. Select the package-owned binary, not the
+      # common wrapper that dispatches by the runner's Azure kernel name.
+      # The gate-0 identity twins shell to bpftool for their raw BTF dumps.
+      - name: Install packaged bpftool
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y linux-tools-generic
+          if bpftool_files=$(dpkg-query -L bpftool 2>/dev/null); then
+            bpftool_source=$(printf '%s\n' "$bpftool_files" | grep -Ex '/usr/(sbin|bin)/bpftool')
+          else
+            status=$?
+            [[ "$status" -eq 1 ]]
+            tools_package=$(dpkg-query -W -f='${Depends}' linux-tools-generic)
+            [[ "$tools_package" =~ ^linux-tools-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$ ]]
+            bpftool_source="/usr/lib/linux-tools/${tools_package#linux-tools-}/bpftool"
+            bpftool_files=$(dpkg-query -L "$tools_package")
+            grep -Fxq -- "$bpftool_source" <<< "$bpftool_files"
+          fi
+          test -f "$bpftool_source"
+          test -x "$bpftool_source"
+          sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
+          bpftool version
+          sudo bpftool version
       - name: Reconstruct pinned dependency sources
         run: python3 -I scripts/prepare-dependencies.py
       # Network acquisition is explicit and precedes every offline validation.

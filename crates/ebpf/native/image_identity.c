@@ -280,10 +280,11 @@ static __always_inline u64 identity_sat_sum(u64 a, u64 b)
 }
 
 /* Count a quota or no-slot refusal. A missing SELECT has no cell, so
- * like the gate's missing control it refuses uncounted. */
-static __always_inline void bank_refuse(struct image_bank_select *select)
+ * like the gate's missing control it refuses uncounted; a witness pass
+ * (count_failures clear) counts nothing. */
+static __always_inline void bank_refuse(struct image_bank_select *select, int count_failures)
 {
-    if (select)
+    if (select && count_failures)
         identity_count(select, &select->refusals);
 }
 
@@ -391,7 +392,7 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
     /* Same value as NO_SLOT, spelled as a bound so the verifier keeps
      * bank (and bank-derived indexes) inside the two slots. */
     if (bank >= IMAGE_BANK_SLOTS) {
-        bank_refuse(select);
+        bank_refuse(select, count_failures);
         result.status = COOKIE_STATUS_BAD_CONFIG;
         return result;
     }
@@ -532,7 +533,7 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
                 if (control)
                     identity_count(select, &control->unavailable);
             }
-            bank_refuse(select);
+            bank_refuse(select, count_failures);
             result.status = COOKIE_STATUS_QUOTA;
             return result;
         }

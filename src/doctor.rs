@@ -1947,7 +1947,7 @@ pub(crate) fn counter_modes_footer(verdict: &crate::attach::BpfLoopVerdict) -> S
 /// `Ok(())` when the object loads and releases). A proven named
 /// refusal (the old-kernel token or the memory-limit preflight)
 /// replaces the availability sentence, as does any other load failure
-/// with its own text: only a clean all-modes load keeps an
+/// with its mode and text: only a clean all-modes load keeps an
 /// availability sentence.
 pub(crate) fn counter_modes_footer_with_preflight(
     verdict: &crate::attach::BpfLoopVerdict,
@@ -1964,10 +1964,11 @@ pub(crate) fn counter_modes_footer_with_preflight(
             return format!("counter modes: {refusal}\n");
         }
         // A failed load that is not a proven refusal still names its
-        // failure: falling back to the "available" sentence here hid a
-        // real gate-1 load error behind "subject to the kernel verifier".
-        if let Some((_, Err(failure))) = loads.iter().find(|(_, result)| result.is_err()) {
-            return format!("counter modes: {failure}\n");
+        // mode and failure: falling back to the "available" sentence here
+        // hid a real gate-1 load error behind "subject to the kernel
+        // verifier".
+        if let Some((mode, Err(failure))) = loads.iter().find(|(_, result)| result.is_err()) {
+            return format!("counter modes: {}: {failure}\n", mode.name());
         }
         if loads.iter().all(|(_, result)| result.is_ok()) {
             return "counter modes: available (counts, timestamps, latency; the kernel provides bpf_loop (helper 181); counter objects load on this kernel)\n"
@@ -4335,9 +4336,9 @@ mod tests {
         } else {
             assert!(line.contains("not enabled in this build"), "{line:?}");
         }
-        // An unproven load failure names itself instead of falling back
-        // to the "available" sentence (C1: the fallback hid a real
-        // gate-1 load error behind the probe sentence).
+        // An unproven load failure names its mode and itself instead of
+        // falling back to the "available" sentence (C1: the fallback hid
+        // a real gate-1 load error behind the probe sentence).
         let unproven = loads([
             Err("counter object load failed (Operation not permitted (os error 1))".to_string()),
             Ok(()),
@@ -4346,10 +4347,27 @@ mod tests {
         let line = counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&unproven));
         if cfg!(p11scope_counter_objects) {
             assert!(
-                line.starts_with("counter modes: counter object load failed ("),
+                line.starts_with("counter modes: counts: counter object load failed ("),
                 "{line:?}"
             );
             assert!(!line.contains("available"), "{line:?}");
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        } else {
+            assert!(line.contains("not enabled in this build"), "{line:?}");
+        }
+        // The named mode is the failed one, not always the first.
+        let unproven_late = loads([
+            Ok(()),
+            Err("counter object load failed (broken)".to_string()),
+            Ok(()),
+        ]);
+        let line =
+            counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&unproven_late));
+        if cfg!(p11scope_counter_objects) {
+            assert!(
+                line.starts_with("counter modes: timestamps: counter object load failed ("),
+                "{line:?}"
+            );
             assert_eq!(line.lines().count(), 1, "{line:?}");
         } else {
             assert!(line.contains("not enabled in this build"), "{line:?}");

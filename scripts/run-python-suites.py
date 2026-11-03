@@ -136,6 +136,7 @@ RUN = [
     ("test_prepared_dependency_evidence.py", []),
     ("test_prepared_dependency_metadata.py", []),
     ("test_prepared_dependency_tools.py", []),
+    ("test_public_cli_breadth.py", []),
     ("test_public_cli_oracle.py", []),
     ("test_p11kit_transparency_oracle.py", []),
     ("test_real_provider_oracle.py", []),

@@ -8,6 +8,7 @@
 # Exit codes: the guest's qualify exit (0 qualifies, 1 fails, 2 is the
 # documented nonqualifying smoke); 1 when vng itself fails or the results
 # are missing.
+# P11SCOPE_STARTUP_BOUND_S, when set, is forwarded for the startup-to-capturing cell.
 set -u
 K=$1; BIN=$(realpath -e "$2"); OUT=$3
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -21,7 +22,7 @@ uname -r > $OUT/uname.txt
 # host user and remaps ownership, which p11scope's -o trust and private temp-file
 # identity checks rightly refuse for a root observer. Evidence is copied out after.
 mkdir -p /tmp/qual && chmod 755 /tmp/qual
-${MODULE:+MODULE=$MODULE }THREADS=4 $REPO/scripts/qualify-public-cli.sh $BIN /tmp/qual/cells > $OUT/qual.log 2>&1
+${MODULE:+MODULE=$MODULE }${P11SCOPE_STARTUP_BOUND_S:+P11SCOPE_STARTUP_BOUND_S=$P11SCOPE_STARTUP_BOUND_S }THREADS=4 $REPO/scripts/qualify-public-cli.sh $BIN /tmp/qual/cells > $OUT/qual.log 2>&1
 echo "qual_exit=\$?" >> $OUT/qual.log
 cp -r /tmp/qual/cells $OUT/cells
 INNER

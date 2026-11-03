@@ -15,7 +15,8 @@
 # P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 (ruling CI-GAP-1) discloses hosted
 # runner noise on the system cell only; default 0 keeps every cell strict.
 set -u
-HERE=$(cd "$(dirname "$0")" && pwd) || exit 64
+_SRC=${BASH_SOURCE[0]:-$0}
+HERE=$(cd "$(dirname "$_SRC")" && pwd) || exit 64
 ORACLE=$HERE/public-cli-oracle.py
 CONTROL=0
 CONTROL_KIND=gated
@@ -202,13 +203,13 @@ judge() {
 gated() {
   local cell=$1 scope=$2 fixture=$3; shift 3
   local gate=$OUT/$cell.gate ext=json
-  [ "$cell" = trace-pid ] && ext=txt
+  case "$cell" in trace-*) ext=txt;; esac
   rm -f -- "$gate" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json"
   local output; output=$(product_output "$cell.$ext")
   [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
   local before after gen='' readygen='' wl pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
   local poll=waitfor settle=finish release=touch
-  if [ "$cell" = system ]; then poll=waitfor_quiet settle=finish_quiet release=touch_quiet; fi
+  if [ "$scope" = system ]; then poll=waitfor_quiet settle=finish_quiet release=touch_quiet; fi
   before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
   if [ "$cell" = mt-exact ]; then
     asuser "$fixture" "$MODULE" "$THREADS" 5 0 "$gate" > "$cell.wl" 2>&1 &
@@ -320,7 +321,21 @@ second_sigint() {
     terminate "$pid" || cleanup_ok=0
   done
   publish_output sigint2.json || cleanup_ok=0
-  result second-sigint "$([ "$custody" = 1 ] && [ "$cleanup_ok" = 1 ] && [ "$rc" = 130 ] && grep -qa 'p11scope: cleanup incomplete' sig2.stderr && ! grep -qa panicked sig2.stderr && python3 -c 'import json; json.load(open("sigint2.json"))' 2>/dev/null && echo 1 || echo 0)" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok"
+  report_ok=0
+  if python3 - sigint2.json <<'PY' 2>/dev/null; then report_ok=1; fi
+import json,sys
+report=json.load(open(sys.argv[1]))
+assert report.get('schema')=='p11scope/observed-profile/v3', 'schema'
+evidence=report['evidence']
+assert evidence.get('completeness')=='PARTIAL', 'abandoned teardown cannot seal COMPLETE'
+stop=evidence['stop_quiescence']
+proven=stop.get('state')=='proven' and stop.get('post_q_events') is False and stop.get('post_q_discovery') is False
+assert evidence.get('drain_proven') is proven, 'drain_proven must match the stop-gate evidence'
+samples=evidence.get('scheduling',{}).get('inter_drain_gap',{}).get('samples')
+assert isinstance(samples,int) and samples>0, 'report must carry this capture live-loop drain samples'
+assert evidence.get('child_still_running') is False, 'owned child must be settled, not still running'
+PY
+  result second-sigint "$([ "$custody" = 1 ] && [ "$cleanup_ok" = 1 ] && [ "$rc" = 130 ] && [ "$report_ok" = 1 ] && grep -qa 'p11scope: cleanup incomplete' sig2.stderr && ! grep -qa panicked sig2.stderr && echo 1 || echo 0)" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok report_ok=$report_ok"
 }
 fifo_refused() {
   local wl rc=125
@@ -331,7 +346,143 @@ fifo_refused() {
     timeout 60 "$P" profile --pid "$wl" --duration 2 -o "$OUT/fifo" > fifo.stdout 2> fifo.stderr; rc=$?
   fi
   terminate "$wl"
-  result fifo-refused "$([ "$rc" != 0 ] && [ "$rc" != 125 ] && [ "$rc" != 124 ] && [ -p fifo ] && grep -qai 'fifo\|not a regular\|refus' fifo.stderr && echo 1 || echo 0)" "rc=$rc"
+  result fifo-refused "$([ "$rc" != 0 ] && [ "$rc" != 125 ] && [ "$rc" != 124 ] && [ -p fifo ] && grep -qF 'exists and is a FIFO; refusing to replace it' fifo.stderr && echo 1 || echo 0)" "rc=$rc"
+}
+# Cgroup capture: inside (cgroup-fork, parent+child) and outside (gated) use the
+# same owned provider copy; a leak breaks equality. The fork child inherits the
+# cgroup after attach and must be counted. The owned cgroup is removed afterwards.
+cgroup_capture() {
+  local cell=$1 kind=$2
+  local ext=json; [ "$kind" = trace ] && ext=txt
+  local CG=/sys/fs/cgroup/p11scope-qual-$cell-$$
+  local inside_gate=$OUT/$cell-inside.gate outside_gate=$OUT/$cell-outside.gate
+  rm -f -- "$inside_gate" "$outside_gate" "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json"
+  local output; output=$(product_output "$cell.$ext")
+  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
+  local before after gen='' readygen='' inside='' outside='' child='' pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
+  local scope=cgroup wl=''
+  before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
+  mkdir -p "$CG" || { result "$cell" 0 "cgroup mkdir failed $CG" failed; return 1; }
+  asuser "$CFORK" "$MODULE" 250 200 "$inside_gate" > "$cell-inside.wl" 2>&1 & inside=$!; register "$inside" && gen=${CHILDREN[$inside]}
+  asuser "$GATED" "$MODULE" 500 200 "$outside_gate" > "$cell-outside.wl" 2>&1 & outside=$!; register "$outside" || true
+  local inside_ready=0 outside_ready=0 in_cgroup=0
+  if waitfor "$cell-inside.wl" "^READY pid=$inside$" "$inside" "$READY_TICKS"; then
+    inside_ready=1; readygen=$(generation "$inside")
+    if echo "$inside" > "$CG/cgroup.procs" 2>/dev/null && grep -qw "$inside" "$CG/cgroup.procs" 2>/dev/null; then
+      in_cgroup=1
+    fi
+  fi
+  if waitfor "$cell-outside.wl" "^READY pid=$outside$" "$outside" "$READY_TICKS"; then
+    outside_ready=1
+  fi
+  if [ "$inside_ready" = 1 ] && [ "$outside_ready" = 1 ] && [ "$in_cgroup" = 1 ]; then
+    ready=1
+    local args=()
+    if [ "$kind" = profile ]; then args=(profile --cgroup "$CG" --duration 12 -o "$output")
+    elif [ "$kind" = metrics ]; then args=(profile --mode metrics --cgroup "$CG" --duration 12 -o "$output")
+    elif [ "$kind" = trace ]; then args=(trace --cgroup "$CG" --duration 12 -o "$output")
+    else args=(inventory --cgroup "$CG" --duration 12 -o "$output"); fi
+    "$P" "${args[@]}" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
+    local observer_started=0
+    if [ "$kind" = inventory ]; then
+      sleep 2; alive "$pp" && observer_started=1 && capturing=1
+    else
+      if waitfor "$cell.stderr" 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$inside" && alive "$outside" && alive "$pp"; then
+        capturing=1; observer_started=1
+      fi
+    fi
+    if [ "$observer_started" = 1 ]; then
+      if touch "$inside_gate" && touch "$outside_gate"; then
+        released=1
+        if waitfor "$cell-inside.wl" '^LEDGER ' "$inside" "$LEDGER_TICKS" 1 && waitfor "$cell-outside.wl" '^LEDGER ' "$outside" "$LEDGER_TICKS" 1; then
+          child=$(grep -m1 '^CHILD pid=' "$cell-inside.wl" 2>/dev/null | sed 's/^CHILD pid=//')
+          [[ "$child" =~ ^[1-9][0-9]*$ ]] || child=''
+          if [ -n "$child" ]; then register "$child" || true; fi
+          if finish "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi
+        fi
+      fi
+    fi
+  fi
+  if [ -n "$pp" ] && [ -n "${CHILDREN[$pp]:-}" ]; then terminate "$pp"; observer_rc=$LAST_EXIT; fi
+  if [ -n "$inside" ]; then terminate "$inside"; workload_rc=$LAST_EXIT; wl=$inside; fi
+  if [ -n "$outside" ] && [ -n "${CHILDREN[$outside]:-}" ]; then terminate "$outside" || true; fi
+  if [ -n "$child" ] && [ -n "${CHILDREN[$child]:-}" ]; then terminate "$child" || true; fi
+  after=$(pin) || after='null'
+  rmdir "$CG" 2>/dev/null || true
+  local cg_gone=0; [ ! -e "$CG" ] && cg_gone=1
+  if [ "$cg_gone" != 1 ]; then result "$cell" 0 "owned cgroup not removed $CG" failed; return 1; fi
+  if [ "$kind" = inventory ]; then
+    publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }
+    python3 - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" <<'PY' > "$cell.detail" 2>&1
+import json,sys
+report=json.load(open(sys.argv[1]))
+inside=open(sys.argv[2]).read(); outside=open(sys.argv[3]).read()
+pin=json.loads(sys.argv[4])
+assert report.get('schema')=='p11scope/inventory/v1', 'inventory schema'
+assert report.get('scope')=='cgroup', 'inventory scope'
+inside_pid=int([l for l in inside.splitlines() if l.startswith('READY pid=')][0].split('=')[1])
+child_pid=int([l for l in inside.splitlines() if l.startswith('CHILD pid=')][0].split('=')[1])
+outside_pid=int([l for l in outside.splitlines() if l.startswith('READY pid=')][0].split('=')[1])
+assert sum(l.startswith('LEDGER ') for l in inside.splitlines())==1, 'inside ledger missing'
+assert sum(l.startswith('LEDGER ') for l in outside.splitlines())==1, 'outside ledger missing (leak test invalid)'
+modules={m['id']:m for m in report.get('modules',[])}
+owned=None
+for mid,m in modules.items():
+    ident=m.get('identity',{})
+    dev=ident.get('device',{})
+    if [dev.get('major'),dev.get('minor')]==pin['dev'] and ident.get('inode')==pin['ino'] and ident.get('sha256')==pin['sha256']:
+        owned=mid; break
+assert owned is not None, 'owned provider not inventoried'
+assert modules[owned].get('admission',{}).get('state')=='admitted', 'owned provider not admitted'
+callers={c['id']:c for c in report.get('callers',[])}
+inside_ids=[cid for cid,c in callers.items() if c.get('pid')==inside_pid]
+child_ids=[cid for cid,c in callers.items() if c.get('pid')==child_pid]
+outside_ids=[cid for cid,c in callers.items() if c.get('pid')==outside_pid]
+assert inside_ids, 'inside parent not a caller'
+assert child_ids, 'fork-after-attach child not a caller'
+assert not outside_ids, 'outside workload leaked into cgroup inventory'
+edges=report.get('edges',[])
+assert any(e.get('caller') in inside_ids+child_ids and e.get('module')==owned for e in edges), 'no inside edge to owned module'
+owned_gaps=[g for g in report.get('gaps',[]) if g.get('module')==owned]
+assert owned_gaps==[], 'inventory gaps about owned module: %r' % owned_gaps
+print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s gaps=%d' % (inside_pid,child_pid,outside_pid,owned,len(report.get('gaps',[]))))
+PY
+    rc=$?
+    detail=$(cat "$cell.detail" 2>/dev/null || echo "inventory check failed rc=$rc")
+    if [ "$rc" = 0 ] && [ "$observer_rc" = 0 ]; then result "$cell" 1 "$detail"
+    else result "$cell" 0 "$detail observer_rc=$observer_rc" failed; fi
+    return 0
+  fi
+  if ! grep -qa '^LEDGER ' "$cell-outside.wl" 2>/dev/null; then result "$cell" 0 'outside ledger missing (leak test invalid)' failed; return 1; fi
+  cp -- "$cell-inside.wl" "$cell.wl"
+  receipt || { result "$cell" 0 'receipt publication failed' failed; return 1; }
+  publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }
+  judge "$cell.$ext" "$cell.wl" "$cell.receipt.json" "$cell"
+}
+# Exact run: the gated workload prints TARGET/READY/LEDGER to the captured
+# stdout (the child inherits the observer's stdout). Judge with the exact
+# oracle and require pause confirmed; pass comes from the oracle.
+run_exact() {
+  local cell=$1 fixture=$2 iters=$3
+  rm -f -- "$cell.json" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json"
+  local output; output=$(product_output "$cell.json")
+  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
+  local before after wl='' pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
+  local gen='' readygen='' scope=pid
+  before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
+  SUDO_UID=$RUNUID SUDO_GID=$RUNGID "$P" run --pause auto -o "$output" -- "$fixture" "$MODULE" "$iters" 0 - > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
+  if finish "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi
+  workload_rc=$observer_rc
+  [ -n "${CHILDREN[$pp]:-}" ] && { terminate "$pp"; observer_rc=$LAST_EXIT; workload_rc=$observer_rc; }
+  after=$(pin) || after='null'
+  cp -- "$cell.stdout" "$cell.wl" 2>/dev/null || : > "$cell.wl"
+  if grep -qa '^READY pid=' "$cell.wl" 2>/dev/null; then ready=1; fi
+  if grep -qa 'p11scope: capturing:' "$cell.stderr" 2>/dev/null; then capturing=1; fi
+  wl=$(grep -m1 '^READY pid=' "$cell.wl" 2>/dev/null | sed 's/^READY pid=//')
+  [[ "$wl" =~ ^[1-9][0-9]*$ ]] || wl=0
+  receipt || { result "$cell" 0 'receipt publication failed' failed; return 1; }
+  publish_output "$cell.json" || { result "$cell" 0 'output copy failed' failed; return 1; }
+  judge "$cell.json" "$cell.wl" "$cell.receipt.json" "$cell"
 }
 run_prearm() {
   # Owned-run pre-arm exactness (packet 6.13, R2-D1-6): the pause-held
@@ -406,6 +557,7 @@ if [ "$CONTROL" = 1 ]; then
   else gated "$CONTROL_CELL" pid "$GATED" profile --pid @PID@ --duration 1 -o "$OUT/$CONTROL_CELL.json"; fi
   summary "$CONTROL_CELL"; exit $?
 fi
+if [ "${P11SCOPE_SOURCE_ONLY:-}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
 SRC=$HERE/../tests/fixtures/public-cli
 FIX=$OUT/fix; mkdir -p "$FIX"
 if [ -n "${P11SCOPE_QUALIFY_GATED_BIN:-}" ] || [ -n "${P11SCOPE_QUALIFY_MT_BIN:-}" ]; then
@@ -415,8 +567,9 @@ else
   gcc -O1 -o "$FIX/gated" "$SRC/gated.c" -ldl && gcc -O2 -o "$FIX/mt" "$SRC/mt.c" -ldl -lpthread || exit 65
 fi
 gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$FIX/prearm-first-use" "$SRC/prearm-first-use.c" -ldl || exit 65
-GATED=$FIX/gated; MT=$FIX/mt; PREARM_LOADER=$FIX/prearm-first-use
-chmod 755 "$FIX" "$GATED" "$MT"
+gcc -O1 -o "$FIX/cgroup-fork" "$SRC/cgroup-fork.c" -ldl || exit 65
+GATED=$FIX/gated; MT=$FIX/mt; PREARM_LOADER=$FIX/prearm-first-use; CFORK=$FIX/cgroup-fork
+chmod 755 "$FIX" "$GATED" "$MT" "$CFORK"
 export SOFTHSM2_CONF=$OUT/softhsm2.conf
 mkdir -p tokens
 printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$OUT" > softhsm2.conf
@@ -444,7 +597,7 @@ if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ]; then
   summary "$@"; exit $?
 fi
 "$P" doctor > doctor.out 2>&1; rc=$?
-result doctor "$([ "$rc" = 0 ] && grep -q 'capture available' doctor.out && echo 1 || echo 0)" "rc=$rc"
+result doctor "$([ "$rc" = 0 ] && grep -q 'capture available' doctor.out && grep -qE '^uprobe-multi attach \(own libc\) \.+ ok([ \t].*)?$' doctor.out && grep -qE '^uretprobe vs seccomp \.+ ok([ \t].*)?$' doctor.out && echo 1 || echo 0)" "rc=$rc"
 gated profile-pid pid "$GATED" profile --pid @PID@ --duration 12 -o "$OUT/profile-pid.json"
 # The semantic assertions reuse the independently captured receipt, with their
 # own cell binding; they cannot turn a failed capture into a second PASS.
@@ -457,46 +610,113 @@ PY
 done
 gated metrics-pid pid "$GATED" profile --mode metrics --pid @PID@ --duration 12 -o "$OUT/metrics-pid.json"
 gated trace-pid pid "$GATED" trace --pid @PID@ --duration 12 -o "$OUT/trace-pid.txt"
-# Run remains explicitly nonqualifying until an independent first-call contract
-# exists. A report or a successful child exit alone does not establish coverage.
-for cell in run-short run-cover; do
-  n=3; [ "$cell" = run-cover ] && n=2000
-  rm -f -- "$cell.json" "$cell.wl" "$cell.stderr" "$cell.stdout"
-  output=$(product_output "$cell.json"); [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
-  before=$(pin) || before=null
-  SUDO_UID=$RUNUID SUDO_GID=$RUNGID "$P" run --pause auto -o "$output" -- "$GATED" "$MODULE" "$n" 0 - > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
-  if finish "$pp" "$EXIT_TICKS"; then rc=$LAST_EXIT; else rc=124; fi
-  publish_output "$cell.json" || rc=1
-  # run does not expose a separately authenticated fixture PID/exit/readiness
-  # channel here. Validate the available smoke assertion without fabricating it.
-  if [ "$rc" = 0 ] && python3 - "$cell.json" <<'PY'
-import json,sys
-with open(sys.argv[1]) as f: d=json.load(f)
-assert d['schema']=='p11scope/observed-profile/v3'
-PY
-  then result "$cell" 0 'report smoke passed; first-call ledger and independent child exit remain unproved' nonqualifying
-  else result "$cell" 0 "run smoke failed rc=$rc" failed; fi
-done
+run_exact run-short "$GATED" 3
+run_exact run-cover "$GATED" 2000
 run_prearm
 gated mt-exact pid "$MT" profile --pid @PID@ --duration 25 -o "$OUT/mt-exact.json"
 system_cell
-# Signal cells retain distinct expected exits; readiness is mandatory.
-rm -f sigint.json sig.gate
-output=$(product_output sigint.json); [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
-asuser "$GATED" "$MODULE" 100000000 1000 "$OUT/sig.gate" > sig.wl 2>&1 & wl=$!; register "$wl" || true
-rc=125
-if waitfor sig.wl '^READY pid=' "$wl" "$READY_TICKS"; then
-  env --default-signal=INT "$P" profile --pid "$wl" --duration 120 -o "$output" > sig.stdout 2> sig.stderr & pp=$!; register "$pp" || true
-  if waitfor sig.stderr 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$wl"; then
-    touch sig.gate; sleep 1; kill -INT "$pp"
-    if finish "$pp" "$EXIT_TICKS"; then rc=$LAST_EXIT; else rc=124; fi
+# SIGINT exact: the workload does exactly K calls, emits LEDGER, then holds.
+# SIGINT arrives after the ledger is complete; require exact counts, a proven
+# drain and exact observation via the oracle.
+sigint_exact() {
+  local cell=sigint scope=pid gate=$OUT/sigint.gate
+  rm -f -- "$gate" sigint.json sigint.wl sigint.stderr sigint.stdout sigint.receipt.json
+  local output; output=$(product_output sigint.json)
+  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
+  local before after gen='' readygen='' wl='' pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
+  before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
+  asuser "$GATED" "$MODULE" "$ITERS" 200 "$gate" > sigint.wl 2>&1 & wl=$!; register "$wl" && gen=${CHILDREN[$wl]}
+  if waitfor sigint.wl "^READY pid=$wl$" "$wl" "$READY_TICKS"; then
+    ready=1; readygen=$(generation "$wl")
+    env --default-signal=INT "$P" profile --pid "$wl" --duration 120 -o "$output" > sigint.stdout 2> sigint.stderr & pp=$!; register "$pp" || true
+    if waitfor sigint.stderr 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$wl" && alive "$pp"; then
+      capturing=1
+      if touch "$gate"; then
+        released=1
+        if waitfor sigint.wl '^LEDGER ' "$wl" "$LEDGER_TICKS" 1; then
+          sleep 1; kill -INT "$pp"
+          if finish "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi
+        fi
+      fi
+    fi
   fi
-  [ -n "${CHILDREN[$pp]:-}" ] && terminate "$pp"
-fi
-terminate "$wl"
-publish_output sigint.json || rc=1
-result sigint "$([ "$rc" = 0 ] && python3 -c 'import json; json.load(open("sigint.json"))' 2>/dev/null && echo 1 || echo 0)" "rc=$rc"
+  if [ -n "$pp" ] && [ -n "${CHILDREN[$pp]:-}" ]; then terminate "$pp"; observer_rc=$LAST_EXIT; fi
+  terminate "$wl"; workload_rc=$LAST_EXIT
+  after=$(pin) || after='null'
+  receipt || { result "$cell" 0 'receipt publication failed' failed; return 1; }
+  publish_output sigint.json || { result "$cell" 0 'output copy failed' failed; return 1; }
+  judge sigint.json sigint.wl sigint.receipt.json sigint
+}
+sigint_exact
 second_sigint
 fifo_refused
-summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm mt-exact system sigint second-sigint fifo-refused
+# WP-4 breadth: cgroup scopes (S5).
+cgroup_capture profile-cgroup profile
+cgroup_capture metrics-cgroup metrics
+cgroup_capture trace-cgroup trace
+cgroup_capture inventory-cgroup inventory
+# WP-4 breadth: counter modes and select-endpoint (S6).
+gated counter-counts-pid pid "$GATED" profile --mode metrics --counter-mode counts --pid @PID@ --duration 12 -o "$OUT/counter-counts-pid.json"
+gated counter-timestamps-pid pid "$GATED" profile --mode metrics --counter-mode timestamps --pid @PID@ --duration 12 -o "$OUT/counter-timestamps-pid.json"
+gated counter-latency-pid pid "$GATED" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-pid.json"
+gated counter-counts-system system "$GATED" profile --mode metrics --counter-mode counts --system --module "$MODULE" --duration 25 -o "$OUT/counter-counts-system.json"
+gated counter-timestamps-system system "$GATED" profile --mode metrics --counter-mode timestamps --system --module "$MODULE" --duration 25 -o "$OUT/counter-timestamps-system.json"
+gated counter-latency-system system "$GATED" profile --mode metrics --counter-mode latency --system --module "$MODULE" --duration 25 -o "$OUT/counter-latency-system.json"
+gated select-endpoint-pid pid "$GATED" profile --mode metrics --counter-mode counts --select-endpoint C_Digest --module "$MODULE" --pid @PID@ --duration 12 -o "$OUT/select-endpoint-pid.json"
+gated select-endpoint-system system "$GATED" profile --mode metrics --counter-mode counts --select-endpoint C_Digest --module "$MODULE" --system --duration 25 -o "$OUT/select-endpoint-system.json"
+# WP-4 breadth: ia32 through the public command (S12).
+IA32_MODULE=/usr/lib/i386-linux-gnu/softhsm/libsofthsm2.so
+IA32_OK=0
+if [ -r "$IA32_MODULE" ] && gcc -m32 -O1 -o "$FIX/gated32" "$SRC/gated.c" -ldl 2>/dev/null; then
+  chmod 755 "$FIX/gated32"
+  IA32_OK=1
+fi
+if [ "$IA32_OK" = 1 ]; then
+  MODULE_BAK=$MODULE; MODULE=$IA32_MODULE
+  gated profile-pid-ia32 pid "$FIX/gated32" profile --pid @PID@ --duration 12 -o "$OUT/profile-pid-ia32.json"
+  # run-ia32 uses the 32-bit fixture and provider; run_exact reads $MODULE.
+  run_exact run-ia32 "$FIX/gated32" 3
+  MODULE=$MODULE_BAK
+else
+  for cell in profile-pid-ia32 run-ia32; do
+    result "$cell" 0 "prerequisite missing (exit 77 equivalent): $IA32_MODULE not readable or -m32 build failed; CI apt: dpkg --add-architecture i386 && apt-get update && apt-get install -y libsofthsm2:i386 gcc-multilib libc6-dev-i386" failed
+  done
+fi
+# WP-4 breadth: startup latency as its own cell (S15). Bound is a harness
+# parameter, not a user promise; record the three measured values.
+startup_cell() {
+  local cell=startup-to-capturing bound_s=${P11SCOPE_STARTUP_BOUND_S:-${STARTUP_BOUND_S:-30}}
+  local gate=$OUT/startup.gate
+  rm -f -- "$gate" startup-to-capturing.json startup.wl startup.stderr startup.stdout
+  local -a samples=()
+  local trial_ok=1
+  for _ in 1 2 3; do
+    rm -f -- "$gate" startup.wl startup.stderr startup.stdout
+    local wl pp start_ns end_ns delta_ms
+    asuser "$GATED" "$MODULE" 500 200 "$gate" > startup.wl 2>&1 & wl=$!; register "$wl" || true
+    if ! waitfor startup.wl "^READY pid=$wl$" "$wl" "$READY_TICKS"; then trial_ok=0; terminate "$wl" || true; break; fi
+    start_ns=$(date +%s%N)
+    "$P" profile --pid "$wl" --duration 2 -o "$OUT/startup-to-capturing.json" > startup.stdout 2> startup.stderr & pp=$!; register "$pp" || true
+    if waitfor startup.stderr 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$wl" && alive "$pp"; then
+      end_ns=$(date +%s%N)
+      delta_ms=$(( (end_ns - start_ns) / 1000000 ))
+      samples+=("$delta_ms")
+      touch "$gate" || true
+      if finish "$pp" "$EXIT_TICKS"; then :; else trial_ok=0; fi
+    else
+      trial_ok=0
+    fi
+    [ -n "${CHILDREN[$pp]:-}" ] && terminate "$pp" || true
+    terminate "$wl" || true
+  done
+  local detail="startup_ms=${samples[*]:-none} bound_s=$bound_s trials=${#samples[@]}"
+  if [ "$trial_ok" != 1 ] || [ "${#samples[@]}" != 3 ]; then result "$cell" 0 "$detail" failed; return 1; fi
+  local bound_ms=$(( bound_s * 1000 ))
+  for ms in "${samples[@]}"; do
+    if [ "$ms" -gt "$bound_ms" ]; then result "$cell" 0 "$detail over_bound_ms=$ms" failed; return 1; fi
+  done
+  result "$cell" 1 "$detail"
+}
+startup_cell
+summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm mt-exact system sigint second-sigint fifo-refused profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
 exit $?

@@ -19,8 +19,32 @@ import sys
 NAMES = ("C_GenerateRandom", "C_DigestInit", "C_Digest",
          "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal")
 COUNT_CELLS = {"profile-pid", "metrics-pid", "mt-exact", "system",
-               "names-pid", "verdict-pid"}
-SMOKE_CELLS = {"run-short", "run-cover", "trace-pid"}
+               "names-pid", "verdict-pid",
+               "run-short", "run-cover", "run-ia32", "sigint",
+               "profile-cgroup", "metrics-cgroup",
+               "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",
+               "counter-counts-system", "counter-timestamps-system", "counter-latency-system",
+               "select-endpoint-pid", "select-endpoint-system",
+               "profile-pid-ia32"}
+SMOKE_CELLS = {"trace-pid", "trace-cgroup"}
+RUN_CELLS = {"run-short", "run-cover", "run-ia32"}
+COUNTER_MODES = {
+    "counter-counts-pid": "counts", "counter-timestamps-pid": "timestamps",
+    "counter-latency-pid": "latency",
+    "counter-counts-system": "counts", "counter-timestamps-system": "timestamps",
+    "counter-latency-system": "latency",
+    "select-endpoint-pid": "counts", "select-endpoint-system": "counts",
+}
+CELL_SCOPES = {
+    "system": "system",
+    "counter-counts-system": "system", "counter-timestamps-system": "system",
+    "counter-latency-system": "system", "select-endpoint-system": "system",
+    "profile-cgroup": "cgroup", "metrics-cgroup": "cgroup", "trace-cgroup": "cgroup",
+}
+METRICS_CELLS = {"metrics-pid", "metrics-cgroup",
+                 "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",
+                 "counter-counts-system", "counter-timestamps-system", "counter-latency-system",
+                 "select-endpoint-pid", "select-endpoint-system"}
 LOSS_COUNTERS = ("event_loss", "in_flight_at_end", "start_insert_failures", "unmatched_returns",
                  "rv_update_failures", "cgroup_scope_failures", "abi_refusals", "malformed_records",
                  "discovery_ring_loss", "discovery_state_failures", "discovery_read_failures",
@@ -28,6 +52,9 @@ LOSS_COUNTERS = ("event_loss", "in_flight_at_end", "start_insert_failures", "unm
 # Keep verdict policy in the existing canonical reader; it recomputes classes
 # from published counters rather than trusting a report's claimed statuses.
 VERDICT = runpy.run_path(str(Path(__file__).with_name("check-capture-evidence.py")))
+# Trace loss identity lives in the system-scope measurer; reuse it so the two
+# oracles cannot drift (gap §3 item 11).
+TRACE = runpy.run_path(str(Path(__file__).with_name("system-scope-measure.py")))
 
 
 class EvidenceError(Exception):
@@ -196,7 +223,7 @@ def fixture(text, receipt, cell):
         attempts, successes = row.get("attempts"), row.get("successful")
         require(integer(attempts) and integer(successes) and attempts > 0 and attempts == successes,
                 "workload had failed calls or no successful calls")
-        if cell == "system":
+        if CELL_SCOPES.get(cell, "pid") == "system":
             require(attempts == 500, "strict SYSTEM requires 500 successful calls per target: " + name)
         expected[name] = attempts
     require(set(expected) == names, "missing fixture ledger function")
@@ -221,7 +248,7 @@ def common(receipt, cell):
             receipt.get("cell") == cell, "receipt schema or cell mismatch")
     for key in ("workload_ready", "capture_ready", "ledger_complete"):
         require(receipt.get(key) is True, "missing " + key)
-    if cell not in {"run-short", "run-cover"}:
+    if cell not in RUN_CELLS:
         require(receipt.get("gate_released") is True, "gate was not safely released")
     for key in ("observer_exit", "workload_exit"):
         require(type(receipt.get(key)) is int and receipt[key] == 0, "nonzero or missing " + key)
@@ -234,6 +261,146 @@ def common(receipt, cell):
             "provider physical identity or hash changed")
 
 
+def trace_judge(report_text, expected):
+    try:
+        parsed = TRACE["parse_trace_stream"](report_text.splitlines(keepends=True))
+    except ValueError as error:
+        raise EvidenceError("trace stream malformed: " + str(error))
+    total = sum(expected.values())
+    for name, want in expected.items():
+        got = parsed["per_function"].get(name, 0)
+        require(got == want, "trace per-function lines differ from ledger: %s has %d, want %d" % (name, got, want))
+    require(parsed["call_lines_total"] >= total,
+            "trace delivery/count short of independent ledger: %d lines vs %d ledger" % (
+                parsed["call_lines_total"], total))
+    require(parsed["truncated"] is False, "trace truncated; line stream is short")
+    count = parsed["count_evidence"]
+    evidence = parsed["evidence"]
+    require(isinstance(evidence, dict), "trace EVIDENCE is not an object")
+    for key in LOSS_COUNTERS:
+        require(type(evidence.get(key)) is int and evidence[key] == 0, "trace loss or unknown " + key)
+    observation = evidence.get("gap_classes", {}).get("observation", {})
+    require(observation.get("status") == "exact" and observation.get("causes") == [],
+            "trace lossy or unknown observation gap class")
+    require(evidence.get("drain_proven") is True, "trace drain unproven")
+    require(evidence.get("final_drain") is True, "trace final drain unproven")
+    terminal = (evidence.get("completeness"), evidence.get("verdict_detail"))
+    require(terminal in {("COMPLETE", "clean_proven"), ("PARTIAL", "attribution_only")},
+            "trace terminal is not exact (COMPLETE/clean or PARTIAL/attribution-only): %r" % (terminal,))
+    require(evidence.get("trace_truncated") is False, "trace truncated flag set")
+    semantic_failures = evidence.get("semantic_capture_failures", 0)
+    require(type(semantic_failures) is int, "trace semantic failures unknown")
+    ok, note = TRACE["trace_crosscheck"](
+        lost_total=parsed["lost_total"], event_loss=evidence.get("event_loss", 0),
+        stats_returned=count.get("stats_returned", 0), raw_calls=count.get("raw_calls", 0),
+        semantic_failures=semantic_failures, truncated=parsed["truncated"])
+    require(ok, "trace loss identity broken: " + note)
+    require(count.get("stats_returned") == parsed["call_lines_total"],
+            "trace kernel aggregate differs from delivered lines: %r vs %d" % (
+                count.get("stats_returned"), parsed["call_lines_total"]))
+    require(count.get("raw_calls") == parsed["call_lines_total"],
+            "trace reduced records differ from delivered lines: %r vs %d" % (
+                count.get("raw_calls"), parsed["call_lines_total"]))
+    require(count.get("stats_returned") >= total,
+            "trace kernel aggregate short of ledger: %r vs %d" % (count.get("stats_returned"), total))
+    require(parsed["lost_total"] == 0, "trace LOST reports loss")
+
+
+def counter_judge(evidence, rows, cell):
+    want_mode = COUNTER_MODES[cell]
+    collection = evidence.get("counter_collection")
+    require(isinstance(collection, dict), "missing counter_collection metadata")
+    require(collection.get("mode") == want_mode,
+            "counter mode differs from declared cell: %r vs %s" % (collection.get("mode"), want_mode))
+    require(integer(collection.get("generation")) and collection["generation"] > 0,
+            "invalid counter collection generation")
+    window = collection.get("read_window")
+    if window is not None:
+        require(isinstance(window, dict) and integer(window.get("started_ns")) and
+                integer(window.get("finished_ns")) and window["started_ns"] <= window["finished_ns"],
+                "invalid counter read window")
+    require(collection.get("status") == "fresh", "counter collection is not fresh")
+    health = collection.get("health")
+    require(isinstance(health, dict) and health.get("saturated") is False and
+            health.get("contended") is False, "counter collection health is not OK")
+    require(collection.get("discontinuity") is False, "counter collection discontinuity")
+    require(collection.get("failure") is None, "counter collection failure")
+    duration_ns = 25 * 10**9 if CELL_SCOPES.get(cell, "pid") == "system" else 12 * 10**9
+    for row in rows:
+        timing = row.get("latency_ns")
+        calls = row.get("calls", 0)
+        if want_mode == "counts":
+            require(timing is None, "counts mode publishes timing")
+        elif want_mode == "timestamps":
+            require(isinstance(timing, dict), "timestamps mode lacks timing")
+            require(timing.get("approximate") is False, "timestamps approximation flag wrong")
+            require(timing.get("p50") is None and timing.get("p95") is None and timing.get("p99") is None,
+                    "timestamps publishes percentiles")
+            total, maximum = timing.get("total"), timing.get("max")
+            if calls == 0:
+                require(total == 0 and maximum == 0, "idle endpoint timing is not zero")
+                continue
+            require(integer(total) and total > 0 and integer(maximum) and maximum > 0,
+                    "timestamps timing is not positive")
+            require(maximum <= total, "timestamps max exceeds total")
+            require(maximum < duration_ns and total < duration_ns * max(calls, 1),
+                    "timestamps timing outside the capture window")
+        else:
+            require(isinstance(timing, dict), "latency mode lacks timing")
+            require(timing.get("approximate") is True, "latency approximation flag wrong")
+            total, maximum = timing.get("total"), timing.get("max")
+            if calls == 0:
+                require(total == 0 and maximum == 0, "idle endpoint timing is not zero")
+                require(timing.get("p50") is None and timing.get("p95") is None and timing.get("p99") is None,
+                        "idle endpoint publishes percentiles")
+                continue
+            require(integer(total) and total > 0 and integer(maximum) and maximum > 0,
+                    "latency timing is not positive")
+            require(maximum <= total, "latency max exceeds total")
+            require(maximum < duration_ns and total < duration_ns * max(calls, 1),
+                    "latency timing outside the capture window")
+            for key in ("p50", "p95", "p99"):
+                value = timing.get(key)
+                require(integer(value) and value <= maximum,
+                        "latency percentile missing or above max: " + key)
+
+
+def select_judge(evidence, cell):
+    envelope = evidence.get("selected_detail")
+    require(isinstance(envelope, dict), "missing selected_detail envelope")
+    selection = envelope.get("selection")
+    require(isinstance(selection, dict), "missing selection record")
+    require(selection.get("endpoint") == "C_Digest", "selection endpoint differs from declared cell")
+    require(envelope.get("events") == [], "selection events are not empty")
+    require(envelope.get("lineage") is None and envelope.get("aggregate") is None and
+            envelope.get("detail") is None, "selection close products present without a closed window")
+    if cell == "select-endpoint-pid":
+        require(selection.get("refusal") == "bundle_unavailable",
+                "selection refusal differs from today's named unavailability: %r" % selection.get("refusal"))
+        require(integer(selection.get("slot")) and integer(selection.get("file_offset")),
+                "resolved selection lacks slot or file offset")
+        require(selection.get("names") == ["C_Digest"], "resolved selection names differ")
+        require(set(selection) == {"endpoint", "slot", "file_offset", "names", "refusal"},
+                "resolved selection carries unexpected keys")
+    else:
+        require(selection.get("refusal") == "promotion_scope_unsupported",
+                "system selection refusal differs from named refusal: %r" % selection.get("refusal"))
+        require("slot" not in selection and "file_offset" not in selection and "names" not in selection,
+                "unresolved system selection carries resolution")
+        require(set(selection) == {"endpoint", "refusal"},
+                "unresolved selection carries unexpected keys")
+
+
+def run_judge(evidence):
+    require(evidence.get("pause") == "sigstop", "run pause is not confirmed sigstop")
+    attempts, confirmed, partial = (evidence.get("pause_attempts"), evidence.get("pause_confirmed"),
+                                    evidence.get("pause_partial"))
+    require(integer(attempts) and attempts > 0, "run pause attempted nothing")
+    require(confirmed == attempts and partial == 0,
+            "run pause is not fully confirmed")
+    require(evidence.get("child_still_running") is False, "run child still running")
+
+
 def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=False):
     require(cell in COUNT_CELLS | SMOKE_CELLS, "undeclared cell")
     # Ruling CI-GAP-1: only the hosted-runner host system cell may disclose
@@ -241,19 +408,16 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     relaxed = cell == "system" and allow_pid_descendant_gaps is True
     common(receipt, cell)
     expected, physical = fixture(ledger_text, receipt, cell)
-    if cell == "trace-pid":
-        require(sum(" → " in line for line in report_text.splitlines()) == sum(expected.values()),
-                "trace delivery/count smoke differs from independent ledger")
-        raise Nonqualifying("trace delivery/count smoke; text lacks attributable physical targets")
+    if cell in SMOKE_CELLS:
+        trace_judge(report_text, expected)
+        raise Nonqualifying("trace delivery/count checked with loss identity; text lacks attributable physical targets")
     report = parse(report_text)
-    schema = "p11scope/observed-profile/v3-metrics" if cell == "metrics-pid" else "p11scope/observed-profile/v3"
+    schema = "p11scope/observed-profile/v3-metrics" if cell in METRICS_CELLS else "p11scope/observed-profile/v3"
     require(report.get("schema") == schema, "unsupported or wrong cell profile schema")
-    mode = "metrics" if cell == "metrics-pid" else "profile"
+    mode = "metrics" if cell in METRICS_CELLS else "profile"
     require(report.get("lane") == mode and report.get("capture", {}).get("mode") == mode,
             "report lane or capture mode differs from declared cell/schema")
-    if cell in {"run-short", "run-cover"}:
-        raise Nonqualifying("run report smoke; independently counted first-call completeness remains unproved")
-    scope = "system" if cell == "system" else "pid"
+    scope = CELL_SCOPES.get(cell, "pid")
     require(receipt.get("scope") == scope and report.get("capture", {}).get("scope") == scope,
             "receipt or report capture scope differs from declared cell")
     evidence = report.get("evidence")
@@ -294,6 +458,10 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         if hints is not None:
             require(hints.get("links_provider", 0) == 0,
                     "runner noise subject links the watched provider")
+    if cell in RUN_CELLS:
+        run_judge(evidence)
+    if cell.startswith("select-endpoint-"):
+        select_judge(evidence, cell)
     provider = identity(receipt["provider_before"])
     admitted = evidence.get("discovery")
     require(isinstance(admitted, list) and any(identity(row) == provider for row in admitted
@@ -345,8 +513,12 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
             uncertainty.append("shared, unresolved or unpinned module count domain: " + name)
         else:
             require(owner == provider, "owned target has a different publishing module: " + name)
+    if cell in COUNTER_MODES:
+        counter_judge(evidence, rows, cell)
     if uncertainty:
         raise Nonqualifying("; ".join(dict.fromkeys(uncertainty)))
+    if cell == "sigint":
+        require(evidence.get("drain_proven") is True, "SIGINT terminal drain unproven")
     if cell == "verdict-pid":
         require(evidence.get("completeness") in {"COMPLETE", "PARTIAL"} and
                 evidence.get("verdict_detail") in {"clean_proven", "attribution_only", "clean_but_unproven"},

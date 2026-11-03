@@ -7591,6 +7591,124 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     }
 }
 
+/// Waiter-driven eviction: a viewless waiter whose pid sits outside the
+/// current reconcile slice settles within one sweep. The cursor is parked
+/// on the waiter, so the next 64-pid slice cannot cover it; without waiter
+/// demand it would wait for the cursor to wrap all the way around. 70
+/// provider-free sleeps over a 4-view cap keep every tick over-cap with
+/// full exploratory views, so only an eviction makes room.
+#[test]
+fn reconcile_waiter_outside_slice_settles_within_one_sweep() {
+    struct ChildrenGuard(Vec<std::process::Child>);
+    impl Drop for ChildrenGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut children = ChildrenGuard(
+        (0..70)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("120")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let mut pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
+    pids.sort_unstable();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        track_short_lived: false,
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        manifests: vec![],
+        prearm_modules: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: Some(4),
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+
+    // Every child must have execed into sleep: a pre-exec child still shows
+    // the test binary's mappings and would scan as a provider carrier.
+    let self_exe = std::env::current_exe().unwrap();
+    for child in &children.0 {
+        let pid = child.id();
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    // Fill the cap through ordinary rotation; the bound only guards the
+    // harness (each tick admits into every free slot).
+    for _ in 0..20 {
+        if engine.views.len() >= 4 {
+            break;
+        }
+        refresh_inventory_once(&mut engine);
+    }
+    assert_eq!(engine.views.len(), 4, "rotation fills the 4-view cap");
+    // The waiter is the highest viewless pid: rotation admits lowest-first,
+    // so it is still out, and the cursor park below puts the next slice
+    // furthest from it.
+    let waiter = pids
+        .iter()
+        .copied()
+        .rev()
+        .find(|pid| !engine.views.iter().any(|view| view.pid() == *pid))
+        .expect("a viewless pid remains over a 4-view cap");
+    assert!(engine.request_refresh(waiter, None), "the waiter queues");
+    engine.scheduler.advance_cursor(waiter);
+    let sweeps_before = engine.scheduler.reconcile_sweeps_for_test();
+    for _ in 0..6 {
+        refresh_inventory_once(&mut engine);
+        if engine.scheduler.reconcile_sweeps_for_test() > sweeps_before {
+            break;
+        }
+    }
+    assert_eq!(
+        engine.scheduler.reconcile_sweeps_for_test(),
+        sweeps_before + 1,
+        "exactly one sweep ran"
+    );
+    assert!(
+        engine.views.iter().any(|view| view.pid() == waiter),
+        "the out-of-slice waiter settles within one sweep"
+    );
+
+    for child in &mut children.0 {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
 /// Task 3.1b: a zero wall-time quantum stops the reconcile slice before its
 /// first read — the whole slice defers explicitly and the cursor holds.
 /// Package C: the polling rescan still runs on under its own tick quantum;

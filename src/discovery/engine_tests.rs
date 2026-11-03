@@ -23123,7 +23123,6 @@ fn publish_deferral_matches_full_publication_step_for_step() {
         engine.publish_current_capture_facts().unwrap();
         let live = engine.capture_facts.history.modules[&module.id]
             .watch
-            .clone()
             .expect("the merge renders the live watch");
         assert_eq!(live.ended_by, None);
     }
@@ -23158,8 +23157,8 @@ fn publish_deferral_matches_full_publication_step_for_step() {
     // denies deferral on both: the cleaned candidate publishes identically.
     let fixture = LoaderPlanningFixture::new();
     let (mut deferred, mut full) = clean_deferral_pair(&fixture);
-    let mut deferred_counts = publish_operation_counts(&deferred);
-    let mut full_counts = publish_operation_counts(&full);
+    let deferred_counts = publish_operation_counts(&deferred);
+    let full_counts = publish_operation_counts(&full);
     let mut outcomes = Vec::new();
     for engine in [&mut deferred, &mut full] {
         let (candidate, _) = fixture.candidate(engine, false);

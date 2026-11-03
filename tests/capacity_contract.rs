@@ -314,12 +314,25 @@ fn native_slot_checks_counts_and_cleanup_share_one_bound() {
         "key->slot >= P11SCOPE_OWNER_SLOT_BOUND",
         "owner->start_count >= P11SCOPE_OWNER_SLOT_BOUND",
         "owner->start_count > P11SCOPE_OWNER_SLOT_BOUND",
-        "i < P11SCOPE_OWNER_SLOT_BOUND",
-        "start.slot = i",
     ] {
         assert!(
             source.contains(site),
             "native site must stay pinned: {site}"
+        );
+    }
+    // The exec/exit cleanup sweeps (live starts, then orphaned object rows)
+    // run every slot through bpf_loop: the sweep length, its completion
+    // check, each callback's slot guard and the swept key share the bound.
+    for (site, sweeps) in [
+        ("owner_loop(P11SCOPE_OWNER_SLOT_BOUND,", 2),
+        ("completed != P11SCOPE_OWNER_SLOT_BOUND", 2),
+        ("if (slot >= P11SCOPE_OWNER_SLOT_BOUND) {", 2),
+        ("context->key.slot = slot;", 2),
+    ] {
+        assert_eq!(
+            source.matches(site).count(),
+            sweeps,
+            "native cleanup sweep site must stay pinned: {site}"
         );
     }
     assert!(

@@ -987,6 +987,156 @@ class SoakOracleTest(unittest.TestCase):
         self.assertIn("BPF", detail)
         self.assertIn("pre-arming", detail)
 
+    def test_red_resources_pre_go_fd_leak_short_window_fails(self):
+        """A short pre-arming window is still judged against the pre-GO bound.
+
+        GO lands 5 s in (5 pre samples): an FD 30 to 2000 rise during
+        arming fails even though the post-arming floor is flat. The
+        same step fails with GO at 30 s, so a PASS here would be a
+        fail-open skip, not an honest verdict.
+        """
+        base = make_green(self.base / "prego-fd-short-base", horizon=120)
+        rows = []
+        for n in range(190):
+            if n < 5:
+                fds = 30 if n < 2 else 2000
+            else:
+                fds = 2000
+            rows.append((n * 1000, 52_000 + (n % 5), 54_000, fds))
+
+        def leak(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 5000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-prego-fd-short", leak))
+        self.assert_red_only(verdict, "resource_accounting")
+        detail = verdict["gates"]["resource_accounting"]["detail"]
+        self.assertIn("FDs", detail)
+        self.assertIn("pre-arming", detail)
+
+    def test_red_resources_pre_go_pidfd_leak_short_window_fails(self):
+        """A short pre-arming pidfd rise is judged against its own bound.
+
+        GO lands 5 s in (5 pre samples): a 10 to 900 pidfd rise during
+        arming fails even though total FDs stay flat and the
+        post-arming floor is flat. The detail must name pidfds and the
+        pre-arming window.
+        """
+        base = make_green(self.base / "prego-pid-short-base", horizon=120)
+        rows = []
+        for n in range(190):
+            if n < 5:
+                pidfd = 10 if n < 2 else 900
+            else:
+                pidfd = 900
+            rows.append((n * 1000, 52_000 + (n % 5), 54_000,
+                         2500, pidfd, 4))
+
+        def leak(target):
+            (target / "resources.tsv").write_text(
+                _resources6(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 5000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-prego-pid-short", leak))
+        self.assert_red_only(verdict, "resource_accounting")
+        detail = verdict["gates"]["resource_accounting"]["detail"]
+        self.assertIn("pidfds", detail)
+        self.assertIn("pre-arming", detail)
+
+    def test_red_resources_pre_go_bpf_leak_short_window_fails(self):
+        """A short pre-arming BPF-FD rise is judged against its own bound.
+
+        GO lands 5 s in (5 pre samples): a 4 to 400 BPF-FD rise during
+        arming fails even though total FDs stay flat and the
+        post-arming floor is flat. The detail must name BPF and the
+        pre-arming window.
+        """
+        base = make_green(self.base / "prego-bpf-short-base", horizon=120)
+        rows = []
+        for n in range(190):
+            if n < 5:
+                bpf = 4 if n < 2 else 400
+            else:
+                bpf = 400
+            rows.append((n * 1000, 52_000 + (n % 5), 54_000,
+                         700, 10, bpf))
+
+        def leak(target):
+            (target / "resources.tsv").write_text(
+                _resources6(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 5000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-prego-bpf-short", leak))
+        self.assert_red_only(verdict, "resource_accounting")
+        detail = verdict["gates"]["resource_accounting"]["detail"]
+        self.assertIn("BPF", detail)
+        self.assertIn("pre-arming", detail)
+
+    def test_green_resources_pre_go_short_honest_arming_passes(self):
+        """An honest arming ramp inside a short pre window still passes.
+
+        GO lands 5 s in (5 pre samples): FDs rise 30 to 400 with the
+        first pin batch while pidfds and BPF settle under their pre-GO
+        margins, then all hold flat. The short-window bound must fail
+        the retained rises above without failing honest admission.
+        """
+        base = make_green(self.base / "prego-short-honest-base", horizon=120)
+        pre_fds = [30, 122, 215, 307, 400]
+        pre_pid = [10, 72, 135, 197, 260]
+        pre_bpf = [4, 34, 65, 96, 127]
+        rows = []
+        for n in range(190):
+            if n < 5:
+                fds, pidfd, bpf = pre_fds[n], pre_pid[n], pre_bpf[n]
+            else:
+                fds, pidfd, bpf = 400, 260, 127
+            rows.append((n * 1000, 52_000 + (n % 5), 54_000,
+                         fds, pidfd, bpf))
+
+        def honest(target):
+            (target / "resources.tsv").write_text(
+                _resources6(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 5000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-prego-short-honest", honest))
+        self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+
+    def test_red_resources_mixed_column_widths_fail_closed(self):
+        """A trace mixing 4- and 6-column rows is refused, never mixed.
+
+        A sampler restart mid-run changing column counts must fail the
+        resource gate naming the mixed widths instead of silently
+        judging a spliced series.
+        """
+        base = make_green(self.base / "mixed-width-base", horizon=120)
+        lines = ["# ms rss_kb hwm_kb fds pidfds bpf_fds"]
+        for n in range(190):
+            if n < 95:
+                lines.append(f"{n * 1000} {52_000 + (n % 5)} 54000 40")
+            else:
+                lines.append(f"{n * 1000} {52_000 + (n % 5)} 54000 40 10 4")
+
+        def mix(target):
+            (target / "resources.tsv").write_text(
+                "\n".join(lines) + "\n", encoding="utf-8")
+        verdict = self.evaluate(mutate_copy(base, "leg-mixed-width", mix))
+        self.assert_red_only(verdict, "resource_accounting")
+        self.assertIn("mixed resources row widths",
+                      verdict["gates"]["resource_accounting"]["detail"])
+
+    def test_green_resources_legacy_four_column_discloses_skipped_gates(self):
+        """A legacy 4-column trace passes with the skip disclosure.
+
+        Without the pidfd/BPF breakdown columns those gates are
+        skipped and the detail says so; the verdict still judges RSS
+        and total FDs.
+        """
+        verdict = self.evaluate(self.green)
+        self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+        self.assertIn("no FD breakdown columns",
+                      verdict["gates"]["resource_accounting"]["detail"])
+
     def test_green_resources_late_go_fallback_names_short_post_window(self):
         """A GO with fewer than eight post samples falls back, and says so."""
         base = make_green(self.base / "f5-base", horizon=120)

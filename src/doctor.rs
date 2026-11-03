@@ -1946,9 +1946,9 @@ pub(crate) fn counter_modes_footer(verdict: &crate::attach::BpfLoopVerdict) -> S
 /// Counter-mode line with load-preflight verdicts (one per mode,
 /// `Ok(())` when the object loads and releases). A proven named
 /// refusal (the old-kernel token or the memory-limit preflight)
-/// replaces the availability sentence; an unproven load failure
-/// (privilege, unexpected errors) keeps it, since only a proven
-/// refusal shows unavailability.
+/// replaces the availability sentence, as does any other load failure
+/// with its own text: only a clean all-modes load keeps an
+/// availability sentence.
 pub(crate) fn counter_modes_footer_with_preflight(
     verdict: &crate::attach::BpfLoopVerdict,
     preflight: Option<&[(p11scope_ebpf_common::CounterMode, Result<(), String>)]>,
@@ -1962,6 +1962,12 @@ pub(crate) fn counter_modes_footer_with_preflight(
             })
         }) {
             return format!("counter modes: {refusal}\n");
+        }
+        // A failed load that is not a proven refusal still names its
+        // failure: falling back to the "available" sentence here hid a
+        // real gate-1 load error behind "subject to the kernel verifier".
+        if let Some((_, Err(failure))) = loads.iter().find(|(_, result)| result.is_err()) {
+            return format!("counter modes: {failure}\n");
         }
         if loads.iter().all(|(_, result)| result.is_ok()) {
             return "counter modes: available (counts, timestamps, latency; the kernel provides bpf_loop (helper 181); counter objects load on this kernel)\n"
@@ -4329,17 +4335,25 @@ mod tests {
         } else {
             assert!(line.contains("not enabled in this build"), "{line:?}");
         }
-        // An unproven load failure keeps the probe sentence, whatever
-        // the build carries.
+        // An unproven load failure names itself instead of falling back
+        // to the "available" sentence (C1: the fallback hid a real
+        // gate-1 load error behind the probe sentence).
         let unproven = loads([
             Err("counter object load failed (Operation not permitted (os error 1))".to_string()),
             Ok(()),
             Ok(()),
         ]);
-        assert_eq!(
-            counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&unproven)),
-            counter_modes_footer(&BpfLoopVerdict::Available)
-        );
+        let line = counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, Some(&unproven));
+        if cfg!(p11scope_counter_objects) {
+            assert!(
+                line.starts_with("counter modes: counter object load failed ("),
+                "{line:?}"
+            );
+            assert!(!line.contains("available"), "{line:?}");
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        } else {
+            assert!(line.contains("not enabled in this build"), "{line:?}");
+        }
         // Other verdicts ignore the preflight.
         assert_eq!(
             counter_modes_footer_with_preflight(

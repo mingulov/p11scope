@@ -4368,6 +4368,30 @@ fn exit_mappings_capture_facts_stamp_carries_live_split() {
     );
 }
 
+/// Spawn guards for the live exit-mapping cell below: `Child::drop`
+/// neither kills nor reaps, so every owned fixture child is wrapped
+/// and drops kill and reap. Module-level (unlike the file's usual
+/// fn-local guards) so the drop contract below tests them directly.
+struct ExitMappingChildGuard(std::process::Child);
+
+impl Drop for ExitMappingChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct ExitMappingChildrenGuard(Vec<std::process::Child>);
+
+impl Drop for ExitMappingChildrenGuard {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// The live cell below spawns a root holder plus three short-lived
 /// children; `Child::drop` neither kills nor reaps, so every owned
 /// child is wrapped in a guard whose drop kills and reaps. A panic
@@ -4554,6 +4578,27 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
 
     impl Drop for OwnedCgroup {
         fn drop(&mut self) {
+            // Failure paths converge with the success path (`remove`
+            // after every owned process is reaped): a panic between
+            // spawn and reap must not leak the cgroup. The child
+            // guards drop first and already killed and reaped owned
+            // fixtures; move the test itself out so the kill below
+            // can never SIGKILL this binary mid-unwind, then kill
+            // strays and retry removal while members drain.
+            if !self.path.exists() {
+                return;
+            }
+            let _ = std::fs::write(
+                "/sys/fs/cgroup/cgroup.procs",
+                std::process::id().to_string(),
+            );
+            let _ = std::fs::write(self.path.join("cgroup.kill"), "1");
+            for _ in 0..20 {
+                if std::fs::remove_dir(&self.path).is_ok() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             let _ = std::fs::remove_dir(&self.path);
         }
     }
@@ -4785,7 +4830,8 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             cgroup.members(what).contains(&this),
             "{what}: the test must spawn from inside the cgroup"
         );
-        let mut holder_child = spawn_holder(what, &fixtures.holder, &fixtures.provider);
+        let mut holder_child =
+            ExitMappingChildGuard(spawn_holder(what, &fixtures.holder, &fixtures.provider));
         move_out.move_out(what);
         // Settle: tick the production cadence until a slot carries
         // a watch for exactly the fixture file. Only then can a
@@ -4845,11 +4891,14 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             .spawn()
             .expect("spawn threaded mapper");
         let threaded_pid = threaded_child.id();
-        for (child, role) in [
+        // Guarded: a panic mid-reap still kills and reaps whatever
+        // the drain below has not consumed yet.
+        let mut owned_children = ExitMappingChildrenGuard(vec![
             (mapper_child, "mapper"),
             (plain_child, "plain"),
             (threaded_child, "threaded"),
-        ] {
+        ]);
+        for (child, role) in owned_children.0.drain(..) {
             let output = child.wait_with_output().expect("reap owned child");
             assert!(
                 output.status.success(),
@@ -4899,8 +4948,8 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         // The window is closed: reap the holder before reading the
         // outcome (its exit is never drained, so it cannot move the
         // counts either way), then remove the cgroup.
-        holder_child.kill().expect("reap holder");
-        holder_child.wait().expect("wait holder");
+        holder_child.0.kill().expect("reap holder");
+        holder_child.0.wait().expect("wait holder");
         let skips = engine.counters.object_skips.clone();
         let outcome = (
             LiveExits {

@@ -1157,6 +1157,24 @@ fn pin_inventory_prearm(
         })
 }
 
+/// Test-only count of pass-heap reclamations on any thread: each
+/// classic pass publication reclaims once.
+#[cfg(test)]
+static RECLAIM_PASS_HEAP_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only read of the pass-heap reclamation count.
+#[cfg(test)]
+pub(crate) fn reclaim_pass_heap_calls() -> u64 {
+    RECLAIM_PASS_HEAP_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only reset of the pass-heap reclamation count.
+#[cfg(test)]
+pub(crate) fn reset_reclaim_pass_heap_calls() {
+    RECLAIM_PASS_HEAP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_with_terminal_budget(
     scope: impl Into<InventorySelection>,
@@ -8569,6 +8587,55 @@ mod tests {
         assert_eq!(code, 0);
         let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
         assert_eq!(document["observation"]["passes"], 1);
+    }
+
+    #[test]
+    fn classic_pass_publication_reclaims_pass_heap() {
+        // A `--system` pass pins hundreds of module files and buffers the
+        // match; publication must hand the freed peak back to the kernel,
+        // or glibc retains ~200 MiB and the soak's 256 MiB bound has no
+        // margin under load. The counter is process-wide (other tests may
+        // also publish), so this asserts at least one reclamation.
+        reset_reclaim_pass_heap_calls();
+        let mut stdout = Vec::new();
+        let code = run_with_terminal_budget(
+            InspectScope::Pid(std::process::id()),
+            &[PathBuf::from("/missing/p11scope-provider")],
+            &[],
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            Some(1),
+            None,
+            inventory_endpoint_budget(None).unwrap(),
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Singles,
+            None,
+            false,
+            &|| false,
+            &|| {},
+            false,
+            &mut WriterStdout(&mut stdout),
+            &DashboardIo::stdio(),
+            DiagnosticRequest::disabled(),
+            None,
+            &|| panic!("a genuine scan must not probe or load capture BPF"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            reclaim_pass_heap_calls() >= 1,
+            "a published pass reclaims its transient heap"
+        );
     }
 
     #[test]

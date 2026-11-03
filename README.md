@@ -153,9 +153,9 @@ run `python3 -I scripts/prepare-dependencies.py --archive-dir DIRECTORY`, then
 use `mise exec -- ./scripts/cargo.sh +1.99.1 build --locked --offline`. An
 ordinary fresh checkout therefore needs archive access. A plain Git checkout
 or GitHub's automatic source archive excludes the generated trees, receipts
-and local archive cache. All locked registry packages and the fixed
-[pkcs11-components](https://github.com/mingulov/pkcs11-components/) Git revision
-(`d0a47c7`) are separate Cargo inputs and
+and local archive cache. All locked registry packages (including the
+[pkcs11-components](https://github.com/mingulov/pkcs11-components/) crates
+`pkcs11-types`/`pkcs11-module` 0.2.3) are separate Cargo inputs and
 must already be cached for an offline build from that checkout. The published
 v0.3.0 source export embeds the two exact pinned Aya archives, but fetching the
 remaining locked Cargo dependencies requires network access or a populated

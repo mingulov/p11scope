@@ -57,6 +57,14 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Fixed
 
+- Providers whose legacy `CK_FUNCTION_LIST` is stamped PKCS#11 3.0–3.2
+  (for example SoftHSM 2.7, which reports 3.2) are no longer left
+  `PARTIAL` with a surface gap: the frozen 68-slot layout selects the
+  exact walk, so discovery, manifests and inventory report the complete
+  surface. The `pkcs11-types`/`pkcs11-module` crates move from the pinned
+  Git revision to the crates.io 0.2.3 release; the approved mechanism
+  union grows from 463 to 465 entries (two proposed 3.3 external-mu
+  registrations).
 - `doctor` no longer spends minutes test-loading capture programs on kernels
   without uprobe_multi (for example Linux 6.1, where it took about 4 minutes).
   Live capture refuses there anyway, so those checks now read

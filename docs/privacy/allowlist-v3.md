@@ -143,7 +143,7 @@ These scalar-result mechanisms are specified in PKCS #11 Current Mechanisms
 key-material or PRF results outside `phKey`; that cell can be ignored.
 [Primary mechanism specification](https://docs.oasis-open.org/pkcs11/pkcs11-curr/v3.0/os/pkcs11-curr-v3.0-os.html).
 Numeric IDs are pinned by the
-[pkcs11-types mechanism catalog](https://github.com/mingulov/pkcs11-components/blob/d0a47c71d34294466bc41100ae6b5a5a329029d2/crates/types/src/mechanism_official.rs).
+[pkcs11-types mechanism catalog](https://github.com/mingulov/pkcs11-components/blob/v0.2.3/crates/types/src/mechanism_official.rs).
 
 Before reading/retaining arg 5 or reading the requested template, classify
 one target-width `CK_MECHANISM.mechanism` word at arg 1's pointer by exact
@@ -221,7 +221,7 @@ Class and key-type numbers follow the OASIS PKCS #11 3.0 `pkcs11t.h`;
 the pinned pkcs11-types `CkKeyType` table misnumbers values from 0x27
 upward and is not a source for this vocabulary. The selected attribute
 selectors are a deliberately small subset of the pinned [pkcs11-types
-attribute definitions](https://github.com/mingulov/pkcs11-components/blob/d0a47c71d34294466bc41100ae6b5a5a329029d2/crates/types/src/attribute.rs).
+attribute definitions](https://github.com/mingulov/pkcs11-components/blob/v0.2.3/crates/types/src/attribute.rs).
 These sets are closed; support for another standard or vendor value requires
 a reviewed policy change, not numeric passthrough.
 

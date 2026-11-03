@@ -124,15 +124,15 @@ shared-layer/copy-up, Kubernetes, Knative and performance qualification remain
 separate. The manual job retains its diagnostics for seven days, checks owned
 container/image/process and BPF link/program/map cleanup, and never prunes the daemon.
 
-## Pinned Git dependency
+## Pinned PKCS#11 crates
 
-The only Git dependency is
-[pkcs11-components](https://github.com/mingulov/pkcs11-components) (its
-`pkcs11-module` and `pkcs11-types` crates and their `pkcs11-abi` dependency),
-pinned to revision `d0a47c71d34294466bc41100ae6b5a5a329029d2` in every
-manifest that names it and in both lockfiles (`Cargo.lock`, `crates/ebpf/Cargo.lock`). The repository is
-public, so an ordinary networked fetch resolves it; no Git configuration or
-local mirror is needed:
+There is no Git dependency. The
+[pkcs11-components](https://github.com/mingulov/pkcs11-components) crates
+(`pkcs11-module` and `pkcs11-types` and their `pkcs11-abi` dependency) come
+from crates.io, pinned to version `0.2.3` in every manifest that names them
+and in both lockfiles (`Cargo.lock`, `crates/ebpf/Cargo.lock`), with registry
+checksums. An ordinary networked fetch resolves them; no Git configuration
+or local mirror is needed:
 
 ```sh
 mise exec -- ./scripts/cargo.sh +1.99.1 fetch --locked

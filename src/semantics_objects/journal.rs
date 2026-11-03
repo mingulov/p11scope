@@ -611,6 +611,11 @@ struct JournalDomainState {
     s1only_original_refused: bool,
     tainted: bool,
     era_ended: bool,
+    /// A seal of this key settled a qualified successful `C_Finalize`
+    /// that left nothing unfinished (the model's completed domain). The
+    /// era is completed history: a later seal with nothing new for this
+    /// key succeeds empty instead of refusing `DomainEnded`.
+    era_completed: bool,
     sealed_through: u64,
     bootstraps: BTreeMap<u64, u64>,
     /// The maximum recorded bounded-loss upper for this key. The fence
@@ -4942,6 +4947,7 @@ impl JournalAdapter {
         if state.era_ended {
             return Err(self.failure(JournalGap::DomainEnded));
         }
+        let completed = state.era_completed;
         // Era discipline: the proof carries the live era, or the next era
         // once the live one ended (handled below after the ended check can
         // observe it). Anything else is a mismatched bootstrap.
@@ -5114,7 +5120,69 @@ impl JournalAdapter {
             Some(pinned) if pinned < floors => None,
             _ => Some(floors),
         };
+        // A completed era (its sealed successful C_Finalize ended the
+        // model domain with nothing left unfinished) has nothing left
+        // to prove: with no new history for this key it seals empty,
+        // like an idle key, never reaching the ended model domain. New
+        // history after it cannot be proved under the ended domain and
+        // keeps the ordinary path's refusal.
+        if completed && !self.has_history_through(key, &live, frontier) {
+            return self.seal_completed_era(key, bootstrap, frontier, replay);
+        }
         self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay)
+    }
+
+    /// Whether any staged wire truth for one key sits at or below a
+    /// frontier: a begin converting here or already converted for it,
+    /// or a refused begin converting here.
+    fn has_history_through(
+        &self,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        frontier: u64,
+    ) -> bool {
+        self.open
+            .values()
+            .any(|entry| entry.begin_ordinal <= frontier && self.abandons_here(key, live, entry))
+            || self.refused.iter().any(|refused| {
+                refused.cut <= frontier && self.refused_converts_here(key, live, refused)
+            })
+    }
+
+    /// The empty success of a completed era: nothing settles, no
+    /// bootstrap is claimed, and the frontier advances exactly as an
+    /// idle key's empty seal would. The model is not consulted.
+    fn seal_completed_era(
+        &mut self,
+        key: JournalDomainKey,
+        bootstrap: &BootstrapReceipt,
+        frontier: u64,
+        replay: Option<ReplayPreparation>,
+    ) -> Result<SealSuccess, SealFailure> {
+        let mut prefix = SealedObjectPrefix {
+            domain: ObjectDomain::sealed(&bootstrap.proof()),
+            frontier,
+            birth_cut: bootstrap.birth_cut(),
+            bootstrap: None,
+            settled: Vec::new(),
+            settled_len: 0,
+            replay_steps: Vec::new(),
+            replay_index: None,
+            open: Vec::new(),
+        };
+        if let Some(replay) = replay {
+            let Some((steps, index)) = replay.finish(0) else {
+                return Err(self.failure(JournalGap::ModelRefused));
+            };
+            prefix.replay_steps = steps;
+            prefix.replay_index = Some(index);
+        }
+        let state = self.keys.get_mut(&key).expect("sealed key");
+        state.sealed_through = frontier;
+        Ok(SealSuccess {
+            prefix,
+            effects: ObjectEffects::default(),
+        })
     }
 
     /// Preserve staged unbounded abandonments across a void: each
@@ -6094,6 +6162,9 @@ impl JournalAdapter {
         }
         debug_assert!(prefix.settled_len <= prefix.settled.len());
         self.keys.get_mut(&key).expect("sealed key").sealed_through = frontier;
+        if model.domain_completed(domain) {
+            self.keys.get_mut(&key).expect("sealed key").era_completed = true;
+        }
         self.keys
             .get_mut(&key)
             .expect("sealed key")

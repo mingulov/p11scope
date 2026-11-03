@@ -2324,19 +2324,12 @@ impl AttestedSemanticLane {
             .and_then(|live| live.capture.first_failed_quantum_audit_for_test())
     }
 
-    /// Coverage-failure state for the stuck-transaction diagnostic only:
-    /// (capture image_failed, pending discovery complete, router
-    /// image_failed, faulted key count, faulted-overflow latch, router
-    /// counters). Test-visible; production behavior never reads it.
+    /// Coverage-failure state for the stuck-transaction diagnostic only.
+    /// Test-visible; production behavior never reads it.
     #[cfg(test)]
     pub(crate) fn router_coverage_for_test(
         &self,
-    ) -> Option<(
-        bool,
-        bool,
-        (bool, usize, bool),
-        crate::discovery::instances::RouterCounters,
-    )> {
+    ) -> Option<crate::semantic_capture::RouterCoverageForTest> {
         self.live
             .as_deref()
             .map(|live| live.capture.router_coverage_for_test())

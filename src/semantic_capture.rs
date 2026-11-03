@@ -1569,6 +1569,17 @@ pub(crate) type PendingH3Original<'a> = (
     &'a EventRecord,
     Option<crate::semantics_objects::journal::joint_driver::JointResourceOrigin>,
 );
+/// Coverage-failure state for the stuck-transaction diagnostic only:
+/// (capture image_failed, pending discovery complete, (router
+/// image_failed, faulted key count, faulted-overflow latch), router
+/// counters). Test-visible; production behavior never reads it.
+#[cfg(test)]
+pub(crate) type RouterCoverageForTest = (
+    bool,
+    bool,
+    (bool, usize, bool),
+    crate::discovery::instances::RouterCounters,
+);
 static NEXT_SEMANTIC_CAPTURE: AtomicU64 = AtomicU64::new(0);
 
 /// Lane-attach cutover in clock ticks since boot: `/proc/uptime` read at
@@ -2895,14 +2906,7 @@ impl SemanticCapture {
     /// image_failed, faulted key count, faulted-overflow latch, router
     /// counters). Test-visible; production behavior never reads it.
     #[cfg(test)]
-    pub(crate) fn router_coverage_for_test(
-        &self,
-    ) -> (
-        bool,
-        bool,
-        (bool, usize, bool),
-        crate::discovery::instances::RouterCounters,
-    ) {
+    pub(crate) fn router_coverage_for_test(&self) -> RouterCoverageForTest {
         (
             self.image_failed,
             self.pending_discovery_status == CollectionStatus::Complete,

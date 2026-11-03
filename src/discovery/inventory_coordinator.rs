@@ -1009,10 +1009,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// unarmed; a lost link truncates).
     fn prearm_links_by_object(
         &self,
-    ) -> BTreeMap<
-        crate::discovery::identity::PinnedObjectId,
-        Vec<crate::prearm_module::DeclaredLink>,
-    > {
+    ) -> BTreeMap<crate::discovery::identity::PinnedObjectId, Vec<crate::prearm_module::DeclaredLink>>
+    {
         let mut links_by_object: BTreeMap<
             crate::discovery::identity::PinnedObjectId,
             Vec<crate::prearm_module::DeclaredLink>,
@@ -1228,8 +1226,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Attach-object → pinned-object index from the declared endpoints
         // (one target per pre-armed file; undeclared same-object endpoints
         // share it), so each endpoint resolves without scanning all inputs.
-        let mut attach_to_pin: BTreeMap<AttachObjectId, crate::discovery::identity::PinnedObjectId> =
-            BTreeMap::new();
+        let mut attach_to_pin: BTreeMap<
+            AttachObjectId,
+            crate::discovery::identity::PinnedObjectId,
+        > = BTreeMap::new();
         for (key, endpoint_id) in &self.prearm_endpoints {
             if let Some(endpoint) = self.attach_set.endpoint(*endpoint_id) {
                 attach_to_pin.insert(endpoint.object, key.object);
@@ -1249,9 +1249,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     let Some(target) = self.attach_set.target(endpoint.object) else {
                         continue;
                     };
-                    let Some(pin) = self.prearm_state.watches().keys().copied().find(|pin| {
-                        target.same_object_as(pins, *pin)
-                    }) else {
+                    let Some(pin) = self
+                        .prearm_state
+                        .watches()
+                        .keys()
+                        .copied()
+                        .find(|pin| target.same_object_as(pins, *pin))
+                    else {
                         continue;
                     };
                     pin

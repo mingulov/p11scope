@@ -6009,8 +6009,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 .freeze_prearm_stop(crate::attach::monotonic_ns());
         }
         if self.coordinator.has_prearm() {
-            let stop = self.prearm_probe_stop.unwrap_or(false)
-                || self.coordinator.capture_failed();
+            let stop = self.prearm_probe_stop.unwrap_or(false) || self.coordinator.capture_failed();
             let cause = if stop {
                 crate::render::PrearmWatchEnd::Stop
             } else {

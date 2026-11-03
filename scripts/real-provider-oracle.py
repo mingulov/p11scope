@@ -14,8 +14,9 @@ appends one entry per forwarded call to a spy log. This oracle checks:
   count; and C_GetInterface/C_GetInterfaceList are forwarded only when
   the spied module exports them (recorded in the receipt from its
   dynamic symbols), otherwise the observed count must be zero;
-- the pause outcome equals the pinned expectation (today: partial, a
-  known failure owned by the exec-real-providers lane);
+- the pause outcome equals the pinned expectation (cells pinning partial
+  today record the known OpenSC-partial-pause failure owned by the
+  exec-real-providers lane);
 - the set of observation causes equals the pinned per-cell list, where
   every pin carries a reason and an owner (the ratchet: a fixed cause or
   a new cause both fail until the pin is updated);
@@ -222,6 +223,10 @@ def select_pin(expects, cell, os_id, tool_version):
     for entry in entries:
         if not isinstance(entry, dict):
             raise HarnessError("invalid expected-causes entry for cell: " + cell)
+        if not isinstance(entry.get("os"), str) or not entry.get("os").strip() or \
+                not isinstance(entry.get("tool_version"), str) or \
+                not entry.get("tool_version").strip():
+            raise HarnessError("expected-causes entry lacks its os/tool key for cell: " + cell)
         if entry.get("os") == os_id and entry.get("tool_version") == tool_version:
             return entry
     raise HarnessError("no expected-causes pin for cell %s on os %s tool %s"

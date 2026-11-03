@@ -334,6 +334,12 @@ class JudgeTests(unittest.TestCase):
         with self.assertRaises(ORACLE_MOD["HarnessError"]):
             self.judge(tool_version="9.9.9")
 
+    def test_pin_without_os_key_is_a_harness_error(self):
+        def mutate(doc, rec, exp):
+            del exp["cells"][rec["cell"]][0]["os"]
+        with self.assertRaises(ORACLE_MOD["HarnessError"]):
+            self.judge(mutate=mutate)
+
     def test_pin_without_reason_is_a_harness_error(self):
         def mutate(doc, rec, exp):
             exp["cells"][rec["cell"]][0]["observation"][0]["reason"] = ""

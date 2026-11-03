@@ -25,8 +25,10 @@
 # Ledger routing per tool (all verified on Ubuntu 26.04 + Fedora 44):
 # - pkcs11-tool: --module <spy> (documented in pkcs11-tool --help).
 # - p11tool: --provider <spy> (documented in p11tool --help).
-# - NSS: modutil -add spy -libfile <spy> into an owned DB (modutil usage);
-#   the observed command then runs certutil and modutil against that DB.
+# - NSS: the spy is registered into an owned DB with modutil -add (falling
+#   back to modutil -rawadd where -add verification fails); the observed
+#   command is certutil -L -h all alone, with an owned empty p11-kit user
+#   config blinding NSS's second SoftHSM path (both distros ship it).
 # - trust: an owned p11-kit user config (XDG_CONFIG_HOME/pkcs11/{pkcs11.conf
 #   with "user-config: only", modules/spy.module naming the spy with
 #   trust-policy/priority/x-trust-lookup copied from p11-kit-trust.module}),
@@ -35,8 +37,8 @@
 # sudo-run child only inherits PATH/LC/TERM/TZ/SOFTHSM2_CONF, so PKCS11SPY,
 # PKCS11SPY_OUTPUT and XDG_CONFIG_HOME must ride the command line.
 #
-# Owned state: OUTDIR/work holds the SoftHSM config+tokens, the NSS DB, the
-# p11-kit user configs and the NSS tool script. Nothing is written outside
+# Owned state: OUTDIR/work holds the SoftHSM config+tokens, the NSS DB and
+# the p11-kit user configs (trust spy module, NSS blinding). Nothing is written outside
 # OUTDIR (the opencryptoki soft token is used as the system provides it and
 # is never initialized here). The spy log appends across runs, so every
 # cell removes its spy log before running.
@@ -69,6 +71,8 @@ OUT=$2
 [ "$(id -u)" = 0 ] || [ -n "${SUDO_UID:-}" ] || sudo -n true || {
   echo 'passwordless sudo required' >&2; exit 77; }
 mkdir -p "$OUT" && OUT=$(realpath -e -- "$OUT") || { echo 'cannot create OUTDIR' >&2; exit 2; }
+command -v python3 >/dev/null 2>&1 || { echo 'python3 missing' >&2; exit 77; }
+mkdir -p /var/tmp/p11scope-ws-tmp || { echo 'cannot create lock dir' >&2; exit 2; }
 WORK=$OUT/work; mkdir -p "$WORK"
 : > "$OUT/results.jsonl"
 FAILED=0; SKIPPED=0; HARNESS=0
@@ -76,7 +80,7 @@ NM_MISSING=0
 command -v nm >/dev/null 2>&1 || NM_MISSING=1
 
 result() {
-  python3 - "$1" "$2" "$3" "$4" <<'PY' | tee -a "$OUT/results.jsonl"
+  python3 -I - "$1" "$2" "$3" "$4" <<'PY' | tee -a "$OUT/results.jsonl"
 import json,sys
 print(json.dumps({'cell':sys.argv[1],'pass':sys.argv[2]=='1','detail':sys.argv[3],
  'qualification':sys.argv[4]}))
@@ -84,7 +88,7 @@ PY
 }
 skip() { SKIPPED=1; result "$1" 0 "SKIP (77): $2" nonqualifying; }
 
-OS_ID=$(python3 -c 'import re;print(re.search(r"^ID=(.*)$",open("/etc/os-release").read(),re.M).group(1).strip().strip("\""))' 2>/dev/null || echo unknown)
+OS_ID=$(python3 -I -c 'import re;print(re.search(r"^ID=(.*)$",open("/etc/os-release").read(),re.M).group(1).strip().strip("\""))' 2>/dev/null || echo unknown)
 [ -n "$OS_ID" ] || OS_ID=unknown
 
 pkg_version() {
@@ -99,9 +103,13 @@ pkg_version() {
 }
 
 probe_module() {
-  local candidate
+  # Canonicalized: the oracle compares the spy's Loaded path byte-wise,
+  # and distro module paths are sometimes symlinks (libopencryptoki.so).
+  local candidate resolved
   for candidate in "$@"; do
-    [ -f "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+    if [ -f "$candidate" ]; then
+      resolved=$(realpath -e -- "$candidate") && { printf '%s\n' "$resolved"; return 0; }
+    fi
   done
   return 1
 }
@@ -115,7 +123,7 @@ OCK_CANDIDATES=(/usr/lib/x86_64-linux-gnu/pkcs11/libopencryptoki.so /usr/lib64/p
 pin() { python3 -I "$HERE/mapped-provider-pin.py" "$1"; }
 
 spied_exports() {
-  nm -D --defined-only -- "$1" 2>/dev/null | python3 -c '
+  nm -D --defined-only -- "$1" 2>/dev/null | python3 -I -c '
 import json,sys
 defined = {line.split()[-1].split("@")[0] for line in sys.stdin if line.split()}
 print(json.dumps({name: (name in defined)
@@ -158,7 +166,7 @@ run_and_judge() {
   after=$(pin "$SPIED") || { HARNESS=1; result "$CELL" 0 'harness: spied re-pin failed' failed; return 1; }
   exports=$(spied_exports "$SPIED") || { HARNESS=1; result "$CELL" 0 'harness: nm exports failed' failed; return 1; }
   P11KIT_VERSION=${P11KIT_VERSION:-unknown}
-  python3 - "$OUT/$CELL.receipt.json" "$CELL" "$MODE" "$TOOL" "$TOOL_VERSION" "$OS_ID" \
+  python3 -I - "$OUT/$CELL.receipt.json" "$CELL" "$MODE" "$TOOL" "$TOOL_VERSION" "$OS_ID" \
     "$SPIED" "$before" "$after" "$rc" "$P11KIT_VERSION" "$exports" <<'PY'
 import json,sys
 path, cell, mode, tool, version, os_id, spied, before, after, rc, p11kit, exports = sys.argv[1:]
@@ -172,6 +180,7 @@ PY
   local row oracle_rc
   row=$(python3 -I "$ORACLE" --report "$OUT/$CELL.json" --spy "$OUT/$CELL.spy.log" \
     --receipt "$OUT/$CELL.receipt.json" --expect "$EXPECTS" --cell "$CELL"); oracle_rc=$?
+  if [ -z "$row" ]; then HARNESS=1; result "$CELL" 0 'harness: oracle produced no row' failed; return 1; fi
   printf '%s\n' "$row" | tee -a "$OUT/results.jsonl" >/dev/null
   case $oracle_rc in
     0|3) return 0 ;;
@@ -196,7 +205,7 @@ pkcs11tool_cell() {
   P11KIT_VERSION=$(pkg_version p11-kit p11-kit || echo unknown)
   softhsm_setup || { skip "$base" 'owned SoftHSM setup failed'; skip "$base-metrics" 'owned SoftHSM setup failed'; return 0; }
   if [ "$candname" = OPENSC ]; then
-    if ! pkcs11-tool --module "$spied" -L >/dev/null 2>&1; then
+    if ! "$toolbin" --module "$spied" -L >/dev/null 2>&1; then
       skip "$base" 'no smart-card reader: pkcs11-tool exits nonzero with opensc';
       skip "$base-metrics" 'no smart-card reader: pkcs11-tool exits nonzero with opensc'; return 0;
     fi
@@ -214,7 +223,7 @@ pkcs11tool_cell() {
     rm -f -- "$WORK/ock-probe.spy.log"
     if ! sudo -n setpriv --reuid="$ruid" --regid="$rgid" --clear-groups \
       /usr/bin/env PKCS11SPY="$spied" PKCS11SPY_OUTPUT="$WORK/ock-probe.spy.log" \
-      pkcs11-tool --module "$SPY" -L >/dev/null 2>&1; then
+      "$toolbin" --module "$SPY" -L >/dev/null 2>&1; then
       rm -f -- "$WORK/ock-probe.spy.log"
       skip "$base" 'opencryptoki token not usable as the run-child identity (pkcs11 group; sudo-run clears groups)';
       skip "$base-metrics" 'opencryptoki token not usable as the run-child identity (pkcs11 group; sudo-run clears groups)'; return 0;
@@ -344,7 +353,7 @@ nss_cell
 p11tool_cell
 pkcs11tool_cell real-opencryptoki OCK libopencryptoki.so
 
-python3 - "$OUT/results.jsonl" <<'PY' | tee "$OUT/summary.txt"
+python3 -I - "$OUT/results.jsonl" <<'PY' | tee "$OUT/summary.txt"
 import json,sys
 rows = [json.loads(line) for line in open(sys.argv[1])]
 expected = ["real-pkcs11tool-softhsm", "real-pkcs11tool-softhsm-metrics",

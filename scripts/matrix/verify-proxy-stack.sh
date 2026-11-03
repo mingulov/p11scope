@@ -5,14 +5,17 @@
 # of the lane is that one capture keeps them apart.
 #
 # Kept apart here means the plan's capacity semantics, which is what a real
-# libp11-kit forces: it maps 64 static CK_FUNCTION_LIST_3_2 closure templates
-# (104 entries each, 6530 distinct targets) into its own image, so discovery
-# decodes thousands of entries against a frozen 512-slot ceiling. Since Task
-# 1.2 the K=4 per-object heuristic cap admits 4 tables (410 distinct targets)
-# and records the other 60 as `discovery_uncorroborated_candidates` — spill is
-# evidence, never slots — so the proxy module is NOT refused whole: both
-# providers attach (478 slots, nothing skipped) and a target both providers
-# publish is attached exactly once. Completeness stays PARTIAL.
+# libp11-kit forces: it maps M static CK_FUNCTION_LIST_3_2 closure templates
+# (104 entries each) into its own image, so discovery decodes thousands of
+# entries against a frozen 512-slot ceiling. The late-start closure takes
+# the reserve-capped heuristic prefix: the leading N tables attach ("N of M
+# template tables attached") and the other M-N spill as
+# `discovery_uncorroborated_candidates` — spill is evidence, never slots —
+# so the proxy module is NOT refused whole: SoftHSM2 attaches in full first
+# (68 slots), then the prefix, and a target both providers publish is
+# attached exactly once. Completeness stays PARTIAL. (Measured on Fedora 42
+# / libp11-kit.so.0.4.11: "3 of 67 template tables attached", 68+308=376
+# slots, 478 calls.)
 #
 # p11-kit loads its backends lazily, at C_Initialize, after the observer has
 # attached. LD_PRELOAD maps SoftHSM2 at exec instead, so both providers are
@@ -126,10 +129,11 @@ doc = json.load(open(sys.argv[1]))
 ev = doc["evidence"]
 
 # The plan's capacity semantics are this lane's expected outcome, not a
-# fallback. A real libp11-kit maps 64 static CK_FUNCTION_LIST_3_2 closure
+# fallback. A real libp11-kit maps M static CK_FUNCTION_LIST_3_2 closure
 # templates into the scanned image — thousands of decoded entries against the
-# frozen 512-slot ceiling — so the K=4 per-object heuristic cap admits 4
-# tables and spills 60 as candidates: both providers attach, nothing is
+# frozen 512-slot ceiling — so the reserve-capped heuristic prefix admits the
+# leading N tables ("N of M template tables attached") and spills M-N as
+# candidates: SoftHSM2 attaches in full first, then the prefix, nothing is
 # refused whole, and a target both providers publish is attached exactly
 # once. No p11-kit module-directory scoping can change that: the closures
 # are part of the mapped image, not of any backend it loads.
@@ -144,7 +148,7 @@ for module in doc["capture"]["modules"]:
     print("  attached:", module["path"])
 print("  slots:", ev["slots"], "probes:", ev["attached_probes"], "calls:", called)
 print("  decoded entries:", ev["table_entries"], "over", len(ev["surfaces"]), "surfaces")
-print("  K=4 spill (uncorroborated candidates):", ev["discovery_uncorroborated_candidates"])
+print("  prefix spill (uncorroborated candidates):", ev["discovery_uncorroborated_candidates"])
 PY
 
 echo "=== nested function-list and interface-list exports ==="

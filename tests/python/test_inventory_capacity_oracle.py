@@ -59,6 +59,7 @@ def population():
                                   "mapping": {"state": "mapped", "evidence": "deep_scan"},
                                   "entries": {"count": 3, "observation": "observed",
                                               "coverage": {"state": "counted", "lossy": False}}})
+    scan_lane_authority(document)
     late = copy.deepcopy(document)
     for edge in late["edges"][:32]:
         edge["entries"]["count"] = 9
@@ -105,7 +106,7 @@ def owner_population(manifest, ledger, initial, last):
             "device": {"major": 0, "minor": 35}, "inode": inode, "sha256": "a" * 64},
             "admission": {"state": "admitted", "endpoints": 1}})
         last["callers"].append({"id": f"c{index}", "pid": pid, "start_time": 70,
-                                "image": {"authority": "native_exact"}})
+                                "image": {"authority": "scan_pinned"}})
         last["edges"].append({"caller": f"c{index}", "module": f"m{index}", "mapping": {
             "state": "mapped", "evidence": "deep_scan"}, "entries": {
             "count": 1, "observation": "observed", "coverage": {"state": "counted", "lossy": False}}})
@@ -174,6 +175,7 @@ def refusal_case(limit=4096):
                 "require_retirement": "closed", "providers": providers, "owners": [owner],
                 "phases": [{"name": "activity", "providers": [p["key"] for p in providers],
                             "snapshot": "late.json"}]}
+    scan_lane_authority(document)
     return manifest, ledger, document
 
 
@@ -319,7 +321,7 @@ class CapacityOracleTests(unittest.TestCase):
         self.run_case(outside, 1, "CAPACITY-WINDOW")
 
     def test_native_positive_requires_exact_caller_authority(self):
-        self.run_case(lambda _m, _l, _a, last: last["callers"][0]["image"].update(authority="scan_pinned"),
+        self.run_case(lambda _m, _l, _a, last: last["callers"][0].pop("image"),
                       1, "CAPACITY-AUTHORITY")
 
     def test_scan_pinned_callers_with_disclosure_pass_authority(self):
@@ -330,18 +332,15 @@ class CapacityOracleTests(unittest.TestCase):
 
     def test_authority_rejects_stale_native_exact(self):
         def stale(_manifest, _ledger, _first, last):
+            last["callers"][0]["image"]["authority"] = "native_exact"
             last["gaps"].append(standing_authority_gap())
         self.run_case(stale, 1, "CAPACITY-AUTHORITY")
 
     def test_authority_without_disclosure_gap_fails(self):
         def undisclosed(_manifest, _ledger, _first, last):
-            for caller in last["callers"]:
-                caller["image"]["authority"] = "scan_pinned"
+            last["gaps"] = [gap for gap in last["gaps"]
+                            if gap.get("subject") != standing_authority_gap()["subject"]]
         self.run_case(undisclosed, 1, "CAPACITY-AUTHORITY")
-
-    def test_authority_rejects_missing_image(self):
-        self.run_case(lambda _m, _l, _a, last: last["callers"][0].pop("image"),
-                      1, "CAPACITY-AUTHORITY")
 
     def test_growth_cannot_skip_the_middle_capacity_population(self):
         def skipped(manifest, ledger, _first, _last):
@@ -376,6 +375,7 @@ class CapacityOracleTests(unittest.TestCase):
 
     def test_refusal_authority_rejects_stale_native_exact(self):
         def stale(_manifest, _ledger, late):
+            late["callers"][0]["image"]["authority"] = "native_exact"
             late["gaps"].append(standing_authority_gap())
         self.run_refusal_case(stale, 1, "CAPACITY-AUTHORITY")
 

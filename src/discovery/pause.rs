@@ -21,6 +21,9 @@ pub(crate) use crate::events::DiscoveryItem;
 /// its hook. Crate-visible so the run loop's gate tests measure against it.
 pub(crate) const CYCLE_NS: u64 = 500_000_000;
 const SAMPLE_NS: u64 = 1_000_000;
+/// Upper bound on the first sample's settling re-samples: one per sample
+/// interval of a cycle. The cycle deadline normally ends it first.
+const MAX_SETTLE_SAMPLES: u64 = CYCLE_NS / SAMPLE_NS;
 /// Stops one arm may chain after its first (GT-4). A confirmed stop installs
 /// a successor while the child is still stopped, so the owned child's next
 /// pause-eligible event — a loader hit, a `C_GetFunctionList` /
@@ -1037,9 +1040,9 @@ impl PauseCoordinator {
             return self.fail_cycle(io, "discovery ring loss in pause epoch", false);
         }
 
-        let first_sample = match self.sample_stopped(io, deadline) {
+        let first_sample = match self.sample_until_stopped(io, deadline) {
             Ok(sample) => sample,
-            Err(error) => return self.fail_cycle(io, error, false),
+            Err((error, lifecycle)) => return self.fail_cycle(io, error, lifecycle),
         };
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
@@ -1410,7 +1413,51 @@ impl PauseCoordinator {
         self.finish_nonconfirmed(retained_error.unwrap_or_else(|| MSG_PAUSE_HELPER_REJECTED.into()))
     }
 
+    /// A strict sample: every thread must already be stopped. Used once the
+    /// stop was seen complete, where a running thread means it was continued
+    /// under the stop.
     fn sample_stopped(&mut self, io: &mut impl PauseIo, deadline: u64) -> Result<u64, String> {
+        self.sample_tasks(io, deadline, false)?
+            .ok_or_else(|| MSG_TASK_SET_CHANGED.into())
+    }
+
+    /// The stop's first sample. The helper's SIGSTOP is queued before its
+    /// record, but on a loaded host a thread can still be running or about to
+    /// be woken into the group stop when the record is serviced. Re-sample at
+    /// the existing 1 ms cadence until every thread is stopped, inside the
+    /// stop's existing deadline and never more than one cycle of samples. A
+    /// thread still not stopped then keeps today's task-set refusal; a
+    /// changed set (vanished, reused or undated thread) refuses at once.
+    /// Nothing is attached before this returns, so a thread that ran while the
+    /// stop settled only ran before the hooks changed. The error carries
+    /// whether it is a lifecycle failure (a failed wait).
+    fn sample_until_stopped(
+        &mut self,
+        io: &mut impl PauseIo,
+        deadline: u64,
+    ) -> Result<u64, (String, bool)> {
+        for attempt in 0..=MAX_SETTLE_SAMPLES {
+            match self.sample_tasks(io, deadline, true) {
+                Ok(Some(now)) => return Ok(now),
+                Ok(None) => {}
+                Err(error) if attempt > 0 && error == MSG_PAUSE_CONFIRMATION_DEADLINE => {
+                    return Err((MSG_TASK_SET_CHANGED.into(), false));
+                }
+                Err(error) => return Err((error, false)),
+            }
+            io.wait_one_ms().map_err(|error| (error, true))?;
+        }
+        Err((MSG_TASK_SET_CHANGED.into(), false))
+    }
+
+    /// One task sample. `Ok(None)` (only while `settling`): the set is valid
+    /// but some thread is not stopped yet; nothing is adopted from it.
+    fn sample_tasks(
+        &mut self,
+        io: &mut impl PauseIo,
+        deadline: u64,
+        settling: bool,
+    ) -> Result<Option<u64>, String> {
         let states = io.task_states(self.pid)?;
         let starts = io.task_starts(self.pid)?;
         // Read after the starts: a later read can only see a later attach.
@@ -1421,6 +1468,9 @@ impl PauseCoordinator {
         }
         let births = self.covered_births(&states, &starts, last_attach)?;
         if states.values().any(|state| *state != b'T') {
+            if settling {
+                return Ok(None);
+            }
             return Err(MSG_TASK_SET_CHANGED.into());
         }
         for (tid, start) in births {
@@ -1429,16 +1479,17 @@ impl PauseCoordinator {
             }
             self.expected_starts.insert(tid, start);
         }
-        Ok(now)
+        Ok(Some(now))
     }
 
-    /// Threads born after the last completed provider hook attach, by more
-    /// than one tick of margin, that this sample may adopt into the expected
-    /// set. Uprobes are per file: once attached they fire for every thread,
-    /// so such a thread never ran with a provider unhooked. The pause arm is
+    /// Threads whose floored birth is strictly after the last completed
+    /// provider hook attach (see [`birth_covered`]), which this sample may
+    /// adopt into the expected set. Uprobes are per file: once attached they
+    /// fire for every thread, so such a thread never ran with a provider
+    /// unhooked. The pause arm is
     /// deliberately not the instant: a frame or successor re-arm is no attach.
     /// Every other change — a missing expected tid, a reused tid (same tid,
-    /// different start time), a birth at or within one tick of the attach, an
+    /// different start time), a floored birth at or before the attach, an
     /// unreadable start time, no recorded attach or one in flight — keeps
     /// today's task-set refusal. An adopted thread is then held to every later
     /// sample like a preflight thread, so this stop's own attach (which it was
@@ -2822,16 +2873,28 @@ pub(crate) fn read_task_starts(pid: u32) -> Result<BTreeMap<u32, u64>, String> {
     Ok(starts)
 }
 
-/// Whether a start-time tick dates strictly more than one tick after the last
-/// completed provider hook attach. The tick floor is a lower bound on the true
-/// birth, so a satisfied check proves the margin; no recorded attach (or one in
-/// flight) covers nothing, and a saturated instant covers nothing either.
+/// Whether a thread's birth provably follows the last completed provider hook
+/// attach: `start_ticks * tick_ns > attach_ns` (ruling PT-3).
+///
+/// Why the floor alone is sound: `fs/proc/array.c` `do_task_stat` reports
+/// `nsec_to_clock_t(timens_add_boottime_ns(task->start_boottime))`.
+/// `copy_process` (`kernel/fork.c`) sets `start_boottime =
+/// ktime_get_boottime_ns()` before the task is made visible or woken, so it
+/// precedes anything the thread runs. `timens_add_boottime_ns` adds the
+/// *reader's* time-namespace boottime offset, the same offset
+/// `posix_get_boottime_timespec` (`kernel/time/posix-timers.c`) adds to this
+/// observer's own `CLOCK_BOOTTIME`, so both values share one domain. With
+/// `NSEC_PER_SEC % USER_HZ == 0` (USER_HZ 100 on x86-64), `nsec_to_clock_t`
+/// is an exact floor division, so `start_ticks * tick_ns <= birth_ns`; a
+/// truncated `tick_ns` only lowers the bound. Hence a floor strictly after
+/// the attach proves the birth is after it. Checked against the 6.6.157,
+/// 6.12.111 and 7.0.14 sources. Equality is not covered, and neither is a
+/// missing instant (none recorded or one in flight) or a saturated one.
 fn birth_covered(start_ticks: u64, last_attach_boot_ns: Option<u64>) -> bool {
     let Some(attach) = last_attach_boot_ns else {
         return false;
     };
-    let tick = clock_tick_ns();
-    start_ticks.saturating_mul(tick) > attach.saturating_add(tick)
+    start_ticks.saturating_mul(clock_tick_ns()) > attach
 }
 
 fn parse_task_start(stat: &[u8]) -> Option<u64> {
@@ -2844,10 +2907,9 @@ fn parse_task_start(stat: &[u8]) -> Option<u64> {
     std::str::from_utf8(field).ok()?.parse().ok()
 }
 
-/// The kernel clock tick in nanoseconds (`sysconf(_SC_CLK_TCK)`), cached:
-/// start-time ticks quantize births to this granularity, so the covered margin
-/// is strict in whole ticks. Falls back to USER_HZ 100 when the sysconf read
-/// fails.
+/// The kernel clock tick in nanoseconds (`sysconf(_SC_CLK_TCK)`, USER_HZ),
+/// cached: start-time ticks floor births to this granularity. Falls back to
+/// USER_HZ 100 when the sysconf read fails.
 fn clock_tick_ns() -> u64 {
     static TICK_NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *TICK_NS.get_or_init(|| {
@@ -4419,6 +4481,45 @@ mod tests {
         assert!(
             !io.states.is_empty(),
             "the deadline, not the script, ended it"
+        );
+    }
+
+    /// The settling sample itself: a thread still running when the deadline
+    /// passes returns today's task-set refusal (not the deadline message), a
+    /// first sample already past the deadline keeps the deadline message, and
+    /// a failed wait is a lifecycle failure.
+    #[test]
+    fn settling_sample_reports_todays_refusal_at_the_deadline() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            states: std::iter::repeat_with(|| Ok(running_42()))
+                .take(2_000)
+                .collect(),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut io, 5 * SAMPLE_NS),
+            Err((MSG_TASK_SET_CHANGED.into(), false))
+        );
+        assert!((4..=6).contains(&waits(&io)), "{} waits", waits(&io));
+
+        let mut late = FakeIo {
+            fallback_now: 10,
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut late, 5),
+            Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
+        );
+
+        let mut failing = FakeIo {
+            states: VecDeque::from([Ok(running_42())]),
+            fail_wait: true,
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut failing, CYCLE_NS),
+            Err(("wait".into(), true))
         );
     }
 

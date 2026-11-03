@@ -835,15 +835,19 @@ fn native_semantic_resource_final_types_pinned() {
     // +8 (cf644635f): the inline `semantic_capture` summary carries the
     // additive `events_lost` ring-loss count (one u64; the summary grows
     // 40 -> 48), measured 1184.
+    // +40: the optional staged reload-disclosure view (two u64 counts
+    // plus the identities vector), measured 1224.
     pin!(crate::inventory_present::PresentationRenderIndex, 8);
     pin!(crate::inventory_semantics::SemanticCaptureSummary, 48);
     // +24 (c9e1dd977): one inline Vec of pre-arm interval rows, one row
     // per `--prearm-module` input; the pin was never re-measured for it.
     // v0.6.0 `--exclude-module`: two more inline Vecs (excluded files,
     // unmatched inputs), +48.
+    // B17 leg 2: the staged reload disclosure `Option` adds 40 B inline,
+    // 1176 -> 1216.
     pin!(
         crate::inventory_present::Presentation,
-        1176 + size_of::<crate::inventory_present::PresentationRenderIndex>()
+        1216 + size_of::<crate::inventory_present::PresentationRenderIndex>()
             + 3 * size_of::<Vec<u8>>()
     );
     // Supporting payload: RoutedCall carries one EventRecord.

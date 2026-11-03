@@ -1559,6 +1559,23 @@ impl CallerRegistry {
     pub(crate) fn instances(&self) -> impl Iterator<Item = &InstanceRecord> {
         self.instance_state.records.values()
     }
+
+    /// B17 leg-2 inventory projection: every registered instance for one
+    /// ledger identity's `(domain, image)` as `(router id, instance,
+    /// module)` rows. Records are append-only, so the match is exact for
+    /// the snapshot; the projection groups rows by their recorded module.
+    pub(crate) fn reload_disclosure_instances(
+        &self,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+    ) -> Vec<(u64, RegistryInstanceId, ModuleId)> {
+        self.instance_state
+            .records
+            .values()
+            .filter(|record| record.key.domain == domain && record.key.image == image)
+            .map(|record| (record.key.router.get(), record.id, record.module))
+            .collect()
+    }
     pub(crate) fn instance_semantic_edges(&self) -> impl Iterator<Item = &InstanceSemanticRecord> {
         self.instance_state.semantics.values()
     }

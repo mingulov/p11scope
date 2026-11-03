@@ -15,8 +15,8 @@ mod promotion;
 use crate::discovery::caller_registry::OsProcessSource;
 use crate::discovery::caller_registry::instance_input::{
     AdmittedInstanceCall, CallEvidence, CallStanding, ConversionRefusal, InstanceReason,
-    admit_call_from_evidence, admit_registration_from_coverage, finalize_invalidation,
-    tail_loss_from_negative,
+    RegistryInstanceId, admit_call_from_evidence, admit_registration_from_coverage,
+    finalize_invalidation, tail_loss_from_negative,
 };
 use crate::discovery::caller_registry::{CallerLifecycle, ModuleLifecycle};
 use crate::discovery::instances::{MAX_INSTANCES, MAX_PENDING, Route};
@@ -2245,6 +2245,24 @@ impl InventoryCoordinator<OsProcessSource> {
     }
 }
 
+/// B17 leg-2 inventory view of the staged reload disclosure: the exact
+/// router count snapshots plus one entry per affected module, sorted by
+/// module with sorted instances. Renders as the top-level
+/// `instance_reload_not_excluded` inventory object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InventoryReloadDisclosure {
+    pub continued_across_global: u64,
+    pub joined_across_global: u64,
+    pub identities: Vec<InventoryReloadDisclosureIdentity>,
+}
+
+/// One affected module and its disclosed registered instances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InventoryReloadDisclosureIdentity {
+    pub module: ModuleId,
+    pub instances: Vec<RegistryInstanceId>,
+}
+
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Borrow the actual retained classic batch without preparing or consuming it.
     #[cfg(test)]
@@ -2422,6 +2440,56 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             continued_across_global: state.continued_across_global,
             joined_across_global: state.joined_across_global,
             identities,
+        })
+    }
+
+    /// B17 leg-2 inventory projection of the staged disclosure ledger:
+    /// the exact router count snapshots plus one entry per affected
+    /// module with the sorted registered instances, or `None` when the
+    /// capture has no producer (same absent rule as
+    /// [`Self::reload_not_excluded_evidence`]). Each router ID resolves
+    /// through its registered instance, so the named module is always
+    /// the one conversion recorded — never a second lookup that could
+    /// disagree. Unregistered IDs are omitted, identities with nothing
+    /// nameable are dropped, and the counts stay exact; no file slot,
+    /// router ID, task cookie or exec ID leaves the ledger.
+    pub(crate) fn reload_disclosure_for_inventory(&self) -> Option<InventoryReloadDisclosure> {
+        let state = self.semantic_finalizer.as_ref()?;
+        if state.reload_not_excluded.is_empty()
+            && state.continued_across_global == 0
+            && state.joined_across_global == 0
+        {
+            return None;
+        }
+        let mut groups: BTreeMap<ModuleId, BTreeSet<RegistryInstanceId>> = BTreeMap::new();
+        for ((cookie, exec, _slot), (_entry_slot, ids)) in state.reload_not_excluded.iter() {
+            if ids.is_empty() {
+                continue;
+            }
+            let wanted: BTreeSet<u64> = ids.iter().copied().collect();
+            let image = ImageIdentity {
+                task_cookie: *cookie,
+                exec_id: *exec,
+            };
+            for (router, instance, module) in self
+                .registry
+                .reload_disclosure_instances(state.domain, image)
+            {
+                if wanted.contains(&router) {
+                    groups.entry(module).or_default().insert(instance);
+                }
+            }
+        }
+        Some(InventoryReloadDisclosure {
+            continued_across_global: state.continued_across_global,
+            joined_across_global: state.joined_across_global,
+            identities: groups
+                .into_iter()
+                .map(|(module, instances)| InventoryReloadDisclosureIdentity {
+                    module,
+                    instances: instances.into_iter().collect(),
+                })
+                .collect(),
         })
     }
 

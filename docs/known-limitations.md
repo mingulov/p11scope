@@ -53,7 +53,11 @@ withhold the detail as `broad_stopping`, so an owned `run`
 child that loads and exits at once may still void intermittently (about
 1 in 10 runs in local testing). A child that keeps running for a
 few seconds after its provider loads is unaffected (measured with a
-3-second gap).
+3-second gap). Each bracketing read samples the return-value table
+before the slot counters, so a call that completes between the two
+passes leaves a torn window and the detail is withheld as
+`broad_plan_topology`; against a busy `--pid` target this can withhold
+most windows.
 With `run`, a host whose kernel and userspace monotonic clocks cannot
 be compared (a time namespace offset, or a kernel without the time
 namespace files) refuses the selection as `promotion_scope_unsupported`.

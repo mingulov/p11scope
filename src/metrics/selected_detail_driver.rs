@@ -1317,12 +1317,13 @@ pub(super) fn close_k0_window_with_tail_and_losses(
     // Torn-read guard: each bracketing read takes the return-value map
     // first and the slot stats after, so a window overlapping live
     // calls can pair one read's stats with the other's return-value
-    // counts. Every counted return adds exactly one return-value
-    // count (BPF `account_return`), and any return-value update
-    // failure already voids the read, so a windowed row whose
-    // `rv_counts` sum differs from its `returned` delta is torn in
-    // either direction: refuse the detail as a topology mismatch
-    // rather than render rows that disagree with the main report.
+    // counts. Bank returns run native `p11_bank_complete`/`_timed`,
+    // which count the return before its return value, and a full
+    // return-value table does not void the read (its counts are a
+    // lower bound), so a windowed row whose `rv_counts` sum differs
+    // from its `returned` delta is torn in either direction: refuse
+    // the detail as a topology mismatch rather than render rows that
+    // disagree with the main report.
     if deltas.iter().any(|delta| {
         delta
             .rv_counts
@@ -4550,9 +4551,25 @@ mod tests {
         Ok(Some(LifecycleFacts::default()))
     }
 
-    /// A scripted read with explicit producer health, through the
-    /// genuine fold and pack (mirrors `scripted_read`, which is
-    /// always healthy).
+    /// The saturated twins must script return values consistent
+    /// with `returned` (the `rv {0: returned}` production shape):
+    /// with no return values the torn-read guard would fire on
+    /// their window and mask a broken saturation latch.
+    fn assert_k0_read_rv_consistent(read: &CounterRead) {
+        for row in read.view().rows.expect("scripted rows") {
+            let view = row.view();
+            let sum: u64 = view.rv_counts.values().sum();
+            assert_eq!(
+                sum, view.returned,
+                "saturated twin scripts consistent return values"
+            );
+        }
+    }
+
+    /// A scripted read with explicit producer health and consistent
+    /// return values (`rv {0: returned}` on every row), through the
+    /// genuine fold and pack (mirrors `scripted_read_consistent`,
+    /// which is always healthy).
     fn k0_scripted_read(
         pool: &SemanticResourcePool,
         plan: &AttachPlan,
@@ -4567,6 +4584,10 @@ mod tests {
             plan.slots.len(),
             "one explicit sample per plan slot"
         );
+        let limits = CounterLimits {
+            rows: plan.slots.len(),
+            rv_keys: plan.slots.len(),
+        };
         let mut rows = Vec::with_capacity(plan.slots.len());
         let held: Vec<CountStats> = counts
             .iter()
@@ -4578,13 +4599,20 @@ mod tests {
             .collect();
         for (slot, index) in plan.slots.iter().zip(0..) {
             let cells = vec![CounterCell::Counts(&held[index])];
+            let slot_rvs = [(
+                RvKey {
+                    slot: slot.index,
+                    _pad: 0,
+                    rv: 0,
+                },
+                counts[index].1,
+            )];
             rows.push(
-                CounterRow::fold(slot, mode, cells, Vec::new(), limits_for(plan))
-                    .expect("explicit cells fold"),
+                CounterRow::fold(slot, mode, cells, slot_rvs, limits).expect("explicit cells fold"),
             );
         }
-        let reservation =
-            ReadReservation::reserve(rows.len(), 0, &pool.reserver()).expect("read reserves");
+        let reservation = ReadReservation::reserve(rows.len(), rows.len(), &pool.reserver())
+            .expect("read reserves");
         CounterRead::new(
             generation,
             mode,
@@ -5281,10 +5309,11 @@ mod tests {
                 contended: false,
             },
         );
+        assert_k0_read_rv_consistent(&saturated_before);
         assert!(
             open_k0_window(
                 resolved,
-                limits_for(&scene.plan),
+                limits_consistent(&scene.plan),
                 scene.pool.reserver(),
                 Ok(saturated_before),
                 k0_clean(),
@@ -5305,7 +5334,7 @@ mod tests {
         let mut ledger = SelectionLedger::new();
         let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
             .expect("live name resolves for the K0 window");
-        let before = scripted_read(
+        let before = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -5315,7 +5344,7 @@ mod tests {
         );
         let window = open_k0_window(
             resolved,
-            limits_for(&scene.plan),
+            limits_consistent(&scene.plan),
             scene.pool.reserver(),
             Ok(before),
             k0_clean(),
@@ -5334,6 +5363,7 @@ mod tests {
                 contended: false,
             },
         );
+        assert_k0_read_rv_consistent(&saturated_after);
         close_k0_window(
             window,
             &scene.plan,
@@ -6701,6 +6731,80 @@ mod tests {
                 .refusal,
             Some("broad_plan_topology"),
             "the torn window refuses"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_none(), "no detail on a refusal");
+        assert!(
+            section.get("aggregate").is_none(),
+            "no aggregate on a refusal"
+        );
+    }
+
+    #[test]
+    fn k0_torn_unselected_row_refuses_as_broad_plan_topology() {
+        // The guard checks every windowed row before the slot
+        // filter: a tear confined to a non-selected row still
+        // refuses, because the aggregate is built scope-wide from
+        // the same deltas. Only slot 0 tears here (entered/returned
+        // 0 with `rv_counts {"0": 4}`); the selected slot 2 stays
+        // consistent.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        assert_eq!(resolved.slot, 2);
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let limits = limits_with_rvs(&scene.plan, 4);
+        let before = scripted_read_with_rvs(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            &vec![vec![(0, 100)]; scene.plan.slots.len()],
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits,
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read_with_rvs(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &[(100, 100, 0), (110, 110, 0), (110, 110, 0), (110, 110, 0)],
+            &[
+                vec![(0, 104)],
+                vec![(0, 110)],
+                vec![(0, 110)],
+                vec![(0, 110)],
+            ],
+            window_of(20, 30),
+        );
+        close_k0_window(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("broad_plan_topology"),
+            "a tear outside the selected slot still refuses"
         );
         let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
         let section = &composed["evidence"]["selected_detail"];

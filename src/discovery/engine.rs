@@ -738,8 +738,8 @@ pub struct Engine {
     /// Test-only one-shot: the next `Memory` loader scan fails without
     /// touching the target. Production reaches a failing resolving scan
     /// only through a live exit race (a dead child fails earlier at maps
-    /// validation), so the zero-state settle twins force the failure and
-    /// drive the real branch, predicate and settlement past it.
+    /// validation), so the zero-state negative twin forces the failure
+    /// and drives the real branch, predicate and settlement past it.
     #[cfg(test)]
     fail_next_loader_memory_scan: bool,
     #[cfg(test)]

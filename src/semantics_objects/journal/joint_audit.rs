@@ -432,6 +432,7 @@ fn vector_capacity(required: usize) -> Option<usize> {
 ///   `establish` on one of a call's input handles. So each object emits
 ///   once for its state at seal start, plus once per input-handle
 ///   re-establishment.
+///
 /// Objects created during the seal are bounded by the touched handles of
 /// each call, and sessions by one per call.
 pub(super) fn result_storage_bound(

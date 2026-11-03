@@ -3627,10 +3627,11 @@ fn joint_pregrant_begin_table_full_closes_during_extension() {
     );
 }
 
-/// One reservation the ledger already holds (a live key association)
-/// leaves room for 1,023 more. A thousand-START backlog then closes the
-/// quantum at that room: the 1,024th START stays on the wire for the
-/// next quantum instead of being refused for want of a reservation.
+/// One reservation the ledger already holds outside the quantum (a
+/// live key association) leaves room for 1,023 STARTs. A
+/// thousand-START backlog then closes the quantum at that room: the
+/// last START waits on the wire for the next quantum instead of being
+/// refused for want of a reservation.
 #[test]
 fn joint_pregrant_ledger_room_closes_before_refusing_a_begin() {
     use crate::semantics_objects::journal::tests::{begin_bytes, function_id};
@@ -3648,11 +3649,22 @@ fn joint_pregrant_ledger_room_closes_before_refusing_a_begin() {
     scene.scene.drain.source_mut().bound = 4_096;
     let pid = std::process::id();
     push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
-    for thread in 1..=1_024 {
+    for (chunk, threads) in [1..=400, 401..=800].into_iter().enumerate() {
+        for thread in threads {
+            let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
+            scene.scene.drain.source_mut().push_record(begin.to_vec());
+        }
+        scene.service(100_000).expect("chunk collects");
+        assert_eq!(
+            phase_of(&scene),
+            "Collecting",
+            "chunk {chunk} extends below the ledger's room"
+        );
+    }
+    for thread in 801..=1_024 {
         let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
         scene.scene.drain.source_mut().push_record(begin.to_vec());
     }
-    scene.service(100_000).expect("the backlog collects");
     assert!(
         drive_until_closed(&mut scene, 512),
         "the ledger's room closes the quantum"
@@ -3665,7 +3677,11 @@ fn joint_pregrant_ledger_room_closes_before_refusing_a_begin() {
         !raw.resource_refused_for_test(),
         "no START was refused for want of a reservation"
     );
-    assert_eq!(raw.invocations_for_test(), 1_023, "the quantum took exactly its room");
+    assert_eq!(
+        raw.invocations_for_test(),
+        1_023,
+        "the quantum took exactly the ledger's room"
+    );
     assert_eq!(
         scene.scene.drain.source_mut().pending_records(),
         1,

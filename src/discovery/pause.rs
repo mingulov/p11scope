@@ -3216,6 +3216,13 @@ mod tests {
         unvalidated_records: u64,
         required_complete: bool,
         fail_wait: bool,
+        /// Waits that succeed before every later wait fails. Default: no limit.
+        fail_wait_after: Option<usize>,
+        waits_done: usize,
+        /// Fails the first stop-clock read after the first boot-clock read
+        /// (the resume hold's), once.
+        fail_first_now_after_boot: bool,
+        boot_read: bool,
         cancelled: bool,
         same_generation: bool,
         same_generation_results: VecDeque<Result<bool, String>>,
@@ -3274,6 +3281,10 @@ mod tests {
                 unvalidated_records: 0,
                 required_complete: true,
                 fail_wait: false,
+                fail_wait_after: None,
+                waits_done: 0,
+                fail_first_now_after_boot: false,
+                boot_read: false,
                 cancelled: false,
                 same_generation: true,
                 same_generation_results: VecDeque::new(),
@@ -3316,6 +3327,10 @@ mod tests {
 
     impl PauseIo for FakeIo {
         fn now_ns(&mut self) -> Result<u64, String> {
+            if self.fail_first_now_after_boot && self.boot_read {
+                self.fail_first_now_after_boot = false;
+                return Err("clock".into());
+            }
             if self.resumed
                 && let Some(now) = self.post_resume_now.pop_front()
             {
@@ -3339,9 +3354,10 @@ mod tests {
 
         fn wait_one_ms(&mut self) -> Result<(), String> {
             self.events.push("wait");
-            if self.fail_wait {
+            if self.fail_wait || self.fail_wait_after.is_some_and(|n| self.waits_done >= n) {
                 return Err("wait".into());
             }
+            self.waits_done += 1;
             self.fallback_now = self.fallback_now.saturating_add(SAMPLE_NS);
             Ok(())
         }
@@ -3386,6 +3402,7 @@ mod tests {
         }
 
         fn boot_now_ns(&mut self) -> Option<u64> {
+            self.boot_read = true;
             self.boot_clock.pop_front().unwrap_or(self.fallback_boot)
         }
 
@@ -4814,6 +4831,172 @@ mod tests {
                 max_waits,
                 "attach {attach:?} boot {boot:?}"
             );
+        }
+    }
+
+    /// The hold never costs the stop its deadline: a confirmed stop whose
+    /// next 1 ms wait could cross the deadline resumes at once, because a
+    /// resume observed late fails the whole run. A birth inside the attach's
+    /// tick then stays partial at the next stop, the safe direction.
+    #[test]
+    fn resume_hold_never_waits_past_the_stop_deadline() {
+        let tick = test_tick_ns();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.now = [10, 11, 496_999_997].into_iter().map(Ok).collect();
+        io.fallback_attach = Some(100 * tick + 1);
+        io.fallback_boot = Some(100 * tick + 2);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0, "{:?}", io.events);
+    }
+
+    /// The hold resumes at once when it cannot read the stop's clock: it has
+    /// no way to know the next wait is inside the deadline.
+    #[test]
+    fn resume_hold_resumes_at_once_without_the_stop_clock() {
+        let tick = test_tick_ns();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = Some(100 * tick);
+        io.fallback_boot = Some(100 * tick);
+        io.fail_first_now_after_boot = true;
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0, "{:?}", io.events);
+    }
+
+    /// A saturated attach instant has no next tick: nothing to wait for.
+    #[test]
+    fn resume_hold_skips_a_saturated_attach_instant() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fallback_attach = Some(u64::MAX);
+        io.fallback_boot = Some(0);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0);
+    }
+
+    /// A wait that fails inside the hold is a lifecycle failure like every
+    /// other wait in the cycle, and the stopped child is still resumed.
+    #[test]
+    fn a_failed_wait_inside_the_resume_hold_is_lifecycle_and_still_resumes() {
+        let tick = test_tick_ns();
+        let held = |fail_wait_after| {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            io.fallback_attach = Some(100 * tick);
+            io.fallback_boot = Some(100 * tick);
+            io.fail_wait_after = fail_wait_after;
+            io
+        };
+        let mut reference = held(None);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        coordinator.service(&mut reference).unwrap();
+        let hold_waits = waits_before_resume(&reference);
+        assert!(hold_waits > 2);
+        let resume = reference
+            .events
+            .iter()
+            .position(|e| *e == "resume")
+            .unwrap();
+        let waits_before_hold = waits(&FakeIo {
+            events: reference.events[..resume - hold_waits].to_vec(),
+            ..FakeIo::default()
+        });
+
+        let mut io = held(Some(waits_before_hold + 2));
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(
+            error.lifecycle(),
+            "a failed hold wait is lifecycle: {error}"
+        );
+        assert_eq!(io.waits_done, waits_before_hold + 2);
+        let last_wait = io.events.iter().rposition(|e| *e == "wait").unwrap();
+        assert!(
+            io.events[last_wait..].contains(&"resume"),
+            "the child is resumed after the failed wait: {:?}",
+            io.events
+        );
+    }
+
+    /// While the stop settles, a thread still on its way into the stop when
+    /// the deadline passes is a late boundary: the deadline message and its
+    /// `later_pause_boundary` category, as for a late fully stopped sample.
+    #[test]
+    fn settling_sample_out_of_time_with_a_thread_on_its_way_reports_the_deadline() {
+        for state in *b"RSD" {
+            let on_its_way: BTreeMap<u32, u8> = [(41, b'T'), (42, state)].into_iter().collect();
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            let mut io = FakeIo {
+                states: VecDeque::from([Ok(on_its_way.clone()), Ok(on_its_way)]),
+                ..FakeIo::default()
+            };
+            assert_eq!(
+                coordinator.sample_until_stopped(&mut io, SAMPLE_NS / 2),
+                Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false)),
+                "state {}",
+                state as char
+            );
+            assert_eq!(waits(&io), 1);
+        }
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.states = std::iter::repeat_with(|| Ok(running_42()))
+            .take(600)
+            .collect();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        let error = coordinator.service(&mut io).unwrap_err();
+
+        assert!(error.required());
+        assert!(
+            format!("{error}").contains(MSG_PAUSE_CONFIRMATION_DEADLINE),
+            "{error}"
+        );
+    }
+
+    /// The other direction: a strict sample with a running thread, and a
+    /// settling sample with a thread that can never reach the stop, keep the
+    /// task-set refusal even past the deadline (ruling PT-6).
+    #[test]
+    fn late_strict_or_unreachable_samples_keep_the_task_set_refusal() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            states: VecDeque::from([Ok(running_42())]),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_stopped(&mut io, 0),
+            Err(MSG_TASK_SET_CHANGED.into())
+        );
+        for state in *b"ZXxt" {
+            let unreachable: BTreeMap<u32, u8> = [(41, b'T'), (42, state)].into_iter().collect();
+            let mut io = FakeIo {
+                states: VecDeque::from([Ok(unreachable)]),
+                ..FakeIo::default()
+            };
+            assert_eq!(
+                coordinator.sample_until_stopped(&mut io, 0),
+                Err((MSG_TASK_SET_CHANGED.into(), false)),
+                "state {}",
+                state as char
+            );
+            assert_eq!(waits(&io), 0);
         }
     }
 

@@ -10704,9 +10704,11 @@ mod tests {
     }
 
     /// Pause thread-birth dating trusts the attach clock: every provider
-    /// attach body must stamp it before its first link mutation, and the
-    /// loader and diagnostic probes (no provider hooks) must not. Deleting a
-    /// stamp would date births against an older attach, the unsafe direction.
+    /// attach body must stamp it before its first link mutation, holding the
+    /// window in a named binding to the end of the body, and the loader and
+    /// diagnostic probes (no provider hooks) must not. Deleting a stamp, or
+    /// dropping its window at once (`let _ =`), would date births against an
+    /// instant before the attach, the unsafe direction.
     #[test]
     fn hook_attach_stamps_cover_every_provider_attach_and_skip_the_loader_and_diagnostic_probes() {
         fn body<'a>(source: &'a str, signature: &str) -> &'a str {
@@ -10719,6 +10721,7 @@ mod tests {
                 .0
         }
         const STAMP: &str = "crate::discovery::pause::hook_attach_window";
+        const BINDING: &str = "let _attach_window =";
         const PROVIDER_ATTACHES: [(&str, &str); 3] = [
             (
                 "    pub(crate) fn attach_targets(",
@@ -10737,10 +10740,14 @@ mod tests {
         fn contract(source: &str) -> bool {
             PROVIDER_ATTACHES.iter().all(|(signature, mutation)| {
                 let text = body(source, signature);
+                let (Some(binding), Some(stamp)) = (text.find(BINDING), text.find(STAMP)) else {
+                    return false;
+                };
                 text.matches(STAMP).count() == 1
-                    && text
-                        .find(mutation)
-                        .is_some_and(|at| text.find(STAMP) < Some(at))
+                    && text.matches(BINDING).count() == 1
+                    && binding < stamp
+                    && !text[binding..stamp].contains(';')
+                    && text.find(mutation).is_some_and(|at| stamp < at)
             }) && UNHOOKED
                 .iter()
                 .all(|signature| !body(source, signature).contains(STAMP))
@@ -10753,6 +10760,11 @@ mod tests {
             assert!(
                 !contract(&format!("{}{}", &source[..start], tail)),
                 "removed the stamp from {signature}"
+            );
+            let dropped = source[start..].replacen(BINDING, "let _ =", 1);
+            assert!(
+                !contract(&format!("{}{}", &source[..start], dropped)),
+                "dropped the window at once in {signature}"
             );
         }
         for signature in UNHOOKED {

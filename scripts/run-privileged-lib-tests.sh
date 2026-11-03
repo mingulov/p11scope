@@ -687,8 +687,8 @@ inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
 inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
 )
 XFAIL_REASONS=(
-"expected failure: lane-A runtime does not converge, the rotation stalls (doc Known limit 2026-10-19); an unexpected pass promotes the cell to the runnable campaign"
-"expected failure: lane-A view-capacity stall (doc Known limit 2026-10-19): owned requests strand and the settle never converges; an unexpected pass promotes the cell to the runnable campaign"
+"expected failure: lane-A runtime does not converge, the rotation stalls (Known limit 2026-10-19, see src/discovery/pressure_native_tests.rs); an unexpected pass promotes the cell to the runnable campaign"
+"expected failure: lane-A view-capacity stall (Known limit 2026-10-19, see src/discovery/pressure_native_tests.rs): owned requests strand and the settle never converges; an unexpected pass promotes the cell to the runnable campaign"
 "expected failure: RED by design while the post-copy-up D-C7-3 re-edge stands (investigation target); an unexpected pass gets noticed for promotion"
 "expected failure: R57 future positive, RED until a provider-free settlement receipt lands (unprivileged, no BPF or root); an unexpected pass un-ignores the cell"
 "expected failure: D3d forced-kernel positive gate fails at exactly-one-module for gate-k1.so on loop and physical btrfs alike (stale-vs-product verdict belongs to src/inventory/privileged_tests.rs); an unexpected pass promotes the cell to the btrfs group"

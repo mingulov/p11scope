@@ -22603,7 +22603,7 @@ impl Engine {
         } else if pids.len() > max_scan_pids {
             self.select_over_cap_desired(&pids)
         } else {
-            // Under-cap polling round, every second under-cap tick: retained
+            // Under-cap polling round, every fourth under-cap tick: retained
             // exploratory views carry no loader context, so without this a
             // process that gains a provider while the capture sits under the
             // cap would never re-scan. Queued here so the requests flow into

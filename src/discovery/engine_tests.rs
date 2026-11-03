@@ -34470,7 +34470,7 @@ fn polling_rescan_upgrades_retained_view_that_gains_a_provider() {
 }
 
 /// F1 (kind pod lane): an under-cap cgroup capture polls its provider-free
-/// processes (a pod's pause container, `sleep infinity`) every second frame,
+/// processes (a pod's pause container, `sleep infinity`) every fourth frame,
 /// and every poll published "queued N retained exploratory views for polling
 /// rescan" as a `discovery unavailable` skip. An exact capture (136/136
 /// probes, exact counts) then read `concrete_gap`, depending only on how

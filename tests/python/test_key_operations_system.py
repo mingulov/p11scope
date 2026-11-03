@@ -383,6 +383,35 @@ class CheckHelperTests(unittest.TestCase):
             self.assertFalse(ok, reason)
             self.assertIn("loss gap", detail)
 
+    def test_s1_events_lost_subject_fails_zero_loss_gate(self):
+        # semantics.rs disclose_events_ring_loss: the subject alone must
+        # fail the gate, with the current reason text or without it.
+        current = ("the EVENTS ring was full; the kernel refused records "
+                   "before the drain could read them "
+                   "(kernel reserve failures; exact count in events_lost)")
+        without_token = ("the EVENTS ring was full; the kernel refused "
+                         "records before the drain could read them")
+        for reason in (current, without_token):
+            gap = {"subject": "native capture events lost", "reason": reason}
+            ok, detail = checks.check_no_loss_gap(self.doc(gaps=[gap]))
+            self.assertFalse(ok, reason)
+            self.assertIn("loss gap", detail)
+
+    def test_s1_events_loss_unknown_subject_fails_zero_loss_gate(self):
+        # semantics.rs poll_and_disclose_events_ring_loss: the subject
+        # alone must fail the gate even when the reason names no
+        # events_lost token (the batch-4 review probe).
+        current = ("the EVENTS ring-loss counter could not be read; "
+                   "events_lost may undercount until a later good read "
+                   "restores the exact cumulative total")
+        probe = "the EVENTS ring-loss counter could not be read"
+        for reason in (current, probe):
+            gap = {"subject": "native capture events loss unknown",
+                   "reason": reason}
+            ok, detail = checks.check_no_loss_gap(self.doc(gaps=[gap]))
+            self.assertFalse(ok, reason)
+            self.assertIn("loss gap", detail)
+
     def test_benign_gaps_never_match(self):
         benign = [
             {"subject": "native capture scope custody unproven",

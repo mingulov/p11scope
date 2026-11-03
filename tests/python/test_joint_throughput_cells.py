@@ -424,5 +424,55 @@ class ResultsRows(unittest.TestCase):
                 self.assertIn("no gcc", row["detail"])
 
 
+class EmitterLedgerCeiling(unittest.TestCase):
+    """The 10k/60s run needs 600k calls; the toolchain must allow it."""
+
+    NEEDED = 10_000 * 60
+
+    def _read_define(self, path, name):
+        text = (ROOT / path).read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.startswith(f"#define {name} "):
+                return int(line.split()[2].rstrip("ulUL"))
+        raise AssertionError(f"{name} not found in {path}")
+
+    def _read_py_const(self, path, name):
+        text = (ROOT / path).read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.startswith(f"{name} = "):
+                return int(line.split("=")[1].strip())
+        raise AssertionError(f"{name} not found in {path}")
+
+    def test_ceilings_cover_10k_60s(self):
+        emitter = self._read_define(
+            "tests/fixtures/joint-throughput/gen-calls.c",
+            "MAX_CALLS_PER_LEDGER")
+        per_call = self._read_define(
+            "tests/fixtures/joint-ledger/per-call-ledger.c", "MAX_CALLS")
+        oracle = self._read_py_const(
+            "scripts/joint-ledger-oracle.py", "MAX_CALLS")
+        events = self._read_py_const(
+            "scripts/s1-throughput-compare.py", "MAX_EVENT_ROWS")
+        self.assertGreaterEqual(emitter, self.NEEDED)
+        self.assertGreaterEqual(per_call, self.NEEDED)
+        self.assertGreaterEqual(oracle, self.NEEDED)
+        self.assertGreaterEqual(events, self.NEEDED)
+        self.assertEqual(emitter, oracle)
+        self.assertEqual(per_call, oracle)
+
+    def test_dry_run_accepts_10k_60s(self):
+        with tempfile.TemporaryDirectory(prefix="jtp-ceil-") as tmp:
+            proc = run_sourced(f'build_emitter "{tmp}/bin"', timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            binary = Path(tmp) / "bin" / "gen-calls"
+            for mode in ("keyed", "keyed-churn"):
+                dry = subprocess.run(
+                    [str(binary), "--dry-run", "/nonexistent-provider.so",
+                     mode, "10k", "60", f"{tmp}/ledger.jsonl"],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(dry.returncode, 0, dry.stderr)
+                self.assertIn("600000 calls", dry.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -120,8 +120,8 @@ call shape depends on both packages:
   between exact-count shapes, one entry pins every observed shape; the
   actual (cause set, pause) pair must equal the primary or one
   alternate jointly, so a mix of two shapes or any third shape fails.
-  Alternates share the entry's `p11kit_skip`; each alternate names the
-  lane that owns the flap.
+  Alternates share the entry's `p11kit_skip`; the entry names the lane
+  that owns the flap and the recheck.
 
 Counts, tool exit, report schema and the metrics skip rule are
 strict and never pinned: a metrics twin must skip nothing except,

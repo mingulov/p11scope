@@ -152,8 +152,8 @@
      },
      {
       "cause": "discovery_truncated",
-      "owner": "exec-real-providers",
-      "reason": "a non-spied subject scan truncated with the spied counts exact (flaps 1/4 on quiet runs; see final text)"
+      "owner": "wu11-k0, batch 5b",
+      "reason": "a non-spied subject scan truncated with the spied counts exact (flaps 1/4 on quiet runs with identical counts; open K0 exit-ended truncation work, recheck on the batch-5b tree)"
      }
     ],
     "os": "fedora",
@@ -164,7 +164,39 @@
      "reason": "pause confirmed on every owner",
      "status": "sigstop"
     },
-    "tool_version": "3.130.0-1.fc44"
+    "tool_version": "3.130.0-1.fc44",
+    "alternates": [
+     {
+      "observation": [
+       {
+        "cause": "skipped",
+        "owner": "exec-real-providers",
+        "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+       },
+       {
+        "cause": "surfaces",
+        "owner": "exec-scan-legacy32",
+        "reason": "SoftHSM 2.7 68-entry 3.2 table reads known_prefix"
+       },
+       {
+        "cause": "loader_discovery",
+        "owner": "exec-real-providers",
+        "reason": "live-loader timing gap with confirmed pause (unproven classification)"
+       },
+       {
+        "cause": "interface_selection",
+        "owner": "exec-real-providers",
+        "reason": "selection loss beside unverified tables"
+       }
+      ],
+      "pause": {
+       "owner": "exec-real-providers",
+       "reason": "pause confirmed on every owner",
+       "status": "sigstop"
+      }
+     }
+    ],
+    "provisional": true
    },
    {
     "observation": [

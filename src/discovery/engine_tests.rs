@@ -4451,7 +4451,12 @@ fn exit_mapping_spawn_guards_reap_dropped_children() {
 }
 
 /// Reap helper for the live exit-mapping cell's spawn window: reaps
-/// each owned child in role order through `reap`.
+/// each owned child in role order through `reap`. Each child leaves
+/// the guard only when its own reap starts, so a panic mid-reap
+/// leaves the remainder guarded: the guard's drop still kills and
+/// reaps them. (A `Vec::drain` would detach the whole batch up
+/// front, and its drop would discard the unreaped remainder with no
+/// kill or wait.)
 fn reap_owned_children(
     owned: &mut ExitMappingChildrenGuard,
     roles: &[&str],
@@ -4464,8 +4469,8 @@ fn reap_owned_children(
         owned.0.len(),
         roles.len()
     );
-    for (child, role) in owned.0.drain(..).zip(roles.iter().copied()) {
-        reap(child, role);
+    for role in roles {
+        reap(owned.0.remove(0), role);
     }
 }
 
@@ -4956,23 +4961,24 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             .spawn()
             .expect("spawn threaded mapper");
         let threaded_pid = threaded_child.id();
-        // Guarded: a panic mid-reap still kills and reaps whatever
-        // the drain below has not consumed yet.
+        // Guarded: each child leaves the guard only when its own
+        // reap starts, so a panic mid-reap still kills and reaps
+        // whatever the loop below has not consumed yet.
         let mut owned_children =
             ExitMappingChildrenGuard(vec![mapper_child, plain_child, threaded_child]);
-        for (child, role) in owned_children
-            .0
-            .drain(..)
-            .zip(["mapper", "plain", "threaded"])
-        {
-            let output = child.wait_with_output().expect("reap owned child");
-            assert!(
-                output.status.success(),
-                "{what}: owned {role} child exited {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+        reap_owned_children(
+            &mut owned_children,
+            &["mapper", "plain", "threaded"],
+            |child, role| {
+                let output = child.wait_with_output().expect("reap owned child");
+                assert!(
+                    output.status.success(),
+                    "{what}: owned {role} child exited {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            },
+        );
         move_out.move_out(what);
         let owned = [mapper_pid, plain_pid, threaded_pid];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);

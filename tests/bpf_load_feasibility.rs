@@ -18,7 +18,7 @@
 //! (default 10 for the per-program cell, 5 for the parallel cell); the
 //! cleanup twin always runs once.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::os::fd::RawFd;
@@ -538,6 +538,152 @@ fn per_program_load_times() {
     }
 }
 
+/// Env var naming a `per_program_load_times.jsonl` whose warm means
+/// deal the parallel partition on THIS host; unset keeps the
+/// dev-host 7.0 const order with a loud warning.
+const BASELINE_ENV: &str = "P11SCOPE_FEASIBILITY_BASELINE";
+
+/// Warm per-program mean walls (ns) in the parallel configuration
+/// plus the warm maps mean (ns), parsed from a baseline JSONL.
+#[derive(Debug)]
+struct BaselineCosts {
+    programs: BTreeMap<String, f64>,
+    maps_mean_ns: f64,
+}
+
+fn mean_ns(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len().max(1) as f64
+}
+
+/// Warm means for one object from a per-program JSONL: per-program
+/// walls in the exact parallel configuration (multi variant where the
+/// matrix measured one, else single) plus the maps mean. Cold trials
+/// and other objects/cells are excluded; a malformed line or a
+/// missing warm section fails loud.
+fn baseline_program_costs(path: &str, object: &str) -> Result<BaselineCosts, String> {
+    let text = fs::read_to_string(path).map_err(|error| format!("read {path}: {error}"))?;
+    let mut program_walls: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    let mut maps_walls: Vec<f64> = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| format!("{path} line {}: bad JSON: {error}", index + 1))?;
+        let cell = row.get("cell").and_then(serde_json::Value::as_str);
+        let row_object = row.get("object").and_then(serde_json::Value::as_str);
+        if cell != Some("per_program_load_times") || row_object != Some(object) {
+            continue;
+        }
+        if row.get("cold").and_then(serde_json::Value::as_bool) != Some(false) {
+            continue;
+        }
+        let wall = row
+            .get("wall_ns")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        match row.get("phase").and_then(serde_json::Value::as_str) {
+            Some("maps") => maps_walls.push(wall),
+            Some("program") => {
+                let name = row
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| format!("{path} line {}: program row lacks name", index + 1))?;
+                let variant = row
+                    .get("variant")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        format!("{path} line {}: program row lacks variant", index + 1)
+                    })?;
+                program_walls
+                    .entry((name.to_string(), variant.to_string()))
+                    .or_default()
+                    .push(wall);
+            }
+            _ => {}
+        }
+    }
+    if maps_walls.is_empty() {
+        return Err(format!("{path}: no warm maps rows for {object}"));
+    }
+    let mut names = BTreeSet::new();
+    for (name, _) in program_walls.keys() {
+        names.insert(name.clone());
+    }
+    let mut programs = BTreeMap::new();
+    for name in names {
+        let walls = program_walls
+            .get(&(name.clone(), "multi".to_string()))
+            .or_else(|| program_walls.get(&(name.clone(), "single".to_string())))
+            .ok_or_else(|| format!("{path}: program {name} has no warm rows"))?;
+        programs.insert(name, mean_ns(walls));
+    }
+    Ok(BaselineCosts {
+        programs,
+        maps_mean_ns: mean_ns(&maps_walls),
+    })
+}
+
+/// Descending-cost deal order over exactly the embedded program set;
+/// fails loud on drift either way (baseline missing a program, or
+/// naming one the object no longer ships).
+fn order_by_cost(
+    costs: &BTreeMap<String, f64>,
+    expected: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let mut missing: Vec<&str> = expected
+        .iter()
+        .filter(|name| !costs.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    missing.sort_unstable();
+    if !missing.is_empty() {
+        return Err(format!("baseline lacks programs: {}", missing.join(", ")));
+    }
+    let mut unknown: Vec<&str> = costs
+        .keys()
+        .filter(|name| !expected.contains(*name))
+        .map(String::as_str)
+        .collect();
+    unknown.sort_unstable();
+    if !unknown.is_empty() {
+        return Err(format!("baseline has unknown programs: {}", unknown.join(", ")));
+    }
+    let mut order: Vec<String> = expected.iter().cloned().collect();
+    order.sort_by(|left, right| {
+        costs[right]
+            .partial_cmp(&costs[left])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(order)
+}
+
+/// Round-robin deal over descending cost (LPT): keeps worker sums
+/// balanced without stacking the heavy programs on one worker.
+fn deal_round_robin(order: &[String], workers: usize) -> Vec<Vec<String>> {
+    let mut parts: Vec<Vec<String>> = vec![Vec::new(); workers];
+    for (index, name) in order.iter().enumerate() {
+        parts[index % workers].push(name.clone());
+    }
+    parts
+}
+
+/// Max/min worker program-cost-sum ratio; `None` when a worker sum is
+/// zero (no numeric costs, or a degenerate empty worker).
+fn worker_balance(parts: &[Vec<String>], costs: &BTreeMap<String, f64>) -> Option<f64> {
+    let sums: Vec<f64> = parts
+        .iter()
+        .map(|part| {
+            part.iter()
+                .map(|name| costs.get(name).copied().unwrap_or(0.0))
+                .sum()
+        })
+        .collect();
+    let max = sums.iter().cloned().fold(0.0, f64::max);
+    let min = sums.iter().cloned().fold(f64::INFINITY, f64::min);
+    if min > 0.0 { Some(max / min) } else { None }
+}
+
 /// One worker's loaded program: name, section, variant, load wall,
 // program id, verifier-reported processed insns.
 type WorkerRow = (String, String, &'static str, Duration, u32, Option<u32>);
@@ -574,9 +720,10 @@ fn parallel_load_measures_kernel_overlap() {
         "need at least 4 programs to split across workers"
     );
     // Longest-processing-time order from the lane's own per-program means
-    // (per_program_load_times, warm multi): dealing round-robin over
-    // descending cost balances worker sums. The set equality below fails
-    // loud if the object gains, loses, or renames a program.
+    // (per_program_load_times, warm multi on the dev host, kernel 7.0):
+    // dealing round-robin over descending cost balances worker sums.
+    // Fallback when P11SCOPE_FEASIBILITY_BASELINE is unset; other
+    // hosts/kernels must pass their own baseline JSONL.
     const COST_ORDER: [&str; 20] = [
         "p11_return",
         "interface_list_worker",
@@ -603,25 +750,72 @@ fn parallel_load_measures_kernel_overlap() {
     for (name, section) in &programs {
         by_name.insert(name.as_str(), section.clone());
     }
-    assert_eq!(
-        by_name.len(),
-        COST_ORDER.len(),
-        "{CELL}: Detailed program set drifted; re-derive COST_ORDER"
-    );
-    for name in COST_ORDER {
-        assert!(
-            by_name.contains_key(name),
-            "{CELL}: Detailed program {name} missing; re-derive COST_ORDER"
-        );
-    }
+    // The set equality in both branches fails loud if the object
+    // gains, loses, or renames a program.
+    let expected: BTreeSet<String> = by_name.keys().map(|name| name.to_string()).collect();
+    let (cost_order, cost_source, baseline) = match std::env::var_os(BASELINE_ENV) {
+        Some(path) => {
+            let path = path.to_string_lossy().into_owned();
+            let baseline = baseline_program_costs(&path, "detailed")
+                .unwrap_or_else(|error| panic!("{CELL}: baseline {path}: {error}"));
+            let order = order_by_cost(&baseline.programs, &expected)
+                .unwrap_or_else(|error| panic!("{CELL}: baseline {path}: {error}"));
+            println!(
+                "{CELL}: deal order from baseline {path} ({} programs)",
+                order.len()
+            );
+            (order, format!("baseline:{path}"), Some(baseline))
+        }
+        None => {
+            assert_eq!(
+                by_name.len(),
+                COST_ORDER.len(),
+                "{CELL}: Detailed program set drifted; re-derive COST_ORDER"
+            );
+            for name in COST_ORDER {
+                assert!(
+                    by_name.contains_key(name),
+                    "{CELL}: Detailed program {name} missing; re-derive COST_ORDER"
+                );
+            }
+            println!(
+                "{CELL}: WARNING: {BASELINE_ENV} unset; dealing by the dev-host 7.0 const order — pass this host's per_program JSONL on other kernels"
+            );
+            (
+                COST_ORDER.iter().map(|name| name.to_string()).collect(),
+                "const-fallback-7.0".to_string(),
+                None,
+            )
+        }
+    };
     for workers in [2usize, 4usize] {
         // LPT partition: round-robin over descending cost keeps worker
         // sums balanced (name-sorted round-robin stacked p11_return and
         // interface_list_worker on one worker, capping speedup at 1.5x).
+        let deal = deal_round_robin(&cost_order, workers);
+        let balance = baseline
+            .as_ref()
+            .and_then(|costs| worker_balance(&deal, &costs.programs));
+        match balance {
+            Some(ratio) => {
+                println!("{CELL}: workers={workers}: baseline cost balance max/min={ratio:.2}x");
+                if ratio > 1.5 {
+                    println!(
+                        "{CELL}: WARNING: workers={workers}: imbalanced deal ({ratio:.2}x); speedup understates kernel overlap"
+                    );
+                }
+            }
+            None if baseline.is_some() => println!(
+                "{CELL}: WARNING: workers={workers}: balance unknown (zero cost sum)"
+            ),
+            None => {}
+        }
         let mut parts: Vec<Vec<(String, aya_obj::ProgramSection)>> = vec![Vec::new(); workers];
-        for (index, name) in COST_ORDER.iter().enumerate() {
-            let section = by_name.get(name).expect("checked above").clone();
-            parts[index % workers].push((name.to_string(), section));
+        for (worker, subset) in deal.into_iter().enumerate() {
+            for name in subset {
+                let section = by_name.get(name.as_str()).expect("checked above").clone();
+                parts[worker].push((name, section));
+            }
         }
         for trial in 0..trials {
             let barrier = Arc::new(Barrier::new(workers + 1));
@@ -704,6 +898,7 @@ fn parallel_load_measures_kernel_overlap() {
                 "object": "detailed", "workers": workers, "trial": trial,
                 "phase": "summary", "parallel_wall_ns": parallel_wall.as_nanos() as u64,
                 "serial_sum_ns": serial_sum.as_nanos() as u64, "speedup": speedup,
+                "cost_source": cost_source, "worker_balance": balance,
             }));
             println!(
                 "{CELL}: workers={workers} trial={trial}: parallel={:.3}s serial-sum={:.3}s speedup={speedup:.2}x",
@@ -1015,7 +1210,6 @@ fn resident_service_cost_parts() {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use std::io::Write as _;
 
     fn fake_sysctl(initial: &str) -> (tempfile::NamedTempFile, String) {
         let mut file = tempfile::NamedTempFile::new().expect("temp sysctl");
@@ -1150,5 +1344,114 @@ mod unit_tests {
             drop_caches_for_cold_at(missing.to_str().expect("utf8")),
             "fresh-process-first-trial"
         );
+    }
+
+    fn program_row(name: &str, variant: &str, wall_ns: u64, cold: bool) -> String {
+        format!(
+            r#"{{"cell":"per_program_load_times","object":"detailed","cold":{cold},"phase":"program","name":"{name}","variant":"{variant}","wall_ns":{wall_ns}}}"#
+        )
+    }
+
+    fn maps_row(wall_ns: u64, cold: bool) -> String {
+        format!(
+            r#"{{"cell":"per_program_load_times","object":"detailed","cold":{cold},"phase":"maps","wall_ns":{wall_ns}}}"#
+        )
+    }
+
+    fn write_baseline(lines: &[String]) -> (tempfile::NamedTempFile, String) {
+        let mut file = tempfile::NamedTempFile::new().expect("temp baseline");
+        for line in lines {
+            file.write_all(line.as_bytes()).expect("write row");
+            file.write_all(b"\n").expect("write newline");
+        }
+        file.flush().expect("flush baseline");
+        let path = file.path().to_str().expect("utf8 temp path").to_string();
+        (file, path)
+    }
+
+    #[test]
+    fn baseline_prefers_multi_and_skips_cold() {
+        let (_file, path) = write_baseline(&[
+            program_row("prog-a", "multi", 100, false),
+            program_row("prog-a", "multi", 200, false),
+            program_row("prog-a", "single", 10, false),
+            program_row("prog-a", "multi", 9999, true),
+            program_row("prog-b", "single", 50, false),
+            program_row("prog-b", "single", 70, false),
+            maps_row(20, false),
+            maps_row(30, false),
+            maps_row(9999, true),
+            r#"{"cell":"per_program_load_times","object":"counter-counts","cold":false,"phase":"program","name":"prog-a","variant":"multi","wall_ns":9999}"#.to_string(),
+            r#"{"cell":"other_cell","object":"detailed","cold":false,"phase":"maps","wall_ns":9999}"#.to_string(),
+            r#"{"cell":"per_program_load_times","object":"detailed","cold":false,"phase":"btf","wall_ns":9999}"#.to_string(),
+        ]);
+        let costs = baseline_program_costs(&path, "detailed").expect("parse baseline");
+        assert_eq!(costs.programs.get("prog-a"), Some(&150.0));
+        assert_eq!(costs.programs.get("prog-b"), Some(&60.0));
+        assert_eq!(costs.maps_mean_ns, 25.0);
+    }
+
+    #[test]
+    fn baseline_refuses_missing_file() {
+        let error = baseline_program_costs("/nonexistent/baseline.jsonl", "detailed")
+            .expect_err("missing file must fail loud");
+        assert!(error.contains("read"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn baseline_refuses_without_warm_maps() {
+        let (_file, path) = write_baseline(&[program_row("prog-a", "single", 10, false)]);
+        let error = baseline_program_costs(&path, "detailed")
+            .expect_err("maps-less baseline must fail loud");
+        assert!(error.contains("no warm maps"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn baseline_refuses_bad_json() {
+        let (_file, path) = write_baseline(&["{bad json".to_string()]);
+        let error = baseline_program_costs(&path, "detailed")
+            .expect_err("corrupt line must fail loud");
+        assert!(error.contains("bad JSON"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn order_by_cost_sorts_descending_and_checks_sets() {
+        let costs = BTreeMap::from([
+            ("a".to_string(), 1.0),
+            ("b".to_string(), 3.0),
+            ("c".to_string(), 2.0),
+        ]);
+        let expected = BTreeSet::from(["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            order_by_cost(&costs, &expected).expect("exact set"),
+            vec!["b".to_string(), "c".to_string(), "a".to_string()]
+        );
+        let wide = BTreeSet::from(["a".to_string(), "b".to_string(), "zzz".to_string()]);
+        let error = order_by_cost(&costs, &wide).expect_err("missing must fail");
+        assert!(error.contains("zzz"), "unexpected: {error}");
+        let narrow = BTreeSet::from(["a".to_string()]);
+        let error = order_by_cost(&costs, &narrow).expect_err("unknown must fail");
+        assert!(error.contains("unknown"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn deal_round_robin_splits_descending() {
+        let order: Vec<String> = (0..5).map(|index| format!("n{index}")).collect();
+        assert_eq!(
+            deal_round_robin(&order, 2),
+            vec![
+                vec!["n0".to_string(), "n2".to_string(), "n4".to_string()],
+                vec!["n1".to_string(), "n3".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_balance_reports_ratio() {
+        let costs = BTreeMap::from([("a".to_string(), 3.0), ("b".to_string(), 1.0)]);
+        let parts = vec![vec!["a".to_string()], vec!["b".to_string()]];
+        assert_eq!(worker_balance(&parts, &costs), Some(3.0));
+        let empty: BTreeMap<String, f64> = BTreeMap::new();
+        assert_eq!(worker_balance(&parts, &empty), None);
     }
 }

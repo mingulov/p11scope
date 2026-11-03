@@ -1208,6 +1208,9 @@ impl PauseCoordinator {
             return self.fail_cycle(io, error.to_string(), lifecycle);
         }
 
+        if let Err(error) = hold_until_the_attach_tick_passes(io, deadline) {
+            return self.fail_cycle(io, error, true);
+        }
         match io.cancelled() {
             Ok(false) => {}
             Ok(true) => return self.fail_cycle(io, "pause coordination cancelled", true),
@@ -1215,9 +1218,6 @@ impl PauseCoordinator {
         }
         if let Err(error) = self.check_ring_loss(io) {
             return self.fail_cycle(io, error, false);
-        }
-        if let Err(error) = hold_until_the_attach_tick_passes(io) {
-            return self.fail_cycle(io, error, true);
         }
         self.epoch.resume_attempted = true;
         if let Err(error) = io.resume() {
@@ -1470,7 +1470,7 @@ impl PauseCoordinator {
     /// be woken into the group stop when the record is serviced. Re-sample at
     /// the existing 1 ms cadence until every thread is stopped, inside the
     /// stop's existing deadline and never more than one cycle of samples. A
-    /// thread still not stopped then keeps today's task-set refusal; a
+    /// thread still on its way at the deadline reports the deadline; a
     /// changed set (vanished, reused or undated thread) or a thread that can
     /// never reach the stop refuses at once. Nothing is attached before this
     /// returns, so a thread that ran while the stop settled only ran before
@@ -1494,12 +1494,13 @@ impl PauseCoordinator {
     }
 
     /// One task sample, a single `stat` read per thread. The task set and
-    /// thread states are judged before the deadline: a sample that is not
-    /// fully stopped is today's task-set refusal (or, only while `settling`
-    /// and still inside the deadline, `Ok(None)`: wait for a thread that is
-    /// on its way into the stop), and a fully stopped sample past the deadline
-    /// keeps the deadline message. New threads are adopted only by a fully
-    /// stopped settling sample.
+    /// thread states are judged before the deadline. A strict sample that is
+    /// not fully stopped, or any sample with a thread that can never reach the
+    /// stop, is today's task-set refusal. While `settling`, a sample whose
+    /// threads are all in `T`, `R`, `S` or `D` waits (`Ok(None)`) for the
+    /// ones on their way into the stop, and once past the deadline reports
+    /// the deadline message, as a fully stopped sample past the deadline does.
+    /// New threads are adopted only by a fully stopped settling sample.
     fn sample_tasks(
         &mut self,
         io: &mut impl PauseIo,
@@ -1513,10 +1514,13 @@ impl PauseCoordinator {
         let births = self.covered_births(&samples, last_attach, settling)?;
         if samples.values().any(|sample| sample.state != b'T') {
             let settles = |sample: &TaskSample| matches!(sample.state, b'T' | b'R' | b'S' | b'D');
-            if settling && now <= deadline && samples.values().all(settles) {
-                return Ok(None);
+            if !settling || !samples.values().all(settles) {
+                return Err(MSG_TASK_SET_CHANGED.into());
             }
-            return Err(MSG_TASK_SET_CHANGED.into());
+            if now > deadline {
+                return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
+            }
+            return Ok(None);
         }
         if now > deadline {
             return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
@@ -2961,32 +2965,42 @@ fn birth_covered(start_ticks: u64, last_attach_boot_ns: Option<u64>) -> bool {
 /// such thread is born after the resume, so once the resume is past the next
 /// tick boundary its floor is at or past that boundary, strictly after the
 /// attach. This changes only when the child resumes, never which births are
-/// covered. The wait uses the existing 1 ms cadence and is bounded by one
-/// tick; with no recorded attach, an unreadable boot clock or a saturated
-/// instant there is nothing to wait for. Only a failed wait is an error.
-fn hold_until_the_attach_tick_passes(io: &mut impl PauseIo) -> Result<(), String> {
-    let Some(mut now) = io.boot_now_ns() else {
+/// covered. The hold makes at most one tick's worth of the existing 1 ms
+/// waits (each may oversleep), and never one that could end past the stop
+/// `deadline`: a resume observed late fails the run, so the hold resumes at
+/// once when the next wait could cross the deadline or the stop clock cannot
+/// be read. A birth inside the attach's tick then stays partial at the next
+/// stop, the safe direction. With no recorded attach, an unreadable boot
+/// clock, a saturated instant or a zero tick there is nothing to wait for.
+/// Only a failed wait is an error.
+fn hold_until_the_attach_tick_passes(io: &mut impl PauseIo, deadline: u64) -> Result<(), String> {
+    let Some(mut boot) = io.boot_now_ns() else {
         return Ok(());
     };
     let Some(attach) = io.last_hook_attach_boot_ns() else {
         return Ok(());
     };
     let tick = clock_tick_ns();
-    let Some(boundary) = (attach / tick)
-        .checked_add(1)
+    let Some(boundary) = attach
+        .checked_div(tick)
+        .and_then(|ticks| ticks.checked_add(1))
         .and_then(|ticks| ticks.checked_mul(tick))
     else {
         return Ok(());
     };
     for _ in 0..=tick / SAMPLE_NS {
-        if now >= boundary {
+        if boot >= boundary {
             return Ok(());
+        }
+        match io.now_ns() {
+            Ok(now) if now.saturating_add(SAMPLE_NS) <= deadline => {}
+            _ => return Ok(()),
         }
         io.wait_one_ms()?;
         let Some(read) = io.boot_now_ns() else {
             return Ok(());
         };
-        now = read;
+        boot = read;
     }
     Ok(())
 }
@@ -3084,7 +3098,9 @@ impl HookAttachClock {
 /// One provider hook attach in flight. Its completion is stamped when it
 /// drops, on every return path (success, error or unwind): whatever the
 /// attach made live was live by then, so the stamp is an upper bound on
-/// every hook it installed.
+/// every hook it installed. Bind it to a named variable for the whole attach:
+/// `let _ =` drops it at once and stamps an instant before the attach.
+#[must_use = "the window stamps the attach completion when it drops"]
 pub(crate) struct HookAttachWindow<'a> {
     clock: &'a HookAttachClock,
 }
@@ -4718,11 +4734,11 @@ mod tests {
     }
 
     /// The settling sample itself: a thread still running when the deadline
-    /// passes returns today's task-set refusal (not the deadline message), a
-    /// first sample already past the deadline keeps the deadline message, and
-    /// a failed wait is a lifecycle failure.
+    /// passes reports the deadline message (ruling PT-7), a first sample
+    /// already past the deadline keeps the deadline message, and a failed wait
+    /// is a lifecycle failure.
     #[test]
-    fn settling_sample_reports_todays_refusal_at_the_deadline() {
+    fn settling_sample_reports_the_deadline_when_it_runs_out_of_time() {
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         let mut io = FakeIo {
             states: std::iter::repeat_with(|| Ok(running_42()))
@@ -4732,7 +4748,7 @@ mod tests {
         };
         assert_eq!(
             coordinator.sample_until_stopped(&mut io, 5 * SAMPLE_NS),
-            Err((MSG_TASK_SET_CHANGED.into(), false))
+            Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
         );
         assert!((4..=6).contains(&waits(&io)), "{} waits", waits(&io));
 

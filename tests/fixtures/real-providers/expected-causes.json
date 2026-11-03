@@ -125,6 +125,11 @@
       "cause": "interface_selection",
       "owner": "exec-real-providers",
       "reason": "selection loss beside unverified tables"
+     },
+     {
+      "cause": "discovery_truncated",
+      "owner": "exec-real-providers",
+      "reason": "a non-spied subject scan truncated with the spied counts exact (flaps 1/4 on quiet runs; see final text)"
      }
     ],
     "os": "fedora",

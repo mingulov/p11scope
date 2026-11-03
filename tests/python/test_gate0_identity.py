@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Unit tests for scripts/check-gate0-identity.py (P2F-5 F3, r6 I1/I6).
+"""Unit tests for scripts/check-gate0-identity.py (P2F-5 F3, r6 I1/I6, r7 R1).
 
 Drives the checker's real code on tiny owned BPF objects built with
 clang-18: relocation enumeration covers both `.rel.x` and `.relx`
@@ -12,8 +12,9 @@ enumeration from readelf flags, with a one-byte program-section drift
 twin. I6: a true reordered-.BTF pair (surgical type-order swap)
 normalizes to PASS with the decision printed, a renamed-type pair
 still fails, and a .BTF-plus-code pair fails by bytes without
-consulting bpftool. Hermetic: temp dirs only (the I6 twins skip where
-bpftool is absent, as in the hosted scripts job).
+consulting bpftool. R1: map capacity/type pairs and a .bss size pair
+fail (the C-dump fallback wrongly passed them). Hermetic: temp dirs
+only (the BTF twins skip where bpftool is absent).
 
 Run: python3 -I tests/python/test_gate0_identity.py -v
 """
@@ -72,6 +73,28 @@ struct Beta { void *seq; unsigned long long session_id; unsigned long long seq_n
 struct { __uint(type, 2); __type(key, int); __type(value, struct Alpha); __uint(max_entries, 1); } map_a __attribute__((section(".maps"), used));
 struct { __uint(type, 2); __type(key, int); __type(value, struct Beta); __uint(max_entries, 1); } map_b __attribute__((section(".maps"), used));
 __attribute__((section("uprobe"), used)) int prog(void *ctx) { (void)ctx; return 0; }
+"""
+
+MAP_SHAPE_C = """\
+typedef unsigned int __u32;
+typedef unsigned long long __u64;
+#define __uint(name, value) int (*name)[value]
+#define __type(name, value) typeof(value) *name
+struct cell { __u64 a; __u32 b; };
+struct {
+    __uint(type, MAP_TYPE);
+    __uint(max_entries, MAP_MAXE);
+    __type(key, __u32);
+    __type(value, struct cell);
+} DEMO __attribute__((section(".maps"), used));
+__attribute__((section("uprobe"), used)) int prog(void *ctx) { (void)ctx; return 0; }
+"""
+
+BSS_SIZE_C = """\
+#define SEC(n) __attribute__((section(n), used))
+int g[G_LEN];
+SEC("uprobe") int prog(void *ctx) { (void)ctx; return g[0]; }
+char LICENSE[] SEC("license") = "GPL";
 """
 
 
@@ -206,6 +229,29 @@ class Gate0IdentityTests(unittest.TestCase):
         # differ (the mismatch control for the I6 fallback).
         cls.btf_renamed = cls.compile_c(
             work, "btf-rend", BTF_ORDER_C.replace("Beta", "BetX")
+        )
+        # R1 shape twins: same-length stems so each pair differs in .BTF
+        # bytes only (map pairs) or .BTF plus the .bss header (size pair).
+        cls.map_256 = cls.compile_c(
+            work,
+            "map-256a",
+            MAP_SHAPE_C.replace("MAP_TYPE", "2").replace("MAP_MAXE", "256"),
+        )
+        cls.map_512 = cls.compile_c(
+            work,
+            "map-512a",
+            MAP_SHAPE_C.replace("MAP_TYPE", "2").replace("MAP_MAXE", "512"),
+        )
+        cls.map_hash = cls.compile_c(
+            work,
+            "map-hsh1",
+            MAP_SHAPE_C.replace("MAP_TYPE", "1").replace("MAP_MAXE", "256"),
+        )
+        cls.bss_4 = cls.compile_c(
+            work, "bss-004a", BSS_SIZE_C.replace("G_LEN", "4")
+        )
+        cls.bss_64 = cls.compile_c(
+            work, "bss-064a", BSS_SIZE_C.replace("G_LEN", "64")
         )
 
     @classmethod
@@ -427,6 +473,43 @@ class Gate0IdentityTests(unittest.TestCase):
         self.assertIn("OVERALL: FAIL", text)
         self.assertIn("p11scope-ebpf: FAIL", text)
         self.assertIn(".BTF", text)
+
+    @unittest.skipUnless(shutil.which("bpftool"), "R1 shape twins need bpftool")
+    def test_map_max_entries_btf_still_fails(self):
+        problems = CHECKER.compare_object(self.map_256, self.map_512)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith(".BTF differs"), problems)
+        decision = CHECKER.adjudicate_btf_only(self.map_256, self.map_512)
+        self.assertIsNotNone(decision)
+        self.assertIn(".BTF", decision)
+
+    @unittest.skipUnless(shutil.which("bpftool"), "R1 shape twins need bpftool")
+    def test_map_type_btf_still_fails(self):
+        problems = CHECKER.compare_object(self.map_256, self.map_hash)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith(".BTF differs"), problems)
+        decision = CHECKER.adjudicate_btf_only(self.map_256, self.map_hash)
+        self.assertIsNotNone(decision)
+        self.assertIn(".BTF", decision)
+
+    @unittest.skipUnless(shutil.which("bpftool"), "R1 shape twins need bpftool")
+    def test_bss_size_header_diff_fails(self):
+        problems = CHECKER.compare_object(self.bss_4, self.bss_64)
+        self.assertTrue(
+            any(".bss" in problem for problem in problems),
+            f".bss size change must be named: {problems}",
+        )
+        base = self.case_path("base")
+        cand = self.case_path("cand")
+        self.lay_out(base, self.bss_4)
+        self.lay_out(cand, self.bss_4)
+        shutil.copyfile(self.bss_64, cand / "p11scope-ebpf")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(CHECKER.main(["check", str(base), str(cand)]), 1)
+        text = out.getvalue()
+        self.assertIn("OVERALL: FAIL", text)
+        self.assertIn(".bss", text)
 
     def test_main_passes_on_identical_dirs_and_fails_on_reloc_drift(self):
         base = self.case_path("base")

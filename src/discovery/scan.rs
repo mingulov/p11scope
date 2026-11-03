@@ -4005,6 +4005,38 @@ pub(crate) fn startup_exclude_conflict(
     exclude_match(path_str, &file, &exclude_paths, &exclude_names)
 }
 
+/// Which operator-named `--module` input names this opened mapped file, if
+/// any. Same match as [`exclude_match`] (identity, resolved basename,
+/// soname): full-path inputs match by fstat identity with the hint resolved
+/// through the observer's view (a symlinked hint follows its link), bare
+/// names by the mapped basename or the ELF soname read from this handle.
+/// The mapped path needs no canonicalization (the kernel renders the real
+/// file). `None` with no hints. Evaluated at scan time while the file is
+/// open; the planner reads it for the operator-named closure exception
+/// only, never for scan filtering (narrowing is unchanged).
+pub(crate) fn module_hint_match(path: &str, file: &File, hints: &[PathBuf]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    if hints.is_empty() {
+        return None;
+    }
+    let hint_paths: ExcludePaths = hints
+        .iter()
+        .filter(|h| h.as_os_str().as_bytes().contains(&b'/'))
+        .filter_map(|h| {
+            std::fs::metadata(h)
+                .ok()
+                .map(|m| (h.clone(), m.dev(), m.ino()))
+        })
+        .collect();
+    let hint_names: ExcludeNames = hints
+        .iter()
+        .filter(|h| !h.as_os_str().as_bytes().contains(&b'/'))
+        .map(|h| (h.clone(), h.as_os_str().as_bytes().to_vec()))
+        .collect();
+    exclude_match(path, file, &hint_paths, &hint_names)
+}
+
 /// Why `/proc/<pid>/mem` could not be opened, and whether that is a published
 /// discovery loss. `ESRCH` is proof the process ended — the ordinary end of a
 /// process, already recorded by `scan_unavailable`, and nothing a capture that
@@ -5639,8 +5671,13 @@ fn scan_view_examined_mode(
             }
             continue;
         }
+        // Operator-named `--module` match while the file is open (identity,
+        // resolved basename, soname). Recorded only; narrowing above is
+        // unchanged, and the planner reads it for the operator-named
+        // closure exception only.
+        let module_hint = module_hint_match(&path, &file, request.hints);
         let mut module = ScannedModule {
-            module_hint: None,
+            module_hint,
             mapped_identity: scanned_identity,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
@@ -6135,6 +6172,88 @@ mod tests {
         assert_eq!(
             exclude_match(unrelated.to_str().unwrap(), &file, &paths, &names),
             None
+        );
+    }
+
+    /// A `--module` path through a symlink names the closure's opened file:
+    /// identity follows the link, so the operator-named exception sees it.
+    /// A different file is not named, even at the same path string.
+    #[test]
+    fn module_hint_match_names_a_symlinked_module_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("libclosure.so.0.4.8");
+        let link = dir.path().join("closure-alias.so");
+        let other = dir.path().join("libother.so.0");
+        std::fs::write(&real, b"fake").unwrap();
+        std::fs::write(&other, b"fake").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let hints = std::slice::from_ref(&link);
+        let file = File::open(&real).unwrap();
+        assert_eq!(
+            module_hint_match(real.to_str().unwrap(), &file, hints),
+            Some(link.clone())
+        );
+        // The link's own basename never matches: only the file does.
+        let other_file = File::open(&other).unwrap();
+        assert_eq!(
+            module_hint_match(other.to_str().unwrap(), &other_file, hints),
+            None
+        );
+        // Same path string, different file: not named.
+        assert_eq!(
+            module_hint_match(real.to_str().unwrap(), &other_file, hints),
+            None
+        );
+    }
+
+    /// A bare `--module` name matches by basename or ELF soname, like the
+    /// exclusion match it reuses; anything else matches nothing.
+    #[test]
+    fn module_hint_match_bare_name_matches_basename_and_soname() {
+        use crate::discovery::elf_needed::fixture::{ElfSpec, build_elf, write_elf};
+        let dir = tempfile::tempdir().unwrap();
+        let sonamed = write_elf(
+            dir.path(),
+            "libversioned.so.0.4.8",
+            &build_elf(&ElfSpec::lib(b"libversioned.so.0", &[])),
+        );
+        let bare = PathBuf::from("libversioned.so.0");
+        let file = File::open(&sonamed).unwrap();
+        assert_eq!(
+            module_hint_match(
+                sonamed.to_str().unwrap(),
+                &file,
+                std::slice::from_ref(&bare)
+            ),
+            Some(bare.clone()),
+            "soname matches across versions"
+        );
+        let plain = dir.path().join("libplain.so.1");
+        std::fs::write(&plain, b"not-an-elf").unwrap();
+        let bare_plain = PathBuf::from("libplain.so.1");
+        let plain_file = File::open(&plain).unwrap();
+        assert_eq!(
+            module_hint_match(
+                plain.to_str().unwrap(),
+                &plain_file,
+                std::slice::from_ref(&bare_plain)
+            ),
+            Some(bare_plain),
+            "basename matches"
+        );
+        assert_eq!(
+            module_hint_match(
+                plain.to_str().unwrap(),
+                &plain_file,
+                std::slice::from_ref(&bare)
+            ),
+            None,
+            "an unrelated name matches nothing"
+        );
+        assert_eq!(
+            module_hint_match(plain.to_str().unwrap(), &plain_file, &[]),
+            None,
+            "no hints name nothing"
         );
     }
 

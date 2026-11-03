@@ -389,9 +389,10 @@ enum AdmissionClass {
     /// that provider is attached, and the whole array (~6,656 endpoints)
     /// never fits, so it is admitted last in every scope: whole when it
     /// fits (late-start, reserve-capped), otherwise a reserve-capped
-    /// leading-templates prefix in a named scope when first seen, and its
-    /// published tables only when first mapped mid-capture — refused whole
-    /// when none of those admit.
+    /// leading-templates prefix in a named scope when first seen or when
+    /// its opened file matched an operator-named `--module` input, and
+    /// its published tables only when first mapped mid-capture unnamed —
+    /// refused whole when none of those admit.
     ClosureArray,
 }
 
@@ -624,10 +625,11 @@ pub enum AdmissionScope {
     /// array is decided after every provider: whole when it fits
     /// (late-start, reserve-capped), otherwise a reserve-capped
     /// leading-templates prefix only when first seen in the capture's first
-    /// plan — the prefix never takes the [`shared_scope_reserve`] slots, so
-    /// a provider decoded later still fits — and its published tables only
-    /// when first mapped mid-capture. A later provider that still does not
-    /// fit is refused by name with the `--exclude-module` remedy.
+    /// plan or when operator-named — the prefix never takes the
+    /// [`shared_scope_reserve`] slots, so a provider decoded later still
+    /// fits — and its published tables only when first mapped mid-capture
+    /// unnamed. A later provider that still does not fit is refused by name
+    /// with the `--exclude-module` remedy.
     #[default]
     Named,
     /// Cgroup or system scope without `--module` (GT-5). Every process in
@@ -2683,11 +2685,13 @@ fn merge(
         order.sort_by_key(|&position| classes[position].0 == AdmissionClass::ClosureArray);
     }
     let reserve = shared_scope_reserve(capacity);
-    // PA-5 C1: the heuristic closure prefix is allowed only for a closure
-    // object already mapped when the capture's first plan was built (the
-    // late-start case). A closure first mapped during the capture never gets
-    // the prefix; it admits only its publication-authorized tables below.
-    // Generic object identity only — no provider names, offsets or symbols.
+    // PA-5 C1 plus the operator-named exception: the heuristic closure
+    // prefix is allowed only for a closure object already mapped when the
+    // capture's first plan was built (the late-start case), or whose
+    // opened file matched an operator-named `--module` input. Any other
+    // closure first mapped during the capture never gets the prefix; it
+    // admits only its publication-authorized tables below. Generic object
+    // identity only — no provider names, offsets or symbols.
     // Retired slots stay allocated for the capture lifetime and are never
     // reused; refusals say so apart from the active endpoints.
     let retired = allocated.slots.saturating_sub(existing_slots.len());
@@ -2727,21 +2731,27 @@ fn merge(
             None => true,
             Some(first) => first.contains(&object),
         };
-        // PA-5 C1+C2+M3: a Detailed closure array in a named scope, late-
-        // start, with no provider refused or omitted ahead of it, falls back
-        // to its leading-templates prefix when whole does not fit — outside
+        // Operator-named exception: any scan piece of this object matched an
+        // operator-named `--module` input at scan time. Generic object
+        // identity only — no provider names, offsets or symbols.
+        let closure_named = group.iter().any(|module| module.module_named);
+        // PA-5 C1+C2+M3 plus the operator-named exception: a Detailed
+        // closure array in a named scope, late-start or operator-named,
+        // with no provider refused or omitted ahead of it, falls back to
+        // its leading-templates prefix when whole does not fit — outside
         // the reserve, so a provider decoded later still fits. Shared scope
-        // stays whole-or-nothing for closures (no prefix); a mid-capture
-        // closure admits only its published tables below, never a prefix.
+        // stays whole-or-nothing for closures (no prefix); an unnamed
+        // mid-capture closure admits only its published tables below.
         let closure_prefix_allowed = is_detailed_closure
             && !shared
-            && closure_late_start
+            && (closure_late_start || closure_named)
             && !provider_refused
             && !provider_omitted;
         // PA-5 C2+M4: shared scope admits every non-operator module whole or
         // not at all (closures included, no prefix); a Detailed closure
         // admitted whole respects the reserve cap and the first-plan rule —
-        // mid-capture closures skip whole entirely for published-only below.
+        // mid-capture closures skip whole entirely, for published-only below
+        // (or the prefix attempt when operator-named).
         // Inventory/Counters and broad admit keep their complete-union whole.
         let whole_original = broad_admit
             || admission_policy.admits_complete_validated_union()
@@ -2754,15 +2764,19 @@ fn merge(
         // reserve as before.
         let reserved = if is_detailed_closure {
             // Late-start starts whole (reserve-capped, M4); mid-capture
-            // starts published-only (full budget, corroborated tables).
-            // The retries below re-cap accordingly.
+            // starts published-only (full budget, corroborated tables) or
+            // at the reserve-capped prefix attempt when operator-named.
+            // The passes below re-cap accordingly.
             closure_late_start
         } else {
             shared && class.leaves_reserve()
         };
         // Mid-capture Detailed closures admit published tables only, never
-        // whole and never a heuristic prefix.
-        let closure_published_only_first = is_detailed_closure && !closure_late_start;
+        // whole and never a heuristic prefix — unless operator-named with
+        // the prefix allowed, in which case the first pass below is the
+        // prefix attempt itself. The exception never grants whole.
+        let closure_published_only_first =
+            is_detailed_closure && !closure_late_start && !closure_prefix_allowed;
         let budget = GroupBudget {
             policy: admission_policy,
             ceiling: if reserved {
@@ -2806,17 +2820,18 @@ fn merge(
         // first pass spilled before the refusal would be counted again on
         // the retry — a double spill alongside the omission.
         let spill_baseline = uncorroborated_candidates;
-        // PA-5 C1: late-start whole first; on whole failure a prefix-allowed
-        // closure retries as a K4 prefix, then (or directly, when the prefix
-        // is blocked or admits nothing) as published-tables-only. Mid-capture
-        // closures start published-only, never whole and never a prefix.
-        let mut use_prefix_fallback = false;
+        // PA-5 C1 plus the operator-named exception: late-start whole
+        // first; on whole failure a prefix-allowed closure retries as a K4
+        // prefix, then (or directly, when the prefix is blocked or admits
+        // nothing) as published-tables-only. An operator-named mid-capture
+        // closure starts at the prefix attempt and retries published-only;
+        // other mid-capture closures start published-only and never retry.
+        let mut use_prefix_fallback =
+            is_detailed_closure && !closure_late_start && closure_prefix_allowed;
         let mut use_published_fallback = false;
         let outcome = 'admission: loop {
             let published_only = closure_published_only_first || use_published_fallback;
-            let whole = if published_only
-                || (closure_prefix_allowed && use_prefix_fallback)
-            {
+            let whole = if published_only || (closure_prefix_allowed && use_prefix_fallback) {
                 false
             } else {
                 whole_original
@@ -3198,12 +3213,15 @@ fn merge(
                 uncorroborated_candidates = spill_baseline;
                 continue 'admission;
             }
-            // PA-5 C1: a late-start Detailed closure with nothing to keep
-            // retries whole, then prefix (when allowed), then published-only.
-            // Whole never spills, so the baseline resets are exact. Shared
-            // scope and prefix-blocked closures retry published-only
-            // directly; mid-capture closures start there and never retry.
-            if is_detailed_closure && closure_late_start && kept.is_empty() {
+            // PA-5 C1 plus the operator-named exception: a late-start
+            // Detailed closure with nothing to keep retries whole, then
+            // prefix (when allowed), then published-only; an operator-named
+            // mid-capture closure retries its prefix as published-only.
+            // Prefix and whole never spill, so the baseline resets are
+            // exact. Shared scope, prefix-blocked, and unnamed mid-capture
+            // closures never retry.
+            if is_detailed_closure && kept.is_empty() && (closure_late_start || use_prefix_fallback)
+            {
                 if closure_prefix_allowed && !use_prefix_fallback && !use_published_fallback {
                     use_prefix_fallback = true;
                     uncorroborated_candidates = spill_baseline;

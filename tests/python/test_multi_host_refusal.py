@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,8 @@ a=sys.argv[1:]; mode=os.environ.get('FAKE_MULTI_REFUSAL','healthy')
 if a in [['--help'],['--version']]:
     if mode=='blocks-offline': print('uprobe-multi-required',file=sys.stderr);sys.exit(1)
     print('p11scope help/version');sys.exit(0)
+if a==['doctor'] and mode=='slow-doctor':
+    import time;time.sleep(3)
 if a[:2]==['inventory','diff']: print('{}');sys.exit(0)
 if a[0]=='inventory' and '--capture' in a and a[a.index('--capture')+1]=='scan':
     if mode=='fails-scan':
@@ -55,6 +58,9 @@ class CombinedRefusalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="guest-disk-", dir=self.work.parent) as temp:
             yield Path(temp)
 
+    def remove_guest_bindir(self, stage):
+        remove_guest_bindir(stage)
+
     def test_combined_capture_refusals_and_offline_twins(self):
         rows = self.check(self.observer, self.work)
         self.assertGreaterEqual(sum(r["outcome"] == "refused" for r in rows), 12)
@@ -73,7 +79,8 @@ class CombinedRefusalTests(unittest.TestCase):
                     "sha256": {"p11scope": namespace["digest"](observer)}}
         (self.work / "inputs.json").write_text(json.dumps(metadata))
 
-        def check(observer, work, progress=None):
+        def check(observer, work, progress=None, doctor_timeout=60):
+            self.assertEqual(doctor_timeout, 300)
             self.assertNotEqual(work.parent, self.work, "product work must leave the 9p stage")
             self.assertEqual(work.stat().st_mode & 0o777, 0o700)
             self.assertEqual(os.environ["TMPDIR"], str(work))
@@ -94,6 +101,9 @@ class CombinedRefusalTests(unittest.TestCase):
                 patch.dict(guest.__globals__, {"check_commands": check,
                                               "guest_disk_work": self.simulated_guest_disk}):
             guest(self.work)
+        self.remove_guest_bindir(self.work)
+        context = json.loads((self.work / "guest-context.json").read_text())
+        self.assertTrue(context["bindir"].startswith("/tmp/refusal-bin-"))
         self.assertEqual(len(json.loads((self.work / "result.json").read_text())["cases"]), 20)
         self.assertFalse(any(path.is_dir() for path in self.work.iterdir()))
 
@@ -196,6 +206,7 @@ class CombinedRefusalTests(unittest.TestCase):
                            {"guest_disk_work": self.simulated_guest_disk}):
             with self.assertRaisesRegex(RuntimeError, "inventory-scan"):
                 namespace["guest"](self.work)
+        self.remove_guest_bindir(self.work)
         progress = self.work / "case-results.json"
         self.assertTrue(progress.is_file(), "failed19th case erased preceding receipts")
         rows = json.loads(progress.read_text())["cases"]
@@ -237,6 +248,110 @@ class CombinedRefusalTests(unittest.TestCase):
         with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "blocks-offline"}):
             with self.assertRaisesRegex(RuntimeError, "offline"):
                 self.check(self.observer, self.work)
+
+    def test_doctor_timeout_is_honored(self):
+        with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "slow-doctor"}):
+            with self.assertRaisesRegex(RuntimeError, "command timed out"):
+                self.check(self.observer, self.work, doctor_timeout=1)
+            rows = self.check(self.observer, self.work, doctor_timeout=30)
+        self.assertEqual(rows[0]["case"], "doctor")
+
+    def test_guest_gives_doctor_room_for_old_verifiers(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        seen = {}
+
+        def check(observer, work, progress=None, doctor_timeout=60):
+            seen["doctor_timeout"] = doctor_timeout
+            return []
+
+        for release, expected in (("5.15.221-0515221-generic", 300),
+                                  ("6.1.188-0601188-generic", 300)):
+            stage = self.work / ("stage-" + release)
+            stage.mkdir()
+            metadata = {"kernel": "v" + release, "runner_uid": stage.stat().st_uid,
+                        "sha256": {"p11scope": "x"}}
+            (stage / "inputs.json").write_text(json.dumps(metadata))
+            (stage / "p11scope").write_text("observer")
+            with tempfile.TemporaryDirectory(prefix="guest-disk-",
+                                             dir=self.work.parent) as temp, \
+                    patch("os.geteuid", return_value=0), \
+                    patch("os.uname") as uname, \
+                    patch.dict(namespace["guest"].__globals__,
+                               {"check_commands": check,
+                                "digest": lambda path: "x",
+                                "stage_guest_binaries": lambda *a: (Path(temp), {"p11scope": Path(temp)}),
+                                "guest_disk_work": lambda stage: _disk(Path(temp))}):
+                uname.return_value.release = release
+                namespace["guest"](stage)
+            with self.subTest(release=release):
+                self.assertEqual(seen["doctor_timeout"], expected)
+
+
+def remove_guest_bindir(stage):
+    """Remove exactly the /tmp bindir the guest staged (suite hygiene)."""
+    context = json.loads((stage / "guest-context.json").read_text())
+    bindir = Path(context["bindir"])
+    assert bindir.parent == Path("/tmp"), bindir
+    assert bindir.name.startswith("refusal-bin-"), bindir
+    shutil.rmtree(bindir)
+
+
+class StagingTests(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue(SCRIPT.is_file(), "combined unsupported-host driver is missing")
+        self.temp = tempfile.TemporaryDirectory(prefix="refusal-stage-")
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+        self.namespace = runpy.run_path(str(SCRIPT))
+
+    def test_binaries_are_copied_verified_and_private(self):
+        observer = self.work / "p11scope"
+        observer.write_text("observer-bytes")
+        libtest = self.work / "lib-tests"
+        libtest.write_text("libtest-bytes")
+        metadata = {"denial": "denied",
+                    "sha256": {"p11scope": self.namespace["digest"](observer),
+                               "lib-tests": self.namespace["digest"](libtest)}}
+        parent = self.work / "guest-tmp"
+        parent.mkdir()
+        destdir, staged = self.namespace["stage_guest_binaries"](
+            self.work, parent, metadata)
+        self.assertEqual(destdir.parent, parent)
+        self.assertEqual(destdir.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(set(staged), {"p11scope", "lib-tests"})
+        for name in ("p11scope", "lib-tests"):
+            with self.subTest(name=name):
+                self.assertEqual(staged[name].read_bytes(),
+                                 (self.work / name).read_bytes())
+                self.assertEqual(staged[name].stat().st_mode & 0o777, 0o700)
+
+    def test_libtest_stays_unstaged_without_denial(self):
+        observer = self.work / "p11scope"
+        observer.write_text("observer-bytes")
+        (self.work / "lib-tests").write_text("libtest-bytes")
+        metadata = {"sha256": {"p11scope": self.namespace["digest"](observer)}}
+        parent = self.work / "guest-tmp"
+        parent.mkdir()
+        _, staged = self.namespace["stage_guest_binaries"](
+            self.work, parent, metadata)
+        self.assertEqual(set(staged), {"p11scope"})
+
+    def test_guest_has_room_for_staged_binaries(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"--memory", "4G"', text)
+
+    def test_outer_liveness_bound_fits_a_slow_515_run(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"600", "vng"', text)
+
+    def test_tampered_copy_is_refused(self):
+        observer = self.work / "p11scope"
+        observer.write_text("observer-bytes")
+        metadata = {"sha256": {"p11scope": "0" * 64}}
+        parent = self.work / "guest-tmp"
+        parent.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "staged binary mismatch"):
+            self.namespace["stage_guest_binaries"](self.work, parent, metadata)
 
 
 FAKE_LIBTEST = r'''#!/usr/bin/env python3
@@ -332,7 +447,9 @@ class DenialCellTests(unittest.TestCase):
                             "check_denial_cell": fake_denial,
                             "guest_disk_work": lambda stage: _disk(Path(temp))}):
             namespace["guest"](self.work)
-        self.assertEqual(seen["path"], self.work / "lib-tests")
+        remove_guest_bindir(self.work)
+        self.assertEqual(seen["path"].parent.name[:12], "refusal-bin-")
+        self.assertEqual(seen["path"].name, "lib-tests")
         self.assertEqual(seen["expect"], "denied")
         cases = json.loads((self.work / "result.json").read_text())["cases"]
         self.assertEqual([row["case"] for row in cases],

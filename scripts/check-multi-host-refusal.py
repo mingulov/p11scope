@@ -36,8 +36,14 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def check_commands(observer, work, progress=None):
-    """Exercise actual command/sink/workload boundaries; callable unprivileged."""
+def check_commands(observer, work, progress=None, doctor_timeout=60):
+    """Exercise actual command/sink/workload boundaries; callable unprivileged.
+
+    doctor_timeout is a liveness bound only (the refusal oracle is
+    unchanged): the old verifiers grind ~65 s through doctor's preflight
+    loads (measured 65 s on 5.15, 64 s on 6.1), so refusal guests pass
+    300 there.
+    """
     rows = []
 
     def complete(case, result, outcome, checks, reason=None):
@@ -98,7 +104,7 @@ def check_commands(observer, work, progress=None):
         if argv[0] == "run":
             argv += ["--", "/bin/sh", "-c", 'printf unexpected > "$1"',
                      "multi-refusal", str(sentinel)]
-        result = run(case, argv, 60 if case == "doctor" else 20)
+        result = run(case, argv, doctor_timeout if case == "doctor" else 20)
         try:
             sink_unchanged = case == "doctor" or (sink.read_bytes() == before and sink.stat().st_ino == identity)
         except OSError:
@@ -190,6 +196,28 @@ def check_denial_cell(libtest, work, expect, progress=None):
     return row
 
 
+def stage_guest_binaries(stage, parent, metadata):
+    """Copy the transferred binaries to guest-local disk, verified.
+
+    The 9p share demand-pages a 391 MB observer in 65 s on 5.15 (FS-Cache
+    per-page pathology); a sequential copy takes 10 s and every later
+    case runs from fast local disk. The copies are re-verified against
+    the transferred digests before anything executes them.
+    """
+    destdir = Path(tempfile.mkdtemp(prefix="refusal-bin-", dir=str(parent)))
+    os.chmod(destdir, 0o700)
+    names = ["p11scope"] + (["lib-tests"] if metadata.get("denial") is not None else [])
+    staged = {}
+    for name in names:
+        target = destdir / name
+        shutil.copyfile(stage / name, target)
+        os.chmod(target, 0o700)
+        if digest(target) != metadata["sha256"][name]:
+            raise RuntimeError("staged binary mismatch: " + name)
+        staged[name] = target
+    return destdir, staged
+
+
 def trust_stage_owner(stage, runner_uid):
     # Root's output trust policy also checks the runner-owned shared ancestors.
     if type(runner_uid) is not int or not 0 <= runner_uid < 2**32 - 1 or stage.stat().st_uid != runner_uid:
@@ -265,13 +293,21 @@ def guest(stage):
                "sudo_uid": os.environ.get("SUDO_UID")}
     with guest_disk_work(stage) as work:
         os.environ["TMPDIR"] = str(work)
+        bindir, staged = stage_guest_binaries(stage, Path("/tmp"), metadata)
+        # Every refusal guest is pre-Multi with an old slow verifier
+        # (measured: 65 s on 5.15, 64 s on 6.1; OD32/CP-5 accept old
+        # kernels slow but correct). Liveness bound only; the refusal
+        # oracle is unchanged.
+        doctor_timeout = 300
         context.update({"work": str(work), "work_uid": work.stat().st_uid,
                         "work_mode": oct(work.stat().st_mode & 0o777),
-                        "work_filesystem": "ext4"})
+                        "work_filesystem": "ext4", "bindir": str(bindir),
+                        "doctor_timeout": doctor_timeout})
         (stage / "guest-context.json").write_text(json.dumps(context, indent=2) + "\n")
-        rows = check_commands(stage / "p11scope", work, progress=stage / "case-results.json")
+        rows = check_commands(staged["p11scope"], work, progress=stage / "case-results.json",
+                              doctor_timeout=doctor_timeout)
         if metadata.get("denial") is not None:
-            rows.append(check_denial_cell(stage / "lib-tests", work,
+            rows.append(check_denial_cell(staged["lib-tests"], work,
                                           metadata["denial"],
                                           progress=stage / "case-results.json"))
     result = {"kernel": kernel, "observer_sha256": metadata["sha256"]["p11scope"],
@@ -321,9 +357,13 @@ def main():
         metadata["denial"] = args.denial
     (stage / "inputs.json").write_text(json.dumps(metadata) + "\n")
     command = shlex.join(["python3", str(stage / "guest.py"), "--guest", str(stage)])
+    # Liveness bound only: a healthy 5.15 run needs boot (~111 s) plus
+    # staged binaries plus ~65 s of doctor verifier grind plus 20 more
+    # cases, which a loaded host cannot fit in 300 s. The refusal oracle
+    # is unchanged; a hung guest still fails loudly here.
     with (stage / "guest.log").open("w") as log:
-        result = subprocess.run(["timeout", "-k", "20", "300", "vng", "--run", kernel,
-                                 "--user", "root", "--cpus", "2", "--memory", "2G",
+        result = subprocess.run(["timeout", "-k", "20", "600", "vng", "--run", kernel,
+                                 "--user", "root", "--cpus", "2", "--memory", "4G",
                                  "--rwdir", str(stage), "--exec", command],
                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
     if result.returncode != 0 or not (stage / "result.json").is_file():

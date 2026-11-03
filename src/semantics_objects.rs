@@ -1224,13 +1224,17 @@ impl ObjectSemantics {
         self.state.settle(prefix, ledger)
     }
 
-    pub(in crate::semantics_objects) fn settle_recorded(
+    /// Settlement appending to `effects` in place; spans
+    /// passed to `record` are relative to its length at entry.
+    pub(in crate::semantics_objects) fn settle_recorded_into(
         &mut self,
         prefix: CompleteInputPrefix,
         ledger: &mut journal::StagingLedger,
+        effects: &mut ObjectEffects,
         record: &mut impl FnMut(state::SettlementTransition, std::ops::Range<usize>),
-    ) -> ObjectEffects {
-        self.state.settle_recorded(prefix, ledger, record)
+    ) {
+        self.state
+            .settle_recorded_into(prefix, ledger, effects, record);
     }
 
     /// Apply an explicit reference boundary to the affected scope.

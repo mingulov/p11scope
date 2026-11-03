@@ -414,63 +414,113 @@ fn vector_capacity(required: usize) -> Option<usize> {
     }
 }
 
-/// Retained result only; transition temporaries remain covered by the existing
-/// serialized scratch reservation. Recompute from current populations before
-/// EVERY seal: a previous domain may have grown the model since acquisition.
+/// Per-category effect counts one seal can emit, from the populations
+/// at seal start. Every category is a hard upper bound on the matching
+/// effects of any seal outcome, so the sum is the retained effect bound.
 ///
-/// Linear in retained calls. One seal applies its calls once, in place, to
-/// one model, and every broad action (contradiction, void, session end,
-/// alias retirement, uncertain mutation) emits at most once per object or
-/// session over the whole seal, not once per call:
+/// One seal applies its calls once, in place, to one model. Broad
+/// actions (contradiction, void, session end, alias retirement,
+/// uncertain mutation) emit at most once per object or session over the
+/// whole seal, not once per call:
 /// - `Retired`/`AccessEnded`/`Destroyed`: only a `Live` view ends, and an
 ///   ended view never becomes `Live` again (`end_view`, `destroy_view`).
 /// - `Downgraded`: only a `Valid` view downgrades, and only allocation
 ///   makes a view `Valid` (`contradict`).
 /// - `SessionEnded`: only a `Live` session ends (`end_session`).
 /// - `MetadataInvalidated`: only a view holding an established or
-///   conflicting field emits, and a field is re-established only by
-///   `establish` on one of a call's input handles. So each object emits
-///   once for its state at seal start, plus once per input-handle
-///   re-establishment.
+///   conflicting field emits, a view allocates with none, and only
+///   `establish` on one of a call's input handles writes one. So each
+///   object present at seal start emits once for its state then, plus
+///   once per input-handle establishment.
 ///
-/// Objects created during the seal are bounded by the touched handles of
-/// each call, and sessions by one per call.
+/// Only staged begins (`adapter.open`) apply an action and mint records:
+/// a refused begin applies none (`note_refused` only voids, a broad
+/// action). Each applied call touches at most its input, result and find
+/// handles, so it mints at most that many views; it mints at most one
+/// session per session word, and the per-call slack below covers a
+/// second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SealEffectBound {
+    /// `Retired`, `AccessEnded` and `Destroyed`: once per object.
+    pub(super) lifetime_ends: usize,
+    /// `Downgraded`: once per object.
+    pub(super) downgrades: usize,
+    /// `SessionEnded`: once per session.
+    pub(super) session_ends: usize,
+    /// `MetadataInvalidated`: once per object plus once per input-handle
+    /// re-establishment.
+    pub(super) invalidations: usize,
+    /// Every other effect of an applied seal: the per-call direct effects
+    /// plus the seal-level settlement gaps.
+    pub(super) direct: usize,
+    /// A refused or voided seal that applies no call: one end per object
+    /// and session plus two gaps per key. Never combined with the
+    /// applied categories above.
+    pub(super) loss: usize,
+}
+
+/// Seal-level gap effects that belong to no call: settlement emits at
+/// most one refusal gap (unheld, ended, stale or prefix contradiction)
+/// and one bootstrap refusal.
+const SEAL_LEVEL_GAPS: usize = 2;
+
+impl SealEffectBound {
+    pub(super) fn sample(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<Self> {
+        let calls = adapter.open.len();
+        let (objects, sessions) = model.audit_loss_record_counts();
+        let handles = MAX_INPUT_HANDLES
+            .checked_add(MAX_RESULT_HANDLES)?
+            .checked_add(MAX_FIND_HANDLES)?;
+        let prospective_objects = objects.checked_add(calls.checked_mul(handles)?)?;
+        let prospective_sessions = sessions.checked_add(calls)?;
+        // state::apply_action selects one finite action. Per touched
+        // handle, establishment may emit one conflict for each bounded
+        // observation and one established summary; creation/first
+        // observation, reference, destruction/retirement and
+        // unresolved/gap each add at most one.
+        let per_handle = MAX_TEMPLATE_ATTRIBUTES.checked_add(1)?.checked_add(4)?;
+        // Direct per-call effects: the touched handles plus the session
+        // first/open and call gap/unresolved summaries.
+        let per_call = handles.checked_mul(per_handle)?.checked_add(4)?;
+        Some(Self {
+            lifetime_ends: prospective_objects,
+            downgrades: prospective_objects,
+            session_ends: prospective_sessions,
+            // A view allocates with no established field, so one created
+            // during the seal is invalidated only after an `establish`,
+            // which the per-input term already counts.
+            invalidations: objects.checked_add(calls.checked_mul(MAX_INPUT_HANDLES)?)?,
+            direct: calls.checked_mul(per_call)?.checked_add(SEAL_LEVEL_GAPS)?,
+            loss: objects
+                .checked_add(sessions)?
+                .checked_add(adapter.keys.len().checked_mul(2)?)?,
+        })
+    }
+
+    /// The retained effect count: an applied seal's categories, or a
+    /// loss outcome, whichever is larger (a seal emits one or the other).
+    pub(super) fn total(self) -> Option<usize> {
+        let applied = self
+            .lifetime_ends
+            .checked_add(self.downgrades)?
+            .checked_add(self.session_ends)?
+            .checked_add(self.invalidations)?
+            .checked_add(self.direct)?;
+        Some(applied.max(self.loss))
+    }
+}
+
+/// Retained result only; transition temporaries remain covered by the existing
+/// serialized scratch reservation. Recompute from current populations before
+/// EVERY seal: a previous domain may have grown the model since acquisition.
+/// Linear in retained calls (see [`SealEffectBound`]). The settlement
+/// appends straight into the retained effect vector, so no second
+/// settlement-sized vector exists at any point.
 pub(super) fn result_storage_bound(
     adapter: &JournalAdapter,
     model: &ObjectSemantics,
 ) -> Option<usize> {
-    let calls = adapter.open.len().checked_add(adapter.refused.len())?;
-    let (objects, sessions) = model.audit_loss_record_counts();
-    let handles = MAX_INPUT_HANDLES
-        .checked_add(MAX_RESULT_HANDLES)?
-        .checked_add(MAX_FIND_HANDLES)?;
-    let prospective_objects = objects.checked_add(calls.checked_mul(handles)?)?;
-    let prospective_sessions = sessions.checked_add(calls)?;
-    // state::apply_action selects one finite action. Per touched handle,
-    // establishment may emit one conflict for each bounded observation and
-    // one established summary; creation/first-observation, reference,
-    // destruction/retirement and unresolved/gap each add at most one.
-    let per_handle = MAX_TEMPLATE_ATTRIBUTES.checked_add(1)?.checked_add(4)?;
-    // Direct per-call effects: the touched handles, the session first/open
-    // and call gap/unresolved summaries, and one repeated metadata
-    // invalidation for each input handle the call may re-establish.
-    let per_call = handles
-        .checked_mul(per_handle)?
-        .checked_add(4)?
-        .checked_add(MAX_INPUT_HANDLES)?;
-    // Broad effects, once per object or session across the whole seal:
-    // lifetime end, downgrade and first invalidation per object, and one
-    // end per session.
-    let broad = prospective_objects
-        .checked_mul(3)?
-        .checked_add(prospective_sessions)?;
-    let loss = objects
-        .checked_add(sessions)?
-        .checked_add(adapter.keys.len().checked_mul(2)?)?;
-    let effects = calls
-        .checked_mul(per_call)?
-        .checked_add(broad)?
-        .checked_add(loss)?;
+    let effects = SealEffectBound::sample(adapter, model)?.total()?;
     allocation_bytes::<ObjectDomain>(adapter.keys.len())?
         .checked_add(allocation_bytes::<ObjectEffect>(vector_capacity(effects)?)?)?
         .checked_add(allocation_bytes::<SealedCall>(vector_capacity(

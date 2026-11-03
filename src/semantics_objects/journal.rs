@@ -6556,16 +6556,26 @@ impl JournalAdapter {
             replay_index: None,
             open,
         };
+        // Settlement appends to the retained vector in place: the
+        // result bound covers it, and no second settlement-sized
+        // vector is ever held beside it.
         let offset = effects.effects.len();
-        let applied = match &mut replay {
-            Some(replay) => model.settle_recorded(
+        match &mut replay {
+            Some(replay) => model.settle_recorded_into(
                 CompleteInputPrefix::sealed(&prefix),
                 &mut self.ledger,
+                &mut effects,
                 &mut |transition, span| replay.settlement(transition, span, offset),
             ),
-            None => model.settle(CompleteInputPrefix::sealed(&prefix), &mut self.ledger),
-        };
-        let ended = applied.effects.iter().any(|effect| {
+            None => model.settle_recorded_into(
+                CompleteInputPrefix::sealed(&prefix),
+                &mut self.ledger,
+                &mut effects,
+                &mut |_, _| {},
+            ),
+        }
+        let applied = &effects.effects[offset..];
+        let ended = applied.iter().any(|effect| {
             matches!(
                 effect,
                 ObjectEffect::Gap {
@@ -6578,7 +6588,7 @@ impl JournalAdapter {
         // no pruning. The key is not tainted — staged inputs stay for a
         // later seal once authority clears (new history can raise the
         // floors past a moved model floor).
-        let rejected = applied.effects.iter().any(|effect| {
+        let rejected = applied.iter().any(|effect| {
             matches!(
                 effect,
                 ObjectEffect::Gap {
@@ -6586,7 +6596,6 @@ impl JournalAdapter {
                 }
             )
         });
-        effects.effects.extend(applied.effects);
         if ended {
             let lived = self.key_is_live(key);
             self.keys.get_mut(&key).expect("sealed key").era_ended = true;
@@ -8147,7 +8156,7 @@ pub(crate) mod tests {
     /// manifest: every modeled function journal tests stage needs an
     /// admittable plan slot, since each staged call converts only
     /// under its own H3 admission claim.
-    const ADMITTABLE_FUNCTIONS: [&str; 25] = [
+    const ADMITTABLE_FUNCTIONS: [&str; 26] = [
         "C_CreateObject",
         "C_GetAttributeValue",
         "C_SignInit",
@@ -8178,6 +8187,9 @@ pub(crate) mod tests {
         // Packet 6.07c KEM extension, appended for the same reason.
         "C_EncapsulateKey",
         "C_DecapsulateKey",
+        // Seal-bound metadata invalidation (cross-session writes),
+        // appended for the same reason.
+        "C_SetAttributeValue",
     ];
 
     /// v3-only functions, resolved on the 3.0 interface surface
@@ -14702,10 +14714,12 @@ pub(crate) mod tests {
     fn joint_keepup_seal_result_stays_within_its_linear_bound_under_broad_retirement() {
         use super::joint_audit::{outcome_storage, result_storage_bound};
         use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, OBJECT_ACTION_DESTROY};
-        // Worst case for the per-object broad terms: every created view is
-        // live when a long run of ambiguous destroys from another session
-        // each retire every alias. Only the first retirement of each view
-        // emits; the bound charges once per object, not once per call.
+        // Broad retirement under a long run of failing destroys: every
+        // created view is live when the first ambiguous destroy from
+        // another session retires every alias and ends every compatible
+        // session (the device-loss path). The later destroys find nothing
+        // live and emit nothing more; the bound charges once per object,
+        // not once per call.
         const CREATES: u64 = 256;
         const DESTROYS: u64 = 768;
         const OTHER: u64 = SESSION ^ 0x0101;
@@ -14743,7 +14757,10 @@ pub(crate) mod tests {
         scene.prepare_claims();
         let bootstrap = scene.bootstrap(proof, 0);
         let bound = result_storage_bound(&scene.adapter, &scene.model).expect("bound");
+        let categories = super::joint_audit::SealEffectBound::sample(&scene.adapter, &scene.model)
+            .expect("category bound");
         let success = scene.seal(&bootstrap).expect("broad scene seals");
+        assert_effects_within(categories, &success.effects.effects);
         assert_eq!(
             success.prefix.settled().len(),
             (CREATES + DESTROYS) as usize
@@ -14760,6 +14777,304 @@ pub(crate) mod tests {
         );
         let actual = outcome_storage(&Ok(success)).expect("sized outcome");
         assert!(actual <= bound, "actual {actual} > bound {bound}");
+    }
+
+    /// Effects of one seal outcome, per [`SealEffectBound`] category.
+    #[derive(Debug, Default)]
+    struct SealEffectCounts {
+        lifetime_ends: usize,
+        downgrades: usize,
+        session_ends: usize,
+        invalidations: usize,
+        direct: usize,
+    }
+
+    fn seal_effect_counts(effects: &[ObjectEffect]) -> SealEffectCounts {
+        let mut counts = SealEffectCounts::default();
+        for effect in effects {
+            match effect {
+                ObjectEffect::Retired { .. }
+                | ObjectEffect::AccessEnded { .. }
+                | ObjectEffect::Destroyed { .. } => counts.lifetime_ends += 1,
+                ObjectEffect::Downgraded { .. } => counts.downgrades += 1,
+                ObjectEffect::SessionEnded { .. } => counts.session_ends += 1,
+                ObjectEffect::MetadataInvalidated { .. } => counts.invalidations += 1,
+                _ => counts.direct += 1,
+            }
+        }
+        counts
+    }
+
+    /// Every category of an applied seal's effects stays within its own
+    /// bound, and the total within the retained count bound.
+    fn assert_effects_within(
+        bound: super::joint_audit::SealEffectBound,
+        effects: &[ObjectEffect],
+    ) -> SealEffectCounts {
+        let counts = seal_effect_counts(effects);
+        assert!(
+            counts.lifetime_ends <= bound.lifetime_ends,
+            "lifetime ends {counts:?} > {bound:?}"
+        );
+        assert!(
+            counts.downgrades <= bound.downgrades,
+            "downgrades {counts:?} > {bound:?}"
+        );
+        assert!(
+            counts.session_ends <= bound.session_ends,
+            "session ends {counts:?} > {bound:?}"
+        );
+        assert!(
+            counts.invalidations <= bound.invalidations,
+            "invalidations {counts:?} > {bound:?}"
+        );
+        assert!(
+            counts.direct <= bound.direct,
+            "direct {counts:?} > {bound:?}"
+        );
+        assert!(
+            effects.len() <= bound.total().expect("bounded total"),
+            "{} effects > {bound:?}",
+            effects.len()
+        );
+        counts
+    }
+
+    const POPULATED_KEY_BASE: u64 = 0x7000;
+
+    /// Ingest `views` creates (one per thread, distinct result handles)
+    /// in the scene's session and attest them.
+    fn populate_created_views(scene: &mut Scene, views: u64) -> JournalDomainProof {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let create = function_id("C_CreateObject");
+        for thread in 1..=views {
+            let begin = begin_bytes(thread, 1, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            let end = end_bytes_result(
+                &begin,
+                OBJECT_ACTION_CREATE,
+                0,
+                ENTRY_NS + 50,
+                POPULATED_KEY_BASE + thread,
+            );
+            assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        }
+        scene.attest_calls(views as usize)
+    }
+
+    /// One establishing C_GetAttributeValue on `handle` from `session`.
+    fn ingest_establishing_get(
+        scene: &mut Scene,
+        thread: u64,
+        sequence: u64,
+        session: u64,
+        handle: u64,
+    ) {
+        let getattr = function_id("C_GetAttributeValue");
+        let begin = begin_bytes_shaped(
+            thread,
+            sequence,
+            getattr,
+            0,
+            (COOKIE, EXEC),
+            session,
+            0,
+            capture::MECHANISM_NONE | capture::OUTPUT_NULL,
+            Some((handle, 1)),
+            None,
+            FLAGS,
+        );
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let end = end_bytes_getattr(
+            &begin,
+            0,
+            ENTRY_NS + 55,
+            &[(1, 1, 3), (2, 1, 0), (5, 1, 2048)],
+        );
+        assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        scene.attest_session_function(session, "C_GetAttributeValue");
+    }
+
+    /// One call on `handle` from `session` with an explicit action and rv.
+    #[allow(clippy::too_many_arguments)] // Fixture shaper: every record word explicit.
+    fn ingest_handle_call(
+        scene: &mut Scene,
+        thread: u64,
+        sequence: u64,
+        name: &str,
+        action: u8,
+        session: u64,
+        handle: u64,
+        rv: u64,
+    ) {
+        let mut begin = begin_bytes(thread, sequence, function_id(name), 0);
+        put_u64(&mut begin, 80, session);
+        put_u64(&mut begin, 88, handle);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let end = end_bytes(&begin, action, rv, ENTRY_NS + 60);
+        assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        scene.attest_session_function(session, name);
+    }
+
+    #[test]
+    fn joint_keepup_seal_effects_stay_within_their_categories_on_a_populated_model() {
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_GET, OBJECT_ACTION_SET};
+        // A large existing model and a tiny seal: every broad category
+        // fires once per existing record. Seal 1 creates N views and
+        // establishes their metadata; seal 2 is two calls. A successful
+        // cross-session C_SetAttributeValue invalidates every compatible
+        // view, then CKR_CRYPTOKI_NOT_INITIALIZED downgrades, retires and
+        // ends everything. The count is about 3N + sessions, so the
+        // per-object broad terms are required: two calls alone allow
+        // only a few hundred effects.
+        const VIEWS: u64 = 512;
+        const OTHER: u64 = SESSION ^ 0x0101;
+        let mut scene = Scene::new(image_default());
+        let proof = populate_created_views(&mut scene, VIEWS);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let bound = super::joint_audit::SealEffectBound::sample(&scene.adapter, &scene.model)
+            .expect("bound");
+        let created = scene.seal(&bootstrap).expect("creates seal");
+        assert_effects_within(bound, &created.effects.effects);
+        for thread in 1..=VIEWS {
+            ingest_establishing_get(&mut scene, thread, 2, SESSION, POPULATED_KEY_BASE + thread);
+        }
+        let bound = super::joint_audit::SealEffectBound::sample(&scene.adapter, &scene.model)
+            .expect("bound");
+        let established = scene.seal(&bootstrap).expect("reads seal");
+        let counts = assert_effects_within(bound, &established.effects.effects);
+        assert!(
+            counts.direct >= VIEWS as usize,
+            "every read establishes: {counts:?}"
+        );
+        let objects_before = scene.model.audit_loss_record_counts().0;
+        assert_eq!(objects_before, VIEWS as usize, "one view per create");
+        let thread = VIEWS + 1;
+        ingest_handle_call(
+            &mut scene,
+            thread,
+            1,
+            "C_SetAttributeValue",
+            OBJECT_ACTION_SET,
+            OTHER,
+            POPULATED_KEY_BASE + 1,
+            0,
+        );
+        ingest_handle_call(
+            &mut scene,
+            thread + 1,
+            1,
+            "C_GetAttributeValue",
+            OBJECT_ACTION_GET,
+            SESSION,
+            POPULATED_KEY_BASE + 2,
+            pkcs11_types::CkRv::CRYPTOKI_NOT_INITIALIZED.0,
+        );
+        scene.prepare_claims();
+        let bound = super::joint_audit::SealEffectBound::sample(&scene.adapter, &scene.model)
+            .expect("bound");
+        let effects = match scene.seal(&bootstrap) {
+            Ok(success) => success.effects.effects,
+            Err(failure) => failure.effects.effects,
+        };
+        let counts = assert_effects_within(bound, &effects);
+        eprintln!(
+            "populated seal: {} effects {counts:?} bound {bound:?} total {:?}",
+            effects.len(),
+            bound.total()
+        );
+        let views = VIEWS as usize;
+        assert!(
+            counts.invalidations >= views,
+            "the cross-session write invalidates every view: {counts:?}"
+        );
+        assert!(
+            counts.downgrades >= views && counts.lifetime_ends >= views,
+            "the finalize-class return downgrades and retires every view: {counts:?}"
+        );
+        assert!(counts.session_ends >= 1, "{counts:?}");
+        assert!(
+            effects.len() >= 3 * views,
+            "about 3N effects: {}",
+            effects.len()
+        );
+    }
+
+    #[test]
+    fn joint_keepup_seal_metadata_rearm_stays_within_the_input_term() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_SET;
+        // One view, its metadata re-armed and invalidated again and again
+        // inside one seal: reads establish it, cross-session writes
+        // invalidate it. Each invalidation after the first needs its own
+        // establishing input, so they stay within one per object plus
+        // one per input handle.
+        const ROUNDS: u64 = 64;
+        const OTHER: u64 = SESSION ^ 0x0101;
+        let mut scene = Scene::new(image_default());
+        let proof = populate_created_views(&mut scene, 1);
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("create seals");
+        let handle = POPULATED_KEY_BASE + 1;
+        for round in 0..ROUNDS {
+            ingest_establishing_get(&mut scene, 2, 2 * round + 1, SESSION, handle);
+            ingest_handle_call(
+                &mut scene,
+                3,
+                2 * round + 1,
+                "C_SetAttributeValue",
+                OBJECT_ACTION_SET,
+                OTHER,
+                handle,
+                0,
+            );
+        }
+        scene.prepare_claims();
+        let bound = super::joint_audit::SealEffectBound::sample(&scene.adapter, &scene.model)
+            .expect("bound");
+        let success = scene.seal(&bootstrap).expect("re-arm history seals");
+        let counts = assert_effects_within(bound, &success.effects.effects);
+        eprintln!("re-arm seal: {counts:?} bound {bound:?}");
+        assert!(
+            counts.invalidations >= ROUNDS as usize,
+            "every read re-arms one invalidation: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn joint_keepup_seal_reservation_fits_the_pool_on_a_populated_model() {
+        use crate::semantics_edge::resources::{
+            SEMANTIC_RESOURCE_LIMIT, SEMANTIC_TRANSITION_SCRATCH,
+        };
+        // The model is shared by every application of one capture and
+        // prunes lazily, so long runs carry many existing records into
+        // every seal. With the full retained call cap (open table plus
+        // refused shelf) over a populated model, the seal still fits.
+        let budget = (SEMANTIC_RESOURCE_LIMIT - SEMANTIC_TRANSITION_SCRATCH) / 2;
+        let mut scene = Scene::new(image_default());
+        let proof = populate_created_views(&mut scene, 1_024);
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("creates seal");
+        let populated = keepup_seal_reservation(&scene);
+        let (objects, _) = scene.model.audit_loss_record_counts();
+        assert_eq!(objects, 1_024);
+        assert!(
+            populated <= budget,
+            "1,024 existing views reserve {populated} > {budget}"
+        );
+        let full = keepup_seal_reservation(&keepup_scene_with_retained(2_048));
+        // Existing records cost a fixed few hundred bytes each: the
+        // largest model (65,536 views, 16,384 sessions) beside the full
+        // retained cap still fits.
+        let per_view = populated
+            .checked_sub(keepup_seal_reservation(&Scene::new(image_default())))
+            .expect("populated reserves more")
+            / 1_024;
+        let worst = full + per_view * 65_536 + per_view * 16_384;
+        assert!(
+            worst <= budget,
+            "full calls {full} + capped model at {per_view} B/record = {worst} > {budget}"
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ SCRIPT = ROOT / "scripts/ci/joint-throughput.sh"
 def run_script(argv, env=None, timeout=60):
     base = {key: value for key, value in os.environ.items()
             if key not in ("RATE", "DURATION", "MIN_RATE", "CELLS",
-                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT")}
+                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT", "STAGE_TIMINGS")}
     if env:
         base.update(env)
     return subprocess.run([str(SCRIPT), *argv], capture_output=True,
@@ -43,7 +43,7 @@ def run_sourced(shell, env=None, timeout=60):
     """
     base = {key: value for key, value in os.environ.items()
             if key not in ("RATE", "DURATION", "MIN_RATE", "CELLS",
-                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT")}
+                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT", "STAGE_TIMINGS")}
     if env:
         base.update(env)
     base["JOINT_TP_SOURCED"] = "1"
@@ -134,6 +134,17 @@ class CellScriptLibrary(unittest.TestCase):
             proc = run_sourced('observer_env', env=env)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.strip(), "", env)
+
+    def test_observer_env_passes_the_stage_timings_toggle(self):
+        proc = run_sourced('observer_env', env={"STAGE_TIMINGS": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "P11SCOPE_STAGE_TIMINGS=1")
+        proc = run_sourced('observer_env',
+                           env={"SETTLEMENT_LAT": "1", "STAGE_TIMINGS": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines(),
+                         ["P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY=1",
+                          "P11SCOPE_STAGE_TIMINGS=1"])
 
     def test_select_provider_finds_a_live_library(self):
         proc = run_sourced('select_provider')

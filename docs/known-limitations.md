@@ -47,9 +47,9 @@ aggregate counts continue. A leader exit that is the last lifecycle
 record ends the window cleanly and the detail renders the calls made
 before the exit. Loader scans left unfinished by the exit itself, and
 loader rejects the exiting process explains, are counted apart as
-exit-only and do not void the detail; only truncation the exiting
-process cannot explain counts. Other loader rejects still count as real
-truncation and withhold the detail as `broad_stopping`, so an owned `run`
+exit-only and do not void the detail; other truncation still counts,
+including loader rejects the observer cannot tie to the exit. Those
+withhold the detail as `broad_stopping`, so an owned `run`
 child that loads and exits at once may still void intermittently (about
 1 in 10 runs in local testing). A child that keeps running for a
 few seconds after its provider loads is unaffected (measured with a

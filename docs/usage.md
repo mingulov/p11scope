@@ -803,7 +803,10 @@ Limits that matter in pods:
   observer attaches. The detail
   is the function's own broad-counter cells between a selection-time
   read and the close read, in the measurement's own mode (counts,
-  timestamps or latency cells). If the watched process replaces
+  timestamps or latency cells). With `run` the selection-time read
+  happens after the owned child is released, so the window may start
+  after the child has started and early calls can fall outside the
+  detail. If the watched process replaces
   itself (exec) between the two reads, the slot retires, or the close
   boundary cannot be proven clean, the detail is withheld with a named
   reason; a leader exit that is the last lifecycle record ends the
@@ -812,8 +815,8 @@ Limits that matter in pods:
   the exiting process explains (a hook address that no longer maps, a
   late record bound to the ended process, a zero-state scan that never
   completed), do not void it: they are counted apart as exit-only, and
-  only truncation the exiting process cannot explain counts. Other
-  loader rejects still count as real truncation and withhold the detail
+  other truncation still counts, including loader rejects the observer
+  cannot tie to the exit. Those withhold the detail
   as `broad_stopping`, so a `run` child that loads and exits at once may
   still void intermittently, about 1 in 10 runs in local testing; a child
   that runs on for a few seconds after loading is unaffected. With
@@ -1064,6 +1067,12 @@ Limits that matter in pods:
   stop line reports the run's final maximum including the terminal
   sweep. It measures headroom, never loss; it is timings output only
   and adds no schema key.
+  With `P11SCOPE_K0_DEBUG=1`, a `--select-endpoint` capture also
+  prints one `k0-debug` stderr line at close: selection-time
+  comparable losses plus close-time truncation, exit-only total and
+  per-route exit-only counts (`scan_end`, `reject`, `zero_state`),
+  and comparable losses. It is test scaffolding for the K0 live
+  cells, never part of the JSON report.
   `--attach-backend auto|multi|singles` (default `auto`) selects how the
   native lane attaches the provider entries. `auto` decides by a
   functional probe once per run, never by the kernel version: where the

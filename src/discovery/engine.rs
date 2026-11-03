@@ -611,15 +611,19 @@ pub struct Engine {
     /// Batch-tail publications skipped as provably redundant (same proof).
     tail_skips: u64,
     discovery_truncated: u64,
-    /// Loader-scan truncations settled at a proven process exit (a
-    /// subset of `discovery_truncated`): the scan's process ended
-    /// before the scan resolved. K0's truncation-growth rule
-    /// subtracts this from the total, so a short child that exits
-    /// before its provider load is processed leaves no voiding
-    /// growth. In cgroup and system scopes a scope departure settles
-    /// here too, but K0 refuses those scopes by name, so no consumer
-    /// reads it there.
+    /// Loader scans and loader rejects settled at a proven process
+    /// exit (a subset of `discovery_truncated`). K0's
+    /// truncation-growth rule subtracts this from the total, so a
+    /// short child that exits before its provider load is processed
+    /// leaves no voiding growth. In cgroup and system scopes a scope
+    /// departure settles here too, but K0 refuses those scopes by
+    /// name, so no consumer reads it there.
     exit_ended_truncations: u64,
+    /// The exit-only total above, split by route for the K0 debug
+    /// line: [deferred-scan ends (fallback, RT_ADD settle, retirement
+    /// sweep), loader rejects (missing-mapping, no-retained-view),
+    /// zero-state ends]. The buckets always sum to the total.
+    exit_ended_by_route: [u64; 3],
     pending_rejected_keys: BTreeSet<ObjectKey>,
     pending_retirements: BTreeSet<ProcessViewId>,
     retirement_intents: PendingViewRetirements,
@@ -627,13 +631,17 @@ pub struct Engine {
     // Original custody and exact Session endpoint proof survive only the
     // existing bounded conservative retirement/replay transaction.
     ended_pid_retirement: Option<PendingEndedPidRetirement>,
-    /// Recently ended loader origins for late-record binding (R-1): on
-    /// ExpectedRemoval the view's pid, admission time and pin are
-    /// retained (bounded FIFO). A loader record with no retained view
-    /// counts exit-only only when it matches one of these by pid and
-    /// `hook_ts_ns >= admitted_ns` with the pin still proving exit.
-    /// Never pid alone (reuse). Populated at view removal; the pin
-    /// holds the original task, so a reused number cannot match.
+    /// Recently ended loader origins for late-record binding (R-1):
+    /// recorded only in `Scope::Pid`, on ExpectedRemoval, as the
+    /// view's pid, admission time and pin (bounded FIFO). A loader
+    /// record with no retained view counts exit-only only when it
+    /// matches one by pid and `hook_ts_ns >= admitted_ns` with the
+    /// pin still proving exit. That test rejects stale records from
+    /// an older process; safety against a later process reusing the
+    /// pid comes from the hooks being bound to the process in Pid
+    /// scope (kernel pid filter or per-task links). Other scopes
+    /// record nothing: K0 refuses them by name, so no consumer reads
+    /// the count there.
     ended_loader_origins: VecDeque<EndedLoaderOrigin>,
     expected_target_exit_pending: Option<ProcessViewId>,
     expected_target_exit: bool,
@@ -727,6 +735,13 @@ pub struct Engine {
     probationary_completions: u64,
     #[cfg(test)]
     loader_memory_scan_attempts: usize,
+    /// Test-only one-shot: the next `Memory` loader scan fails without
+    /// touching the target. Production reaches a failing resolving scan
+    /// only through a live exit race (a dead child fails earlier at maps
+    /// validation), so the zero-state settle twins force the failure and
+    /// drive the real branch, predicate and settlement past it.
+    #[cfg(test)]
+    fail_next_loader_memory_scan: bool,
     #[cfg(test)]
     loader_arm_scan_after_scan: Option<fn(&mut Engine)>,
     /// Scripted pin-probe answers, consumed in order by the next matching
@@ -10019,6 +10034,7 @@ impl Engine {
             tail_skips: 0,
             discovery_truncated: 0,
             exit_ended_truncations: 0,
+            exit_ended_by_route: [0, 0, 0],
             pending_rejected_keys: BTreeSet::new(),
             pending_retirements: BTreeSet::new(),
             retirement_intents: PendingViewRetirements::new(),
@@ -10056,6 +10072,8 @@ impl Engine {
             probationary_completions: 0,
             #[cfg(test)]
             loader_memory_scan_attempts: 0,
+            #[cfg(test)]
+            fail_next_loader_memory_scan: false,
             #[cfg(test)]
             loader_arm_scan_after_scan: None,
             #[cfg(test)]
@@ -11002,6 +11020,11 @@ impl Engine {
             exit_ended <= discovery_truncated,
             "exit-only stays a subset of the truncation total"
         );
+        debug_assert_eq!(
+            self.exit_ended_by_route.iter().sum::<u64>(),
+            exit_ended,
+            "the per-route exit-only buckets sum to the total"
+        );
         render::CaptureFacts {
             discovery: self.discovery.clone(),
             table_entries: self.plan.entries_seen,
@@ -11030,6 +11053,7 @@ impl Engine {
             // The exit-ended subset of the truncation total above: K0
             // subtracts it from the total.
             exit_ended_truncations: exit_ended,
+            exit_ended_by_route: self.exit_ended_by_route,
         }
     }
 
@@ -11832,6 +11856,7 @@ impl Engine {
     fn reject_loader_record_exit_ended(&mut self, reason: &str) -> bool {
         self.loader_registry.reject_hit();
         self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
+        self.exit_ended_by_route[1] = self.exit_ended_by_route[1].saturating_add(1);
         self.mark_live_loss("live loader discovery", reason);
         false
     }
@@ -12467,6 +12492,7 @@ impl Engine {
     fn record_pending_loader_scan_end(&mut self, reason: &str) {
         self.discovery_truncated = self.discovery_truncated.saturating_add(1);
         self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
+        self.exit_ended_by_route[0] = self.exit_ended_by_route[0].saturating_add(1);
         self.mark_partial("live loader memory discovery", reason);
     }
 
@@ -12477,6 +12503,7 @@ impl Engine {
     fn record_pending_loader_scan_end_with_live_loss(&mut self, reason: &str) {
         self.discovery_truncated = self.discovery_truncated.saturating_add(1);
         self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
+        self.exit_ended_by_route[2] = self.exit_ended_by_route[2].saturating_add(1);
         self.mark_live_loss("live loader memory discovery", reason);
     }
 
@@ -15844,6 +15871,9 @@ impl Engine {
         #[cfg(test)]
         if mode == LoaderScanMode::Memory {
             self.loader_memory_scan_attempts = self.loader_memory_scan_attempts.saturating_add(1);
+            if std::mem::take(&mut self.fail_next_loader_memory_scan) {
+                return Err(anyhow!("test-forced loader memory scan failure"));
+            }
         }
         let broad_admit = self.broad_admit;
         let (scan_result, scan_counters) = match mode {
@@ -19518,10 +19548,14 @@ impl Engine {
     }
 
     /// Retains one ended loader origin (R-1): called with a view being
-    /// removed as ExpectedRemoval. Only a pin that still proves exit is
-    /// recorded; anything else stays unrecorded (fail-closed). Bounded
-    /// FIFO: an evicted origin's late records stay real losses.
+    /// removed as ExpectedRemoval. Only in `Scope::Pid`, and only when
+    /// the pin still proves exit; anything else stays unrecorded
+    /// (fail-closed). Bounded FIFO: an evicted origin's late records
+    /// stay real losses.
     fn note_ended_loader_origin(&mut self, view: &ProcessView) {
+        if !matches!(self.scope, Scope::Pid(_)) {
+            return;
+        }
         if view.original_exited() != Ok(true) {
             return;
         }

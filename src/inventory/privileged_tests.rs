@@ -8937,6 +8937,58 @@ mod joint_ledger_parse_tests {
         Ok(())
     }
 
+    /// The quiet loss twins judge gap labels, never bare file paths: a
+    /// hint gap whose subject is a `.so` under a temp dir containing
+    /// "loss" passes, while a real loss label still fails — a loss
+    /// subject, a label with an embedded path, and a loss reason on a
+    /// path subject alike.
+    #[test]
+    fn quiet_twins_ignore_file_path_subjects_but_keep_loss_labels() -> anyhow::Result<()> {
+        use crate::discovery::caller_registry::{CallerId, RegistryGap};
+        let check = |subject: &str, reason: &str| -> anyhow::Result<()> {
+            let mut coordinator = system_joint_coordinator(&[])?;
+            coordinator.registry_mut().record_gap(RegistryGap {
+                caller: Some(CallerId(0)),
+                module: None,
+                pid: Some(1),
+                subject: subject.into(),
+                reason: reason.into(),
+                budget: None,
+            });
+            coordinator.registry_mut().publish();
+            assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[])
+        };
+        assert!(
+            check(
+                "/var/tmp/p11scope-ws-tmp/h3loss/live-joint-held.so",
+                "not mapped in the target",
+            )
+            .is_ok(),
+            "a bare path subject is not a label"
+        );
+        assert!(
+            check("semantic capture loss", "test probe").is_err(),
+            "a loss label still fails"
+        );
+        assert!(
+            check(
+                "semantic provider file /var/tmp/p11scope-ws-tmp/x.so admission refused",
+                "mapping_incomplete",
+            )
+            .is_err(),
+            "a label with an embedded path still fails"
+        );
+        assert!(
+            check(
+                "/var/tmp/p11scope-ws-tmp/h3loss/live-joint-held.so",
+                "native capture lifecycle evidence loss",
+            )
+            .is_err(),
+            "a loss reason still fails on a path subject"
+        );
+        Ok(())
+    }
+
     /// The failure diagnosis names the missing edge, every gap, and each
     /// ledger function's verdict without root or a live lane.
     #[test]

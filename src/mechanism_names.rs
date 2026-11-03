@@ -6,12 +6,16 @@
 //! (`crates/types/src/mechanism_official.rs` at the pinned rev):
 //! every official id maps to its header name, sorted by id. No
 //! hand-written literals: re-run the generator (see the S1 report)
-//! when the pin moves. Ids outside the official list — vendor ids
-//! (`>= 0x8000_0000`) and unregistered ids — have no name and render
-//! verbatim as `0x…`, never guessed.
+//! when the pin moves. Named vendor ids from the p11scope overlay
+//! (`vendor_mechanisms::VENDOR_MECHANISMS`, NSS `CKM_NSS_*`
+//! key-creation/derivation ids from `pkcs11n.h`) resolve through the
+//! fallthrough below. Every other id outside those two lists —
+//! vendor ids (`>= 0x8000_0000`) and unregistered ids — has no name
+//! and renders verbatim as `0x…`, never guessed.
 
-/// Official `CKM_*` name for a registered mechanism id, or `None`
-/// when the id is vendor-defined or otherwise unregistered. The
+/// Official `CKM_*` name for a registered mechanism id, falling back
+/// to the p11scope vendor overlay for named `CKM_NSS_*` ids, or `None`
+/// when the id is otherwise vendor-defined or unregistered. The
 /// caller renders `None` as the verbatim hex id.
 pub(crate) fn mechanism_name(id: u64) -> Option<&'static str> {
     match id {
@@ -478,7 +482,7 @@ pub(crate) fn mechanism_name(id: u64) -> Option<&'static str> {
         0x00004038 => Some("CKM_ECDH_X_AES_KEY_WRAP"),
         0x00004039 => Some("CKM_ECDH_COF_AES_KEY_WRAP"),
         0x0000403A => Some("CKM_PUB_KEY_FROM_PRIV_KEY"),
-        _ => None,
+        _ => crate::vendor_mechanisms::vendor_mechanism_name(id),
     }
 }
 
@@ -507,6 +511,30 @@ mod tests {
         assert_eq!(mechanism_name(0x8000_1042), None);
         assert_eq!(mechanism_name(0xFFFF_FFFF), None);
         assert_eq!(mechanism_name(0x0000_FFFF), None);
+    }
+
+    #[test]
+    fn nss_vendor_keygen_ids_are_named() {
+        // NSS `lib/util/pkcs11n.h` (`CKM_NSS` = `0xCE534350`): the TLS
+        // ephemeral keygen ids from the vendor overlay, not guesses.
+        assert_eq!(
+            mechanism_name(0xCE53_437F),
+            Some("CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN")
+        );
+        assert_eq!(
+            mechanism_name(0xCE53_4380),
+            Some("CKM_NSS_ML_KEM_KEY_PAIR_GEN")
+        );
+        assert_eq!(
+            mechanism_name(0xCE53_437D),
+            Some("CKM_NSS_KYBER_KEY_PAIR_GEN")
+        );
+    }
+
+    #[test]
+    fn unassigned_nss_ids_still_have_no_name() {
+        assert_eq!(mechanism_name(0xCE53_43A9), None);
+        assert_eq!(mechanism_name(0xCE53_4400), None);
     }
 
     #[test]

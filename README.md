@@ -384,12 +384,15 @@ There is no decoder or dump switch for PINs, key material, `CKA_VALUE`, labels,
 `CKA_ID`, plaintext, ciphertext, signatures, wrapped blobs, random output, raw
 mechanism byte arrays, raw session handles, or ordinary buffers.
 
-The default capture policy is `allowlisted`, and it is safe against a caller
-that aliases a metadata pointer into unrelated readable memory. Pointer-derived
-function and mechanism metadata become output only by *exact* membership in a
-finite published set: a mechanism id in the registry, or one of the 104
-published function names. Other values in those fields are dropped in the
-kernel. That is a containment boundary, not pointer validation —
+The default capture policy is `allowlisted`. For function metadata it is safe
+against a caller that aliases a metadata pointer into unrelated readable
+memory: pointer-derived function metadata becomes output only by *exact*
+membership in the 104 published function names, and other values in that
+field are dropped in the kernel. Mechanism ids are public constants: the
+observer publishes the numeric id with call/error counts (registered ids by
+registry membership; others as bare numbers, never decoded, never named —
+see the allowlist-v3 row on unregistered mechanism id publication). That is a
+containment boundary, not pointer validation —
 `bpf_probe_read_user` avoids faults, it does not check types.
 
 FULL release builds additionally perform the approved bounded reads of

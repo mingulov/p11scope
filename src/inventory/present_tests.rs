@@ -2040,3 +2040,30 @@ fn f7_snapshot_high_cardinality_allocation_baseline() {
         snapshot.len(),
     );
 }
+
+#[test]
+fn flagged_unregistered_mechanism_renders_row_without_name() {
+    // Round-2 P2-b: a Detailed unregistered id (VALUE +
+    // MECHANISM_UNREGISTERED) admitted by the edge renders an S1
+    // mechanism row keyed by the raw id with no name; the inventory
+    // JSON layer maps `None` to `null` (`mechanisms_json`).
+    use crate::semantics_edge::{EdgeSemantics, SemanticCall};
+    use p11scope_ebpf_common::capture;
+    let mut edge = EdgeSemantics::default();
+    edge.observe(&SemanticCall {
+        function: "C_SignInit".into(),
+        session: 7,
+        mechanism: 0xCE53_43A9,
+        capture: capture::MECHANISM_VALUE
+            | capture::MECHANISM_UNREGISTERED
+            | capture::OUTPUT_NON_NULL,
+        ts_ns: 100,
+        ..SemanticCall::default()
+    });
+    let view = super::semantics_view(Some(&edge), false);
+    assert_eq!(view.mechanisms.len(), 1);
+    let row = &view.mechanisms[0];
+    assert_eq!(row.id, 0xCE53_43A9);
+    assert_eq!(row.name, None);
+    assert_eq!((row.calls, row.errors), (1, 0));
+}

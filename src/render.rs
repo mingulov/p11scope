@@ -3020,6 +3020,11 @@ struct MechanismOut {
     /// Verbatim id — vendor ids survive unchanged, never renamed or dropped.
     mechanism: u64,
     mechanism_hex: String,
+    /// The BPF return path found this id in `MECH_SHAPE` (registry
+    /// membership, parameter shape published). `false` marks an
+    /// unregistered publication: numeric id plus call/error counts
+    /// only, never decoded, never named.
+    registered: bool,
     /// Operation categories (`"sign"`, `"encrypt"`, ...) this id was seen
     /// initializing. Empty when only ever seen as an orphan operational
     /// call (no `*Init` observed in this capture).
@@ -3202,6 +3207,11 @@ struct SessionsOut {
 struct CgroupMechOut {
     mechanism: u64,
     mechanism_hex: String,
+    /// The BPF return path found this id in `MECH_SHAPE` (registry
+    /// membership). `false` marks an unregistered publication:
+    /// numeric id plus call/error counts only, never decoded, never
+    /// named — the same flag as the top-level `mechanisms[]` rows.
+    registered: bool,
     calls: u64,
     errors: u64,
 }
@@ -3246,6 +3256,7 @@ fn cgroups_out(state: &crate::semantics::State) -> Vec<CgroupOut> {
                 .map(|(&mechanism, m)| CgroupMechOut {
                     mechanism,
                     mechanism_hex: format!("0x{mechanism:x}"),
+                    registered: !m.unregistered,
                     calls: m.calls,
                     errors: m.errors,
                 })
@@ -3333,6 +3344,7 @@ pub fn profile_json(
             MechanismOut {
                 mechanism: *id,
                 mechanism_hex: format!("0x{id:x}"),
+                registered: !m.unregistered,
                 ops: m.ops.iter().cloned().collect(),
                 calls: m.calls,
                 errors: m.errors,
@@ -7901,6 +7913,146 @@ pub(crate) mod tests {
         assert_eq!(value["evidence"]["completeness"], "COMPLETE");
     }
 
+    /// Unassigned NSS vendor gap (`CKM_NSS` + 89), the codebase's
+    /// unknown-vendor sentinel: exact registry membership never admits
+    /// it (see `vendor_mechanisms::unassigned_vendor_ids_stay_withheld`).
+    const UNREGISTERED_SENTINEL: u64 = 0xCE53_43A9;
+
+    fn profile_mechanisms(state: &crate::semantics::State) -> serde_json::Value {
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = capture_fixture();
+        profile_json(&[], VersionedEvidence::wrap(&ev), state, &capture)["mechanisms"].clone()
+    }
+
+    #[test]
+    fn profile_json_lists_unregistered_mechanism_id_with_registered_false() {
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let mut first = init_event(0, UNREGISTERED_SENTINEL, shape::NONE, 0, 0, 0);
+        first.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        let mut second = first;
+        second.duration_ns = 200;
+        state.observe(&first);
+        state.observe(&second);
+
+        let mechanisms = profile_mechanisms(&state);
+        assert_eq!(mechanisms.as_array().unwrap().len(), 1);
+        let row = &mechanisms[0];
+        assert_eq!(row["mechanism"], UNREGISTERED_SENTINEL);
+        assert_eq!(row["mechanism_hex"], "0xce5343a9");
+        assert_eq!(row["calls"], 2);
+        assert_eq!(row["errors"], 0);
+        assert_eq!(row["registered"], false);
+    }
+
+    #[test]
+    fn profile_json_lists_registered_mechanism_id_with_registered_true() {
+        let mut state = crate::semantics::State::with_policy(
+            &init_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        state.observe(&init_event(0, 0x0D, shape::NONE, 0, 0, 0));
+
+        let mechanisms = profile_mechanisms(&state);
+        assert_eq!(mechanisms.as_array().unwrap().len(), 1);
+        let row = &mechanisms[0];
+        assert_eq!(row["mechanism"], 0x0D);
+        assert_eq!(row["calls"], 1);
+        assert_eq!(row["registered"], true);
+    }
+
+    /// Two slots on module 0: `C_SignInit` (index 0) binds a mechanism
+    /// id, `C_Sign` (index 1) attributes to that binding.
+    fn init_sign_plan() -> crate::plan::AttachPlan {
+        crate::plan::AttachPlan::from_slots(vec![
+            crate::plan::Slot {
+                index: 0,
+                descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+                object: crate::plan::TEST_PINNED_OBJECT,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+                names: vec!["C_SignInit".into()],
+                aliased: false,
+                semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+                semantic_authorized: true,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(0)],
+            },
+            crate::plan::Slot {
+                index: 1,
+                descriptor_index: crate::kinds::function_id("C_Sign").unwrap() + 1,
+                object: crate::plan::TEST_PINNED_OBJECT,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x20,
+                names: vec!["C_Sign".into()],
+                aliased: false,
+                semantics: crate::kinds::descriptor("C_Sign").unwrap(),
+                semantic_authorized: true,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(0)],
+            },
+        ])
+    }
+
+    /// An operational `C_Sign` call on slot 1 of [`init_sign_plan`]: no
+    /// mechanism of its own, attributed through the session binding.
+    fn sign_op_event() -> p11scope_ebpf_common::Event {
+        let mut op = init_event(1, p11scope_ebpf_common::MECH_NONE, shape::NONE, 0, 0, 0);
+        op.capture = p11scope_ebpf_common::capture::MECHANISM_NONE;
+        op
+    }
+
+    #[test]
+    fn profile_json_operation_attributed_call_keeps_unregistered_flag() {
+        // The Init binds the unregistered id, the operational call
+        // attributes to that binding. Both land on one row that stays
+        // unregistered.
+        let mut state = crate::semantics::State::with_policy(
+            &init_sign_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let mut init = init_event(0, UNREGISTERED_SENTINEL, shape::NONE, 0, 0, 0);
+        init.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        state.observe(&init);
+        state.observe(&sign_op_event());
+
+        let mechanisms = profile_mechanisms(&state);
+        assert_eq!(mechanisms.as_array().unwrap().len(), 1);
+        assert_eq!(mechanisms[0]["mechanism"], UNREGISTERED_SENTINEL);
+        assert_eq!(mechanisms[0]["calls"], 2);
+        assert_eq!(mechanisms[0]["registered"], false);
+    }
+
+    #[test]
+    fn profile_json_binding_recreated_row_stays_unregistered_after_purge() {
+        // `purge_modules` clears mechanism rows capture-wide but keeps
+        // another module's bindings: the next attributed call recreates
+        // the row from the binding, which must carry the flag along.
+        let mut state = crate::semantics::State::with_policy(
+            &init_sign_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let mut init = init_event(0, UNREGISTERED_SENTINEL, shape::NONE, 0, 0, 0);
+        init.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        state.observe(&init);
+        let mut modules = std::collections::BTreeSet::new();
+        modules.insert(crate::plan::ModuleId(99));
+        state.purge_modules(&modules);
+        assert!(state.mechanisms().is_empty());
+        state.observe(&sign_op_event());
+
+        let mechanisms = profile_mechanisms(&state);
+        assert_eq!(mechanisms.as_array().unwrap().len(), 1);
+        assert_eq!(mechanisms[0]["mechanism"], UNREGISTERED_SENTINEL);
+        assert_eq!(mechanisms[0]["calls"], 1);
+        assert_eq!(mechanisms[0]["registered"], false);
+    }
+
     #[test]
     fn profile_json_mechanisms_carry_verbatim_id_hex_ops_and_null_params() {
         use p11scope_ebpf_common::{Event, USER_TYPE_NONE};
@@ -8454,6 +8606,49 @@ pub(crate) mod tests {
             serde_json::json!([]),
             "allowlisted capture must not attribute a rejected init as a mechanism request"
         );
+    }
+
+    #[test]
+    fn profile_json_cgroup_mechanism_rows_carry_registered_flag() {
+        // The cgroup breakdown names the same registry membership as
+        // the top-level rows: system scope is the main surface, and an
+        // unregistered id there used to render with no flag at all. A
+        // later observation without the bit must not clear it —
+        // membership is fixed per capture, so the flag is sticky.
+        let mut state = crate::semantics::State::new(&init_plan());
+        let mut flagged = init_event(0, UNREGISTERED_SENTINEL, 0, 0, 0, 0);
+        flagged.cgroup_id = 111;
+        flagged.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        state.observe(&flagged);
+        let mut plain = init_event(0, UNREGISTERED_SENTINEL, 0, 0, 0, 0);
+        plain.cgroup_id = 111;
+        state.observe(&plain);
+        let mut registered = init_event(0, 0x0D, 0, 0, 0, 0);
+        registered.cgroup_id = 111;
+        state.observe(&registered);
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = capture_fixture();
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
+
+        let cgroups = v["cgroups"].as_array().unwrap();
+        assert_eq!(cgroups.len(), 1);
+        let rows = cgroups[0]["mechanisms"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let unreg = rows
+            .iter()
+            .find(|row| row["mechanism"] == UNREGISTERED_SENTINEL)
+            .expect("unregistered cgroup row present");
+        assert_eq!(unreg["mechanism_hex"], "0xce5343a9");
+        assert_eq!(unreg["calls"], 2);
+        assert_eq!(unreg["registered"], false);
+        let reg = rows
+            .iter()
+            .find(|row| row["mechanism"] == 0x0D)
+            .expect("registered cgroup row present");
+        assert_eq!(reg["calls"], 1);
+        assert_eq!(reg["registered"], true);
     }
 
     // ---- Slice 1b-2 public evidence contract (design §5.5–§5.7, §9) -------

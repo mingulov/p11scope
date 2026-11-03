@@ -7895,6 +7895,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_agreement_refuses_unregistered_bit_beside_non_value() {
+        // The journal lane never produces the unregistered bit (the
+        // Detailed object alone publishes it): beside any non-VALUE
+        // state it is a malformed return, and beside VALUE the
+        // unproduced-transitions pin refuses it too.
+        for state in [
+            capture::MECHANISM_NONE,
+            capture::MECHANISM_NULL,
+            capture::MECHANISM_UNREADABLE,
+        ] {
+            let (begin, end) = producer_agreement_pair("C_SignInit", |_, facts| {
+                facts.capture_flags = (facts.capture_flags & !capture::MECHANISM_MASK)
+                    | state
+                    | capture::MECHANISM_UNREGISTERED;
+            });
+            assert!(
+                !producer_pair_agrees(&begin, &end),
+                "unregistered bit beside non-VALUE state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_journal_begin_carrying_unregistered_bit_refuses_at_decode() {
+        // No entry path publishes the bit: the frozen BEGIN
+        // CAPTURE_MASK refuses a capture word carrying it.
+        let rows = publish_object_descriptors();
+        let (mut begin, _) = producer_agreement_pair("C_SignInit", |_, _| {});
+        let word = u32::from_le_bytes(begin[120..124].try_into().unwrap());
+        begin[120..124].copy_from_slice(&(word | capture::MECHANISM_UNREGISTERED).to_le_bytes());
+        assert!(decode_journal_record(&begin, &rows).is_none());
+    }
+
+    #[test]
     fn object_journal_agreement_refuses_unwritten_open_session_results() {
         let (begin, end) = producer_agreement_pair("C_OpenSession", |_, facts| {
             facts.rv = 5;

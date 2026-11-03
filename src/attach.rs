@@ -31,7 +31,6 @@ use p11scope_ebpf_common::{
     TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT, ThreadOwnerControl, attach_cookie,
 };
 use p11scope_manifest::elf::ElfAbi;
-use pkcs11_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) mod reexec_diagnostic;
@@ -7339,11 +7338,11 @@ impl Session {
                     publish_async_catalog(&mut ebpf).context("publishing ASYNC_FUNCTIONS")?;
                 }
                 SessionPreparation::PublishShapes => {
-                    // Embedded defaults: this binary ships statically and has no
-                    // config-file plumbing yet, so `None` is the only reachable
-                    // path today. A future task can thread a path through here
+                    // Embedded defaults plus the p11scope vendor overlay: this
+                    // binary ships statically and has no config-file plumbing
+                    // yet. A future task can thread a path through here
                     // without touching the publish-before-attach placement.
-                    let registry = MechanismRegistry::load(None)
+                    let registry = crate::vendor_mechanisms::load_registry()
                         .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
                     crate::shapes::publish(&mut ebpf, &registry)
                         .context("publishing MECH_SHAPE")?;

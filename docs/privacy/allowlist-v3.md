@@ -29,7 +29,9 @@ the GetAttributeValue result rules, the output/retention table and
 the [H9 publication section](#object-observations-publication-h9) are
 APPROVED (owner decision OD11, 2026-10-24),
 and [extensive-mode executable dependency hints](#extensive-mode-executable-dependency-hints-614-option-b-d-transitive),
-which implements the ratified D-transitive hint contract below.**
+which implements the ratified D-transitive hint contract below,
+and [unregistered mechanism id publication](#unregistered-mechanism-id-publication-owner-2026-11-03),
+which publishes unregistered mechanism ids with counts only.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1422,3 +1424,24 @@ counters); allowlist-v1 bytes are unchanged.
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
 | Owned-child thread start time (`starttime`) | `/proc/<pid>/task/<tid>/stat` field 22 (boot-relative clock ticks) of the observer's own owned child only, read beside the existing state-letter sample at pause preflight and at each stopped sample; the whole stat line is parsed around the `comm` field, which is discarded. The observer stamps each of its own provider hook attach completions (static targets, dynamic exports, multi-group rebuilds) in the same boot domain (`CLOCK_BOOTTIME`) and keeps one process-wide latest stamp plus an in-flight count; the pause arm is not stamped. No `cmdline`, `environ`, argument, payload or memory read. | Private to the capture: a new thread counts as covered only when its earliest possible birth (tick floor) is strictly after the last completed attach (ruling PT-3: the kernel's floored tick is a lower bound on the birth in the reader's time namespace), and a reused tid (same tid, different start time) never counts as the preflight thread. Start times and attach stamps never enter output, logs or errors. | An unreadable or missing start time, a floored birth at or before the attach, a reused tid, no recorded attach or an attach in flight keeps the existing `task set changed` partial with its existing diagnostic; nothing is guessed. Required evidence: covered/before-boundary/unreadable/reuse twins at the pause seam plus the OpenSC live cell before/after counts. |
+
+## Unregistered mechanism id publication (owner, 2026-11-03)
+
+**Status: IMPLEMENTED in v0.6.0 by owner decision 2026-11-03 (rulings
+KG-1/KG-2): mechanism ids are public constants, so the observer publishes
+the numeric id (hex) of every 32-bit mechanism id it counts as
+unregistered, with its call/error counts, instead of only a total.** This
+extends v1's finite-published-set rule for the mechanism-id scalar only: a
+readable, provider-accepted id outside `MECH_SHAPE` and at most
+`0xFFFFFFFF` is published as a bare number with counts, never decoded,
+never named. Allowlist-v1 bytes are unchanged.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Unregistered mechanism id (`registered: false`) | The existing guarded return-time `CK_MECHANISM.mechanism` word, read under `allowlisted` with the same descriptor, span and `return_allows_mechanism` gates as a registered publication; only the membership outcome differs, so no new read exists. Published only when the value is at most `0xFFFFFFFF` (every standard and portable vendor id; `CK_ULONG` is 32-bit on ILP32 and Windows); a wider word stays unpublished. `pParameter` and `ulParameterLen` are never touched for these ids. Detailed object only; the journal object keeps withholding (its validator pins the capture transition set). Unsafe diagnostic builds, whose allowlisted return gate is off, flag membership misses at entry; they never carry the journal object. | The id beside `MECHANISM_VALUE` with the `MECHANISM_UNREGISTERED` capture bit, aggregated per id through the existing bounded semantic path (16,384-key capture budget, event ring), private until publication. Public: `mechanisms[]` and `cgroups[].mechanisms[]` rows with `registered: false`, hex id, calls, errors and null params; trace text shows the bare hex id. Key-operation rows never carry an unregistered id. No name is assigned or guessed from any header. | An unreadable id stays `MECHANISM_UNREADABLE` with `ARG_READ_FAILURE`. Every occurrence, including wider-than-32-bit values and journal-lane occurrences, counts in `evidence.unregistered_mechanisms`; ring loss and state-budget refusals disclose through their existing `PARTIAL`-forcing evidence, never silently. Required evidence: unregistered/registered/sticky/overflow twins and a wider-than-32-bit twin (counted, unpublished) at the semantic seam; journal withholding pins; the bits-aware live canary on 32- and 64-bit targets; a live before/after capture listing every remaining unregistered id. |
+
+The provider accepted each published id (return gate) and the bound
+excludes full-width words, so the published value is a 32-bit
+mechanism-id scalar plus counts, never a buffer, parameter, handle or key
+fact. The v1 function-name rule is untouched: function words still reach
+output only by exact membership in the 104 published names.

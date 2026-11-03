@@ -8222,6 +8222,31 @@ fn decode_params_narrows_output_and_reports_failure_once() {
 }
 
 #[test]
+fn unregistered_publication_bound_to_32bit_ids_at_return_path() {
+    // Per-id publication covers only ids <= 0xFFFFFFFF — the whole
+    // defined and portable mechanism space. A provider-accepted wider
+    // word on a 64-bit target is counted in
+    // `evidence.unregistered_mechanisms`, never published.
+    let source = read("crates/ebpf/src/main.rs");
+    let facts = between(
+        &source,
+        "fn capture_return_facts<const DEFER_ROUTING: bool>(",
+        "fn ordinary_return(",
+    );
+    let flat: String = facts.chars().filter(|c| !c.is_whitespace()).collect();
+    let bound = flat
+        .find("ifmember||(!DEFER_ROUTING&&value<=0xFFFF_FFFF){")
+        .expect("return-path publication must bound unregistered ids to 32 bits");
+    let bump = flat
+        .find("if!member{bump_evidence(EVIDENCE_UNREGISTERED_MECHANISMS);}")
+        .expect("membership-keyed evidence bump");
+    assert!(
+        bound < bump,
+        "the bound gates publication; the total counts every occurrence"
+    );
+}
+
+#[test]
 fn async_key_initialization_and_copy_are_fixed_and_guarded() {
     let source = read("crates/ebpf/src/main.rs");
     assert!(source.contains("const _: [(); 32] = [(); core::mem::size_of::<FunctionNameKey>()];"));

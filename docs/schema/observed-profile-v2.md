@@ -212,7 +212,7 @@ Kernel/event loss:
 | `rv_update_failures` | Failed `RV_COUNTS` updates. |
 | `cgroup_scope_failures` | Native cgroup-membership helper failures. |
 | `semantic_capture_failures` | Descriptor-selected argument or bounded user-memory reads that failed. |
-| `unregistered_mechanisms` | Calls for mechanism ids that are readable but unapproved: not in the allowlisted capture policy, so never decoded. Forces `PARTIAL`. |
+| `unregistered_mechanisms` | Calls for mechanism ids that are readable but unapproved: not in the allowlisted capture policy, so never decoded. Counts every occurrence under `allowlisted`, including any lost later (unsafe diagnostic builds keep it at 0). v3 documents also list each such id with its counts in `mechanisms[]` rows with `registered: false`. Forces `PARTIAL`. |
 | `template_tail_failures` | Internal second-template handoff failed; the first template may remain available, but the key-pair request is incomplete. |
 | `malformed_records` | Event records rejected for ABI size mismatch. |
 
@@ -466,7 +466,8 @@ statement, and it forces `PARTIAL` so the count is never read as attributed.
 
 | Field | Meaning |
 | --- | --- |
-| `mechanism`, `mechanism_hex` | 64-bit mechanism id admitted by the capture policy; the default policy permits only finite published registry membership. |
+| `mechanism`, `mechanism_hex` | 64-bit mechanism id. Registered ids are admitted by the capture policy (finite published registry membership); v3 documents additionally list unregistered ids as bare numbers with counts (see `registered`). Historical v2 documents list registered ids only. |
+| `registered` | v3 only: `true` when the BPF return path found the id in `MECH_SHAPE`, `false` for an unregistered publication (numeric id plus call/error counts only, never decoded, never named). Absent from historical v2 documents. |
 | `ops` | Operation categories observed for this id. |
 | `calls`, `errors` | Event-derived semantic calls and non-success final results. |
 | `latency_ns` | Always the histogram object shape, independent of function timing availability; async semantic latency spans pending entry to completion. |
@@ -517,6 +518,10 @@ captured.
 
 Each item has numeric `cgroup_id`, best-effort `label`, calls, errors, and a
 per-mechanism breakdown. A missing label is `null`; the resolver never guesses.
+Each per-mechanism row carries the numeric id (`mechanism`,
+`mechanism_hex`), calls and errors; v3 documents additionally carry
+`registered` with the same meaning as `mechanisms[]` `registered`
+(absent from historical v2 documents).
 
 ## v1.4 → v2 migration
 
@@ -592,10 +597,13 @@ revision:
 - `capture.privacy_mode` names the kernel capture policy that produced the
   document (`allowlisted` by default, `unsafe-unvalidated-metadata` only in a
   build that opted into the feature *and* passed the flag).
-- Under `allowlisted`, pointer-derived metadata appears only when it matched
-  the finite published mechanism registry or the 104-name function catalog
-  exactly. A caller that aliases a metadata pointer elsewhere yields no
-  decoded value rather than an arbitrary read.
+- Under `allowlisted`, pointer-derived function metadata appears only when it
+  matched the 104-name function catalog exactly. A caller that aliases a
+  function-metadata pointer elsewhere yields no decoded value rather than an
+  arbitrary read. Mechanism ids are public constants and publish as numeric
+  id plus call/error counts (v3 documents list unregistered ids as bare
+  numbers with `registered: false`; historical v2 documents list registered
+  ids only) — see the allowlist-v3 unregistered-id row.
 - Mechanism parameter and template decoding beyond that finite equality is
   absent from the default eBPF object. Every emitted mechanism therefore has
   `params: null`, and `templates.operations` is always empty under `allowlisted`,

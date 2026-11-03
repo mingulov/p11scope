@@ -159,7 +159,7 @@ pub(crate) fn disposition_of(gap: JournalGap) -> SealFailureDisposition {
         H3Pending | BoundNotReady | FrontierRegression => Retry,
         ModelRefused | BootstrapMismatch | ClosureStale | DomainTainted | ImageTainted
         | DomainEnded | AdapterInvalidated | Stopped | DrainMismatch | CutExhausted
-        | ResourceUnavailable => Fallback,
+        | ResourceUnavailable | ClaimUnmatched => Fallback,
     }
 }
 

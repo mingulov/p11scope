@@ -4575,7 +4575,7 @@ mod joint_ending_reason_tests {
             joint_seal_reason(ClosureStale, "fallback"),
             "joint_seal_closure_stale_fallback"
         );
-        let all: [JournalGap; 22] = [
+        let all: [JournalGap; 23] = [
             FaultChanged,
             FaultUnreadable,
             FaultSaturated,
@@ -4598,6 +4598,7 @@ mod joint_ending_reason_tests {
             H3Exhausted,
             Discarded,
             CutExhausted,
+            ClaimUnmatched,
         ];
         let labels: std::collections::BTreeSet<_> = all.iter().map(|gap| gap.label()).collect();
         assert_eq!(labels.len(), all.len(), "labels are distinct");

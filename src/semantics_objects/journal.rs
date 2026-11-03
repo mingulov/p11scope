@@ -762,6 +762,12 @@ pub(crate) enum JournalGap {
     /// derived. The seal refuses explicitly instead of saturating
     /// into a vacuous re-seal; staged inputs are kept.
     CutExhausted,
+    /// A staged entry no admission claim can ever name: a claim on its
+    /// own entry-time identity reports a return it cannot have made,
+    /// two entries share one entry-time identity, or its END's H0
+    /// position was disposed (clean H3 coverage) without a claim. The
+    /// image is tainted; the seal ends named instead of waiting.
+    ClaimUnmatched,
 }
 
 impl JournalGap {
@@ -792,6 +798,7 @@ impl JournalGap {
             Self::H3Exhausted => "h3_exhausted",
             Self::Discarded => "discarded",
             Self::CutExhausted => "cut_exhausted",
+            Self::ClaimUnmatched => "claim_unmatched",
         }
     }
 }

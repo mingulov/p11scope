@@ -2366,13 +2366,29 @@ fn prearm_terminal_kernel(session: &Session) -> Result<metrics::KernelEvidence> 
 fn owned_prearm_hold(
     owned: Option<&Owned>,
 ) -> (Option<crate::discovery::pause::PauseGateHold>, bool) {
-    let Some(owned) = owned else {
-        return (None, false);
+    let (hold, scope_start_ns) = match owned {
+        None => (None, None),
+        Some(owned) => (owned.coordinator.pause_hold(), owned.prearm_scope_start_ns),
     };
-    let Some(mut hold) = owned.coordinator.pause_hold() else {
+    compose_prearm_hold(hold, scope_start_ns, owned.is_some())
+}
+
+/// Pure composition for the terminal hold claim (pinned below): only an
+/// owned run forwards a hold, and the forwarded hold always carries the
+/// run's pre-spawn scope start — which bridges the barrier-held prefix
+/// before the pause segment — in place of the coordinator's arm bound.
+fn compose_prearm_hold(
+    hold: Option<crate::discovery::pause::PauseGateHold>,
+    scope_start_ns: Option<u64>,
+    owned_run: bool,
+) -> (Option<crate::discovery::pause::PauseGateHold>, bool) {
+    if !owned_run {
+        return (None, false);
+    }
+    let Some(mut hold) = hold else {
         return (None, true);
     };
-    hold.start_ns = owned.prearm_scope_start_ns;
+    hold.start_ns = scope_start_ns;
     (Some(hold), true)
 }
 
@@ -13731,6 +13747,50 @@ mod tests {
         // A non-`run` scope has no owned child: no hold and no owned-run
         // claim, so the terminal builder keeps every window.
         assert_eq!(owned_prearm_hold(None), (None, false));
+    }
+
+    #[test]
+    fn compose_prearm_hold_pins_every_claim_shape() {
+        use crate::discovery::pause::PauseGateHold;
+
+        let held = || PauseGateHold {
+            start_ns: Some(5),
+            end_ns: Some(900),
+            continuous: true,
+        };
+        // Owned run with a proven hold: the run's pre-spawn scope start
+        // replaces the coordinator's arm bound.
+        assert_eq!(
+            compose_prearm_hold(Some(held()), Some(50), true),
+            (
+                Some(PauseGateHold {
+                    start_ns: Some(50),
+                    end_ns: Some(900),
+                    continuous: true,
+                }),
+                true
+            )
+        );
+        // Owned run without a scope start: the unboundable claim start
+        // fails closed downstream, never silently armed.
+        assert_eq!(
+            compose_prearm_hold(Some(held()), None, true),
+            (
+                Some(PauseGateHold {
+                    start_ns: None,
+                    end_ns: Some(900),
+                    continuous: true,
+                }),
+                true
+            )
+        );
+        // Passive owned run: no hold, but the owned-run scope stands.
+        assert_eq!(compose_prearm_hold(None, Some(50), true), (None, true));
+        // Non-`run` scope: any hold-shaped input is dropped entirely.
+        assert_eq!(
+            compose_prearm_hold(Some(held()), Some(50), false),
+            (None, false)
+        );
     }
 
     #[test]

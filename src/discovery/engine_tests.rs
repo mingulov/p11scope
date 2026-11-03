@@ -11185,26 +11185,34 @@ fn prearm_pause_hold_unstamped_member_discloses_nothing() {
     assert_eq!(record.unobserved_windows, None);
 }
 
-/// A non-`run` scope threads no hold: the same stamps keep the window.
+/// No hold means no proof on either scope shape: a non-`run` capture and
+/// a passive owned run keep the identical window from the same stamps.
 #[test]
 fn prearm_no_pause_hold_keeps_window() {
     use crate::render::PrearmWatchEnd;
 
-    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
-    engine.finish_prearm_capture(
-        &session,
-        PrearmWatchEnd::ScopeEnd,
-        &BTreeSet::new(),
-        &[],
-        Some(5000),
-        &crate::metrics::KernelEvidence::default(),
-        0,
-        None,
-        false,
-    );
-    let record = watched_prearm_record(&engine);
-    assert_eq!(record.attached_at_ns, Some(Some(900)));
-    assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
+    for owned_run in [false, true] {
+        let (_fixture, mut engine, session, _declared) =
+            prearm_mapped_engine_with_declared_stamps(900);
+        engine.finish_prearm_capture(
+            &session,
+            PrearmWatchEnd::ScopeEnd,
+            &BTreeSet::new(),
+            &[],
+            Some(5000),
+            &crate::metrics::KernelEvidence::default(),
+            0,
+            None,
+            owned_run,
+        );
+        let record = watched_prearm_record(&engine);
+        assert_eq!(record.attached_at_ns, Some(Some(900)), "owned {owned_run}");
+        assert_eq!(
+            record.unobserved_windows,
+            Some(pre_attach_window()),
+            "owned {owned_run}"
+        );
+    }
 }
 
 /// The proofs builder reads the declared-set maximum over every member

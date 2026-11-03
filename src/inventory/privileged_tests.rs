@@ -488,7 +488,7 @@ fn drive<L: CaptureLane<PidPin>>(
 #[test]
 #[ignore = "privileged: live pre-arm reaches armed on pid scope"]
 fn privileged_prearm_reaches_armed_pid() -> Result<()> {
-    use crate::render::PrearmWatchState;
+    use crate::render::{PrearmWatchEnd, PrearmWatchState};
     let workload = Workload::build()?;
     let gate = workload.path("gate");
     let gate_arg = gate.to_str().context("gate path")?.to_string();
@@ -515,14 +515,35 @@ fn privileged_prearm_reaches_armed_pid() -> Result<()> {
         !pinning.inputs.is_empty() && !pinning.inputs[0].proved.is_empty(),
         "SoftHSM pins with no proved offsets; the fixture or oracle is broken"
     );
+    let declared = pinning.inputs[0].proved.len();
     coordinator.set_prearm_pinning(pinning);
     coordinator.absorb_prearm_plan(crate::attach::monotonic_ns().unwrap_or(1));
     let probe = pid_probe(target.pid(), &coordinator)?;
+    let attached = Rc::clone(&probe.attached);
     let lane = NativeLane::start(probe, &mut coordinator, LaneWindows::PROVISIONAL, None)
         .map_err(|(_, reason)| anyhow::anyhow!("{reason}"))?;
-    // The activating extend already attached the declared set (I3): after
-    // three passes the terminal watch must carry the arm it reached (exact
-    // positive: `since` set at arm, preserved through the end).
+    // The activating extend already attached the declared set (I3): the
+    // watch is armed before pass 0, not after a later extend. Pre-I3 this
+    // reads `pinned_unarmed` with nothing attached yet.
+    ensure!(
+        attached.get() >= declared,
+        "activating extend attaches the declared set: {} < {declared}",
+        attached.get()
+    );
+    {
+        let rows = coordinator.prearm_rows();
+        let watch = rows[0].watch.as_ref().context("pre-pass watch")?;
+        ensure!(
+            watch.state == PrearmWatchState::Armed,
+            "armed before pass 0: {watch:?}"
+        );
+        ensure!(
+            watch.since_ns.is_some(),
+            "arm instant before pass 0: {watch:?}"
+        );
+    }
+    // After three passes the terminal watch must carry the arm it reached
+    // (exact positive: `since` set at arm, preserved through the end).
     let stopped = drive(
         &mut coordinator,
         InspectScope::Pid(target.pid()),
@@ -549,6 +570,15 @@ fn privileged_prearm_reaches_armed_pid() -> Result<()> {
         "terminal state: {watch:?}"
     );
     ensure!(watch.until_ns.is_some(), "terminal bound: {watch:?}");
+    let until_ns = watch.until_ns.context("terminal bound")?;
+    ensure!(
+        since_ns <= until_ns,
+        "ordered interval: since {since_ns} <= until {until_ns}"
+    );
+    ensure!(
+        watch.ended_by == Some(PrearmWatchEnd::ScopeEnd),
+        "harness probe None ends ScopeEnd: {watch:?}"
+    );
     ensure!(
         matches!(stopped.summary.retirement, Retirement::Closed(_)),
         "retirement: {:?}",

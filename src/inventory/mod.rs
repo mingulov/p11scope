@@ -22390,6 +22390,277 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn hold_rediscloses_settlement_after_terminal_commit_applies_calls() {
+        // The exit hold discloses the stop counts (with the
+        // diagnostic settlement line) BEFORE the terminal abandon
+        // commit; that commit can apply staged calls, whose
+        // ENTRY-to-application samples land after the printed line.
+        // The hold must re-emit the cumulative settlement summary
+        // when the commit moved it, so the last settlement line
+        // always carries the final applied count. The pre-staged
+        // Joined call below commits during the hold's abandon
+        // commit through the production stage/finalize/commit path
+        // (the same path the live finish batch takes).
+        use crate::attach::{BackendSelection, Scope};
+        use crate::discovery::caller_registry::instance_input::admit_registration_from_coverage;
+        use crate::discovery::caller_registry::{AdmissionState, ModuleInfo};
+        use crate::discovery::engine::inventory_coordinator::semantics::{
+            AttestedSubset, SemanticCallerBinding,
+        };
+        use crate::discovery::identity::PinnedObjectId;
+        use crate::discovery::instances::{InstanceId, Route};
+        use crate::inventory_semantics::{
+            AttestedSemanticLane, LaneCoverage, SemanticBatch, SemanticRefusal,
+        };
+        use crate::semantic_capture::{Endpoint, RoutedCall, TickOutcome, TickReport};
+        use p11scope_ebpf_common::instance::STAMP_VALID;
+        use p11scope_ebpf_common::{Event, InstanceStamp, capture};
+        use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
+        use p11scope_manifest::manifest::{
+            Acquisition, FunctionRecord, Manifest, ObjectRecord, ProvenanceObject, Resolution,
+            SCHEMA, SurfaceRecord, SurfaceSource, Version, WalkOutcome,
+        };
+        take_warned_for_test();
+        let mut coordinator = coordinator();
+        coordinator.set_diagnostic_settlement_latency(true);
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .expect("caller admits");
+        // A pinned provider object: the call admission below proves
+        // the provider module through the subset pins, so the lane
+        // starts on a scripted subset carrying one real pin (the
+        // manifest needs no function table: only pinning runs).
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("provider.so");
+        std::fs::copy("/bin/true", &provider).unwrap();
+        let file = open_object(&provider).unwrap();
+        let inspected = inspect_file(&file).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let path = provider.to_str().unwrap().to_string();
+        // The canonical 68-function table, all unresolved: pinning
+        // only checks object identity, but validation requires the
+        // full ordered table.
+        let functions =
+            match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
+                version: cryptoki_sys::CK_VERSION {
+                    major: 2,
+                    minor: 40,
+                },
+            }) {
+                pkcs11_module::TableSet::Walk(spans) => spans
+                    .iter()
+                    .flat_map(|span| span.fields())
+                    .map(|field| FunctionRecord {
+                        name: field.name.into(),
+                        resolution: Resolution::NullPointer,
+                    })
+                    .collect(),
+                _ => panic!("2.40 is a full standard table"),
+            };
+        let manifest = Manifest {
+            schema: SCHEMA.into(),
+            module_path: path.clone(),
+            objects: vec![ObjectRecord {
+                id: 0,
+                path: path.clone(),
+                identity: inspected.identity.clone(),
+            }],
+            provenance_objects: vec![ProvenanceObject {
+                path,
+                device_major: mapping.device_major,
+                device_minor: mapping.device_minor,
+                inode: mapping.inode,
+                identity: inspected.identity,
+            }],
+            interface_list: Acquisition::Absent,
+            surfaces: vec![SurfaceRecord {
+                source: SurfaceSource::LegacyFunctionList,
+                acquisition: Acquisition::Ok,
+                version: Some(Version {
+                    major: 2,
+                    minor: 40,
+                }),
+                walk: WalkOutcome::Full,
+                functions,
+            }],
+            vendor_interfaces: Vec::new(),
+            alias_groups: Vec::new(),
+            selection_evidence: Default::default(),
+        };
+        let pinning = crate::discovery::identity::pin_manifest_objects_deferred(&manifest).unwrap();
+        assert!(pinning.stale.is_empty());
+        let pin = pinning.pins.pinned().next().expect("one pin");
+        assert_eq!(pin.id, PinnedObjectId(0), "the pin names object 0");
+        let module = ModuleKey::physical(
+            pin.key.device.major,
+            pin.key.device.minor,
+            pin.key.inode,
+            Some(pin.sha256.to_owned()),
+            pin.path,
+        );
+        let slot = crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+            object: PinnedObjectId(0),
+            object_path: "/stub-provider.so".into(),
+            file_offset: 0x1200,
+            names: vec!["C_SignInit".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        };
+        let subset = AttestedSubset::scripted(
+            crate::plan::AttachPlan::from_slots(vec![slot]),
+            pinning.pins.clone(),
+            std::collections::BTreeMap::from([(
+                PinnedObjectId(0),
+                std::collections::BTreeSet::from([0]),
+            )]),
+        );
+        let mut lane =
+            AttestedSemanticLane::start(subset, &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("pinned shell lane starts");
+        lane.set_test_joint_frame(true);
+        lane.set_test_joint_machine(true);
+        assert!(lane.has_joint_frame(), "the seam marks a Joint lane");
+        let detailed = lane.domain();
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/stub-provider.so".into(),
+                key: module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("f2-twin".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(1),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let image = ImageIdentity {
+            task_cookie: 7,
+            exec_id: 1,
+        };
+        coordinator
+            .semantic_bindings_mut()
+            .insert_for_test(SemanticCallerBinding::scripted(
+                caller,
+                module.clone(),
+                detailed,
+                image,
+                Arc::new(PidPin::test_proc_only(pid)),
+            ))
+            .unwrap();
+        let endpoint = Endpoint {
+            object: PinnedObjectId(0),
+            file_slot: 0,
+            offset: 0x1200,
+        };
+        // A tests-only reference id: admission only requires the
+        // coverage to list it (production ids come from the router).
+        let r0 = InstanceId::from_raw(1);
+        let coverage = LaneCoverage::scripted(detailed, image, endpoint, vec![r0]);
+        let input = {
+            let binding = coordinator.semantic_bindings().get(caller).unwrap();
+            admit_registration_from_coverage(&coverage, binding, lane.subset(), r0, 100, None)
+                .expect("scripted coverage registers")
+        };
+        coordinator.registry_mut().note_instance(input);
+        coordinator.commit_batch(false).unwrap();
+        let stamp = InstanceStamp {
+            epoch: 1,
+            file_slot_plus1: 1,
+            flags: STAMP_VALID,
+            ..InstanceStamp::default()
+        };
+        let routed = RoutedCall::scripted(
+            detailed,
+            crate::events::DecodedEventRecord {
+                joint_resource: None,
+                base: crate::semantic_capture::event_record_with_routing(
+                    Event {
+                        slot: 0,
+                        session: 7,
+                        mechanism: 0x000d,
+                        capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+                        rv: 0,
+                        ts_ns: 110,
+                        image,
+                        ..Default::default()
+                    },
+                    stamp,
+                    0x2200,
+                ),
+                object: None,
+            },
+            Route::Joined(r0),
+            Some(endpoint),
+            Some(1),
+        );
+        let batch = SemanticBatch::from_tick_report(
+            detailed,
+            TickReport::scripted(vec![TickOutcome::Call(routed)], Vec::new()),
+            Vec::new(),
+            130,
+        )
+        .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        lane.note_joint_finish_failure(SemanticRefusal::ProviderStorage);
+        assert!(
+            lane.joint_finish_disposition_required(),
+            "the twin latches the lane"
+        );
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            lane,
+            &mut coordinator,
+            "joint finish disposition required",
+            "joint finish abandoned for exit",
+            &mut warn,
+            None,
+        );
+        // Non-vacuity: the terminal commit applied the staged call
+        // through the probe (api_returns and the sample share the
+        // post-refusal population).
+        let final_summary = coordinator
+            .settlement_latency_summary()
+            .expect("diagnostic still enabled");
+        assert_eq!(
+            final_summary.samples, 1,
+            "the staged call applied during the hold"
+        );
+        let warned = take_warned_for_test();
+        let settlement: Vec<&str> = warned
+            .iter()
+            .filter(|line| line.contains("settlement latency"))
+            .map(String::as_str)
+            .collect();
+        assert!(
+            !settlement.is_empty(),
+            "the hold discloses a settlement line: {warned:?}"
+        );
+        let expected = format!("samples={} ", final_summary.samples);
+        assert!(
+            settlement
+                .last()
+                .is_some_and(|line| line.contains(&expected)),
+            "the last settlement line carries the post-commit {expected:?}: {settlement:?}"
+        );
+    }
+
+    #[test]
     fn latched_abandon_hold_discloses_ring_loss_on_its_stop_line() {
         // Isolate from lines other tests on this thread warned: the
         // recorder is thread-local and every read drains.

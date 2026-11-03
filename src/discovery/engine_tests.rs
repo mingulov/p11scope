@@ -31152,6 +31152,107 @@ fn selection_edges_tie_break_empty_key_under_cap() {
     assert_eq!(select_deep_scan_candidates(&under, 3), vec![9, 30, 50]);
 }
 
+/// Deep-scan selection never spends slots on kernel threads: they have no
+/// user address space to scan. A fixture /proc with 260 kernel threads at
+/// the lowest pids and 40 unmapped user processes at high pids still
+/// deep-scans every user process under a 256 cap.
+#[test]
+fn kernel_threads_first_in_pid_order_do_not_consume_deep_scan_slots() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let proc_root = std::env::temp_dir().join(format!("demo2-kthreads-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    let mut sweep: Vec<(u32, Vec<MapEntry>)> = Vec::new();
+    for pid in 2..262u32 {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("stat"),
+            stat_line(pid, "kworker", crate::process::PF_KTHREAD),
+        )
+        .unwrap();
+        sweep.push((pid, Vec::new()));
+    }
+    for (index, pid) in (10000..10040u32).enumerate() {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), stat_line(pid, "worker", 0x0040_0000)).unwrap();
+        sweep.push((pid, vec![map_entry("/usr/bin/worker", 500 + index as u64)]));
+    }
+    let excluded = kernel_thread_exclusions(&sweep, &BTreeSet::new(), &proc_root);
+    assert_eq!(excluded.len(), 260, "{excluded:?}");
+    // The bug this pins: without the exclusion the 256 cap fills with
+    // kernel threads and no user process is selected.
+    let unfiltered = select_deep_scan_candidates(&sweep, 256);
+    assert_eq!(unfiltered.len(), 256);
+    assert!(unfiltered.iter().all(|pid| *pid < 10000), "{unfiltered:?}");
+    let eligible: Vec<(u32, Vec<MapEntry>)> = sweep
+        .into_iter()
+        .filter(|(pid, _)| !excluded.contains(pid))
+        .collect();
+    let selected = select_deep_scan_candidates(&eligible, 256);
+    assert_eq!(selected.len(), 40, "{selected:?}");
+    assert!(selected.iter().all(|pid| *pid >= 10000), "{selected:?}");
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
+/// The exclusion is conjunctive and fail-closed: a zombie shape (empty maps,
+/// no thread flag), an unavailable snapshot, a flagged pid with mappings,
+/// and an unreadable stat all stay eligible for deep scanning.
+#[test]
+fn kernel_thread_exclusion_needs_empty_maps_and_the_thread_flag() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let proc_root =
+        std::env::temp_dir().join(format!("demo2-kthreads-edge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    for (pid, flags) in [
+        (10u32, crate::process::PF_KTHREAD),
+        (11, 0x0040_0000u32),
+        (12, crate::process::PF_KTHREAD),
+        (13, crate::process::PF_KTHREAD),
+    ] {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), stat_line(pid, "p", flags)).unwrap();
+    }
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, Vec::new()),
+        (11, Vec::new()),
+        (12, Vec::new()),
+        (13, vec![map_entry("/usr/bin/worker", 7)]),
+        (14, Vec::new()),
+    ];
+    let unavailable: BTreeSet<u32> = [12].into_iter().collect();
+    let excluded = kernel_thread_exclusions(&sweep, &unavailable, &proc_root);
+    assert_eq!(excluded, [10].into_iter().collect(), "{excluded:?}");
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
 /// Package C: rotation's fairness tier agrees with plain selection when
 /// nothing is stale, prefers never-evicted members within each rarity
 /// class, and still lets global rarity beat pid order across groups.

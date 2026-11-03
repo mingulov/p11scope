@@ -58,10 +58,23 @@ impl MultiHostRefusal {
         Self::at(stage, errno)
     }
 
-    /// A permission or policy denial: the kernel may support Multi with
-    /// more privilege, so the denied operation itself is worth reporting.
-    pub(crate) fn is_denied(&self) -> bool {
-        self.cause == MultiHostCause::Denied
+    /// Whether the probe shape proves the kernel itself lacks Multi: the
+    /// scratch self-link refusal observed on 6.1, an explicit unsupported
+    /// answer at load or link time, or a load refusal for the unknown
+    /// attach type. Every other shape (permission or policy at any stage,
+    /// a resource error, ENOSYS, an anchor failure) may come from a
+    /// capable but confined host, so doctor still test-loads the capture
+    /// objects there: they fail fast and keep their guidance.
+    pub(crate) fn is_premulti_kernel(&self) -> bool {
+        matches!(
+            (self.stage, self.errno),
+            (MultiHostStage::SelfLink, Some(libc::EINVAL))
+                | (MultiHostStage::ProgramLoad, Some(libc::EINVAL))
+                | (
+                    MultiHostStage::ProgramLoad | MultiHostStage::SelfLink,
+                    Some(libc::EOPNOTSUPP)
+                )
+        )
     }
 }
 
@@ -367,6 +380,44 @@ mod tests {
             }
             assert_eq!(text.lines().count(), 1);
             assert!(text.len() < 1_024, "{text}");
+        }
+    }
+
+    #[test]
+    fn premulti_predicate_covers_only_shapes_where_the_kernel_lacks_multi() {
+        for (stage, errno, premulti) in [
+            // Known pre-Multi shapes: the observed 6.1 scratch-link
+            // refusal, the unknown attach type refused at load, and an
+            // explicit unsupported answer at load or link time.
+            (MultiHostStage::SelfLink, Some(libc::EINVAL), true),
+            (MultiHostStage::ProgramLoad, Some(libc::EINVAL), true),
+            (MultiHostStage::ProgramLoad, Some(libc::EOPNOTSUPP), true),
+            (MultiHostStage::SelfLink, Some(libc::EOPNOTSUPP), true),
+            // Permission or policy at any stage: a capable but
+            // unprivileged host.
+            (MultiHostStage::Anchor, Some(libc::EPERM), false),
+            (MultiHostStage::Anchor, Some(libc::EACCES), false),
+            (MultiHostStage::ProgramLoad, Some(libc::EPERM), false),
+            (MultiHostStage::ProgramLoad, Some(libc::EACCES), false),
+            (MultiHostStage::SelfLink, Some(libc::EPERM), false),
+            (MultiHostStage::SelfLink, Some(libc::EACCES), false),
+            // Resource errors: a capable but exhausted host.
+            (MultiHostStage::ProgramLoad, Some(libc::EMFILE), false),
+            (MultiHostStage::ProgramLoad, Some(libc::ENOMEM), false),
+            (MultiHostStage::SelfLink, Some(libc::EMFILE), false),
+            (MultiHostStage::SelfLink, Some(libc::ENOMEM), false),
+            // ENOSYS may be a seccomp mask on a capable host.
+            (MultiHostStage::ProgramLoad, Some(libc::ENOSYS), false),
+            (MultiHostStage::SelfLink, Some(libc::ENOSYS), false),
+            // An anchor failure never shows the kernel lacks Multi.
+            (MultiHostStage::Anchor, None, false),
+            (MultiHostStage::Anchor, Some(libc::EOPNOTSUPP), false),
+            // Any other errno stays unproven and keeps its loads.
+            (MultiHostStage::ProgramLoad, Some(libc::E2BIG), false),
+            (MultiHostStage::SelfLink, Some(libc::EFAULT), false),
+        ] {
+            let refusal = MultiHostRefusal::at(stage, errno);
+            assert_eq!(refusal.is_premulti_kernel(), premulti, "{refusal}");
         }
     }
 

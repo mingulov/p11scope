@@ -248,16 +248,16 @@ const UPROBE_MULTI_ROW: &str = "uprobe-multi attach (own libc)";
 /// (minutes on 6.1) and could not change the verdict.
 const SKIPPED_WITHOUT_MULTI: &str = "skipped: uprobe-multi-required (live capture needs uprobe-multi; this check loads capture programs)";
 
-/// Whether doctor test-loads the capture objects. Only a proven Multi
-/// host, or a permission/policy denial of the Multi probe, loads them: a
-/// denied host may support Multi with more privilege, and the failed
-/// loads then name the denied operation and its origin. A host where
-/// Multi is unavailable or unproven skips them; its uprobe-multi row
-/// still fails, so the verdict stays "capture unavailable".
+/// Whether doctor test-loads the capture objects. A proven Multi host
+/// loads them, and so does any refused probe except a known pre-Multi
+/// kernel shape (V61-5): permission, resource and ENOSYS states fail
+/// fast and keep their guidance, while only a kernel that itself lacks
+/// Multi skips them; its uprobe-multi row still fails, so the verdict
+/// stays "capture unavailable".
 fn capture_loads_assessed(host: crate::attach::MultiHostVerdict) -> bool {
     match host {
         Ok(_) => true,
-        Err(refusal) => refusal.is_denied(),
+        Err(refusal) => !refusal.is_premulti_kernel(),
     }
 }
 
@@ -1429,7 +1429,7 @@ fn is_capture_row(name: &str) -> bool {
         // A flavor mismatch fails the object row, and no capture lane can
         // work then, so it gates the exit code with the other capture rows.
         || name == "object-attribute capture"
-        || name == "uprobe-multi attach (own libc)"
+        || name == UPROBE_MULTI_ROW
         || name.starts_with("uprobe attach")
 }
 
@@ -1488,7 +1488,7 @@ fn capability_tier(checks: &[Check]) -> CapabilityTierResult {
         host_attach: row_ok("BPF map create")
             && row_ok(UPROBE_ATTACH_SELF_ROW)
             && row_ok("host program preflight")
-            && row_ok("uprobe-multi attach (own libc)"),
+            && row_ok(UPROBE_MULTI_ROW),
         target_readable,
         lifecycle: row_ok("lifecycle preflight"),
         // A requested --pid lane refused for its PID namespace is not a
@@ -1631,6 +1631,18 @@ fn is_requested_lane(name: &str) -> bool {
 /// diagnostic rows. This is pure over probe results; missing rows cannot prove
 /// a target or scope ready, and copy does not change qualification or exits.
 pub fn summary(checks: &[Check], extra_strict: bool) -> String {
+    summary_with_host(checks, extra_strict, None)
+}
+
+/// The summary with the typed host verdict: the Next step for the
+/// uprobe-multi row comes from the typed probe refusal, never from
+/// re-parsing the rendered row text. Without a typed verdict (callers
+/// with synthetic checks) no kernel-age claim is made.
+fn summary_with_host(
+    checks: &[Check],
+    extra_strict: bool,
+    host: Option<crate::attach::MultiHostVerdict>,
+) -> String {
     let assessed = checks.iter().any(|check| {
         is_requested_lane(&check.name) && !matches!(check.status, Status::NotApplicable(_))
     });
@@ -1682,7 +1694,7 @@ pub fn summary(checks: &[Check], extra_strict: bool) -> String {
             })
     };
     let next = match problem {
-        Some(check) => next_step(check),
+        Some(check) => next_step_with_host(check, host),
         None if scope == "unassessed" =>
             "choose --pid <PID> or --cgroup <PATH> to assess a target scope".into(),
         None => "choose a capture mode with p11scope profile --help; these checks do not prove provider activity".into(),
@@ -1691,18 +1703,23 @@ pub fn summary(checks: &[Check], extra_strict: bool) -> String {
     out
 }
 
-fn next_step(check: &Check) -> String {
-    let detail = status_detail(&check.status);
-    // A host without Multi (not a permission denial, which keeps the
-    // privilege advice below): capture-object checks were skipped.
+/// The Next step with the typed host verdict. Only a probe refusal that
+/// proves the kernel itself lacks Multi names a Multi host; every other
+/// Multi refusal falls through to the generic guidance below, and the
+/// loads that ran ahead of it keep their own rows.
+fn next_step_with_host(check: &Check, host: Option<crate::attach::MultiHostVerdict>) -> String {
     if check.name == UPROBE_MULTI_ROW
-        && detail.starts_with("uprobe-multi-required")
-        && !detail.contains("denied")
+        && matches!(host, Some(Err(refusal)) if refusal.is_premulti_kernel())
     {
         return "use a host with uprobe-multi (normally Linux 6.6+) for live capture; \
                 p11scope inspect --pid <PID> works here without live capture"
             .into();
     }
+    next_step(check)
+}
+
+fn next_step(check: &Check) -> String {
+    let detail = status_detail(&check.status);
     // These suffixes come from the existing independent EPERM classifier.
     // Seccomp mode or CapEff alone must never select a causal recommendation.
     if detail.ends_with("(origin: controlled seccomp denial)") {
@@ -1755,8 +1772,20 @@ pub fn render(checks: &[Check]) -> String {
     render_with_mode(checks, false)
 }
 
+fn render_with_host(checks: &[Check], host: crate::attach::MultiHostVerdict) -> String {
+    render_with_mode_and_host(checks, false, Some(host))
+}
+
 fn render_with_mode(checks: &[Check], extra_strict: bool) -> String {
-    let mut out = summary(checks, extra_strict);
+    render_with_mode_and_host(checks, extra_strict, None)
+}
+
+fn render_with_mode_and_host(
+    checks: &[Check],
+    extra_strict: bool,
+    host: Option<crate::attach::MultiHostVerdict>,
+) -> String {
+    let mut out = summary_with_host(checks, extra_strict, host);
     for check in checks {
         let dots = NAME_WIDTH.saturating_sub(check.name.chars().count());
         let word = status_word(&check.status);
@@ -1849,7 +1878,14 @@ pub fn verdict_extra_strict(checks: &[Check]) -> i32 {
 /// labels, never target-controlled bytes, so the refusal line cannot be
 /// forged the way a detail could (F-59).
 pub fn render_extra_strict(checks: &[Check]) -> String {
-    let mut out = render_with_mode(checks, true);
+    render_extra_strict_with_host(checks, None)
+}
+
+fn render_extra_strict_with_host(
+    checks: &[Check],
+    host: Option<crate::attach::MultiHostVerdict>,
+) -> String {
+    let mut out = render_with_mode_and_host(checks, true, host);
     let violations = extra_strict_violations(checks);
     let exempt: Vec<&str> = checks
         .iter()
@@ -1973,9 +2009,12 @@ pub fn run(pid: Option<u32>, cgroup: Option<&Path>, extra_strict: bool) -> Resul
     let host = crate::attach::require_multi_capable_host();
     let checks = probe_with_host(pid, cgroup, host);
     let (mut text, code) = if extra_strict {
-        (render_extra_strict(&checks), verdict_extra_strict(&checks))
+        (
+            render_extra_strict_with_host(&checks, Some(host)),
+            verdict_extra_strict(&checks),
+        )
     } else {
-        (render(&checks), verdict(&checks))
+        (render_with_host(&checks, host), verdict(&checks))
     };
     // The preflight loads each counter object and releases it without
     // attaching; only a proven bpf_loop host can answer, and omitted
@@ -2125,21 +2164,46 @@ mod tests {
         assert!(!line.contains("uprobe-multi-required"));
     }
 
-    /// Twin of `doctor_loads_capture_objects_on_a_multi_or_denied_host`: a
-    /// host where Multi is unavailable or unproven (6.1 refuses the
-    /// scratch load with EINVAL) skips every capture-object load with the
-    /// named token, keeps the same rows, and never reads as ready.
+    /// Twin of `doctor_runs_capture_loads_unless_the_kernel_itself_lacks_multi`:
+    /// a probe shape that proves the kernel itself lacks Multi (the
+    /// observed 6.1 scratch-link refusal, an explicit unsupported answer,
+    /// or a load refusal for the unknown attach type) skips every
+    /// capture-object load with the named token, keeps the same rows,
+    /// and never reads as ready.
     #[test]
-    fn doctor_skips_capture_loads_without_multi_and_stays_not_ready() {
+    fn doctor_skips_capture_loads_on_known_premulti_shapes_and_stays_not_ready() {
         use crate::attach::{MultiHostRefusal, MultiHostStage};
-        for (stage, errno) in [
-            (MultiHostStage::ProgramLoad, Some(libc::EINVAL)),
-            (MultiHostStage::SelfLink, Some(libc::EOPNOTSUPP)),
-            (MultiHostStage::SelfLink, Some(libc::ENOSYS)),
-            (MultiHostStage::Anchor, None),
+        for (stage, errno, cause) in [
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::EINVAL),
+                "Multi capability unproven",
+            ),
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::EINVAL),
+                "Multi capability unproven",
+            ),
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::EOPNOTSUPP),
+                "Multi capability unavailable",
+            ),
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::EOPNOTSUPP),
+                "Multi capability unavailable",
+            ),
         ] {
             let refusal = MultiHostRefusal::for_test(stage, errno);
+            assert!(refusal.is_premulti_kernel(), "{refusal}");
             assert!(!capture_loads_assessed(Err(refusal)), "{refusal}");
+            let stage_word = match stage {
+                MultiHostStage::Anchor => "self-probe anchor",
+                MultiHostStage::ProgramLoad => "scratch program load",
+                MultiHostStage::SelfLink => "scratch self-link",
+            };
+            let multi_detail = expected_multi_detail(stage_word, cause, errno, None);
             let bpf = premulti_bpf_checks(Err(refusal));
             let healthy = bpf_checks_with_seccomp(
                 Ok(()),
@@ -2170,7 +2234,7 @@ mod tests {
             for check in bpf.iter().chain(&preflight) {
                 match check.name.as_str() {
                     UPROBE_MULTI_ROW => {
-                        assert_eq!(check.status, Status::Fail(refusal.to_string()));
+                        assert_eq!(check.status, Status::Fail(multi_detail.clone()));
                     }
                     JOURNAL_PAIR_ROW => {
                         assert_eq!(check.status, Status::Ok("available".into()));
@@ -2199,7 +2263,10 @@ mod tests {
             checks.extend(preflight);
             assert_eq!(verdict(&checks), 1, "{refusal}");
             assert_eq!(capability_tier(&checks).tier, CapabilityTier::T0);
-            let text = render(&checks);
+            // The typed render names a Multi host, in both modes; the
+            // untyped render of the same rows must not invent that claim
+            // from the row text alone.
+            let text = render_with_host(&checks, Err(refusal));
             assert_eq!(
                 text.lines().next(),
                 Some("Doctor: requested lane unavailable."),
@@ -2209,28 +2276,165 @@ mod tests {
                 verdict_line(&checks).contains("capture unavailable"),
                 "{text}"
             );
+            let next = text
+                .lines()
+                .find(|line| line.starts_with("Next: "))
+                .unwrap();
+            assert_eq!(next, format!("Next: {PREMULTI_KERNEL_NEXT}."), "{text}");
+            let strict = render_extra_strict_with_host(&checks, Some(Err(refusal)));
+            let next = strict
+                .lines()
+                .find(|line| line.starts_with("Next: "))
+                .unwrap();
+            assert_eq!(next, format!("Next: {PREMULTI_KERNEL_NEXT}."), "{strict}");
+            let untyped = render(&checks);
             assert!(
-                text.contains("Next: use a host with uprobe-multi"),
-                "{text}"
+                !untyped.contains("Linux 6.6"),
+                "untyped render must not claim a kernel age: {untyped}"
             );
         }
     }
 
+    /// The exact Multi-row detail for one probe shape: cause and stage
+    /// words plus the libc errno text, the Denied operation sentence when
+    /// present, and the shared offline-pointer tail.
+    fn expected_multi_detail(
+        stage: &str,
+        cause: &str,
+        errno: Option<i32>,
+        operation: Option<&str>,
+    ) -> String {
+        let mut detail = format!("uprobe-multi-required: {cause} at {stage}");
+        if let Some(errno) = errno {
+            detail.push_str(&format!(
+                " (errno {errno}: {})",
+                std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        if let Some(operation) = operation {
+            detail.push_str(&format!("; cannot {operation}; live capture requires root or appropriate capabilities and a permitting host policy (for example, sudo)"));
+        }
+        detail.push_str("; run `p11scope doctor` for host readiness or `p11scope doctor --pid <n>` for target readiness; `p11scope inspect --pid <n>` lists readable mapped providers without live capture");
+        detail
+    }
+
+    /// The Next step for a Multi row that carries no kernel-age claim.
+    const GENERIC_MULTI_NEXT: &str = "review uprobe-multi attach (own libc) in the checks below before retrying qualification or capture";
+    /// The Next step for a Multi row whose errno names a permission failure.
+    const UNCLASSIFIED_DENIAL_NEXT: &str = "denial cause is unclassified; inspect the failed operation and launcher policy before changing privileges";
+    /// The Next step for a probe refusal that proves a pre-Multi kernel.
+    const PREMULTI_KERNEL_NEXT: &str = "use a host with uprobe-multi (normally Linux 6.6+) for live capture; p11scope inspect --pid <PID> works here without live capture";
+
+    /// Twin of the skip test: permission, resource and ENOSYS probe states
+    /// (at any stage) run the capture-object loads as before, and the Next
+    /// step for the Multi row never claims a newer kernel.
     #[test]
-    fn doctor_loads_capture_objects_on_a_multi_or_denied_host() {
+    fn doctor_runs_capture_loads_unless_the_kernel_itself_lacks_multi() {
         use crate::attach::{MultiCapableHost, MultiHostRefusal, MultiHostStage};
         assert!(capture_loads_assessed(Ok(MultiCapableHost::for_test())));
-        for (stage, errno) in [
-            (MultiHostStage::ProgramLoad, libc::EPERM),
-            (MultiHostStage::SelfLink, libc::EPERM),
-            (MultiHostStage::SelfLink, libc::EACCES),
+        for (stage, errno, cause, operation, next) in [
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::EACCES),
+                "Multi capability unproven",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::Anchor,
+                Some(libc::EPERM),
+                "Multi capability unproven",
+                None,
+                UNCLASSIFIED_DENIAL_NEXT,
+            ),
+            (
+                MultiHostStage::Anchor,
+                Some(libc::EACCES),
+                "Multi capability unproven",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::EPERM),
+                "Multi probe denied by permission or policy",
+                Some("load p11scope's BPF programs"),
+                UNCLASSIFIED_DENIAL_NEXT,
+            ),
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::EPERM),
+                "Multi probe denied by permission or policy",
+                Some("attach p11scope's required Multi probe"),
+                UNCLASSIFIED_DENIAL_NEXT,
+            ),
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::EACCES),
+                "Multi probe denied by permission or policy",
+                Some("attach p11scope's required Multi probe"),
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::EMFILE),
+                "Multi capability unproven",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::ENOMEM),
+                "Multi capability unproven",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::ProgramLoad,
+                Some(libc::ENOSYS),
+                "Multi capability unavailable",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::SelfLink,
+                Some(libc::ENOSYS),
+                "Multi capability unavailable",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
+            (
+                MultiHostStage::Anchor,
+                None,
+                "Multi capability unproven",
+                None,
+                GENERIC_MULTI_NEXT,
+            ),
         ] {
-            let refusal = MultiHostRefusal::for_test(stage, Some(errno));
-            assert!(refusal.is_denied(), "{refusal}");
+            let refusal = MultiHostRefusal::for_test(stage, errno);
+            assert!(!refusal.is_premulti_kernel(), "{refusal}");
             assert!(capture_loads_assessed(Err(refusal)), "{refusal}");
-            // A denial keeps the privilege guidance, not the kernel advice.
-            let next = next_step(&uprobe_multi_check(Err(refusal)));
-            assert!(!next.contains("Linux 6.6"), "{next}");
+            let multi = uprobe_multi_check(Err(refusal));
+            assert_eq!(multi.name, UPROBE_MULTI_ROW);
+            let stage_word = match stage {
+                MultiHostStage::Anchor => "self-probe anchor",
+                MultiHostStage::ProgramLoad => "scratch program load",
+                MultiHostStage::SelfLink => "scratch self-link",
+            };
+            assert_eq!(
+                multi.status,
+                Status::Fail(expected_multi_detail(stage_word, cause, errno, operation)),
+                "{refusal}"
+            );
+            assert_eq!(
+                next_step_with_host(&multi, Some(Err(refusal))),
+                next,
+                "{refusal}"
+            );
+            assert!(
+                !next_step(&multi).contains("Linux 6.6"),
+                "untyped Next must not claim a kernel age: {refusal}"
+            );
         }
     }
 

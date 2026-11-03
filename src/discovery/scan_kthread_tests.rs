@@ -115,6 +115,29 @@ fn pinned_start_time() -> u64 {
         .expect("the test process pins a start time")
 }
 
+/// [`scan_view_with_examined`] over scripted maps with operator hints: the
+/// flag reports whether the scan reached its `--module` hint loop. Memory
+/// reads stay off: the flag is about the mapping pass, not `/proc/<pid>/mem`.
+fn run_examined(
+    fixture: &mut EmptyMapsFixture,
+    budget: &mut CaptureWorkBudget,
+    hints: &[PathBuf],
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+    let view = self_view();
+    let hooks = HookRegistry::builtin();
+    scan_view_with_examined(
+        &ScanRequest {
+            pid: view.pid(),
+            hints,
+            hooks: &hooks,
+        },
+        &view,
+        budget,
+        fixture,
+        false,
+    )
+}
+
 #[test]
 fn scan_kernel_thread_empty_maps_is_verified_absence() {
     let mut fixture = EmptyMapsFixture {
@@ -145,6 +168,187 @@ fn scan_kernel_thread_empty_maps_is_verified_absence() {
         budget.kernel_thread_absences(),
         1,
         "one verified absence is counted once"
+    );
+}
+
+#[test]
+fn kernel_thread_scan_never_examines_hints() {
+    // Verified absence never evaluates hints: the collapse must not read
+    // the missing miss notes as a match.
+    let mut fixture = EmptyMapsFixture {
+        maps: Vec::new(),
+        stat: Ok(kthread_stat(pinned_start_time())),
+        exe: Err(io::ErrorKind::NotFound),
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let (outcome, examined, hints_examined) =
+        run_examined(&mut fixture, &mut budget, &[]).expect("kernel thread must scan, not error");
+    assert!(
+        !hints_examined,
+        "a kernel thread never reaches the hint loop, got {outcome:?}"
+    );
+    assert!(examined.is_empty());
+    assert!(outcome.skipped().is_empty());
+}
+
+#[test]
+fn refused_initial_scan_never_examines_hints() {
+    // A refusal before the hint loop is hint-silent too: no miss notes,
+    // no match implied.
+    let mut fixture = EmptyMapsFixture {
+        maps: Vec::new(),
+        stat: Ok(user_stat(pinned_start_time())),
+        exe: Ok(PathBuf::from("/usr/bin/worker")),
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let (outcome, _, hints_examined) = run_examined(&mut fixture, &mut budget, &[])
+        .expect("refusal must keep scanning, not error");
+    assert!(
+        !hints_examined,
+        "a refused-initial scan never reaches the hint loop, got {outcome:?}"
+    );
+    assert!(
+        outcome.skipped().iter().any(|skip| skip
+            .reason
+            .contains("empty or truncated /proc maps snapshot")),
+        "live exe must keep today's refusal, got {:?}",
+        outcome.skipped()
+    );
+}
+
+#[test]
+fn completed_scan_marks_hints_examined() {
+    // One executable group with an unopenable path and an unmatched hint:
+    // the ordinary miss disclosure plus the examined flag.
+    let mut fixture = EmptyMapsFixture {
+        maps: b"7f0000000000-7f0000001000 r-xp 00000000 08:01 424242 /nonexistent-dir/missing.so\n"
+            .to_vec(),
+        stat: Err(io::ErrorKind::NotFound),
+        exe: Err(io::ErrorKind::NotFound),
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let hints = [PathBuf::from("/opt/typo.so")];
+    let (outcome, _, hints_examined) = run_examined(&mut fixture, &mut budget, &hints)
+        .expect("an ordinary scan must complete, not error");
+    assert!(
+        hints_examined,
+        "a completed scan reached the hint loop, got {outcome:?}"
+    );
+    assert!(
+        outcome.unavailable_reason().is_none(),
+        "the mapping bracket must complete, got {outcome:?}"
+    );
+    assert!(
+        outcome
+            .skipped()
+            .iter()
+            .any(|skip| skip.subject == "/opt/typo.so" && skip.reason == HINT_NOT_MAPPED_REASON),
+        "the unmatched hint is owed one miss note, got {:?}",
+        outcome.skipped()
+    );
+}
+
+/// A `--module` hint file plus scripted maps whose one executable group
+/// carries the hint's inode under the given raw path spelling: the
+/// inode-alias shape, with no path equality.
+fn inode_alias_fixture(raw_path: &str) -> (tempfile::TempDir, PathBuf, EmptyMapsFixture) {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let hint = dir.path().join("libtok.so");
+    std::fs::write(&hint, b"provider bytes").unwrap();
+    let inode = std::fs::metadata(&hint).unwrap().ino();
+    let maps = format!("7f0000000000-7f0000001000 r-xp 00000000 08:01 {inode} {raw_path}\n");
+    let fixture = EmptyMapsFixture {
+        maps: maps.into_bytes(),
+        stat: Err(io::ErrorKind::NotFound),
+        exe: Err(io::ErrorKind::NotFound),
+    };
+    (dir, hint, fixture)
+}
+
+fn hint_missed(outcome: &ScanOutcome, hint: &Path) -> bool {
+    outcome.skipped().iter().any(|skip| {
+        skip.subject == hint.display().to_string() && skip.reason == HINT_NOT_MAPPED_REASON
+    })
+}
+
+#[test]
+fn inode_match_without_usable_path_still_misses_the_hint() {
+    // An inode alias the scan cannot open (memfd, deleted mapping) is
+    // unconfirmed: it must not mask the hint's miss.
+    for raw_path in ["[memfd:jit-cache]", "/opt/stale/libtok.so (deleted)"] {
+        let (_dir, hint, mut fixture) = inode_alias_fixture(raw_path);
+        let mut budget = CaptureWorkBudget::default();
+        let (outcome, _, hints_examined) =
+            run_examined(&mut fixture, &mut budget, std::slice::from_ref(&hint))
+                .expect("the scan must complete, not error");
+        assert!(
+            hints_examined,
+            "the scan reached the hint loop ({raw_path})"
+        );
+        assert!(
+            hint_missed(&outcome, &hint),
+            "an unconfirmed inode alias must not mask the miss ({raw_path}), got {:?}",
+            outcome.skipped()
+        );
+    }
+}
+
+#[test]
+fn inode_match_with_unopenable_object_still_misses_the_hint() {
+    // Same, when the aliased path exists in maps but cannot be opened in
+    // the target: the gate never runs, so the hint stays unmatched.
+    let (_dir, hint, mut fixture) = inode_alias_fixture("/nonexistent-dir/unopenable.so");
+    let mut budget = CaptureWorkBudget::default();
+    let (outcome, _, hints_examined) =
+        run_examined(&mut fixture, &mut budget, std::slice::from_ref(&hint))
+            .expect("the scan must complete, not error");
+    assert!(hints_examined, "the scan reached the hint loop");
+    assert!(
+        hint_missed(&outcome, &hint),
+        "an unconfirmed inode alias must not mask the miss, got {:?}",
+        outcome.skipped()
+    );
+}
+
+#[test]
+fn path_match_counts_as_matched_without_further_confirmation() {
+    // Healthy twin: exact path equality in the target view is the
+    // confirmation, so the hint is mapped here even when the object
+    // itself cannot be corroborated afterwards (here the opened identity
+    // cannot match the scripted maps key). The object stays disclosed
+    // as its own skip; only the hint miss is not owed.
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let hint = dir.path().join("libtok.so");
+    std::fs::write(&hint, b"provider bytes").unwrap();
+    let inode = std::fs::metadata(&hint).unwrap().ino();
+    let maps = format!(
+        "7f0000000000-7f0000001000 r-xp 00000000 ff:fe {inode} {}\n",
+        hint.display()
+    );
+    let mut fixture = EmptyMapsFixture {
+        maps: maps.into_bytes(),
+        stat: Err(io::ErrorKind::NotFound),
+        exe: Err(io::ErrorKind::NotFound),
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let (outcome, _, hints_examined) =
+        run_examined(&mut fixture, &mut budget, std::slice::from_ref(&hint))
+            .expect("the scan must complete, not error");
+    assert!(hints_examined, "the scan reached the hint loop");
+    assert!(
+        !hint_missed(&outcome, &hint),
+        "a path-matched hint is mapped, got {:?}",
+        outcome.skipped()
+    );
+    assert!(
+        outcome
+            .skipped()
+            .iter()
+            .any(|skip| skip.reason.contains("does not match mapped object")),
+        "the unconfirmed object stays disclosed, got {:?}",
+        outcome.skipped()
     );
 }
 

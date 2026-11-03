@@ -163,15 +163,6 @@ await_signal_child() {
   done
   return 1
 }
-register_owned_descendants() {
-  local parent=$1 file list candidate
-  alive "$parent" || return 1
-  for file in /proc/"$parent"/task/*/children; do
-    list=''
-    { IFS= read -r list < "$file"; } 2>/dev/null || [ -n "$list" ] || continue
-    for candidate in $list; do register_owned_child "$candidate" "$parent" || true; done
-  done
-}
 cleanup_all() {
   local pid
   for pid in "${!CHILDREN[@]}"; do terminate "$pid" || true; done
@@ -219,8 +210,8 @@ sweep_trial() {
   local prefix="sweep-$cmd-t$n"
   local wl="$prefix.wl" stdout="$prefix.stdout" stderr="$prefix.stderr"
   local report="$prefix.json" gate="$prefix.gate"
-  local ready='p11scope: capturing:' wlpid='' pp='' content
-  local ledger_before=0 rc_obs=125 orc=125
+  local ready='p11scope: capturing:' wlpid='' pp='' content content_after
+  local ledger_before=0 ledger_race_possible=0 rc_obs=125 orc=125
   rm -f -- "$wl" "$stdout" "$stderr" "$report" "$gate" "$prefix.pin_before" \
     "$prefix.pin_after" "$prefix.oracle.json" "$prefix.childpid"
   local offset; offset=$(trial_offset "$cmd" "$seed") || return 2
@@ -271,6 +262,16 @@ sweep_trial() {
   alive "$pp" || {
     trial_log "TRIAL cmd=$cmd trial=$n seed=$seed offset_ms=$offset setup_fail=observer-died"; return 2; }
   kill -INT "$pp"
+  # The workload may print LEDGER between the pre-kill grep above and
+  # this signal (one scheduling gap). Re-check immediately: if LEDGER
+  # is present now but was absent before, the trial may have finished
+  # before the signal yet is judged racing (false-pass bias). Flag it
+  # in the trial line; the verdict stays racing because a post-hoc
+  # LEDGER cannot order itself against SIGINT.
+  { content_after=$(<"$wl"); } 2>/dev/null || content_after=''
+  case $content_after in
+    *'LEDGER '*) [ "$ledger_before" = 0 ] && ledger_race_possible=1 ;;
+  esac
   if finish_quiet "$pp" "$EXIT_TICKS"; then rc_obs=$LAST_EXIT; else rc_obs=124; fi
   waitfor_quiet "$wl" 'LEDGER ' "$wlpid" "$LEDGER_TICKS" || true
   if [ -n "${CHILDREN[$wlpid]:-}" ]; then terminate "$wlpid" || true; fi
@@ -280,7 +281,7 @@ sweep_trial() {
     --ledger-complete "$ledger_before" --provider-before "$prefix.pin_before" \
     --provider-after "$prefix.pin_after" > "$prefix.oracle.json" 2> "$prefix.oracle.stderr"; orc=$?
   VERDICTS=$((VERDICTS + 1))
-  trial_log "TRIAL cmd=$cmd trial=$n seed=$seed offset_ms=$offset ledger_before=$ledger_before observer_rc=$rc_obs oracle_rc=$orc"
+  trial_log "TRIAL cmd=$cmd trial=$n seed=$seed offset_ms=$offset ledger_before=$ledger_before ledger_race_possible=$ledger_race_possible observer_rc=$rc_obs oracle_rc=$orc"
   return "$orc"
 }
 
@@ -354,9 +355,7 @@ for i in range(population):
         assert row["attempts"] == 1 and row["successful"] == 1, "newcomer %d calls" % i
 PY
     trial_log "TRIAL cmd=burst trial=$n seed=$seed setup_fail=newcomer-ledgers"; return 2; }
-  local newcomers
-  newcomers=$(printf ',%s' $NAMES)
-  newcomers=${newcomers#,}
+  local newcomers=${NAMES// /,}
   python3 -I "$ORACLE" --mode burst --command profile-system --report "$report" \
     --workload "$wl" --stderr "$stderr" --exit "$rc_obs" --seed "$seed" \
     --offset-ms "$BURST_AT_MS" --ledger-complete 1 --provider-before "$prefix.pin_before" \

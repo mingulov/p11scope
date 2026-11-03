@@ -42,15 +42,24 @@ EXPECT_JOINT_FAIL=${JOINT_EXPECTED_FAILURE:-1}
 case $TRIALS in *[!0-9]*|'') echo "bad STOP_RACES_TRIALS: $TRIALS" >&2; exit 64 ;; esac
 case $BURST in *[!0-9]*|'') echo "bad STOP_RACES_BURST_TRIALS: $BURST" >&2; exit 64 ;; esac
 case $EXPECT_JOINT_FAIL in 0|1) ;; *) echo "bad JOINT_EXPECTED_FAILURE: $EXPECT_JOINT_FAIL" >&2; exit 64 ;; esac
-[ "$(id -u)" = 0 ] || { echo 'stop-races.sh: prerequisite missing: must run as root' >&2; exit 77; }
 umask 022
-P=$(realpath -e -- "$P") || { echo "stop-races.sh: prerequisite missing: observer not found: $1" >&2; exit 77; }
 mkdir -p "$OUT" && OUT=$(realpath -e -- "$OUT") || exit 2
 cd "$OUT" || exit 2
+: > results.jsonl
+prereq_fail() {
+  echo "stop-races.sh: prerequisite missing: $1" >&2
+  python3 - "$1" <<'PY' >> results.jsonl
+import json,sys
+print(json.dumps({"cell":"stop-races-prerequisites","pass":False,"qualification":"environment-precluded","detail":"prerequisite missing: "+sys.argv[1]},sort_keys=True))
+PY
+  exit 77
+}
+[ "$(id -u)" = 0 ] || prereq_fail 'must run as root'
+P=$(realpath -e -- "$P") || prereq_fail "observer not found: $1"
 "$QUALIFY" "$P" "$OUT" --trials "$TRIALS" --burst-trials "$BURST" --cell all > qualify.log 2>&1
 qualify_rc=$?
 [ -f results.jsonl ] || { echo 'stop-races.sh: harness error: qualify produced no results.jsonl' >&2; exit 2; }
-python3 - "$qualify_rc" <<'PY'
+if python3 - "$qualify_rc" <<'PY'
 import json,sys
 rows=[]
 for line in open('results.jsonl'):
@@ -68,7 +77,11 @@ with open('results.jsonl','w') as stream:
     for row in mapped:
         stream.write(json.dumps(row,sort_keys=True)+'\n')
 PY
-[ $? = 0 ] || { echo 'stop-races.sh: harness error: cannot map qualifications' >&2; exit 2; }
+then
+  :
+else
+  echo 'stop-races.sh: harness error: cannot map qualifications' >&2; exit 2
+fi
 joint_detail=''
 joint_qual='failed'
 joint_pass=0

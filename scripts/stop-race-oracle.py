@@ -45,6 +45,14 @@ STORAGE_REFUSAL = "provider_storage_refused"
 CALL_PATH_LOSS = ("event_loss", "start_insert_failures", "unmatched_returns",
                   "rv_update_failures", "cgroup_scope_failures", "abi_refusals",
                   "malformed_records")
+# Known limitation: a pending backlog accepts any lossy observation
+# while every newcomer is counted or pending, so ambient churn
+# coincident with the backlog (descendant gaps, skips) is masked as
+# pending-covered. Live busy-host bursts always carry such churn
+# (pending 43-68 with skipped/pid_descendant_gaps in campaign 2), so
+# a strict cause whitelist would fail every live trial; the causes
+# ride along in the detail instead (as the sweep does), never silent.
+# Call-path loss is still refused above in every branch.
 
 
 EvidenceError = BASE["EvidenceError"]
@@ -352,8 +360,11 @@ def judge_burst(report_text, workload_text, stderr_text, exit_code,
             require(extra == provider_newcomers,
                     "provider newcomers missing with none pending: %s" % name)
         branch = "exact-all-counted"
+    causes = ",".join(observation.get("causes", [])) or "-"
     return ("newcomer-burst",
-            "system burst %s: newcomer fns=%d pending=%d" % (branch, len(extras), pending))
+            "system burst %s: newcomer fns=%d pending=%d obs=%s[%s]" % (
+                branch, len(extras), pending,
+                observation.get("status", "?"), causes))
 
 
 def main(argv=None):

@@ -2124,7 +2124,10 @@ pub fn spawn_exec_mapping_child(paths: &[PathBuf]) -> io::Result<MappedChild> {
 /// (every child still emits its inherited exec VMAs, which is exactly
 /// what the whole-system run must walk). Returns [`MappedChild`]s with
 /// empty [`MappedChild::addrs`] (reap-on-drop; a mid-spawn fork failure
-/// reaps the already-spawned prefix via the same path).
+/// reaps the already-spawned prefix via the same path). In test builds
+/// each child reports one readiness byte after arming its parent-death
+/// signal, and this returns only after reading every byte, so a
+/// returned child is always armed (see the body).
 pub fn spawn_pause_children(count: u32) -> io::Result<Vec<MappedChild>> {
     if count == 0 {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -2134,23 +2137,46 @@ pub fn spawn_pause_children(count: u32) -> io::Result<Vec<MappedChild>> {
     // release behavior identical.
     #[cfg(test)]
     let owner = std::process::id();
+    // Test-only readiness pipe: the parent reads one byte per child
+    // before returning, so a returned child has always armed. Without
+    // this, the spawner thread can exit before a child arms, and the
+    // `getppid` recheck cannot observe thread death, so the child
+    // misses its death signal and parks in `pause()` forever.
+    #[cfg(test)]
+    let mut ready = [0; 2];
+    #[cfg(test)]
+    if unsafe { libc::pipe(ready.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     let mut children = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        // SAFETY: like `spawn_exec_mapping_child`, but the child pauses
-        // immediately: no pipe, no report, no return.
+        // SAFETY: like `spawn_exec_mapping_child`, but the child only
+        // arms, reports readiness (test builds), and pauses: no exec
+        // report, no return.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
+            #[cfg(test)]
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(ready[1]);
+            }
             return Err(io::Error::last_os_error());
         }
         if pid == 0 {
             #[cfg(test)]
             unsafe {
+                libc::close(ready[0]);
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
                     libc::_exit(127);
                 }
                 if libc::getppid() != owner as libc::pid_t {
                     libc::_exit(127);
                 }
+                let byte = [1u8; 1];
+                if libc::write(ready[1], byte.as_ptr().cast(), byte.len()) != byte.len() as isize {
+                    libc::_exit(127);
+                }
+                libc::close(ready[1]);
             }
             unsafe {
                 loop {
@@ -2163,6 +2189,45 @@ pub fn spawn_pause_children(count: u32) -> io::Result<Vec<MappedChild>> {
             addrs: Vec::new(),
             reaped: false,
         });
+    }
+    #[cfg(test)]
+    {
+        // SAFETY: parent: the write end belongs to the children now; one
+        // byte per child proves every child armed before this returns. A
+        // child that dies first closes its ends, so a short read ends as
+        // EOF, never a hang. Any error drops the already-spawned prefix
+        // through the same reap-on-drop path as a fork failure.
+        unsafe {
+            libc::close(ready[1]);
+        }
+        for _ in 0..count {
+            let mut byte = [0u8; 1];
+            loop {
+                let got = unsafe { libc::read(ready[0], byte.as_mut_ptr().cast(), byte.len()) };
+                if got == byte.len() as isize {
+                    break;
+                }
+                if got == 0 {
+                    unsafe {
+                        libc::close(ready[0]);
+                    }
+                    return Err(io::Error::other("pause child died before arming"));
+                }
+                if got < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    unsafe {
+                        libc::close(ready[0]);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        unsafe {
+            libc::close(ready[0]);
+        }
     }
     Ok(children)
 }

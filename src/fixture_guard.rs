@@ -30,8 +30,11 @@
 //! too. A fixture that forks its own grandchildren must re-arm after each
 //! fork: raw-fork Rust children arm the same body at their fork site
 //! (parking children directly, `clone` survivors through
-//! [`SURVIVOR_OWNER_PID`]); every current C grandchild is finite or
-//! EOF-terminated on parent death, so C needs no arm.
+//! [`SURVIVOR_OWNER_PID`]) and report readiness from behind the arm, so
+//! a spawner returns only an armed child: a spawner thread that exits
+//! first would otherwise beat the arm, which no `getppid` recheck can
+//! observe. Every current C grandchild is finite or EOF-terminated on
+//! parent death, so C needs no arm.
 //!
 //! Integration tests cannot link this `cfg(test)` module; they use the
 //! mirror helper in `tests/support/mod.rs`. Keep the two bodies in sync.

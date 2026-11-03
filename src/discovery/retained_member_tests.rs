@@ -110,13 +110,21 @@ struct PausingChild {
 
 impl PausingChild {
     fn spawn() -> Self {
-        // SAFETY: the child only calls async-signal-safe prctl, getppid
-        // and pause() until killed.
+        let mut ready = [0 as libc::c_int; 2];
+        // SAFETY: two valid two-element arrays for pipe2.
+        assert_eq!(
+            unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "ready pipe failed"
+        );
+        // SAFETY: the child only calls async-signal-safe prctl, getppid,
+        // write, close and pause() until killed.
         let owner = std::process::id();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe {
+                libc::close(ready[0]);
                 // Parent-death guard (same body as
                 // `crate::fixture_guard::DieWithParent`): a test that dies
                 // abruptly must not strand the parking child.
@@ -126,10 +134,49 @@ impl PausingChild {
                 if libc::getppid() != owner as libc::pid_t {
                     libc::_exit(127);
                 }
+                // Readiness: the parent returns only after this write, so
+                // a returned child is always armed. Without it, the
+                // spawner thread can exit before the child arms, and the
+                // `getppid` recheck cannot observe thread death, so the
+                // child misses its death signal and parks forever.
+                let byte = [1u8];
+                if libc::write(ready[1], byte.as_ptr().cast(), byte.len()) != byte.len() as isize {
+                    libc::_exit(127);
+                }
+                libc::close(ready[1]);
                 loop {
                     libc::pause();
                 }
             }
+        }
+        // SAFETY: the parent owns the read end; one byte proves the child
+        // armed before this returns. A child that died first closes its
+        // ends, so a short read ends as EOF, never a hang.
+        unsafe {
+            libc::close(ready[1]);
+        }
+        let mut byte = [0u8; 1];
+        loop {
+            // SAFETY: reading into a valid stack buffer.
+            let got = unsafe { libc::read(ready[0], byte.as_mut_ptr().cast(), byte.len()) };
+            if got == byte.len() as isize {
+                break;
+            }
+            if got == 0 {
+                panic!("parking child died before arming");
+            }
+            if got < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                panic!("parking child readiness read failed: {error}");
+            }
+        }
+        // SAFETY: the readiness byte was consumed; the read end served
+        // its single byte.
+        unsafe {
+            libc::close(ready[0]);
         }
         Self { pid: pid as u32 }
     }

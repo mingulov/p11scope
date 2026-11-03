@@ -19175,9 +19175,19 @@ struct FdInheritor {
 
 impl FdInheritor {
     fn spawn() -> Self {
+        let mut ready = [0 as libc::c_int; 2];
+        // SAFETY: pipe2 writes both fds on success; CLOEXEC keeps them
+        // out of any exec'd image.
+        assert_eq!(
+            unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "ready pipe failed: {}",
+            std::io::Error::last_os_error()
+        );
         // SAFETY: fork in a multithreaded binary. The child calls only
-        // async-signal-safe functions (prctl, getppid, nanosleep on a
-        // stack timespec, _exit) and never returns to test code.
+        // async-signal-safe functions (prctl, getppid, write, close,
+        // nanosleep on a stack timespec, _exit) and never returns to
+        // test code.
         let owner = std::process::id();
         let pid = unsafe { libc::fork() };
         assert!(
@@ -19187,6 +19197,7 @@ impl FdInheritor {
         );
         if pid == 0 {
             unsafe {
+                libc::close(ready[0]);
                 // Parent-death guard (same body as
                 // `crate::fixture_guard::DieWithParent`): a test that dies
                 // abruptly must not strand the sleeping child.
@@ -19196,6 +19207,16 @@ impl FdInheritor {
                 if libc::getppid() != owner as libc::pid_t {
                     libc::_exit(127);
                 }
+                // Readiness: the parent returns only after this write, so
+                // a returned child is always armed. Without it, the
+                // spawner thread can exit before the child arms, and the
+                // `getppid` recheck cannot observe thread death, so the
+                // child misses its death signal and sleeps on.
+                let byte = [1u8];
+                if libc::write(ready[1], byte.as_ptr().cast(), byte.len()) != byte.len() as isize {
+                    libc::_exit(127);
+                }
+                libc::close(ready[1]);
                 let delay = libc::timespec {
                     tv_sec: 60,
                     tv_nsec: 0,
@@ -19203,6 +19224,35 @@ impl FdInheritor {
                 libc::nanosleep(&delay, std::ptr::null_mut());
                 libc::_exit(0);
             }
+        }
+        // SAFETY: the parent owns the read end; one byte proves the child
+        // armed before this returns. A child that died first closes its
+        // ends, so a short read ends as EOF, never a hang.
+        unsafe {
+            libc::close(ready[1]);
+        }
+        let mut byte = [0u8; 1];
+        loop {
+            // SAFETY: `read` into the live stack buffer.
+            let got = unsafe { libc::read(ready[0], byte.as_mut_ptr().cast(), byte.len()) };
+            if got == byte.len() as isize {
+                break;
+            }
+            if got == 0 {
+                panic!("inheritor child died before arming");
+            }
+            if got < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                panic!("inheritor readiness read failed: {error}");
+            }
+        }
+        // SAFETY: the readiness byte was consumed; the read end served
+        // its single byte.
+        unsafe {
+            libc::close(ready[0]);
         }
         Self { pid }
     }

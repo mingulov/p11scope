@@ -11002,6 +11002,18 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             ),
         }
     }
+    // WP-1: lanes that run hosted in another workflow, not in ci.yml's
+    // checks job, so they are not UNRUN hosted. Each must still be named
+    // there, or the exclusion rots and this fails until the UNRUN line
+    // returns or the table is taught about the move.
+    let hosted_elsewhere = ["scripts/system-scope-measure.sh"];
+    let priv_yml = read(".github/workflows/privileged-tests.yml");
+    for lane in &hosted_elsewhere {
+        assert!(
+            priv_yml.contains(lane),
+            "{lane} no longer runs in privileged-tests.yml: re-add its UNRUN line or fix the table"
+        );
+    }
     let mut expected = BTreeSet::new();
     for dir in &script_roots {
         for entry in fs::read_dir(dir).expect("walk scripts") {
@@ -11025,6 +11037,7 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                     is_privileged(&path)
                 })
                 && !hosted_full.contains(path.as_str())
+                && !hosted_elsewhere.contains(&path.as_str())
             {
                 expected.insert(path);
             }

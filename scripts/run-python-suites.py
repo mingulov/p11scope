@@ -65,6 +65,7 @@ RUN = [
     ("test_multi_host_refusal.py", []),
     ("test_browser_cells.py", []),
     ("test_cargo_wrapper.py", []),
+    ("test_cell_results.py", []),
     ("test_e16_oracle.py", []),
     ("test_first_use_oracle.py", []),
     ("test_first_use_sweep.py", []),

@@ -11,23 +11,49 @@ name: privileged-tests
 #
 # How it works:
 # - privileged-build compiles the lib-test executable and the observer
-#   (default features, no P11SCOPE_SMALL_*) once, lists the curated
-#   default cells with scripts/run-privileged-lib-tests.sh --list, and
-#   ships all three as a 1-day artifact;
+#   once per flavor (default features, no P11SCOPE_SMALL_*; journal with
+#   P11SCOPE_JOURNAL=1), lists the curated default cells with
+#   scripts/run-privileged-lib-tests.sh --list, and ships all three as a
+#   1-day artifact. The default flavor also builds P11SCOPE_JOURNAL_PROOF=1
+#   and runs the two root_proof_tests (unprivileged, about 4 min);
 # - each privileged-shard job checks out the same commit at the same
 #   absolute path (the lib tests compile their C fixtures from the
 #   source tree), takes every SHARDS-th cell from the list and runs them
 #   through the curated runner as root;
 # - privileged-summary proves the shards together ran every listed cell
-#   exactly once, and fails on any FAIL, SKIP or missing result;
+#   exactly once, fails on any FAIL, SKIP or missing result, enforces the
+#   floor file tests/privileged-campaign.json (listed count never drops
+#   below the floor, no curated name disappears without a reviewed floor
+#   edit) and judges P11SCOPE_CELL_BRANCH lines against its per-environment
+#   expectation table (pending entries are allowed absent until WP-2 lands);
 # - privileged-btrfs runs the btrfs campaign (--include-btrfs) with the
 #   runner's own loop-mounted image, and privileged-overlay runs the
 #   overlay campaign (--include-overlay) plus the copy-up expected
 #   failure; both fail on any FAIL, SKIP or leaked mount.
+# - privileged-second-flavor runs the journal-only cells (the four linked
+#   key-operations cells plus the sealed drain linkage) from the journal
+#   build with exact selectors; a SKIP fails the job. Pending cells may be
+#   absent until WU-2a lands, but must PASS when present;
+# - system-scale, public-cli and browser-cells run the installed-behavior
+#   jobs from the release observer. New scripts/ci/<name>.sh cells run
+#   through scripts/ci/run-cell-script.sh (which validates results.jsonl
+#   with scripts/ci/check-cell-results.py) packed into these existing jobs,
+#   never as new jobs: WP-3 real-providers and WP-7 stop-races in
+#   system-scale, WP-4 breadth and WP-5 legacy32 in public-cli.
+# Weekly campaign: workflow_dispatch input campaign selects default, long
+# (--include-long) or all (long plus the fixture-skip groups once WP-2 adds
+# them). GitHub schedules run only on the default branch, so the weekly run
+# is a dispatch on the dev tip, never a schedule trigger here.
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      campaign:
+        description: Lib campaign (default, long adds --include-long, all adds fixture-skip groups once WP-2 lands them)
+        type: choice
+        options: [default, long, all]
+        default: default
 permissions:
   contents: read
 concurrency:
@@ -43,6 +69,13 @@ jobs:
   privileged-build:
     runs-on: ubuntu-26.04
     timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        # Second flavor today: P11SCOPE_JOURNAL=1. Once WU-2b makes journal
+        # plus birth marker the default (ruling CP-1), the second flavor
+        # becomes P11SCOPE_JOURNAL=0 P11SCOPE_BIRTH_MARKER=0.
+        flavor: [default, journal]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,17 +112,31 @@ jobs:
             target/debug/build
             target/debug/deps
             target/debug/incremental
-          key: target-privileged-build-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
-      - name: Prove the default build environment
+          key: target-privileged-build-${{ matrix.flavor }}-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
+      - name: Prove the build environment
         shell: bash
+        env:
+          P11SCOPE_JOURNAL: ${{ matrix.flavor == 'journal' && '1' || '' }}
         run: |
-          if env | grep -E '^(P11SCOPE_SMALL_|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)'; then
-            echo "refusing: size-override environment is set" >&2
-            exit 1
+          if [ "${{ matrix.flavor }}" = default ]; then
+            if env | grep -E '^(P11SCOPE_SMALL_|P11SCOPE_JOURNAL=|P11SCOPE_BIRTH_MARKER=|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)'; then
+              echo "refusing: size-override or flavor environment is set" >&2
+              exit 1
+            fi
+            echo "default features, no size overrides"
+          else
+            test "${P11SCOPE_JOURNAL:-}" = 1
+            if env | grep -E '^(P11SCOPE_SMALL_|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)'; then
+              echo "refusing: size-override environment is set" >&2
+              exit 1
+            fi
+            echo "journal flavor: P11SCOPE_JOURNAL=1, no size overrides"
           fi
-          echo "default features, no size overrides"
       - name: Build the lib-test executable and the observer
         shell: bash
+        env:
+          P11SCOPE_JOURNAL: ${{ matrix.flavor == 'journal' && '1' || '' }}
+          CAMPAIGN: ${{ inputs.campaign || 'default' }}
         run: |
           set -euo pipefail
           toolchain=$(cat .release-rust-version)
@@ -97,25 +144,62 @@ jobs:
           cargo +"$toolchain" test --locked --offline --lib --no-run --message-format=json >"$RUNNER_TEMP/lib-build.jsonl"
           lib=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "p11scope" and (.target.kind | any(. == "lib"))) | .executable' "$RUNNER_TEMP/lib-build.jsonl" | grep -v '^null$' | tail -1)
           test -x "$lib"
-          out="$RUNNER_TEMP/privileged-inputs"
+          out="$RUNNER_TEMP/privileged-inputs-${{ matrix.flavor }}"
           mkdir -p "$out/bin"
           cp -p "$lib" "$out/lib-tests"
           cp -p target/debug/p11scope target/debug/p11scope-discover "$out/bin/"
           # The curated list verifies itself against the binary's own
           # ignored-test list and fails on drift.
           scripts/run-privileged-lib-tests.sh --list "$out/lib-tests" >"$out/list.txt"
-          awk '/^default \(/{f=1;next} /^(long|skipped) \(/{f=0} f' "$out/list.txt" | sed 's/ :: .*//' | grep -v '^$' >"$out/selectors.txt"
-          count=$(wc -l <"$out/selectors.txt")
-          declared=$(sed -n 's/^default (\([0-9]*\)).*/\1/p' "$out/list.txt")
-          echo "default cells: $count (declared $declared)"
-          test "$count" -gt 0
-          test "$count" -eq "$declared"
+          if [ "${{ matrix.flavor }}" = default ]; then
+            case "$CAMPAIGN" in
+              default)
+                awk '/^default \(/{f=1;next} /^(long|skipped) \(/{f=0} f' "$out/list.txt" | sed 's/ :: .*//' | grep -v '^$' >"$out/selectors.txt"
+                ;;
+              long|all)
+                # long adds --include-long cells; all adds the fixture-skip
+                # groups too once WP-2 lands their runner flags (same as long
+                # until then).
+                awk '/^default \(/{f=1;next} /^skipped \(/{f=0} /^long \(/{next} f' "$out/list.txt" | sed 's/ :: .*//' | grep -v '^$' >"$out/selectors.txt"
+                ;;
+              *) echo "unknown campaign: $CAMPAIGN" >&2; exit 1 ;;
+            esac
+            count=$(wc -l <"$out/selectors.txt")
+            declared=$(sed -n 's/^default (\([0-9]*\)).*/\1/p' "$out/list.txt")
+            long_declared=$(sed -n 's/^long (\([0-9]*\).*/\1/p' "$out/list.txt")
+            echo "campaign $CAMPAIGN cells: $count (declared default $declared long $long_declared)"
+            test "$count" -gt 0
+            case "$CAMPAIGN" in
+              default) test "$count" -eq "$declared" ;;
+              long|all) test "$count" -eq $((declared + long_declared)) ;;
+            esac
+          else
+            # Journal flavor runs five exact cells in privileged-second-flavor,
+            # not the sharded campaign; keep the list for the presence check.
+            awk '/^default \(/{f=1;next} /^(long|skipped) \(/{f=0} f' "$out/list.txt" | sed 's/ :: .*//' | grep -v '^$' >"$out/selectors.txt"
+          fi
           (cd "$out" && sha256sum lib-tests bin/p11scope bin/p11scope-discover selectors.txt >SHA256SUMS)
           cat "$out/SHA256SUMS"
+      - name: Build P11SCOPE_JOURNAL_PROOF=1 and run root_proof_tests
+        if: matrix.flavor == 'default'
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(cat .release-rust-version)
+          # Separate target dir: the proof build must not poison the default
+          # target/debug cache the next run restores.
+          P11SCOPE_JOURNAL_PROOF=1 cargo +"$toolchain" test --locked --offline --lib \
+            --target-dir target/proof --no-run --message-format=json >"$RUNNER_TEMP/proof-build.jsonl"
+          lib=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "p11scope" and (.target.kind | any(. == "lib"))) | .executable' "$RUNNER_TEMP/proof-build.jsonl" | grep -v '^null$' | tail -1)
+          test -x "$lib"
+          # Unprivileged: the proof compiles a native bridge with clang-18 and
+          # loads no BPF. Both tests must pass with nonzero counts.
+          "$lib" semantics_objects::journal::root_proof_tests --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/proof.log"
+          grep -q 'test result: ok. 2 passed' "$RUNNER_TEMP/proof.log"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: privileged-inputs
-          path: ${{ runner.temp }}/privileged-inputs/
+          name: privileged-inputs-${{ matrix.flavor }}
+          path: ${{ runner.temp }}/privileged-inputs-${{ matrix.flavor }}/
           if-no-files-found: error
           retention-days: 1
   privileged-shard:
@@ -137,10 +221,12 @@ jobs:
       - name: Download the build
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: privileged-inputs
+          name: privileged-inputs-default
           path: ${{ runner.temp }}/privileged-inputs
       - name: Run this shard's cells as root
         shell: bash
+        env:
+          CAMPAIGN: ${{ inputs.campaign || 'default' }}
         run: |
           set -euo pipefail
           umask 022
@@ -149,7 +235,7 @@ jobs:
           # Artifacts do not keep the executable bit.
           chmod +x "$in/lib-tests" "$in/bin/p11scope" "$in/bin/p11scope-discover"
           awk -v n="$SHARDS" -v s="${{ matrix.shard }}" '(NR - 1) % n == s' "$in/selectors.txt" >"$RUNNER_TEMP/shard.txt"
-          echo "shard ${{ matrix.shard }} of $SHARDS: $(wc -l <"$RUNNER_TEMP/shard.txt") cells"
+          echo "shard ${{ matrix.shard }} of $SHARDS campaign $CAMPAIGN: $(wc -l <"$RUNNER_TEMP/shard.txt") cells"
           test -s "$RUNNER_TEMP/shard.txt"
           header=/usr/include/p11-kit-1/p11-kit
           test -f "$header/pkcs11.h"
@@ -158,11 +244,21 @@ jobs:
           out="$RUNNER_TEMP/privileged-out"
           mkdir -m 700 "$out"
           rc=0
+          extra=()
+          case "$CAMPAIGN" in
+            default) ;;
+            long|all)
+              extra+=(--include-long)
+              # all adds the fixture-skip groups too once WP-2 lands their
+              # runner flags (same as long until then).
+              ;;
+            *) echo "unknown campaign: $CAMPAIGN" >&2; exit 1 ;;
+          esac
           # `env` sets the variables after sudo's own environment strip.
           mapfile -t cells <"$RUNNER_TEMP/shard.txt"
           sudo -n env PKCS11_HEADER_DIR="$header" \
             P11SCOPE_E2E_OBSERVER="$in/bin/p11scope" \
-            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" "${cells[@]}" || rc=$?
+            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" "${extra[@]}" "${cells[@]}" || rc=$?
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           cat "$out/run/results.txt"
           cp "$out/run/results.txt" "$RUNNER_TEMP/results-${{ matrix.shard }}.txt"
@@ -183,13 +279,18 @@ jobs:
             ${{ runner.temp }}/privileged-out/run/logs/
           if-no-files-found: warn
           retention-days: 7
-  # Every listed cell ran exactly once across the shards and passed.
+  # Every listed cell ran exactly once across the shards and passed; the
+  # floor file stops a quiet curation shrink and the branch table judges
+  # which dual-outcome arm each cell took.
   privileged-summary:
     needs: [privileged-build, privileged-shard]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
       - name: Download the list and every shard's results
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -199,8 +300,9 @@ jobs:
         run: |
           set -euo pipefail
           all="$RUNNER_TEMP/all"
-          sort "$all/privileged-inputs/selectors.txt" >"$RUNNER_TEMP/want.txt"
+          sort "$all/privileged-inputs-default/selectors.txt" >"$RUNNER_TEMP/want.txt"
           : >"$RUNNER_TEMP/got.txt"
+          : >"$RUNNER_TEMP/full.txt"
           for shard in $(seq 0 $((SHARDS - 1))); do
             f="$all/privileged-shard-$shard/results-$shard.txt"
             if [ ! -s "$f" ]; then
@@ -208,6 +310,7 @@ jobs:
               continue
             fi
             awk '$1 == "PASS" || $1 == "FAIL" || $1 == "SKIP" {print $1, $2}' "$f" >>"$RUNNER_TEMP/got.txt"
+            grep -E '^(PASS|FAIL|SKIP) ' "$f" >>"$RUNNER_TEMP/full.txt" || true
           done
           awk '{print $2}' "$RUNNER_TEMP/got.txt" | sort >"$RUNNER_TEMP/ran.txt"
           echo "listed $(wc -l <"$RUNNER_TEMP/want.txt"), reported $(wc -l <"$RUNNER_TEMP/ran.txt")"
@@ -224,6 +327,141 @@ jobs:
             bad=1
           fi
           test "$bad" -eq 0
+      - name: Enforce the campaign floor and branch expectations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - "$RUNNER_TEMP/want.txt" "$RUNNER_TEMP/full.txt" tests/privileged-campaign.json <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          want = {line.strip() for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()}
+          full = [line for line in Path(sys.argv[2]).read_text().splitlines() if line.strip()]
+          campaign = json.loads(Path(sys.argv[3]).read_text())
+          assert campaign.get("schema") == "p11scope/privileged-campaign/v1", "floor schema"
+          floor = campaign["default_floor"]
+          cells = campaign["default_cells"]
+          assert floor == len(cells), "floor count must equal the listed names"
+          assert len(cells) == len(set(cells)), "floor names must be unique"
+          print(f"floor {floor}, listed {len(want)}")
+          if len(want) < floor:
+              raise SystemExit(f"listed count {len(want)} dropped below the floor {floor}")
+          missing = sorted(set(cells) - want)
+          if missing:
+              raise SystemExit("curated names disappeared without a reviewed floor edit: " + ", ".join(missing[:5]))
+          print(f"floor ok: all {len(cells)} curated names listed")
+          branches = {line.split()[1]: line for line in full if len(line.split()) >= 2}
+          expectations = campaign.get("branch_expectations", {})
+          checked = 0
+          for cell, rule in sorted(expectations.items()):
+              expected = rule.get("ci")
+              status = rule.get("status", "expected")
+              if status == "pending":
+                  print(f"BRANCH pending {cell} (expects {expected} on CI once WP-2 lands)")
+                  continue
+              if cell not in branches:
+                  if cell not in want:
+                      print(f"BRANCH skip {cell}: not in this campaign")
+                      continue
+                  raise SystemExit(f"missing result for branched cell {cell}")
+              line = branches[cell]
+              found = re.findall(r"branch=([A-Za-z0-9_.-]+)", line)
+              print(f"BRANCH {cell} expected {expected} found {found or 'none'}")
+              if expected not in found:
+                  raise SystemExit(f"cell {cell} did not take the expected {expected} branch on CI: {line}")
+              checked += 1
+          print(f"branch ok: {checked} expected cells judged")
+          PY
+  # Journal-flavor cells from the journal build: the four linked
+  # key-operations cells plus the sealed drain linkage, with exact
+  # selectors. A SKIP fails the job. Pending cells (the four, until WU-2a
+  # lands) may be absent from the binary, but must PASS when present.
+  privileged-second-flavor:
+    needs: privileged-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: sudo apt-get update && sudo apt-get install -y gcc gcc-multilib jq libp11-kit-dev p11-kit python3 softhsm2 e2fsprogs util-linux
+      - name: Download the journal build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: privileged-inputs-journal
+          path: ${{ runner.temp }}/privileged-inputs-journal
+      - name: Run the journal cells as root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/privileged-inputs-journal"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/lib-tests" "$in/bin/p11scope" "$in/bin/p11scope-discover"
+          sudo -n true
+          uname -a
+          # Presence comes from the journal build's own list, never from a
+          # direct --ignored run: the curated runner stays the only executor.
+          python3 -I - tests/privileged-campaign.json "$in/list.txt" "$RUNNER_TEMP/wanted.txt" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          campaign = json.loads(Path(sys.argv[1]).read_text())
+          listed = Path(sys.argv[2]).read_text()
+          second = campaign["second_flavor"]
+          pending = set(second.get("pending", []))
+          wanted = []
+          for cell in second["cells"]:
+              present = f"\n{cell}\n" in f"\n{listed}\n" or f"\n{cell} :: " in listed
+              if present:
+                  wanted.append(cell)
+                  print(f"WANT {cell}")
+              elif cell in pending:
+                  print(f"PENDING absent {cell} (allowed until WU-2a lands)")
+              else:
+                  raise SystemExit(f"expected journal cell absent from the binary: {cell}")
+          assert wanted, "no journal cells present"
+          Path(sys.argv[3]).write_text("\n".join(wanted) + "\n")
+          PY
+          mapfile -t cells <"$RUNNER_TEMP/wanted.txt"
+          out="$RUNNER_TEMP/privileged-out"
+          mkdir -m 700 "$out"
+          rc=0
+          header=/usr/include/p11-kit-1/p11-kit
+          sudo -n env PKCS11_HEADER_DIR="$header" \
+            P11SCOPE_E2E_OBSERVER="$in/bin/p11scope" \
+            scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" "${cells[@]}" || rc=$?
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          cat "$out/run/results.txt"
+          echo "runner rc=$rc"
+          if grep -E '^(FAIL|SKIP) ' "$out/run/results.txt"; then
+            echo "journal flavor has failed or skipped cells" >&2
+            exit 1
+          fi
+          test "$rc" -eq 0
+          # Exact-list check: every wanted cell reported PASS exactly once.
+          python3 -I - "$RUNNER_TEMP/wanted.txt" "$out/run/results.txt" <<'PY'
+          import sys
+          from pathlib import Path
+          wanted = sorted(line.strip() for line in Path(sys.argv[1]).read_text().splitlines() if line.strip())
+          reported = sorted(line.split()[1] for line in Path(sys.argv[2]).read_text().splitlines() if line.startswith("PASS "))
+          assert wanted, "no wanted journal cells"
+          if wanted != reported:
+              raise SystemExit(f"journal exact-list mismatch: wanted {wanted}, reported {reported}")
+          print(f"journal ok: {len(wanted)} cells PASS")
+          PY
+      - name: Upload the journal results and logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privileged-second-flavor
+          path: |
+            ${{ runner.temp }}/privileged-out/run/results.txt
+            ${{ runner.temp }}/privileged-out/run/logs/
+          if-no-files-found: warn
+          retention-days: 7
   # The btrfs campaign: the 14 cells that need TMPDIR on btrfs. The
   # curated runner loop-mounts its own image for them (no ambient
   # btrfs needed) and tears it down afterwards; the cleanup step
@@ -454,7 +692,9 @@ jobs:
   # System scale: --pid and --system, each in metrics and profile mode,
   # against a 20,000-call SoftHSM workload with exact expected counts, a
   # valid capture window, zero loss and a proven final drain (the same
-  # cells and oracle as ci.yml's manual privileged-e2e job).
+  # cells and oracle as ci.yml's manual privileged-e2e job). WP-3
+  # real-providers and WP-7 stop-races run here later through
+  # scripts/ci/run-cell-script.sh, packed into this job's 45-minute budget.
   system-scale:
     needs: release-build
     runs-on: ubuntu-26.04
@@ -490,8 +730,23 @@ jobs:
           chmod +x "$in/p11scope" "$in/p11scope-discover"
           uname -a
           test -r /sys/kernel/btf/vmlinux
-          sudo -n env TMPDIR="$TMPDIR" "$in/p11scope" doctor >"$TMPDIR/doctor.txt" 2>&1 || true
+          doctor_status=0
+          sudo -n env TMPDIR="$TMPDIR" "$in/p11scope" doctor >"$TMPDIR/doctor.txt" 2>&1 || doctor_status=$?
+          printf "%s\n" "$doctor_status" >"$TMPDIR/doctor-status.txt"
           cat "$TMPDIR/doctor.txt"
+          python3 -I - "$TMPDIR/doctor.txt" "$doctor_status" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          if int(sys.argv[2]) not in (0, 1):
+              raise RuntimeError("doctor did not finish with a supported verdict")
+          lines = Path(sys.argv[1]).read_text().splitlines()
+          for name in ("uprobe-multi attach (own libc)", "uretprobe vs seccomp"):
+              rows = [line for line in lines if line.startswith(name)]
+              if len(rows) != 1 or re.fullmatch(re.escape(name) + r" \.* ok(?:[ \t].*)?", rows[0]) is None:
+                  raise RuntimeError("functional doctor row missing, duplicated or not ok: " + name)
+          print("doctor functional rows ok")
+          PY
           scripts/system-scope-measure.sh --scope both --mode both \
             --duration 8 --n-calls 20000 --binary "$in/p11scope" --no-build \
             --work "$TMPDIR/system-scale"
@@ -556,6 +811,7 @@ jobs:
           name: system-scale
           path: |
             /var/tmp/p11scope-ws-tmp/doctor.txt
+            /var/tmp/p11scope-ws-tmp/doctor-status.txt
             /var/tmp/p11scope-ws-tmp/system-scale/matrix.json
             /var/tmp/p11scope-ws-tmp/system-scale/*/summary.txt
             /var/tmp/p11scope-ws-tmp/system-scale/*/stderr.txt
@@ -563,7 +819,10 @@ jobs:
           retention-days: 7
   # The public CLI cells (doctor, profile/metrics/trace --pid, a
   # multi-threaded exact count, --system, run, SIGINT and refusal
-  # controls) as root: on the runner kernel and in virtme-ng guests.
+  # controls) as root: on the runner kernel and in virtme-ng guests. The
+  # host leg runs through scripts/ci/run-cell-script.sh as the template
+  # proof; WP-4 breadth and WP-5 legacy32 extend here, packed into this
+  # job's matrix, never as new jobs.
   public-cli:
     needs: release-build
     runs-on: ubuntu-26.04
@@ -633,7 +892,11 @@ jobs:
             # Ruling CI-GAP-1: the hosted host system cell discloses shared-
             # runner descendant exits as runner noise. VNG guests keep the
             # strict no-gap mode (no flag on the guest leg below).
-            sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 scripts/qualify-public-cli.sh "$in/p11scope" "$out/cells" >"$RUNNER_TEMP/qual.log" 2>&1 || rc=$?
+            # Template proof: the host leg runs through run-cell-script.sh,
+            # which validates with check-cell-results.py (smoke allow-listed).
+            sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 scripts/ci/run-cell-script.sh public-cli-host "$in/p11scope" "$out/cells" \
+              --allow-nonqualifying run-short --allow-nonqualifying run-cover --allow-nonqualifying trace-pid \
+              >"$RUNNER_TEMP/qual.log" 2>&1 || rc=$?
             sudo -n chown -R "$(id -un):$(id -gn)" "$out"
             tail -40 "$RUNNER_TEMP/qual.log"
           else
@@ -642,8 +905,8 @@ jobs:
             cat "$out/uname.txt" || true
           fi
           echo "qualify rc=$rc"
-          # Exit 2 is the documented nonqualifying-smoke result (the run
-          # cells); the per-cell check below decides.
+          # The wrapper translates the documented nonqualifying-smoke exit 2
+          # to 0 when results exist; the per-cell checks below still decide.
           python3 -I - "$out/cells/results.jsonl" <<'PY'
           import json
           import sys
@@ -710,6 +973,21 @@ jobs:
           if problems:
               raise SystemExit("\n".join(problems))
           PY
+          if [ "${{ matrix.kernel }}" = host ]; then
+            # Workflow-side doctor check (the lane script belongs to WP-4):
+            # the same two functional rows must read ok on the host.
+            python3 -I - "$out/cells/doctor.out" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          lines = Path(sys.argv[1]).read_text().splitlines()
+          for name in ("uprobe-multi attach (own libc)", "uretprobe vs seccomp"):
+              rows = [line for line in lines if line.startswith(name)]
+              if len(rows) != 1 or re.fullmatch(re.escape(name) + r" \.* ok(?:[ \t].*)?", rows[0]) is None:
+                  raise RuntimeError("functional doctor row missing, duplicated or not ok: " + name)
+          print("doctor functional rows ok (public-cli host)")
+          PY
+          fi
       - name: Upload the CLI results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -718,6 +996,7 @@ jobs:
           path: |
             ${{ github.workspace }}/cli-out/cells/results.jsonl
             ${{ github.workspace }}/cli-out/cells/summary.txt
+            ${{ github.workspace }}/cli-out/cells/doctor.out
             ${{ github.workspace }}/cli-out/cells/*.stderr
             ${{ github.workspace }}/cli-out/cells/*.json
             ${{ github.workspace }}/cli-out/qual.log

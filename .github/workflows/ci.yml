@@ -786,7 +786,6 @@ jobs:
           UNRUN: scripts/qualify-task-storage-canary.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/qualify-e16-surfaces.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/run-t7-static-campaign.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
-          UNRUN: scripts/system-scope-measure.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-owned.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-receipt.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/system-scope-sample.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)

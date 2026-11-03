@@ -1691,3 +1691,7 @@ mod tests;
 #[cfg(test)]
 #[path = "present_key_ops_tests.rs"]
 mod inventory_present_key_ops_tests;
+
+#[cfg(test)]
+#[path = "present/reload_disclosure_privileged_tests.rs"]
+mod reload_disclosure_privileged_tests;

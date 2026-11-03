@@ -33,7 +33,7 @@ u32 p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_co
     return 0;
 }
 #endif
-#if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
+#ifndef P11SCOPE_INVENTORY_ONLY
 #define P11SCOPE_HOST_OWNER_LOOP 1
 #endif
 #ifndef P11SCOPE_INVENTORY_ONLY
@@ -182,6 +182,22 @@ static long controlled_owner_loop(u32 count, long (*callback)(u32, void *),
     return end;
 }
 #endif
+
+/* Only helper 181 is replaced. The callback remains the real native find
+ * body, including its occupancy, cookie and domain checks. The find loop
+ * also runs in Inventory builds, so this stub is unconditional. */
+static long controlled_find_loop(u32 count, long (*callback)(u32, void *),
+                                 void *context, u64 flags)
+{
+    assert(count == 64 && flags == 0);
+    for (u32 i = 0; i < count; i++) {
+        long stop = callback(i, context);
+        assert(stop == 0 || stop == 1);
+        if (stop)
+            return i + 1;
+    }
+    return count;
+}
 
 static u64 controlled_cas(u64 *cell, u64 old, u64 replacement)
 {
@@ -455,6 +471,7 @@ static void reset(void)
     owner_map_lookup = lookup; owner_map_update = update; owner_map_delete = pair_delete;
     owner_storage_get = storage_get; owner_storage_delete = storage_delete;
     owner_current_task = current_task; owner_pid_tgid = pid_tgid;
+    find_loop = controlled_find_loop;
 #if defined(P11SCOPE_LOADER_GATE) && !defined(P11SCOPE_INVENTORY_ONLY)
     memset(gate_rows, 0, sizeof(gate_rows));
     memset(&gate_ctl, 0, sizeof(gate_ctl));

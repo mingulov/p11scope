@@ -3070,19 +3070,32 @@ fn object_journal_every_reason_has_an_emitter_or_a_reservation() {
         4,
         "slot-bound call sites"
     );
-    for (label, mutant) in [
+    // The exec-exit reason has one emitter, the wrapped call in the
+    // cleanup sweep callback; its mutant necessarily drops that token,
+    // so only the other named emitter must survive there.
+    assert_eq!(
+        owner_c.matches("P11_OWNER_START_REASON_EXEC_EXIT").count(),
+        1,
+        "exec-exit emitter anchor"
+    );
+    for (label, mutant, kept) in [
         (
             "7U",
             owner_c.replacen(slot_bound, "remove_start(ctl, owner, key, 7U);", 1),
+            &[
+                "P11_OWNER_START_REASON_COLLISION",
+                "P11_OWNER_START_REASON_EXEC_EXIT",
+            ][..],
         ),
         (
             "8U-wrapped",
             owner_c.replacen("P11_OWNER_START_REASON_EXEC_EXIT", "8U", 1),
+            &["P11_OWNER_START_REASON_COLLISION"][..],
         ),
     ] {
+        assert_ne!(mutant, owner_c, "{label} mutant changes the source");
         assert!(
-            mutant.contains("P11_OWNER_START_REASON_COLLISION")
-                && mutant.contains("P11_OWNER_START_REASON_EXEC_EXIT"),
+            kept.iter().all(|token| mutant.contains(token)),
             "{label} keeps named emitters: token presence stays green"
         );
         assert!(

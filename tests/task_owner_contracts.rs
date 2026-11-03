@@ -127,7 +127,7 @@ fn production_task_owner_transactions_and_lifecycle() {
             "native compile: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let output = Command::new(binary)
+        let output = Command::new(&binary)
             .output()
             .expect("execute native owner test");
         assert!(
@@ -135,6 +135,27 @@ fn production_task_owner_transactions_and_lifecycle() {
             "native owner test: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if inventory {
+            continue;
+        }
+        // The default-capacity cleanup sweeps through helper 181 as well:
+        // its error, short-loop, high-slot and orphan twins run here too.
+        for selector in [
+            "counter_bank_owner_high_slot",
+            "counter_bank_owner_start_failures",
+            "counter_bank_owner_orphan_failures",
+            "counter_bank_owner_incomplete_loops",
+        ] {
+            let output = Command::new(&binary)
+                .arg(selector)
+                .output()
+                .expect("execute native owner loop twin");
+            assert!(
+                output.status.success(),
+                "native owner {selector} small={small}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
 

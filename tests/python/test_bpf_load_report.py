@@ -465,12 +465,37 @@ class ReportTests(unittest.TestCase):
     def test_driver_anchors_guest_release_on_version_boundary(self):
         # The release check must accept the exact version or a `-`-suffixed
         # release only; a bare prefix also matches a different kernel
-        # (6.1.1880 for 6.1.188). Real guest runs prove the behavior; this
-        # pins the anchored pattern against revert.
+        # (6.1.1880 for 6.1.188). A release-candidate tag (v7.4-rc1) boots
+        # the dotted triplet (7.4.0-070400rc1-generic) and must match only
+        # its own rc number. Run the driver's own release_ok function.
         self.assertTrue(DRIVER.is_file(),
                         "scripts/check-bpf-load-kernels.sh is missing")
         text = DRIVER.read_text(encoding="ascii")
-        self.assertIn('"${KERNEL#v}"|"${KERNEL#v}-"*)', text)
+        start = text.index("release_ok() {\n")
+        end = text.index("\n}\n", start) + 3
+        function = text[start:end]
+        self.assertEqual(text.count("release_ok() {"), 1)
+        # The doctor, inventory and counter guests all use it.
+        self.assertEqual(text[end:].count('if release_ok "$KERNEL" '), 3)
+        cases = [
+            ("v6.1.188", "6.1.188", True),
+            ("v6.1.188", "6.1.188-0601188-generic", True),
+            ("v6.1.188", "6.1.1880", False),
+            ("v6.1.188", "6.1.1880-generic", False),
+            ("v6.1.188", "6.1.18", False),
+            ("v7.4-rc1", "7.4.0-070400rc1-generic", True),
+            ("v7.4-rc1", "7.4.0-070400rc1", True),
+            ("v7.4-rc1", "7.4.0-070400rc10-generic", False),
+            ("v7.4-rc1", "7.4.0-070400rc2-generic", False),
+            ("v7.4-rc1", "7.4.1-070401-generic", False),
+            ("v7.4-rc1", "7.40.0-070400rc1-generic", False),
+        ]
+        for tag, release, expected in cases:
+            result = subprocess.run(
+                ["sh", "-c", function + 'release_ok "$1" "$2"', "sh", tag, release],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode == 0, expected,
+                             (tag, release, result.returncode, result.stderr))
 
     def test_driver_scores_inventory_side_against_budgets(self):
         # The 72 inventory budget cells exist (pinned by the budgets-shape

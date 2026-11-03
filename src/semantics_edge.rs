@@ -2478,6 +2478,25 @@ mod tests {
     }
 
     #[test]
+    fn init_with_flagged_unregistered_mechanism_tracks_row_under_raw_id() {
+        // Round 2: the Detailed return path publishes unregistered ids
+        // with `capture::MECHANISM_UNREGISTERED` set alongside
+        // `MECHANISM_VALUE`. The mask-gated reducer admits them exactly
+        // like registered ids (row keyed by the raw id plus the started
+        // machine); naming stays a render-layer lookup.
+        let mut edge = EdgeSemantics::default();
+        let mut flagged = init("C_SignInit", 7, 0xCE53_43A9, 100);
+        flagged.capture |= capture::MECHANISM_UNREGISTERED;
+        assert_eq!(edge.observe(&flagged), 0);
+        assert_eq!(edge.label(), SEMANTIC_OBSERVED);
+        assert_eq!((edge.calls(), edge.started()), (1, 1));
+        let stat = &edge.mechanisms()[&0xCE53_43A9];
+        assert_eq!((stat.calls, stat.errors), (1, 0));
+        assert_eq!(stat.last_seen_ns, 100);
+        assert!(stat.functions.contains("C_SignInit"));
+    }
+
+    #[test]
     fn failed_init_creates_no_operation_and_no_mechanism() {
         let mut edge = EdgeSemantics::default();
         let failed = SemanticCall {

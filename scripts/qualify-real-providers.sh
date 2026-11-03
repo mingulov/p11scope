@@ -202,12 +202,31 @@ pkcs11tool_cell() {
   esac
   [ -n "${spied:-}" ] || { skip "$base" "$label missing"; skip "$base-metrics" "$label missing"; return 0; }
   version=$(pkg_version opensc opensc) || { skip "$base" 'opensc version unknown'; skip "$base-metrics" 'opensc version unknown'; return 0; }
+  if [ "$candname" = OCK ]; then
+    # OCK behaviour depends on the opencryptoki module as well as on
+    # pkcs11-tool, so OCK pins key on both versions (README: the ratchet).
+    ock_version=$(pkg_version opencryptoki opencryptoki) || {
+      skip "$base" 'opencryptoki version unknown';
+      skip "$base-metrics" 'opencryptoki version unknown'; return 0; }
+    version="opensc/$version+ock/$ock_version"
+  fi
   P11KIT_VERSION=$(pkg_version p11-kit p11-kit || echo unknown)
   softhsm_setup || { skip "$base" 'owned SoftHSM setup failed'; skip "$base-metrics" 'owned SoftHSM setup failed'; return 0; }
   if [ "$candname" = OPENSC ]; then
     if ! "$toolbin" --module "$spied" -L >/dev/null 2>&1; then
-      skip "$base" 'no smart-card reader: pkcs11-tool exits nonzero with opensc';
-      skip "$base-metrics" 'no smart-card reader: pkcs11-tool exits nonzero with opensc'; return 0;
+      # W3-2 finding 4 verdict: no virtual-reader path on ubuntu-26.04
+      # runners within reasonable effort. vsmartcard-vpcd ships only the
+      # pcscd driver side (no vpcd server daemon is packaged), vicc ships
+      # in vsmartcard-vpicc with cryptoflex/ePass/nPA personalities, but
+      # no packaged card profile is verified to yield an OpenSC token,
+      # and pins cannot be taken without a runner. The cell stays 77;
+      # the CI job treats it as a named non-qualifying cell, not a pass.
+      reason='no smart-card reader: pkcs11-tool exits nonzero with opensc'
+      if [ "${P11SCOPE_CI_DISPOSABLE:-}" = 1 ]; then
+        reason="$reason; CI has no virtual-reader path (W3-2 finding 4)"
+      fi
+      skip "$base" "$reason";
+      skip "$base-metrics" "$reason"; return 0;
     fi
   fi
   if [ "$candname" = OCK ]; then
@@ -369,7 +388,12 @@ skipped = [r["cell"] for r in rows if not r["pass"] and r["qualification"] == "n
 harness = [r["cell"] for r in rows if r["detail"].startswith("harness:")]
 print("SUMMARY pass=%d fail=%d skipped=%d harness=%d failed=%s terminal_rows_valid=%s"
  % (sum(r["pass"] for r in rows), len(failed), len(skipped), len(harness), failed, valid))
+sys.exit(0 if valid else 1)
 PY
+# Invalid terminal rows (truncated or duplicated results.jsonl) are a
+# harness error, never a pass; this check runs before the flag exits so
+# a silent mid-run `tee -a` failure cannot report success.
+[ "${PIPESTATUS[0]}" = 0 ] || exit 2
 [ "$HARNESS" != 0 ] && exit 2
 [ "$FAILED" != 0 ] && exit 1
 [ "$SKIPPED" != 0 ] && exit 77

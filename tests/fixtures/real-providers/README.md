@@ -94,7 +94,10 @@ ledger on Fedora).
 
 ## expected-causes.json: the ratchet
 
-Each cell lists one entry per `(os-release ID, tool package version)`:
+Each cell lists one entry per `(os-release ID, tool package version)`.
+`real-opencryptoki*` key `tool_version` as
+`opensc/<pkcs11-tool version>+ock/<opencryptoki version>`, since OCK
+call shape depends on both packages:
 
 - `observation`: the exact pinned observation-cause set. Every entry
   carries a `reason` and an `owner`; the oracle refuses pins without

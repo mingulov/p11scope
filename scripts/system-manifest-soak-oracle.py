@@ -71,13 +71,17 @@ RSS_LIMIT_KB = 256 * 1024
 #   over 195 loaded samples: ~19 admissions, ~17 retirements); 32 is
 #   16x that drift, tolerates ambient caller churn over 1800 s, and
 #   fails a +80 retained leak.
-# - BPF FDs 4: the attach topology is fixed after arming (75 map, 34
-#   prog, 15 link, drift 0 over 195 samples); any sustained +5 is a
-#   leak. BTF FDs are file-backed and counted in FDs only.
+# - BPF FDs 32: BPF objects are created progressively during arming
+#   and settle ~2-5 min after GO (+15 measured max across two Fedora
+#   runs: 113 to 122 and 121 to 136, then exactly flat for 1500 s even
+#   under ambient churn, since refused endpoints attach nothing); 32 is
+#   ~2x the max settling tail and fails a +72 sustained leak. A slower
+#   link leak under ~32 per window would hide in the settling tail.
+#   BTF FDs are file-backed and counted in FDs only.
 RSS_GROWTH_MARGIN_KB = 32 * 1024
 FD_GROWTH_MARGIN = 64
 PIDFD_GROWTH_MARGIN = 32
-BPF_GROWTH_MARGIN = 4
+BPF_GROWTH_MARGIN = 32
 # Pre-arming (arming-window) floor-growth margins allow one full
 # admission while failing unbounded pre-GO growth; the pre-GO window is
 # short because GO must leave half the required window for judging:
@@ -430,7 +434,8 @@ def gate_resource_accounting(evidence):
     # arming point) and must leave at least half the required window
     # for post-arming judging. Without that point, or with fewer than
     # eight post-arming samples, the whole trace is judged (fail
-    # closed). Growth before GO is judged against pre-GO margins.
+    # closed). Growth before GO is judged against pre-GO margins
+    # (pre windows under eight samples by their range).
     timing = run.get("timing")
     go_ms = timing.get("t_go_sampler_ms") if isinstance(timing, dict) else None
     judged = rows
@@ -498,8 +503,18 @@ def growth_check(series, margin, label, pre_arming=False):
     (10th percentile) must stay within an absolute margin of the
     early-half floor, so the same leak fails on any base. A retained
     leak raises the floor; a bounded oscillation between fixed levels
-    (or a lone spike, or a detach tail dip) does not move it."""
+    (or a lone spike, or a detach tail dip) does not move it. A
+    pre-arming window with fewer than eight samples is judged by its
+    range (max - min) against the same margin instead of being
+    skipped, so an early GO cannot leave pre-GO growth unjudged;
+    honest admission over a few samples stays well under the
+    pre-GO margins."""
     if len(series) < 8:
+        if pre_arming and len(series) >= 2:
+            low, high = min(series), max(series)
+            if high > low + margin:
+                return (f"{label} grows pre-arming: range {low:.0f} "
+                        f"-> {high:.0f} (margin {margin:.0f})")
         return None
     half = len(series) // 2
     floor_early = quantile(sorted(series[:half]), 0.10)

@@ -1909,6 +1909,25 @@ fn coverage_prefix(total: usize, deep: usize, cap: usize, matched: usize) -> Str
     )
 }
 
+/// One pid's "maps shared objects no deep scan examined" gap, for a
+/// matched member or an unmatched process alike: either way the pid
+/// stays listed in the text instead of folding into the "N other
+/// processes" line, which may only cover pids with nothing unexamined.
+fn unexamined_maps_gap(pid: u32, count: usize) -> PidGap {
+    PidGap::member(
+        pid,
+        Skipped {
+            subject: "maps attribution".into(),
+            reason: format!(
+                "maps {count} shared object{} no deep scan examined this pass; {} may be \
+                 an undiscovered provider",
+                if count == 1 { "" } else { "s" },
+                if count == 1 { "it" } else { "each" },
+            ),
+        },
+    )
+}
+
 /// Lower one shared-scope plan over collected evidence and validated inputs,
 /// and project the catalog records — deep-scanned and maps-matched
 /// members alike. Pure: no `/proc` reads.
@@ -2247,22 +2266,27 @@ fn assemble(
                 reason: format!("{reason}; its maps attributions were dropped"),
             }));
         }
-        for member in &attributed.attribution.members {
-            if member.unexamined > 0 {
-                gaps.push(PidGap::member(
-                    member.pid,
-                    Skipped {
-                        subject: "maps attribution".into(),
-                        reason: format!(
-                            "maps {} shared object{} no deep scan examined this pass; {} may be \
-                             an undiscovered provider",
-                            member.unexamined,
-                            if member.unexamined == 1 { "" } else { "s" },
-                            if member.unexamined == 1 { "it" } else { "each" },
-                        ),
-                    },
-                ));
-            }
+        // Every unselected pid with unexamined keys — matched member
+        // or not — keeps its own gap, so only pids with nothing
+        // unexamined can fold. The map holds exactly the nonzero
+        // counts, members included, so this replaces the members loop
+        // with identical text for members.
+        for (pid, count) in &attributed.attribution.unexamined {
+            gaps.push(unexamined_maps_gap(*pid, *count));
+        }
+        // Unselected pids whose phase-1 maps snapshot was unavailable:
+        // nothing examined their mappings, so they stay listed too. A
+        // selected pid keeps its own member record instead.
+        let selected: BTreeSet<u32> = collection.selected.iter().copied().collect();
+        for pid in collection.sweep_unavailable.difference(&selected) {
+            gaps.push(PidGap::member(
+                *pid,
+                Skipped {
+                    subject: "maps attribution".into(),
+                    reason: "had no maps snapshot this pass; its mappings were never examined"
+                        .into(),
+                },
+            ));
         }
         if lost > 0 {
             let parts: Vec<String> = losses
@@ -3028,6 +3052,9 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
         .collect();
     let _ = writeln!(out, "processes: {}", parts.join(", "));
     let mut unlisted = 0usize;
+    let mut unlisted_scanned = 0usize;
+    let mut unlisted_past_cap = 0usize;
+    let mut unlisted_exited = 0usize;
     let with_gaps: BTreeSet<u32> = catalog
         .skipped
         .iter()
@@ -3035,10 +3062,12 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
         .filter_map(|gap| gap.pid)
         .collect();
     for process in &catalog.processes {
-        // Kernel threads and other processes that map no provider object
-        // are counted above; listing each would bury the few that matter.
-        // A process with an object, a reason or its own gap record
-        // (skipped or note) is always listed.
+        // Kernel threads and other processes with nothing to report are
+        // counted below; listing each would bury the few that matter. A
+        // process with an object, a reason or its own gap record
+        // (skipped or note) is always listed, so the folded line may
+        // only claim no object was found or attributed, never that a
+        // folded process maps none.
         if process.objects.is_empty()
             && process.status.reason().is_none()
             && !with_gaps.contains(&process.pid)
@@ -3048,6 +3077,12 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
             )
         {
             unlisted += 1;
+            match process.status {
+                MemberStatus::Scanned => unlisted_scanned += 1,
+                MemberStatus::NotSelected { .. } => unlisted_past_cap += 1,
+                MemberStatus::Exited => unlisted_exited += 1,
+                _ => {}
+            }
             continue;
         }
         let objects = process
@@ -3077,14 +3112,14 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
     if unlisted > 0 {
         let _ = writeln!(
             out,
-            "  {unlisted} other {} no PKCS#11 object and {} not listed (--json lists every \
-             process)",
+            "  {unlisted} other {} not listed: no PKCS#11 object found or attributed \
+             ({unlisted_scanned} deep-scanned, {unlisted_past_cap} past the deep-scan cap, \
+             {unlisted_exited} exited); --json lists every process",
             if unlisted == 1 {
-                "process maps"
+                "process is"
             } else {
-                "processes map"
+                "processes are"
             },
-            if unlisted == 1 { "is" } else { "are" },
         );
     }
     let _ = writeln!(
@@ -6599,7 +6634,7 @@ mod tests {
             let gap = catalog
                 .skipped
                 .iter()
-                .find(|gap| gap.subject == "maps attribution")
+                .find(|gap| gap.subject == "maps attribution" && gap.pid.is_none())
                 .unwrap();
             assert!(gap.reason.contains("1 exec_changed"), "{gap:?}");
             let lost = catalog

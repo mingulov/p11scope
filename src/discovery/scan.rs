@@ -12210,6 +12210,33 @@ mod tests {
         }
     }
 
+    /// A warm zombie view must die with its spawner: without the
+    /// survivor's parent-death arm the parked survivor keeps the group
+    /// alive forever once its spawner is gone. A helper thread plays
+    /// the spawner; only the arm can kill the forgotten group.
+    #[test]
+    fn warm_zombie_view_dies_with_spawning_thread() {
+        let recorded = std::thread::spawn(|| {
+            let warm = WarmZombieView::spawn();
+            let start = crate::process::process_start_time(warm.tgid)
+                .expect("the group leader has a start time");
+            let recorded = vec![(warm.tgid, start)];
+            std::mem::forget(warm);
+            recorded
+        })
+        .join()
+        .expect("the spawner thread joins");
+        let survivors = crate::fixture_guard::poll_descendants_gone(
+            &recorded,
+            std::time::Duration::from_secs(2),
+        );
+        crate::fixture_guard::cleanup_descendants(&recorded);
+        assert!(
+            survivors.is_empty(),
+            "the warm zombie view {recorded:?} outlived its spawner"
+        );
+    }
+
     /// A scripted IO never mints a real cold member: with a warm view
     /// of a real zombie-with-survivor group, the cold attempt keeps the
     /// exited outcome (`None`) and spends no mint budget. Control: the

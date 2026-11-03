@@ -280,6 +280,56 @@ impl Drop for ZombieLeaderGroup {
     }
 }
 
+/// A forked parking child must die with its spawner: without the
+/// parent-death arm it loops `pause()` forever once its spawner is
+/// gone. A helper thread plays the spawner; only the arm can kill the
+/// forgotten child.
+#[test]
+fn pausing_child_dies_with_spawning_thread() {
+    let recorded = std::thread::spawn(|| {
+        let child = PausingChild::spawn();
+        let start = crate::process::process_start_time(child.pid)
+            .expect("the parking child has a start time");
+        let recorded = vec![(child.pid, start)];
+        std::mem::forget(child);
+        recorded
+    })
+    .join()
+    .expect("the spawner thread joins");
+    let survivors =
+        crate::fixture_guard::poll_descendants_gone(&recorded, std::time::Duration::from_secs(2));
+    crate::fixture_guard::cleanup_descendants(&recorded);
+    assert!(
+        survivors.is_empty(),
+        "the parking child {recorded:?} outlived its spawner"
+    );
+}
+
+/// A zombie-leader group must die with its spawner: without the
+/// survivor's parent-death arm the parked survivor keeps the group
+/// alive forever once its spawner is gone. A helper thread plays the
+/// spawner; only the arm can kill the forgotten group.
+#[test]
+fn zombie_leader_group_dies_with_spawning_thread() {
+    let recorded = std::thread::spawn(|| {
+        let group = ZombieLeaderGroup::spawn();
+        let start = crate::process::process_start_time(group.tgid)
+            .expect("the group leader has a start time");
+        let recorded = vec![(group.tgid, start)];
+        std::mem::forget(group);
+        recorded
+    })
+    .join()
+    .expect("the spawner thread joins");
+    let survivors =
+        crate::fixture_guard::poll_descendants_gone(&recorded, std::time::Duration::from_secs(2));
+    crate::fixture_guard::cleanup_descendants(&recorded);
+    assert!(
+        survivors.is_empty(),
+        "the zombie-leader group {recorded:?} outlived its spawner"
+    );
+}
+
 static WORKDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_workdir(tag: &str) -> std::path::PathBuf {

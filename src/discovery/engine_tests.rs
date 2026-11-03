@@ -18056,6 +18056,32 @@ impl Drop for FdInheritor {
     }
 }
 
+/// A forked fd-inheriting child must die with its spawner: without the
+/// parent-death arm it sleeps its whole 60 s once its spawner is gone.
+/// A helper thread plays the spawner; only the arm can kill the
+/// forgotten child.
+#[test]
+fn fd_inheritor_dies_with_spawning_thread() {
+    let recorded = std::thread::spawn(|| {
+        let child = FdInheritor::spawn();
+        let pid = child.pid as u32;
+        let start =
+            crate::process::process_start_time(pid).expect("the inheriting child has a start time");
+        let recorded = vec![(pid, start)];
+        std::mem::forget(child);
+        recorded
+    })
+    .join()
+    .expect("the spawner thread joins");
+    let survivors =
+        crate::fixture_guard::poll_descendants_gone(&recorded, std::time::Duration::from_secs(2));
+    crate::fixture_guard::cleanup_descendants(&recorded);
+    assert!(
+        survivors.is_empty(),
+        "the fd-inheriting child {recorded:?} outlived its spawner"
+    );
+}
+
 /// Astra A4: `O_CLOEXEC` does not cross fork, so a concurrent test's
 /// forked-but-never-exec'd child inherits the release writer; an EOF-close
 /// release would hang until that child exits. The explicit release byte

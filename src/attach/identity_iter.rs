@@ -8147,6 +8147,69 @@ mod tests {
         }
     }
 
+    /// A mapping child must die with its spawner: without the
+    /// parent-death arm it parks in `pause()` forever after reporting
+    /// once its spawner is gone. A helper thread plays the spawner;
+    /// only the arm can kill the forgotten child.
+    #[test]
+    fn exec_mapping_child_dies_with_spawning_thread() {
+        // The mapped fixture stays alive until the test ends.
+        let (recorded, _dir) = std::thread::spawn(|| {
+            let dir = probe_tempdir();
+            let fixture = write_probe_fixture(dir.path()).expect("fixture");
+            let paths = [&fixture.hardlink, &fixture.b, &fixture.copy];
+            let child = spawn_exec_mapping_child(&paths.map(std::path::PathBuf::from))
+                .expect("the mapping child spawns");
+            let pid = child.pid();
+            let start = crate::process::process_start_time(pid)
+                .expect("the mapping child has a start time");
+            let recorded = vec![(pid, start)];
+            std::mem::forget(child);
+            (recorded, dir)
+        })
+        .join()
+        .expect("the spawner thread joins");
+        let survivors = crate::fixture_guard::poll_descendants_gone(
+            &recorded,
+            std::time::Duration::from_secs(2),
+        );
+        crate::fixture_guard::cleanup_descendants(&recorded);
+        assert!(
+            survivors.is_empty(),
+            "the mapping child {recorded:?} outlived its spawner"
+        );
+    }
+
+    /// Pause children must die with their spawner: without the
+    /// parent-death arm they park in `pause()` forever once their
+    /// spawner is gone. A helper thread plays the spawner; only the
+    /// arm can kill the forgotten children.
+    #[test]
+    fn pause_children_die_with_spawning_thread() {
+        let recorded = std::thread::spawn(|| {
+            let children = spawn_pause_children(2).expect("spawn 2");
+            let mut recorded = Vec::with_capacity(children.len());
+            for child in &children {
+                let start = crate::process::process_start_time(child.pid())
+                    .expect("the pause child has a start time");
+                recorded.push((child.pid(), start));
+            }
+            std::mem::forget(children);
+            recorded
+        })
+        .join()
+        .expect("the spawner thread joins");
+        let survivors = crate::fixture_guard::poll_descendants_gone(
+            &recorded,
+            std::time::Duration::from_secs(2),
+        );
+        crate::fixture_guard::cleanup_descendants(&recorded);
+        assert!(
+            survivors.is_empty(),
+            "the pause children {recorded:?} outlived their spawner"
+        );
+    }
+
     /// Small-scale whole-system shape (privileged): 32 pause children, 3
     /// whole-system runs; every child emits, nothing demotes, every
     /// verdict is NONE (no anchors installed). Timing is campaign

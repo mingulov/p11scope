@@ -90,6 +90,57 @@ pub(crate) fn reap_known_descendant(pid: u32) {
     }
 }
 
+/// Poll until every recorded `(pid, start time)` is gone, reaping
+/// test-adopted zombies each pass; returns the pids still present past
+/// `deadline`. A reused pid number reads as gone (its start time
+/// differs), so only the recorded generation can be reported.
+pub(crate) fn poll_descendants_gone(
+    recorded: &[(u32, u64)],
+    deadline: std::time::Duration,
+) -> Vec<u32> {
+    let end = std::time::Instant::now() + deadline;
+    loop {
+        let mut present = Vec::new();
+        for (pid, start) in recorded {
+            reap_known_descendant(*pid);
+            if crate::process::process_start_time(*pid).is_ok_and(|birth| birth == *start) {
+                present.push(*pid);
+            }
+        }
+        if present.is_empty() || std::time::Instant::now() >= end {
+            return present;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Best-effort cleanup for a failed orphan cell: SIGKILL each recorded
+/// pid that still matches its start time, then reap what is ours.
+/// Never blocks on foreign pids (`ECHILD` ends the reap).
+pub(crate) fn cleanup_descendants(recorded: &[(u32, u64)]) {
+    for (pid, start) in recorded {
+        if crate::process::process_start_time(*pid).is_ok_and(|birth| birth == *start) {
+            // SAFETY: signals only the recorded pid whose start time
+            // still matches.
+            unsafe {
+                libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+    for (pid, _) in recorded {
+        let mut status = 0;
+        // SAFETY: reaps only our own children; anything else (`ECHILD`)
+        // or a second signal ends the loop. The recorded pids are
+        // SIGKILLed above, so a live own child cannot block this.
+        loop {
+            let waited = unsafe { libc::waitpid(*pid as libc::pid_t, &mut status, 0) };
+            if waited >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::DieWithParent as _;

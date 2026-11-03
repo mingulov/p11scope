@@ -1317,12 +1317,13 @@ pub(super) fn close_k0_window_with_tail_and_losses(
     // Torn-read guard: each bracketing read takes the return-value map
     // first and the slot stats after, so a window overlapping live
     // calls can pair one read's stats with the other's return-value
-    // counts. Every counted return adds exactly one return-value
-    // count (BPF `account_return`), and any return-value update
-    // failure already voids the read, so a windowed row whose
-    // `rv_counts` sum differs from its `returned` delta is torn in
-    // either direction: refuse the detail as a topology mismatch
-    // rather than render rows that disagree with the main report.
+    // counts. Bank returns run native `p11_bank_complete`/`_timed`,
+    // which count the return before its return value, and a full
+    // return-value table does not void the read (its counts are a
+    // lower bound), so a windowed row whose `rv_counts` sum differs
+    // from its `returned` delta is torn in either direction: refuse
+    // the detail as a topology mismatch rather than render rows that
+    // disagree with the main report.
     if deltas.iter().any(|delta| {
         delta
             .rv_counts

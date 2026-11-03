@@ -13306,6 +13306,35 @@ mod tests {
         );
     }
 
+    /// M3: the named ordering holds within one discovery pass only. A named
+    /// closure admitted in an earlier pass (309 held) crowds a named
+    /// two-table provider arriving later: its first table attaches, the
+    /// second spills into the uncorroborated count with no refusal record.
+    #[test]
+    fn named_prefix_from_an_earlier_pass_crowds_a_later_named_provider() {
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let mut later = provider_with_tables(32, "/opt/late.so", 2, 104, false);
+        later.scanned.module_hint = Some(std::path::PathBuf::from("/opt/late.so"));
+        let first = scoped_plan(std::slice::from_ref(&closure), AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 31), 3 * 103, "named prefix immediate");
+        assert_eq!(
+            first.uncorroborated_candidates, 61,
+            "prefix fallback spills its 61 non-admitted tables"
+        );
+        let rebuilt = first.rebuild_from_sources(&[closure, later], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&rebuilt, 32), 104, "first table attaches");
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 62,
+            "the second table joins the count: 61 closure plus 1 provider"
+        );
+        assert!(
+            refusal_of(&rebuilt, "/opt/late.so").is_none(),
+            "the spill leaves no refusal record"
+        );
+        assert_eq!(slots_of(&rebuilt, 31), 3 * 103, "held prefix kept");
+    }
+
     /// PA-5 C1 late-start twin (`--pid` on a running process): the closure
     /// and providers are all mapped before the first plan. The prefix is
     /// admitted after the providers, and nothing is starved.

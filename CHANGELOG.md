@@ -40,7 +40,9 @@ versioned separately and are opaque, exact dispatch keys.
   narrowing attributed its opened file to a named path (verbatim path
   string, or an inode alias confirmed against the opened files), in which
   case it may take the reserve-capped prefix after the named non-closure
-  modules are admitted. Shared scope stays
+  modules admitted in the same discovery pass (ordering is per-pass: a
+  prefix held from an earlier pass can still crowd a later-named
+  provider's weaker tables into the uncorroborated count). Shared scope stays
   whole-or-nothing for closures (never a heuristic prefix). A later provider
   that still does not fit is refused by name with the `--exclude-module`
   remedy.

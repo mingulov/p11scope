@@ -176,8 +176,9 @@ reserve-capped leading-templates prefix with a named partial gap when no
 provider was refused or omitted; a closure alone in the first plan, or first
 mapped mid-capture, admits only its published tables, unless its opened file
 matches an operator-named `--module` path, which admits the reserve-capped
-prefix after the named non-closure modules. The terminal report names each
-refused or partially covered module
+prefix after the named non-closure modules admitted in the same discovery
+pass (a prefix held from an earlier pass can still crowd a later-named
+provider). The terminal report names each refused or partially covered module
 with its reason: `run` and `profile` print a `Module gaps` section with the
 first five and an "and K more" line, and `inventory` prints the admission
 reason under each refused module. A capture whose only mapped provider is

@@ -391,7 +391,7 @@ static void ring_discard(void *record, u64 flags)
 }
 #endif
 
-#if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
+#ifndef P11SCOPE_INVENTORY_ONLY
 static unsigned owner_loop_calls;
 /* Replace only kernel helper 181; execute the production cleanup callbacks. */
 static long controlled_owner_loop(u32 count, long (*callback)(u32, void *),
@@ -410,9 +410,8 @@ static long controlled_owner_loop(u32 count, long (*callback)(u32, void *),
 #endif
 
 /* Only helper 181 is replaced. The callback remains the real native find
- * body, including its occupancy, cookie and domain checks. Unlike the
- * sweep loop, the find loop runs in every build, so this stub is
- * unconditional. */
+ * body, including its occupancy, cookie and domain checks. The find loop
+ * also runs in Inventory builds, so this stub is unconditional. */
 static long controlled_find_loop(u32 count, long (*callback)(u32, void *),
                                  void *context, u64 flags)
 {
@@ -449,7 +448,7 @@ static void reset(void)
     owner_current_task = current_task;
     owner_pid_tgid = pid_tgid;
     find_loop = controlled_find_loop;
-#if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
+#ifndef P11SCOPE_INVENTORY_ONLY
     owner_loop_calls = 0;
     owner_loop = controlled_owner_loop;
 #endif
@@ -667,7 +666,7 @@ static void cleanup_preserves_words(void)
     EXPECT(p11_owner_cleanup() == P11_OWNER_CLEANUP_ABANDONED_START,
            "exec/exit cleanup settles abandoning live START");
     EXPECT(ctl.abandoned_start == 1, "cleanup abandoned one live START");
-#if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
+#ifndef P11SCOPE_INVENTORY_ONLY
     EXPECT(owner_loop_calls == 2, "both production callback sweeps completed");
 #endif
     EXPECT(owner_map_lookup(&START, &key) == NULL, "cleanup removed the START row");

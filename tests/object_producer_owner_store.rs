@@ -1016,12 +1016,12 @@ fn object_producer_scalar_globals_are_exact_and_reachable() {
 
 #[test]
 fn object_producer_sweep_path_within_jump_budget() {
-    // Both teardown sweeps run 512 slots per cleanup; every per-slot
-    // branch multiplies into the kernel jump budget (live 8193-jump
-    // reject). The path stays branch-lean by construction, with no
-    // per-iteration carried accumulators: those multiply verifier
-    // states instead (live 17k-state blowup). Bulk helpers and the
-    // outlined sweep worker stay out for the same reason.
+    // Both teardown sweeps run every slot per cleanup through bpf_loop
+    // callbacks; each per-slot branch still costs the callback's verified
+    // paths and the runtime of every slot. The callbacks stay branch-lean
+    // by construction, with no per-iteration carried accumulators: those
+    // multiply verifier states (live 17k-state blowup). Bulk helpers and
+    // the outlined sweep worker stay out for the same reason.
     let native =
         std::fs::read_to_string("crates/ebpf/native/task_owner.c").expect("read native owner");
     for forbidden in [
@@ -1037,16 +1037,20 @@ fn object_producer_sweep_path_within_jump_budget() {
     }
     let sweep = source_between(
         &native,
-        "for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {",
-        "if (owner->start_count) {",
+        "static long owner_cleanup_start_callback(",
+        "static long owner_cleanup_orphan_callback(",
     );
     assert!(
         !sweep.contains("int retired = "),
         "START sweep must test retirement directly, not materialize it"
     );
-    let orphans = source_between(&native, "/* Orphaned side rows", "#endif");
+    let orphans = source_between(
+        &native,
+        "static long owner_cleanup_orphan_callback(",
+        "#endif",
+    );
     assert!(
-        orphans.contains("count(&ctl->abandoned_start);"),
+        orphans.contains("count(&context->ctl->abandoned_start);"),
         "orphan sweep must count per retired row"
     );
     assert!(
@@ -2162,29 +2166,30 @@ def check_scrub_body(data, report, name):
 
 
 def check_scrubs(data, report, wide=False):
-    names = ['p11_owner_cleanup']
-    if wide:
-        # Pin the actual helper-bound callback references, not nearby symbols.
-        _, raws, _, bodies, relocations = bodies_and_relocations(data)
-        root = only(bodies, 'p11_owner_cleanup')
-        body = body_of(raws, bodies, root)
-        instructions = [struct.unpack_from('<BBhi', body, at)
-                        for at in range(0, len(body), 8)]
-        calls = [pc for pc, insn in enumerate(instructions)
-                 if insn == (0x85, 0, 0, 181)]
-        names = ['owner_cleanup_start_callback', 'owner_cleanup_orphan_callback']
-        assert len(calls) == 2, 'wide cleanup needs both real bounded helper calls'
-        for pc, name in zip(calls, names):
-            assert instructions[pc - 4] == (0xb7, 1, 0, 2112), \
-                'wide cleanup helper must cover every slot'
-            assert instructions[pc - 1] == (0xb7, 4, 0, 0), 'loop flags must be zero'
-            op, reg, offset, immediate = instructions[pc - 3]
-            assert (op, reg, offset) == (0x18, 2, 0), 'helper callback must be argument two'
-            relocation = relocations.get((root[0], root[1] + (pc - 3) * 8))
-            assert relocation and relocation[0] == 1, 'callback needs its actual relocation'
-            target = relocation[1]
-            assert (target[3], target[4] + immediate) == only(bodies, name), \
-                'wide helper must call the corresponding cleanup callback'
+    # Both capacities sweep through bpf_loop; the bound is the slot count
+    # (2112 wide, 512 default). Pin the actual helper-bound callback
+    # references, not nearby symbols.
+    bound = 2112 if wide else 512
+    _, raws, _, bodies, relocations = bodies_and_relocations(data)
+    root = only(bodies, 'p11_owner_cleanup')
+    body = body_of(raws, bodies, root)
+    instructions = [struct.unpack_from('<BBhi', body, at)
+                    for at in range(0, len(body), 8)]
+    calls = [pc for pc, insn in enumerate(instructions)
+             if insn == (0x85, 0, 0, 181)]
+    names = ['owner_cleanup_start_callback', 'owner_cleanup_orphan_callback']
+    assert len(calls) == 2, 'cleanup needs both real bounded helper calls'
+    for pc, name in zip(calls, names):
+        assert instructions[pc - 4] == (0xb7, 1, 0, bound), \
+            'cleanup helper must cover every slot'
+        assert instructions[pc - 1] == (0xb7, 4, 0, 0), 'loop flags must be zero'
+        op, reg, offset, immediate = instructions[pc - 3]
+        assert (op, reg, offset) == (0x18, 2, 0), 'helper callback must be argument two'
+        relocation = relocations.get((root[0], root[1] + (pc - 3) * 8))
+        assert relocation and relocation[0] == 1, 'callback needs its actual relocation'
+        target = relocation[1]
+        assert (target[3], target[4] + immediate) == only(bodies, name), \
+            'cleanup helper must call the corresponding cleanup callback'
     for name in names:
         check_scrub_body(data, report, name)
 

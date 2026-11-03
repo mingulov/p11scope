@@ -33,7 +33,7 @@ u32 p11_journal_settle_finish(struct journal_settle_words *words, u32 cleanup_co
     return 0;
 }
 #endif
-#if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
+#ifndef P11SCOPE_INVENTORY_ONLY
 #define P11SCOPE_HOST_OWNER_LOOP 1
 #endif
 #ifndef P11SCOPE_INVENTORY_ONLY
@@ -184,9 +184,8 @@ static long controlled_owner_loop(u32 count, long (*callback)(u32, void *),
 #endif
 
 /* Only helper 181 is replaced. The callback remains the real native find
- * body, including its occupancy, cookie and domain checks. Unlike the
- * sweep loop, the find loop runs in every build, so this stub is
- * unconditional. */
+ * body, including its occupancy, cookie and domain checks. The find loop
+ * also runs in Inventory builds, so this stub is unconditional. */
 static long controlled_find_loop(u32 count, long (*callback)(u32, void *),
                                  void *context, u64 flags)
 {

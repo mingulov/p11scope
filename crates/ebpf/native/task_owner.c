@@ -357,7 +357,7 @@ static __always_inline void object_scrub_side(void *side)
     volatile u64 *words = side;
     u32 i;
     /* Fixed 432-byte row: keep all volatile stores in order, without a
-     * second verifier loop inside each of the 512-slot cleanup sweeps. */
+     * second verifier loop inside the cleanup sweep callback. */
 #pragma clang loop unroll(full)
     for (i = 0; i < OBJECT_START_WORDS; i++)
         words[i] = 0;
@@ -1090,10 +1090,11 @@ __attribute__((noinline)) long p11_owner_discovery_insert(const struct owner_dis
     return -1;
 }
 
-#if (defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U) && !defined(P11SCOPE_INVENTORY_ONLY)
-/* Helper 181 verifies the callback body once instead of exploring the wide
- * or private bank-profile loop frontier in each lifecycle root. Both actual
- * exec/exit roots still require a separate kernel load proof. */
+#ifndef P11SCOPE_INVENTORY_ONLY
+/* Helper 181 verifies each cleanup callback body once instead of exploring
+ * the whole slot frontier (512 default, 2112 wide, 8192 bank profile) in
+ * each exec/exit root. Capture requires uprobe_multi (Linux 6.6+), which
+ * always has the helper; the exec/exit roots keep their kernel load proof. */
 static long (*owner_loop)(u32, long (*)(u32, void *), void *, u64) = (void *)181;
 
 struct owner_cleanup_context {
@@ -1194,7 +1195,6 @@ __attribute__((noinline)) u32 p11_owner_cleanup(void)
      * Mismatched counts still fail (1) at the checks below. */
     u32 live_starts = owner->start_count;
 #ifndef P11SCOPE_INVENTORY_ONLY
-#if defined(P11SCOPE_COUNTER_BANK_PROOF) || P11SCOPE_OWNER_SLOT_BOUND == 2112U
     struct owner_cleanup_context context = {
         .ctl = ctl,
         .owner = owner,
@@ -1223,50 +1223,6 @@ __attribute__((noinline)) u32 p11_owner_cleanup(void)
         poison(ctl, OWNER_CLASSIFIER_FAILED);
         return 1;
     }
-#else
-    struct owner_start_key start = { .pid_tgid = owner->original_pid_tgid, .slot = 0, .pad = 0 };
-    for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
-        start.slot = i;
-        if (owner_map_lookup(&START, &start)) {
-            long rc = remove_start(ctl, owner, &start, P11_OWNER_START_REASON_EXEC_EXIT);
-            /* Retirement is tested directly (no materialized flag): one
-             * jump per slot. No carried accumulator: per-iteration
-             * scalars multiply verifier states instead. */
-            if (!owner_map_lookup(&START, &start)) {
-                count(&ctl->abandoned_start);
-                /* A contradicted row still retired: settle an emptied
-                 * lease instead of stranding it until the next hook. The
-                 * success path releases once below. */
-                if (rc)
-                    release_empty(ctl, owner);
-            }
-            if (rc)
-                return 1;
-        }
-    }
-    if (owner->start_count) {
-        bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
-        return 1;
-    }
-    /* Orphaned side rows (START gone without its subordinate) hold no live
-     * call; scrub and delete them under these proven retained keys. A bare
-     * numeric key never authorizes this sweep. Inline by design: no
-     * carried accumulator (per-iteration scalars multiply verifier
-     * states) and no outlined worker (no verification gain). */
-    for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
-        void *orphan;
-        start.slot = i;
-        orphan = owner_map_lookup(&OBJECT_START, &start);
-        if (orphan) {
-            object_scrub_side(orphan);
-            if (owner_map_delete(&OBJECT_START, &start)) {
-                poison(ctl, OWNER_STATE_DELETE_FAILED);
-                return 1;
-            }
-            count(&ctl->abandoned_start);
-        }
-    }
-#endif
 #endif
     struct owner_discovery_key key = { .pid_tgid = owner->original_pid_tgid };
     for (u32 i = 0; i < 64; i++) {

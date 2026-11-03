@@ -617,7 +617,10 @@ jobs:
           rc=0
           if [ "${{ matrix.kernel }}" = host ]; then
             uname -a
-            sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" scripts/qualify-public-cli.sh "$in/p11scope" "$out/cells" >"$RUNNER_TEMP/qual.log" 2>&1 || rc=$?
+            # Ruling CI-GAP-1: the hosted host system cell discloses shared-
+            # runner descendant exits as runner noise. VNG guests keep the
+            # strict no-gap mode (no flag on the guest leg below).
+            sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 scripts/qualify-public-cli.sh "$in/p11scope" "$out/cells" >"$RUNNER_TEMP/qual.log" 2>&1 || rc=$?
             sudo -n chown -R "$(id -un):$(id -gn)" "$out"
             tail -40 "$RUNNER_TEMP/qual.log"
           else

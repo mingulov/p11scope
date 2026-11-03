@@ -584,13 +584,43 @@ const NATIVE_OWNER_SUSPENDED_LOST_REASON: &str = "the caller failed its final pe
 
 /// Collapse per-view `--module` hint-miss notes into per-pass scope misses.
 ///
-/// STUB (RED): passes notes through unchanged.
+/// Every deep-scanned view reports each hint it does not map, so hints by
+/// views notes reach the registry: at system scale (121 hints, ~475 views)
+/// that drowns the gap store (~49k suppressed gaps) and hides real loss. A
+/// hint the scan matched in any inventoried view — or that maps identity
+/// attributed to a catalog object — is mapped: its miss notes are noise and
+/// drop. A hint missed everywhere is owed one pid-less scope answer. Match
+/// state comes from this pass's own notes and statuses, never from
+/// re-statting hints (fd and maps device domains must not be compared).
 fn collapse_hint_misses(
-    _inventoried: &BTreeSet<u32>,
-    _object_paths: &BTreeSet<&str>,
+    inventoried: &BTreeSet<u32>,
+    object_paths: &BTreeSet<&str>,
     notes: &[crate::inspect_system::PidGap],
 ) -> Vec<crate::inspect_system::PidGap> {
-    notes.to_vec()
+    let mut missed: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
+    let mut kept: Vec<crate::inspect_system::PidGap> = Vec::with_capacity(notes.len());
+    for note in notes {
+        if note.reason == crate::discovery::scan::HINT_NOT_MAPPED_REASON
+            && let Some(pid) = note.pid
+        {
+            missed.entry(note.subject.as_str()).or_default().insert(pid);
+        } else {
+            kept.push(note.clone());
+        }
+    }
+    for (subject, pids) in missed {
+        let matched = object_paths.contains(subject)
+            || inventoried.iter().any(|pid| !pids.contains(pid));
+        if !matched {
+            kept.push(crate::inspect_system::PidGap {
+                pid: None,
+                subject: subject.into(),
+                reason: crate::discovery::scan::HINT_NOT_MAPPED_REASON.into(),
+                generic: false,
+            });
+        }
+    }
+    kept
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {

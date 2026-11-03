@@ -71,17 +71,17 @@ RSS_LIMIT_KB = 256 * 1024
 #   over 195 loaded samples: ~19 admissions, ~17 retirements); 32 is
 #   16x that drift, tolerates ambient caller churn over 1800 s, and
 #   fails a +80 retained leak.
-# - BPF FDs 16: BPF objects are created progressively during arming
-#   and settle ~2 min after GO (+9 measured: 113 to 122, then exactly
-#   flat for 1500 s even under ambient churn, since refused endpoints
-#   attach nothing); 16 is ~2x the settling tail and fails a +40
-#   sustained leak. A slower link leak under ~16 per window would hide
-#   in the settling tail. BTF FDs are file-backed and counted in FDs
-#   only.
+# - BPF FDs 32: BPF objects are created progressively during arming
+#   and settle ~2-5 min after GO (+15 measured max across two Fedora
+#   runs: 113 to 122 and 121 to 136, then exactly flat for 1500 s even
+#   under ambient churn, since refused endpoints attach nothing); 32 is
+#   ~2x the max settling tail and fails a +72 sustained leak. A slower
+#   link leak under ~32 per window would hide in the settling tail.
+#   BTF FDs are file-backed and counted in FDs only.
 RSS_GROWTH_MARGIN_KB = 32 * 1024
 FD_GROWTH_MARGIN = 64
 PIDFD_GROWTH_MARGIN = 32
-BPF_GROWTH_MARGIN = 16
+BPF_GROWTH_MARGIN = 32
 # Pre-arming (arming-window) floor-growth margins allow one full
 # admission while failing unbounded pre-GO growth; the pre-GO window is
 # short because GO must leave half the required window for judging:

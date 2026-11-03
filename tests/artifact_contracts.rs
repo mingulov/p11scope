@@ -3922,6 +3922,12 @@ launch_user_recorded_process_group "$work/leader.pid" "$work/leader.log" \
     sh -c 'sleep 30 & echo $! > "$1/sleeper.pid"; wait' sh "$work"
 leader=$USER_PROCESS_PID
 sid=$USER_PROCESS_SID
+attempt=0
+while [ ! -s "$work/sleeper.pid" ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || { echo "sleeper pid file never appeared" >&2; exit 1; }
+    sleep 0.05
+done
 sleeper=$(cat "$work/sleeper.pid")
 snapshot_user_process_session "$sid" > "$work/members.json"
 python3 - "$work/members.json" "$leader" "$sleeper" <<'PY'

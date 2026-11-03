@@ -22,6 +22,30 @@ use std::path::PathBuf;
 
 const DOC_ID: &str = "p11scope/inspect/v1";
 
+/// Writes `lines`, naming each run of consecutive identical lines once with
+/// its count (`  (×N identical)`). A proxy such as p11-kit carries dozens of
+/// identical closure tables; the text keeps their order and count while
+/// `--json` still lists every table.
+pub(crate) fn push_collapsed_lines(out: &mut String, lines: impl IntoIterator<Item = String>) {
+    let mut run: Option<(String, usize)> = None;
+    let flush = |out: &mut String, run: Option<(String, usize)>| {
+        if let Some((line, count)) = run {
+            if count > 1 {
+                let _ = writeln!(out, "{line}  (×{count} identical)");
+            } else {
+                let _ = writeln!(out, "{line}");
+            }
+        }
+    };
+    for line in lines {
+        match &mut run {
+            Some((previous, count)) if *previous == line => *count += 1,
+            _ => flush(out, run.replace((line, 1))),
+        }
+    }
+    flush(out, run);
+}
+
 /// The scan's refusal when it could not take the target's mapping snapshot
 /// at all (`/proc/<pid>/maps` unreadable, empty, or unparseable). No module
 /// inventory exists behind it, so `inspect` must not render it as a scan
@@ -123,7 +147,7 @@ fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObject
 
     let _ = writeln!(out, "  exports    {}", module.exports.join(", "));
 
-    for table in &module.tables {
+    let table_lines = module.tables.iter().map(|table| {
         let count = table.entries.len();
         let entry_word = if count == 1 { "entry" } else { "entries" };
         let nulls = if table.null_entries.is_empty() {
@@ -131,12 +155,12 @@ fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObject
         } else {
             format!("  (NULL: {})", table.null_entries.join(", "))
         };
-        let _ = writeln!(
-            out,
+        format!(
             "  table      {}.{}  {}  {count} {entry_word}{nulls}",
             table.version.0, table.version.1, table.walk
-        );
-    }
+        )
+    });
+    push_collapsed_lines(out, table_lines);
 
     for interface in &module.interfaces {
         let name = interface

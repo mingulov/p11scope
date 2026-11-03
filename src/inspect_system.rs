@@ -2960,7 +2960,7 @@ fn render_object(
                 observation.exports.join(", ")
             },
         );
-        for table in &observation.tables {
+        let table_lines = observation.tables.iter().map(|table| {
             let count = table.entries.len();
             let entry_word = if count == 1 { "entry" } else { "entries" };
             let nulls = if table.null_entries.is_empty() {
@@ -2973,12 +2973,12 @@ fn render_object(
             } else {
                 format!("  (unpinned: {})", table.unpinned.len())
             };
-            let _ = writeln!(
-                out,
+            format!(
                 "    table      {}.{}  {}  {count} {entry_word}{nulls}{unpinned}",
                 table.version.0, table.version.1, table.walk
-            );
-        }
+            )
+        });
+        crate::inspect::push_collapsed_lines(out, table_lines);
         for interface in &observation.interfaces {
             let name = interface
                 .name_lossy
@@ -3014,7 +3014,24 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
         .map(|(status, count)| format!("{count} {status}"))
         .collect();
     let _ = writeln!(out, "processes: {}", parts.join(", "));
+    let mut unlisted = 0usize;
+    let with_gaps: BTreeSet<u32> = catalog.skipped.iter().filter_map(|gap| gap.pid).collect();
     for process in &catalog.processes {
+        // Kernel threads and other processes that map no provider object
+        // are counted above; listing each would bury the few that matter.
+        // A process with an object, a reason or its own skipped record is
+        // always listed.
+        if process.objects.is_empty()
+            && process.status.reason().is_none()
+            && !with_gaps.contains(&process.pid)
+            && matches!(
+                process.status,
+                MemberStatus::Scanned | MemberStatus::NotSelected { .. } | MemberStatus::Exited
+            )
+        {
+            unlisted += 1;
+            continue;
+        }
         let objects = process
             .objects
             .iter()
@@ -3038,6 +3055,19 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
                 crate::render::escape_controls(reason)
             );
         }
+    }
+    if unlisted > 0 {
+        let _ = writeln!(
+            out,
+            "  {unlisted} other {} no PKCS#11 object and {} not listed (--json lists every \
+             process)",
+            if unlisted == 1 {
+                "process maps"
+            } else {
+                "processes map"
+            },
+            if unlisted == 1 { "is" } else { "are" },
+        );
     }
     let _ = writeln!(
         out,

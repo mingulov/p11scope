@@ -3184,6 +3184,11 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// plus its comment lines and the `result_unit_err` allow on the new
 /// method): 144504 B, measured with this same lexer on the integrated
 /// source.
+/// Re-baselined for the outlined GetID return facts (the only BPF source
+/// change: the two inlined C_AsyncGetID arms in `capture_return_facts`
+/// become one `#[inline(never)] async_get_id_fact` helper with the same
+/// four cases, plus its comment lines): 144694 B, measured with this same
+/// lexer; the previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3193,8 +3198,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            144504,
-            "85824d418e798e9c1bd987b3fce025b0af63a0ae0a73c060ff279b853ce9d44f"
+            144694,
+            "fa28cd112317383bc55fc3cb96aed098a9acb700fd734da61ff5dd574fdbce18"
         ),
         "stripped BPF dump must stay byte-identical"
     );

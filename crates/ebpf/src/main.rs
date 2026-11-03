@@ -4379,6 +4379,42 @@ fn account_return(
     ReturnAccounting { now, delta, rv }
 }
 
+// C_AsyncGetID return facts. Only an OK GetID is examined: a null
+// output pointer produced no id, and an unreadable one leaves no trusted
+// id; both mark the value unreadable with exactly one evidence bump
+// (a failed entry arg read also leaves out_ptr zeroed, so that
+// unreachable corner double-counts). A readable id is written through
+// `out`; the caller's default stays otherwise. Outlined so the verifier
+// explores this branch tree once instead of at every inlined return
+// site; the scalar u32 return keeps the BTF prototype register-sized.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn async_get_id_fact(
+    out_ptr: u64,
+    rv: u64,
+    lifecycle: u8,
+    layout: LinuxLayout,
+    out: &mut u64,
+) -> u32 {
+    if rv != 0 || lifecycle != lifecycle::ASYNC_GET_ID {
+        return 0;
+    }
+    if out_ptr == 0 {
+        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+        return capture::ASYNC_VALUE_UNREADABLE;
+    }
+    match read_word(out_ptr, layout) {
+        Ok(value) => {
+            *out = value;
+            0
+        }
+        Err(_) => {
+            bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
+            capture::ASYNC_VALUE_UNREADABLE
+        }
+    }
+}
+
 #[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
 fn capture_return_facts<const DEFER_ROUTING: bool>(
@@ -4422,25 +4458,16 @@ fn capture_return_facts<const DEFER_ROUTING: bool>(
         }
     }
     let mut async_value = start.async_value;
-    // An OK GetID with a null output pointer produced no id: mark the
-    // value unreadable instead of leaving a valid-looking default.
-    // A failed entry arg read also leaves out_ptr zeroed, so that unreachable corner double-counts the evidence below.
-    if accounting.rv == 0
-        && semantics.lifecycle == lifecycle::ASYNC_GET_ID
-        && start.out_ptr == 0
-    {
-        capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
-        bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-    }
-    if accounting.rv == 0 && start.out_ptr != 0 && semantics.lifecycle == lifecycle::ASYNC_GET_ID {
-        match read_word(start.out_ptr, layout) {
-            Ok(value) => async_value = value,
-            Err(_) => {
-                capture_flags |= capture::ASYNC_VALUE_UNREADABLE;
-                bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
-            }
-        }
-    }
+    // The GetID return facts run in one outlined helper (verified once,
+    // not at every inlined return site); the entry default stays unless
+    // a successful read overwrites it.
+    capture_flags |= async_get_id_fact(
+        start.out_ptr,
+        accounting.rv,
+        semantics.lifecycle,
+        layout,
+        &mut async_value,
+    );
 
     ReturnEventFacts {
         ts_ns: accounting.now,

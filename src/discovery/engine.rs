@@ -1001,6 +1001,8 @@ struct CaptureHistory {
     losses: BTreeMap<(String, String), Skipped>,
     /// Scan gaps contradicted by a later same-path nonempty table; exact keys
     /// keep persistent counters from resurrecting them after that table retires.
+    /// Written by `record_object_skips` on suppression and by `merge_current`;
+    /// read by both through `scan_gap_key`.
     scan_gap_tombstones: BTreeSet<(String, String)>,
     refusals: BTreeMap<plan::ModuleId, Skipped>,
     fallbacks: BTreeMap<(u32, u32), render::ManifestObjectFallback>,
@@ -2524,7 +2526,7 @@ impl CaptureFacts {
             history.scan_gap_tombstones.insert(key);
         }
         for skipped in &counters.object_skips {
-            let key = (skipped.subject.clone(), skipped.reason.clone());
+            let key = scan_gap_key(skipped);
             if scan_gap_this_capture_attached(&plan.modules, skipped) {
                 history.scan_gap_tombstones.insert(key);
             } else if !history.scan_gap_tombstones.contains(&key) {
@@ -6934,6 +6936,7 @@ fn build_current_plan(
     prearm: &[plan::PrearmPlanPiece],
     pinned: &PinnedObjects,
     counters: &mut DiscoveryCounters,
+    tombstones: &mut BTreeSet<(String, String)>,
     corroborated: &BTreeSet<PinnedObjectId>,
     identity_mismatches: usize,
     manifest_fallbacks: usize,
@@ -6952,7 +6955,7 @@ fn build_current_plan(
         admission_scope,
         counter_hint,
     );
-    record_object_skips(&mut plan, &counters.object_skips);
+    record_object_skips(&mut plan, &counters.object_skips, tombstones);
     for object in corroborated {
         if let Some(summary) = plan
             .modules
@@ -7005,26 +7008,56 @@ fn uncorroborated_count(
     (uncorroborated + identity_mismatches + manifest_fallbacks) as u64
 }
 
+/// Exact `(subject, reason)` identity of a scan gap. `record_object_skips`
+/// and `merge_current` share this shape so a tombstone one writes the other
+/// reads; a drift between the two would resurrect retired gaps.
+fn scan_gap_key(skip: &Skipped) -> (String, String) {
+    (skip.subject.clone(), skip.reason.clone())
+}
+
 /// Folds the scan's own object-level losses into the plan's skip list, where
 /// `Evidence::verdict` already turns any skip into `PARTIAL`. Deduplicated:
 /// a `--cgroup` scans every process in the tree, and one provider ten of them
 /// map is one loss, not ten lines of the same one.
-fn record_object_skips(plan: &mut plan::AttachPlan, skips: &[Skipped]) {
+fn record_object_skips(
+    plan: &mut plan::AttachPlan,
+    skips: &[Skipped],
+    tombstones: &mut BTreeSet<(String, String)>,
+) {
     // Judged by capture end, so what an earlier batch already recorded is
     // re-judged too: the plan's skip list is only rebuilt when its sources are.
+    // A gap contradicted once — the capture attached a full same-path table —
+    // stays contradicted: the tombstone outlives the retirement that empties
+    // the terminal plan, so a terminal record cannot resurrect the gap the
+    // persistent counters still carry.
     let modules = std::mem::take(&mut plan.modules);
-    plan.skipped
-        .retain(|skip| !scan_gap_this_capture_attached(&modules, skip));
+    plan.skipped.retain(|skip| {
+        let key = scan_gap_key(skip);
+        if scan_gap_this_capture_attached(&modules, skip) {
+            tombstones.insert(key);
+            return false;
+        }
+        !tombstones.contains(&key)
+    });
     // Newly visible loss records in canonical (subject, reason) order —
     // the merge folds counters into a keyed losses map and projection
     // emits that map's order, so arrival order here would flip-flop
     // against projection order every arm and no commit could ever
     // reproduce its predecessor. Already-recorded entries keep their
     // positions; a late out-of-order arrival heals with one publish.
+    // Tombstoned and newly contradicted gaps stay out, as above.
     let mut new: Vec<&Skipped> = skips
         .iter()
         .filter(|skip| {
-            !scan_gap_this_capture_attached(&modules, skip) && !plan.skipped.contains(skip)
+            let key = scan_gap_key(skip);
+            if tombstones.contains(&key) {
+                return false;
+            }
+            if scan_gap_this_capture_attached(&modules, skip) {
+                tombstones.insert(key);
+                return false;
+            }
+            !plan.skipped.contains(skip)
         })
         .collect();
     new.sort_by(|a, b| (&a.subject, &a.reason).cmp(&(&b.subject, &b.reason)));
@@ -8275,6 +8308,10 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         &prearm_pieces,
         &pinned,
         &mut counters,
+        &mut discovered
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
         &corroborated,
         identity_mismatches,
         manifest_fallbacks,
@@ -8300,7 +8337,14 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
             reason,
         });
     }
-    record_object_skips(&mut plan, &counters.object_skips);
+    record_object_skips(
+        &mut plan,
+        &counters.object_skips,
+        &mut discovered
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
+    );
     if let Some(fallback) = counters
         .manifest_fallbacks
         .iter()
@@ -11122,7 +11166,11 @@ impl Engine {
             return;
         }
         self.mark_live_loss("live discovery frame", UNFINISHED_DEFERRAL_LOSS);
-        record_object_skips(&mut self.plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut self.plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
     }
 
     /// The capture's operator-stop flag: a live frame that sees it set
@@ -12783,7 +12831,11 @@ impl Engine {
     fn record_publication_skips(&mut self) -> bool {
         let skips_start = crate::attach::monotonic_ns();
         let before = self.plan.skipped.clone();
-        record_object_skips(&mut self.plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut self.plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
         self.stage_timings.span(
             crate::timing::StageKind::Projection,
             "record_publication_skips",
@@ -12920,7 +12972,11 @@ impl Engine {
         // identity left with its process view stops accepting probes, and its
         // already-accepted aggregate cell stays exactly as it was.
         plan.retire_unpinned_targets(&pinned, plan.slots.len());
-        record_object_skips(&mut plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
 
         self.plan = plan;
         self.pinned = pinned;
@@ -12970,7 +13026,11 @@ impl Engine {
                 self.settle_all_pending_loader_scans(
                     "a deferred loader memory scan was unresolved when capture start was cancelled",
                 );
-                record_object_skips(&mut self.plan, &self.counters.object_skips);
+                record_object_skips(
+                    &mut self.plan,
+                    &self.counters.object_skips,
+                    &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+                );
                 Err(error)
             }
         }
@@ -13114,7 +13174,11 @@ impl Engine {
             crate::attach::monotonic_ns(),
         );
         let mut merge_tail_start = crate::attach::monotonic_ns();
-        record_object_skips(&mut rebuilt, &self.counters.object_skips);
+        record_object_skips(
+            &mut rebuilt,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
         let module_objects: BTreeSet<_> =
             rebuilt.modules.iter().map(|module| module.object).collect();
         let mut corroboration = self.counters.corroboration.clone();
@@ -13282,7 +13346,11 @@ impl Engine {
         if !candidate_identity_is_complete(&candidate_plan, &modules, &pinned) {
             bail!("live candidate retained an active module or slot without exact pinned identity");
         }
-        record_object_skips(&mut candidate_plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut candidate_plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
         let views = modules.iter().map(|module| module.scanned.view).collect();
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
@@ -15170,7 +15238,11 @@ impl Engine {
                 .withdraw_unlinked_additions(self.plan.slots.len());
         }
         let withdrew = candidate.plan.slots.len() != slots_before_withdraw;
-        record_object_skips(&mut candidate.plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut candidate.plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
         let plan_reproduced = candidate.plan == self.plan;
         outcome.changed |= !plan_reproduced;
         // Publication-deferral leg 2: this commit reproduces every merge
@@ -18899,7 +18971,11 @@ impl Engine {
         self.settle_all_pending_loader_scans(
             "a deferred loader memory scan was unresolved at capture cancellation or shutdown",
         );
-        record_object_skips(&mut self.plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut self.plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
         let pending_views = self.pending_leader_exit_views.clone();
         finalize_pending_leader_exit_views(
             &mut self.pending_leader_exit_views,
@@ -21886,7 +21962,11 @@ impl Engine {
             self.mark_partial("offline interface selection", &reason);
         }
         let mut plan = self.plan.clone();
-        record_object_skips(&mut plan, &self.counters.object_skips);
+        record_object_skips(
+            &mut plan,
+            &self.counters.object_skips,
+            &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+        );
         let manifest_inventory_slots = plan
             .slots
             .iter()
@@ -29928,7 +30008,11 @@ impl Engine {
                 return Err(error);
             }
             cleanup?;
-            record_object_skips(&mut self.plan, &self.counters.object_skips);
+            record_object_skips(
+                &mut self.plan,
+                &self.counters.object_skips,
+                &mut self.capture_facts.visible_history_mut().scan_gap_tombstones,
+            );
             self.publish_current_capture_facts()?;
             Ok(session)
         })();

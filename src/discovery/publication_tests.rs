@@ -3369,12 +3369,14 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         entry_objects: vec![vec![object; per_table as usize]; 4],
     };
     let mut selected_counters = DiscoveryCounters::default();
+    let mut tombstones = BTreeSet::new();
     let selected = build_current_plan(
         std::slice::from_ref(&module),
         &[],
         &[],
         &PinnedObjects::empty(),
         &mut selected_counters,
+        &mut tombstones,
         &BTreeSet::new(),
         0,
         0,
@@ -3396,6 +3398,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         &[],
         &PinnedObjects::empty(),
         &mut broad_counters,
+        &mut tombstones,
         &BTreeSet::new(),
         0,
         0,
@@ -3459,6 +3462,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
         &[],
         &PinnedObjects::empty(),
         &mut mixed_counters,
+        &mut tombstones,
         &BTreeSet::new(),
         0,
         0,

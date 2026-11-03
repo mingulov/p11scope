@@ -81,7 +81,14 @@ fn lifecycle_tier_gap_uses_existing_public_discovery_evidence() {
     session.lifecycle_tracking_unavailable =
         Some("live lifecycle tracking unavailable: tracefs not found");
     engine.record_session_lifecycle_tracking(&session);
-    record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+    record_object_skips(
+        &mut engine.plan,
+        &engine.counters.object_skips,
+        &mut engine
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
+    );
     engine.publish_current_capture_facts().unwrap();
 
     assert_eq!(engine.plan.skipped.len(), 1);
@@ -2110,13 +2117,15 @@ fn shared_scope_capture_starts_when_every_module_is_refused() {
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
-    let build = |scope| {
+    let mut tombstones = BTreeSet::new();
+    let mut build = |scope| {
         build_current_plan(
             &modules,
             &[],
             &[],
             &pins,
             &mut DiscoveryCounters::default(),
+            &mut tombstones,
             &BTreeSet::new(),
             0,
             0,
@@ -2175,6 +2184,10 @@ fn capture_facts_keep_a_manifest_only_capacity_refusal() {
         &[],
         &engine.pinned,
         &mut counters,
+        &mut engine
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
         &BTreeSet::new(),
         0,
         0,
@@ -7843,20 +7856,90 @@ fn an_empty_scan_pass_is_not_a_loss_once_the_capture_attaches_that_table() {
     let attached = empty_scan("/opt/p11.so");
     let never_attached = empty_scan("/opt/other.so");
 
-    record_object_skips(&mut plan, &[attached.clone(), never_attached.clone()]);
+    let mut tombstones = BTreeSet::new();
+    record_object_skips(
+        &mut plan,
+        &[attached.clone(), never_attached.clone()],
+        &mut tombstones,
+    );
     assert_eq!(
         plan.skipped,
         vec![never_attached.clone()],
         "a module this capture attached a table in has no empty scan to show; \
              one it never attached still does"
     );
+    assert!(
+        tombstones.contains(&scan_gap_key(&attached))
+            && !tombstones.contains(&scan_gap_key(&never_attached)),
+        "only the contradicted gap is tombstoned: {tombstones:?}"
+    );
 
     // …and the plan's skip list is only rebuilt when its sources are, so a
     // record an earlier batch made while the module was still empty has to
     // be re-judged, not just kept out.
     plan.skipped = vec![attached, never_attached.clone()];
-    record_object_skips(&mut plan, &[]);
+    record_object_skips(&mut plan, &[], &mut tombstones);
     assert_eq!(plan.skipped, vec![never_attached]);
+
+    // …and the suppression outlives the retirement that empties the terminal
+    // plan: a terminal record of the gap the counters still carry must not
+    // resurrect it.
+    plan.modules.clear();
+    plan.slots.clear();
+    record_object_skips(&mut plan, &[empty_scan("/opt/p11.so")], &mut tombstones);
+    assert_eq!(
+        plan.skipped,
+        vec![empty_scan("/opt/other.so")],
+        "a retired attached table keeps its gap suppressed"
+    );
+}
+
+/// M4 twin (proxy-lane flake): an early empty scan gap for a module the
+/// capture later attached in full retires at publish time. When the
+/// process ends and retirement empties the terminal plan, the terminal
+/// settle must not resurrect the gap: once fully attached, always
+/// suppressed. Reproduced live: 1 run in 10 published `function table
+/// unavailable in file-backed data` beside the fully attached module.
+#[test]
+fn terminal_settle_does_not_resurrect_a_retired_scan_gap() {
+    let (mut engine, module, _, _) = engine_with_overlay(77);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    // The overlay module carries one scanned table with one entry: the
+    // capture attached this module in full, the gap's contradiction.
+    assert!(
+        engine
+            .plan
+            .modules
+            .iter()
+            .any(|module| module.tables.iter().any(|table| table.entries > 0)),
+        "the overlay plan attaches a nonempty table: {:?}",
+        engine.plan.modules
+    );
+    let gap = Skipped {
+        subject: module.path.clone(),
+        reason: crate::discovery::scan::no_table_found_reason(&module.path, false),
+    };
+    engine.counters.object_skips = vec![gap.clone()];
+    // Attached at publish time: the gap retires.
+    engine.publish_current_capture_facts().unwrap();
+    assert!(
+        !engine.plan.skipped.contains(&gap),
+        "publish retires the gap for the attached module: {:?}",
+        engine.plan.skipped
+    );
+    // The process ends; retirement empties the terminal plan.
+    engine.plan.modules.clear();
+    engine.plan.slots.clear();
+    // The terminal settle must not resurrect the retired gap.
+    engine.settle_terminal_drain();
+    assert!(
+        !engine.plan.skipped.contains(&gap),
+        "terminal settle keeps the retired gap suppressed: {:?}",
+        engine.plan.skipped
+    );
 }
 
 /// A cgroup whose `cgroup.procs` names one process that no longer exists —
@@ -31888,12 +31971,14 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
     let first = module(ProcessViewId(0), PinnedObjectId(100), "/first.so", 0x10);
     let second = module(ProcessViewId(0), PinnedObjectId(200), "/second.so", 0x20);
     let mut counters = DiscoveryCounters::default();
+    let mut tombstones = BTreeSet::new();
     let plan = build_current_plan(
         &[first, second],
         &[],
         &[],
         &PinnedObjects::empty(),
         &mut counters,
+        &mut tombstones,
         // The exact final object, not its equal-key peer, owns the outcome.
         &[PinnedObjectId(200)].into_iter().collect(),
         0,
@@ -32698,8 +32783,9 @@ fn p2_retained_scan_error_keeps_counters_and_survives_attachment() {
             },
             exports_agreeing: (source != "manifest").then_some(0),
         });
-        record_object_skips(&mut plan, std::slice::from_ref(&refusal));
-        record_object_skips(&mut plan, &[]);
+        let mut tombstones = BTreeSet::new();
+        record_object_skips(&mut plan, std::slice::from_ref(&refusal), &mut tombstones);
+        record_object_skips(&mut plan, &[], &mut tombstones);
         assert_eq!(
             plan.skipped.as_slice(),
             std::slice::from_ref(&refusal),
@@ -32750,7 +32836,8 @@ fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
         plan.skipped
     );
 
-    record_object_skips(&mut plan, &skips);
+    let mut tombstones = BTreeSet::new();
+    record_object_skips(&mut plan, &skips, &mut tombstones);
     assert_eq!(
         plan.skipped, skips,
         "the actual skip is transferred exactly"
@@ -32770,7 +32857,7 @@ fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
         .chain([other.clone()])
         .collect();
     let mut plan = plan::build_from_reconciled_modules(&reconciled);
-    record_object_skips(&mut plan, &mixed);
+    record_object_skips(&mut plan, &mixed, &mut tombstones);
     // Canonical (subject, reason) order matches the merge's losses-map
     // order, so a commit reproduces its predecessor instead of
     // flip-flopping against projection; the dedupe still collapses the
@@ -46600,7 +46687,14 @@ fn automatic_exec_named_pid_end_receipt_refuses_foreign_stale_or_stopped_detach(
                 .is_empty()
         );
         engine.sync_physical_gap(&session);
-        record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+        record_object_skips(
+            &mut engine.plan,
+            &engine.counters.object_skips,
+            &mut engine
+                .capture_facts
+                .visible_history_mut()
+                .scan_gap_tombstones,
+        );
         assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
     }
 }
@@ -46650,7 +46744,14 @@ fn automatic_exec_named_pid_end_receipt_refuses_replacement_endpoint_selection()
     assert_eq!(session.physical_gap_summary().episodes, 1);
     assert!(session.physical_gap_summary().open);
     engine.sync_physical_gap(&session);
-    record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+    record_object_skips(
+        &mut engine.plan,
+        &engine.counters.object_skips,
+        &mut engine
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
+    );
     assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
 }
 
@@ -47254,7 +47355,14 @@ fn automatic_exec_physical_gap_public_terminal_only_cannot_publish_recovered_his
             .is_empty()
     );
     engine.sync_physical_gap(&session);
-    record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+    record_object_skips(
+        &mut engine.plan,
+        &engine.counters.object_skips,
+        &mut engine
+            .capture_facts
+            .visible_history_mut()
+            .scan_gap_tombstones,
+    );
     assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
 }
 
@@ -50925,7 +51033,14 @@ fn global_retirement_unknown_without_count_remains_concrete_partial_in_public_ou
             open,
             unknown,
         });
-        record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+        record_object_skips(
+            &mut engine.plan,
+            &engine.counters.object_skips,
+            &mut engine
+                .capture_facts
+                .visible_history_mut()
+                .scan_gap_tombstones,
+        );
         assert_eq!(engine.capture_facts().attach_gap_ms(), None);
         assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
     }

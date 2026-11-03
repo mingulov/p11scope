@@ -54,6 +54,50 @@ mod corrective_tests {
     use super::*;
     use crate::plan::{AttachPlan, Slot};
 
+    /// Unassigned NSS vendor gap, the codebase's unknown-vendor
+    /// sentinel (see `vendor_mechanisms::unassigned_vendor_ids_stay_withheld`).
+    const UNREGISTERED_SENTINEL: u64 = 0xCE53_43A9;
+
+    /// Wire value of the `MECHANISM_UNREGISTERED` capture bit. Spelled
+    /// literally until the named constant lands with the implementation.
+    const UNREGISTERED_BIT: u32 = 1u32 << 7;
+
+    #[test]
+    fn unregistered_mechanism_id_is_listed_with_its_call_count() {
+        // The per-mechanism stats path aggregates by verbatim id; an
+        // id the BPF return path publishes with the unregistered bit
+        // lands on a row with its call count, like any other value.
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::new(&p);
+        let mut first = mechanism(&p, "C_SignInit", 7, UNREGISTERED_SENTINEL, 0);
+        first.capture |= UNREGISTERED_BIT;
+        let mut second = first.clone();
+        second.duration_ns = 200;
+        state.observe(&first);
+        state.observe(&second);
+
+        assert_eq!(state.mechanisms().len(), 1);
+        let stat = &state.mechanisms()[&UNREGISTERED_SENTINEL];
+        assert_eq!(stat.calls, 2);
+        assert_eq!(stat.errors, 0);
+    }
+
+    #[test]
+    fn unregistered_mechanism_refused_by_state_budget_counts_a_disclosed_drop() {
+        // The mechanisms map shares the capture's monotonic key budget:
+        // a refused unregistered id never appears, and the refusal is
+        // counted in `semantic_state_drops` (rendered as semantic state
+        // gaps, forcing PARTIAL), never silently dropped.
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::with_limit(&p, 0);
+        let mut init = mechanism(&p, "C_SignInit", 7, UNREGISTERED_SENTINEL, 0);
+        init.capture |= UNREGISTERED_BIT;
+        state.observe(&init);
+
+        assert!(state.mechanisms().is_empty());
+        assert!(state.semantic_evidence().semantic_state_drops > 0);
+    }
+
     #[test]
     fn history_loss_saturates_and_capacity_open_remains_observed() {
         let p = plan(&["C_OpenSession"]);

@@ -4004,6 +4004,26 @@ mod safe_capture {
             capture::MECHANISM_VALUE
         );
     }
+
+    #[test]
+    fn mechanism_unregistered_bit_sits_outside_every_capture_state() {
+        // The unregistered flag is orthogonal to the mechanism/output
+        // state enums: every existing masked comparison keeps working
+        // with the bit set.
+        assert_eq!(
+            capture::MECHANISM_UNREGISTERED
+                & (capture::MECHANISM_MASK
+                    | capture::OUTPUT_MASK
+                    | capture::ARG_READ_FAILURE
+                    | capture::ASYNC_SESSION
+                    | capture::ASYNC_VALUE_UNREADABLE),
+            0
+        );
+        assert_eq!(
+            (capture::MECHANISM_VALUE | capture::MECHANISM_UNREGISTERED) & capture::MECHANISM_MASK,
+            capture::MECHANISM_VALUE
+        );
+    }
 }
 
 #[cfg(test)]

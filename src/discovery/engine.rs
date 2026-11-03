@@ -12938,8 +12938,14 @@ impl Engine {
         pinned: &PinnedObjects,
         loader: PinnedObjectId,
     ) -> bool {
+        // The merge renders pre-arm watches, but watch transitions
+        // re-render discovery directly without dirtying the facts
+        // revision — so a proved commit could defer and leave the stored
+        // history watch stale. Deny the proof while any watch exists:
+        // pre-arm captures merge per commit, exactly as before deferral.
         self.capture_facts.staged.is_none()
             && self.facts_revision == self.published_facts_revision
+            && self.prearm.is_empty()
             && self.inventory.is_none()
             && self.manifests.is_empty()
             && self.manifest_ordinals.is_empty()

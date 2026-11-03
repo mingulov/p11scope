@@ -936,6 +936,57 @@ class SoakOracleTest(unittest.TestCase):
         self.assert_red_only(verdict, "resource_accounting")
         self.assertIn("256 MiB", verdict["gates"]["resource_accounting"]["detail"])
 
+    def test_red_resources_pre_go_pidfd_leak_fails(self):
+        """Pre-GO pidfd growth is judged against its own bound.
+
+        A 0 to 2400 pidfd rise during arming fails even though total
+        FDs stay flat (other classes release as pidfds pin) and the
+        post-arming floor is flat: the detail must name pidfds and the
+        pre-arming window.
+        """
+        base = make_green(self.base / "prego-pid-base", horizon=120)
+        rows = []
+        for n in range(190):
+            pidfd = n * 2400 // 29 if n < 30 else 2400
+            rows.append((n * 1000, 52_000 + (n % 5), 54_000,
+                         2500, pidfd, 4))
+
+        def leak(target):
+            (target / "resources.tsv").write_text(
+                _resources6(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 30000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-prego-pid", leak))
+        self.assert_red_only(verdict, "resource_accounting")
+        detail = verdict["gates"]["resource_accounting"]["detail"]
+        self.assertIn("pidfds", detail)
+        self.assertIn("pre-arming", detail)
+
+    def test_red_resources_pre_go_bpf_leak_fails(self):
+        """Pre-GO BPF-FD growth is judged against its own bound.
+
+        A 0 to 600 BPF-FD rise during arming fails even though total
+        FDs stay flat and the post-arming floor is flat: the detail
+        must name BPF and the pre-arming window.
+        """
+        base = make_green(self.base / "prego-bpf-base", horizon=120)
+        rows = []
+        for n in range(190):
+            bpf = n * 600 // 29 if n < 30 else 600
+            rows.append((n * 1000, 52_000 + (n % 5), 54_000,
+                         700, 10, bpf))
+
+        def leak(target):
+            (target / "resources.tsv").write_text(
+                _resources6(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 30000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-prego-bpf", leak))
+        self.assert_red_only(verdict, "resource_accounting")
+        detail = verdict["gates"]["resource_accounting"]["detail"]
+        self.assertIn("BPF", detail)
+        self.assertIn("pre-arming", detail)
+
     def test_green_resources_late_go_fallback_names_short_post_window(self):
         """A GO with fewer than eight post samples falls back, and says so."""
         base = make_green(self.base / "f5-base", horizon=120)

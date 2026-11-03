@@ -33,7 +33,10 @@ appends one entry per forwarded call to a spy log. This oracle checks:
 Counts, tool exit, report schema, the p11-kit skip text and the
 metrics skip rule are strict: any violation fails the cell. Only the
 pause outcome and the observation-cause set are pinnable, and then only
-to exactly the pinned values.
+to exactly the pinned values. A pin may list `alternates`: further
+accepted (cause set, pause) shapes for cells whose outcome flaps with
+identical exact counts; the actual shape must equal the primary or one
+alternate jointly, and any third shape fails.
 """
 
 import argparse
@@ -237,21 +240,23 @@ def select_pin(expects, cell, os_id, tool_version):
                        % (cell, os_id, tool_version))
 
 
-def check_pin_shape(pin, cell):
-    causes = pin.get("observation")
-    if not isinstance(causes, list):
+def check_causes_shape(rows, cell):
+    if not isinstance(rows, list):
         raise HarnessError("pin lacks an observation list for cell: " + cell)
-    for row in causes:
+    for row in rows:
         if not isinstance(row, dict):
             raise HarnessError("invalid pinned cause for cell: " + cell)
         for key in ("cause", "reason", "owner"):
             value = row.get(key)
             if not isinstance(value, str) or not value.strip():
                 raise HarnessError("pinned cause lacks %s for cell: %s" % (key, cell))
-    names = [row["cause"] for row in causes]
+    names = [row["cause"] for row in rows]
     if len(set(names)) != len(names):
         raise HarnessError("pinned cause duplicated for cell: " + cell)
-    pause = pin.get("pause")
+    return set(names)
+
+
+def check_pause_shape(pause, cell):
     if not isinstance(pause, dict):
         raise HarnessError("pin lacks a pause expectation for cell: " + cell)
     if pause.get("status") not in ("sigstop", "partial"):
@@ -260,6 +265,12 @@ def check_pin_shape(pin, cell):
         value = pause.get(key)
         if not isinstance(value, str) or not value.strip():
             raise HarnessError("pinned pause lacks %s for cell: %s" % (key, cell))
+    return pause
+
+
+def check_pin_shape(pin, cell):
+    causes = check_causes_shape(pin.get("observation"), cell)
+    pause = check_pause_shape(pin.get("pause"), cell)
     if "provisional" in pin and type(pin["provisional"]) is not bool:
         raise HarnessError("pin carries a non-boolean provisional marker for cell: " + cell)
     skip = pin.get("p11kit_skip")
@@ -271,7 +282,20 @@ def check_pin_shape(pin, cell):
             raise HarnessError("pin carries a p11-kit version without a skip for cell: " + cell)
     elif not isinstance(version, str) or not version.strip():
         raise HarnessError("pin names a p11-kit skip without its version for cell: " + cell)
-    return {row["cause"] for row in causes}, pause, skip, version
+    alternates = []
+    if "alternates" in pin:
+        raw = pin["alternates"]
+        if not isinstance(raw, list):
+            raise HarnessError("pin carries a non-list alternates for cell: " + cell)
+        for alt in raw:
+            if not isinstance(alt, dict):
+                raise HarnessError("invalid alternate shape for cell: " + cell)
+            alternates.append((check_causes_shape(alt.get("observation"), cell),
+                               check_pause_shape(alt.get("pause"), cell)["status"]))
+    shapes = [(causes, pause["status"])] + alternates
+    if len({(frozenset(names), status) for names, status in shapes}) != len(shapes):
+        raise HarnessError("pin carries a duplicated shape for cell: " + cell)
+    return causes, pause, skip, version, alternates
 
 
 def judge(report_text, spy_text, receipt, expects, cell):
@@ -294,7 +318,8 @@ def judge(report_text, spy_text, receipt, expects, cell):
     provider = identity(receipt["provider_before"])
 
     pin = select_pin(expects, cell, os_id, tool_version)
-    pinned_causes, pinned_pause, pinned_skip, pinned_p11kit = check_pin_shape(pin, cell)
+    pinned_causes, pinned_pause, pinned_skip, pinned_p11kit, alternates = \
+        check_pin_shape(pin, cell)
 
     loaded, spy_counts, processes = parse_spy_log(spy_text)
     require(loaded == spied_path,
@@ -369,14 +394,18 @@ def judge(report_text, spy_text, receipt, expects, cell):
             "invalid observation causes")
     fixed = sorted(pinned_causes - set(actual_causes))
     new = sorted(set(actual_causes) - pinned_causes)
-    require(not fixed and not new,
-            "observation causes differ from pin (fixed: %s; new: %s)"
-            % (",".join(fixed) or "none", ",".join(new) or "none"))
 
     pause = evidence.get("pause")
     require(pause in ("none", "sigstop", "partial"), "missing pause outcome")
-    require(pause == pinned_pause["status"],
-            "pause is %s, pinned %s" % (pause, pinned_pause["status"]))
+    # The actual (cause set, pause) shape must equal the primary or one
+    # alternate jointly; a mix of two shapes, or any third shape, fails
+    # with the primary-relative diagnostic below.
+    if (set(actual_causes), pause) not in [(pinned_causes, pinned_pause["status"])] + alternates:
+        require(not fixed and not new,
+                "observation causes differ from pin (fixed: %s; new: %s)"
+                % (",".join(fixed) or "none", ",".join(new) or "none"))
+        require(pause == pinned_pause["status"],
+                "pause is %s, pinned %s" % (pause, pinned_pause["status"]))
 
     pairs = skipped_counts(evidence)
     p11kit = sorted(count for name, count in pairs

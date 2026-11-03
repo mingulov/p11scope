@@ -111,6 +111,14 @@ Each cell lists one entry per `(os-release ID, tool package version)`:
   carry `"provisional": true` until a quiet host confirms them; the
   ratchet still applies in full, and the marker never changes a
   verdict. The oracle ignores any other unknown pin fields.
+- `alternates`: optional list of further accepted shapes, each with its
+  own `observation` and `pause` (same reason+owner rules, no duplicate
+  causes, and no shape duplicated). For cells whose outcome flaps
+  between exact-count shapes, one entry pins every observed shape; the
+  actual (cause set, pause) pair must equal the primary or one
+  alternate jointly, so a mix of two shapes or any third shape fails.
+  Alternates share the entry's `p11kit_skip`; each alternate names the
+  lane that owns the flap.
 
 Counts, tool exit, report schema and the metrics skip rule are
 strict and never pinned: a metrics twin must skip nothing except,

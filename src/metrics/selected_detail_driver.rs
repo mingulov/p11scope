@@ -1368,7 +1368,7 @@ fn k0_broad_read(
 }
 
 /// K0-comparable discovery losses: the live total minus the
-/// exit-ended loader-scan truncations, which prove their process
+/// exit-ended loader scans and rejects, which prove their process
 /// exited and are not discovery loss. Production snapshots both ends
 /// of the window through this (contract §5 step 1 voids on growth of
 /// real loss only), so a short `run` child that exits before its

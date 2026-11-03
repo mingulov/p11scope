@@ -17492,11 +17492,19 @@ fn missing_mapping_reject_counts_exit_only_when_proven_exited() {
         .borrow_mut()
         .extend([PinProbeAnswer::Exited(Ok(true))]);
 
+    assert!(
+        !engine.timings.invalidated,
+        "causal timing starts proven for the reject"
+    );
     let before = engine.capture_facts().discovery_losses()[3];
     let before_exit = engine.capture_facts().exit_ended_truncations();
     let before_failures = engine.loader_registry.context_failures();
     apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
 
+    assert!(
+        engine.timings.invalidated,
+        "the exit-only reject keeps its live loss"
+    );
     assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
     assert_eq!(
         engine.capture_facts().exit_ended_truncations(),
@@ -17567,11 +17575,19 @@ fn no_retained_view_reject_counts_exit_only_for_ended_origin() {
     let mut late = loader_record_for(context, pid);
     late.hook_ts_ns = admitted_ns;
     late.announced_count = 0;
+    assert!(
+        !engine.timings.invalidated,
+        "causal timing starts proven for the reject"
+    );
     let before = engine.capture_facts().discovery_losses()[3];
     let before_exit = engine.capture_facts().exit_ended_truncations();
     let before_failures = engine.loader_registry.context_failures();
     apply_ordinary_batch(&mut engine, &mut session, vec![late]).unwrap();
 
+    assert!(
+        engine.timings.invalidated,
+        "the exit-only reject keeps its live loss"
+    );
     assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
     assert_eq!(
         engine.capture_facts().exit_ended_truncations(),
@@ -17637,6 +17653,45 @@ fn no_retained_view_reject_stays_loss_when_hook_predates_admission() {
 
     assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
     assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+}
+
+/// R-1 scope gate: outside `Scope::Pid` no ended origin is recorded,
+/// even with exit proof — a later process reusing the pid with a
+/// later hook time would still match the ledger's own test, and only
+/// Pid scope binds the hooks to the process. Nothing reads the count
+/// there (K0 refuses those scopes by name), so late records stay loss.
+#[test]
+fn ended_loader_origins_record_only_in_pid_scope() {
+    let (mut fixture, mut engine, _context, _record, _session) = armed_seed_route(1);
+    engine.scope = Scope::System;
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let view = engine.views.remove(0);
+    engine.note_ended_loader_origin(&view);
+    assert!(
+        engine.ended_loader_origins.is_empty(),
+        "system scope records no ended origin"
+    );
+    assert!(
+        !engine.late_loader_record_ended(view.pid(), view.admitted_ns()),
+        "no origin, no exit-only binding"
+    );
+}
+
+/// R-1 ledger source pin: both production ExpectedRemoval removal
+/// sites retain the removed view's ended origin. The twins drive the
+/// helper by hand, so deleting a call site would fail closed without
+/// failing them — this pin keeps the wiring.
+#[test]
+fn ended_loader_origin_production_calls_stay_wired() {
+    let source = include_str!("engine.rs");
+    assert_eq!(
+        source
+            .matches("self.note_ended_loader_origin(&owner);")
+            .count(),
+        2,
+        "both ExpectedRemoval removal sites retain the ended origin"
+    );
 }
 
 /// R-1 no-retained-view negative: a different pid than any recorded

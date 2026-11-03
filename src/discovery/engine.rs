@@ -611,14 +611,13 @@ pub struct Engine {
     /// Batch-tail publications skipped as provably redundant (same proof).
     tail_skips: u64,
     discovery_truncated: u64,
-    /// Loader-scan truncations settled at a proven process exit (a
-    /// subset of `discovery_truncated`): the scan's process ended
-    /// before the scan resolved. K0's truncation-growth rule
-    /// subtracts this from the total, so a short child that exits
-    /// before its provider load is processed leaves no voiding
-    /// growth. In cgroup and system scopes a scope departure settles
-    /// here too, but K0 refuses those scopes by name, so no consumer
-    /// reads it there.
+    /// Loader scans and loader rejects settled at a proven process
+    /// exit (a subset of `discovery_truncated`). K0's
+    /// truncation-growth rule subtracts this from the total, so a
+    /// short child that exits before its provider load is processed
+    /// leaves no voiding growth. In cgroup and system scopes a scope
+    /// departure settles here too, but K0 refuses those scopes by
+    /// name, so no consumer reads it there.
     exit_ended_truncations: u64,
     pending_rejected_keys: BTreeSet<ObjectKey>,
     pending_retirements: BTreeSet<ProcessViewId>,
@@ -627,13 +626,17 @@ pub struct Engine {
     // Original custody and exact Session endpoint proof survive only the
     // existing bounded conservative retirement/replay transaction.
     ended_pid_retirement: Option<PendingEndedPidRetirement>,
-    /// Recently ended loader origins for late-record binding (R-1): on
-    /// ExpectedRemoval the view's pid, admission time and pin are
-    /// retained (bounded FIFO). A loader record with no retained view
-    /// counts exit-only only when it matches one of these by pid and
-    /// `hook_ts_ns >= admitted_ns` with the pin still proving exit.
-    /// Never pid alone (reuse). Populated at view removal; the pin
-    /// holds the original task, so a reused number cannot match.
+    /// Recently ended loader origins for late-record binding (R-1):
+    /// recorded only in `Scope::Pid`, on ExpectedRemoval, as the
+    /// view's pid, admission time and pin (bounded FIFO). A loader
+    /// record with no retained view counts exit-only only when it
+    /// matches one by pid and `hook_ts_ns >= admitted_ns` with the
+    /// pin still proving exit. That test rejects stale records from
+    /// an older process; safety against a later process reusing the
+    /// pid comes from the hooks being bound to the process in Pid
+    /// scope (kernel pid filter or per-task links). Other scopes
+    /// record nothing: K0 refuses them by name, so no consumer reads
+    /// the count there.
     ended_loader_origins: VecDeque<EndedLoaderOrigin>,
     expected_target_exit_pending: Option<ProcessViewId>,
     expected_target_exit: bool,
@@ -19530,10 +19533,14 @@ impl Engine {
     }
 
     /// Retains one ended loader origin (R-1): called with a view being
-    /// removed as ExpectedRemoval. Only a pin that still proves exit is
-    /// recorded; anything else stays unrecorded (fail-closed). Bounded
-    /// FIFO: an evicted origin's late records stay real losses.
+    /// removed as ExpectedRemoval. Only in `Scope::Pid`, and only when
+    /// the pin still proves exit; anything else stays unrecorded
+    /// (fail-closed). Bounded FIFO: an evicted origin's late records
+    /// stay real losses.
     fn note_ended_loader_origin(&mut self, view: &ProcessView) {
+        if !matches!(self.scope, Scope::Pid(_)) {
+            return;
+        }
         if view.original_exited() != Ok(true) {
             return;
         }

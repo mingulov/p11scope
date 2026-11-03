@@ -617,7 +617,6 @@ impl ProcessView {
     /// the view's own bounded custody (one view per retained owner, paid
     /// by the view's opening budget); there is no fresh budget and no
     /// long-lived observation cache.
-    #[cfg_attr(not(test), allow(dead_code))] // Packet 2 preparation consumes this.
     pub(crate) fn retained_pin_arc(&self) -> &Arc<PidPin> {
         &self.pin
     }

@@ -316,12 +316,12 @@ pub struct CaptureFacts {
     pub(crate) discovery_state_failures: u64,
     pub(crate) discovery_read_failures: u64,
     pub(crate) discovery_truncated: u64,
-    /// The exit-ended subset of `discovery_truncated`: loader-scan
-    /// truncations whose process provably exited before the scan
-    /// resolved. Not a fifth loss lane — K0 subtracts it from the
-    /// total when it compares its window snapshots. In cgroup and
-    /// system scopes a scope departure settles here too, but K0
-    /// refuses those scopes by name, so no consumer reads it there.
+    /// The exit-ended subset of `discovery_truncated`: loader scans
+    /// and loader rejects settled at a proven process exit. Not a
+    /// fifth loss lane — K0 subtracts it from the total when it
+    /// compares its window snapshots. In cgroup and system scopes a
+    /// scope departure settles here too, but K0 refuses those scopes
+    /// by name, so no consumer reads it there.
     pub(crate) exit_ended_truncations: u64,
     pub(crate) task_uprobe_link_losses: u64,
 }
@@ -374,11 +374,11 @@ impl CaptureFacts {
         ]
     }
 
-    /// Loader-scan truncations settled at a proven process exit: the
-    /// exit-only subset of the truncation total. K0's window rule
-    /// compares the total minus this count. In cgroup and system
-    /// scopes a scope departure settles here too, but K0 refuses
-    /// those scopes by name, so no consumer reads it there.
+    /// Loader scans and loader rejects settled at a proven process
+    /// exit: the exit-only subset of the truncation total. K0's
+    /// window rule compares the total minus this count. In cgroup and
+    /// system scopes a scope departure settles here too, but K0
+    /// refuses those scopes by name, so no consumer reads it there.
     pub fn exit_ended_truncations(&self) -> u64 {
         self.exit_ended_truncations
     }

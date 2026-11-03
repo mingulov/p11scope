@@ -4761,6 +4761,9 @@ struct OwnedPiece {
     object: PinnedObjectId,
     key: ObjectKey,
     path: String,
+    // PA-7 scaffold: the stop-time copy drops the operator-named signal
+    // until this carries `piece.module_named`; the PA-7 twin fails on it.
+    module_named: bool,
     source: &'static str,
     tables: Vec<TableSummary>,
     interfaces: usize,
@@ -4776,6 +4779,7 @@ fn own_piece(piece: Discovered<'_>) -> OwnedPiece {
         object: piece.object,
         key: piece.key,
         path: piece.path.to_owned(),
+        module_named: false,
         source: piece.source,
         tables: piece.tables,
         interfaces: piece.interfaces,
@@ -13270,6 +13274,73 @@ mod tests {
                 partial.reason
             );
         }
+    }
+
+    /// PA-7 twin: the stop-time owned copy preserves the operator-named
+    /// signal, and a later rebuild over settled providers (the stop-time
+    /// rebuild shape: the first plan is carried, the closure arrives in
+    /// the rebuild input) admits the reserve-capped prefix for the
+    /// operator-named closure and still applies C1 published-only to the
+    /// unnamed one. Generic object identity only — no provider names,
+    /// offsets or symbols.
+    #[test]
+    fn stop_time_rebuild_applies_the_operator_named_exception() {
+        let provider = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let mut named = provider_with_tables(31, P11_KIT, 64, 103, false);
+        named.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let unnamed = provider_with_tables(31, P11_KIT, 64, 103, false);
+        // The stop-time owned copy keeps the scan-time signal.
+        assert!(
+            own_piece(lower_scanned(&named)).module_named,
+            "the stop-time copy keeps the operator-named signal"
+        );
+        assert!(
+            !own_piece(lower_scanned(&unnamed)).module_named,
+            "an unnamed closure stays unnamed through the stop-time copy"
+        );
+        // Providers settled in the first plan; the closure arrives later.
+        let settled = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Named);
+        assert_eq!(slots_of(&settled, 33), 68, "the provider settles whole");
+        // Named: the reserve-capped prefix after the provider.
+        let rebuilt =
+            settled.rebuild_from_sources(&[provider.clone(), named], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&rebuilt, 33), 68, "the provider stays whole");
+        // 68 in use, reserve-capped ceiling 384: 3 tables (309) fit.
+        assert_eq!(
+            slots_of(&rebuilt, 31),
+            3 * 103,
+            "the named closure takes its prefix in the later rebuild"
+        );
+        let partial = refusal_of(&rebuilt, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("3 of 64 template tables attached"),
+            "{}",
+            partial.reason
+        );
+        // Unnamed: C1 published-only, never the prefix.
+        let mut lone = provider_with_tables(31, P11_KIT, 65, 68, false);
+        lone.scanned.tables[64].live_return = true;
+        assert!(
+            !own_piece(lower_scanned(&lone)).module_named,
+            "the C1 closure stays unnamed through the stop-time copy"
+        );
+        let settled = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Named);
+        let rebuilt =
+            settled.rebuild_from_sources(&[provider, lone], &[], &PinnedObjects::empty());
+        assert_eq!(
+            slots_of(&rebuilt, 31),
+            68,
+            "only the published table attaches, no heuristic prefix"
+        );
+        assert!(
+            refusal_of(&rebuilt, P11_KIT).is_none(),
+            "published-only admission carries no prefix record: {:?}",
+            rebuilt.modules_skipped
+        );
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 64,
+            "the 64 heuristic templates spill as evidence"
+        );
     }
 
     /// PA-5 I4 twin (reviewer's panic probe): an empty-target leading table

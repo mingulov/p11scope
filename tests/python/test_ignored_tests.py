@@ -557,7 +557,7 @@ class IgnoredTestsTests(unittest.TestCase):
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
         full = set().union(*(lists[group] for group in
                             ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
-                             "LONG_TESTS", "BTRFS_TESTS", "MARKER_TESTS",
+                             "LONG_TESTS", "BTRFS_TESTS",
                              "EXPECTED_FAILURE_TESTS", "SKIP_TESTS")))
         unknown = prefix + "unknown_cell"
         renamed = prefix + "verifier_stats_renamed"

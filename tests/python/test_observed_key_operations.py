@@ -847,9 +847,9 @@ def unknown_row(category, reason, completed=0, failed=0):
 
 
 def unlabeled_private_doc():
-    """The product's populated shape for that ledger: the private key keeps no
-    label, its signs land under metadata_unknown, and the key-pair generation
-    under not_applicable (generation binds no key)."""
+    """The pre-inheritance product shape for that ledger: the private key keeps no
+    label and its signs land under metadata_unknown. Refused now: the pair
+    proves the size, so the product must label."""
     doc = observed("clean.json")
     doc["key_operations"] = [row for row in doc["key_operations"]
                              if row["category"] != "sign"]
@@ -866,6 +866,25 @@ def unlabeled_private_doc():
     return doc
 
 
+def inherited_private_doc():
+    """The product's populated shape for that ledger: the private key inherits
+    the pair's public 2048 (label rsa_2048, own modulus unknown), its signs
+    land in the labeled row, and the key-pair generation under not_applicable.
+    Both mates share one generate_pair birth: one successful return."""
+    doc = observed("clean.json")
+    private = next(row for row in doc["objects"] if row["object"] == 11)
+    public = next(row for row in doc["objects"] if row["object"] == 12)
+    private["label"] = "rsa_2048"
+    private["established"]["modulus_bits"] = {"status": "unknown", "value": None}
+    private["queries"]["modulus_bits"] = "unavailable"
+    private["birth"] = dict(public["birth"])
+    doc["unknown_key_operations"] = [
+        unknown_row("generate_key_pair", "not_applicable", completed=1),
+    ]
+    doc["budgets"]["unknown_rows"]["occupied"] = 1
+    return doc
+
+
 class LedgerDerivedMetadataTests(unittest.TestCase):
     """Expected key labels follow what the application itself established."""
 
@@ -874,13 +893,16 @@ class LedgerDerivedMetadataTests(unittest.TestCase):
             ORACLE.compare(rows, doc)
         self.assertIn(token, str(caught.exception))
 
-    def test_unestablished_private_size_qualifies_under_metadata_unknown(self):
-        result = ORACLE.compare(unsupported_private_size_rows(), unlabeled_private_doc())
+    def test_inherited_private_size_qualifies_labeled(self):
+        result = ORACLE.compare(unsupported_private_size_rows(), inherited_private_doc())
         self.assertTrue(result.get("match"))
         seen = result["observed"]
-        self.assertEqual(seen["sign"], {"completed": 10, "failed": 0,
-                                        "unknown_reason": "metadata_unknown"})
+        self.assertEqual(seen["sign"], {"started": 10, "completed": 10, "failed": 0})
         self.assertEqual(seen["verify"], {"started": 12, "completed": 10, "failed": 2})
+
+    def test_unlabeled_signs_refused_when_the_pair_proves_the_size(self):
+        self.assert_refused(unsupported_private_size_rows(), unlabeled_private_doc(),
+                            "unattributed sign outcomes under metadata_unknown")
 
     def test_keygen_not_applicable_row_matches_the_ledger(self):
         rows = APP_TESTS.application_rows()
@@ -910,49 +932,79 @@ class LedgerDerivedMetadataTests(unittest.TestCase):
                             "unattributed sign outcomes under metadata_unknown")
 
     def test_label_the_application_could_not_establish_is_refused(self):
+        # clean.json reports an established private modulus the ledger's
+        # application never established: fabrication, not inheritance.
         self.assert_refused(unsupported_private_size_rows(), observed("clean.json"),
-                            "under a key label the application could not establish")
+                            "does not prove pair inheritance")
 
-    def test_unlabeled_twins_are_refused(self):
+    def test_inherited_twins_are_refused(self):
         rows = unsupported_private_size_rows()
 
+        def sign_row(doc):
+            return next(row for row in doc["key_operations"]
+                        if row["category"] == "sign")
+
         def with_sign(**counts):
-            doc = unlabeled_private_doc()
-            doc["unknown_key_operations"][1] = unknown_row("sign", "metadata_unknown",
-                                                           **counts)
+            doc = inherited_private_doc()
+            for name, value in counts.items():
+                sign_row(doc)[name] = value
             return doc
 
         def private(doc):
             return next(row for row in doc["objects"] if row["object"] == 11)
 
+        def public(doc):
+            return next(row for row in doc["objects"] if row["object"] == 12)
+
         cases = []
-        cases.append(("short sign count", with_sign(completed=9), "!= expected"))
-        cases.append(("failed sign", with_sign(completed=9, failed=1), "!= expected"))
-        doc = unlabeled_private_doc()
-        doc["unknown_key_operations"].pop()
-        doc["budgets"]["unknown_rows"]["occupied"] = 1
-        cases.append(("missing bucket", doc, "missing from the metadata_unknown bucket"))
-        doc = unlabeled_private_doc()
+        cases.append(("short sign count", with_sign(started=9, completed=9),
+                      "!= expected"))
+        cases.append(("failed sign", with_sign(completed=9, failed=1),
+                      "!= expected"))
+        doc = inherited_private_doc()
+        doc["key_operations"] = [row for row in doc["key_operations"]
+                                 if row["category"] != "sign"]
+        doc["budgets"]["key_rows"]["occupied"] = len(doc["key_operations"])
+        cases.append(("missing labeled row", doc, "!= expected"))
+        cases.append(("unlabeled shape", unlabeled_private_doc(),
+                      "unattributed sign outcomes under metadata_unknown"))
+        doc = inherited_private_doc()
         private(doc)["successful_key_references"] = 9
         cases.append(("unproved key references", doc, "key references 9 != expected 10"))
-        doc = unlabeled_private_doc()
-        private(doc)["label"] = "rsa_2048"
+        doc = inherited_private_doc()
         private(doc)["established"]["modulus_bits"] = {"status": "value", "value": 2048}
         private(doc)["queries"]["modulus_bits"] = "established"
-        cases.append(("labeled key object", doc, "could not establish"))
-        doc = unlabeled_private_doc()
+        cases.append(("fabricated modulus", doc, "does not prove pair inheritance"))
+        doc = inherited_private_doc()
+        private(doc)["label"] = None
+        cases.append(("missing inherited label", doc, "does not prove pair inheritance"))
+        doc = inherited_private_doc()
         private(doc)["attribution"] = "downgraded"
         private(doc)["attribution_reason"] = "handle_reuse"
         cases.append(("downgraded key object", doc, "downgraded"))
-        doc = unlabeled_private_doc()
+        doc = inherited_private_doc()
         private(doc)["established"]["class"] = {"status": "value", "value": 2}
         cases.append(("no private key object", doc, "not unique"))
-        doc = unlabeled_private_doc()
+        doc = inherited_private_doc()
+        public(doc)["established"]["modulus_bits"] = {"status": "unknown",
+                                                      "value": None}
+        cases.append(("mate without size", doc, "no unique public mate"))
+        doc = inherited_private_doc()
+        public(doc)["attribution"] = "downgraded"
+        public(doc)["attribution_reason"] = "handle_reuse"
+        cases.append(("mate downgraded", doc, "no valid public mate"))
+        doc = inherited_private_doc()
+        private(doc)["birth"] = {"start_ns": 1, "end_ns": 2}
+        cases.append(("mates from different returns", doc, "no same-return public mate"))
+        doc = inherited_private_doc()
+        public(doc)["creation"] = "create"
+        cases.append(("mate not a pair product", doc, "no same-return public mate"))
+        doc = inherited_private_doc()
         doc["unknown_key_operations"].append(
             unknown_row("verify", "metadata_unknown", completed=1))
-        doc["budgets"]["unknown_rows"]["occupied"] = 3
+        doc["budgets"]["unknown_rows"]["occupied"] = 2
         cases.append(("verify unknown", doc, "unattributed verify"))
-        doc = unlabeled_private_doc()
+        doc = inherited_private_doc()
         doc["gaps"]["rows"] = [{"subject": "model", "reason": "output_unreadable",
                                 "repeats": 1}]
         cases.append(("gap still refused", doc, "observation gap model/output_unreadable"))

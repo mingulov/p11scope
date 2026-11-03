@@ -660,9 +660,12 @@ pub struct DiscoveryEvidence {
 }
 
 /// 6.14 Option A exit-time split of the novel unmatched-exit
-/// subpopulation: leaders that had a watched provider file mapped at
-/// exit (`mapped`) vs every other shape (`unknown`). Nominally `pub`
-/// for the `DiscoveryEvidence` carrier; only the two counts render.
+/// subpopulation: leaders for which the kernel recorded a localized
+/// mapping of a watched provider file at some point while watched
+/// (`mapped`; the cells persist across unmap and exec, so this never
+/// means the file was still mapped at the exit instant) vs every
+/// other shape (`unknown`). Nominally `pub` for the
+/// `DiscoveryEvidence` carrier; only the two counts render.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GapExitMappings {
     pub mapped: u64,

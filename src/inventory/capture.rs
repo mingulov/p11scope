@@ -147,17 +147,21 @@ impl LaneWindows {
         retirement_per_group_link: Duration::from_millis(100),
         retirement_per_group_endpoint: Duration::from_millis(10),
         retirement_cap: PRE_OUTPUT_RETIREMENT_WAIT,
-        // 8,192 records of 920 B: at most about 7.2 MiB of user memory
-        // (strict), over 4 s of a 1,000 execs/s host (two records per
-        // short-lived exec) behind one collection. This userspace bound
-        // is separate from the 2 MiB kernel lifecycle ring (~2,259
-        // records): the ring keeps what this bound cannot hold, and what
-        // it cannot hold is counted lost by the kernel.
-        held_records: 8192,
-        // 16,384 batch shells (each about a hundred bytes: two stamps,
-        // flags, and an empty record vector): at most about 1.7 MiB
+        // 32,768 records of 920 B: at most about 29 MiB of user memory
+        // (strict, allocated only as records arrive), over 16 s of a
+        // 1,000 execs/s host (two records per short-lived exec) behind
+        // one collection or the startup drain. Sized from a measured
+        // startup under heavy churn: about 28,400 records arrived before
+        // the first pass (8,192 held + 2,259 in the 2 MiB ring + 17,977
+        // lost); with the 8 MiB ring (~9,100 records) this keeps about
+        // 1.5x margin. This userspace bound is separate from the kernel
+        // lifecycle ring: the ring keeps what this bound cannot hold, and
+        // what it cannot hold is counted lost by the kernel.
+        held_records: 32_768,
+        // 65,536 batch shells (each about a hundred bytes: two stamps,
+        // flags, and an empty record vector): at most about 6.6 MiB
         // beside the record bound, however long the collection runs.
-        held_batches: 16_384,
+        held_batches: 65_536,
     };
 
     /// The stop's retirement budget for `load`.

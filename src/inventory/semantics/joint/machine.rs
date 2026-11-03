@@ -2846,9 +2846,18 @@ impl LiveJointMachine {
                 // The H0 leaf accepts at most MAX_PENDING ordinary records.
                 // Total wire capacity and actual ordinary/H0 room are
                 // independent. BEGIN-only prefixes may cross wire1024.
+                // While reservations outside this quantum share the
+                // ledger's table, a backlog closes at the table's room: its
+                // later records wait on the wire for the next quantum,
+                // never refused for want of a reservation.
+                let shared_full = original
+                    .raw
+                    .shared_intake_room(coordinator.joint_capture().ledger())
+                    == Some(0);
                 if !original.poll.backlog
                     || original.attempted >= RAW_CAPACITY
                     || original.raw.pending_h0_records() >= MAX_PENDING
+                    || shared_full
                 {
                     let failed = retain_on_refusal!(
                         Phase::Collecting(original),
@@ -2863,7 +2872,8 @@ impl LiveJointMachine {
                         && self.grant.is_none()
                         && !failed
                         && !requested
-                        && original.attempted < RAW_CAPACITY;
+                        && original.attempted < RAW_CAPACITY
+                        && !shared_full;
                     // Pre-grant extension on a linked lane: a quantum with
                     // an in-flight journaled START, or with only count-only
                     // setup calls among its H0 records, stays open for the
@@ -2896,7 +2906,8 @@ impl LiveJointMachine {
                         requested,
                         attempted: original.attempted,
                         pending_h0: original.raw.pending_h0_records(),
-                        begin_table_full_or_refused: original.raw.begin_table_full_or_refused(),
+                        begin_table_full_or_refused: original.raw.begin_table_full_or_refused()
+                            || shared_full,
                         hold_open: original.raw.has_open_affecting_start()
                             || original.raw.h0_records_all_count_only(lane.subset().plan()),
                         timed_out: pregrant_timed_out(),

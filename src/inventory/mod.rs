@@ -1390,7 +1390,7 @@ fn run_with_terminal_budget(
     let cgroup = matches!(scope, InventoryRunScope::Cgroup)
         .then(|| CgroupDriverState::new(deadline_for_duration(duration), operator_stop_source))
         .transpose()?;
-    let lane = match open_native_lane(
+    let mut lane = match open_native_lane(
         capture,
         attach_backend,
         engine_scope.clone(),
@@ -1436,12 +1436,14 @@ fn run_with_terminal_budget(
     let semantic = if manifests.is_empty() {
         None
     } else {
-        start_semantic_lane(
-            &mut coordinator,
-            &engine_scope,
-            attach_backend,
-            key_operations,
-        )
+        draining_lifecycle(lane.as_mut(), || {
+            start_semantic_lane(
+                &mut coordinator,
+                &engine_scope,
+                attach_backend,
+                key_operations,
+            )
+        })
     };
     // Interactive dashboard takes over stdout's terminal; a pipe
     // degrades honestly to snapshots/JSON below (never ANSI).
@@ -4973,6 +4975,44 @@ fn note_semantic_lane_sealed() {
     inventory_diagnostic(SEMANTIC_SEAL_LINE);
     #[cfg(test)]
     record_sealed_for_test(SEMANTIC_SEAL_LINE);
+}
+
+/// Run `start` (the semantic lane's seconds-long BPF load) while a worker
+/// keeps draining the native lane's lifecycle ring. The lifecycle
+/// producers are already live, and the ring is sized for non-draining
+/// spans of at most 350 ms. The worker only drains and holds, exactly as
+/// during a pass's collection: nothing reaches the coordinator until the
+/// first pass stages the held quanta in drain order, bounded by the same
+/// held-record and held-batch caps (past them the ring fills and its loss
+/// is counted as before).
+fn draining_lifecycle<T>(
+    lane: Option<&mut NativeLane<FacadeLane>>,
+    start: impl FnOnce() -> T,
+) -> T {
+    struct Done<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let Some(lane) = lane else {
+        return start();
+    };
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|threads| {
+        threads.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                lane.collecting_tick::<crate::process::PidPin>();
+                std::thread::sleep(SERVICE_TICK);
+            }
+            // One last quantum after the load: the first pass follows.
+            lane.collecting_tick::<crate::process::PidPin>();
+        });
+        // Released on return and on unwind, so the scope never waits on
+        // a drainer whose load panicked.
+        let _done = Done(&done);
+        start()
+    })
 }
 
 /// Optional lane startup: no manifests means no Detailed Session, maps,

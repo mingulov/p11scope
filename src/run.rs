@@ -5146,6 +5146,13 @@ pub(crate) fn resolve_ring_bytes(ring_bytes: Option<u32>) -> u32 {
     ring_bytes.unwrap_or(p11scope_ebpf_common::RING_BYTES)
 }
 
+/// A journal (Joint key-operations) capture loads the larger EVENTS ring
+/// unless `--ring-bytes` names a size; every other capture keeps
+/// [`resolve_ring_bytes`].
+pub(crate) fn resolve_journal_ring_bytes(ring_bytes: Option<u32>) -> u32 {
+    ring_bytes.unwrap_or(p11scope_ebpf_common::JOINT_RING_BYTES)
+}
+
 struct CaptureConsumers<'state> {
     state: &'state mut semantics::State,
     tracker: &'state mut process::Tracker,
@@ -19306,6 +19313,11 @@ mod tests {
     fn ring_bytes_default_is_the_bpf_constant() {
         assert_eq!(resolve_ring_bytes(None), p11scope_ebpf_common::RING_BYTES);
         assert_eq!(resolve_ring_bytes(Some(1 << 20)), 1 << 20);
+        assert_eq!(
+            resolve_journal_ring_bytes(None),
+            p11scope_ebpf_common::JOINT_RING_BYTES
+        );
+        assert_eq!(resolve_journal_ring_bytes(Some(1 << 20)), 1 << 20);
     }
 
     /// DR-CLASSIC-PID0: an `auto` fallback is disclosed on stderr before the

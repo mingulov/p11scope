@@ -543,9 +543,12 @@ fn joint_unlinked_discarded_stream_resyncs_next_collect() {
 }
 
 #[test]
-fn joint_linked_broken_stream_keeps_gap_refusal() {
-    // Healthy twin: a journal-linked lane keeps the fail-closed Gap
-    // refusal after a stream break; only S1-only lanes re-sync.
+fn joint_linked_broken_stream_resyncs_above_a_fenced_loss() {
+    // A journal-linked lane re-syncs after an unlocalized raw disposal,
+    // like an S1-only lane, but only above a fence: the disposal names
+    // its gap, refuses every key and voids staged custody, and the
+    // consumed interval it covered is voided, so no later birth can
+    // certify the lost window.
     let events = EventsDomain::test_standin(0x61a9);
     let retained = producers(&events);
     assert!(retained.journal_linked());
@@ -564,12 +567,19 @@ fn joint_linked_broken_stream_keeps_gap_refusal() {
         owner.adapter_mut(),
     )
     .unwrap();
-    raw.dispose_without_ingest(&mut owner, &retained, RawDisposeReason::TerminalLoss)
+    let disposed = raw
+        .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::TerminalLoss)
         .unwrap_or_else(|(_, reason)| panic!("malformed raw disposal: {reason:?}"));
+    assert_eq!(
+        disposed.failure().map(|failure| failure.gap),
+        Some(crate::semantics_objects::journal::JournalGap::Malformed),
+        "the disposal discloses its named gap"
+    );
     assert!(
         owner.adapter.invalidated && owner.adapter.stream_broken,
         "the failed disposal breaks the stream"
     );
+    let lost_through = owner.adapter.consumed_through;
     let mut drain =
         EventDrain::over_domain(ScriptedRecords::records([vec![1, 2, 3]], 1), events.clone());
     let next = RawJointQuantum::collect_bounded_with_adapter(
@@ -582,18 +592,57 @@ fn joint_linked_broken_stream_keeps_gap_refusal() {
         |bytes| pool.reserve(bytes),
         owner.adapter_mut(),
     );
-    let err = next.err();
     assert!(
-        matches!(
-            err,
-            Some(RawQuantumRefusal::Cut(
-                crate::semantics_objects::journal::BirthCutRefusal::Gap
-            ))
-        ),
-        "a linked lane still refuses Gap after a break: {err:?}"
+        next.is_ok(),
+        "a linked lane re-syncs after a fenced break: {:?}",
+        next.err()
     );
     assert!(
-        owner.adapter.invalidated && owner.adapter.stream_broken,
-        "the break stays fail-closed for linked lanes"
+        !(owner.adapter.invalidated || owner.adapter.stream_broken),
+        "the re-sync clears the broken stream"
     );
+    assert!(
+        owner.adapter.voided_through >= lost_through,
+        "the lost window is voided: {} < {lost_through}",
+        owner.adapter.voided_through
+    );
+}
+
+#[test]
+fn joint_linked_broken_stream_without_disposal_keeps_gap_refusal() {
+    // Failure twin: a linked stream broken outside an unlocalized
+    // disposal (staged custody still held across the hole) keeps the
+    // fail-closed Gap refusal; so does a stopped adapter.
+    let events = EventsDomain::test_standin(0x61aa);
+    let retained = producers(&events);
+    assert!(retained.journal_linked());
+    for stopped in [false, true] {
+        let pool = SemanticResourcePool::default();
+        let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+        owner.adapter.stream_broken = true;
+        owner.adapter.invalidated = stopped;
+        owner.adapter.stopped = stopped;
+        let mut drain =
+            EventDrain::over_domain(ScriptedRecords::records([vec![1, 2, 3]], 1), events.clone());
+        let next = RawJointQuantum::collect_bounded_with_adapter(
+            &mut drain,
+            &publish_object_descriptors(),
+            4,
+            None,
+            &SteadyFault(Cell::new(None)),
+            &retained,
+            |bytes| pool.reserve(bytes),
+            owner.adapter_mut(),
+        );
+        let err = next.err();
+        assert!(
+            matches!(
+                err,
+                Some(RawQuantumRefusal::Cut(
+                    crate::semantics_objects::journal::BirthCutRefusal::Gap
+                ))
+            ),
+            "stopped={stopped}: the break stays fail-closed: {err:?}"
+        );
+    }
 }

@@ -319,7 +319,11 @@ counter counts records, not calls: at system/cgroup scope a refused
 FORK marker counts too, and on a linked (`--key-operations`) capture
 one call writes up to two records (its journal BEGIN and its END, or
 an ABANDON in place of the END), so one lost call can count up to
-twice. Prompt saturated-tick commits apply to
+twice. A linked capture therefore loads a 16 MiB EVENTS ring (about
+1.9 s of 10,000 calls/s; every other capture keeps 4 MiB), which costs
+12 MiB more locked kernel memory while that lane is active. The ring is
+read only between seals of the key-operation lane, so a seal longer than
+the ring's headroom still loses records, disclosed as above. Prompt saturated-tick commits apply to
 legacy lanes only; joint-machine lanes service the machine instead
 and disclose loss at each publish. Measured sustained rate (one
 busy 12-CPU development host, release observer): without
@@ -995,7 +999,7 @@ The old bounds are measurements, not a product startup SLA.
 
 ## Capture loss and coverage
 
-### Lifecycle ring loss under exec churn (M4) — clean at 100 and 1,000 exec/s with the 2 MiB ring
+### Lifecycle ring loss under exec churn (M4) — clean at 100 and 1,000 exec/s; 8 MiB ring since v0.6.0
 
 - What the user sees: at 448 processes, native lane: 100 exec/s loses
   nothing (0 lifecycle and 0 ring loss in all 6 samples); since v0.3.0
@@ -1014,10 +1018,18 @@ The old bounds are measurements, not a product startup SLA.
   all 12 samples (3 rounds of 1 cold + 1 warm per size), high-water
   6–11% of the ring, with one cold 448-process sample at 37%. Churn 0
   cells were not measured in this tier.
+- Since v0.6.0 the inventory ring is 8 MiB (about 9,100 records) and the
+  lane also drains it while the semantic lane starts. A Joint startup
+  under heavy unrelated churn (2 MiB ring, 8,192 held records) lost
+  17,977 lifecycle records before the first pass, so both bounds were
+  raised: 8 MiB of locked kernel memory per inventory capture (was
+  2 MiB), and up to 32,768 held records in user memory (about 29 MiB,
+  allocated only as records arrive; was 8,192, about 7.2 MiB).
 - Headroom is bounded by pass length, not by the ring alone: while a
-  pass collects, the lane holds at most 8,192 drained records and then
+  pass collects, the lane holds at most 32,768 drained records and then
   stops draining, so at 1,000 exec/s (about 2,100 records/s) a pass
-  absorbs about 4 s of held records plus about 1 s of ring. The peak
+  absorbs about 15 s of held records plus about 4 s of ring. The
+  measurements below used the 2 MiB ring and 8,192 held records. The peak
   fill came at the first pass in every sample above. On a contended
   host (builds running; excluded from the numbers above) cold first
   passes with 3.1–3.5 s of deep scan peaked at 73–79% of the ring with

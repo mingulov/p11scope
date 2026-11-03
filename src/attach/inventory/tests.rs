@@ -285,11 +285,11 @@ fn expected_inventory_discovery_is_the_shared_constant() {
         EXPECTED_INVENTORY_DISCOVERY_BYTES,
         p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES
     );
-    assert_eq!(EXPECTED_INVENTORY_DISCOVERY_BYTES, 2 * 1024 * 1024);
+    assert_eq!(EXPECTED_INVENTORY_DISCOVERY_BYTES, 8 * 1024 * 1024);
 }
 
 /// A size pin per flavor over the embedded objects: both Inventory
-/// flavors compile this build's ring (2 MiB stock, 4 KiB small), while
+/// flavors compile this build's ring (8 MiB stock, 4 KiB small), while
 /// Detailed keeps 64 KiB (4 KiB when the small-ring feature shrank every
 /// flavor's compiled ring, as today).
 #[test]

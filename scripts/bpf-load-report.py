@@ -80,7 +80,8 @@ COUNTER_UNIQUE_ROOTS = frozenset({
 # exactly one member of each group, so group assignment accepts either
 # member and scoring refuses a kernel where both were measured. Mirrors
 # EXCLUSIVE_VARIANT_GROUPS in tests/python/test_bpf_load_report.py
-# (there with the "detailed/" budget-key prefix).
+# (there once per budget-key prefix: detailed/, detailed-gate1/ and
+# journal-gate1/).
 EXCLUSIVE_VARIANT_GROUPS = [
     frozenset({"p11_image_exec_release", "p11_image_mmap_release"}),
     frozenset({"p11_inst_vma_copy", "p11_inst_vma_retcopy"}),
@@ -306,9 +307,9 @@ def select_object_loads(parsed_loads, object_name, group_errors):
     sits in Inventory's program set; counter objects always carry
     their bank roots and journal objects always carry their pair, so
     shared-only groups never belong to them.
-    "detailed-gate1" selects exactly the Detailed groups (the gate-1
-    object carries the same unique roots); only the budget-key prefix
-    differs.
+    "detailed-gate1" selects exactly the Detailed groups and
+    "journal-gate1" exactly the journal groups (gate-1 objects carry the
+    same unique roots); only the budget-key prefix differs.
     """
     unresolved = [entry for entry in parsed_loads
                   if entry["root"] == "unresolved"]
@@ -320,6 +321,7 @@ def select_object_loads(parsed_loads, object_name, group_errors):
     selected = list(unresolved)
     want_counter = object_name.startswith("counter-")
     want_detailed = object_name in ("detailed", "detailed-gate1")
+    want_journal = object_name in ("journal", "journal-gate1")
     for btf_id in sorted(by_btf):
         entries = by_btf[btf_id]
         if btf_id == 0:
@@ -339,7 +341,7 @@ def select_object_loads(parsed_loads, object_name, group_errors):
             if object_name == "inventory":
                 selected.extend(entries)
         elif assigned == "journal":
-            if object_name == "journal":
+            if want_journal:
                 selected.extend(entries)
         elif assigned == "counter":
             if want_counter:

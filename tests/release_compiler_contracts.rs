@@ -154,7 +154,9 @@ fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
 "#;
     if !comparison
         .lines()
-        // Pinned baseline b200e06f: the PID-scope birth witness on top of
+        // Pinned baseline cf46fc5e: the gate-1 loader frame and bank series
+        // (gate-1 regions only; default objects move only debug data) on
+        // top of b200e06f, the PID-scope birth witness on top of
         // the verifier-cost series (d0bfdfcf: 7.4-rc1 load fix, outlined
         // GetID facts, bpf_loop directory scan and cleanup sweep), the 7.3
         // exec-release and 6/7-argument copy_vma hooks (8b7ee11a), the
@@ -164,7 +166,7 @@ fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
         // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        .any(|line| line == "          BASELINE=b200e06fa3f45e4f69ee63c098f9fb1c9adfaf7d")
+        .any(|line| line == "          BASELINE=cf46fc5edc705f0f337f418d92db8214dc0f8f4b")
         || !comparison.contains(repeat)
         || !comparison.contains(integration)
         || comparison.contains("--host-compiler-transition")
@@ -244,7 +246,9 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
         "a renamed comparison job must be rejected"
     );
     for marker in [
-        // Pinned baseline b200e06f: the PID-scope birth witness on top of
+        // Pinned baseline cf46fc5e: the gate-1 loader frame and bank series
+        // (gate-1 regions only; default objects move only debug data) on
+        // top of b200e06f, the PID-scope birth witness on top of
         // the verifier-cost series (d0bfdfcf: 7.4-rc1 load fix, outlined
         // GetID facts, bpf_loop directory scan and cleanup sweep), the 7.3
         // exec-release and 6/7-argument copy_vma hooks (8b7ee11a), the
@@ -254,7 +258,7 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
         // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=b200e06fa3f45e4f69ee63c098f9fb1c9adfaf7d",
+        "BASELINE=cf46fc5edc705f0f337f418d92db8214dc0f8f4b",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"",

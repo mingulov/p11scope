@@ -209,6 +209,15 @@ jobs:
             fi
           done
           echo "default Detailed object carries no gate maps"
+          journal=(target/debug/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1)
+          test "${#journal[@]}" -ge 1
+          for obj in "${journal[@]}"; do
+            if nm "$obj" | grep -Eq ' (IMAGE_BANK_SELECT|TASK_COOKIE_B)$'; then
+              echo "refusing: gate maps in the default journal object: $obj" >&2
+              exit 1
+            fi
+          done
+          echo "default journal object carries no gate maps"
       - name: Build the verifier-stats probe
         shell: bash
         run: |
@@ -422,6 +431,9 @@ jobs:
         run: |
           cargo +"$(cat .release-rust-version)" build --locked --offline
           test -x target/debug/p11scope
+          # The journal leg needs a manifest for the guest SoftHSM.
+          cargo +"$(cat .release-rust-version)" build --locked --offline -p p11scope-discover
+          test -x target/debug/p11scope-discover
       - name: Prove the gate-1 object carries the gate
         shell: bash
         run: |
@@ -439,6 +451,15 @@ jobs:
             nm "$obj" | grep -q ' TASK_COOKIE_B$'
           done
           echo "gate-1 Detailed object carries IMAGE_BANK_SELECT and TASK_COOKIE_B"
+          # The production journal object is a Detailed flavor, so a
+          # gate-1 build gates it too; system sessions load it.
+          journal=(target/debug/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1)
+          test -f "${journal[0]}"
+          for obj in "${journal[@]}"; do
+            nm "$obj" | grep -q ' IMAGE_BANK_SELECT$'
+            nm "$obj" | grep -q ' TASK_COOKIE_B$'
+          done
+          echo "gate-1 journal object carries IMAGE_BANK_SELECT and TASK_COOKIE_B"
       - name: Build the verifier-stats probe
         shell: bash
         run: |
@@ -448,8 +469,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/bpf-load-gate1-inputs"
-          cp -p target/debug/p11scope "$RUNNER_TEMP/probe/verifier-stats-probe.so" "$RUNNER_TEMP/bpf-load-gate1-inputs/"
-          (cd "$RUNNER_TEMP/bpf-load-gate1-inputs" && sha256sum p11scope verifier-stats-probe.so > SHA256SUMS)
+          cp -p target/debug/p11scope target/debug/p11scope-discover "$RUNNER_TEMP/probe/verifier-stats-probe.so" "$RUNNER_TEMP/bpf-load-gate1-inputs/"
+          (cd "$RUNNER_TEMP/bpf-load-gate1-inputs" && sha256sum p11scope p11scope-discover verifier-stats-probe.so > SHA256SUMS)
           cat "$RUNNER_TEMP/bpf-load-gate1-inputs/SHA256SUMS"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -457,13 +478,14 @@ jobs:
           path: ${{ runner.temp }}/bpf-load-gate1-inputs/
           if-no-files-found: error
           retention-days: 1
-  # Gate-1 loads: one kernel per job. Only doctor runs: the gate-1
-  # delta is the Detailed object alone (Inventory and counter objects
-  # are byte-identical to gate-0, proven host-side by
-  # scripts/check-gate0-identity.py), so the driver scores doctor's
-  # Detailed BTF groups as detailed-gate1/<root> only. A guest that
-  # cannot boot, a refused load, a missing table or a nonzero doctor
-  # exit is a FAIL, never a skip.
+  # Gate-1 loads: one kernel per job. The gate-1 delta is the Detailed
+  # flavor alone (Inventory and counter objects are byte-identical to
+  # gate-0, proven host-side by scripts/check-gate0-identity.py): doctor
+  # loads the Detailed object, scored as detailed-gate1/<root>, and a
+  # linked system inventory loads the production journal object (also
+  # a Detailed flavor, so gated too), scored as journal-gate1/<root>. A
+  # guest that cannot boot, a refused load, a missing table or a
+  # nonzero doctor exit is a FAIL, never a skip.
   bpf-load-gate1-kernels:
     needs: bpf-load-gate1-build
     runs-on: ubuntu-26.04
@@ -471,7 +493,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [v6.6.157, v6.12.111, v6.18.58]
+        kernel: [v6.6.157, v6.12.111, v6.18.58, v7.3.1]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -549,6 +571,32 @@ jobs:
           # driver's own verdict line, pinning the pass to OVERALL: PASS
           # even if a future driver exits 0 on a FAIL table (P2F-5 F2).
           grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt"
+      # The guest runs the host userspace, so the SoftHSM provider, the
+      # ledger caller's compiler and the manifest come from the runner.
+      - run: sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 softhsm2 libsofthsm2 gcc
+      - name: Run the gate-1 journal load check for this kernel
+        shell: bash
+        run: |
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/p11scope-discover"
+          module=$(python3 -I scripts/release-matrix-contract.py --select-module)
+          test -f "$module"
+          mkdir -p "$GITHUB_WORKSPACE/bpf-load-gate1-journal/out"
+          "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/p11scope-discover" --module "$module" \
+            -o "$GITHUB_WORKSPACE/bpf-load-gate1-journal/manifest.json"
+          scripts/check-bpf-load-journal.sh --object journal-gate1 \
+            "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/p11scope" \
+            "$GITHUB_WORKSPACE/bpf-load-gate1-inputs/verifier-stats-probe.so" \
+            "$GITHUB_WORKSPACE/bpf-load-gate1-journal/manifest.json" \
+            "$GITHUB_WORKSPACE/bpf-load-gate1-journal/out" "${{ matrix.kernel }}" 2>&1 | tee "$GITHUB_WORKSPACE/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt"
+          grep -q '^# object: journal-gate1$' "$GITHUB_WORKSPACE/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt"
+          grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt"
+          # A gate-1 journal row must be budgeted, never the unbudgeted
+          # loaded-plus-headroom fallback.
+          grep -q '"pass": true' "$GITHUB_WORKSPACE/bpf-load-gate1-journal/out/results.jsonl"
+          if grep -q 'unbudgeted' "$GITHUB_WORKSPACE/bpf-load-gate1-journal/out/results.jsonl"; then
+            echo "gate-1 journal row is unbudgeted" >&2
+            exit 1
+          fi
       - name: Upload the table and doctor output
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -559,6 +607,8 @@ jobs:
             ${{ github.workspace }}/bpf-load-gate1-out/doctor-${{ matrix.kernel }}.txt
             ${{ github.workspace }}/bpf-load-gate1-out/probe-${{ matrix.kernel }}.jsonl
             ${{ github.workspace }}/bpf-load-gate1-out/vng-${{ matrix.kernel }}.log
+            ${{ github.workspace }}/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt
+            ${{ github.workspace }}/bpf-load-gate1-journal/out/results.jsonl
           if-no-files-found: error
           retention-days: 7
   # No VM: load every BPF program on the runner kernel itself with sudo

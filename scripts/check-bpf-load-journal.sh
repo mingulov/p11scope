@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Load the journal object in throwaway vng guests and score its verifier cost.
 #
-# Usage: check-bpf-load-journal.sh [--budgets FILE] OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]
+# Usage: check-bpf-load-journal.sh [--budgets FILE] [--object journal|journal-gate1]
+#        OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]
 #
 # OBSERVER is the prebuilt observer under test (a build with the journal
 # object; it must live on the vng shared filesystem, never under /var/tmp
@@ -16,7 +17,10 @@
 # carries journal/ keys for the kernel; otherwise the gate is loaded +
 # stats + 5% headroom and the row says unbudgeted. A corrupt or
 # unreadable budgets file is a harness error (exit 2), never a silent
-# unbudgeted pass.
+# unbudgeted pass. --object journal-gate1 scores a gate-1 observer's
+# journal object (P11SCOPE_LOADER_GATE=1 gates every Detailed flavor,
+# the journal object included) against journal-gate1/ keys instead;
+# the object's BTF groups are the same, only the key prefix differs.
 #
 # Per kernel one throwaway guest runs a bounded linked inventory,
 # `inventory --system --capture native --key-operations --manifest
@@ -62,6 +66,7 @@
 set -eu
 
 BUDGETS=""
+OBJECT=journal
 while [ $# -gt 0 ]; do
     case "$1" in
         --budgets)
@@ -71,6 +76,15 @@ while [ $# -gt 0 ]; do
             ;;
         --budgets=*)
             BUDGETS="${1#--budgets=}"
+            shift
+            ;;
+        --object)
+            [ $# -ge 2 ] || { echo "missing value for --object" >&2; exit 2; }
+            OBJECT="$2"
+            shift 2
+            ;;
+        --object=*)
+            OBJECT="${1#--object=}"
             shift
             ;;
         --)
@@ -87,9 +101,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 if [ $# -lt 4 ]; then
-    echo "usage: check-bpf-load-journal.sh [--budgets FILE] OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]" >&2
+    echo "usage: check-bpf-load-journal.sh [--budgets FILE] [--object journal|journal-gate1] OBSERVER PROBE MANIFEST OUTDIR [KERNEL...]" >&2
     exit 2
 fi
+case "$OBJECT" in
+    journal|journal-gate1) ;;
+    *) echo "check-bpf-load-journal.sh: unknown object $OBJECT" >&2; exit 2 ;;
+esac
 OBSERVER=$1
 PROBE=$2
 MANIFEST=$3
@@ -181,6 +199,7 @@ fi
 OBSERVER_SHA=$(sha256sum "$OBSERVER" | cut -d' ' -f1)
 echo "# observer: $OBSERVER"
 echo "# observer-sha256: $OBSERVER_SHA"
+echo "# object: $OBJECT"
 echo "# probe: $PROBE"
 echo "# manifest: $MANIFEST"
 echo "# module: $MODULE"
@@ -190,6 +209,34 @@ else
     echo "# budgets: none (gate is loaded + stats + 5% headroom)"
 fi
 
+# Guest release match: the tag without its leading v must equal uname -r
+# or prefix it, except release candidates, whose tag (v7.4-rc1) boots the
+# dotted triplet (7.4.0-070400rc1-generic): there the triplet prefix plus
+# the same rc marker must match, never another rc number.
+release_ok() {
+    _release_expected=${1#v}
+    _release_guest=$2
+    case "$_release_guest" in
+        "$_release_expected"|"$_release_expected"-*)
+            return 0
+            ;;
+    esac
+    case "$_release_expected" in
+        *-rc[0-9]*)
+            _release_base=${_release_expected%-rc*}
+            _release_tag=${_release_expected##*-rc}
+            case "$_release_guest" in
+                "$_release_base.0-"*rc"$_release_tag")
+                    return 0
+                    ;;
+                "$_release_base.0-"*rc"$_release_tag"[!0-9]*)
+                    return 0
+                    ;;
+            esac
+            ;;
+    esac
+    return 1
+}
 # Single-quote a path for the guest shell.
 q() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
@@ -421,15 +468,12 @@ for KERNEL in "$@"; do
         continue
     fi
     GUEST_RELEASE=$(grep '^guest-release=' "$VNG_LOG" | tail -1 | cut -d= -f2)
-    case "$GUEST_RELEASE" in
-        "${KERNEL#v}"|"${KERNEL#v}-"*)
-            echo "# guest release $GUEST_RELEASE (expected $KERNEL)"
-            ;;
-        *)
-            infra_fail "guest booted $GUEST_RELEASE, expected $KERNEL"
-            continue
-            ;;
-    esac
+    if release_ok "$KERNEL" "$GUEST_RELEASE"; then
+        echo "# guest release $GUEST_RELEASE (expected $KERNEL)"
+    else
+        infra_fail "guest booted $GUEST_RELEASE, expected $KERNEL"
+        continue
+    fi
     if grep -q '^guest-stage=token-failed' "$VNG_LOG"; then
         infra_fail "guest SoftHSM token setup failed"
         continue
@@ -553,15 +597,15 @@ PY
         LEDGERS=$(grep -c '^LEDGER ' "$J_WL" || true)
     fi
     # Score the journal object from its own BTF groups: budgeted when
-    # the budgets file carries journal/ keys for this kernel, else
+    # the budgets file carries $OBJECT/ keys for this kernel, else
     # loaded + stats + 5% headroom.
     BUDGETED="unbudgeted"
     USE_BUDGETS=0
     if [ -n "$BUDGETS" ]; then
-        if [ "$(python3 - "$BUDGETS" "$KERNEL" <<'PY'
+        if [ "$(python3 - "$BUDGETS" "$KERNEL" "$OBJECT" <<'PY'
 import json,sys
 document = json.load(open(sys.argv[1], encoding="ascii"))
-print("yes" if any(name.startswith("journal/") and sys.argv[2] in cells
+print("yes" if any(name.startswith(sys.argv[3] + "/") and sys.argv[2] in cells
                    for name, cells in document.get("programs", {}).items())
       else "no")
 PY
@@ -572,14 +616,14 @@ PY
     fi
     REPORT_RC=0
     if [ "$USE_BUDGETS" = 1 ]; then
-        python3 -I "$REPORT" --budgets "$BUDGETS" --object journal --kernel "$KERNEL" \
+        python3 -I "$REPORT" --budgets "$BUDGETS" --object "$OBJECT" --kernel "$KERNEL" \
             --observer-sha256 "$OBSERVER_SHA" "$J_PROBE" >"$J_REPORT" 2>&1 || REPORT_RC=$?
     else
-        python3 -I "$REPORT" --object journal --kernel "$KERNEL" \
+        python3 -I "$REPORT" --object "$OBJECT" --kernel "$KERNEL" \
             --observer-sha256 "$OBSERVER_SHA" "$J_PROBE" >"$J_REPORT" 2>&1 || REPORT_RC=$?
     fi
     cat "$J_REPORT"
-    BITS=$(python3 - "$J_REPORT" <<'PY'
+    BITS=$(python3 - "$J_REPORT" "$OBJECT" <<'PY'
 import sys
 count, best_proc, best_root, best_head, failed = 0, -1, "-", 101.0, None
 try:
@@ -588,7 +632,7 @@ except OSError:
     lines = []
 for line in lines:
     parts = line.split()
-    if len(parts) < 8 or not parts[1].startswith("journal/"):
+    if len(parts) < 8 or not parts[1].startswith(sys.argv[2] + "/"):
         continue
     count += 1
     try:

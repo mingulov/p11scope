@@ -502,7 +502,18 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin b200e06f, the PID-scope birth witness on top of 4dbdf106 (the
+      # Pin cf46fc5e, the gate-1 loader frame and bank series on top of
+      # b200e06f: the image-bank allocator narrowing, the bank-B cookie
+      # qualification at the image query seam, the verifier-visible bank
+      # indexes, the 512-byte p11_return fit and the witness-pass refusal
+      # count are all inside the gate-1 (P11SCOPE_LOADER_GATE) regions of
+      # image_identity.c, image_identity.h and image_identity_query.c. The
+      # default objects keep every allocated and executable section,
+      # symbol, relocation and .BTF byte (scripts/check-gate0-identity.py,
+      # journal object included); only .BTF.ext line info and .debug_*
+      # move with the shifted source lines. No other BPF input changed
+      # since b200e06f.
+      # Earlier pin b200e06f, the PID-scope birth witness on top of 4dbdf106 (the
       # picked d0bfdfcf, which is not an ancestor of this pin): the birth
       # marker compares the target leader's start time with the
       # published PID_START_TICK value before it mints a READY row, so a
@@ -604,7 +615,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=b200e06fa3f45e4f69ee63c098f9fb1c9adfaf7d
+          BASELINE=cf46fc5edc705f0f337f418d92db8214dc0f8f4b
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

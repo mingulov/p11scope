@@ -22028,7 +22028,10 @@ impl Engine {
     /// ordinary rotation only fills free view slots and never displaces,
     /// while reconcile passes rotate exploratory (never-owned, currently
     /// empty) views to reach unscanned processes within a finite bound.
-    fn select_over_cap_desired(&mut self, pids: &[u32]) -> BTreeSet<u32> {
+    /// Desired pids plus whether this pass evicted: the newcomer ordering
+    /// below admits pending waiters first after an eviction, so freed slots
+    /// reach event-driven work instead of refilling in rotation order.
+    fn select_over_cap_desired(&mut self, pids: &[u32]) -> (BTreeSet<u32>, bool) {
         let known: BTreeSet<u32> = self.views.iter().map(|view| view.pid()).collect();
         let enumerated: BTreeSet<u32> = pids.iter().copied().collect();
         let pending: BTreeSet<u32> = enumerated
@@ -22071,7 +22074,7 @@ impl Engine {
                         ),
                     );
                 }
-                desired
+                (desired, false)
             }
             InventoryCadence::Reconcile => {
                 // Exploratory rotation: the slice selects into the free
@@ -22083,7 +22086,31 @@ impl Engine {
                 let evictable = self.exploratory_evictable_views();
                 let evict_budget = evictable.len().min(self.scheduler.max_evictions_per_pass());
                 let selected = self.reconcile_slice(pids, &known, free_slots + evict_budget);
-                let need = selected.len().saturating_sub(free_slots);
+                // Waiter-driven eviction: viewless enumerated waiters
+                // (event-driven refresh requests with no view yet) count
+                // as eviction demand even when the slice did not select
+                // them, so a waiter outside the current slice still gains
+                // room within a sweep instead of waiting for the cursor to
+                // wrap all the way around. Demand is one slot per waiter
+                // (never double-counting slice-selected waiters), bounded
+                // by the eviction budget; cooling waiters sit out (their
+                // bounded delay beats evict-rerequest churn), and no
+                // waiter's own view is ever a victim (the classifier
+                // shields requested pids).
+                let selected_set: BTreeSet<u32> = selected.iter().copied().collect();
+                let waiter_demand = pending
+                    .iter()
+                    .filter(|pid| {
+                        !known.contains(*pid)
+                            && !selected_set.contains(*pid)
+                            && !self.scheduler.cooling_down(**pid)
+                    })
+                    .count();
+                let need = selected
+                    .len()
+                    .saturating_add(waiter_demand)
+                    .saturating_sub(free_slots)
+                    .min(evict_budget);
                 let victims: BTreeSet<ProcessViewId> = evictable.into_iter().take(need).collect();
                 // Evicted pids leave the desired set with their views: they
                 // were desired as retained views, and re-selecting them as
@@ -22124,7 +22151,7 @@ impl Engine {
                         ),
                     );
                 }
-                desired
+                (desired, !victims.is_empty())
             }
         }
     }
@@ -22621,36 +22648,37 @@ impl Engine {
         // `desired` only narrows which new pids get deep-scanned. A zero cap
         // short-circuits to empty: selection could only ever take nothing,
         // so the sweep reads are skipped outright.
-        let desired: BTreeSet<_> = if let Some(selected) = self.pressure_selected {
-            // Selected transaction: serve only the selected pid. No polling
-            // round, no over-cap reconcile turn, no sweep: the pass neither
-            // reads maps beyond this enumeration nor advances any scheduler
-            // cursor of its own (H1 accounting is checkpointed around it).
-            // At view capacity the selected pid still makes its own room —
-            // one guarded exploratory eviction, else a probationary probe —
-            // both scoped to the selection inside newcomer admission.
-            if pids.contains(&selected.pid) {
-                BTreeSet::from([selected.pid])
+        let (desired, reconcile_evicted): (BTreeSet<_>, bool) =
+            if let Some(selected) = self.pressure_selected {
+                // Selected transaction: serve only the selected pid. No polling
+                // round, no over-cap reconcile turn, no sweep: the pass neither
+                // reads maps beyond this enumeration nor advances any scheduler
+                // cursor of its own (H1 accounting is checkpointed around it).
+                // At view capacity the selected pid still makes its own room —
+                // one guarded exploratory eviction, else a probationary probe —
+                // both scoped to the selection inside newcomer admission.
+                if pids.contains(&selected.pid) {
+                    (BTreeSet::from([selected.pid]), false)
+                } else {
+                    (BTreeSet::new(), false)
+                }
+            } else if max_scan_pids == 0 {
+                (BTreeSet::new(), false)
+            } else if pids.len() > max_scan_pids {
+                self.select_over_cap_desired(&pids)
             } else {
-                BTreeSet::new()
-            }
-        } else if max_scan_pids == 0 {
-            BTreeSet::new()
-        } else if pids.len() > max_scan_pids {
-            self.select_over_cap_desired(&pids)
-        } else {
-            // Under-cap polling round, every fourth under-cap tick: retained
-            // exploratory views carry no loader context, so without this a
-            // process that gains a provider while the capture sits under the
-            // cap would never re-scan. Queued here so the requests flow into
-            // `refreshed` below and are served same-tick. The zero cap
-            // short-circuits above and never polls. `scope_pids` guarantees
-            // pid order for the poll cursor.
-            if self.scheduler.begin_under_cap_tick() {
-                self.queue_polling_rescans(&pids);
-            }
-            pids.into_iter().collect()
-        };
+                // Under-cap polling round, every fourth under-cap tick: retained
+                // exploratory views carry no loader context, so without this a
+                // process that gains a provider while the capture sits under the
+                // cap would never re-scan. Queued here so the requests flow into
+                // `refreshed` below and are served same-tick. The zero cap
+                // short-circuits above and never polls. `scope_pids` guarantees
+                // pid order for the poll cursor.
+                if self.scheduler.begin_under_cap_tick() {
+                    self.queue_polling_rescans(&pids);
+                }
+                (pids.into_iter().collect(), false)
+            };
         // Only new candidates count: known views are retained, not selected.
         // The zero-cap short-circuit keeps its exact historical skip; the
         // scheduler publishes the ordinary/reconcile gaps itself.
@@ -22779,10 +22807,13 @@ impl Engine {
         // consume the same first window forever and starve later processes.
         // Deferred requests and their explicit evidence are retained.
         let max_new_views = self.scheduler.max_new_views_per_tick();
-        let mut new_pids = if self.views.len() >= self.max_scan_pids {
+        let mut new_pids = if self.views.len() >= self.max_scan_pids || reconcile_evicted {
             // Lane-A P2a: view slots are scarce, so event-driven newcomers
-            // sort ahead of rotation candidates for whatever frees up. With
-            // free slots the plain pid order stands (fairness pins).
+            // sort ahead of rotation candidates for whatever frees up. A
+            // reconcile pass that just evicted dropped the count below the
+            // cap, but the freed slots still belong to event-driven work
+            // first. With free slots the plain pid order stands (fairness
+            // pins).
             let pending: BTreeSet<u32> = serviced_requests.keys().copied().collect();
             self.scheduler
                 .new_view_order_pending_first(&new_pids, &pending)

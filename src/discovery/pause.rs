@@ -1216,6 +1216,9 @@ impl PauseCoordinator {
         if let Err(error) = self.check_ring_loss(io) {
             return self.fail_cycle(io, error, false);
         }
+        if let Err(error) = hold_until_the_attach_tick_passes(io) {
+            return self.fail_cycle(io, error, true);
+        }
         self.epoch.resume_attempted = true;
         if let Err(error) = io.resume() {
             return self.fail_cycle(io, error, true);
@@ -2948,6 +2951,44 @@ fn birth_covered(start_ticks: u64, last_attach_boot_ns: Option<u64>) -> bool {
         return false;
     };
     start_ticks.saturating_mul(clock_tick_ns()) > attach
+}
+
+/// Holds a confirmed stop's resume until the boot clock has crossed into the
+/// clock tick after the last completed provider hook attach. A thread the
+/// child starts once resumed is dated by its floored tick ([`birth_covered`]),
+/// and a birth inside the attach's own tick floors at or before the attach, so
+/// it would keep the stop partial although it came after the hooks. Every
+/// such thread is born after the resume, so once the resume is past the next
+/// tick boundary its floor is at or past that boundary, strictly after the
+/// attach. This changes only when the child resumes, never which births are
+/// covered. The wait uses the existing 1 ms cadence and is bounded by one
+/// tick; with no recorded attach, an unreadable boot clock or a saturated
+/// instant there is nothing to wait for. Only a failed wait is an error.
+fn hold_until_the_attach_tick_passes(io: &mut impl PauseIo) -> Result<(), String> {
+    let Some(mut now) = io.boot_now_ns() else {
+        return Ok(());
+    };
+    let Some(attach) = io.last_hook_attach_boot_ns() else {
+        return Ok(());
+    };
+    let tick = clock_tick_ns();
+    let Some(boundary) = (attach / tick)
+        .checked_add(1)
+        .and_then(|ticks| ticks.checked_mul(tick))
+    else {
+        return Ok(());
+    };
+    for _ in 0..=tick / SAMPLE_NS {
+        if now >= boundary {
+            return Ok(());
+        }
+        io.wait_one_ms()?;
+        let Some(read) = io.boot_now_ns() else {
+            return Ok(());
+        };
+        now = read;
+    }
+    Ok(())
 }
 
 fn parse_task_start(stat: &[u8]) -> Option<u64> {

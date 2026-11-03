@@ -29008,7 +29008,9 @@ impl Engine {
         hold: Option<crate::discovery::pause::PauseGateHold>,
         owned_run: bool,
     ) -> BTreeMap<PinnedObjectId, crate::prearm_module::ExactnessProof> {
-        let _ = owned_run;
+        if !owned_run {
+            return BTreeMap::new();
+        }
         let Some(hold) = hold.filter(|hold| hold.continuous) else {
             return BTreeMap::new();
         };

@@ -1167,11 +1167,27 @@ fn parallel_load_partial_failure_retains_cleanup_owner() {
     );
 }
 
+/// Splits one held object's idle RSS into the one-time shared BTF
+/// share and the per-object maps/programs share. The daemon pays BTF
+/// once (shared via `host_btf::shared`), so fleet projections must
+/// scale only the second; saturates because RSS samples can dip.
+fn split_hold_cost(
+    baseline_rss_kb: u64,
+    post_btf_rss_kb: u64,
+    idle_rss_kb: u64,
+) -> (u64, u64) {
+    (
+        post_btf_rss_kb.saturating_sub(baseline_rss_kb),
+        idle_rss_kb.saturating_sub(post_btf_rss_kb),
+    )
+}
+
 /// Root measures the resident-service cost parts on the Detailed object:
 /// BTF parse, map/object creation without program loads, the serial
 /// program-load sum, and the idle RSS/FD cost of one held fully-loaded
-/// object (sampled, held, re-sampled, then dropped and re-sampled).
-/// Nothing is attached or retained.
+/// object (sampled, held, re-sampled, then dropped and re-sampled),
+/// with the shared BTF share sampled separately so per-object
+/// projections never scale it. Nothing is attached or retained.
 #[test]
 #[ignore = "privileged: resident-service cost parts; run as root with --ignored --test-threads=1"]
 fn resident_service_cost_parts() {
@@ -1192,6 +1208,10 @@ fn resident_service_cost_parts() {
     let btf_start = Instant::now();
     let btf = aya::Btf::from_sys_fs().expect("host vmlinux BTF must load");
     let btf_wall = btf_start.elapsed();
+    // The daemon pays BTF once (shared), not per held object: sample
+    // after BTF so the per-object delta excludes it.
+    let post_btf_fds = fd_count();
+    let post_btf_rss = rss_kb();
 
     // Per-capture floor: fresh maps/object without any program load.
     // Scoped so its map FDs close before the FD assertions below.
@@ -1233,6 +1253,7 @@ fn resident_service_cost_parts() {
         "{CELL}: dropping the object must close every prog/map FD"
     );
 
+    let (btf_rss_kb, object_rss_kb) = split_hold_cost(baseline_rss, post_btf_rss, idle_rss);
     let summary = serde_json::json!({
         "cell": CELL, "run_id": id, "kernel": kernel,
         "bpf_stats_enabled": stats_label, "object": "detailed",
@@ -1243,22 +1264,27 @@ fn resident_service_cost_parts() {
         "maps_wall_ns": maps_wall.as_nanos() as u64,
         "program_sum_ns": program_sum.as_nanos() as u64,
         "baseline_fds": baseline_fds, "baseline_rss_kb": baseline_rss,
+        "post_btf_fds": post_btf_fds, "post_btf_rss_kb": post_btf_rss,
+        "btf_rss_kb": btf_rss_kb, "object_rss_kb": object_rss_kb,
+        "object_fds": idle_fds.saturating_sub(post_btf_fds),
         "idle_fds": idle_fds, "idle_rss_kb": idle_rss,
         "idle_fds_late": idle_fds_late, "idle_rss_kb_late": idle_rss_late,
         "after_fds": after_fds, "after_rss_kb": after_rss,
     });
     sink.row(&summary);
     println!(
-        "{CELL}: btf={:.3}s maps-only={:.3}s full={:.3}s (maps {:.3}s + programs {:.3}s); RSS {} -> {} -> {} kB; FDs {} -> {} -> {}",
+        "{CELL}: btf={:.3}s maps-only={:.3}s full={:.3}s (maps {:.3}s + programs {:.3}s); RSS {} -> {} (post-BTF) -> {} (held) -> {} kB; FDs {} -> {} -> {} -> {}",
         btf_wall.as_secs_f64(),
         maps_only_wall.as_secs_f64(),
         full_wall.as_secs_f64(),
         maps_wall.as_secs_f64(),
         program_sum.as_secs_f64(),
         baseline_rss,
+        post_btf_rss,
         idle_rss,
         after_rss,
         baseline_fds,
+        post_btf_fds,
         idle_fds,
         after_fds,
     );
@@ -1535,5 +1561,18 @@ mod unit_tests {
     fn honest_speedup_guards_zero_wall() {
         let honest = honest_speedup(8_000_000_000, Duration::ZERO);
         assert!(honest.is_finite(), "zero wall must not yield NaN/inf");
+    }
+
+    #[test]
+    fn split_hold_cost_isolates_shared_btf() {
+        // Lane shape: 12.3MB process baseline, ~7MB BTF, ~12.5MB more
+        // for the held maps/programs. Only the last scales per object.
+        assert_eq!(split_hold_cost(12_256, 19_500, 31_792), (7_244, 12_292));
+    }
+
+    #[test]
+    fn split_hold_cost_saturates_on_rss_dips() {
+        assert_eq!(split_hold_cost(100, 90, 80), (0, 0));
+        assert_eq!(split_hold_cost(100, 110, 105), (10, 0));
     }
 }

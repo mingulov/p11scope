@@ -13228,17 +13228,13 @@ mod tests {
         let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
         let opensc = provider_with_tables(34, OPENSC, 1, 104, false);
         let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
-        assert_eq!(slots_of(&first, 31), 0, "closure alone takes no prefix");
-        assert!(
-            refusal_of(&first, P11_KIT).is_some(),
-            "closure alone is refused whole, never silent: {:?}",
-            first.modules_skipped
-        );
         let rebuilt = first.rebuild_from_sources(
             &[p11_kit, trust, softhsm, opensc],
             &[],
             &PinnedObjects::empty(),
         );
+        // The backends first: starvation is what this twin guards, so it
+        // must be the first failure a regression shows.
         assert_eq!(slots_of(&rebuilt, 32), 68, "trust fits");
         assert_eq!(slots_of(&rebuilt, 33), 68, "softhsm fits");
         assert_eq!(slots_of(&rebuilt, 34), 104, "opensc fits, not starved");
@@ -13246,6 +13242,12 @@ mod tests {
             slots_of(&rebuilt, 31),
             0,
             "closure stays at published-only, never a held prefix"
+        );
+        assert_eq!(slots_of(&first, 31), 0, "closure alone takes no prefix");
+        assert!(
+            refusal_of(&first, P11_KIT).is_some(),
+            "closure alone is refused whole, never silent: {:?}",
+            first.modules_skipped
         );
     }
 
@@ -13259,28 +13261,33 @@ mod tests {
         let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
         let opensc = provider_with_tables(34, OPENSC, 1, 104, false);
         let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
-        assert_eq!(slots_of(&first, 31), 0, "closure alone takes no prefix");
         let with_trust = first.rebuild_from_sources(
             &[p11_kit.clone(), trust.clone()],
             &[],
             &PinnedObjects::empty(),
         );
+        // Backends before the closure at every step: starvation is the
+        // first failure a regression shows.
         assert_eq!(slots_of(&with_trust, 32), 68, "trust admitted in full");
         assert_eq!(slots_of(&with_trust, 31), 0, "no prefix after trust");
         let with_softhsm = with_trust.rebuild_from_sources(
-            &[p11_kit.clone(), trust, softhsm.clone()],
+            &[p11_kit.clone(), trust.clone(), softhsm.clone()],
             &[],
             &PinnedObjects::empty(),
         );
         assert_eq!(slots_of(&with_softhsm, 33), 68, "softhsm admitted in full");
+        assert_eq!(slots_of(&with_softhsm, 32), 68, "trust stays attached");
         assert_eq!(slots_of(&with_softhsm, 31), 0, "no prefix after softhsm");
         let all = with_softhsm.rebuild_from_sources(
-            &[p11_kit, softhsm, opensc],
+            &[p11_kit, trust, softhsm, opensc],
             &[],
             &PinnedObjects::empty(),
         );
         assert_eq!(slots_of(&all, 34), 104, "opensc admitted in full");
+        assert_eq!(slots_of(&all, 33), 68, "softhsm stays attached");
+        assert_eq!(slots_of(&all, 32), 68, "trust stays attached");
         assert_eq!(slots_of(&all, 31), 0, "no prefix after opensc");
+        assert_eq!(slots_of(&first, 31), 0, "closure alone takes no prefix");
     }
 
     /// PA-9/C1 guard: the named exception survives the late-start gate. A

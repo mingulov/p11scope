@@ -2154,6 +2154,155 @@ fn shared_scope_capture_starts_when_every_module_is_refused() {
     );
 }
 
+/// A proxy closure array with no published table, mapped alone in a
+/// running process before the proxy loads any provider below it (`profile
+/// --pid` on such a process). The startup build goes through
+/// `build_current_plan`: the capture must start with the closure named as a
+/// PARTIAL gap — never a capacity refusal, since nothing is in use — and a
+/// provider the process loads later is admitted whole while the closure
+/// stays at zero slots.
+#[test]
+fn named_capture_starts_beside_an_unpublished_closure_alone() {
+    let mut closure = p11kit_like_64_table_module();
+    // No interface links any table: nothing is published, every table is
+    // an unresolved lookalike.
+    closure.interfaces.clear();
+    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut engine = Engine::empty();
+    engine.pinned = pins;
+    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let closure_object = modules[0].object;
+    let mut counters = DiscoveryCounters::default();
+    let plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    assert!(plan.slots.is_empty(), "the closure takes no slot");
+    assert_eq!(plan.modules_skipped.len(), 1, "{:?}", plan.modules_skipped);
+    let gap = &plan.modules_skipped[0];
+    assert!(
+        plan::is_closure_array_refusal(&gap.reason),
+        "named as a closure gap: {}",
+        gap.reason
+    );
+    assert!(
+        !gap.reason.contains("attach slots are available") && !gap.reason.contains("more;"),
+        "nothing is in use, so the gap is not a capacity refusal: {}",
+        gap.reason
+    );
+    assert!(
+        gap.reason.contains("is published yet"),
+        "names why nothing attached: {}",
+        gap.reason
+    );
+    assert_eq!(
+        evidence_verdict(&plan, &engine.pinned, &counters).completeness,
+        "PARTIAL",
+        "the named gap forces PARTIAL"
+    );
+    engine.plan = plan;
+    engine.modules = modules;
+    engine.counters = counters;
+
+    // The process loads a provider below the proxy: a later live rebuild
+    // admits it whole, and the closure stays at zero slots.
+    let mut provider = overlay_module(overlay_key(58));
+    provider.tables[0].entries = overlay_entries(&provider, first_offsets(68));
+    let mut candidate_pins = engine.pinned.clone();
+    let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    let candidate = engine
+        .live_candidate(candidate_pins, vec![closure.clone(), provider.clone()], skipped)
+        .expect("the later provider's rebuild");
+    let provider_object = candidate
+        .pinned
+        .id_for_scanned(&provider, provider.key, &provider.path)
+        .expect("the provider is pinned");
+    assert_ne!(provider_object, closure_object, "two distinct objects");
+    let slots_of = |object| {
+        candidate
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object == object)
+            .count()
+    };
+    assert_eq!(slots_of(provider_object), 68, "the provider is admitted whole");
+    assert_eq!(slots_of(closure_object), 0, "the closure stays at zero");
+    assert!(
+        candidate
+            .plan
+            .modules_skipped
+            .iter()
+            .any(|skip| plan::is_closure_array_refusal(&skip.reason)
+                && skip.reason.contains("is published yet")),
+        "the closure gap stays named: {:?}",
+        candidate.plan.modules_skipped
+    );
+}
+
+/// Healthy twins of the startup rule above. With nothing mapped a named
+/// capture starts empty, as before; a real capacity refusal that leaves
+/// nothing to attach still stops the capture, even beside an unpublished
+/// closure, and names that refusal rather than the closure.
+#[test]
+fn named_capture_startup_twins_beside_an_unpublished_closure() {
+    let build = |modules: &[ReconciledModule], pins: &PinnedObjects| {
+        build_current_plan(
+            modules,
+            &[],
+            &[],
+            pins,
+            &mut DiscoveryCounters::default(),
+            &mut BTreeSet::new(),
+            &BTreeSet::new(),
+            0,
+            0,
+            false,
+            plan::AdmissionScope::Named,
+            false,
+        )
+    };
+    let empty = build(&[], &PinnedObjects::empty()).expect("nothing mapped still starts");
+    assert!(empty.slots.is_empty() && empty.modules_skipped.is_empty());
+
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut oversized = overlay_module(overlay_key(58));
+    oversized.tables[0].entries = overlay_entries(
+        &oversized,
+        first_offsets(p11scope_ebpf_common::MAX_SLOTS + 1),
+    );
+    let mut pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    assert!(
+        pins.absorb(overlay_pins(&[(oversized.key, "c3a91d07", 1)]))
+            .is_empty()
+    );
+    let (modules, skipped) = bind_scanned_modules(&[oversized, closure], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let error = build(&modules, &pins).expect_err("a real capacity refusal leaves nothing");
+    let text = error.to_string();
+    assert!(text.contains("leaving nothing to attach"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "module needs {} more",
+            p11scope_ebpf_common::MAX_SLOTS + 1
+        )),
+        "names the provider's capacity refusal, not the closure: {text}"
+    );
+}
+
 #[test]
 fn capture_facts_keep_a_manifest_only_capacity_refusal() {
     let (_, pins) = pinned_self();

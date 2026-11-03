@@ -291,7 +291,10 @@ pub(crate) fn is_growth_omission(reason: &str) -> bool {
 /// array (whole or growth): the terminal report names where its forwarded
 /// calls are counted instead of suggesting `--module` for it.
 pub(crate) fn is_closure_array_refusal(reason: &str) -> bool {
-    reason.contains("(a proxy closure array is admitted whole or not at all)")
+    reason.contains(
+        "(a proxy closure array is admitted whole, as a prefix when first seen, \
+         or as published tables)",
+    )
 }
 
 /// Whether a `modules_skipped` reason records a Part 0 prefix-admitted
@@ -385,8 +388,10 @@ enum AdmissionClass {
     /// through the proxy is seen at the real provider's own functions once
     /// that provider is attached, and the whole array (~6,656 endpoints)
     /// never fits, so it is admitted last in every scope: whole when it
-    /// fits, otherwise a reserve-capped leading-templates prefix once the
-    /// pass is quiescent, and refused whole until then.
+    /// fits (late-start, reserve-capped), otherwise a reserve-capped
+    /// leading-templates prefix in a named scope when first seen, and its
+    /// published tables only when first mapped mid-capture — refused whole
+    /// when none of those admit.
     ClosureArray,
 }
 
@@ -586,7 +591,7 @@ impl CapacityRefusal<'_> {
         if let Some(tables) = self.closure_tables {
             reason.push_str(&format!(
                 " of its {tables} lookalike function tables (a proxy closure array is \
-                 admitted whole or not at all)"
+                 admitted whole, as a prefix when first seen, or as published tables)"
             ));
         }
         if self.closure_tables.is_none() {
@@ -616,12 +621,13 @@ pub enum AdmissionScope {
     /// with `--module`: providers are admitted first-come in discovery order,
     /// and an unresolved heuristic object admits its strongest
     /// [`MAX_TABLES_PER_OBJECT`] tables (K4). A recognized proxy closure
-    /// array is decided after every provider: whole when it fits, otherwise
-    /// refused whole while providers are still arriving, and a
-    /// leading-templates prefix only after a pass with no new provider
-    /// object — the prefix never takes the [`shared_scope_reserve`] slots,
-    /// so a provider decoded later still fits. A later provider that still
-    /// does not fit is refused by name with the `--exclude-module` remedy.
+    /// array is decided after every provider: whole when it fits
+    /// (late-start, reserve-capped), otherwise a reserve-capped
+    /// leading-templates prefix only when first seen in the capture's first
+    /// plan — the prefix never takes the [`shared_scope_reserve`] slots, so
+    /// a provider decoded later still fits — and its published tables only
+    /// when first mapped mid-capture. A later provider that still does not
+    /// fit is refused by name with the `--exclude-module` remedy.
     #[default]
     Named,
     /// Cgroup or system scope without `--module` (GT-5). Every process in
@@ -634,7 +640,9 @@ pub enum AdmissionScope {
     /// fewest tables, and proxy closure arrays last, each class ordered by
     /// `(dev, inode)` so the admitted set never depends on discovery order.
     /// Every module but an operator-attested one is admitted whole or not at
-    /// all, and uncorroborated ones leave [`shared_scope_reserve`] slots free.
+    /// all (closures: whole, or their published tables when the heuristic
+    /// set is refused — never a heuristic prefix), and uncorroborated ones
+    /// leave [`shared_scope_reserve`] slots free.
     Shared,
 }
 
@@ -831,6 +839,12 @@ pub struct AttachPlan {
     counter_consumed_end: u32,
     admission_policy: AdmissionPolicy,
     admission_scope: AdmissionScope,
+    // Objects present in the capture's first plan input (PA-5 C1): a proxy
+    // closure array gets its heuristic prefix only when here (the late-start
+    // case); a closure first mapped during the capture admits only its
+    // publication-authorized tables. Carried through rebuilds, never grown.
+    // Generic object identity only — no provider names, offsets or symbols.
+    first_plan_objects: BTreeSet<PinnedObjectId>,
     // Plan fence for the conservative rebuild cursor: every `&mut self`
     // method bumps `mutations` first, and `token` is minted fresh per plan
     // value (`Clone` mints, so whole-plan replacement changes the token).
@@ -1220,6 +1234,7 @@ impl AttachPlan {
             admission_scope: AdmissionScope::Named,
             slot_ordinals: BTreeMap::new(),
             object_identities: BTreeMap::new(),
+            first_plan_objects: BTreeSet::new(),
             mutations: MutationCount::default(),
             token: PlanToken::default(),
         })
@@ -1440,7 +1455,6 @@ impl AttachPlan {
         counter_hint: bool,
     ) -> AttachPlan {
         let owned = self.active_keys_by_owner();
-        let known = self.known_objects();
         let mut rebuilt = build_from_sources_with(
             scanned,
             manifests,
@@ -1451,7 +1465,7 @@ impl AttachPlan {
                 slots: self.slots.len(),
                 active: &self.slot_by_key,
                 owned: &owned,
-                known: &known,
+                first_plan: Some(&self.first_plan_objects),
             },
             broad_admit,
             admission_policy,
@@ -1739,23 +1753,6 @@ impl AttachPlan {
         self.refused_module_objects
             .iter()
             .map(|(object, skipped)| (*object, skipped))
-    }
-
-    /// Every provider object this plan knew: admitted modules and refused
-    /// ones alike (a refused provider is still old news, and its presence
-    /// never quiesces a prefix on its own — the current merge's own
-    /// `provider_refused` covers that). A rebuild's quiescence check compares
-    /// its input against this set.
-    fn known_objects(&self) -> BTreeSet<PinnedObjectId> {
-        self.modules
-            .iter()
-            .map(|module| module.object)
-            .chain(
-                self.refused_module_objects
-                    .iter()
-                    .map(|(object, _)| *object),
-            )
-            .collect()
     }
 
     /// Every active exact target, under the object of each module that
@@ -2673,24 +2670,18 @@ fn merge(
     } else {
         // Named scope keeps first-come discovery order for providers, but a
         // recognized proxy closure array is decided last in every scope, so
-        // providers claim the room first; quiescence plus the reserve cap
-        // below keep an early prefix from crowding out a provider decoded
-        // later. Stable, so discovery order holds within each partition.
+        // providers claim the room first; the first-plan rule plus the
+        // reserve cap below keep an early prefix from crowding out a
+        // provider decoded later. Stable, so discovery order holds within
+        // each partition.
         order.sort_by_key(|&position| classes[position].0 == AdmissionClass::ClosureArray);
     }
     let reserve = shared_scope_reserve(capacity);
-    // Quiescence (PA-3): a closure-array prefix is admitted only after a
-    // discovery pass that finds no new provider object. Closure arrays are
-    // not providers, so they never reset quiescence — a remote-client-only
-    // capture quiesces at once and takes its prefix one pass later — while
-    // any provider object the previous plan never knew keeps the closure
-    // refused whole for this pass. An initial build knows no object, so a
-    // mixed initial input refuses the closure whole and prefixes on the
-    // first quiet rebuild.
-    let prefix_quiesced = classes.iter().enumerate().all(|(position, (class, _))| {
-        *class == AdmissionClass::ClosureArray
-            || allocated.known.contains(&groups[position][0].object)
-    });
+    // PA-5 C1: the heuristic closure prefix is allowed only for a closure
+    // object already mapped when the capture's first plan was built (the
+    // late-start case). A closure first mapped during the capture never gets
+    // the prefix; it admits only its publication-authorized tables below.
+    // Generic object identity only — no provider names, offsets or symbols.
     // Retired slots stay allocated for the capture lifetime and are never
     // reused; refusals say so apart from the active endpoints.
     let retired = allocated.slots.saturating_sub(existing_slots.len());
@@ -2710,38 +2701,62 @@ fn merge(
     let mut decisions: Vec<Option<AdmissionDecision>> = (0..groups.len()).map(|_| None).collect();
     let mut uncorroborated_candidates = 0u64;
     let mut allocated_slots = allocated.slots;
-    // Part 0: a closure array takes leftover room only when no real provider
-    // was refused whole ahead of it. Closures decide last, so this is known.
-    // Together with quiescence above, a prefix never hides a loss and never
-    // precedes a provider still arriving.
+    // PA-5 C1+M3: a closure array takes heuristic room only when no real
+    // provider was refused whole or omitted its growth ahead of it. Closures
+    // decide last, so this is known. A prefix never hides a loss.
     let mut provider_refused = false;
+    let mut provider_omitted = false;
     for position in order {
         let group = &groups[position];
         let object = group[0].object;
         let path = group[0].path;
         let (class, table_count) = classes[position];
-        // Part 0: a Detailed closure array with no provider refused ahead of
-        // it falls back to its leading-templates prefix when whole does not
-        // fit (remote-access clients have no backend; their templates are the
-        // only observation) — but only once the pass is quiescent, and only
-        // outside the reserve, so a provider decoded later still fits (up to
-        // the reserve; anything bigger is refused by name with the remedy).
-        // Otherwise a closure array is whole-or-nothing.
-        let closure_prefix_allowed = class == AdmissionClass::ClosureArray
+        let is_detailed_closure = class == AdmissionClass::ClosureArray
             && matches!(admission_policy, AdmissionPolicy::Detailed)
-            && !broad_admit
+            && !broad_admit;
+        // Late-start when the object was in the capture's first plan input.
+        // An initial build's input IS its first plan, so every closure it
+        // holds is late-start; a rebuild compares against the carried set.
+        let closure_late_start = match allocated.first_plan {
+            None => true,
+            Some(first) => first.contains(&object),
+        };
+        // PA-5 C1+C2+M3: a Detailed closure array in a named scope, late-
+        // start, with no provider refused or omitted ahead of it, falls back
+        // to its leading-templates prefix when whole does not fit — outside
+        // the reserve, so a provider decoded later still fits. Shared scope
+        // stays whole-or-nothing for closures (no prefix); a mid-capture
+        // closure admits only its published tables below, never a prefix.
+        let closure_prefix_allowed = is_detailed_closure
+            && !shared
+            && closure_late_start
             && !provider_refused
-            && prefix_quiesced;
-        // Shared scope: every module but an operator-attested one is admitted
-        // whole or not at all, and uncorroborated ones leave the reserve free.
-        // A proxy closure array is admitted whole or not at all unless Part 0
-        // prefix fallback applies (tried below on whole failure, reserve-
-        // capped in every scope once the pass is quiescent).
+            && !provider_omitted;
+        // PA-5 C2+M4: shared scope admits every non-operator module whole or
+        // not at all (closures included, no prefix); a Detailed closure
+        // admitted whole respects the reserve cap and the first-plan rule —
+        // mid-capture closures skip whole entirely for published-only below.
+        // Inventory/Counters and broad admit keep their complete-union whole.
         let whole_original = broad_admit
             || admission_policy.admits_complete_validated_union()
-            || class == AdmissionClass::ClosureArray
+            || (class == AdmissionClass::ClosureArray
+                && (!is_detailed_closure || closure_late_start))
             || (shared && class != AdmissionClass::Operator);
-        let reserved = shared && class.leaves_reserve();
+        // A Detailed closure's whole and prefix budgets leave the reserve
+        // free (M4); its published-only retry below uses the full budget, as
+        // do corroborated tables. Shared uncorroborated modules keep the
+        // reserve as before.
+        let reserved = if is_detailed_closure {
+            // Late-start starts whole (reserve-capped, M4); mid-capture
+            // starts published-only (full budget, corroborated tables).
+            // The retries below re-cap accordingly.
+            closure_late_start
+        } else {
+            shared && class.leaves_reserve()
+        };
+        // Mid-capture Detailed closures admit published tables only, never
+        // whole and never a heuristic prefix.
+        let closure_published_only_first = is_detailed_closure && !closure_late_start;
         let budget = GroupBudget {
             policy: admission_policy,
             ceiling: if reserved {
@@ -2785,22 +2800,32 @@ fn merge(
         // first pass spilled before the refusal would be counted again on
         // the retry — a double spill alongside the omission.
         let spill_baseline = uncorroborated_candidates;
-        // Part 0: whole is tried first; on whole failure a prefix-allowed
-        // closure retries once as a K4 prefix into the leftover room.
+        // PA-5 C1: late-start whole first; on whole failure a prefix-allowed
+        // closure retries as a K4 prefix, then (or directly, when the prefix
+        // is blocked or admits nothing) as published-tables-only. Mid-capture
+        // closures start published-only, never whole and never a prefix.
         let mut use_prefix_fallback = false;
+        let mut use_published_fallback = false;
         let outcome = 'admission: loop {
-            let whole = if closure_prefix_allowed && use_prefix_fallback {
+            let published_only = closure_published_only_first || use_published_fallback;
+            let whole = if published_only
+                || (closure_prefix_allowed && use_prefix_fallback)
+            {
                 false
             } else {
                 whole_original
             };
             let kept_only = refused_growth.is_some();
-            // Reserve (PA-3): a closure prefix never takes the reserve's
-            // slots, in a named scope either, so a provider decoded later
-            // still fits. Whole admission keeps the group's budget; only the
-            // prefix fallback is capped. A shared scope already caps these
-            // groups, so the minimum changes nothing there.
-            let budget = if closure_prefix_allowed && use_prefix_fallback {
+            // A closure prefix never takes the reserve's slots, so a provider
+            // decoded later still fits (M4: whole respects the cap too). The
+            // published-only retry uses the full budget: corroborated tables
+            // are not held out of the reserve.
+            let budget = if published_only {
+                GroupBudget {
+                    policy: admission_policy,
+                    ceiling: capacity,
+                }
+            } else if closure_prefix_allowed && use_prefix_fallback {
                 GroupBudget {
                     policy: admission_policy,
                     ceiling: budget.ceiling.min(capacity.saturating_sub(reserve)),
@@ -3028,6 +3053,23 @@ fn merge(
                             }
                             continue;
                         }
+                        // Published-only admits no new heuristic table: every
+                        // template spills as uncorroborated evidence, never
+                        // slots — except a table holding kept endpoints,
+                        // which routes to the kept-only retry (G-03) like any
+                        // other kept table. Kept-only retries skip this block
+                        // and preserve kept tables through the normal logic
+                        // below.
+                        if published_only && !kept_only {
+                            if let Some(demand) = kept_demand(key) {
+                                refused_top = Some(*key);
+                                break 'refused demand;
+                            }
+                            if refused_top != Some(*key) {
+                                uncorroborated_candidates += 1;
+                            }
+                            continue;
+                        }
                         // The kept-only retry after a refused growth admits
                         // every table that still lists a kept endpoint: kept
                         // endpoints need no new slot, so the cap must not
@@ -3090,19 +3132,29 @@ fn merge(
                         admitted.insert(*key);
                         heuristic_admitted += 1;
                     }
-                    if use_prefix_fallback {
-                        // F6: N counts every attached table — heuristic and
-                        // publication-authorized alike — so the report never
-                        // reads "0 of M" as partial while authorized tables
-                        // are attached. A fallback that attaches nothing is
-                        // impossible: whole covers the all-empty case, and
-                        // otherwise the fitting top table admits (first
-                        // heuristic when nothing is published).
-                        debug_assert!(
-                            !admitted.is_empty(),
-                            "a prefix fallback attaches at least one table"
-                        );
-                        closure_prefix = Some((admitted.len(), table_count));
+                    // PA-5 I4+M1: a prefix fallback that attaches nothing falls
+                    // through to the whole refusal below, never a "0 of M"
+                    // partial and never a panic. M counts every distinct
+                    // table, published and heuristic alike.
+                    if use_prefix_fallback && !published_only {
+                        if admitted.is_empty() {
+                            let full_union: BTreeSet<AttachKey> = keys_of
+                                .values()
+                                .flat_map(|keys| keys.iter().filter(|key| is_fresh(key)).copied())
+                                .collect();
+                            break 'refused full_union;
+                        }
+                        closure_prefix = Some((admitted.len(), ordered.len()));
+                    }
+                    // A published-only pass that admits nothing (no published
+                    // tables) is a whole refusal, never an empty admission:
+                    // the heuristic set stays refused whole with its demand.
+                    if published_only && admitted.is_empty() {
+                        let full_union: BTreeSet<AttachKey> = keys_of
+                            .values()
+                            .flat_map(|keys| keys.iter().filter(|key| is_fresh(key)).copied())
+                            .collect();
+                        break 'refused full_union;
                     }
                 }
                 break 'admission Ok((fresh, admitted, closure_prefix));
@@ -3140,14 +3192,24 @@ fn merge(
                 uncorroborated_candidates = spill_baseline;
                 continue 'admission;
             }
-            // Part 0: whole failed for a prefix-allowed closure with nothing
-            // to keep — retry once as a leading-templates prefix. Whole
-            // never spills, so the baseline reset is exact.
-            if closure_prefix_allowed && !use_prefix_fallback && kept.is_empty() {
-                use_prefix_fallback = true;
-                uncorroborated_candidates = spill_baseline;
-                refused_top = None;
-                continue 'admission;
+            // PA-5 C1: a late-start Detailed closure with nothing to keep
+            // retries whole, then prefix (when allowed), then published-only.
+            // Whole never spills, so the baseline resets are exact. Shared
+            // scope and prefix-blocked closures retry published-only
+            // directly; mid-capture closures start there and never retry.
+            if is_detailed_closure && closure_late_start && kept.is_empty() {
+                if closure_prefix_allowed && !use_prefix_fallback && !use_published_fallback {
+                    use_prefix_fallback = true;
+                    uncorroborated_candidates = spill_baseline;
+                    refused_top = None;
+                    continue 'admission;
+                }
+                if !use_published_fallback {
+                    use_published_fallback = true;
+                    uncorroborated_candidates = spill_baseline;
+                    refused_top = None;
+                    continue 'admission;
+                }
             }
             break 'admission Err(refused);
         };
@@ -3177,6 +3239,15 @@ fn merge(
                 continue;
             }
         };
+        // PA-5 M3: a provider growth omission blocks the closure prefix
+        // below — a prefix never hides a loss. Zero-demand preservation
+        // (no record) does not block.
+        if class != AdmissionClass::ClosureArray
+            && let Some(demand) = &refused_growth
+            && !demand.is_empty()
+        {
+            provider_omitted = true;
+        }
         allocated_slots = admission_policy
             .checked_required(allocated_slots, fresh.len())
             .expect("admitted target union was checked before allocation");
@@ -3418,6 +3489,11 @@ fn merge(
             // snapshot stays COMPLETE. Non-empty demand always leaves the
             // total non-empty, so explicit refusals are unchanged.
             if !omitted.is_empty() {
+                // PA-5 M5: the holder list names what holds the room the
+                // growth needed — never the omitted module's own kept
+                // endpoints.
+                let mut holders_map = holding.clone();
+                holders_map.remove(&object);
                 let omission = Skipped {
                     subject: path.to_string(),
                     reason: growth_omission_reason(&GrowthOmission {
@@ -3427,7 +3503,7 @@ fn merge(
                         retired,
                         kept: kept_attached.len(),
                         policy: admission_policy,
-                        holders: &slot_holders(&holding, &paths),
+                        holders: &slot_holders(&holders_map, &paths),
                         provider_remedies: class != AdmissionClass::ClosureArray,
                         counter_hint,
                     }),
@@ -3494,6 +3570,10 @@ fn merge(
     plan.vendor_interfaces = vendor_interfaces;
     plan.interface_list = interface_list;
     plan.admission_scope = admission_scope;
+    plan.first_plan_objects = match allocated.first_plan {
+        Some(first) => first.clone(),
+        None => paths.keys().copied().collect(),
+    };
     plan
 }
 
@@ -3507,7 +3587,7 @@ pub fn build_from_reconciled_modules(modules: &[ReconciledModule]) -> AttachPlan
             slots: 0,
             active: &BTreeMap::new(),
             owned: &BTreeMap::new(),
-            known: &BTreeSet::new(),
+            first_plan: None,
         },
         false,
         AdmissionPolicy::detailed(),
@@ -3854,7 +3934,7 @@ fn build_from_sources_with_policy(
             slots: 0,
             active: &BTreeMap::new(),
             owned: &BTreeMap::new(),
-            known: &BTreeSet::new(),
+            first_plan: None,
         },
         broad_admit,
         admission_policy,
@@ -3874,12 +3954,10 @@ struct ExistingAllocation<'a> {
     /// `active`, under the object of each module that currently owns a
     /// target: a module listed here is already admitted (G-03).
     owned: &'a BTreeMap<PinnedObjectId, BTreeSet<AttachKey>>,
-    /// Every provider object the previous plan knew: admitted modules and
-    /// refused ones alike. A provider object missing here is new to this
-    /// pass, so the pass is not quiescent and no closure prefix is admitted.
-    /// Empty for an initial build, which therefore admits a prefix only when
-    /// its input holds no provider object at all.
-    known: &'a BTreeSet<PinnedObjectId>,
+    /// Objects in the capture's first plan input (`None` for an initial
+    /// build, whose input IS the first plan). A closure array gets its
+    /// heuristic prefix only when its object is here (PA-5 C1).
+    first_plan: Option<&'a BTreeSet<PinnedObjectId>>,
 }
 
 /// The standard manifest lookups over live pins: manifest keys resolve to
@@ -3968,7 +4046,7 @@ fn build_from_test_sources_with_policy(
             slots: 0,
             active: &BTreeMap::new(),
             owned: &BTreeMap::new(),
-            known: &BTreeSet::new(),
+            first_plan: None,
         },
         false,
         admission_policy,
@@ -4189,7 +4267,7 @@ fn build(m: &Manifest) -> AttachPlan {
             slots: 0,
             active: &BTreeMap::new(),
             owned: &BTreeMap::new(),
-            known: &BTreeSet::new(),
+            first_plan: None,
         },
         false,
         AdmissionPolicy::detailed(),
@@ -5961,6 +6039,7 @@ impl ConservativePlanCursor {
         out.vendor_interfaces = old.vendor_interfaces;
         out.interface_list = old.interface_list.clone();
         out.counter_consumed_end = old.counter_consumed_end;
+        out.first_plan_objects = old.first_plan_objects.clone();
         out.uncorroborated_candidates = if self.broad_admit {
             0
         } else {
@@ -7374,7 +7453,7 @@ mod tests {
                 slots: 0,
                 active: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
-                known: &BTreeSet::new(),
+                first_plan: None,
             },
             false,
             AdmissionPolicy::detailed(),
@@ -7510,7 +7589,7 @@ mod tests {
                 slots: 0,
                 active: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
-                known: &BTreeSet::new(),
+                first_plan: None,
             },
             false,
             AdmissionPolicy::detailed(),
@@ -7555,7 +7634,7 @@ mod tests {
                 slots: 0,
                 active: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
-                known: &BTreeSet::new(),
+                first_plan: None,
             },
             false,
             AdmissionPolicy::detailed(),
@@ -9162,10 +9241,10 @@ mod tests {
         );
         assert!(
             omission.reason.contains(&format!(
-                "{MAX_SLOTS} are in use ({MAX_SLOTS} active, 0 retired; held by /proc/self/fd/10 \
-                 {MAX_SLOTS}) — 2 endpoints not attached; kept its {MAX_SLOTS} attached endpoints"
+                "{MAX_SLOTS} are in use ({MAX_SLOTS} active, 0 retired) — 2 endpoints not \
+                 attached; kept its {MAX_SLOTS} attached endpoints"
             )),
-            "{omission:?}"
+            "M5: the holder list excludes the omitted module itself: {omission:?}"
         );
         assert!(
             omission.reason.contains("--exclude-module"),
@@ -10552,7 +10631,7 @@ mod tests {
                 slots: plan.slots.len(),
                 active: &plan.slot_by_key,
                 owned: &plan.active_keys_by_owner(),
-                known: &plan.known_objects(),
+                first_plan: Some(&plan.first_plan_objects),
             },
             false,
             AdmissionPolicy::detailed(),
@@ -11793,7 +11872,7 @@ mod tests {
                 slots: 0,
                 active: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
-                known: &BTreeSet::new(),
+                first_plan: None,
             },
             true,
             AdmissionPolicy::detailed(),
@@ -11833,7 +11912,7 @@ mod tests {
                 slots: 0,
                 active: &BTreeMap::new(),
                 owned: &BTreeMap::new(),
-                known: &BTreeSet::new(),
+                first_plan: None,
             },
             false,
             AdmissionPolicy::detailed(),
@@ -11968,10 +12047,9 @@ mod tests {
     /// GT-5, the stock-desktop shape: an ambient `libp11-kit` decoding 64
     /// closure tables, ambient `p11-kit-trust`, and the SoftHSM2 the workload
     /// uses, all heuristic. Both scopes admit both single-table providers in
-    /// every discovery order. Quiescence holds the closure refused whole
-    /// while the providers are new; once the set settles, the family takes
-    /// the leftover room as a reserve-capped prefix with a named partial gap
-    /// (Part 0).
+    /// every discovery order. PA-5 C1+C2: the late-start closure takes a
+    /// reserve-capped prefix immediately in a named scope, and stays
+    /// whole-or-nothing (refused whole, no prefix) in a shared scope.
     #[test]
     fn shared_scope_admits_single_table_providers_ahead_of_a_proxy_closure_array() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
@@ -11983,26 +12061,14 @@ mod tests {
         assert_eq!(named.admission_scope(), AdmissionScope::Named);
         assert_eq!(slots_of(&named, 32), 68, "named scope admits p11-kit-trust");
         assert_eq!(slots_of(&named, 33), 68, "named scope admits SoftHSM");
+        // 136 in use, reserve-capped ceiling 384: 2 tables (206) fit, the
+        // 3rd would take the reserve. Late-start prefix immediate.
         assert_eq!(
             slots_of(&named, 31),
-            0,
-            "no prefix while the providers are new"
-        );
-        let whole = refusal_of(&named, P11_KIT).expect("closure refused whole");
-        assert!(
-            whole.reason.contains("admitted whole or not at all"),
-            "{}",
-            whole.reason
-        );
-        let settled = named.rebuild_from_sources(&mixed, &[], &PinnedObjects::empty());
-        // 136 in use, reserve-capped ceiling 384: 2 tables (206) fit, the
-        // 3rd would take the reserve.
-        assert_eq!(
-            slots_of(&settled, 31),
             2 * 103,
-            "named scope prefix one pass later"
+            "late-start prefix after providers"
         );
-        let named_partial = refusal_of(&settled, P11_KIT).expect("prefix partial");
+        let named_partial = refusal_of(&named, P11_KIT).expect("prefix partial");
         assert!(
             named_partial
                 .reason
@@ -12035,49 +12101,36 @@ mod tests {
                 68,
                 "p11-kit-trust admitted: {label:?}"
             );
+            // PA-5 C2: shared scope stays whole-or-nothing for closures —
+            // refused whole, never a prefix, even after settling.
             assert_eq!(
                 slots_of(&shared, 31),
                 0,
-                "no prefix while the providers are new: {label:?}"
+                "shared closure refused whole: {label:?}"
+            );
+            let whole = refusal_of(&shared, P11_KIT).expect("closure refused whole");
+            assert!(
+                is_closure_array_refusal(&whole.reason),
+                "{:?}",
+                whole.reason
             );
             let settled = shared.rebuild_from_sources(&modules, &[], &PinnedObjects::empty());
-            // Shared reserve 128, ceiling 384 for uncorroborated: 136 in use,
-            // 248 open — 2 tables (206) fit, the 3rd does not.
             assert_eq!(
                 slots_of(&settled, 31),
-                2 * 103,
-                "closure prefix in leftover room: {label:?}"
-            );
-            assert_eq!(
-                settled.modules_skipped.len(),
-                1,
-                "{:?}",
-                settled.modules_skipped
-            );
-            let partial = refusal_of(&settled, P11_KIT).expect("prefix partial");
-            assert!(
-                partial.reason.contains("2 of 64 template tables attached"),
-                "{}",
-                partial.reason
+                0,
+                "shared closure stays refused whole: {label:?}"
             );
             assert!(
-                partial
-                    .reason
-                    .contains("calls through the others are not counted"),
-                "{}",
-                partial.reason
-            );
-            assert_eq!(
-                settled.uncorroborated_candidates, 62,
-                "the 62 spilled templates: {label:?}"
+                refusal_of(&settled, P11_KIT).is_some(),
+                "whole refusal persists: {label:?}"
             );
         }
     }
 
     /// Named scope defers a proxy closure array behind real providers: a
-    /// heuristic backend admitted in every discovery order, the closure
-    /// refused whole while it is new, and a reserve-capped leading-templates
-    /// prefix with a named partial gap (Part 0) once the set settles.
+    /// heuristic backend admitted in every discovery order, and the
+    /// late-start closure takes a reserve-capped leading-templates prefix
+    /// with a named partial gap immediately after them.
     #[test]
     fn named_scope_admits_a_heuristic_provider_ahead_of_a_proxy_closure_array() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
@@ -12092,19 +12145,14 @@ mod tests {
                 68,
                 "the backend is admitted: {label:?}"
             );
+            // 68 in use, reserve-capped ceiling 384: 3 tables (309) fit.
+            // Late-start prefix immediate (PA-5 C1, no quiescence).
             assert_eq!(
                 slots_of(&named, 31),
-                0,
-                "no prefix while the backend is new: {label:?}"
-            );
-            let settled = named.rebuild_from_sources(modules, &[], &PinnedObjects::empty());
-            // 68 in use, reserve-capped ceiling 384: 3 tables (309) fit.
-            assert_eq!(
-                slots_of(&settled, 31),
                 3 * 103,
-                "closure prefix one pass later: {label:?}"
+                "late-start prefix after the backend: {label:?}"
             );
-            let partial = refusal_of(&settled, P11_KIT).expect("prefix partial reported");
+            let partial = refusal_of(&named, P11_KIT).expect("prefix partial reported");
             assert!(
                 partial.reason.contains("3 of 64 template tables attached"),
                 "{}",
@@ -12118,15 +12166,15 @@ mod tests {
                 partial.reason
             );
             assert_eq!(
-                settled.uncorroborated_candidates, 61,
+                named.uncorroborated_candidates, 61,
                 "the 61 spilled templates: {label:?}"
             );
         }
     }
 
     /// The corroborated twin: a backend with publication evidence is admitted
-    /// ahead of the closure array too, in every discovery order; the prefix
-    /// follows one pass later, reserve-capped.
+    /// ahead of the closure array too, in every discovery order; the
+    /// late-start prefix follows immediately after, reserve-capped.
     #[test]
     fn named_scope_admits_a_corroborated_provider_ahead_of_a_proxy_closure_array() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
@@ -12138,16 +12186,10 @@ mod tests {
             assert_eq!(slots_of(&named, 32), 68, "corroborated backend: {label:?}");
             assert_eq!(
                 slots_of(&named, 31),
-                0,
-                "no prefix while the backend is new: {label:?}"
-            );
-            let settled = named.rebuild_from_sources(modules, &[], &PinnedObjects::empty());
-            assert_eq!(
-                slots_of(&settled, 31),
                 3 * 103,
-                "closure prefix one pass later: {label:?}"
+                "late-start prefix after the backend: {label:?}"
             );
-            let partial = refusal_of(&settled, P11_KIT).expect("prefix partial: {label:?}");
+            let partial = refusal_of(&named, P11_KIT).expect("prefix partial: {label:?}");
             assert!(
                 partial.reason.contains("3 of 64 template tables attached"),
                 "{}",
@@ -12180,22 +12222,15 @@ mod tests {
 
             assert_eq!(slots_of(&named, 32), 68, "p11-kit-trust: {label:?}");
             assert_eq!(slots_of(&named, 33), 68, "SoftHSM: {label:?}");
+            // 136 in use, reserve-capped ceiling 384: 2 tables (206) fit,
+            // the 3rd would take the reserve. Late-start prefix immediate.
             assert_eq!(
                 slots_of(&named, 31),
-                0,
-                "no prefix while the backends are new: {label:?}"
+                2 * 103,
+                "late-start prefix after backends: {label:?}"
             );
             assert_eq!(named.modules_skipped.len(), 1, "{label:?}");
-            let settled = named.rebuild_from_sources(&modules, &[], &PinnedObjects::empty());
-            // 136 in use, reserve-capped ceiling 384: 2 tables (206) fit,
-            // the 3rd would take the reserve.
-            assert_eq!(
-                slots_of(&settled, 31),
-                2 * 103,
-                "closure prefix one pass later: {label:?}"
-            );
-            assert_eq!(settled.modules_skipped.len(), 1, "{label:?}");
-            let partial = refusal_of(&settled, P11_KIT).expect("prefix partial: {label:?}");
+            let partial = refusal_of(&named, P11_KIT).expect("prefix partial: {label:?}");
             assert!(
                 partial.reason.contains("2 of 64 template tables attached"),
                 "{}",
@@ -12237,11 +12272,8 @@ mod tests {
         assert!(refusal_of(&named, SOFTHSM).is_some());
         let refusal = refusal_of(&named, P11_KIT).expect("closure refused whole");
         assert!(
-            refusal.reason.contains(
-                "refusing to attach a prefix of its 64 lookalike function tables \
-                 (a proxy closure array is admitted whole or not at all)"
-            ),
-            "{}",
+            refusal.reason.contains("as a prefix when first seen"),
+            "M2 reword: {}",
             refusal.reason
         );
     }
@@ -12305,10 +12337,9 @@ mod tests {
         assert_eq!(slots_of(&rebuilt, 31), 3 * 103, "prefix kept, not grown");
     }
 
-    /// F1 quiescence: a closure-array prefix is admitted only after a pass
-    /// with no new provider object. Providers still arriving means the
-    /// closure waits one pass: refused whole beside them, prefixed once the
-    /// set settles.
+    /// PA-5 C1: a mid-capture closure never takes a heuristic prefix, even
+    /// after the set settles. The provider is admitted at once; the closure
+    /// stays refused whole (no published tables here), never silent.
     #[test]
     fn closure_waits_one_pass_while_providers_are_still_arriving() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
@@ -12324,7 +12355,7 @@ mod tests {
         assert_eq!(
             slots_of(&arriving, 31),
             0,
-            "no prefix while a provider is new"
+            "mid-capture closure takes no prefix"
         );
         assert!(
             refusal_of(&arriving, P11_KIT).is_some(),
@@ -12334,12 +12365,14 @@ mod tests {
         let settled =
             arriving.rebuild_from_sources(&[p11_kit, trust], &[], &PinnedObjects::empty());
         assert_eq!(slots_of(&settled, 32), 68);
-        assert_eq!(slots_of(&settled, 31), 3 * 103, "prefix one pass later");
-        let partial = refusal_of(&settled, P11_KIT).expect("prefix partial reported");
+        assert_eq!(
+            slots_of(&settled, 31),
+            0,
+            "mid-capture closure never prefixes, even settled"
+        );
         assert!(
-            partial.reason.contains("3 of 64 template tables attached"),
-            "{}",
-            partial.reason
+            refusal_of(&settled, P11_KIT).is_some(),
+            "whole refusal persists, never a prefix"
         );
     }
 
@@ -12370,26 +12403,26 @@ mod tests {
     /// F6: the prefix report counts every attached table. A closure with one
     /// publication-authorized table beside its 64 heuristic templates
     /// reports the authorized table in N: one heuristic admitted plus the
-    /// authorized one reads "2 of 64", never "1 of 64".
+    /// authorized one reads "2 of 65" (M1: distinct tables), never "1 of 65".
+    /// Late-start (both in the first plan) so the prefix applies.
     #[test]
     fn closure_prefix_counts_authorized_tables_in_its_reported_total() {
         let filler = provider_with_tables(50, "/opt/filler.so", 1, 200, true);
         let mut closure = provider_with_tables(31, P11_KIT, 65, 68, false);
         closure.scanned.tables[64].live_return = true;
-        let first = scoped_plan(std::slice::from_ref(&filler), AdmissionScope::Named);
-        let settled = first.rebuild_from_sources(&[filler, closure], &[], &PinnedObjects::empty());
+        let first = scoped_plan(&[filler, closure], AdmissionScope::Named);
 
-        assert_eq!(slots_of(&settled, 50), 200);
+        assert_eq!(slots_of(&first, 50), 200);
         // 200 in use, authorized 68 (268), then one heuristic (336); the
         // next would need 404 of the reserve-capped 384.
-        assert_eq!(slots_of(&settled, 31), 2 * 68);
+        assert_eq!(slots_of(&first, 31), 2 * 68);
         assert_eq!(
-            settled.uncorroborated_candidates, 63,
+            first.uncorroborated_candidates, 63,
             "63 heuristic templates spill"
         );
-        let partial = refusal_of(&settled, P11_KIT).expect("prefix partial reported");
+        let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
         assert!(
-            partial.reason.contains("2 of 64 template tables attached"),
+            partial.reason.contains("2 of 65 template tables attached"),
             "one heuristic plus the authorized table: {}",
             partial.reason
         );
@@ -12397,7 +12430,8 @@ mod tests {
 
     /// F6: the prefix report never reads "0 of M" as partial. Authorized
     /// tables attached while every heuristic template spills report "1 of
-    /// 64", not a zero partial with slots attached.
+    /// 65" (M1), not a zero partial with slots attached. Late-start so the
+    /// prefix applies.
     #[test]
     fn closure_prefix_never_reports_zero_of_m_as_partial() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
@@ -12426,23 +12460,22 @@ mod tests {
             manifest_supported: false,
         });
         closure.entry_objects.push(vec![closure.object; 68]);
-        let first = scoped_plan(std::slice::from_ref(&filler), AdmissionScope::Named);
-        let settled = first.rebuild_from_sources(&[filler, closure], &[], &PinnedObjects::empty());
+        let first = scoped_plan(&[filler, closure], AdmissionScope::Named);
 
-        assert_eq!(slots_of(&settled, 50), 250);
+        assert_eq!(slots_of(&first, 50), 250);
         assert_eq!(
-            slots_of(&settled, 31),
+            slots_of(&first, 31),
             68,
             "only the authorized table attaches"
         );
-        let partial = refusal_of(&settled, P11_KIT).expect("prefix partial reported");
+        let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
         assert!(
-            partial.reason.contains("1 of 64 template tables attached"),
+            partial.reason.contains("1 of 65 template tables attached"),
             "{}",
             partial.reason
         );
         assert!(
-            !partial.reason.contains("0 of 64"),
+            !partial.reason.contains("0 of "),
             "never a zero partial: {}",
             partial.reason
         );
@@ -12458,13 +12491,9 @@ mod tests {
         let small = provider_with_tables(32, "/opt/small.so", 1, 68, false);
         let first = scoped_plan(&[p11_kit.clone(), small.clone()], AdmissionScope::Named);
         assert_eq!(slots_of(&first, 32), 68);
-        assert_eq!(
-            slots_of(&first, 31),
-            0,
-            "no prefix while the provider is new"
-        );
+        assert_eq!(slots_of(&first, 31), 3 * 103, "late-start prefix immediate");
         let settled = first.rebuild_from_sources(&[p11_kit, small], &[], &PinnedObjects::empty());
-        assert_eq!(slots_of(&settled, 31), 3 * 103, "prefix one pass later");
+        assert_eq!(slots_of(&settled, 31), 3 * 103, "prefix kept");
         // The provider's table grows past the room the prefix leaves: its
         // 68 endpoints stay, the 182 new ones are omitted by name.
         let grown = provider_with_tables(32, "/opt/small.so", 1, 250, false);
@@ -12944,24 +12973,18 @@ mod tests {
         for modules in [&[nss.clone(), closure.clone()], &[closure, nss]] {
             let plan = scoped_plan(modules, AdmissionScope::Shared);
             assert_eq!(slots_of(&plan, 83), 66, "the provider admits whole");
-            assert_eq!(
-                slots_of(&plan, 82),
-                0,
-                "no prefix while the provider is new"
-            );
+            // PA-5 C2: shared scope stays whole-or-nothing for closures —
+            // refused whole, never a prefix, even after settling.
+            assert_eq!(slots_of(&plan, 82), 0, "shared closure refused whole");
             let settled = plan.rebuild_from_sources(modules, &[], &PinnedObjects::empty());
-            // Part 0: 66 in use, 318 open under the 384 ceiling — 4 tables
-            // (256) fit, the 5th spills as a named partial gap.
             assert_eq!(
                 slots_of(&settled, 82),
-                4 * entries,
-                "closure prefix one pass later"
+                0,
+                "shared closure stays refused whole"
             );
-            let partial = refusal_of(&settled, P11_KIT).expect("prefix partial");
             assert!(
-                partial.reason.contains("4 of 5 template tables attached"),
-                "{}",
-                partial.reason
+                refusal_of(&settled, P11_KIT).is_some(),
+                "whole refusal persists, never a prefix"
             );
             assert!(
                 refusal_of(&settled, "/opt/nss-softokn.so").is_none(),
@@ -12997,6 +13020,224 @@ mod tests {
         let (class, lookalikes) = admission_class(&[lower_scanned(&mixed)]);
         assert_eq!(class, AdmissionClass::ClosureArray);
         assert_eq!(lookalikes, 60);
+    }
+
+    const OPENSC: &str = "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so";
+
+    /// PA-5 C1 main twin (reviewer's probe): a closure-first pass, then
+    /// trust, softhsm and opensc(104), each in its own rebuild with quiet
+    /// rebuilds in between. All three must be admitted in full in `run`,
+    /// Detailed and named scope; the mid-capture closure takes no prefix.
+    #[test]
+    fn closure_first_then_three_backends_each_in_own_rebuild_admits_all() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let opensc = provider_with_tables(34, OPENSC, 1, 104, false);
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let first = empty.rebuild_from_sources(
+            std::slice::from_ref(&p11_kit),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let quiet = first.rebuild_from_sources(
+            std::slice::from_ref(&p11_kit),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let with_trust = quiet.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let quiet = with_trust.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let with_softhsm = quiet.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone(), softhsm.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let quiet = with_softhsm.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone(), softhsm.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let all = quiet.rebuild_from_sources(
+            &[p11_kit, trust, softhsm, opensc],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(slots_of(&all, 32), 68, "trust admitted in full");
+        assert_eq!(slots_of(&all, 33), 68, "softhsm admitted in full");
+        assert_eq!(
+            slots_of(&all, 34),
+            104,
+            "opensc admitted in full, not starved by the prefix"
+        );
+        assert_eq!(
+            slots_of(&all, 31),
+            0,
+            "mid-capture closure takes no heuristic prefix"
+        );
+    }
+
+    /// PA-5 C1 late-start twin (`--pid` on a running process): the closure
+    /// and providers are all mapped before the first plan. The prefix is
+    /// admitted after the providers, and nothing is starved.
+    #[test]
+    fn late_start_first_plan_admits_prefix_after_providers_without_starvation() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let mixed = [p11_kit, trust, softhsm];
+        let first = scoped_plan(&mixed, AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 32), 68, "trust admitted");
+        assert_eq!(slots_of(&first, 33), 68, "softhsm admitted");
+        // 136 in use, reserve-capped ceiling 384: 2 tables (206) fit.
+        assert_eq!(
+            slots_of(&first, 31),
+            2 * 103,
+            "late-start prefix admitted after providers"
+        );
+        let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("template tables attached"),
+            "{}",
+            partial.reason
+        );
+    }
+
+    /// PA-5 C2 twin (reviewer's probe): shared scope stays whole-or-nothing
+    /// for closures, and a later heuristic provider still fits.
+    #[test]
+    fn shared_scope_closure_whole_or_nothing_leaves_room_for_later_provider() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let opensc = provider_with_tables(34, OPENSC, 1, 104, false);
+        let mixed = [p11_kit.clone(), trust.clone(), softhsm.clone()];
+        let first = scoped_plan(&mixed, AdmissionScope::Shared);
+        let settled = first.rebuild_from_sources(&mixed, &[], &PinnedObjects::empty());
+        assert_eq!(
+            slots_of(&settled, 31),
+            0,
+            "shared closure takes no prefix slots"
+        );
+        let later = settled.rebuild_from_sources(
+            &[p11_kit, trust, softhsm, opensc],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(
+            slots_of(&later, 34),
+            104,
+            "later heuristic provider fits in shared scope"
+        );
+        assert_eq!(
+            slots_of(&later, 31),
+            0,
+            "shared closure stays whole-or-nothing"
+        );
+    }
+
+    /// PA-5 C1 published-tables-only twin: a mid-capture closure admits only
+    /// its publication-authorized tables, never the heuristic prefix.
+    #[test]
+    fn mid_capture_closure_admits_only_its_published_tables() {
+        let mut closure = provider_with_tables(31, P11_KIT, 65, 68, false);
+        closure.scanned.tables[64].live_return = true;
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let first = empty.rebuild_from_sources(
+            std::slice::from_ref(&closure),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(
+            slots_of(&first, 31),
+            68,
+            "only the published table attaches, no heuristic prefix"
+        );
+        assert!(
+            refusal_of(&first, P11_KIT).is_none(),
+            "published-only admission carries no prefix record: {:?}",
+            first.modules_skipped
+        );
+        assert_eq!(
+            first.uncorroborated_candidates, 64,
+            "the 64 heuristic templates spill as evidence"
+        );
+    }
+
+    /// PA-5 I4 twin (reviewer's panic probe): an empty-target leading table
+    /// (all entries unpinned) passes the top-table check, then the next
+    /// table does not fit, so the prefix fallback admits nothing and must
+    /// fall through to the whole refusal instead of panicking or emitting
+    /// a "0 of M" partial.
+    #[test]
+    fn prefix_fallback_with_empty_leading_table_falls_through_to_whole_refusal() {
+        let filler = provider_with_tables(50, "/opt/filler.so", 1, 300, true);
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 100, false);
+        let moved: Vec<Skipped> = closure.scanned.tables[0]
+            .entries
+            .iter()
+            .map(|_| Skipped {
+                subject: P11_KIT.to_string(),
+                reason: "entry target not pinned".to_string(),
+            })
+            .collect();
+        closure.scanned.tables[0].entries.clear();
+        closure.scanned.tables[0].unpinned = moved;
+        closure.entry_objects[0].clear();
+        let first = scoped_plan(&[filler.clone(), closure.clone()], AdmissionScope::Named);
+        let settled = first.rebuild_from_sources(&[filler, closure], &[], &PinnedObjects::empty());
+        assert!(
+            !settled
+                .modules_skipped
+                .iter()
+                .any(|s| s.reason.starts_with("0 of ")),
+            "never a zero partial: {:?}",
+            settled.modules_skipped
+        );
+        // Late-start closure (in the first plan) with no admitted tables:
+        // the whole refusal, not a prefix.
+        let refusal = refusal_of(&settled, P11_KIT).expect("whole refusal recorded");
+        assert!(
+            is_closure_array_refusal(&refusal.reason),
+            "falls through to the whole refusal: {}",
+            refusal.reason
+        );
+    }
+
+    /// PA-5 I5 churn twin (reviewer's probe): shared scope, the last process
+    /// mapping the closure exits (empty input) and another starts (mixed
+    /// input again). With C2 whole-or-nothing the churn spends no slots.
+    #[test]
+    fn shared_scope_closure_churn_spends_no_slots() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, true);
+        let mixed = [p11_kit.clone(), trust.clone()];
+        let mut plan = scoped_plan(&mixed, AdmissionScope::Shared);
+        plan = plan.rebuild_from_sources(&mixed, &[], &PinnedObjects::empty());
+        let settled = plan.slots.len();
+        for _ in 1..=3 {
+            plan = plan.rebuild_from_sources(&[], &[], &PinnedObjects::empty());
+            plan = plan.rebuild_from_sources(&mixed, &[], &PinnedObjects::empty());
+            plan = plan.rebuild_from_sources(&mixed, &[], &PinnedObjects::empty());
+        }
+        assert_eq!(
+            slots_of(&plan, 31),
+            0,
+            "churned closure holds no slots in shared scope"
+        );
+        assert_eq!(
+            plan.slots.len(),
+            settled,
+            "churn spends no fresh slots: settled {settled}, now {}",
+            plan.slots.len()
+        );
     }
 
     #[test]

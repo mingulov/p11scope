@@ -18,6 +18,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,7 +30,7 @@ SCRIPT = ROOT / "scripts/ci/joint-throughput.sh"
 def run_script(argv, env=None, timeout=60):
     base = {key: value for key, value in os.environ.items()
             if key not in ("RATE", "DURATION", "MIN_RATE", "CELLS",
-                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT")}
+                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT", "STAGE_TIMINGS")}
     if env:
         base.update(env)
     return subprocess.run([str(SCRIPT), *argv], capture_output=True,
@@ -43,7 +44,7 @@ def run_sourced(shell, env=None, timeout=60):
     """
     base = {key: value for key, value in os.environ.items()
             if key not in ("RATE", "DURATION", "MIN_RATE", "CELLS",
-                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT")}
+                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT", "STAGE_TIMINGS")}
     if env:
         base.update(env)
     base["JOINT_TP_SOURCED"] = "1"
@@ -134,6 +135,17 @@ class CellScriptLibrary(unittest.TestCase):
             proc = run_sourced('observer_env', env=env)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.strip(), "", env)
+
+    def test_observer_env_passes_the_stage_timings_toggle(self):
+        proc = run_sourced('observer_env', env={"STAGE_TIMINGS": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "P11SCOPE_STAGE_TIMINGS=1")
+        proc = run_sourced('observer_env',
+                           env={"SETTLEMENT_LAT": "1", "STAGE_TIMINGS": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines(),
+                         ["P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY=1",
+                          "P11SCOPE_STAGE_TIMINGS=1"])
 
     def test_select_provider_finds_a_live_library(self):
         proc = run_sourced('select_provider')
@@ -422,6 +434,148 @@ class ResultsRows(unittest.TestCase):
                 self.assertIs(row["pass"], False)
                 self.assertEqual(row["qualification"], "nonqualifying")
                 self.assertIn("no gcc", row["detail"])
+
+
+class EmitterLedgerCeiling(unittest.TestCase):
+    """The 10k/60s run needs 600k calls; the toolchain must allow it."""
+
+    NEEDED = 10_000 * 60
+
+    def _read_define(self, path, name):
+        text = (ROOT / path).read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.startswith(f"#define {name} "):
+                return int(line.split()[2].rstrip("ulUL"))
+        raise AssertionError(f"{name} not found in {path}")
+
+    def _read_py_const(self, path, name):
+        text = (ROOT / path).read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.startswith(f"{name} = "):
+                return int(line.split("=")[1].strip())
+        raise AssertionError(f"{name} not found in {path}")
+
+    def test_ceilings_cover_10k_60s(self):
+        emitter = self._read_define(
+            "tests/fixtures/joint-throughput/gen-calls.c",
+            "MAX_CALLS_PER_LEDGER")
+        per_call = self._read_define(
+            "tests/fixtures/joint-ledger/per-call-ledger.c", "MAX_CALLS")
+        oracle = self._read_py_const(
+            "scripts/joint-ledger-oracle.py", "MAX_CALLS")
+        events = self._read_py_const(
+            "scripts/s1-throughput-compare.py", "MAX_EVENT_ROWS")
+        self.assertGreaterEqual(emitter, self.NEEDED)
+        self.assertGreaterEqual(per_call, self.NEEDED)
+        self.assertGreaterEqual(oracle, self.NEEDED)
+        self.assertGreaterEqual(events, self.NEEDED)
+        self.assertEqual(emitter, oracle)
+        self.assertEqual(per_call, oracle)
+
+    def test_dry_run_accepts_10k_60s(self):
+        with tempfile.TemporaryDirectory(prefix="jtp-ceil-") as tmp:
+            proc = run_sourced(f'build_emitter "{tmp}/bin"', timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            binary = Path(tmp) / "bin" / "gen-calls"
+            for mode in ("keyed", "keyed-churn"):
+                dry = subprocess.run(
+                    [str(binary), "--dry-run", "/nonexistent-provider.so",
+                     mode, "10k", "60", f"{tmp}/ledger.jsonl"],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(dry.returncode, 0, dry.stderr)
+                self.assertIn("600000 calls", dry.stdout)
+
+
+class BpfEvidenceSum(unittest.TestCase):
+    """Sum EVIDENCE[0] (ring loss) over CPUs and maps from bpftool JSON."""
+
+    HELPER = ROOT / "scripts/bpf-evidence-sum.py"
+
+    def _run_helper(self, show_json, dumps, timeout=30):
+        with tempfile.TemporaryDirectory(prefix="bpf-ev-") as tmp:
+            show = Path(tmp) / "show.json"
+            show.write_text(show_json, encoding="utf-8")
+            args = [sys.executable, "-I", str(self.HELPER), "--show", str(show)]
+            for map_id, dump_json in dumps.items():
+                dump = Path(tmp) / f"dump-{map_id}.json"
+                dump.write_text(dump_json, encoding="utf-8")
+                args += ["--dump", f"{map_id}={dump}"]
+            return subprocess.run(args, capture_output=True, text=True,
+                                  timeout=timeout)
+
+    def test_sums_key_zero_over_cpus_and_maps(self):
+        show = json.dumps([
+            {"id": 11, "name": "EVIDENCE", "max_entries": 9},
+            {"id": 12, "name": "EVIDENCE", "max_entries": 9},
+            {"id": 13, "name": "EVENTS", "max_entries": 4},
+        ])
+        dumps = {
+            11: json.dumps([
+                {"key": [0, 0, 0, 0], "values": [3, 0, 7, 0]},
+                {"key": [1, 0, 0, 0], "values": [99, 99, 99, 99]},
+            ]),
+            12: json.dumps([
+                {"key": [0, 0, 0, 0], "values": [1, 1, 1, 1]},
+            ]),
+        }
+        proc = self._run_helper(show, dumps)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["maps"], [
+            {"id": 11, "ring_loss_sum": 10, "cpus": 4},
+            {"id": 12, "ring_loss_sum": 4, "cpus": 4},
+        ])
+        self.assertEqual(summary["total_ring_loss_sum"], 14)
+
+    def test_empty_show_is_empty_summary(self):
+        proc = self._run_helper("[]", {})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["maps"], [])
+        self.assertEqual(summary["total_ring_loss_sum"], 0)
+
+    def test_missing_key_zero_is_zero_not_an_error(self):
+        show = json.dumps([{"id": 21, "name": "EVIDENCE", "max_entries": 9}])
+        dumps = {21: json.dumps([
+            {"key": [5, 0, 0, 0], "values": [1, 2]},
+        ])}
+        proc = self._run_helper(show, dumps)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["maps"],
+                         [{"id": 21, "ring_loss_sum": 0, "cpus": 0}])
+        self.assertEqual(summary["total_ring_loss_sum"], 0)
+
+    def test_scalar_zero_key_counts(self):
+        show = json.dumps([{"id": 31, "name": "EVIDENCE", "max_entries": 9}])
+        dumps = {31: json.dumps([
+            {"key": 0, "values": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]},
+        ])}
+        proc = self._run_helper(show, dumps)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["maps"],
+                         [{"id": 31, "ring_loss_sum": 0, "cpus": 12}])
+        self.assertEqual(summary["total_ring_loss_sum"], 0)
+
+    def test_real_bpftool_hex_format_decodes(self):
+        show = json.dumps([{"id": 41, "name": "EVIDENCE", "max_entries": 9}])
+        zero8 = ["0x00"] * 8
+        dumps = {41: json.dumps([
+            {"key": ["0x00", "0x00", "0x00", "0x00"], "values": [
+                {"cpu": 0, "value": ["0x03"] + zero8[1:]},
+                {"cpu": 1, "value": ["0x07"] + zero8[1:]},
+            ]},
+            {"key": ["0x01", "0x00", "0x00", "0x00"], "values": [
+                {"cpu": 0, "value": ["0x63"] + zero8[1:]},
+            ]},
+        ])}
+        proc = self._run_helper(show, dumps)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["maps"],
+                         [{"id": 41, "ring_loss_sum": 10, "cpus": 2}])
+        self.assertEqual(summary["total_ring_loss_sum"], 10)
 
 
 if __name__ == "__main__":

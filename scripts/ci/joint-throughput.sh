@@ -28,6 +28,10 @@
 #             delays in the observer (1 ms buckets) and prints the
 #             cumulative p50/p99/max line beside the stop line in
 #             observer.out (default unset records nothing)
+#   STAGE_TIMINGS
+#             =1 enables stage-timing telemetry in the observer,
+#             including the lifecycle ring high-water mark on the
+#             stop line (default unset records nothing)
 #
 # Cells:
 #   joint-10k-single  --system --key-operations over keyed RATE/DURATION
@@ -99,14 +103,17 @@ log() {
 # --- library (the python suite sources this file with
 # --- JOINT_TP_SOURCED=1 and calls these functions directly) ---
 
-# Echo the sudo command-line passthrough for the diagnostic
-# settlement toggle, or nothing. Sudo scrubs the environment, so
-# SETTLEMENT_LAT=1 must ride the sudo command line as an explicit
-# assignment; anything else prints nothing. The output is empty or
-# exactly one assignment (never user text).
+# Echo the sudo command-line passthrough for diagnostic toggles, or
+# nothing. Sudo scrubs the environment, so SETTLEMENT_LAT=1 and
+# STAGE_TIMINGS=1 must ride the sudo command line as explicit assignments;
+# anything else prints nothing. Each line is exactly one assignment
+# (never user text).
 observer_env() {
     if [ "${SETTLEMENT_LAT:-0}" = "1" ]; then
         echo "P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY=1"
+    fi
+    if [ "${STAGE_TIMINGS:-0}" = "1" ]; then
+        echo "P11SCOPE_STAGE_TIMINGS=1"
     fi
 }
 
@@ -293,6 +300,57 @@ event_args() {
         args="$args --events $part"
     done
     printf '%s --events %s\n' "$args" "$dir/events.jsonl"
+}
+
+# Capture bpftool EVIDENCE[0] sums while the observer still runs (maps are
+# unpinned and vanish on exit). Runs after DONE, before the observer-stop
+# wait returns. The privileged lock is held here, so no other p11scope
+# observer runs concurrently and every EVIDENCE map found is ours (main plus
+# journal objects; the double-count check needs both summed). Writes
+# $dir/bpftool-evidence.json (helper summary JSON) and logs one line.
+# Always succeeds: measurement failures warn and continue, never failing
+# the cell.
+capture_bpf_evidence() {
+    dir=$1
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/bpf-evidence.XXXXXX") || return 0
+    if ! sudo -n bpftool map show -j > "$tmp/show.json" 2>/dev/null; then
+        log "$dir: bpftool map show failed; skipping EVIDENCE capture"
+        rm -rf "$tmp"
+        return 0
+    fi
+    ids=$(python3 -I "$ROOT/scripts/bpf-evidence-sum.py" \
+        --show "$tmp/show.json" --list-ids 2>/dev/null) || ids=""
+    if [ -z "$ids" ]; then
+        log "$dir: no EVIDENCE maps visible; skipping EVIDENCE capture"
+        rm -rf "$tmp"
+        return 0
+    fi
+    args=""
+    # shellcheck disable=SC2086 # ids are bpftool integers, one per line.
+    for id in $ids; do
+        case $id in ''|*[!0-9]*) continue ;; esac
+        if sudo -n bpftool map dump id "$id" -j > "$tmp/dump-$id.json" \
+            2>/dev/null; then
+            args="$args --dump $id=$tmp/dump-$id.json"
+        else
+            log "$dir: bpftool dump of map $id raced away; skipping it"
+        fi
+    done
+    # shellcheck disable=SC2086 # args are helper paths built above.
+    if python3 -I "$ROOT/scripts/bpf-evidence-sum.py" \
+        --show "$tmp/show.json" $args > "$dir/bpftool-evidence.json" \
+        2>"$tmp/helper.err"; then
+        log "$dir: bpftool EVIDENCE: $(cat "$dir/bpftool-evidence.json")"
+    else
+        log "$dir: bpf-evidence-sum failed: $(cat "$tmp/helper.err")"
+    fi
+    mkdir -p "$dir/bpftool-evidence-raw" 2>/dev/null
+    cp "$tmp/show.json" "$dir/bpftool-evidence-raw/show.json" 2>/dev/null
+    for raw in "$tmp"/dump-*.json; do
+        [ -f "$raw" ] && cp "$raw" "$dir/bpftool-evidence-raw/" 2>/dev/null
+    done
+    rm -rf "$tmp"
+    return 0
 }
 
 # Take evidence ownership after the observer stops: the report,
@@ -483,7 +541,7 @@ run_joint_cell() {
     # The lock fd is inherited; run sudo directly under the held lock.
     # Stdout stays unprivileged by design (the -o outputs are chmodded
     # after the run); shellcheck SC2024 does not apply.
-    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment.
+    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment per line.
     sudo -n $(observer_env) "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
         --key-operations --duration "$obs_dur" --json -o "$dir/report.json" \
         --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
@@ -564,6 +622,7 @@ run_joint_cell() {
         return 0
     fi
     log "$cell: DONE printed; waiting for the observer to stop"
+    capture_bpf_evidence "$dir"
     obs_rc=0
     wait "$(cat "$dir/observer.pid")" || obs_rc=$?
     sample_load
@@ -638,7 +697,7 @@ run_twin_cell() {
     # The lock fd is inherited; run sudo directly under the held lock.
     # Stdout stays unprivileged by design (the -o outputs are chmodded
     # after the run); shellcheck SC2024 does not apply.
-    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment.
+    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment per line.
     sudo -n $(observer_env) "$P11SCOPE" inventory --pid "$gen_pid" --manifest "$MANIFEST" \
         --duration "$obs_dur" --json -o "$dir/report.json" \
         --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
@@ -668,6 +727,7 @@ run_twin_cell() {
         return 0
     fi
     log "$cell: DONE printed; waiting for the observer to stop"
+    capture_bpf_evidence "$dir"
     obs_rc=0
     wait "$(cat "$dir/observer.pid")" || obs_rc=$?
     sample_load

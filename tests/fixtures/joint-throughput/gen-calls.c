@@ -129,8 +129,9 @@ typedef struct {
 #define SIGNATURE_BYTES 64
 
 /* T0 ledger ceiling (scripts/joint-ledger-oracle.py MAX_CALLS): no emitted
- * file may hold more calls, so every file validates unchanged. */
-#define MAX_CALLS_PER_LEDGER 200000ul
+ * file may hold more calls, so every file validates unchanged. Test-tool
+ * limit only (10k/60s needs 600k); not a product limit. */
+#define MAX_CALLS_PER_LEDGER 700000ul
 #define MAX_DURATION_S 3600ul
 /* Paced 5% above nominal: scheduling jitter and churn wave boundaries
  * cannot sink a full window under the named floor. */

@@ -1996,6 +1996,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         (receipt, result)
     }
 
+    /// Record one failed admission preparation. A deferral (see
+    /// `AdmissionPreparationError::is_deferral`) is a named non-loss
+    /// note under `semantic admission deferred`; every other refusal
+    /// stays the `semantic admission refused` loss gap.
+    pub(crate) fn semantic_admission_prepare_failed(
+        &mut self,
+        caller: CallerId,
+        reason: AdmissionPreparationError,
+    ) {
+        if !reason.is_deferral() {
+            self.semantic_admission_refused(caller, &reason.to_string());
+            return;
+        }
+        self.registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: None,
+            subject: "semantic admission deferred".into(),
+            reason: reason.to_string(),
+            budget: None,
+        });
+    }
+
     pub(crate) fn semantic_admission_refused(&mut self, caller: CallerId, reason: &str) {
         self.registry.record_gap(RegistryGap {
             caller: Some(caller),

@@ -167,6 +167,16 @@ also counts records, not calls: under `--cgroup` or `--system`, a refused
 process-start (fork) record counts as one lost call, so the reported loss can
 be higher than the number of calls actually lost, never lower.
 
+A `semantic admission deferred` gap (reason
+`semantic_unavailable:no_receipt`) is a note, not a loss. It means a
+discovery pass could not yet scan a caller (usually one that has made no
+provider call the kernel has seen yet), so key-operation tracking for that
+caller starts at a later pass. Calls the caller makes in the meantime wait for that pass and are
+counted. If the caller is never admitted (for example, it exits first), each
+call it made is shed and reported under the separate
+`semantic calls unrouted` loss gap. Every other `semantic admission refused`
+reason still marks a loss.
+
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are
 missed, with no marker in the output; restarting such processes is the

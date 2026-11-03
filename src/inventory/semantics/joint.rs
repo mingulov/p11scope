@@ -684,9 +684,7 @@ fn bind_semantic_callers_with_q(
                     coordinator.consume_semantic_admission(candidate, prepared, None);
                 lane.deliver_admission_receipt(receipt);
             }
-            Err(reason) => {
-                coordinator.semantic_admission_refused(attempt.caller, &reason.to_string())
-            }
+            Err(reason) => coordinator.semantic_admission_prepare_failed(attempt.caller, reason),
         }
     }
 }

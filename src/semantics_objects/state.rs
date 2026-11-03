@@ -110,13 +110,13 @@ fn observe_settlement_step(
 }
 
 #[cfg(test)]
-fn observe_settlement_effects(domain: ObjectDomain, effects: &ObjectEffects) {
+fn observe_settlement_effects(domain: ObjectDomain, effects: &[ObjectEffect]) {
     SETTLEMENT_TRACE.with(|slot| {
         if let Some((selected, trace)) = slot.borrow_mut().as_mut()
             && *selected == domain
         {
             trace.settlements += 1;
-            trace.effects.extend_from_slice(&effects.effects);
+            trace.effects.extend_from_slice(effects);
         }
     });
 }
@@ -1141,29 +1141,45 @@ impl ModelState {
         record: &mut impl FnMut(SettlementTransition, std::ops::Range<usize>),
     ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
+        self.settle_recorded_into(prefix, ledger, &mut effects, record);
+        effects
+    }
+
+    /// [`Self::settle_recorded`] appending to `effects` in place, so a
+    /// seal keeps one retained effect vector and never holds a second
+    /// settlement-sized one. Spans passed to `record` stay relative to
+    /// the vector's length at entry.
+    pub(super) fn settle_recorded_into(
+        &mut self,
+        prefix: CompleteInputPrefix,
+        ledger: &mut super::journal::StagingLedger,
+        effects: &mut ObjectEffects,
+        record: &mut impl FnMut(SettlementTransition, std::ops::Range<usize>),
+    ) {
+        let base = effects.effects.len();
         let domain = prefix.domain;
         if let Err(reason) = self.held(domain) {
-            self.gap_effect(&mut effects, reason);
-            return effects;
+            self.gap_effect(effects, reason);
+            return;
         }
         if self.domains[&domain].ended.is_some() {
-            self.gap_effect(&mut effects, ObjectGap::DomainEnded);
-            return effects;
+            self.gap_effect(effects, ObjectGap::DomainEnded);
+            return;
         }
         let frontier = prefix.frontier.0;
         if self.domains[&domain]
             .covered
             .is_some_and(|covered| frontier < covered)
         {
-            self.gap_effect(&mut effects, ObjectGap::StalePrefix);
-            return effects;
+            self.gap_effect(effects, ObjectGap::StalePrefix);
+            return;
         }
         if !self.prefix_consistent(domain, frontier, &prefix.open) {
             self.contradict(
                 domain,
                 ObjectGap::PrefixContradiction,
                 None,
-                &mut effects,
+                effects,
                 ledger,
             );
             // Surface the rejection to the seal: contradict counted it;
@@ -1173,10 +1189,10 @@ impl ModelState {
             effects.push(ObjectEffect::Gap {
                 reason: ObjectGap::PrefixContradiction,
             });
-            return effects;
+            return;
         }
         if let Some(bootstrap) = prefix.bootstrap {
-            self.accept_bootstrap(domain, bootstrap.0, frontier, &mut effects);
+            self.accept_bootstrap(domain, bootstrap.0, frontier, effects);
         }
         let state = self.domains.get_mut(&domain).expect("registered domain");
         state.covered = max_opt(state.covered, Some(frontier));
@@ -1195,7 +1211,10 @@ impl ModelState {
             Some(begin) => Some(frontier.min(begin - 1)),
             None => Some(frontier),
         };
-        record(SettlementTransition::Prelude, 0..effects.effects.len());
+        record(
+            SettlementTransition::Prelude,
+            0..effects.effects.len() - base,
+        );
         let applied = self.domains[&domain].applied;
         if let Some(watermark) = watermark {
             let mut events: Vec<(u64, bool, CallToken)> = Vec::new();
@@ -1223,11 +1242,11 @@ impl ModelState {
                     continue;
                 }
                 let key = self.pending[&token].key;
-                let replay_start = effects.effects.len();
+                let replay_start = effects.effects.len() - base;
                 #[cfg(test)]
-                let effect_start = effects.effects.len();
+                let effect_start = effects.effects.len() - base;
                 if is_end {
-                    self.apply_end(token, &mut effects, ledger);
+                    self.apply_end(token, effects, ledger);
                 } else {
                     self.apply_begin(token);
                 }
@@ -1237,7 +1256,7 @@ impl ModelState {
                     _cut,
                     is_end,
                     token,
-                    effect_start..effects.effects.len(),
+                    effect_start..effects.effects.len() - base,
                 );
                 record(
                     if is_end {
@@ -1253,7 +1272,7 @@ impl ModelState {
                             cut: _cut,
                         }
                     },
-                    replay_start..effects.effects.len(),
+                    replay_start..effects.effects.len() - base,
                 );
                 if self.domains[&domain].ended.is_some() {
                     break;
@@ -1262,15 +1281,14 @@ impl ModelState {
             let state = self.domains.get_mut(&domain).expect("registered domain");
             state.applied = max_opt(state.applied, Some(watermark));
         }
-        let tail_start = effects.effects.len();
+        let tail_start = effects.effects.len() - base;
         self.prune(domain, ledger);
         record(
             SettlementTransition::Tail,
-            tail_start..effects.effects.len(),
+            tail_start..effects.effects.len() - base,
         );
         #[cfg(test)]
-        observe_settlement_effects(domain, &effects);
-        effects
+        observe_settlement_effects(domain, &effects.effects[base..]);
     }
 
     fn prefix_consistent(&self, domain: ObjectDomain, frontier: u64, open: &[CallKey]) -> bool {
@@ -2360,6 +2378,8 @@ impl ModelState {
         let Some(view) = self.objects.get_mut(&id) else {
             return;
         };
+        // Seal bound (journal `SealEffectBound`): only a `Live` view ends,
+        // and nothing makes a view `Live` again, so each view ends once.
         if view.lifetime != Lifetime::Live {
             return;
         }
@@ -2384,6 +2404,7 @@ impl ModelState {
         let Some(view) = self.objects.get_mut(&id) else {
             return;
         };
+        // Seal bound (journal `SealEffectBound`): as `end_view`.
         if view.lifetime != Lifetime::Live {
             return;
         }
@@ -2426,6 +2447,8 @@ impl ModelState {
         let Some(record) = self.sessions.get_mut(&s) else {
             return;
         };
+        // Seal bound (journal `SealEffectBound`): only a `Live` session
+        // ends, and only allocation makes a session `Live`.
         if record.state != SessionState::Live {
             return;
         }
@@ -3425,6 +3448,9 @@ impl ModelState {
                 other => other,
             };
         }
+        // Seal bound (journal `SealEffectBound`): only an established or
+        // conflicting field invalidates, and only `establish` (once per
+        // input handle) re-arms one.
         if changed {
             effects.push(ObjectEffect::MetadataInvalidated { object: id, reason });
         }
@@ -3947,6 +3973,8 @@ impl ModelState {
             .filter(|(_, v)| v.domain == domain && v.attribution == Attribution::Valid)
             .map(|(id, _)| *id)
             .collect();
+        // Seal bound (journal `SealEffectBound`): only a `Valid` view
+        // downgrades, and only allocation makes a view `Valid`.
         for id in ids {
             if let Some(view) = self.objects.get_mut(&id) {
                 view.attribution = Attribution::Downgraded(reason);

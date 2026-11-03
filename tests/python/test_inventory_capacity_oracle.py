@@ -177,12 +177,32 @@ def refusal_case(limit=4096):
     return manifest, ledger, document
 
 
+def standing_authority_gap():
+    """The report's standing exact-image disclosure (docs/schema/inventory-v1.md).
+
+    The native lane binds counts but never claims the exact-image contract,
+    so every caller stays scan_pinned and the report carries this gap.
+    """
+    return {"caller": None, "module": None, "pid": None,
+            "subject": "exact image authority unavailable",
+            "reason": "no BPF image identity; scan-lane incarnations by pidfd/start-time "
+                      "with exe-identity exec detection",
+            "budget": None}
+
+
+def scan_lane_authority(doc):
+    """Rewrite one judged document to the documented scan-lane authority shape."""
+    for caller in doc["callers"]:
+        caller["image"]["authority"] = "scan_pinned"
+    doc["gaps"].append(standing_authority_gap())
+
+
 class CapacityOracleTests(unittest.TestCase):
     def run_case(self, mutate=None, want=0, check=None):
         manifest, ledger, initial, late = population()
-        middle = manifest.pop("middle_doc")
         if mutate:
             mutate(manifest, ledger, initial, late)
+        middle = manifest.pop("middle_doc")
         with tempfile.TemporaryDirectory(prefix="inventory-capacity-oracle-") as temporary:
             directory = Path(temporary)
             for name, data in (("capacity.json", manifest), ("initial.json", initial), ("late.json", late)):
@@ -302,6 +322,27 @@ class CapacityOracleTests(unittest.TestCase):
         self.run_case(lambda _m, _l, _a, last: last["callers"][0]["image"].update(authority="scan_pinned"),
                       1, "CAPACITY-AUTHORITY")
 
+    def test_scan_pinned_callers_with_disclosure_pass_authority(self):
+        def scan_lane(manifest, _ledger, first, last):
+            for doc in (first, manifest["middle_doc"], last):
+                scan_lane_authority(doc)
+        self.run_case(scan_lane)
+
+    def test_authority_rejects_stale_native_exact(self):
+        def stale(_manifest, _ledger, _first, last):
+            last["gaps"].append(standing_authority_gap())
+        self.run_case(stale, 1, "CAPACITY-AUTHORITY")
+
+    def test_authority_without_disclosure_gap_fails(self):
+        def undisclosed(_manifest, _ledger, _first, last):
+            for caller in last["callers"]:
+                caller["image"]["authority"] = "scan_pinned"
+        self.run_case(undisclosed, 1, "CAPACITY-AUTHORITY")
+
+    def test_authority_rejects_missing_image(self):
+        self.run_case(lambda _m, _l, _a, last: last["callers"][0].pop("image"),
+                      1, "CAPACITY-AUTHORITY")
+
     def test_growth_cannot_skip_the_middle_capacity_population(self):
         def skipped(manifest, ledger, _first, _last):
             manifest["phases"].pop(1)
@@ -327,6 +368,16 @@ class CapacityOracleTests(unittest.TestCase):
 
     def test_refusal_pair_accepts_named_whole_refusal(self):
         self.run_refusal_case()
+
+    def test_refusal_scan_pinned_with_disclosure_passes_authority(self):
+        def scan_lane(_manifest, _ledger, late):
+            scan_lane_authority(late)
+        self.run_refusal_case(scan_lane)
+
+    def test_refusal_authority_rejects_stale_native_exact(self):
+        def stale(_manifest, _ledger, late):
+            late["gaps"].append(standing_authority_gap())
+        self.run_refusal_case(stale, 1, "CAPACITY-AUTHORITY")
 
     def test_refusal_accepts_absent_edge_for_refused_demand(self):
         self.run_refusal_case(lambda _m, _l, late: late["edges"].pop())

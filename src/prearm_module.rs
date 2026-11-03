@@ -267,6 +267,19 @@ impl PrearmWatch {
         self.state = PrearmWatchState::Ended;
     }
 
+    /// Sets the proven-clean bound for inventory health truncation to the
+    /// capture-level clean read (`last_clean_ns`, already floored at the arm
+    /// instant by the caller): the interval `[since, bound]` is clean (links
+    /// held, witnesses clean), and the tail past `bound` is truncated. This
+    /// overwrites the link-verification bound in both directions: forward to
+    /// the clean read when it postdates the arm, backward when the last clean
+    /// read predates later link progress.
+    pub(crate) fn cap_verified_to(&mut self, bound: Option<u64>) {
+        if let Some(bound) = bound {
+            self.last_verified_ns = Some(bound);
+        }
+    }
+
     /// Ends the watch's tracking at `now` for `cause`, exactly once. A
     /// natural close (`scope_end`/`stop`) preserves an earned `armed_idle`
     /// claim with its closed bounds; every other end voids the standing

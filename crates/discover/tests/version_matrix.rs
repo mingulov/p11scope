@@ -48,9 +48,9 @@ fn legacy_layout_matrix_covers_200_through_32() {
         (2, 30, 68, "full"),
         (2, 40, 68, "full"),
         (2, 41, 68, "known_prefix"),
-        (3, 0, 68, "known_prefix"),
-        (3, 1, 68, "known_prefix"),
-        (3, 2, 68, "known_prefix"),
+        (3, 0, 68, "full"),
+        (3, 1, 68, "full"),
+        (3, 2, 68, "full"),
         (4, 0, 68, "known_prefix"),
         (0, 255, 68, "known_prefix"),
     ];
@@ -81,6 +81,53 @@ fn legacy_layout_matrix_covers_200_through_32() {
                 "{name} boundary"
             );
         }
+    }
+}
+
+/// The shared ABI selection for a legacy table stamped with a published
+/// 3.x: CK_FUNCTION_LIST is the frozen 68-slot 2.40 layout whatever the
+/// stamp says, so the walk is exact. Unpublished minors stay a known
+/// prefix and unknown majors stay refused.
+#[test]
+fn legacy_30_through_32_select_the_exact_base_walk() {
+    fn legacy(major: u8, minor: u8) -> pkcs11_module::TableSet {
+        pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
+            version: cryptoki_sys::CK_VERSION { major, minor },
+        })
+    }
+    fn walked_fields(set: pkcs11_module::TableSet) -> usize {
+        match set {
+            pkcs11_module::TableSet::Walk(spans)
+            | pkcs11_module::TableSet::WalkKnownPrefix(spans) => {
+                spans.iter().map(|span| span.fields().len()).sum()
+            }
+            pkcs11_module::TableSet::Refuse => 0,
+        }
+    }
+    for minor in [0u8, 1, 2] {
+        let set = legacy(3, minor);
+        assert!(
+            matches!(set, pkcs11_module::TableSet::Walk(_)),
+            "legacy 3.{minor} must select the exact walk"
+        );
+        assert_eq!(walked_fields(set), 68, "legacy 3.{minor}");
+    }
+    for minor in [3u8, 9, 255] {
+        let set = legacy(3, minor);
+        assert!(
+            matches!(set, pkcs11_module::TableSet::WalkKnownPrefix(_)),
+            "legacy 3.{minor} stays a known prefix"
+        );
+        assert_eq!(walked_fields(set), 68, "legacy 3.{minor}");
+    }
+    let set = legacy(2, 41);
+    assert!(matches!(set, pkcs11_module::TableSet::WalkKnownPrefix(_)));
+    assert_eq!(walked_fields(set), 68);
+    for (major, minor) in [(0u8, 255u8), (1, 0), (4, 0)] {
+        assert!(
+            matches!(legacy(major, minor), pkcs11_module::TableSet::Refuse),
+            "legacy {major}.{minor} stays refused"
+        );
     }
 }
 

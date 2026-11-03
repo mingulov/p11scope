@@ -49,8 +49,8 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# The only git dependency: rev-pinned PKCS #11 bindings, lockfile-pinned.
-allow-git = ["https://github.com/mingulov/pkcs11-components"]
+# No git dependencies: the PKCS #11 crates come from crates.io, lockfile-pinned.
+allow-git = []
 
 [sources.allow-org]
 github = []

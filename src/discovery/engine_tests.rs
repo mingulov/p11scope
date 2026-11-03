@@ -4368,6 +4368,64 @@ fn exit_mappings_capture_facts_stamp_carries_live_split() {
     );
 }
 
+/// The live cell below spawns a root holder plus three short-lived
+/// children; `Child::drop` neither kills nor reaps, so every owned
+/// child is wrapped in a guard whose drop kills and reaps. A panic
+/// between spawn and reap (settle, the spawn window, drain, the
+/// deadline) must still converge: no leaked holder, no lost cgroup.
+#[test]
+fn exit_mapping_spawn_guards_reap_dropped_children() {
+    fn live(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    // Holder shape: dropping the single guard kills and reaps.
+    let holder_pid = {
+        let guard = ExitMappingChildGuard(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let pid = guard.0.id();
+        assert!(live(pid), "the fixture child must be alive before the drop");
+        drop(guard);
+        pid
+    };
+    assert!(
+        !live(holder_pid),
+        "dropping the guard must reap the child, pid {holder_pid} is still live"
+    );
+    // Spawn-window shape: drained children are reaped explicitly,
+    // whatever a panic leaves behind dies with the guard.
+    let batch_pids = {
+        let mut batch = ExitMappingChildrenGuard(
+            (0..2)
+                .map(|_| {
+                    std::process::Command::new("sleep")
+                        .arg("30")
+                        .spawn()
+                        .expect("spawn sleep")
+                })
+                .collect(),
+        );
+        let pids: Vec<u32> = batch.0.iter().map(|child| child.id()).collect();
+        assert!(
+            pids.iter().all(|pid| live(*pid)),
+            "both batch children must be alive before the drop"
+        );
+        for mut child in batch.0.drain(..1) {
+            child.kill().expect("reap the drained child");
+            child.wait().expect("wait for the drained child");
+        }
+        drop(batch);
+        pids
+    };
+    assert!(
+        batch_pids.iter().all(|pid| !live(*pid)),
+        "dropping the guard must reap the batch, still live: {batch_pids:?}"
+    );
+}
+
 /// Privileged live cell (6.14 Option A): a real extensive capture
 /// classifies three owned short-lived children, and the unarmed twin
 /// records byte-identical kind 6.

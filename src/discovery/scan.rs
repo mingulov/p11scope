@@ -2132,10 +2132,11 @@ pub struct ScannedModule {
     /// without group evidence (heap-lowered records, loader prearm,
     /// single-mapping projections) carry `false`.
     pub double_loaded: bool,
-    /// The operator-named `--module` input this opened file matched (same
-    /// match as [`exclude_match`]: identity, resolved basename, soname),
-    /// evaluated at scan time while the file is open. `None` with no
-    /// `--module` inputs, on no match, or for modules synthesized without
+    /// The operator-named `--module` input the narrowing attributed this
+    /// opened file to (verbatim path string, or an inode alias confirmed
+    /// against the opened files), evaluated at scan time while the file is
+    /// open. `None` with no `--module` inputs, when the narrowing
+    /// attributes the object to no hint, or for modules synthesized without
     /// scan evidence. The planner reads it for the operator-named closure
     /// exception only; it changes no scan filtering.
     pub module_hint: Option<PathBuf>,
@@ -3918,6 +3919,35 @@ fn hint_gate(kind: HintMatch, hint: &Path, actual: &File) -> Result<(), String> 
     )
 }
 
+/// The first `--module` hint the narrowing attributes this opened object
+/// to: the first matched hint its alias gate accepts, in hint order. The
+/// planner reads it as the operator-named signal, so naming follows the
+/// narrowing exactly — a verbatim path match names without consulting
+/// observer identity (the container case), an inode match only once the
+/// opened files confirm the alias, and a bare name never (it never narrows
+/// in). The second element carries the last gate refusal seen, as the
+/// narrowing reported it.
+fn first_attributable_hint(
+    matched: &[(usize, HintMatch)],
+    hints: &[PathBuf],
+    actual: &File,
+) -> (Option<PathBuf>, Option<String>) {
+    let mut named = None;
+    let mut refusal = None;
+    for (index, kind) in matched {
+        match hint_gate(*kind, &hints[*index], actual) {
+            Ok(()) => {
+                named = Some(hints[*index].clone());
+                break;
+            }
+            Err(reason) => {
+                refusal = Some(reason);
+            }
+        }
+    }
+    (named, refusal)
+}
+
 /// `--exclude-module` path inputs resolved to file identity: the operator
 /// input plus the device and inode it resolved to.
 pub(crate) type ExcludePaths = Vec<(PathBuf, u64, u64)>;
@@ -4003,38 +4033,6 @@ pub(crate) fn startup_exclude_conflict(
     let resolved = std::fs::canonicalize(include).unwrap_or_else(|_| include.to_path_buf());
     let path_str = resolved.to_str()?;
     exclude_match(path_str, &file, &exclude_paths, &exclude_names)
-}
-
-/// Which operator-named `--module` input names this opened mapped file, if
-/// any. Same match as [`exclude_match`] (identity, resolved basename,
-/// soname): full-path inputs match by fstat identity with the hint resolved
-/// through the observer's view (a symlinked hint follows its link), bare
-/// names by the mapped basename or the ELF soname read from this handle.
-/// The mapped path needs no canonicalization (the kernel renders the real
-/// file). `None` with no hints. Evaluated at scan time while the file is
-/// open; the planner reads it for the operator-named closure exception
-/// only, never for scan filtering (narrowing is unchanged).
-pub(crate) fn module_hint_match(path: &str, file: &File, hints: &[PathBuf]) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::MetadataExt as _;
-    if hints.is_empty() {
-        return None;
-    }
-    let hint_paths: ExcludePaths = hints
-        .iter()
-        .filter(|h| h.as_os_str().as_bytes().contains(&b'/'))
-        .filter_map(|h| {
-            std::fs::metadata(h)
-                .ok()
-                .map(|m| (h.clone(), m.dev(), m.ino()))
-        })
-        .collect();
-    let hint_names: ExcludeNames = hints
-        .iter()
-        .filter(|h| !h.as_os_str().as_bytes().contains(&b'/'))
-        .map(|h| (h.clone(), h.as_os_str().as_bytes().to_vec()))
-        .collect();
-    exclude_match(path, file, &hint_paths, &hint_names)
 }
 
 /// Why `/proc/<pid>/mem` could not be opened, and whether that is a published
@@ -5527,20 +5525,14 @@ fn scan_view_examined_mode(
             }
             continue;
         }
-        // Corroborate an inode-only match before attributing the object to the hint.
-        let mut refusal = None;
-        let attributable = matched.iter().any(|(index, kind)| {
-            match hint_gate(*kind, &request.hints[*index], &file) {
-                Ok(()) => true,
-                Err(reason) => {
-                    refusal = Some(reason);
-                    false
-                }
-            }
-        });
+        // Corroborate an inode-only match before attributing the object to
+        // the hint. The attributed hint is also the operator-named signal
+        // the planner reads; naming follows the narrowing exactly.
+        let (named_hint, refusal) = first_attributable_hint(&matched, request.hints, &file);
+        let attributable = named_hint.is_some();
         // Each accepted inode candidate confirms its hint; a refused one
-        // keeps its miss. The gates re-run here because `any` above
-        // short-circuits on the first acceptance (path gates are free, so
+        // keeps its miss. The gates re-run here because the helper above
+        // stops at the first acceptance (path gates are free, so
         // only inode candidates repeat their hint open).
         if attributable {
             for (index, kind) in &matched {
@@ -5671,11 +5663,10 @@ fn scan_view_examined_mode(
             }
             continue;
         }
-        // Operator-named `--module` match while the file is open (identity,
-        // resolved basename, soname). Recorded only; narrowing above is
-        // unchanged, and the planner reads it for the operator-named
-        // closure exception only.
-        let module_hint = module_hint_match(&path, &file, request.hints);
+        // The operator-named signal is the narrowing's own attribution: the
+        // first matched hint the alias gate accepted above. Recorded only;
+        // the planner reads it for the operator-named closure exception.
+        let module_hint = named_hint;
         let mut module = ScannedModule {
             module_hint,
             mapped_identity: scanned_identity,
@@ -6172,111 +6163,6 @@ mod tests {
         assert_eq!(
             exclude_match(unrelated.to_str().unwrap(), &file, &paths, &names),
             None
-        );
-    }
-
-    /// A `--module` path through a symlink names the closure's opened file:
-    /// identity follows the link, so the operator-named exception sees it.
-    /// A different file is not named, even at the same path string.
-    #[test]
-    fn module_hint_match_names_a_symlinked_module_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("libclosure.so.0.4.8");
-        let link = dir.path().join("closure-alias.so");
-        let other = dir.path().join("libother.so.0");
-        std::fs::write(&real, b"fake").unwrap();
-        std::fs::write(&other, b"fake").unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let hints = std::slice::from_ref(&link);
-        let file = File::open(&real).unwrap();
-        assert_eq!(
-            module_hint_match(real.to_str().unwrap(), &file, hints),
-            Some(link.clone())
-        );
-        // The link's own basename never matches: only the file does.
-        let other_file = File::open(&other).unwrap();
-        assert_eq!(
-            module_hint_match(other.to_str().unwrap(), &other_file, hints),
-            None
-        );
-        // Same path string, different file: not named.
-        assert_eq!(
-            module_hint_match(real.to_str().unwrap(), &other_file, hints),
-            None
-        );
-    }
-
-    /// A bare `--module` name matches by basename or ELF soname, like the
-    /// exclusion match it reuses; anything else matches nothing.
-    #[test]
-    fn module_hint_match_bare_name_matches_basename_and_soname() {
-        use crate::discovery::elf_needed::fixture::{ElfSpec, build_elf, write_elf};
-        let dir = tempfile::tempdir().unwrap();
-        let sonamed = write_elf(
-            dir.path(),
-            "libversioned.so.0.4.8",
-            &build_elf(&ElfSpec::lib(b"libversioned.so.0", &[])),
-        );
-        let bare = PathBuf::from("libversioned.so.0");
-        let file = File::open(&sonamed).unwrap();
-        assert_eq!(
-            module_hint_match(
-                sonamed.to_str().unwrap(),
-                &file,
-                std::slice::from_ref(&bare)
-            ),
-            Some(bare.clone()),
-            "soname matches across versions"
-        );
-        let plain = dir.path().join("libplain.so.1");
-        std::fs::write(&plain, b"not-an-elf").unwrap();
-        let bare_plain = PathBuf::from("libplain.so.1");
-        let plain_file = File::open(&plain).unwrap();
-        assert_eq!(
-            module_hint_match(
-                plain.to_str().unwrap(),
-                &plain_file,
-                std::slice::from_ref(&bare_plain)
-            ),
-            Some(bare_plain),
-            "basename matches"
-        );
-        assert_eq!(
-            module_hint_match(
-                plain.to_str().unwrap(),
-                &plain_file,
-                std::slice::from_ref(&bare)
-            ),
-            None,
-            "an unrelated name matches nothing"
-        );
-        assert_eq!(
-            module_hint_match(plain.to_str().unwrap(), &plain_file, &[]),
-            None,
-            "no hints name nothing"
-        );
-    }
-
-    /// M2 RED: the named signal must agree with `--module` narrowing. A hint
-    /// matching the mapped path verbatim names the module even when the
-    /// observer cannot resolve the hint itself (a container target, whose
-    /// module lives only under `/proc/<pid>/root`): narrowing attributes by
-    /// verbatim path without consulting observer identity.
-    #[test]
-    fn module_hint_match_diverges_from_narrowing_on_unresolvable_verbatim_hints() {
-        let dir = tempfile::tempdir().unwrap();
-        let mapped = dir.path().join("libclosure.so.0");
-        std::fs::write(&mapped, b"fake").unwrap();
-        let file = File::open(&mapped).unwrap();
-        let hint = PathBuf::from("/target-namespace-only/libclosure.so.0");
-        assert_eq!(
-            module_hint_match(
-                "/target-namespace-only/libclosure.so.0",
-                &file,
-                std::slice::from_ref(&hint)
-            ),
-            Some(hint),
-            "verbatim narrowing attribution names the module without observer resolution"
         );
     }
 
@@ -10088,6 +9974,76 @@ mod tests {
         assert_eq!(hint_gate(HintMatch::Path, &absent, &target), Ok(()));
     }
 
+    /// M2: the narrowing's attribution names a verbatim path match without
+    /// consulting observer identity (the container case the old
+    /// identity-first matcher dropped).
+    #[test]
+    fn first_attributable_hint_names_a_verbatim_hint_without_observer_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let mapped = directory.path().join("libclosure.so.0");
+        std::fs::write(&mapped, b"fake").unwrap();
+        let file = open_object(&mapped).unwrap();
+        let hint = PathBuf::from("/target-namespace-only/libclosure.so.0");
+        let matched = [(0, HintMatch::Path)];
+        assert_eq!(
+            first_attributable_hint(&matched, std::slice::from_ref(&hint), &file),
+            (Some(hint), None),
+            "verbatim attribution names without observer resolution"
+        );
+    }
+
+    /// M2: an inode match confirmed against the opened files attributes its
+    /// hint; an unconfirmed one attributes nothing and carries the gate's
+    /// refusal, as the narrowing reported it.
+    #[test]
+    fn first_attributable_hint_confirms_an_inode_alias_before_naming() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("provider.so");
+        let alias = directory.path().join("provider-alias.so");
+        let foreign = directory.path().join("foreign.so");
+        std::fs::write(&provider, b"provider bytes").unwrap();
+        std::fs::hard_link(&provider, &alias).unwrap();
+        std::fs::write(&foreign, b"provider bytes").unwrap();
+        let target = open_object(&provider).unwrap();
+
+        let matched = [(0, HintMatch::Inode)];
+        assert_eq!(
+            first_attributable_hint(&matched, std::slice::from_ref(&alias), &target),
+            (Some(alias.clone()), None),
+            "the confirmed alias names"
+        );
+
+        let (named, refusal) =
+            first_attributable_hint(&matched, std::slice::from_ref(&foreign), &target);
+        assert_eq!(named, None, "the foreign file names nothing");
+        let refusal = refusal.expect("the gate refusal is carried");
+        assert!(
+            refusal.contains("physical identity") && refusal.contains("another filesystem"),
+            "{refusal}"
+        );
+    }
+
+    /// M2: attribution takes the first passing hint in hint order and keeps
+    /// the last gate refusal seen, exactly as the narrowing's `any` did.
+    #[test]
+    fn first_attributable_hint_takes_the_first_passing_hint_in_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("provider.so");
+        let foreign = directory.path().join("foreign.so");
+        std::fs::write(&provider, b"provider bytes").unwrap();
+        std::fs::write(&foreign, b"provider bytes").unwrap();
+        let target = open_object(&provider).unwrap();
+        let hints = [foreign, provider.clone()];
+        let matched = [(0, HintMatch::Inode), (1, HintMatch::Path)];
+        let (named, refusal) = first_attributable_hint(&matched, &hints, &target);
+        assert_eq!(named, Some(provider), "the first passing hint wins");
+        let refusal = refusal.expect("the earlier refusal is carried");
+        assert!(
+            refusal.contains("physical identity"),
+            "the narrowing still reports why the first hint failed: {refusal}"
+        );
+    }
+
     #[test]
     fn scan_accepts_a_real_hardlink_alias() {
         let mut fixture = BracketFixture::new(8, true);
@@ -10271,33 +10227,42 @@ mod tests {
             "};",
             "the identity guard must immediately follow every successful target open"
         );
+        // Narrowed-out mappings stay silent on pre-exclusion failures (the
+        // exclusion-before-narrowing contract); only in-scope mismatches
+        // record a skip.
         assert_eq!(
             &scan_lines[guard + 1..guard + 4],
             [
+                "if !narrowed_out {",
                 "skipped.push(Skipped { subject, reason });",
-                "continue;",
                 "}"
             ],
-            "identity mismatch must always skip the opened object"
+            "identity mismatch skips the opened object unless narrowed out"
         );
-        let hint_gate = scan_lines
+        let attribution = scan_lines
             .iter()
-            .position(|line| *line == "let attributable = matched.iter().any(|(index, kind)| {")
+            .position(|line| {
+                *line
+                    == "let (named_hint, refusal) = first_attributable_hint(&matched, request.hints, &file);"
+            })
             .expect("hint-specific attribution must remain after the guard");
         assert!(
-            guard < hint_gate,
+            guard < attribution,
             "identity must be checked before hint gating"
         );
-        let physical_hint_gate = scan_lines
-            .iter()
-            .position(|line| *line == "match hint_gate(*kind, &request.hints[*index], &file) {")
-            .expect("scan path must gate aliases using both opened files");
+        // The alias gate lives in the attribution helper now; it still
+        // compares both opened files.
+        include_str!("scan.rs")
+            .lines()
+            .map(str::trim)
+            .position(|line| line == "match hint_gate(*kind, &hints[*index], actual) {")
+            .expect("attribution must gate aliases using both opened files");
         let elf_pin = scan_lines
             .iter()
             .position(|line| *line == "let before = match pin_of(&file) {")
             .expect("ELF inspection pin");
         assert!(
-            guard < physical_hint_gate && physical_hint_gate < elf_pin,
+            guard < attribution && attribution < elf_pin,
             "alias rejection must happen after maps identity and before ELF/table work"
         );
         let guard_body = &include_str!("scan.rs")[include_str!("scan.rs")
@@ -10307,7 +10272,7 @@ mod tests {
             "crate::discovery::identity::retained_object_key_cached(view, file, mounts, budget)"
         ));
         for decision in [
-            "if !request.hints.is_empty() && !hinted {\n            continue;\n        }",
+            "if narrowed_out && !excludes_present {\n            continue;\n        }",
             "if hinted && !attributable {",
             "if request.hints.is_empty() && exports.is_empty() {",
             "examined.push(ExaminedObject {\n                    \

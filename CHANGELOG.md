@@ -36,10 +36,11 @@ versioned separately and are opaque, exact dispatch keys.
   non-closure provider, or when the closure is operator-named, and never
   takes the reserve's slots, so a provider needing up to the remaining
   budget still fits; a closure alone in the first plan, or first mapped
-  mid-capture, admits only its published tables, unless its opened file
-  matches an operator-named `--module` path (by identity, resolved basename
-  or ELF soname), in which case it may take the reserve-capped prefix after
-  the named non-closure modules are admitted. Shared scope stays
+  mid-capture, admits only its published tables, unless the `--module`
+  narrowing attributed its opened file to a named path (verbatim path
+  string, or an inode alias confirmed against the opened files), in which
+  case it may take the reserve-capped prefix after the named non-closure
+  modules are admitted. Shared scope stays
   whole-or-nothing for closures (never a heuristic prefix). A later provider
   that still does not fit is refused by name with the `--exclude-module`
   remedy.

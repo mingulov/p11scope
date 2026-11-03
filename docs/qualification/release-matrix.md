@@ -128,11 +128,13 @@ Working backports must satisfy the same actual host and per-cell feature
 proofs as modern hosts. Saved Singles reports and historical failures retain
 their schema, vocabulary and original outcomes.
 
-The CI kernel matrix runs modern positive load/cost lanes plus one combined
-stock 6.1 refusal guest via `scripts/check-multi-host-refusal.py`. That control
-checks Auto/Multi/Singles entry points, counter modes, unchanged existing
-sinks, an unstarted workload and offline twins. It is never Multi positive or
-verifier headroom evidence. Existing image checksums remain required.
+The CI kernel matrix runs modern positive load/cost lanes plus combined
+stock 6.1 and 5.15 refusal guests via `scripts/check-multi-host-refusal.py`.
+Each control checks Auto/Multi/Singles entry points, counter modes, unchanged
+existing sinks, an unstarted workload and offline twins; the 5.15 guest
+additionally runs the identity denial cell for its denied branch. Neither is
+Multi positive or verifier headroom evidence. Existing image checksums remain
+required.
 
 ## Receipts and results
 

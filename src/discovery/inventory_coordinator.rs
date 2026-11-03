@@ -10629,6 +10629,174 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn prearm_mapped_rows_emit_pre_attach_and_undeclared_windows() {
+        // Window-emission half: a registry module record matching the pinned
+        // object (`mapped == true`) with the declared set stamped [1000 →
+        // 3000] emits exactly one `pre_attach` window over the scope start;
+        // one attached same-object endpoint outside the declared set adds
+        // the `mapped_unattached` window without moving the declared attach
+        // instant; partial stamps emit nothing (a subset maximum is not
+        // readiness).
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "windowed");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let summary = pinning.pins.pinned().next().expect("one pinned object");
+        let object = summary.id;
+        let (key, sha256) = (summary.key, summary.sha256.to_string());
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        assert_eq!(delta.endpoints.len(), 2);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+
+        // The mapped join: a registry module record naming the pinned file
+        // (physical key + retained digest).
+        coordinator.registry_mut().scripted_module_edge(
+            ModuleKey::physical(
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                Some(sha256),
+                "/scripted/prearm.so",
+            ),
+            CallerId(7),
+        );
+
+        // Partial stamps: one member only — mapped but no window.
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: delta.endpoints[0].id,
+                object: delta.endpoints[0].object,
+                at_ns: 2_000,
+            }],
+            ..ExtendReceipt::default()
+        });
+        let rows = coordinator.prearm_rows();
+        assert!(rows[0].mapped);
+        assert!(rows[0].attached_at_ns.is_none());
+        assert!(
+            rows[0].unobserved_windows.is_none(),
+            "a subset maximum is not declared-set readiness"
+        );
+
+        // Full declared set: the base window over [scope start, max].
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        let rows = coordinator.prearm_rows();
+        assert_eq!(rows[0].attached_at_ns, Some(3_000));
+        assert_eq!(
+            rows[0].unobserved_windows,
+            Some(vec![crate::render::UnobservedWindow {
+                start_ns: 1_000,
+                end_ns: 3_000,
+                reason: crate::render::UnobservedReason::PreAttach,
+            }]),
+        );
+
+        // One same-object endpoint outside the declared set (a later
+        // scan-corroborated offset): absorbed straight into the attach
+        // set, never into the declared watch.
+        let declared = coordinator
+            .prearm_declared_endpoints(object)
+            .expect("the declared set stands");
+        let extra_offset = declared.iter().map(|key| key.file_offset).max().unwrap() + 0x1000;
+        let path = coordinator
+            .prearm
+            .as_ref()
+            .expect("retained pinning")
+            .inputs[0]
+            .path
+            .clone();
+        let budget = coordinator.attach_set.budget();
+        let mut extra = crate::plan::AttachPlan::from_slots_with_policy(
+            vec![crate::plan::Slot {
+                index: 0,
+                descriptor_index: 0,
+                object,
+                object_path: path.clone(),
+                file_offset: extra_offset,
+                names: vec!["C_Sign".to_string()],
+                aliased: false,
+                semantics: p11scope_ebpf_common::SlotSemantics::COUNT_ONLY,
+                semantic_authorized: false,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(0)],
+            }],
+            crate::plan::AdmissionPolicy::Inventory(budget),
+        )
+        .expect("one extra slot lowers");
+        extra.modules.push(crate::plan::ModuleSummary {
+            id: crate::plan::ModuleId(0),
+            object,
+            key,
+            path,
+            tables: Vec::new(),
+            interfaces: 0,
+            source: "scan",
+            corroborated: false,
+            skipped: Vec::new(),
+        });
+        let pins = coordinator
+            .prearm
+            .as_ref()
+            .expect("retained pinning")
+            .pins
+            .clone();
+        let absorbed = coordinator.attach_set.absorb(&extra, &pins);
+        assert_eq!(
+            absorbed.delta.endpoints.len(),
+            1,
+            "the scan-corroborated offset joins the same object"
+        );
+        let extra_endpoint = absorbed.delta.endpoints[0];
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: extra_endpoint.id,
+                object: extra_endpoint.object,
+                at_ns: 4_000,
+            }],
+            ..ExtendReceipt::default()
+        });
+        let rows = coordinator.prearm_rows();
+        assert_eq!(
+            rows[0].attached_at_ns,
+            Some(3_000),
+            "the undeclared attach is disclosed, never folded into the declared instant"
+        );
+        assert_eq!(
+            rows[0].unobserved_windows,
+            Some(vec![
+                crate::render::UnobservedWindow {
+                    start_ns: 1_000,
+                    end_ns: 3_000,
+                    reason: crate::render::UnobservedReason::PreAttach,
+                },
+                crate::render::UnobservedWindow {
+                    start_ns: 1_000,
+                    end_ns: 4_000,
+                    reason: crate::render::UnobservedReason::MappedUnattached,
+                },
+            ]),
+        );
+    }
+
+    #[test]
     fn inventory_selected_budget_growth_refusal_keeps_ids_and_positive_history() {
         use crate::discovery::inventory_attach_set::tests as fx;
         let mut scene = CaptureScene::new(2);

@@ -218,6 +218,29 @@ class SystemScriptTests(unittest.TestCase):
         self.assertEqual((ledger["pass"], ledger["qualification"]),
                          (True, "qualified"))
 
+    def test_populated_oracle_refusal_is_failed_row(self):
+        proc, outdir, rows = self.run_script(
+            "oo-populated", "clean",
+            extra_env={"FAKE_EXIT": "1",
+                       "FAKE_TEXT": "refused: simulated churn shape text"})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
+        row = rows["churn-on-ledger"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("oracle refused the populated linked shape",
+                      row["detail"])
+        self.assertIn("simulated churn shape text", row["detail"])
+        self.assertIn("simulated churn shape text", proc.stdout)
+        self.assertTrue((outdir / "churn-linked-sample.json").exists())
+
+    def test_journal_unavailable_oracle_pass_is_stale_failed(self):
+        proc, outdir, rows = self.run_script("clean", "clean")
+        self.assertEqual(proc.returncode, 1)
+        row = rows["churn-on-ledger"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("went stale", row["detail"])
+
     def test_ring_loss_fails_with_clean_twin_attribution(self):
         proc, outdir, rows = self.run_script("ring-loss", "clean")
         self.assertEqual(proc.returncode, 1)

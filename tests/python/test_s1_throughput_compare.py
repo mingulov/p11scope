@@ -2172,7 +2172,7 @@ class DriverFixture(unittest.TestCase):
             self.assertIn("200000 calls 99999 ops", exact.stdout)
             refused = subprocess.run(
                 [str(driver), "--dry-run", "/no-provider.so", "keyed",
-                 "100k", "3", "ledger.jsonl"],
+                 "100k", "8", "ledger.jsonl"],
                 capture_output=True, text=True, timeout=30)
             self.assertEqual(refused.returncode, 2)
             self.assertIn("ledger ceiling", refused.stderr)

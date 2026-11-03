@@ -8,7 +8,7 @@
  * else is refused, because calling unknown-signature entries through the
  * one-pointer-argument TableEntry would be undefined behaviour. Calls the
  * table entry at TABLE_INDEX (0..103, one-pointer-argument shape, NULL
- * argument) COUNT times (1..200000), recording one JSONL row per call with
+ * argument) COUNT times (1..700000), recording one JSONL row per call with
  * CLOCK_MONOTONIC t0/t1 stamps. Prints "READY pid=<pid>" after the table
  * is validated, then, when GO_FILE is given, waits for that path to appear
  * before emitting the ready row; SIGTERM/SIGINT interrupts the wait.
@@ -30,7 +30,8 @@
 #include <unistd.h>
 
 #define TABLE_SLOTS 104
-#define MAX_CALLS 200000
+/* Test-tool limit only (10k/60s needs 600k); not a product limit. */
+#define MAX_CALLS 700000
 
 /* Mirrors P11ScopeTable in tests/fixtures/live-discovery-provider.c:
  * CK_VERSION (2 bytes), 6 reserved bytes, 104 function pointers. */

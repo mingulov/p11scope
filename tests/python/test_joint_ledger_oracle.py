@@ -413,7 +413,7 @@ class LedgerOracleTwins(unittest.TestCase):
     def test_mutation_row_limit_rejected(self):
         oracle = require_oracle(self)
         with self.assertRaisesRegex(oracle.LedgerError, "row limit"):
-            oracle.read_ledger(io.StringIO("{}\n" * 200003))
+            oracle.read_ledger(io.StringIO("{}\n" * 700003))
 
     def test_cli_refusal_reports_p99_numbers(self):
         require_oracle(self)

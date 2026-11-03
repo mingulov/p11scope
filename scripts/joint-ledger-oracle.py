@@ -14,12 +14,13 @@ import json
 import re
 import sys
 
-MAX_CALLS = 200000
+MAX_CALLS = 700000
 # ready + calls + ack: the emitter's COUNT ceiling (per-call-ledger.c
-# MAX_CALLS) plus its two framing rows, so COUNT 200000 passes.
+# MAX_CALLS) plus its two framing rows, so COUNT 700000 passes.
+# Test-tool limit only (10k/60s needs 600k); not a product limit.
 MAX_ROWS = MAX_CALLS + 2
 MAX_LINE_BYTES = 4096
-MAX_LEDGER_BYTES = 32 * 1024 * 1024
+MAX_LEDGER_BYTES = 128 * 1024 * 1024
 MAX_WORD = (1 << 64) - 1
 FN_PATTERN = re.compile(r"[A-Za-z0-9_\[\]]{1,64}\Z")
 

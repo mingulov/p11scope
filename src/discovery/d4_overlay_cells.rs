@@ -302,6 +302,16 @@ fn mount_overlay(opts: &str, mountpoint: &std::path::Path) -> Result<(), String>
     if !status.success() {
         return Err(format!("overlay mount -o {opts}: {status}"));
     }
+    // Prove the mount really is overlayfs: a misconfigured mountpoint
+    // (a stale mount, the wrong fstype) fails here instead of running
+    // the cell against the wrong filesystem.
+    let magic = statfs_magic(&mountpoint.to_string_lossy())?;
+    if magic != p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC {
+        return Err(format!(
+            "overlay mount {} is not overlayfs (statfs magic {magic:#x})",
+            mountpoint.display()
+        ));
+    }
     Ok(())
 }
 

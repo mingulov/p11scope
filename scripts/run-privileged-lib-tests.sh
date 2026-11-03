@@ -8,7 +8,8 @@
 #   scripts/run-privileged-lib-tests.sh --list-integration TEST_BINARY_DIR
 #
 # Group flags (each runs its group plus the default campaign, narrowed by
-# any SELECTORs): --include-long, --include-btrfs, --include-expected-failures.
+# any SELECTORs): --include-long, --include-btrfs, --include-overlay,
+# --include-expected-failures.
 #
 # Run mode executes each selected ignored test once, one at a time, from the
 # repo root, as:
@@ -578,11 +579,6 @@ semantics_edge::resource_tests::native_semantic_resource_probe
 discovery::sweep_attribution::tests::d4_thread_mapping_helper
 discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper
 discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper
-# K1 deep-scan overlay twins (lanes B only): the stale-lower row must
-# refuse and the fresh-upper row must join, per xino mode. Each fails
-# loud off lane B, so both stay hand-run skips with reasons.
-discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_fresh_upper_joins
-discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_stale_lower_refuses
 # TID-scoped nonleader anchor run (installs nothing live; strict BPF
 # load): needs root with a live nonleader thread, run by hand.
 attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing
@@ -625,8 +621,6 @@ SKIP_REASONS=(
 "private entrypoint re-executed only by the owned live-thread/private-files parity fixture; missing owned configuration fails and this helper never qualifies independently"
 "private re-exec entrypoint for the owned literal-clone parity fixture; missing owned configuration fails and this helper never qualifies independently"
 "private re-exec entrypoint for the owned single-survivor zombie fixture; missing owning socket/source fails and this helper never qualifies independently"
-"needs root loop overlay mounts plus eligible BTF/task_vma identity on an overlay lane-B host (fails loud on other lanes); K1 deep-scan fresh-positive twin; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
-"needs root loop overlay mounts plus eligible BTF/task_vma identity on an overlay lane-B host (fails loud on other lanes); K1 deep-scan stale-negative twin; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "needs root with a live nonleader thread for the TID-scoped anchor run (strict BPF load, installs nothing live); run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "live-kernel BPF lane: reports bpf_loop helper presence without asserting it; run exact --ignored as root in an authorized BPF lane"
 "pre-5.17 kernel lane: proves preparation refuses cleanly without the bpf_loop helper (passes vacuously on newer hosts); run exact --ignored as root on that kernel lane"
@@ -661,6 +655,18 @@ discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_p
 BTRFS_TMPDIR_XFAIL_TESTS=(
 inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
 inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
+)
+
+# Overlay campaign cells: run only with --include-overlay on a lane-B
+# host (kernel 6.8+, where the overlay inode is stable). Each mounts
+# its own loop ext4 layers plus overlay merges and fails loud off
+# lane B, so the runner provisions nothing for them. The xino
+# backend-parity cell already runs in the default campaign and the
+# copy-up RED reproducer stays an expected failure; only the K1
+# deep-scan twins are curated here.
+OVERLAY_TESTS=(
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_fresh_upper_joins
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_stale_lower_refuses
 )
 
 # Expected-failure campaign cells: run only with
@@ -760,7 +766,7 @@ tests/run_abandon_report.rs:second_sigint_during_teardown_publishes_truthful_rep
 usage() {
     cat <<EOF
 usage: $PROG LIB_TEST_BINARY OUTDIR [--include-long] [--include-btrfs]
-           [--include-expected-failures] [SELECTOR...]
+           [--include-overlay] [--include-expected-failures] [SELECTOR...]
        $PROG LIB_TEST_BINARY OUTDIR --wide-detailed-2112 [SELECTOR...]
        $PROG --list LIB_TEST_BINARY
        $PROG --list --wide-detailed-2112 LIB_TEST_BINARY
@@ -773,6 +779,8 @@ runs when any SELECTOR matches (no SELECTOR runs the whole campaign).
 --include-long additionally runs the long campaign cells.
 --include-btrfs additionally runs the btrfs campaign cells (the runner
 loop-mounts a btrfs image for them).
+--include-overlay additionally runs the overlay campaign cells (the
+K1 deep-scan twins, which mount their own loop overlays; lane B only).
 --include-expected-failures additionally runs the known-failing
 reproducers with inverted judging (failures record XFAIL, passes fail
 the run as XPASS).
@@ -780,9 +788,9 @@ the run as XPASS).
 built with --features wide-detailed-2112 is required; any other binary
 is refused). It cannot be combined with any --include-* flag.
 --list prints the curated default, long, skipped-with-reason, btrfs,
-and expected-failure lists and verifies them against the binary,
-without running anything. With --wide-detailed-2112 it prints and
-verifies only the wide-Detailed list.
+overlay, and expected-failure lists and verifies them against
+the binary, without running anything. With --wide-detailed-2112 it
+prints and verifies only the wide-Detailed list.
 --list-integration prints the curated integration-test selectors and
 verifies each against the built test binaries in TEST_BINARY_DIR
 (exactly one binary and exactly one selected test per entry), without
@@ -918,6 +926,7 @@ check_curation() {
         printf '%s\n' "${ALTERNATIVE_TESTS[@]}"
         printf '%s\n' "${LONG_TESTS[@]}"
         printf '%s\n' "${BTRFS_TESTS[@]}"
+        printf '%s\n' "${OVERLAY_TESTS[@]}"
         printf '%s\n' "${EXPECTED_FAILURE_TESTS[@]}"
         printf '%s\n' "${SKIP_TESTS[@]}"
     } | sort -u >"$cur_list"
@@ -1061,6 +1070,8 @@ list_mode() {
     done
     echo "btrfs (${#BTRFS_TESTS[@]}, --include-btrfs only)"
     printf '%s\n' "${BTRFS_TESTS[@]}"
+    echo "overlay (${#OVERLAY_TESTS[@]}, --include-overlay only)"
+    printf '%s\n' "${OVERLAY_TESTS[@]}"
     echo "expected-failures (${#EXPECTED_FAILURE_TESTS[@]}, --include-expected-failures only)"
     for i in "${!EXPECTED_FAILURE_TESTS[@]}"; do
         echo "${EXPECTED_FAILURE_TESTS[$i]} :: ${XFAIL_REASONS[$i]} [sig: ${XFAIL_SIGNATURES[$i]}] [owner: ${XFAIL_OWNERS[$i]}]"
@@ -1155,7 +1166,7 @@ cleanup_btrfs_mount() {
 }
 
 main() {
-    local bin outdir include_long=0 include_btrfs=0 include_xfail=0 wide=0
+    local bin outdir include_long=0 include_btrfs=0 include_overlay=0 include_xfail=0 wide=0
     local selected_runnable=() selected_skipped=()
     local arg name i pass=0 fail=0 skipped=0 xfail=0 xpass=0 seq=0
     local tmpdir logdir eviddir results log evdir short start end seconds rc
@@ -1189,6 +1200,7 @@ main() {
         case $arg in
             --include-long) include_long=1 ;;
             --include-btrfs) include_btrfs=1 ;;
+            --include-overlay) include_overlay=1 ;;
             --include-expected-failures) include_xfail=1 ;;
             --wide-detailed-2112) wide=1 ;;
             --*) echo "$PROG: unknown option: $arg" >&2; usage >&2; return 2 ;;
@@ -1196,6 +1208,7 @@ main() {
         esac
     done
     if [ "$wide" -eq 1 ] && { [ "$include_long" -eq 1 ] || [ "$include_btrfs" -eq 1 ] \
+        || [ "$include_overlay" -eq 1 ] \
         || [ "$include_xfail" -eq 1 ]; }; then
         echo "$PROG: --wide-detailed-2112 selects only the wide campaign; --include-* flags do not apply" >&2
         return 2
@@ -1252,6 +1265,13 @@ main() {
                 fi
             done
         fi
+        if [ "$include_overlay" -eq 1 ]; then
+            for name in "${OVERLAY_TESTS[@]}"; do
+                if selected "$name"; then
+                    selected_runnable+=("$name")
+                fi
+            done
+        fi
         if [ "$include_xfail" -eq 1 ]; then
             for name in "${EXPECTED_FAILURE_TESTS[@]}"; do
                 if selected "$name"; then
@@ -1275,8 +1295,8 @@ main() {
             done
         else
             for candidate in "${DEFAULT_TESTS[@]}" "${ALTERNATIVE_TESTS[@]}" "${LONG_TESTS[@]}" \
-                "${BTRFS_TESTS[@]}" "${EXPECTED_FAILURE_TESTS[@]}" \
-                "${SKIP_TESTS[@]}"; do
+                "${BTRFS_TESTS[@]}" "${OVERLAY_TESTS[@]}" \
+                "${EXPECTED_FAILURE_TESTS[@]}" "${SKIP_TESTS[@]}"; do
                 case $candidate in *"$arg"*) matched=1; break ;; esac
             done
         fi
@@ -1299,6 +1319,16 @@ main() {
                 case $candidate in
                     *"$arg"*)
                         echo "$PROG: note: '$arg' matches --include-btrfs tests, skipped without the flag" >&2
+                        break
+                        ;;
+                esac
+            done
+        fi
+        if [ "$wide" -eq 0 ] && [ "$include_overlay" -eq 0 ]; then
+            for candidate in "${OVERLAY_TESTS[@]}"; do
+                case $candidate in
+                    *"$arg"*)
+                        echo "$PROG: note: '$arg' matches --include-overlay tests, skipped without the flag" >&2
                         break
                         ;;
                 esac
@@ -1455,6 +1485,7 @@ main() {
         echo "# binary: $bin"
         echo "# include_long: $include_long"
         echo "# include_btrfs: $include_btrfs"
+        echo "# include_overlay: $include_overlay"
         echo "# include_expected_failures: $include_xfail"
         echo "# wide_detailed_2112: $wide"
         echo "# selectors: ${SELECTORS[*]:-<none>}"

@@ -208,16 +208,19 @@ SRC_LIVE_KERNEL_BTRFS_EXPECTED = [
 ]
 
 # The residual privileged cells: the installed linked control and the two
-# B17 live twins run in the default campaign; the lane-B-only K1 overlay
-# twins are static skips with reasons. Pinned literally so a dropped
-# curation fails here.
+# B17 live twins run in the default campaign. Pinned literally so a
+# dropped curation fails here.
 RESIDUAL_DEFAULT_EXPECTED = [
     "attach::tests::sealed_session_drain_linkage_is_behavioral",
     "attach::instance_tests::privileged_instance_b17_counters_observe_sharer_churn",
     "attach::instance_tests::privileged_instance_b17_drain_yields_identity_once_live",
 ]
 
-RESIDUAL_SKIP_EXPECTED = [
+# The lane-B-only K1 overlay twins run in the overlay campaign (the
+# runner provisions nothing: each mounts its own loop overlays and
+# fails loud off lane B). Pinned literally so a dropped curation
+# fails here.
+OVERLAY_EXPECTED = [
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_fresh_upper_joins",
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_stale_lower_refuses",
 ]
@@ -267,6 +270,7 @@ def write_fixture(root, sources, entries, registered, wide_registered=(),
             ("ALTERNATIVE_TESTS", []),
             ("LONG_TESTS", []),
             ("BTRFS_TESTS", []),
+            ("OVERLAY_TESTS", []),
             ("EXPECTED_FAILURE_TESTS", []),
             ("SKIP_TESTS", skip_registered),
             ("COUNTER_FIXTURE_TESTS", []),
@@ -470,7 +474,7 @@ class IgnoredTestsTests(unittest.TestCase):
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
         self.assertTrue(proof <= lists["SKIP_TESTS"])
         for group in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS",
-                      "BTRFS_TESTS",
+                      "BTRFS_TESTS", "OVERLAY_TESTS",
                       "EXPECTED_FAILURE_TESTS"):
             self.assertFalse(proof & lists[group])
         reasons = dict(zip(runner_array_lines(RUNNER, "SKIP_TESTS"),
@@ -495,7 +499,8 @@ class IgnoredTestsTests(unittest.TestCase):
         full = set().union(*(lists[group] for group in
                             ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
                              "LONG_TESTS", "BTRFS_TESTS",
-                             "EXPECTED_FAILURE_TESTS", "SKIP_TESTS"))) | proof
+                             "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS",
+                             "SKIP_TESTS"))) | proof
         with tempfile.TemporaryDirectory() as raw:
             binary = Path(raw) / "libtest-proof"
             # A run-shaped invocation fails; only the literal list request
@@ -534,7 +539,8 @@ class IgnoredTestsTests(unittest.TestCase):
         full = set().union(*(lists[group] for group in
                             ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
                              "LONG_TESTS", "BTRFS_TESTS",
-                             "EXPECTED_FAILURE_TESTS", "SKIP_TESTS")))
+                             "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS",
+                             "SKIP_TESTS")))
         ordinary = full - proof
         with tempfile.TemporaryDirectory() as raw:
             binary = Path(raw) / "libtest-ordinary"
@@ -558,7 +564,8 @@ class IgnoredTestsTests(unittest.TestCase):
         full = set().union(*(lists[group] for group in
                             ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
                              "LONG_TESTS", "BTRFS_TESTS",
-                             "EXPECTED_FAILURE_TESTS", "SKIP_TESTS")))
+                             "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS",
+                             "SKIP_TESTS")))
         unknown = prefix + "unknown_cell"
         renamed = prefix + "verifier_stats_renamed"
         with tempfile.TemporaryDirectory() as raw:
@@ -621,7 +628,7 @@ class IgnoredTestsTests(unittest.TestCase):
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
         self.assertIn(name, lists["SKIP_TESTS"])
         for group in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS",
-                      "BTRFS_TESTS",
+                      "BTRFS_TESTS", "OVERLAY_TESTS",
                       "EXPECTED_FAILURE_TESTS"):
             self.assertNotIn(name, lists[group])
         names = runner_array_lines(RUNNER, "SKIP_TESTS")
@@ -951,15 +958,12 @@ class IgnoredTestsTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(name, lists["DEFAULT_TESTS"])
                 self.assertNotIn(name, lists["SKIP_TESTS"])
-        names = runner_array_lines(RUNNER, "SKIP_TESTS")
-        reasons = runner_array_lines(RUNNER, "SKIP_REASONS")
-        for name in RESIDUAL_SKIP_EXPECTED:
+        for name in OVERLAY_EXPECTED:
             with self.subTest(name=name):
-                self.assertIn(name, lists["SKIP_TESTS"])
+                self.assertIn(name, lists["OVERLAY_TESTS"])
                 self.assertFalse({name} & runnable)
-                reason = reasons[names.index(name)]
-                self.assertIn("lane-B", reason)
-                self.assertIn("by hand", reason)
+                self.assertNotIn(name, lists["SKIP_TESTS"])
+                self.assertNotIn(name, lists["DEFAULT_TESTS"])
         xfail_names = runner_array_lines(RUNNER, "EXPECTED_FAILURE_TESTS")
         xfail_reasons = runner_array_lines(RUNNER, "XFAIL_REASONS")
         with self.subTest(name=RESIDUAL_REDBYDESIGN_XFAIL_EXPECTED):
@@ -976,9 +980,12 @@ class IgnoredTestsTests(unittest.TestCase):
     def test_residual_inventory_cells_match_what_each_test_needs(self):
         entries = {entry["path"]: entry
                    for entry in json.loads(INVENTORY.read_text())["sites"]}
-        for name in RESIDUAL_DEFAULT_EXPECTED + RESIDUAL_SKIP_EXPECTED:
+        for name in RESIDUAL_DEFAULT_EXPECTED + OVERLAY_EXPECTED:
             with self.subTest(name=name):
                 self.assertEqual(entries[name]["cell"], "privileged")
+        for name in OVERLAY_EXPECTED:
+            with self.subTest(name=name):
+                self.assertIn("--include-overlay", entries[name]["reason"])
         self.assertEqual(entries[RESIDUAL_REDBYDESIGN_XFAIL_EXPECTED]["cell"],
                          "performance")
 
@@ -1421,6 +1428,7 @@ class IgnoredTestsTests(unittest.TestCase):
     def test_revived_group_membership_is_exact(self):
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
         self.assertEqual(set(lists["BTRFS_TESTS"]), set(BTRFS_EXPECTED))
+        self.assertEqual(set(lists["OVERLAY_TESTS"]), set(OVERLAY_EXPECTED))
         self.assertEqual(set(lists["EXPECTED_FAILURE_TESTS"]),
                          set(XFAIL_EXPECTED))
         self.assertEqual(set(lists["COUNTER_FIXTURE_TESTS"]),
@@ -1429,7 +1437,7 @@ class IgnoredTestsTests(unittest.TestCase):
                          set(BTRFS_TMPDIR_XFAIL_EXPECTED))
         self.assertTrue(set(BTRFS_TMPDIR_XFAIL_EXPECTED)
                         <= lists["EXPECTED_FAILURE_TESTS"])
-        for group in ("BTRFS_TESTS",
+        for group in ("BTRFS_TESTS", "OVERLAY_TESTS",
                       "EXPECTED_FAILURE_TESTS"):
             with self.subTest(group=group):
                 self.assertFalse(set(lists[group]) & lists["SKIP_TESTS"])
@@ -1465,6 +1473,7 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
         for flag in ("--include-long", "--include-btrfs",
+                     "--include-overlay",
                      "--include-expected-failures",
                      "--wide-detailed-2112"):
             with self.subTest(flag=flag):
@@ -1475,7 +1484,8 @@ class IgnoredTestsTests(unittest.TestCase):
         full = set().union(*(lists[group] for group in
                              ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
                               "LONG_TESTS", "BTRFS_TESTS",
-                              "EXPECTED_FAILURE_TESTS", "SKIP_TESTS")))
+                              "OVERLAY_TESTS", "EXPECTED_FAILURE_TESTS",
+                              "SKIP_TESTS")))
         prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
         proof = {name for name in full if name.startswith(prefix)}
         self.assertEqual(len(proof), 14)
@@ -1489,9 +1499,11 @@ class IgnoredTestsTests(unittest.TestCase):
         # exactly one), so the default section shows 182 + 2.
         self.assertIn("default (184)", result.stdout)
         self.assertIn("btrfs (14, --include-btrfs only)", result.stdout)
+        self.assertIn("overlay (2, --include-overlay only)", result.stdout)
         self.assertIn("expected-failures (6, --include-expected-failures "
                       "only)", result.stdout)
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
+        self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
         self.assertIn("verify: curation matches the binary (243 tests)",
                       result.stdout)
@@ -1674,7 +1686,7 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(
             "ignored-tests counts: DEFAULT_TESTS=2 ALTERNATIVE_TESTS=0 "
-            "LONG_TESTS=0 BTRFS_TESTS=0 "
+            "LONG_TESTS=0 BTRFS_TESTS=0 OVERLAY_TESTS=0 "
             "EXPECTED_FAILURE_TESTS=0 SKIP_TESTS=0 "
             "COUNTER_FIXTURE_TESTS=0 BTRFS_TMPDIR_XFAIL_TESTS=0 "
             "WIDE_DETAILED_2112_TESTS=1 "
@@ -1691,8 +1703,9 @@ class IgnoredTestsTests(unittest.TestCase):
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
             "BTRFS_TESTS=14",
+            "OVERLAY_TESTS=2",
             "EXPECTED_FAILURE_TESTS=6",
-            "SKIP_TESTS=37",
+            "SKIP_TESTS=35",
             "COUNTER_FIXTURE_TESTS=27",
             "BTRFS_TMPDIR_XFAIL_TESTS=2",
             "WIDE_DETAILED_2112_TESTS=9",

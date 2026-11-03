@@ -417,7 +417,7 @@ fn vector_capacity(required: usize) -> Option<usize> {
 /// Retained result only; transition temporaries remain covered by the existing
 /// serialized scratch reservation. Recompute from current populations before
 /// EVERY seal: a previous domain may have grown the model since acquisition.
-fn result_storage_bound(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<usize> {
+pub(super) fn result_storage_bound(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<usize> {
     let calls = adapter.open.len().checked_add(adapter.refused.len())?;
     let (objects, sessions) = model.audit_loss_record_counts();
     let handles = MAX_INPUT_HANDLES
@@ -454,7 +454,7 @@ fn result_storage_bound(adapter: &JournalAdapter, model: &ObjectSemantics) -> Op
         )?)?)
 }
 
-fn outcome_storage(outcome: &Result<SealSuccess, SealFailure>) -> Option<usize> {
+pub(super) fn outcome_storage(outcome: &Result<SealSuccess, SealFailure>) -> Option<usize> {
     match outcome {
         Ok(seal) => allocation_bytes::<ObjectEffect>(seal.effects.effects.capacity())?
             .checked_add(allocation_bytes::<SealedCall>(

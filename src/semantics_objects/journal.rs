@@ -14655,6 +14655,113 @@ pub(crate) mod tests {
         );
     }
 
+    /// The whole reservation `seal_next_bounded` takes from the semantic
+    /// pool before a seal: the retained result bound plus the replay
+    /// steps and the temporary call locator.
+    fn keepup_seal_reservation(scene: &Scene) -> usize {
+        let bounds = super::seal_replay::ReplayBounds::sample(&scene.adapter, &scene.model)
+            .expect("replay bounds");
+        super::joint_audit::result_storage_bound(&scene.adapter, &scene.model)
+            .and_then(|bytes| bytes.checked_add(bounds.retained_bytes()?))
+            .and_then(|bytes| bytes.checked_add(bounds.temporary_bytes()?))
+            .expect("bounded reservation")
+    }
+
+    #[test]
+    fn joint_keepup_seal_reservation_fits_the_pool_at_the_retained_cap() {
+        use crate::semantics_edge::resources::{
+            SEMANTIC_RESOURCE_LIMIT, SEMANTIC_TRANSITION_SCRATCH,
+        };
+        // The pool keeps its permanent transition scratch charge; the
+        // seal must fit beside it and beside the retained calls' own
+        // charges, so it may take at most half of what remains.
+        let budget = (SEMANTIC_RESOURCE_LIMIT - SEMANTIC_TRANSITION_SCRATCH) / 2;
+        let small = keepup_seal_reservation(&keepup_scene_with_retained(16));
+        assert!(
+            small <= budget,
+            "16 retained calls reserve {small} > {budget}"
+        );
+        // Grows linearly: doubling the retained calls at most doubles
+        // the reservation (a quadratic bound quadruples it).
+        let half = keepup_seal_reservation(&keepup_scene_with_retained(1_024));
+        let full = keepup_seal_reservation(&keepup_scene_with_retained(2_048));
+        assert!(
+            full <= half.checked_mul(2).unwrap(),
+            "1,024 -> 2,048 retained calls: {half} -> {full} bytes"
+        );
+        // 2,048 (full open table plus full refused shelf) is the most a
+        // seal can ever retain: a 10k calls/s feed that falls behind
+        // reaches it, and the seal still fits the pool.
+        assert!(
+            full <= budget,
+            "2,048 retained calls reserve {full} bytes > {budget}"
+        );
+    }
+
+    #[test]
+    fn joint_keepup_seal_result_stays_within_its_linear_bound_under_broad_retirement() {
+        use super::joint_audit::{outcome_storage, result_storage_bound};
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, OBJECT_ACTION_DESTROY};
+        // Worst case for the per-object broad terms: every created view is
+        // live when a long run of ambiguous destroys from another session
+        // each retire every alias. Only the first retirement of each view
+        // emits; the bound charges once per object, not once per call.
+        const CREATES: u64 = 256;
+        const DESTROYS: u64 = 768;
+        const OTHER: u64 = SESSION ^ 0x0101;
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let destroy = function_id("C_DestroyObject");
+        for thread in 1..=CREATES {
+            let begin = begin_bytes(thread, 1, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            let end = end_bytes_result(
+                &begin,
+                OBJECT_ACTION_CREATE,
+                0,
+                ENTRY_NS + 50,
+                0x7000 + thread,
+            );
+            assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+        }
+        let mut proof = scene.attest_calls(CREATES as usize);
+        for thread in CREATES + 1..=CREATES + DESTROYS {
+            let mut begin = begin_bytes(thread, 1, destroy, 0);
+            put_u64(&mut begin, 80, OTHER);
+            put_u64(&mut begin, 88, 0x9000 + thread);
+            begin[126] = 1;
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            let end = end_bytes(
+                &begin,
+                OBJECT_ACTION_DESTROY,
+                pkcs11_types::CkRv::DEVICE_ERROR.0,
+                ENTRY_NS + 60,
+            );
+            assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+            proof = scene.attest_session_function(OTHER, "C_DestroyObject");
+        }
+        scene.prepare_claims();
+        let bootstrap = scene.bootstrap(proof, 0);
+        let bound = result_storage_bound(&scene.adapter, &scene.model).expect("bound");
+        let success = scene.seal(&bootstrap).expect("broad scene seals");
+        assert_eq!(
+            success.prefix.settled().len(),
+            (CREATES + DESTROYS) as usize
+        );
+        let count = |want: fn(&ObjectEffect) -> bool| {
+            success.effects.effects.iter().filter(|e| want(e)).count()
+        };
+        let created = count(|e| matches!(e, ObjectEffect::Created { .. }));
+        let retired = count(|e| matches!(e, ObjectEffect::Retired { .. }));
+        assert_eq!(created, CREATES as usize, "every create mints a view");
+        assert_eq!(
+            retired, CREATES as usize,
+            "broad retirement reaches every view, once"
+        );
+        let actual = outcome_storage(&Ok(success)).expect("sized outcome");
+        assert!(actual <= bound, "actual {actual} > bound {bound}");
+    }
+
     #[test]
     fn joint_keepup_live_feed_claim_cost_flat_while_converting() {
         // The live feed churns: begins convert under their claims

@@ -139,8 +139,10 @@ def judge_reload(report, ledger_text, receipt):
     observation = evidence.get("gap_classes", {}).get("observation", {})
     # Reload discloses loader windows; the calls themselves stay exact.
     # Pin the documented causes: no other loss may hide behind reload.
+    # Ubuntu reports loader_discovery windows; Fedora's SoftHSM 2.7 shape
+    # reports surfaces instead. Both are disclosed; counts stay exact.
     causes = set(observation.get("causes") or [])
-    allowed = {"unprotected_live_windows", "loader_discovery"}
+    allowed = {"unprotected_live_windows", "loader_discovery", "surfaces"}
     require(causes <= allowed,
             f"unexpected observation causes {causes}")
     if observation.get("status") == "exact":

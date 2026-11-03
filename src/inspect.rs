@@ -891,6 +891,42 @@ mod tests {
         );
     }
 
+    /// Consecutive identical tables (a proxy's closure array) print once
+    /// with their count; a different table between them breaks the run.
+    #[test]
+    fn text_collapses_consecutive_identical_tables() {
+        let mut outcome = sample();
+        let ScanOutcome::Scanned { modules, .. } = &mut outcome else {
+            unreachable!()
+        };
+        let base = modules[0].tables[0].clone();
+        let mut other = base.clone();
+        other.version = (3, 2);
+        modules[0].tables = vec![
+            base.clone(),
+            base.clone(),
+            base.clone(),
+            other,
+            base.clone(),
+        ];
+        modules[0].interfaces.clear();
+
+        let out = render_text(4242, &outcome, &PinnedObjects::empty());
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|line| line.trim_start().starts_with("table "))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "  table      2.40  full  1 entry  (NULL: C_GetFunctionStatus)  (×3 identical)",
+                "  table      3.2  full  1 entry  (NULL: C_GetFunctionStatus)",
+                "  table      2.40  full  1 entry  (NULL: C_GetFunctionStatus)",
+            ],
+            "{out}"
+        );
+    }
+
     #[test]
     fn text_escapes_interface_name_quotes_and_ascii_controls() {
         let mut outcome = sample();

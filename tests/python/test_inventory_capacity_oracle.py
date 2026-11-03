@@ -320,7 +320,7 @@ class CapacityOracleTests(unittest.TestCase):
             next(row for row in ledger if row["kind"] == "call").update(t0=1, t1=2)
         self.run_case(outside, 1, "CAPACITY-WINDOW")
 
-    def test_native_positive_requires_exact_caller_authority(self):
+    def test_scan_lane_positive_requires_caller_authority(self):
         self.run_case(lambda _m, _l, _a, last: last["callers"][0].pop("image"),
                       1, "CAPACITY-AUTHORITY")
 

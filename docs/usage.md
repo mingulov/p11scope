@@ -815,8 +815,8 @@ Limits that matter in pods:
   the exiting process explains (a hook address that no longer maps, a
   late record bound to the ended process, a zero-state scan that never
   completed), do not void it: they are counted apart as exit-only, and
-  only truncation the exiting process cannot explain counts. Other
-  loader rejects still count as real truncation and withhold the detail
+  other truncation still counts, including loader rejects the observer
+  cannot tie to the exit. Those withhold the detail
   as `broad_stopping`, so a `run` child that loads and exits at once may
   still void intermittently, about 1 in 10 runs in local testing; a child
   that runs on for a few seconds after loading is unaffected. With

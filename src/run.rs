@@ -14303,22 +14303,26 @@ mod tests {
             .split_once("fn run_terminal(")
             .expect("run_terminal")
             .1;
-        // The binding spans two lines in production; the pin below
-        // matches its head (production precedes the tests module, so
-        // the first match is the production site, not this string).
+        // The close snapshots facts, then comparable losses from them
+        // (production precedes the tests module, so the first match is
+        // the production site, not this string).
+        let facts_binding = terminal_fn
+            .find("let after_facts = context.0.capture_facts()")
+            .expect("K0 close facts");
         let close_binding = terminal_fn
             .find("let after_losses =")
             .expect("K0 close binding");
+        assert!(
+            facts_binding < close_binding,
+            "the K0 close snapshots facts before losses"
+        );
         let close_call = &terminal_fn[close_binding..];
         let close_losses = close_call
-            .find("k0_comparable_losses(")
+            .find("k0_comparable_losses(&after_facts)")
             .expect("K0 close losses");
-        let close_facts = close_call
-            .find("&context.0.capture_facts()")
-            .expect("K0 close facts");
         let close_end = close_call.find(';').expect("K0 close binding end");
         assert!(
-            close_losses < close_end && close_facts < close_end,
+            close_losses < close_end,
             "the K0 close snapshots its comparable losses"
         );
         let close = terminal_fn.find("close_k0_production(").expect("K0 close");

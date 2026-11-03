@@ -751,6 +751,127 @@ jobs:
             ${{ github.workspace }}/legacy32-out/stock/results.jsonl
           if-no-files-found: warn
           retention-days: 7
+  # Dual-outcome integration tests as root with the positive branch
+  # required: run_lifecycle, pause, t2_cold_start and ux_journeys cells
+  # plus the second-SIGINT report cell (13 rows, all qualified; the
+  # script judges the branch of each cell, not just its exit code).
+  # Root-required, consistent with the cell template.
+  root-integration:
+    needs: release-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/incremental
+          key: target-root-integration-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Build the five integration test targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(cat .release-rust-version)
+          cargo +"$toolchain" test --locked --offline --no-run \
+            --test run_lifecycle --test pause --test t2_cold_start \
+            --test ux_journeys --test run_abandon_report \
+            --message-format=json >"$RUNNER_TEMP/root-build.jsonl"
+          bindir="$GITHUB_WORKSPACE/root-test-bins"
+          mkdir -p "$bindir"
+          for target in run_lifecycle pause t2_cold_start ux_journeys run_abandon_report; do
+            exe=$(jq -r --arg t "$target" 'select(.reason == "compiler-artifact" and .target.name == $t and (.target.kind | any(. == "test"))) | .executable' "$RUNNER_TEMP/root-build.jsonl" | grep -v '^null$' | tail -1)
+            test -x "$exe"
+            cp -p "$exe" "$bindir/$target"
+          done
+          ls -l "$bindir"
+      - name: Run the root-integration cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          out="$GITHUB_WORKSPACE/root-integration-out"
+          sudo -n scripts/ci/run-root-integration.sh "$in/p11scope" "$out" "$GITHUB_WORKSPACE/root-test-bins"
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          # Inline exact-set check (the WP-1 checker takes this over
+          # with --require when that lane ports; same 13 cells).
+          python3 -I - "$out/results.jsonl" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+          cells = {row["cell"]: row for row in rows}
+          need = {"run_lifecycle::an_owned_run_reports_the_exact_child_status_and_reaps_it",
+                  "run_lifecycle::a_signalled_child_reports_the_signal_status_the_shell_would",
+                  "run_lifecycle::duration_expiry_hands_back_a_running_child_unless_kill_on_timeout_was_asked_for",
+                  "run_lifecycle::the_run_only_evidence_field_reaches_the_written_document",
+                  "pause::omitted_pause_is_never_and_publishes_the_neutral_lattice",
+                  "pause::explicit_auto_falls_back_to_a_partial_attempt_instead_of_failing",
+                  "pause::explicit_always_refuses_rather_than_completing_unpaused",
+                  "t2_cold_start::cold_start_profile_lane_is_honest_without_ambient_state",
+                  "t2_cold_start::cold_start_run_lane_is_honest_without_ambient_state",
+                  "ux_journeys::b6_doctor_reports_rows_and_verdict",
+                  "ux_journeys::b7_run_refuses_without_capture_lane",
+                  "ux_journeys::t3_f3_doctor_verdict_ends_with_newline",
+                  "run_abandon_report::second_sigint_during_teardown_publishes_truthful_report_and_exits_130"}
+          problems = sorted("missing cell " + name for name in need - set(cells))
+          problems += sorted("extra cell " + name for name in set(cells) - need)
+          for row in rows:
+              status = "PASS" if row["pass"] else "FAIL"
+              print(status, row["cell"], row["qualification"], row["detail"][:200])
+              if not row["pass"] or row["qualification"] != "qualified":
+                  problems.append("unqualified cell " + row["cell"])
+          if problems:
+              raise SystemExit("\n".join(problems))
+          PY
+      - name: Upload the root-integration results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: root-integration
+          path: |
+            ${{ github.workspace }}/root-integration-out/results.jsonl
+            ${{ github.workspace }}/root-integration-out/summary.txt
+            ${{ github.workspace }}/root-integration-out/*.log
+          if-no-files-found: warn
+          retention-days: 7
   # Real browsers: Firefox and Chromium started through Playwright with
   # a SoftHSM token, observed by the release binary as root, in strict
   # mode (a missing prerequisite fails instead of skipping).

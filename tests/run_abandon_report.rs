@@ -41,6 +41,14 @@ fn wait_for(path: &std::path::Path, needle: &str, timeout: Duration) -> Vec<u8> 
     bytes
 }
 
+/// The observer under test: the `P11SCOPE_E2E_OBSERVER` override when the
+/// runner stages a prebuilt binary elsewhere, else the binary Cargo built
+/// beside this test target.
+fn bin() -> String {
+    std::env::var("P11SCOPE_E2E_OBSERVER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_p11scope").to_string())
+}
+
 /// True when any live process still runs under the marker argv[0].
 fn stray_child_present() -> bool {
     let Ok(proc) = std::fs::read_dir("/proc") else {
@@ -78,7 +86,7 @@ fn second_sigint_during_teardown_publishes_truthful_report_and_exits_130() {
     // Mirror the public `second-sigint` cell: the child ignores INT/TERM so
     // settlement is still in flight when the second SIGINT lands (the 5s
     // TERM grace dwarfs the 1s signal spacing).
-    let mut observer = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+    let mut observer = Command::new(bin())
         .args(["run", "-o"])
         .arg(&out)
         .args([
@@ -199,5 +207,25 @@ fn second_sigint_during_teardown_publishes_truthful_report_and_exits_130() {
     assert!(
         !stray_child_present(),
         "the owned signal-ignoring child must be settled, not left running"
+    );
+    eprintln!("P11SCOPE_TEST_BRANCH=completed");
+}
+
+/// Static guard: the staged-binary override `bin()` reads is the dedicated
+/// `P11SCOPE_E2E_OBSERVER` variable. A stray matrix export must not silently
+/// switch the binary in an ordinary `cargo test`, so `bin()` must not read
+/// that variable. (The needle is spelled in two halves so this guard does
+/// not match its own source.)
+#[test]
+fn observer_override_uses_the_dedicated_variable() {
+    let path = format!("{}/tests/run_abandon_report.rs", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        source.contains(r#"std::env::var("P11SCOPE_E2E_OBSERVER")"#),
+        "bin() must read P11SCOPE_E2E_OBSERVER in {path}"
+    );
+    assert!(
+        !source.contains(&["P11SCOPE", "BIN"].join("_")),
+        "bin() must not read the matrix override variable in {path}"
     );
 }

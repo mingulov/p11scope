@@ -14,6 +14,7 @@ use p11scope::attach::BackendSelection;
 use p11scope::cli::{Kind, PausePolicy, RunArgs};
 use p11scope::discovery::hooks::HookRegistry;
 use p11scope::run_owned;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,12 @@ fn work_dir(name: &str) -> PathBuf {
         .join(format!("run-lifecycle-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    if unsafe { libc::geteuid() } == 0 {
+        // A root observer demotes its owned child to the invoking user, so
+        // the marker leaf must let a non-root child create the marker while
+        // the sticky bit keeps other users from unlinking it.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1733)).unwrap();
+    }
     dir
 }
 
@@ -58,6 +65,23 @@ fn capture_available() -> bool {
     p11scope::doctor::verdict(&p11scope::doctor::probe(None, None)) == 0
 }
 
+/// With `P11SCOPE_REQUIRE_CAPTURE=1` (the privileged root run) the
+/// capture-unavailable branch is a named failure instead of a passing
+/// refusal, so the run proves the positive branch. Without the variable
+/// this is a no-op and the test keeps its two-branch behavior.
+fn require_capture_positive(test: &str) {
+    if !matches!(
+        std::env::var("P11SCOPE_REQUIRE_CAPTURE").as_deref(),
+        Ok("1")
+    ) {
+        return;
+    }
+    panic!(
+        "P11SCOPE_REQUIRE_CAPTURE=1 requires the positive branch, \
+         but capture is unavailable ({test})"
+    );
+}
+
 /// A refusal is a refusal: the named failure must not have released the child.
 fn refused_before_the_barrier(error: &anyhow::Error, marker: &Path) {
     let text = format!("{error:#}");
@@ -92,6 +116,7 @@ fn an_owned_run_reports_the_exact_child_status_and_reaps_it() {
 
     match (capture_available(), run_owned(&args)) {
         (true, Ok(outcome)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=positive");
             assert_eq!(outcome.child_exit_code, Some(23));
             assert!(!outcome.child_still_running);
             assert!(marker.exists(), "the observed command never ran");
@@ -99,7 +124,11 @@ fn an_owned_run_reports_the_exact_child_status_and_reaps_it() {
             // evidence says so rather than leaving the field to be guessed.
             assert!(!outcome.evidence.child_still_running.unwrap_or(true));
         }
-        (false, Err(error)) => refused_before_the_barrier(&error, &marker),
+        (false, Err(error)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+            require_capture_positive("an_owned_run_reports_the_exact_child_status_and_reaps_it");
+            refused_before_the_barrier(&error, &marker);
+        }
         (true, Err(error)) => panic!("capture lane available but run failed: {error:#}"),
         (false, Ok(_)) => panic!("capture lane unavailable but run reported success"),
     }
@@ -117,10 +146,15 @@ fn a_signalled_child_reports_the_signal_status_the_shell_would() {
 
     match (capture_available(), run_owned(&args)) {
         (true, Ok(outcome)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=positive");
             assert_eq!(outcome.child_exit_code, Some(128 + libc::SIGTERM));
             assert!(!outcome.child_still_running);
         }
-        (false, Err(error)) => refused_before_the_barrier(&error, &marker),
+        (false, Err(error)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+            require_capture_positive("a_signalled_child_reports_the_signal_status_the_shell_would");
+            refused_before_the_barrier(&error, &marker);
+        }
         (true, Err(error)) => panic!("capture lane available but run failed: {error:#}"),
         (false, Ok(_)) => panic!("capture lane unavailable but run reported success"),
     }
@@ -139,6 +173,7 @@ fn duration_expiry_hands_back_a_running_child_unless_kill_on_timeout_was_asked_f
 
     match (capture_available(), run_owned(&handed_back)) {
         (true, Ok(outcome)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=positive");
             // An expired duration is not a reason to kill someone else's work.
             assert_eq!(outcome.child_exit_code, None);
             assert!(outcome.child_still_running);
@@ -148,7 +183,13 @@ fn duration_expiry_hands_back_a_running_child_unless_kill_on_timeout_was_asked_f
             assert!(Path::new(&format!("/proc/{}", outcome.child_pid)).exists());
             unsafe { libc::kill(-(outcome.child_pid as libc::pid_t), libc::SIGKILL) };
         }
-        (false, Err(error)) => refused_before_the_barrier(&error, &marker),
+        (false, Err(error)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+            require_capture_positive(
+                "duration_expiry_hands_back_a_running_child_unless_kill_on_timeout_was_asked_for",
+            );
+            refused_before_the_barrier(&error, &marker);
+        }
         (true, Err(error)) => panic!("capture lane available but run failed: {error:#}"),
         (false, Ok(_)) => panic!("capture lane unavailable but run reported success"),
     }
@@ -157,12 +198,19 @@ fn duration_expiry_hands_back_a_running_child_unless_kill_on_timeout_was_asked_f
     killed.kill_on_timeout = true;
     match (capture_available(), run_owned(&killed)) {
         (true, Ok(outcome)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=positive");
             assert_eq!(outcome.child_exit_code, Some(128 + libc::SIGTERM));
             assert!(!outcome.child_still_running);
             assert_eq!(outcome.evidence.child_still_running, Some(false));
             wait_until_gone(outcome.child_pid);
         }
-        (false, Err(error)) => refused_before_the_barrier(&error, &marker),
+        (false, Err(error)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+            require_capture_positive(
+                "duration_expiry_hands_back_a_running_child_unless_kill_on_timeout_was_asked_for",
+            );
+            refused_before_the_barrier(&error, &marker);
+        }
         (true, Err(error)) => panic!("capture lane available but run failed: {error:#}"),
         (false, Ok(_)) => panic!("capture lane unavailable but run reported success"),
     }
@@ -189,7 +237,11 @@ fn a_command_that_cannot_execute_fails_by_name_and_leaves_nothing_behind() {
 fn the_run_only_evidence_field_reaches_the_written_document() {
     let dir = work_dir("document");
     let marker = dir.join("ran");
-    let out = dir.join("run.json");
+    // The report lives in a runtime-private directory: the target tree's
+    // ancestors are not guaranteed owner-only (Ubuntu's 0002 umask leaves
+    // them group-writable), and the product refuses `-o` there by design.
+    let out_dir = tempfile::tempdir().unwrap();
+    let out = out_dir.path().join("run.json");
     let mut args = run_args(&[
         "/bin/sh",
         "-c",
@@ -199,6 +251,7 @@ fn the_run_only_evidence_field_reaches_the_written_document() {
 
     match (capture_available(), run_owned(&args)) {
         (true, Ok(_)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=positive");
             let document: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
             let evidence = &document["evidence"];
@@ -222,8 +275,53 @@ fn the_run_only_evidence_field_reaches_the_written_document() {
                 );
             }
         }
-        (false, Err(error)) => refused_before_the_barrier(&error, &marker),
+        (false, Err(error)) => {
+            eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+            require_capture_positive("the_run_only_evidence_field_reaches_the_written_document");
+            refused_before_the_barrier(&error, &marker);
+        }
         (true, Err(error)) => panic!("capture lane available but run failed: {error:#}"),
         (false, Ok(_)) => panic!("capture lane unavailable but run reported success"),
     }
+}
+
+/// Static guard: every test in this file that branches on capture
+/// availability reads `P11SCOPE_REQUIRE_CAPTURE` through
+/// `require_capture_positive`, so the privileged root run cannot pass on
+/// the refusal branch. A new dual-outcome test that forgets the call
+/// fails here by name.
+#[test]
+fn every_capture_branch_names_the_require_guard() {
+    let path = format!("{}/tests/run_lifecycle.rs", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        source.contains("fn require_capture_positive"),
+        "the require guard is missing from {path}"
+    );
+    assert!(
+        source.contains("P11SCOPE_REQUIRE_CAPTURE"),
+        "the require guard no longer reads the variable in {path}"
+    );
+    for segment in source.split("#[test]") {
+        let Some(name) = test_fn_name(segment) else {
+            continue;
+        };
+        if name == "every_capture_branch_names_the_require_guard" {
+            continue;
+        }
+        if segment.contains("capture_available()") {
+            assert!(
+                segment.contains("require_capture_positive"),
+                "{name} branches on capture availability without reading \
+                 P11SCOPE_REQUIRE_CAPTURE"
+            );
+        }
+    }
+}
+
+/// The `fn` name of a `#[test]` segment, if the segment holds a test.
+fn test_fn_name(segment: &str) -> Option<&str> {
+    let rest = segment.split("fn ").nth(1)?;
+    let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+    Some(&rest[..end])
 }

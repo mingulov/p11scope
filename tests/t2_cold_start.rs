@@ -13,8 +13,12 @@
 
 use std::process::Command;
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_p11scope")
+/// The observer under test: the `P11SCOPE_E2E_OBSERVER` override when the
+/// runner stages a prebuilt binary elsewhere, else the binary Cargo built
+/// beside this test target.
+fn bin() -> String {
+    std::env::var("P11SCOPE_E2E_OBSERVER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_p11scope").to_string())
 }
 
 struct Outcome {
@@ -55,6 +59,23 @@ fn assert_no_panic(outcome: &Outcome, args: &[&str]) {
 /// asked with the observer's own doctor rather than a second copy of the rule.
 fn capture_available() -> bool {
     p11scope::doctor::verdict(&p11scope::doctor::probe(None, None)) == 0
+}
+
+/// With `P11SCOPE_REQUIRE_CAPTURE=1` (the privileged root run) the
+/// capture-unavailable branch is a named failure instead of a passing
+/// refusal, so the run proves the positive branch. Without the variable
+/// this is a no-op and the test keeps its two-branch behavior.
+fn require_capture_positive(test: &str) {
+    if !matches!(
+        std::env::var("P11SCOPE_REQUIRE_CAPTURE").as_deref(),
+        Ok("1")
+    ) {
+        return;
+    }
+    panic!(
+        "P11SCOPE_REQUIRE_CAPTURE=1 requires the positive branch, \
+         but capture is unavailable ({test})"
+    );
 }
 
 #[test]
@@ -152,6 +173,7 @@ fn cold_start_profile_lane_is_honest_without_ambient_state() {
     let outcome = cold_run(&["profile", "--pid", "1", "--duration", "1s"]);
     assert_no_panic(&outcome, &["profile"]);
     if capture_available() {
+        eprintln!("P11SCOPE_TEST_BRANCH=positive");
         assert!(
             matches!(outcome.code, Some(0) | Some(1)),
             "cold profile on a capable host must exit 0/1: {:?}\n{}",
@@ -159,6 +181,8 @@ fn cold_start_profile_lane_is_honest_without_ambient_state() {
             outcome.stderr
         );
     } else {
+        eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+        require_capture_positive("cold_start_profile_lane_is_honest_without_ambient_state");
         assert_eq!(
             outcome.code,
             Some(1),
@@ -174,6 +198,7 @@ fn cold_start_run_lane_is_honest_without_ambient_state() {
     let outcome = cold_run(&["run", "--duration", "1s", "--", "/bin/true"]);
     assert_no_panic(&outcome, &["run"]);
     if capture_available() {
+        eprintln!("P11SCOPE_TEST_BRANCH=positive");
         assert!(
             matches!(outcome.code, Some(0) | Some(1)),
             "cold run on a capable host must exit 0/1: {:?}\n{}",
@@ -181,6 +206,8 @@ fn cold_start_run_lane_is_honest_without_ambient_state() {
             outcome.stderr
         );
     } else {
+        eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+        require_capture_positive("cold_start_run_lane_is_honest_without_ambient_state");
         assert_eq!(
             outcome.code,
             Some(1),
@@ -189,4 +216,64 @@ fn cold_start_run_lane_is_honest_without_ambient_state() {
         );
         assert!(!outcome.stderr.is_empty(), "a refusal must name its cause");
     }
+}
+
+/// Static guard: every test in this file that branches on capture
+/// availability reads `P11SCOPE_REQUIRE_CAPTURE` through
+/// `require_capture_positive`, so the privileged root run cannot pass on
+/// the refusal branch. A new dual-outcome test that forgets the call
+/// fails here by name.
+#[test]
+fn every_capture_branch_names_the_require_guard() {
+    let path = format!("{}/tests/t2_cold_start.rs", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        source.contains("fn require_capture_positive"),
+        "the require guard is missing from {path}"
+    );
+    assert!(
+        source.contains("P11SCOPE_REQUIRE_CAPTURE"),
+        "the require guard no longer reads the variable in {path}"
+    );
+    for segment in source.split("#[test]") {
+        let Some(name) = test_fn_name(segment) else {
+            continue;
+        };
+        if name == "every_capture_branch_names_the_require_guard" {
+            continue;
+        }
+        if segment.contains("capture_available()") {
+            assert!(
+                segment.contains("require_capture_positive"),
+                "{name} branches on capture availability without reading \
+                 P11SCOPE_REQUIRE_CAPTURE"
+            );
+        }
+    }
+}
+
+/// The `fn` name of a `#[test]` segment, if the segment holds a test.
+fn test_fn_name(segment: &str) -> Option<&str> {
+    let rest = segment.split("fn ").nth(1)?;
+    let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+    Some(&rest[..end])
+}
+
+/// Static guard: the staged-binary override `bin()` reads is the dedicated
+/// `P11SCOPE_E2E_OBSERVER` variable. A stray matrix export must not silently
+/// switch the binary in an ordinary `cargo test`, so `bin()` must not read
+/// that variable. (The needle is spelled in two halves so this guard does
+/// not match its own source.)
+#[test]
+fn observer_override_uses_the_dedicated_variable() {
+    let path = format!("{}/tests/t2_cold_start.rs", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        source.contains(r#"std::env::var("P11SCOPE_E2E_OBSERVER")"#),
+        "bin() must read P11SCOPE_E2E_OBSERVER in {path}"
+    );
+    assert!(
+        !source.contains(&["P11SCOPE", "BIN"].join("_")),
+        "bin() must not read the matrix override variable in {path}"
+    );
 }

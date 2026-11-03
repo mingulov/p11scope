@@ -5926,6 +5926,65 @@ pub(crate) mod tests {
     /// U-14: the live evidence line must show the plan's currently-active
     /// endpoint count next to the ever-growing allocation total, not just
     /// the allocation total alone.
+    fn mech_stat(calls: u64, errors: u64) -> crate::semantics::MechStat {
+        crate::semantics::MechStat {
+            calls,
+            errors,
+            ..Default::default()
+        }
+    }
+
+    /// Demo journey 2: the human `profile` text names the mechanisms the
+    /// capture observed, under the function table — the same ids the JSON
+    /// `mechanisms[]` carries, with calls/errors and no parameters.
+    #[test]
+    fn live_view_lists_mechanisms_under_the_function_table() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> =
+            [(0x250, mech_stat(8, 1)), (0x9999, mech_stat(2, 0))]
+                .into_iter()
+                .collect();
+        let out = live_scoped(
+            &[report("C_Sign", 10, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(out.contains("MECHANISM"), "{out}");
+        assert!(out.contains("CKM_SHA256"), "{out}");
+        assert!(out.contains("0x9999"), "{out}");
+        let function = out.find("FUNCTION").expect("function table");
+        let mechanism = out.find("MECHANISM").expect("mechanism table");
+        let evidence = out.find("Evidence:").expect("evidence line");
+        assert!(
+            function < mechanism && mechanism < evidence,
+            "mechanisms render under the function table: {out}"
+        );
+    }
+
+    #[test]
+    fn live_view_without_mechanisms_shows_nothing_new() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[report("C_Sign", 10, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(!out.contains("MECHANISM"), "{out}");
+    }
+
     #[test]
     fn live_view_shows_active_slots_next_to_allocated_slots() {
         let mut ev = evidence();

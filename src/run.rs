@@ -464,15 +464,30 @@ const ATTACH_HINT: &str = "or start the application normally and attach to it: f
     `p11scope inspect --system`, then `p11scope profile --pid <pid>` or `p11scope profile \
     --system --module <provider.so>`";
 
+/// A PATH candidate the real exec path would run: `metadata` (which follows
+/// symlinks) succeeds, it is a regular file, and it has an execute bit.
+/// Mirrors [`resolve_program_in_path`]'s skip rule (Sol-full F8), so the snap
+/// pre-check refuses exactly when resolution would land in `/snap/bin`: a
+/// dangling, non-executable or non-file shadow is skipped for the later
+/// runnable candidate.
+fn snap_path_candidate_is_runnable(candidate: &Path) -> bool {
+    std::fs::metadata(candidate)
+        .map(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 /// Refuses a snap command (`/snap/bin/<name>`, named directly or found
 /// first on `path`) before the fork. snapd starts every snap application
 /// through `snap-confine`, which needs its file capabilities; the owned
 /// child runs with no_new_privs, which withholds them, so the launch can
-/// only fail later inside snap-confine. `exists` is injectable for tests.
+/// only fail later inside snap-confine. `exists` (direct path: lstat
+/// existence) and `is_runnable` (PATH: stat + file + exec, mirroring
+/// resolution) are injectable for tests.
 fn snap_launcher_refusal(
     program: &OsStr,
     path: Option<&OsStr>,
     exists: &dyn Fn(&Path) -> bool,
+    is_runnable: &dyn Fn(&Path) -> bool,
 ) -> Option<io::Error> {
     let launcher_dir = Path::new(SNAP_LAUNCHER_DIR);
     let launcher = if program.as_bytes().contains(&b'/') {
@@ -480,10 +495,10 @@ fn snap_launcher_refusal(
         (candidate.parent() == Some(launcher_dir) && exists(candidate))
             .then(|| candidate.to_path_buf())?
     } else {
-        // Like the PATH search: the first directory holding the name wins.
+        // Like the PATH search: the first runnable candidate wins.
         std::env::split_paths(path.unwrap_or_default())
             .map(|directory| directory.join(program))
-            .find(|candidate| exists(candidate))
+            .find(|candidate| is_runnable(candidate))
             .filter(|candidate| candidate.parent() == Some(launcher_dir))?
     };
     let name = launcher.file_name()?.to_string_lossy().into_owned();
@@ -521,6 +536,7 @@ fn check_owned_target_runnable(program: &OsStr) -> io::Result<()> {
         program,
         std::env::var_os("PATH").as_deref(),
         &|candidate: &Path| std::fs::symlink_metadata(candidate).is_ok(),
+        &snap_path_candidate_is_runnable,
     ) {
         return Err(refusal);
     }
@@ -12456,6 +12472,7 @@ mod tests {
                 std::ffi::OsStr::new(program),
                 path.map(std::ffi::OsStr::new),
                 &|candidate: &Path| candidate == Path::new("/snap/bin/firefox"),
+                &|candidate: &Path| candidate == Path::new("/snap/bin/firefox"),
             )
             .unwrap_or_else(|| panic!("{program} must be refused"));
             let text = error.to_string();
@@ -12464,12 +12481,15 @@ mod tests {
             assert!(text.contains("p11scope profile --pid <pid>"), "{text}");
             assert!(text.contains("p11scope inspect --system"), "{text}");
         }
-        // Not a snap: an ordinary binary, a PATH hit before /snap/bin, or
-        // a /snap/bin name that does not exist.
+        // Not a snap: an ordinary binary, a PATH hit before /snap/bin, a
+        // /snap/bin name that does not exist, or an ELF binary that merely
+        // lives under /snap (the refusal is for /snap/bin launchers only,
+        // never a /snap prefix).
         for (program, path) in [
             ("/usr/bin/true", None),
             ("firefox", Some("/usr/bin:/snap/bin")),
             ("/snap/bin/absent", None),
+            ("/snap/firefox/current/usr/lib/firefox/firefox", None),
         ] {
             assert!(
                 snap_launcher_refusal(
@@ -12477,12 +12497,88 @@ mod tests {
                     path.map(std::ffi::OsStr::new),
                     &|candidate: &Path| candidate == Path::new("/snap/bin/firefox")
                         || candidate == Path::new("/usr/bin/firefox")
-                        || candidate == Path::new("/usr/bin/true"),
+                        || candidate == Path::new("/usr/bin/true")
+                        || candidate == Path::new("/snap/firefox/current/usr/lib/firefox/firefox"),
+                    &|candidate: &Path| candidate == Path::new("/snap/bin/firefox")
+                        || candidate == Path::new("/usr/bin/firefox")
+                        || candidate == Path::new("/usr/bin/true")
+                        || candidate == Path::new("/snap/firefox/current/usr/lib/firefox/firefox"),
                 )
                 .is_none(),
                 "{program} {path:?}"
             );
         }
+    }
+
+    /// Over-refusal: a dangling `/snap/bin/tool` (lstat hit, not runnable)
+    /// with a later runnable `/usr/bin/tool` must not refuse — resolution
+    /// runs the later binary. `exists` simulates lstat (true for the
+    /// dangling link), `is_runnable` simulates stat+file+exec (false for
+    /// it), mirroring production.
+    #[test]
+    fn snap_precheck_skips_a_dangling_snap_shadow_for_the_later_runnable() {
+        assert!(
+            snap_launcher_refusal(
+                std::ffi::OsStr::new("tool"),
+                Some(std::ffi::OsStr::new("/snap/bin:/usr/bin")),
+                &|candidate: &Path| candidate == Path::new("/snap/bin/tool")
+                    || candidate == Path::new("/usr/bin/tool"),
+                &|candidate: &Path| candidate == Path::new("/usr/bin/tool"),
+            )
+            .is_none(),
+            "a dangling /snap/bin shadow must be skipped for the later runnable"
+        );
+    }
+
+    /// Under-refusal: a non-executable earlier shadow (lstat hit, not
+    /// runnable) with a real `/snap/bin/tool` must refuse — resolution
+    /// lands on the snap launcher.
+    #[test]
+    fn snap_precheck_skips_an_earlier_shadow_for_the_snap_launcher() {
+        assert!(
+            snap_launcher_refusal(
+                std::ffi::OsStr::new("tool"),
+                Some(std::ffi::OsStr::new("/tmp/shadow:/snap/bin")),
+                &|candidate: &Path| candidate == Path::new("/tmp/shadow/tool")
+                    || candidate == Path::new("/snap/bin/tool"),
+                &|candidate: &Path| candidate == Path::new("/snap/bin/tool"),
+            )
+            .is_some(),
+            "a non-runnable earlier shadow must be skipped for /snap/bin"
+        );
+    }
+
+    /// The PATH predicate uses stat semantics (follows symlinks) plus
+    /// file+exec, exactly like [`resolve_program_in_path`]: a dangling
+    /// symlink (lstat hit, stat miss), a non-executable file and a
+    /// directory are not runnable; an executable file and a symlink to one
+    /// are. No `/snap/bin` writes needed.
+    #[test]
+    fn snap_path_candidate_uses_stat_file_and_exec_semantics() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("absent-target"), &dangling).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dangling).is_ok(),
+            "the dangling link is an lstat hit"
+        );
+        assert!(
+            !snap_path_candidate_is_runnable(&dangling),
+            "a dangling symlink is not runnable (stat miss)"
+        );
+        let shadow = dir.path().join("shadow");
+        std::fs::write(&shadow, "not executable\n").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!snap_path_candidate_is_runnable(&shadow));
+        assert!(!snap_path_candidate_is_runnable(dir.path()));
+        let tool = dir.path().join("tool");
+        std::fs::copy("/bin/true", &tool).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(snap_path_candidate_is_runnable(&tool));
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&tool, &link).unwrap();
+        assert!(snap_path_candidate_is_runnable(&link));
     }
 
     /// Sol-full F8: an earlier PATH directory's readable but

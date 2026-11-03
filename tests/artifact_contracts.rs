@@ -6195,8 +6195,9 @@ fn frozen_policy_inventory_matches_embedded_object() {
     // three subordinate-custody maps (OBJECT_START, OBJECT_DESCRIPTORS,
     // OBJECT_ZERO) with no new programs. Selected detailed adds the
     // three SELECTED_* maps and the bootstrap/cgroup-migrate programs.
-    // The birth-marker control map adds one map without a new program in
-    // carriable builds; journalless builds omit it, and the unsafe
+    // The birth-marker control map and the PID-scope start-time witness
+    // (PID_START_TICK) add two maps without a new program in carriable
+    // builds; journalless builds omit them, and the unsafe
     // decoder maps add two more maps with five extra programs.
     // The 7.3+ exec-release and 6/7-argument copy_vma variants add one
     // program each; one of each pair loads.
@@ -6205,7 +6206,7 @@ fn frozen_policy_inventory_matches_embedded_object() {
     } else if wide {
         (42, 22)
     } else if marker {
-        (43, 22)
+        (44, 22)
     } else {
         (42, 22)
     };

@@ -12368,6 +12368,11 @@ mod tests {
             "M2 reword: {}",
             refusal.reason
         );
+        assert!(
+            !refusal.reason.contains("--module"),
+            "late-start whole refusal names no module remedy: {}",
+            refusal.reason
+        );
     }
 
     /// F1 quiescence plus reserve, the reviewer's two-step rebuild: a
@@ -13373,6 +13378,66 @@ mod tests {
         assert_eq!(
             first.uncorroborated_candidates, 64,
             "the 64 heuristic templates spill as evidence"
+        );
+    }
+
+    /// M6 twin: an unnamed mid-capture closure refused whole names `--module`
+    /// as the way to get the prefix, and "first seen" reads as mapped
+    /// before the capture's first plan. Still recognized as a closure
+    /// refusal, so the terminal report keeps its forwarding hint.
+    #[test]
+    fn unnamed_mid_capture_closure_refusal_names_module_and_first_plan() {
+        let closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let first = empty.rebuild_from_sources(
+            std::slice::from_ref(&closure),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(slots_of(&first, 31), 0, "no prefix, no published tables");
+        let refusal = refusal_of(&first, P11_KIT).expect("whole refusal recorded");
+        assert!(
+            refusal.reason.contains("--module"),
+            "names the prefix remedy: {}",
+            refusal.reason
+        );
+        assert!(
+            refusal
+                .reason
+                .contains("mapped before the capture's first plan"),
+            "first seen means mapped before the first plan: {}",
+            refusal.reason
+        );
+        assert!(
+            is_closure_array_refusal(&refusal.reason),
+            "still recognized as a closure refusal: {}",
+            refusal.reason
+        );
+    }
+
+    /// M6 guard: a named closure refused whole (its prefix blocked by a
+    /// refused provider ahead of it) carries no `--module` remedy — the
+    /// operator already named it.
+    #[test]
+    fn named_closure_refused_whole_carries_no_module_remedy() {
+        let big = provider_with_tables(32, "/opt/big.so", 1, 600, false);
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let rebuilt =
+            empty.rebuild_from_sources(&[big, closure], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&rebuilt, 32), 0, "oversized provider refused");
+        assert_eq!(slots_of(&rebuilt, 31), 0, "prefix blocked behind the loss");
+        let refusal = refusal_of(&rebuilt, P11_KIT).expect("whole refusal recorded");
+        assert!(
+            !refusal.reason.contains("--module"),
+            "no remedy for an already-named closure: {}",
+            refusal.reason
+        );
+        assert!(
+            is_closure_array_refusal(&refusal.reason),
+            "still recognized as a closure refusal: {}",
+            refusal.reason
         );
     }
 

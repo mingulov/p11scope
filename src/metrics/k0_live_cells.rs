@@ -1022,11 +1022,13 @@ fn k0_live_run_gateless_exit_matches_main_counts_lp64() -> Result<()> {
 }
 
 /// One parsed `k0-debug` line (T-2): selection-time comparable losses
-/// plus close-time truncation, exit-only and comparable losses.
+/// plus close-time truncation, exit-only total and per-route exit-only
+/// counts, and comparable losses.
 struct K0DebugCounts {
     before_comparable: [u64; 4],
     after_truncated: u64,
     after_exit: u64,
+    after_exit_routes: [u64; 3],
     after_comparable: [u64; 4],
 }
 
@@ -1041,6 +1043,7 @@ fn parse_k0_debug_counts(log: &str) -> Result<K0DebugCounts> {
     let mut before_comparable = None;
     let mut after_truncated = None;
     let mut after_exit = None;
+    let mut after_exit_routes = None;
     let mut after_comparable = None;
     for part in rest.split_whitespace() {
         let (key, value) = part.split_once('=').context("k0-debug part")?;
@@ -1048,6 +1051,7 @@ fn parse_k0_debug_counts(log: &str) -> Result<K0DebugCounts> {
             "before_comparable" => before_comparable = Some(parse_loss_array(value)?),
             "after_truncated" => after_truncated = Some(value.parse::<u64>()?),
             "after_exit" => after_exit = Some(value.parse::<u64>()?),
+            "after_exit_routes" => after_exit_routes = Some(parse_route_array(value)?),
             "after_comparable" => after_comparable = Some(parse_loss_array(value)?),
             _ => bail!("unknown k0-debug key {key:?}"),
         }
@@ -1056,6 +1060,7 @@ fn parse_k0_debug_counts(log: &str) -> Result<K0DebugCounts> {
         before_comparable: before_comparable.context("k0-debug before_comparable")?,
         after_truncated: after_truncated.context("k0-debug after_truncated")?,
         after_exit: after_exit.context("k0-debug after_exit")?,
+        after_exit_routes: after_exit_routes.context("k0-debug after_exit_routes")?,
         after_comparable: after_comparable.context("k0-debug after_comparable")?,
     })
 }
@@ -1075,6 +1080,24 @@ fn parse_loss_array(text: &str) -> Result<[u64; 4]> {
             .parse::<u64>()?;
     }
     ensure!(parts.next().is_none(), "loss array arity");
+    Ok(out)
+}
+
+fn parse_route_array(text: &str) -> Result<[u64; 3]> {
+    let inner = text
+        .strip_prefix('[')
+        .and_then(|text| text.strip_suffix(']'))
+        .context("route array brackets")?;
+    let mut parts = inner.split(',');
+    let mut out = [0u64; 3];
+    for slot in &mut out {
+        *slot = parts
+            .next()
+            .context("route array arity")?
+            .trim()
+            .parse::<u64>()?;
+    }
+    ensure!(parts.next().is_none(), "route array arity");
     Ok(out)
 }
 
@@ -1109,8 +1132,11 @@ fn require_detail_matches_main_counts(document: &serde_json::Value, log: &str) -
             debug.after_truncated,
         );
         eprintln!(
-            "k0-live-gateless-cell: void reason = {reason} (discovery_truncated={truncated} exit={} comparable={:?}->{:?})",
-            debug.after_exit, debug.before_comparable, debug.after_comparable,
+            "k0-live-gateless-cell: void reason = {reason} (discovery_truncated={truncated} exit={} routes={:?} comparable={:?}->{:?})",
+            debug.after_exit,
+            debug.after_exit_routes,
+            debug.before_comparable,
+            debug.after_comparable,
         );
         ensure!(
             reason == "broad_stopping" && truncated >= 1,
@@ -1169,8 +1195,11 @@ fn require_detail_matches_main_counts(document: &serde_json::Value, log: &str) -
         debug.after_truncated,
     );
     eprintln!(
-        "k0-live-gateless-cell: main={main_calls}/{main_errors} detail={entered}/{returned}/{errors} (discovery_truncated={truncated} exit={} comparable={:?}->{:?})",
-        debug.after_exit, debug.before_comparable, debug.after_comparable,
+        "k0-live-gateless-cell: main={main_calls}/{main_errors} detail={entered}/{returned}/{errors} (discovery_truncated={truncated} exit={} routes={:?} comparable={:?}->{:?})",
+        debug.after_exit,
+        debug.after_exit_routes,
+        debug.before_comparable,
+        debug.after_comparable,
     );
     ensure!(
         main_calls == 4 && main_errors == 0,
@@ -1342,4 +1371,21 @@ fn k0_exec_inner(workload: &K0Workload, module: &str, observer: &Path) -> Result
         "pre-exec calls stay aggregated: {row}"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `k0-debug` parser accepts the per-route exit-only
+    /// breakdown (`after_exit_routes=[scan_end,reject,zero_state]`)
+    /// and still fails closed on unknown keys.
+    #[test]
+    fn k0_debug_parser_accepts_the_per_route_breakdown() {
+        let log = "noise\nk0-debug: before_comparable=[0,0,0,0] after_truncated=1 after_exit=1 after_exit_routes=[0,1,0] after_comparable=[0,0,0,0]\n";
+        let counts = parse_k0_debug_counts(log).expect("the line parses");
+        assert_eq!(counts.after_exit_routes, [0, 1, 0]);
+        assert_eq!(counts.after_exit, 1);
+        assert_eq!(counts.after_truncated, 1);
+    }
 }

@@ -17741,6 +17741,23 @@ fn zero_state_settlement_with_exit_proof_counts_exit_only_and_keeps_loss() {
     }));
 }
 
+/// m6 per-route breakdown: each exit-only helper grows the total and
+/// its own bucket — [deferred-scan ends, loader rejects, zero-state
+/// ends] — so the K0 debug line separates Part B's share from the
+/// deferred-scan split. The snapshot asserts the buckets sum.
+#[test]
+fn exit_only_routes_split_scan_end_reject_and_zero_state() {
+    let mut engine = Engine::empty();
+
+    engine.record_pending_loader_scan_end("test scan end");
+    engine.reject_loader_record_exit_ended("test reject");
+    engine.record_pending_loader_scan_end_with_live_loss("test zero-state end");
+
+    let facts = engine.capture_facts();
+    assert_eq!(facts.exit_ended_truncations(), 3);
+    assert_eq!(facts.exit_ended_by_route(), [1, 1, 1]);
+}
+
 /// R-1 zero-state negative (end to end): a resolving scan that fails
 /// without exit proof settles as plain loss with no exit-only growth.
 /// Drives the real zero-state path: one deferred record, then a

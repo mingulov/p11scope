@@ -323,6 +323,10 @@ pub struct CaptureFacts {
     /// scope departure settles here too, but K0 refuses those scopes
     /// by name, so no consumer reads it there.
     pub(crate) exit_ended_truncations: u64,
+    /// The exit-only total above, split by route for the K0 debug
+    /// line: [deferred-scan ends, loader rejects, zero-state ends].
+    /// Not serialized; the live cells parse it off stderr.
+    pub(crate) exit_ended_by_route: [u64; 3],
     pub(crate) task_uprobe_link_losses: u64,
 }
 
@@ -381,6 +385,12 @@ impl CaptureFacts {
     /// refuses those scopes by name, so no consumer reads it there.
     pub fn exit_ended_truncations(&self) -> u64 {
         self.exit_ended_truncations
+    }
+
+    /// The exit-only total above, split by route for the K0 debug
+    /// line: [deferred-scan ends, loader rejects, zero-state ends].
+    pub fn exit_ended_by_route(&self) -> [u64; 3] {
+        self.exit_ended_by_route
     }
 
     /// Task-uprobe links that disappeared while their retained process group

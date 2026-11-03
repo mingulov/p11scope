@@ -1067,6 +1067,12 @@ Limits that matter in pods:
   stop line reports the run's final maximum including the terminal
   sweep. It measures headroom, never loss; it is timings output only
   and adds no schema key.
+  With `P11SCOPE_K0_DEBUG=1`, a `--select-endpoint` capture also
+  prints one `k0-debug` stderr line at close: selection-time
+  comparable losses plus close-time truncation, exit-only total and
+  per-route exit-only counts (`scan_end`, `reject`, `zero_state`),
+  and comparable losses. It is test scaffolding for the K0 live
+  cells, never part of the JSON report.
   `--attach-backend auto|multi|singles` (default `auto`) selects how the
   native lane attaches the provider entries. `auto` decides by a
   functional probe once per run, never by the kernel version: where the

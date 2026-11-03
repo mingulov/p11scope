@@ -619,6 +619,11 @@ pub struct Engine {
     /// departure settles here too, but K0 refuses those scopes by
     /// name, so no consumer reads it there.
     exit_ended_truncations: u64,
+    /// The exit-only total above, split by route for the K0 debug
+    /// line: [deferred-scan ends (fallback, RT_ADD settle, retirement
+    /// sweep), loader rejects (missing-mapping, no-retained-view),
+    /// zero-state ends]. The buckets always sum to the total.
+    exit_ended_by_route: [u64; 3],
     pending_rejected_keys: BTreeSet<ObjectKey>,
     pending_retirements: BTreeSet<ProcessViewId>,
     retirement_intents: PendingViewRetirements,
@@ -10029,6 +10034,7 @@ impl Engine {
             tail_skips: 0,
             discovery_truncated: 0,
             exit_ended_truncations: 0,
+            exit_ended_by_route: [0, 0, 0],
             pending_rejected_keys: BTreeSet::new(),
             pending_retirements: BTreeSet::new(),
             retirement_intents: PendingViewRetirements::new(),
@@ -11014,6 +11020,11 @@ impl Engine {
             exit_ended <= discovery_truncated,
             "exit-only stays a subset of the truncation total"
         );
+        debug_assert_eq!(
+            self.exit_ended_by_route.iter().sum::<u64>(),
+            exit_ended,
+            "the per-route exit-only buckets sum to the total"
+        );
         render::CaptureFacts {
             discovery: self.discovery.clone(),
             table_entries: self.plan.entries_seen,
@@ -11042,6 +11053,7 @@ impl Engine {
             // The exit-ended subset of the truncation total above: K0
             // subtracts it from the total.
             exit_ended_truncations: exit_ended,
+            exit_ended_by_route: self.exit_ended_by_route,
         }
     }
 
@@ -11844,6 +11856,7 @@ impl Engine {
     fn reject_loader_record_exit_ended(&mut self, reason: &str) -> bool {
         self.loader_registry.reject_hit();
         self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
+        self.exit_ended_by_route[1] = self.exit_ended_by_route[1].saturating_add(1);
         self.mark_live_loss("live loader discovery", reason);
         false
     }
@@ -12479,6 +12492,7 @@ impl Engine {
     fn record_pending_loader_scan_end(&mut self, reason: &str) {
         self.discovery_truncated = self.discovery_truncated.saturating_add(1);
         self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
+        self.exit_ended_by_route[0] = self.exit_ended_by_route[0].saturating_add(1);
         self.mark_partial("live loader memory discovery", reason);
     }
 
@@ -12489,6 +12503,7 @@ impl Engine {
     fn record_pending_loader_scan_end_with_live_loss(&mut self, reason: &str) {
         self.discovery_truncated = self.discovery_truncated.saturating_add(1);
         self.exit_ended_truncations = self.exit_ended_truncations.saturating_add(1);
+        self.exit_ended_by_route[2] = self.exit_ended_by_route[2].saturating_add(1);
         self.mark_live_loss("live loader memory discovery", reason);
     }
 

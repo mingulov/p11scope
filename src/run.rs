@@ -4038,6 +4038,35 @@ fn emit_capture_diagnostic(line: &str) {
     let _ = crate::sink::try_stderr_line(line);
 }
 
+/// One non-wire K0 debug line (T-2): selection-time comparable losses
+/// plus close-time truncation, exit-only total and per-route exit-only
+/// counts, and comparable losses. Space-free arrays: the live cells
+/// split the line on whitespace. Shared by the normal close and the
+/// terminal-failure arm so both print the same shape.
+fn format_k0_debug_line(
+    before: &[u64; 4],
+    facts: &render::CaptureFacts,
+    after: &[u64; 4],
+) -> String {
+    let routes = facts.exit_ended_by_route();
+    format!(
+        "k0-debug: before_comparable=[{},{},{},{}] after_truncated={} after_exit={} after_exit_routes=[{},{},{}] after_comparable=[{},{},{},{}]",
+        before[0],
+        before[1],
+        before[2],
+        before[3],
+        facts.discovery_losses()[3],
+        facts.exit_ended_truncations(),
+        routes[0],
+        routes[1],
+        routes[2],
+        after[0],
+        after[1],
+        after[2],
+        after[3],
+    )
+}
+
 /// Prints every attach failure — shared by `profile` and `trace`, which
 /// each attach the same way. A capture that attached at least one probe
 /// still gets each per-slot failure printed (it is real evidence of a
@@ -6262,10 +6291,33 @@ fn capture_profile(
         poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
         let maps_start = Instant::now();
-        let snapshot =
-            context
-                .6
-                .terminal(context.1, context.0.plan(), context.0.pinned(), profile)?;
+        let snapshot = match context
+            .6
+            .terminal(context.1, context.0.plan(), context.0.pinned(), profile)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                // K0 on the terminal-failure path (m5): the close
+                // boundary is unprovable and no report seals, but the
+                // opted-in debug line still prints, so a quiesce-error
+                // void shows its counts instead of failing the live
+                // cells with a parse error. Best-effort facts: the
+                // terminal read never landed.
+                if let Some(close) = &k0
+                    && std::env::var_os("P11SCOPE_K0_DEBUG").is_some()
+                {
+                    let failed_facts = context.0.capture_facts();
+                    let failed_losses =
+                        metrics::selected_detail_driver::k0_comparable_losses(&failed_facts);
+                    emit_capture_diagnostic(&format_k0_debug_line(
+                        &close.window.before_losses(),
+                        &failed_facts,
+                        &failed_losses,
+                    ));
+                }
+                return Err(error);
+            }
+        };
         let reports = snapshot.reports();
         let kernel_evidence = snapshot.kernel_evidence();
         // K0: close the detail window after the broad terminal read,
@@ -6283,23 +6335,12 @@ fn capture_profile(
             // Never in the JSON report; operators never see it unless
             // they opt in.
             if std::env::var_os("P11SCOPE_K0_DEBUG").is_some() {
-                // Space-free arrays: the live cells split this line on
-                // whitespace, and `{:?}` would emit `[0, 0, 0, 0]`.
                 // Bounded transport, like every capture diagnostic: a
                 // blocking stderr write would park the capture thread.
-                let before = k0.window.before_losses();
-                emit_capture_diagnostic(&format!(
-                    "k0-debug: before_comparable=[{},{},{},{}] after_truncated={} after_exit={} after_comparable=[{},{},{},{}]",
-                    before[0],
-                    before[1],
-                    before[2],
-                    before[3],
-                    after_facts.discovery_losses()[3],
-                    after_facts.exit_ended_truncations(),
-                    after_losses[0],
-                    after_losses[1],
-                    after_losses[2],
-                    after_losses[3],
+                emit_capture_diagnostic(&format_k0_debug_line(
+                    &k0.window.before_losses(),
+                    &after_facts,
+                    &after_losses,
                 ));
             }
             metrics::selected_detail_driver::close_k0_production(
@@ -14332,6 +14373,27 @@ mod tests {
         assert!(
             terminal_read < close_binding && close_binding < close,
             "run_terminal must snapshot the K0 close losses after the terminal read and before the close"
+        );
+    }
+
+    /// m5: the K0 debug line prints on the terminal-failure path too,
+    /// so a quiesce-error void shows its counts instead of failing the
+    /// live cells with a parse error. Both arms gate on the same
+    /// variable and share the format helper.
+    #[test]
+    fn k0_debug_line_prints_on_the_terminal_failure_path() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let terminal_fn = production.split_once("fn run_terminal(").unwrap().1;
+        assert_eq!(
+            terminal_fn.matches("var_os(\"P11SCOPE_K0_DEBUG\")").count(),
+            2,
+            "the normal close and the terminal-failure arm both gate the line"
+        );
+        assert_eq!(
+            production.matches("format_k0_debug_line(").count(),
+            3,
+            "one format helper plus its two call sites"
         );
     }
 

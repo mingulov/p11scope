@@ -1160,8 +1160,7 @@ fn pin_inventory_prearm(
 /// Test-only count of pass-heap reclamations on any thread: each
 /// classic pass publication reclaims once.
 #[cfg(test)]
-static RECLAIM_PASS_HEAP_CALLS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static RECLAIM_PASS_HEAP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Test-only read of the pass-heap reclamation count.
 #[cfg(test)]
@@ -1173,6 +1172,23 @@ pub(crate) fn reclaim_pass_heap_calls() -> u64 {
 #[cfg(test)]
 pub(crate) fn reset_reclaim_pass_heap_calls() {
     RECLAIM_PASS_HEAP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Release pass-transient heap pages back to the kernel after a classic
+/// inventory pass publishes. A `--system` pass pins hundreds of module
+/// files and buffers the match; glibc otherwise retains the freed peak
+/// (about 200 MiB here) for the rest of the run, leaving the soak's
+/// 256 MiB bound no margin under load. A hint only: it never frees live
+/// state, and it is a cheap no-op when nothing is free. Linux/glibc only,
+/// like the rest of this binary.
+fn reclaim_pass_heap() {
+    #[cfg(test)]
+    RECLAIM_PASS_HEAP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: malloc_trim takes a pad length and releases free top pages;
+    // it is thread-safe, takes no pointers, and cannot free live state.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1565,6 +1581,9 @@ fn run_with_terminal_budget(
                 for line in progress_lines(coordinator, report) {
                     inventory_diagnostic(&line);
                 }
+                // The pass freed its pin batch; hand the peak back before
+                // the next pass allocates (see `reclaim_pass_heap`).
+                reclaim_pass_heap();
                 if let Some(error) = stream.attempt("pass publication", |writer| {
                     emit_pass_events(writer, &mut stream_state, report, &presentation, now_ns)
                 }) {

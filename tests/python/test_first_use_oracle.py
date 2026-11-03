@@ -7,7 +7,11 @@ fixture ledger of tests/fixtures/system-first-use.c (delay/mode knobs) plus
 the observer record: the exact missed-call count from the provider body
 counter versus observed calls, and the caller-attribution count from
 trace/profile caller labels versus the ledger pid. The two shares stay
-separate numbers; a gated cell never counts as positive. Healthy and
+separate numbers; a gated cell never counts as positive. The exact-arm
+twins judge a real --prearm-module cell (explicitly empty windows, exact
+counts, an armed watch at the declared attach maximum, an exact
+verdict-cause allowlist) and its passive twin (a disclosed
+pre_attach/late_discovery window, no invented count). Healthy and
 mutation twins run unignored; every mutation names the refused field or
 comparison.
 """
@@ -101,6 +105,71 @@ def healthy_observer(observed=1, unknown=0, pid=PID):
     rows += [{"pid": pid, "label": "Unknown executable"}
              for _ in range(unknown)]
     return {"observed_calls": observed, "caller_rows": rows}
+
+
+# The exact bare-pre-arm attribution pair in the product's fixed cause
+# order: every pre-arm slot is count-only (never semantic-authorized),
+# and the bare module reads uncorroborated.
+BARE_ATTRIBUTION = ["semantic_unverified_slots", "discovery_uncorroborated"]
+ATTACH_NS = 9_000
+
+
+def gap_classes(observation=("exact", []),
+                attribution=("withheld", list(BARE_ATTRIBUTION)),
+                semantics=("not_applicable", []), open_calls=0,
+                settlement="proven"):
+    (o_status, o_causes), (a_status, a_causes), (s_status, s_causes) = (
+        observation, attribution, semantics)
+    return {"observation": {"status": o_status, "causes": list(o_causes)},
+            "attribution": {"status": a_status, "causes": list(a_causes)},
+            "semantics": {"status": s_status, "causes": list(s_causes)},
+            "open_calls": open_calls, "settlement": settlement}
+
+
+def bare_verdict():
+    """Terminal verdict of a bare pre-armed exact cell (PARTIAL)."""
+    return {"completeness": "PARTIAL",
+            "verdict_detail": "attribution_only",
+            "gap_classes": gap_classes()}
+
+
+def manifest_verdict():
+    """Terminal verdict of a manifest-backed exact cell (COMPLETE)."""
+    return {"completeness": "COMPLETE", "verdict_detail": "clean_proven",
+            "gap_classes": gap_classes(attribution=("attested", []),
+                                       semantics=("complete", []))}
+
+
+def exact_module(windows=None, state="armed", since_ns=ATTACH_NS,
+                 attached_at_ns=ATTACH_NS, sources=("prearm",)):
+    """A pre-armed evidence.discovery[] record projection."""
+    module = {"sources": list(sources),
+              "attached_at_ns": attached_at_ns,
+              "unobserved_windows": [] if windows is None else windows}
+    if state is not None:
+        module["watch"] = {"state": state, "since_ns": since_ns}
+    return module
+
+
+def exact_evidence(prearmed=True, module=None, verdict=None):
+    """The sweep-side exact-arm evidence for one cell verdict."""
+    if module is None:
+        module = exact_module()
+    evidence = {"prearmed": prearmed, "module": module}
+    if prearmed:
+        evidence["verdict"] = (bare_verdict() if verdict is None
+                               else verdict)
+    return evidence
+
+
+def twin_module(windows=None, attached_at_ns=ATTACH_NS,
+                sources=("scan",)):
+    """A generic (non-pre-armed) discovery[] record projection: no watch."""
+    if windows is None:
+        windows = [{"start_ns": 1_000, "end_ns": attached_at_ns,
+                    "reason": "pre_attach"}]
+    return {"sources": list(sources), "attached_at_ns": attached_at_ns,
+            "unobserved_windows": windows}
 
 
 class CellValidationTests(unittest.TestCase):
@@ -459,6 +528,465 @@ class VerdictTests(unittest.TestCase):
                     self.assertTrue(verdict["positive"], (mode, delay_us))
                     positives += 1
         self.assertEqual(positives, 32)
+
+
+class ExactArmVerdictTests(unittest.TestCase):
+    def test_exact_arm_accepts_empty_windows_with_exact_counts(self):
+        oracle = require_oracle(self)
+        cell = oracle.validate_cell(healthy_cell("known-inode", 100,
+                                                 "ungated"))
+        verdict = oracle.cell_verdict(cell, healthy_observer(1),
+                                      exact_evidence())
+        self.assertTrue(verdict["positive"])
+        self.assertEqual(verdict["missed"],
+                         {"body_calls": 1, "observed_calls": 1,
+                          "missed_calls": 0})
+        self.assertEqual(verdict["exactness"],
+                         {"prearmed": True, "windows": 0,
+                          "watch_state": "armed",
+                          "completeness": "PARTIAL"})
+
+    def test_exact_arm_accepts_idle_and_naturally_closed_watches(self):
+        oracle = require_oracle(self)
+        cases = [
+            ("armed_idle", {}),
+            ("armed_idle", {"until_ns": 12_000, "ended_by": "scope_end"}),
+            ("ended", {"until_ns": 12_000, "ended_by": "scope_end"}),
+            ("ended", {"until_ns": 12_000, "ended_by": "stop"}),
+        ]
+        for state, end in cases:
+            with self.subTest(state=state, end=end):
+                cell = oracle.validate_cell(healthy_cell())
+                module = exact_module(state=state)
+                module["watch"].update(end)
+                verdict = oracle.cell_verdict(
+                    cell, healthy_observer(1), exact_evidence(module=module))
+                self.assertTrue(verdict["positive"])
+                self.assertEqual(verdict["exactness"]["watch_state"], state)
+
+    def test_exact_arm_accepts_manifest_backed_complete(self):
+        oracle = require_oracle(self)
+        cell = oracle.validate_cell(healthy_cell())
+        module = exact_module(sources=("manifest", "prearm"))
+        verdict = oracle.cell_verdict(
+            cell, healthy_observer(1),
+            exact_evidence(module=module, verdict=manifest_verdict()))
+        self.assertTrue(verdict["positive"])
+        self.assertEqual(verdict["exactness"]["completeness"], "COMPLETE")
+
+    def test_exact_arm_refuses_a_count_mismatch(self):
+        oracle = require_oracle(self)
+        cell = oracle.validate_cell(healthy_cell())
+        with self.assertRaisesRegex(oracle.MeasureError, "missed"):
+            oracle.cell_verdict(cell, healthy_observer(0), exact_evidence())
+
+    def test_exact_arm_refuses_disclosed_windows(self):
+        oracle = require_oracle(self)
+        cell = oracle.validate_cell(healthy_cell())
+        module = exact_module(windows=[{"start_ns": 1_000,
+                                        "end_ns": ATTACH_NS,
+                                        "reason": "pre_attach"}])
+        with self.assertRaisesRegex(oracle.MeasureError, "discloses"):
+            oracle.cell_verdict(cell, healthy_observer(1),
+                                exact_evidence(module=module))
+
+    def test_passive_arm_claiming_empty_windows_trips(self):
+        oracle = require_oracle(self)
+        for module in (twin_module(windows=[]),
+                       exact_module(windows=[])):
+            with self.subTest(module=module):
+                cell = oracle.validate_cell(healthy_cell())
+                with self.assertRaisesRegex(oracle.MeasureError, "passive"):
+                    oracle.cell_verdict(
+                        cell, healthy_observer(1),
+                        exact_evidence(prearmed=False, module=module))
+
+    def test_absent_module_is_never_exact(self):
+        oracle = require_oracle(self)
+        cell = oracle.validate_cell(healthy_cell())
+        null_module = exact_evidence()
+        null_module["module"] = None
+        with self.assertRaisesRegex(oracle.MeasureError, "module"):
+            oracle.cell_verdict(cell, healthy_observer(1), null_module)
+        incomplete = {"prearmed": True, "verdict": bare_verdict()}
+        with self.assertRaisesRegex(oracle.MeasureError, "module"):
+            oracle.cell_verdict(cell, healthy_observer(1), incomplete)
+
+    def test_absent_windows_key_is_never_exact(self):
+        oracle = require_oracle(self)
+        exact = exact_evidence()
+        del exact["module"]["unobserved_windows"]
+        cell = oracle.validate_cell(healthy_cell())
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "unobserved_windows"):
+            oracle.cell_verdict(cell, healthy_observer(1), exact)
+        twin = exact_evidence(prearmed=False, module=twin_module())
+        del twin["module"]["unobserved_windows"]
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "unobserved_windows"):
+            oracle.cell_verdict(cell, healthy_observer(1), twin)
+
+    def test_malformed_exact_evidence_is_refused(self):
+        oracle = require_oracle(self)
+        cases = [
+            ([], "exact evidence"),
+            ({}, "prearmed"),
+            ({"prearmed": 1, "module": exact_module(),
+              "verdict": bare_verdict()}, "prearmed"),
+            ({"prearmed": "yes", "module": exact_module(),
+              "verdict": bare_verdict()}, "prearmed"),
+            ({"prearmed": True, "module": exact_module()}, "verdict"),
+            ({"prearmed": True, "module": exact_module(),
+              "verdict": None}, "verdict"),
+            ({"prearmed": True, "module": exact_module(),
+              "verdict": []}, "verdict"),
+            ({"prearmed": False, "module": twin_module(),
+              "verdict": bare_verdict()}, "unexpected"),
+            ({"prearmed": True, "module": exact_module(),
+              "verdict": bare_verdict(), "extra": 1}, "unexpected"),
+            ({"prearmed": True, "module": [], "verdict": bare_verdict()},
+             "module"),
+        ]
+        for evidence, reason in cases:
+            with self.subTest(evidence=evidence):
+                cell = oracle.validate_cell(healthy_cell())
+                with self.assertRaisesRegex(oracle.MeasureError, reason):
+                    oracle.cell_verdict(cell, healthy_observer(1), evidence)
+
+    def test_gated_and_incomplete_cells_stay_non_positive_with_exact(self):
+        oracle = require_oracle(self)
+        gated = oracle.validate_cell(healthy_cell("known-inode", 10,
+                                                  "gated"))
+        verdict = oracle.cell_verdict(gated, healthy_observer(1),
+                                      exact_evidence())
+        self.assertFalse(verdict["positive"])
+        rows = [row for row in healthy_cell()
+                if row["phase"] != "entry_executed"]
+        partial = oracle.validate_cell(rows)
+        verdict = oracle.cell_verdict(partial, healthy_observer(0),
+                                      exact_evidence())
+        self.assertFalse(verdict["positive"])
+
+    def test_exact_arm_refuses_an_overcount(self):
+        oracle = require_oracle(self)
+        cell = oracle.validate_cell(healthy_cell())
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "counted 2 calls but the body ran 1"):
+            oracle.cell_verdict(cell, healthy_observer(2), exact_evidence())
+
+
+class ExactWatchTests(unittest.TestCase):
+    def judge(self, oracle, watch):
+        cell = oracle.validate_cell(healthy_cell())
+        module = exact_module()
+        if watch is None:
+            del module["watch"]
+        else:
+            module["watch"] = watch
+        return oracle.cell_verdict(cell, healthy_observer(1),
+                                   exact_evidence(module=module))
+
+    def test_states_outside_armed_intervals_are_refused(self):
+        oracle = require_oracle(self)
+        for state in ("pinned_unarmed", "unavailable", "bogus", None):
+            with self.subTest(state=state):
+                with self.assertRaisesRegex(oracle.MeasureError, "watch"):
+                    self.judge(oracle, {"state": state,
+                                        "since_ns": ATTACH_NS})
+        with self.assertRaisesRegex(oracle.MeasureError, "watch"):
+            self.judge(oracle, None)
+        with self.assertRaisesRegex(oracle.MeasureError, "watch"):
+            self.judge(oracle, [])
+
+    def test_failure_ends_are_refused(self):
+        oracle = require_oracle(self)
+        for ended_by in ("attached", "health_loss", "scope_uncertain",
+                         "object_changed"):
+            with self.subTest(ended_by=ended_by):
+                with self.assertRaisesRegex(oracle.MeasureError, "ended"):
+                    self.judge(oracle, {"state": "ended",
+                                        "since_ns": ATTACH_NS,
+                                        "until_ns": 12_000,
+                                        "ended_by": ended_by})
+        with self.assertRaisesRegex(oracle.MeasureError, "ended"):
+            self.judge(oracle, {"state": "ended", "since_ns": ATTACH_NS,
+                                "until_ns": 12_000})
+        with self.assertRaisesRegex(oracle.MeasureError, "ended"):
+            self.judge(oracle, {"state": "armed_idle", "since_ns": ATTACH_NS,
+                                "until_ns": 12_000,
+                                "ended_by": "health_loss"})
+        with self.assertRaisesRegex(oracle.MeasureError, "carries an end"):
+            self.judge(oracle, {"state": "armed", "since_ns": ATTACH_NS,
+                                "until_ns": 12_000, "ended_by": "scope_end"})
+
+    def test_since_must_equal_the_declared_attach_maximum(self):
+        oracle = require_oracle(self)
+        for since_ns in (None, ATTACH_NS - 1_000, "9000"):
+            with self.subTest(since_ns=since_ns):
+                with self.assertRaisesRegex(oracle.MeasureError, "since_ns"):
+                    self.judge(oracle, {"state": "armed",
+                                        "since_ns": since_ns})
+        watch = {"state": "armed"}
+        with self.assertRaisesRegex(oracle.MeasureError, "since_ns"):
+            self.judge(oracle, watch)
+        for attached in (None, ATTACH_NS + 500, "9000"):
+            with self.subTest(attached=attached):
+                cell = oracle.validate_cell(healthy_cell())
+                module = exact_module(attached_at_ns=attached)
+                with self.assertRaisesRegex(oracle.MeasureError,
+                                            "attached_at_ns"):
+                    oracle.cell_verdict(cell, healthy_observer(1),
+                                        exact_evidence(module=module))
+        cell = oracle.validate_cell(healthy_cell())
+        module = exact_module()
+        del module["attached_at_ns"]
+        with self.assertRaisesRegex(oracle.MeasureError, "attached_at_ns"):
+            oracle.cell_verdict(cell, healthy_observer(1),
+                                exact_evidence(module=module))
+
+    def test_changed_object_is_refused(self):
+        oracle = require_oracle(self)
+        with self.assertRaisesRegex(oracle.MeasureError, "changed"):
+            self.judge(oracle, {"state": "armed", "since_ns": ATTACH_NS,
+                                "changed": {"last_ok_ns": 1_000,
+                                            "detected_ns": 2_000,
+                                            "previous_ino": 7}})
+
+
+class ExactCauseTests(unittest.TestCase):
+    def judge(self, oracle, verdict, sources=("prearm",)):
+        cell = oracle.validate_cell(healthy_cell())
+        module = exact_module(sources=sources)
+        return oracle.cell_verdict(cell, healthy_observer(1),
+                                   exact_evidence(module=module,
+                                                  verdict=verdict))
+
+    def test_observation_loss_is_refused(self):
+        oracle = require_oracle(self)
+        verdict = bare_verdict()
+        verdict["gap_classes"]["observation"] = {"status": "lossy",
+                                                 "causes": ["event_loss"]}
+        with self.assertRaisesRegex(oracle.MeasureError, "observation"):
+            self.judge(oracle, verdict)
+        verdict = bare_verdict()
+        verdict["gap_classes"]["observation"] = {"status": "exact",
+                                                 "causes": ["event_loss"]}
+        with self.assertRaisesRegex(oracle.MeasureError, "observation"):
+            self.judge(oracle, verdict)
+
+    def test_attribution_outside_the_bare_pair_is_refused(self):
+        oracle = require_oracle(self)
+        cases = [
+            [],
+            ["discovery_uncorroborated"],
+            ["semantic_unverified_slots"],
+            [*BARE_ATTRIBUTION, "module_ambiguous"],
+            ["discovery_uncorroborated", "semantic_unverified_slots"],
+            "semantic_unverified_slots",
+            [1],
+        ]
+        for causes in cases:
+            with self.subTest(causes=causes):
+                verdict = bare_verdict()
+                verdict["gap_classes"]["attribution"]["causes"] = causes
+                with self.assertRaisesRegex(oracle.MeasureError,
+                                            "attribution"):
+                    self.judge(oracle, verdict)
+        verdict = bare_verdict()
+        verdict["gap_classes"]["attribution"]["status"] = "attested"
+        with self.assertRaisesRegex(oracle.MeasureError, "attribution"):
+            self.judge(oracle, verdict)
+
+    def test_semantics_gaps_are_refused(self):
+        oracle = require_oracle(self)
+        verdict = bare_verdict()
+        verdict["gap_classes"]["semantics"] = {"status": "degraded",
+                                               "causes": ["pending_at_end"]}
+        with self.assertRaisesRegex(oracle.MeasureError, "semantics"):
+            self.judge(oracle, verdict)
+        verdict = bare_verdict()
+        verdict["gap_classes"]["semantics"]["status"] = "complete"
+        with self.assertRaisesRegex(oracle.MeasureError, "semantics"):
+            self.judge(oracle, verdict)
+
+    def test_open_calls_and_unproven_settlement_are_refused(self):
+        oracle = require_oracle(self)
+        for open_calls in (1, -1, "0"):
+            with self.subTest(open_calls=open_calls):
+                verdict = bare_verdict()
+                verdict["gap_classes"]["open_calls"] = open_calls
+                with self.assertRaisesRegex(oracle.MeasureError,
+                                            "open_calls"):
+                    self.judge(oracle, verdict)
+        for settlement in ("unproven", "bogus", None):
+            with self.subTest(settlement=settlement):
+                verdict = bare_verdict()
+                verdict["gap_classes"]["settlement"] = settlement
+                with self.assertRaisesRegex(oracle.MeasureError,
+                                            "settlement"):
+                    self.judge(oracle, verdict)
+
+    def test_completeness_must_match_its_variant(self):
+        oracle = require_oracle(self)
+        verdict = bare_verdict()
+        verdict["completeness"] = "COMPLETE"
+        with self.assertRaisesRegex(oracle.MeasureError, "completeness"):
+            self.judge(oracle, verdict)
+        verdict = manifest_verdict()
+        verdict["completeness"] = "PARTIAL"
+        verdict["verdict_detail"] = "attribution_only"
+        with self.assertRaisesRegex(oracle.MeasureError, "completeness"):
+            self.judge(oracle, verdict, sources=("manifest", "prearm"))
+        verdict = bare_verdict()
+        verdict["verdict_detail"] = "clean_proven"
+        with self.assertRaisesRegex(oracle.MeasureError, "verdict_detail"):
+            self.judge(oracle, verdict)
+        verdict = manifest_verdict()
+        verdict["verdict_detail"] = "attribution_only"
+        with self.assertRaisesRegex(oracle.MeasureError, "verdict_detail"):
+            self.judge(oracle, verdict, sources=("manifest", "prearm"))
+
+    def test_variant_needs_its_sources(self):
+        oracle = require_oracle(self)
+        with self.assertRaisesRegex(oracle.MeasureError, "completeness"):
+            self.judge(oracle, manifest_verdict(), sources=("prearm",))
+        with self.assertRaisesRegex(oracle.MeasureError, "completeness"):
+            self.judge(oracle, bare_verdict(),
+                       sources=("manifest", "prearm"))
+        for sources in (("scan",), ("scan", "manifest"), ()):
+            with self.subTest(sources=sources):
+                with self.assertRaisesRegex(oracle.MeasureError, "source"):
+                    self.judge(oracle, bare_verdict(), sources=sources)
+        for sources in ("prearm", [1], None):
+            with self.subTest(sources=sources):
+                cell = oracle.validate_cell(healthy_cell())
+                module = exact_module(sources=())
+                module["sources"] = sources
+                with self.assertRaisesRegex(oracle.MeasureError, "source"):
+                    oracle.cell_verdict(
+                        cell, healthy_observer(1),
+                        exact_evidence(module=module))
+
+    def test_verdict_shape_mutations_are_refused(self):
+        oracle = require_oracle(self)
+        verdict = bare_verdict()
+        del verdict["gap_classes"]
+        with self.assertRaisesRegex(oracle.MeasureError, "gap_classes"):
+            self.judge(oracle, verdict)
+        for broken in (None, [], "gap_classes"):
+            with self.subTest(broken=broken):
+                verdict = bare_verdict()
+                verdict["gap_classes"] = broken
+                with self.assertRaisesRegex(oracle.MeasureError,
+                                            "gap_classes"):
+                    self.judge(oracle, verdict)
+        verdict = bare_verdict()
+        del verdict["gap_classes"]["observation"]
+        with self.assertRaisesRegex(oracle.MeasureError, "observation"):
+            self.judge(oracle, verdict)
+        verdict = bare_verdict()
+        verdict["gap_classes"]["observation"] = []
+        with self.assertRaisesRegex(oracle.MeasureError, "observation"):
+            self.judge(oracle, verdict)
+        verdict = bare_verdict()
+        del verdict["gap_classes"]["open_calls"]
+        with self.assertRaisesRegex(oracle.MeasureError, "open_calls"):
+            self.judge(oracle, verdict)
+        verdict = bare_verdict()
+        del verdict["gap_classes"]["settlement"]
+        with self.assertRaisesRegex(oracle.MeasureError, "settlement"):
+            self.judge(oracle, verdict)
+
+
+class PassiveTwinTests(unittest.TestCase):
+    def judge(self, oracle, module, observed=1):
+        cell = oracle.validate_cell(healthy_cell())
+        return oracle.cell_verdict(
+            cell, healthy_observer(observed),
+            exact_evidence(prearmed=False, module=module))
+
+    def test_twin_discloses_its_window(self):
+        oracle = require_oracle(self)
+        for reason in ("pre_attach", "late_discovery"):
+            with self.subTest(reason=reason):
+                module = twin_module(windows=[{"start_ns": 1_000,
+                                               "end_ns": ATTACH_NS,
+                                               "reason": reason}])
+                for observed, missed in ((1, 0), (0, 1)):
+                    verdict = self.judge(oracle, module, observed)
+                    self.assertTrue(verdict["positive"])
+                    self.assertEqual(verdict["missed"]["missed_calls"],
+                                     missed)
+                    self.assertEqual(verdict["exactness"],
+                                     {"prearmed": False, "windows": 1,
+                                      "watch_state": None,
+                                      "completeness": None})
+
+    def test_twin_refuses_invented_counts(self):
+        oracle = require_oracle(self)
+        with self.assertRaisesRegex(oracle.MeasureError,
+                                    "counted 2 calls but the body ran 1"):
+            self.judge(oracle, twin_module(), observed=2)
+
+    def test_twin_refuses_undeclared_window_reasons(self):
+        oracle = require_oracle(self)
+        for reason in ("mapped_unattached", "health_loss", "scope_uncertain",
+                       "bogus", None, 1):
+            with self.subTest(reason=reason):
+                module = twin_module(windows=[{"start_ns": 1_000,
+                                               "end_ns": ATTACH_NS,
+                                               "reason": reason}])
+                with self.assertRaisesRegex(oracle.MeasureError,
+                                            "pre_attach"):
+                    self.judge(oracle, module)
+
+    def test_twin_refuses_malformed_windows(self):
+        oracle = require_oracle(self)
+        bad_windows = [
+            "pre_attach",
+            [[]],
+            [{"start_ns": None, "end_ns": ATTACH_NS,
+              "reason": "pre_attach"}],
+            [{"start_ns": 1_000, "end_ns": None, "reason": "pre_attach"}],
+            [{"start_ns": "1000", "end_ns": ATTACH_NS,
+              "reason": "pre_attach"}],
+            [{"start_ns": ATTACH_NS, "end_ns": 1_000,
+              "reason": "pre_attach"}],
+            [{"start_ns": 1_000, "end_ns": ATTACH_NS - 1,
+              "reason": "pre_attach"}],
+            [{"start_ns": 1_000, "end_ns": ATTACH_NS}],
+        ]
+        for windows in bad_windows:
+            with self.subTest(windows=windows):
+                with self.assertRaisesRegex(oracle.MeasureError, "window"):
+                    self.judge(oracle, twin_module(windows=windows))
+
+    def test_twin_refuses_a_watch(self):
+        oracle = require_oracle(self)
+        module = twin_module()
+        module["watch"] = {"state": "armed", "since_ns": ATTACH_NS}
+        with self.assertRaisesRegex(oracle.MeasureError, "watch"):
+            self.judge(oracle, module)
+
+    def test_twin_needs_its_module_and_attach_instant(self):
+        oracle = require_oracle(self)
+        cell = oracle.validate_cell(healthy_cell())
+        with self.assertRaisesRegex(oracle.MeasureError, "module"):
+            oracle.cell_verdict(cell, healthy_observer(1),
+                                {"prearmed": False, "module": None})
+        with self.assertRaisesRegex(oracle.MeasureError, "module"):
+            oracle.cell_verdict(cell, healthy_observer(1),
+                                {"prearmed": False})
+        for attached in (None, "9000"):
+            with self.subTest(attached=attached):
+                with self.assertRaisesRegex(oracle.MeasureError,
+                                            "attached_at_ns"):
+                    self.judge(oracle, twin_module(
+                        attached_at_ns=attached))
+        module = twin_module()
+        del module["attached_at_ns"]
+        with self.assertRaisesRegex(oracle.MeasureError, "attached_at_ns"):
+            self.judge(oracle, module)
 
 
 class BoundTableTests(unittest.TestCase):
@@ -839,6 +1367,104 @@ class OracleCliTests(unittest.TestCase):
                                      "--bounds", str(bounds)])
         self.assertEqual(code, 0)
         self.assertFalse(json.loads(out)["positive"])
+
+
+class ExactCliTests(unittest.TestCase):
+    def run_cli(self, argv):
+        oracle = require_oracle(self)
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = oracle.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def write_inputs(self, directory, rows, observer, evidence):
+        ledger = Path(directory) / "ledger.jsonl"
+        with open(ledger, "w", encoding="utf-8") as stream:
+            for row in rows:
+                stream.write(json.dumps(row) + "\n")
+        seen = Path(directory) / "observer.json"
+        seen.write_text(json.dumps(observer))
+        exact = Path(directory) / "exact.json"
+        exact.write_text(json.dumps(evidence))
+        return ledger, seen, exact
+
+    def test_cli_accepts_an_exact_cell(self):
+        require_oracle(self)
+        work = tempfile.TemporaryDirectory(prefix="p11scope-firstuse-cli-")
+        self.addCleanup(work.cleanup)
+        ledger, seen, exact = self.write_inputs(
+            work.name, healthy_cell("known-inode", 100, "ungated"),
+            healthy_observer(1), exact_evidence())
+        code, out, _ = self.run_cli([str(ledger), str(seen),
+                                     "--exact", str(exact)])
+        self.assertEqual(code, 0)
+        verdict = json.loads(out)
+        self.assertTrue(verdict["positive"])
+        self.assertEqual(verdict["exactness"]["completeness"], "PARTIAL")
+
+    def test_cli_accepts_a_disclosing_twin(self):
+        require_oracle(self)
+        work = tempfile.TemporaryDirectory(prefix="p11scope-firstuse-cli-")
+        self.addCleanup(work.cleanup)
+        ledger, seen, exact = self.write_inputs(
+            work.name, healthy_cell("known-inode", 100, "ungated"),
+            healthy_observer(0),
+            exact_evidence(prearmed=False, module=twin_module()))
+        code, out, _ = self.run_cli([str(ledger), str(seen),
+                                     "--exact", str(exact)])
+        self.assertEqual(code, 0)
+        verdict = json.loads(out)
+        self.assertTrue(verdict["positive"])
+        self.assertEqual(verdict["missed"]["missed_calls"], 1)
+
+    def test_cli_refuses_a_tripwire_cell(self):
+        require_oracle(self)
+        work = tempfile.TemporaryDirectory(prefix="p11scope-firstuse-cli-")
+        self.addCleanup(work.cleanup)
+        ledger, seen, exact = self.write_inputs(
+            work.name, healthy_cell(), healthy_observer(1),
+            exact_evidence(prearmed=False, module=twin_module(windows=[])))
+        code, _, err = self.run_cli([str(ledger), str(seen),
+                                     "--exact", str(exact)])
+        self.assertEqual(code, 1)
+        self.assertIn("first-use refused", err)
+        self.assertIn("passive", err)
+
+    def test_cli_refuses_a_count_mismatch(self):
+        require_oracle(self)
+        work = tempfile.TemporaryDirectory(prefix="p11scope-firstuse-cli-")
+        self.addCleanup(work.cleanup)
+        ledger, seen, exact = self.write_inputs(
+            work.name, healthy_cell(), healthy_observer(0),
+            exact_evidence())
+        code, _, err = self.run_cli([str(ledger), str(seen),
+                                     "--exact", str(exact)])
+        self.assertEqual(code, 1)
+        self.assertIn("missed", err)
+
+    def test_cli_refuses_malformed_exact_evidence(self):
+        require_oracle(self)
+        work = tempfile.TemporaryDirectory(prefix="p11scope-firstuse-cli-")
+        self.addCleanup(work.cleanup)
+        ledger = Path(work.name) / "ledger.jsonl"
+        with open(ledger, "w", encoding="utf-8") as stream:
+            for row in healthy_cell():
+                stream.write(json.dumps(row) + "\n")
+        seen = Path(work.name) / "observer.json"
+        seen.write_text(json.dumps(healthy_observer(1)))
+        exact = Path(work.name) / "exact.json"
+        text = json.dumps(exact_evidence())
+        exact.write_text('{"prearmed": false, ' + text[1:])
+        code, _, err = self.run_cli([str(ledger), str(seen),
+                                     "--exact", str(exact)])
+        self.assertEqual(code, 1)
+        self.assertIn("first-use refused: duplicate JSON key", err)
+        code, _, err = self.run_cli([str(ledger), str(seen),
+                                     "--exact",
+                                     str(Path(work.name) / "missing.json")])
+        self.assertEqual(code, 1)
+        self.assertIn("first-use refused: unreadable exact evidence", err)
 
 
 if __name__ == "__main__":

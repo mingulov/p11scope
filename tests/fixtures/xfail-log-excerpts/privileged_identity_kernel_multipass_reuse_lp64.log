@@ -1,0 +1,15 @@
+# verbatim excerpt of the real failing log (privileged run 2026-11-03)
+
+running 1 test
+test inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64 ... p11scope: enumerating processes...
+  [...]
+p11scope: pass 0: caller c6 admitted (pid 2571)
+p11scope: pass 0: caller c7 admitted (pid 2627)
+Error: exactly one module for gate-k2.so
+FAILED
+
+
+failures:
+    inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7118 filtered out; finished in 1.68s

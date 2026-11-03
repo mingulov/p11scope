@@ -1,0 +1,16 @@
+# reconstructed: the twin-observed settle shape with WHAT swapped (shared helper); the genuine cell refused twice on the loaded host, so no genuine settle line was observed
+
+running 1 test
+test discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head ... t8: fixtures built (head linkage: static)
+p11scope: discovery: other ×290: discovery skipped /var/tmp/p11scope-ws-tmp/wp2r2/obs-xfail/tmp/t8-live256-live256-FwqNQO/early.so — not mapped in the target … ×290
+p11scope: discovery: 0 module(s), 0 attach slot(s), scan 1124ms, conflicts 0, uncorroborated 0
+t8: t8-live256: capture live after 18.791783875s
+  [...]
+thread 'discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head' (3639808) panicked at src/discovery/pressure_native_tests.rs:2518:13:
+t8-live256: unsettled after 121.148963806s: owned-requests=27 pending-owned-records=0 requested-hw=256 views=256 owned-views=229 owned-armed=229 rotation=false truncated=0 dropped=0 passes=7 attempts=7 arms=229 minted=229 scans=651 sample=[3640385, 3640386, 3640387, 3640388, 3640389] episode_loss=[Skipped { subject: "live discovery tick", reason: "256 new processes pending; tick admitted 64 for deep scanning (tick limit 64)" }, ...]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+failures:
+    discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7118 filtered out; finished in 137.31s

@@ -1,0 +1,18 @@
+# verbatim copy of the real failing log (privileged run 2026-11-03)
+
+running 1 test
+test discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation ... 
+thread 'discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation' (3643979) panicked at src/discovery/engine_tests.rs:16370:5:
+assertion `left == right` failed: R57: balanced benign exit-time work needs a strong settlement receipt; empty metadata is insufficient
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7118 filtered out; finished in 0.13s
+

@@ -58,8 +58,11 @@ build counter-bank-growth.c counter-bank-growth-provider.so \
 build counter-bank-growth.c counter-bank-growth-driver -ldl -lpthread
 
 echo "smoke: counter-bank-driver protocol"
+# No `-q`: under pipefail an early-exiting grep SIGPIPEs the driver and
+# the pipeline returns 141 at random (the runner's binary_has_ignored
+# failed this way). Without -q grep consumes the whole protocol.
 if ! printf 'SHR' | "$outdir/counter-bank-driver" "$outdir/counter-bank-provider.so" \
-    | grep -qx 'DONE'; then
+    | grep -x 'DONE' >/dev/null; then
     echo "$PROG: counter-bank-driver smoke failed" >&2
     exit 1
 fi

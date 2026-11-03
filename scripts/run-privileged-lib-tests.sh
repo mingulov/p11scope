@@ -664,10 +664,14 @@ inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
 )
 
 # Expected-failure campaign cells: run only with
-# --include-expected-failures. A cell that fails records XFAIL
-# (counts as passed); a cell that passes records XPASS and fails
-# the run, so a silent fix or change gets noticed. Reasons name
-# the expected failure and stay index-aligned with the tests.
+# --include-expected-failures. A cell records XFAIL (counts as passed)
+# only when it fails WITH its signature in the log; any other failure
+# records FAIL, so a backend refusal, fixture failure or missing tool
+# can never masquerade as the named failure. A cell that passes
+# records XPASS and fails the run, so a silent fix or change gets
+# noticed. Reasons name the expected failure, signatures are the fixed
+# log strings that prove it, and owners name the source file that owns
+# the pin; all three stay index-aligned with the tests.
 EXPECTED_FAILURE_TESTS=(
 discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
 discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
@@ -678,11 +682,27 @@ inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
 )
 XFAIL_REASONS=(
 "expected failure: lane-A runtime does not converge, the rotation stalls (doc Known limit 2026-10-19); an unexpected pass promotes the cell to the runnable campaign"
-"expected failure: lane-A view-capacity stall (doc Known limit; the post-settle refusal asserts unreachable until the runtime fix); an unexpected pass promotes the cell to the runnable campaign"
+"expected failure: lane-A view-capacity stall (doc Known limit 2026-10-19): owned requests strand and the settle never converges; an unexpected pass promotes the cell to the runnable campaign"
 "expected failure: RED by design while the post-copy-up D-C7-3 re-edge stands (investigation target); an unexpected pass gets noticed for promotion"
 "expected failure: R57 future positive, RED until a provider-free settlement receipt lands (unprivileged, no BPF or root); an unexpected pass un-ignores the cell"
 "expected failure: D3d forced-kernel positive gate fails at exactly-one-module for gate-k1.so on loop and physical btrfs alike (stale-vs-product verdict belongs to src/inventory/privileged_tests.rs); an unexpected pass promotes the cell to the btrfs group"
 "expected failure: D3d forced-kernel positive gate fails at exactly-one-module for gate-k2.so on loop and physical btrfs alike (stale-vs-product verdict belongs to src/inventory/privileged_tests.rs); an unexpected pass promotes the cell to the btrfs group"
+)
+XFAIL_SIGNATURES=(
+"t8-live256: unsettled after"
+"t8-twin: unsettled after"
+"D-C7-3 stands: upper mapper re-edged to the stale anchor"
+"R57: balanced benign exit-time work needs a strong settlement receipt"
+"exactly one module for gate-k1.so"
+"exactly one module for gate-k2.so"
+)
+XFAIL_OWNERS=(
+"src/discovery/pressure_native_tests.rs"
+"src/discovery/pressure_native_tests.rs"
+"src/discovery/d4_overlay_cells.rs"
+"src/discovery/engine_tests.rs"
+"src/inventory/privileged_tests.rs"
+"src/inventory/privileged_tests.rs"
 )
 
 # Wide-Detailed campaign: the ignored tests that exist only in a
@@ -809,11 +829,37 @@ cell_branch_suffix() {
     esac
 }
 
+# Expected-failure gate: true when the cell log contains the cell's
+# named-failure signature (fixed string). An empty signature never
+# matches: `grep -F ''` matches every line, so an empty pin would make
+# the XFAIL vacuous.
+xfail_log_matches() {
+    [ -n "$1" ] && command grep -qF -- "$1" "$2"
+}
+
+# De-duplicate a selection array in place, keeping the first curated
+# position of each cell. Two groups may curate one cell (a revive can
+# overlap another lane's add); without this the cell runs twice.
+dedup_preserving_order() {
+    local -n _arr=$1
+    local _name
+    local -a _out=()
+    local -A _seen=()
+    for _name in ${_arr[@]+"${_arr[@]}"}; do
+        if [ -z "${_seen[$_name]+present}" ]; then
+            _seen[$_name]=1
+            _out+=("$_name")
+        fi
+    done
+    _arr=(${_out[@]+"${_out[@]}"})
+}
+
 # Static skips pair each test with its reason by index, and so do the
-# expected-failure cells. A length mismatch would print wrong reasons
-# and, under `set -u` inside a `| tee` pipeline, fail only the forked
-# subshell while the loop reports phantoms and exits 0. Refuse loudly
-# before any print or selection touches the arrays.
+# expected-failure cells (reason, signature and owner each). A length
+# mismatch would print wrong reasons and, under `set -u` inside a
+# `| tee` pipeline, fail only the forked subshell while the loop
+# reports phantoms and exits 0. Refuse loudly before any print or
+# selection touches the arrays.
 check_pair_alignment() {
     local -n _tests=$1 _reasons=$2
     if [ "${#_tests[@]}" -ne "${#_reasons[@]}" ]; then
@@ -823,7 +869,9 @@ check_pair_alignment() {
 }
 check_skip_alignment() {
     check_pair_alignment SKIP_TESTS SKIP_REASONS \
-        && check_pair_alignment EXPECTED_FAILURE_TESTS XFAIL_REASONS
+        && check_pair_alignment EXPECTED_FAILURE_TESTS XFAIL_REASONS \
+        && check_pair_alignment EXPECTED_FAILURE_TESTS XFAIL_SIGNATURES \
+        && check_pair_alignment EXPECTED_FAILURE_TESTS XFAIL_OWNERS
 }
 
 # Compare curation against the binary. Prints drift details to stderr and
@@ -1015,7 +1063,7 @@ list_mode() {
     printf '%s\n' "${BTRFS_TESTS[@]}"
     echo "expected-failures (${#EXPECTED_FAILURE_TESTS[@]}, --include-expected-failures only)"
     for i in "${!EXPECTED_FAILURE_TESTS[@]}"; do
-        echo "${EXPECTED_FAILURE_TESTS[$i]} :: ${XFAIL_REASONS[$i]}"
+        echo "${EXPECTED_FAILURE_TESTS[$i]} :: ${XFAIL_REASONS[$i]} [sig: ${XFAIL_SIGNATURES[$i]}] [owner: ${XFAIL_OWNERS[$i]}]"
     done
     if check_curation "$bin"; then
         local actual_count
@@ -1111,14 +1159,14 @@ main() {
     local selected_runnable=() selected_skipped=()
     local arg name i pass=0 fail=0 skipped=0 xfail=0 xpass=0 seq=0
     local tmpdir logdir eviddir results log evdir short start end seconds rc
-    local result_line verdict branch_suffix
+    local result_line verdict branch_suffix sig_line
     local m32_ok=0 p11kit_ok=0 need_m32=0 need_p11kit=0
     local need_ext4loop=0 ext4loop_skip=
     local need_counter=0 counter_skip=
-    local need_btrfs_run=0 btrfs_mnt= btrfs_skip=
+    local need_btrfs_run=0 btrfs_mnt='' btrfs_skip=''
     local need_target_tmp=0 target_tmpdir=
     local cell_tmpdir
-    local -A counter_fixture_set=() btrfs_set=() xfail_reason=()
+    local -A counter_fixture_set=() btrfs_set=() xfail_reason=() xfail_sig=()
     local -a cell_env=()
 
     if [ $# -eq 0 ]; then
@@ -1217,6 +1265,7 @@ main() {
             fi
         done
     fi
+    dedup_preserving_order selected_runnable
     # Every SELECTOR must match at least one curated test.
     for arg in ${SELECTORS[@]+"${SELECTORS[@]}"}; do
         local matched=0 candidate
@@ -1337,6 +1386,7 @@ main() {
     for name in "${BTRFS_TESTS[@]}" "${BTRFS_TMPDIR_XFAIL_TESTS[@]}"; do btrfs_set[$name]=1; done
     for i in "${!EXPECTED_FAILURE_TESTS[@]}"; do
         xfail_reason[${EXPECTED_FAILURE_TESTS[$i]}]=${XFAIL_REASONS[$i]}
+        xfail_sig[${EXPECTED_FAILURE_TESTS[$i]}]=${XFAIL_SIGNATURES[$i]}
     done
     for name in ${selected_runnable[@]+"${selected_runnable[@]}"}; do
         if [ -n "${counter_fixture_set[$name]+present}" ]; then need_counter=1; fi
@@ -1506,9 +1556,13 @@ main() {
             if [ "$verdict" = "PASS" ]; then
                 xpass=$((xpass + 1))
                 echo "XPASS $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (UNEXPECTED PASS; expected: ${xfail_reason[$name]})" | tee -a "$results"
-            else
+            elif xfail_log_matches "${xfail_sig[$name]}" "$log"; then
                 xfail=$((xfail + 1))
-                echo "XFAIL $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (expected: ${xfail_reason[$name]})" | tee -a "$results"
+                sig_line=$(command grep -F -m 1 -- "${xfail_sig[$name]}" "$log" | head -c 300 || true)
+                echo "XFAIL $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (expected: ${xfail_reason[$name]}; sig: $sig_line)" | tee -a "$results"
+            else
+                fail=$((fail + 1))
+                echo "FAIL $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (EXPECTED-FAILURE SIGNATURE MISMATCH; want sig: ${xfail_sig[$name]}; expected: ${xfail_reason[$name]})" | tee -a "$results"
             fi
         else
             if [ "$verdict" = "PASS" ]; then

@@ -20,6 +20,7 @@ Run: python3 -I tests/python/test_ignored_tests.py -v
 """
 
 import json
+import os
 import re
 import runpy
 import subprocess
@@ -32,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts" / "check-ignored-tests.py"
 INVENTORY = ROOT / "tests" / "ignored-tests.json"
 RUNNER = ROOT / "scripts" / "run-privileged-lib-tests.sh"
+BTRFS_HELPER = ROOT / "scripts" / "ci" / "prepare-btrfs-tmpdir.sh"
 CHECKER_MOD = runpy.run_path(str(CHECKER))
 
 CELLS = {
@@ -106,6 +108,40 @@ XFAIL_EXPECTED = [
     "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64",
     "inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64",
 ]
+
+# The failure signatures and owners pinned beside each expected
+# failure, index-aligned with XFAIL_EXPECTED. A signature is the fixed
+# log string that proves the named failure (observed in a privileged
+# run); the owner is the source file that owns the pin. Pinned
+# literally so a weakened signature fails here, not silently.
+XFAIL_SIGNATURE_EXPECTED = [
+    "t8-live256: unsettled after",
+    "t8-twin: unsettled after",
+    "D-C7-3 stands: upper mapper re-edged to the stale anchor",
+    "R57: balanced benign exit-time work needs a strong settlement receipt",
+    "exactly one module for gate-k1.so",
+    "exactly one module for gate-k2.so",
+]
+
+XFAIL_OWNER_EXPECTED = [
+    "src/discovery/pressure_native_tests.rs",
+    "src/discovery/pressure_native_tests.rs",
+    "src/discovery/d4_overlay_cells.rs",
+    "src/discovery/engine_tests.rs",
+    "src/inventory/privileged_tests.rs",
+    "src/inventory/privileged_tests.rs",
+]
+
+# Canned failing logs for the signature twins: real privileged-run
+# excerpts per cell, plus refusal/fixture/provider-missing negatives
+# that must match no signature.
+XFAIL_EXCERPT_DIR = ROOT / "tests" / "fixtures" / "xfail-log-excerpts"
+XFAIL_NEGATIVE_EXCERPTS = (
+    "negative-ambient-refusal.log",
+    "negative-backend-refusal.log",
+    "negative-fixture-failure.log",
+    "negative-missing-softhsm.log",
+)
 
 COUNTER_FIXTURE_EXPECTED = [
     "metrics::counter_reader::tests::counter_bank_session_old_return_survives_append_lp64",
@@ -351,6 +387,56 @@ def run_runner(*args):
     )
 
 
+def unquote_shell(line):
+    """Strip one pair of double quotes from a runner array entry."""
+    if len(line) >= 2 and line.startswith('"') and line.endswith('"'):
+        return line[1:-1]
+    return line
+
+
+def xfail_log_matches(signature, log_path):
+    """The runner's own signature gate over a canned log.
+
+    Sources the runner with --help (the same trick the branch tests
+    use, so the trailing main call only prints usage) and asks
+    xfail_log_matches; argv carries the signature, so no quoting can
+    corrupt it.
+    """
+    result = subprocess.run(
+        ["bash", "-c",
+         'source "$0" --help >/dev/null 2>&1; xfail_log_matches "$1" "$2"',
+         str(RUNNER), signature, str(log_path)],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    return result.returncode == 0
+
+
+def run_btrfs_helper(helper, *args, path_prefix=(), env=None):
+    """Run the btrfs TMPDIR helper with optional PATH stub overrides."""
+    run_env = dict(env) if env else {}
+    if path_prefix:
+        run_env["PATH"] = (os.pathsep.join(str(p) for p in path_prefix)
+                           + os.pathsep + os.environ["PATH"])
+    merged = {**os.environ, **run_env} if run_env else None
+    return subprocess.run(
+        [str(helper), *args],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env=merged,
+    )
+
+
+def write_path_stub(bin_dir, name, body):
+    """An executable PATH stub (mountpoint/umount stand-ins)."""
+    path = Path(bin_dir) / name
+    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
 def runner_array_lines(path, name):
     """Ordered entries of one `NAME=(...)` shell array, comments stripped.
 
@@ -470,7 +556,9 @@ class IgnoredTestsTests(unittest.TestCase):
         prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
         full = set().union(*(lists[group] for group in
-                            ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS", "SKIP_TESTS")))
+                            ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
+                             "LONG_TESTS", "BTRFS_TESTS", "MARKER_TESTS",
+                             "EXPECTED_FAILURE_TESTS", "SKIP_TESTS")))
         unknown = prefix + "unknown_cell"
         renamed = prefix + "verifier_stats_renamed"
         with tempfile.TemporaryDirectory() as raw:
@@ -928,6 +1016,71 @@ class IgnoredTestsTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn("expected failure", reason.lower())
 
+    def test_xfail_signatures_and_owners_are_pinned(self):
+        # Ordered equality pins alignment as well as content: a
+        # dropped, reordered or weakened signature fails here. Every
+        # owner names the source file that owns the pin.
+        tests = runner_array_lines(RUNNER, "EXPECTED_FAILURE_TESTS")
+        signatures = [unquote_shell(line) for line in
+                      runner_array_lines(RUNNER, "XFAIL_SIGNATURES")]
+        owners = [unquote_shell(line) for line in
+                  runner_array_lines(RUNNER, "XFAIL_OWNERS")]
+        self.assertEqual(tests, XFAIL_EXPECTED)
+        self.assertEqual(signatures, XFAIL_SIGNATURE_EXPECTED)
+        self.assertEqual(owners, XFAIL_OWNER_EXPECTED)
+        for name, signature, owner in zip(tests, signatures, owners):
+            with self.subTest(name=name):
+                self.assertTrue(signature, "empty signature is vacuous")
+                self.assertTrue((ROOT / owner).is_file(),
+                                f"owner is not a file: {owner}")
+
+    def test_xfail_signatures_match_only_their_own_failure_excerpt(self):
+        # The named failure gives XFAIL: each signature matches its
+        # cell's real failing excerpt through the runner's own gate.
+        # The cross-matrix proves discrimination: no signature matches
+        # another cell's failure.
+        excerpts = {}
+        for name in XFAIL_EXPECTED:
+            path = (XFAIL_EXCERPT_DIR
+                    / (name.rsplit("::", 1)[-1] + ".log"))
+            self.assertTrue(path.is_file(), f"missing excerpt: {path}")
+            excerpts[name] = path
+        for name, signature in zip(XFAIL_EXPECTED,
+                                   XFAIL_SIGNATURE_EXPECTED):
+            with self.subTest(name=name, excerpt="own"):
+                self.assertTrue(xfail_log_matches(signature,
+                                                  excerpts[name]),
+                                f"{signature!r} matches no real failure")
+            for other in XFAIL_EXPECTED:
+                if other == name:
+                    continue
+                with self.subTest(name=name,
+                                   excerpt=other.rsplit("::", 1)[-1]):
+                    self.assertFalse(
+                        xfail_log_matches(signature, excerpts[other]),
+                        f"{signature!r} also matches {other}")
+
+    def test_xfail_signatures_match_no_refusal_or_fixture_failure(self):
+        # A different failure gives FAIL, never XFAIL: backend and
+        # ambient refusals, a fixture failure and a missing provider
+        # match no signature through the runner's own gate.
+        for excerpt in XFAIL_NEGATIVE_EXCERPTS:
+            path = XFAIL_EXCERPT_DIR / excerpt
+            self.assertTrue(path.is_file(), f"missing excerpt: {path}")
+            for name, signature in zip(XFAIL_EXPECTED,
+                                       XFAIL_SIGNATURE_EXPECTED):
+                with self.subTest(excerpt=excerpt, name=name):
+                    self.assertFalse(
+                        xfail_log_matches(signature, path),
+                        f"{signature!r} matches {excerpt}")
+
+    def test_xfail_gate_rejects_an_empty_signature(self):
+        # `grep -F ''` matches every line, so the gate refuses an
+        # empty signature outright instead of XFAILing everything.
+        excerpt = (XFAIL_EXCERPT_DIR
+                   / "pressure_live256_all_blocked_twin_refuses_once.log")
+        self.assertFalse(xfail_log_matches("", excerpt))
+
     def test_runner_list_refuses_skip_misalignment(self):
         text = RUNNER.read_text(encoding="utf-8")
         match = re.search(r"^SKIP_REASONS=\(\n(.*?)\n\)", text, re.M | re.S)
@@ -978,6 +1131,190 @@ class IgnoredTestsTests(unittest.TestCase):
             result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("differ in length", result.stderr)
         self.assertIn("EXPECTED_FAILURE_TESTS", result.stderr)
+
+    def test_runner_list_refuses_xfail_signature_misalignment(self):
+        text = RUNNER.read_text(encoding="utf-8")
+        match = re.search(r"^XFAIL_SIGNATURES=\(\n(.*?)\n\)", text, re.M | re.S)
+        self.assertIsNotNone(match, "real runner has no XFAIL_SIGNATURES list")
+        lines = match.group(1).splitlines()
+        dropped = "\n".join(
+            line for line in lines if "D-C7-3 stands" not in line)
+        self.assertLess(len(dropped.splitlines()), len(lines),
+                        "fixture must drop one signature")
+        broken = text[:match.start(1)] + dropped + text[match.end(1):]
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = Path(tmp) / "run-privileged-lib-tests.sh"
+            runner.write_text(broken, encoding="utf-8")
+            runner.chmod(0o755)
+            binary = Path(tmp) / "libtest-empty"
+            write_fake_binary(binary, [])
+            result = subprocess.run(
+                [str(runner), "--list", str(binary)],
+                capture_output=True, text=True, cwd=ROOT,
+            )
+        self.assertNotEqual(
+            result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("differ in length", result.stderr)
+        self.assertIn("EXPECTED_FAILURE_TESTS", result.stderr)
+
+    def test_btrfs_teardown_refuses_an_unmarked_mount(self):
+        # Mounted but not this tool's: with mountpoint stubbed to
+        # report mounted and no marker present, teardown refuses
+        # before unmounting (the stub records any call) and removes
+        # nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            mnt = Path(tmp) / "mnt"
+            mnt.mkdir()
+            sentinel = mnt / "sentinel.txt"
+            sentinel.write_text("data", encoding="utf-8")
+            img = Path(tmp) / "imgfile"
+            img.write_text("image", encoding="utf-8")
+            calls = Path(tmp) / "umount-calls"
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            write_path_stub(bindir, "mountpoint", "exit 0\n")
+            write_path_stub(bindir, "umount", f'echo called >>"{calls}"\n')
+            result = run_btrfs_helper(
+                BTRFS_HELPER, "--teardown", str(img), str(mnt),
+                path_prefix=[bindir])
+            self.assertEqual(result.returncode, 1,
+                             result.stdout + result.stderr)
+            self.assertIn("refusing teardown", result.stderr)
+            self.assertIn("not this tool", result.stderr)
+            self.assertTrue(sentinel.is_file())
+            self.assertTrue(img.is_file())
+            self.assertFalse(calls.exists(), "teardown must not unmount")
+
+    def test_btrfs_teardown_refuses_a_marker_for_another_image(self):
+        # Mounted with a marker, but the marker records a different
+        # image: cross-wired teardown refuses without unmounting.
+        with tempfile.TemporaryDirectory() as tmp:
+            mnt = Path(tmp) / "mnt"
+            mnt.mkdir()
+            (mnt / ".p11-btrfs-tmpdir").write_text(
+                "p11scope-btrfs-tmpdir v1\nimg=/elsewhere/other.img\n",
+                encoding="utf-8")
+            sentinel = mnt / "sentinel.txt"
+            sentinel.write_text("data", encoding="utf-8")
+            img = Path(tmp) / "imgfile"
+            img.write_text("image", encoding="utf-8")
+            calls = Path(tmp) / "umount-calls"
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            write_path_stub(bindir, "mountpoint", "exit 0\n")
+            write_path_stub(bindir, "umount", f'echo called >>"{calls}"\n')
+            result = run_btrfs_helper(
+                BTRFS_HELPER, "--teardown", str(img), str(mnt),
+                path_prefix=[bindir])
+            self.assertEqual(result.returncode, 1,
+                             result.stdout + result.stderr)
+            self.assertIn("refusing teardown", result.stderr)
+            self.assertTrue(sentinel.is_file())
+            self.assertTrue(img.is_file())
+            self.assertFalse(calls.exists(), "teardown must not unmount")
+
+    def test_btrfs_teardown_refuses_a_nonempty_unmarked_directory(self):
+        # Unmounted (a plain dir is not a mount): the sentinel
+        # directory and the plain image are left intact, exit 1.
+        with tempfile.TemporaryDirectory() as tmp:
+            mnt = Path(tmp) / "mnt"
+            mnt.mkdir()
+            sentinel = mnt / "sentinel.txt"
+            sentinel.write_text("data", encoding="utf-8")
+            img = Path(tmp) / "imgfile"
+            img.write_text("image", encoding="utf-8")
+            result = run_btrfs_helper(BTRFS_HELPER, "--teardown",
+                                      str(img), str(mnt))
+            self.assertEqual(result.returncode, 1,
+                             result.stdout + result.stderr)
+            self.assertIn("refusing teardown", result.stderr)
+            self.assertTrue(sentinel.is_file())
+            self.assertTrue(img.is_file())
+
+    def test_btrfs_teardown_removes_only_an_empty_dir_and_plain_image(self):
+        # Unmounted empty directory plus plain image file: both go,
+        # exit 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            mnt = Path(tmp) / "mnt"
+            mnt.mkdir()
+            img = Path(tmp) / "imgfile"
+            img.write_text("image", encoding="utf-8")
+            result = run_btrfs_helper(BTRFS_HELPER, "--teardown",
+                                      str(img), str(mnt))
+            self.assertEqual(result.returncode, 0,
+                                 result.stdout + result.stderr)
+            self.assertFalse(mnt.exists())
+            self.assertFalse(img.exists())
+
+    def test_btrfs_teardown_is_idempotent_on_missing_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_btrfs_helper(
+                BTRFS_HELPER, "--teardown",
+                str(Path(tmp) / "imgfile"), str(Path(tmp) / "mnt"))
+            self.assertEqual(result.returncode, 0,
+                             result.stdout + result.stderr)
+
+    def test_btrfs_teardown_refuses_a_nonfile_image(self):
+        # The image is validated before the empty directory is
+        # removed: a directory image refuses with everything intact.
+        with tempfile.TemporaryDirectory() as tmp:
+            mnt = Path(tmp) / "mnt"
+            mnt.mkdir()
+            img = Path(tmp) / "imgdir"
+            img.mkdir()
+            result = run_btrfs_helper(BTRFS_HELPER, "--teardown",
+                                      str(img), str(mnt))
+            self.assertEqual(result.returncode, 1,
+                             result.stdout + result.stderr)
+            self.assertIn("refusing teardown", result.stderr)
+            self.assertTrue(mnt.is_dir())
+            self.assertTrue(img.is_dir())
+
+    def test_btrfs_setup_refuses_an_occupied_mountpoint(self):
+        # mountpoint stubbed to report mounted: setup refuses 77
+        # naming the mountpoint. The check precedes privilege, so
+        # this runs unprivileged and must not print the root reason.
+        with tempfile.TemporaryDirectory() as tmp:
+            mnt = Path(tmp) / "mnt"
+            mnt.mkdir()
+            img = Path(tmp) / "imgfile"
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            write_path_stub(bindir, "mountpoint", "exit 0\n")
+            result = run_btrfs_helper(BTRFS_HELPER, str(img), str(mnt),
+                                      path_prefix=[bindir])
+            self.assertEqual(result.returncode, 77,
+                             result.stdout + result.stderr)
+            self.assertIn("already a mountpoint", result.stderr)
+            self.assertNotIn("must run as root", result.stderr)
+            self.assertFalse(img.exists())
+
+    def test_btrfs_setup_refuses_a_nonempty_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mnt = Path(tmp) / "mnt"
+            mnt.mkdir()
+            sentinel = mnt / "sentinel.txt"
+            sentinel.write_text("data", encoding="utf-8")
+            img = Path(tmp) / "imgfile"
+            result = run_btrfs_helper(BTRFS_HELPER, str(img), str(mnt))
+            self.assertEqual(result.returncode, 77,
+                             result.stdout + result.stderr)
+            self.assertIn("not empty", result.stderr)
+            self.assertTrue(sentinel.is_file())
+            self.assertFalse(img.exists())
+
+    def test_btrfs_setup_still_reports_missing_prerequisites(self):
+        # No stubs: a non-root setup still exits 77 with the root
+        # reason (the state checks kept the first-run path).
+        if os.geteuid() == 0:
+            self.skipTest("needs a non-root caller")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_btrfs_helper(
+                BTRFS_HELPER, str(Path(tmp) / "imgfile"),
+                str(Path(tmp) / "mnt"))
+            self.assertEqual(result.returncode, 77,
+                             result.stdout + result.stderr)
+            self.assertIn("must run as root", result.stderr)
 
     def test_binary_has_ignored_reports_present_on_large_early_match_lists(self):
         # The membership probe once ran `... | grep -qxF` under pipefail,
@@ -1045,6 +1382,29 @@ class IgnoredTestsTests(unittest.TestCase):
             ["<@@@@>", "<@@ branch=eligible@@>", "<@@ branch=second@@>",
              "<@@ branch=INVALID@@>", "<@@ branch=INVALID@@>"],
         )
+
+    def test_run_selection_deduplicates_overlapping_groups(self):
+        # Two groups may curate one cell (a revive overlapping
+        # another lane's add); the run loop must run it once,
+        # keeping the first curated position. Drives the runner's
+        # own dedup over a crafted selection, plus the empty case.
+        script = (
+            f'source "{RUNNER}" --help >/dev/null 2>&1; '
+            'probe=(b1 a1 b1 c1 a1); dedup_preserving_order probe; '
+            'printf "<%s>\\n" "${probe[@]}"; '
+            'empty=(); dedup_preserving_order empty; '
+            'echo "empty:${#empty[@]}"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True, text=True, cwd=ROOT,
+        )
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(),
+                         ["<b1>", "<a1>", "<c1>", "empty:0"])
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("dedup_preserving_order selected_runnable", text)
 
     def test_run_loop_appends_the_branch_suffix_after_the_result_text(self):
         # The ` branch=` token goes after the test-result text so the
@@ -1221,6 +1581,13 @@ class IgnoredTestsTests(unittest.TestCase):
                                  result.stdout + result.stderr)
                 self.assertIn("all 1 inventoried site(s) match",
                               result.stdout)
+
+    def test_development_version_pin_is_deliberate(self):
+        # The checker judges skip expiry against max(manifest,
+        # DEVELOPMENT_VERSION); a stale constant lets next-release
+        # untils stand a whole cycle (fail-closed but late), so the
+        # value is pinned and bumps are reviewed.
+        self.assertEqual(CHECKER_MOD["DEVELOPMENT_VERSION"], "0.6.0")
 
     def test_malformed_until_fails(self):
         for until in ("0.6.x", "soon", 7,

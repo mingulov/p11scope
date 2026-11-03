@@ -1,0 +1,9 @@
+# synthetic missing-provider log around the real loader diagnostic (must match no signature)
+
+running 1 test
+test inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64 ... provider fixture missing: libsofthsm2.so: cannot open shared object file: No such file or directory
+FAILED
+failures:
+    inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7118 filtered out; finished in 0.03s

@@ -61,7 +61,10 @@ DEFAULT_MANIFEST = "Cargo.toml"
 # The checker judges against the greater of this constant and the
 # Cargo.toml version; bump the constant when development moves to the
 # next release (the Cargo.toml side then covers the release-cut window
-# even if the bump lags).
+# even if the bump lags). If the constant lags when 0.7.0 development
+# starts (manifest still 0.6.0), "0.7.0" untils stand all cycle and
+# expire only at the 0.7.0 release cut: fail-closed, but late. The
+# suite pins the value so bumps are deliberate and reviewed.
 DEVELOPMENT_VERSION = "0.6.0"
 SCAN_DIRS = ("src", "tests", "crates")
 EXCLUDED_SEGMENTS = ("third-party", "target")

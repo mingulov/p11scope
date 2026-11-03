@@ -5,7 +5,8 @@
 Evaluates one evidence directory produced by
 scripts/system-manifest-soak.sh: a long `inventory --system --manifest`
 capture over owned SoftHSM workloads on a private provider copy, with a
-1 Hz RSS/FD trace in the bench-inventory-native.sh sampler format.
+1 Hz RSS/FD trace in the bench-inventory-native.sh sampler format
+extended with pidfd and BPF-FD breakdown columns.
 Six fail-closed gates:
 
 - finite_stop: the observer exited 0 on its own, the receipt window
@@ -22,16 +23,22 @@ Six fail-closed gates:
   count and every budget refusal has a named gap; every gap carries a
   subject and a reason; gaps_suppressed == 0.
 - resource_accounting: the trace spans the window without stalls, RSS
-  stays within 256 MiB, and neither RSS nor FDs grow steadily after
-  arming completes. Growth is judged on samples at or after the
+  stays within 256 MiB, and no resource grows steadily after arming
+  completes. Growth is judged on samples at or after the
   product-reported arming point (pass 0 published, carried as
   run.json timing.t_go_sampler_ms in the sampler's clock domain):
-  the late-half floor (10th percentile) must stay within margin of
-  the early-half floor, so a bounded arming ramp and the
-  pass-synchronous FD sawtooth (module files pinned per pass) read
-  as flat while a real leak still fails. Without an arming point,
-  or with fewer than eight post-arming samples, the whole trace is
-  judged instead (fail closed).
+  the late-half floor (10th percentile) must stay within an absolute
+  margin of the early-half floor on each resource (RSS, FDs, pidfds,
+  BPF FDs), so a bounded arming ramp and the pass-synchronous FD
+  sawtooth (module files pinned per pass) read as flat while a real
+  leak still fails on any base. The GO stamp must come from the
+  vehicle's arming event (t_go_mono_ns == start_mono_ns) and must
+  leave at least half the required window for post-arming judging;
+  growth before GO is judged against pre-GO margins (FDs, pidfds, BPF
+  FDs; RSS by the absolute peak). Without an arming point, or with
+  fewer than eight post-arming samples, the whole trace is judged
+  instead (fail closed). Legacy 4-column traces without the FD
+  breakdown skip the pidfd/BPF gates and say so.
 - journal_disclosure: key operations stay honestly unavailable with
   the journal_unavailable reason (they arrive in 0.6.0).
 - clean_exit: the sampler and every workload exited 0 (the observer
@@ -53,8 +60,39 @@ VERDICT_SCHEMA = "p11scope/manifest-soak-verdict/v1"
 GATES = ("finite_stop", "workload_ledger", "loss_accounting",
          "resource_accounting", "journal_disclosure", "clean_exit")
 RSS_LIMIT_KB = 256 * 1024
+# Post-arming floor-growth margins are absolute: the same retained leak
+# must fail on any base. Values from the W10-2 diagnosis soaks:
+# - RSS 32 MiB: post-arming drift was +4-6 MB over ~180 s on a loaded
+#   host and +0.7 MB over 1800 s quiet; 32 MB (~5x loaded drift) fails
+#   a +68 MB leak while staying well under the 256 MB absolute bound.
+# - FDs 64: the post-arming floor is stable within a few FDs (batch
+#   admissions balance retirements); 64 fails a +150 retained leak.
+# - pidfds 32: retained scan-pinned callers held flat (net drift <= 2
+#   over 195 loaded samples: ~19 admissions, ~17 retirements); 32 is
+#   16x that drift, tolerates ambient caller churn over 1800 s, and
+#   fails a +80 retained leak.
+# - BPF FDs 4: the attach topology is fixed after arming (75 map, 34
+#   prog, 15 link, drift 0 over 195 samples); any sustained +5 is a
+#   leak. BTF FDs are file-backed and counted in FDs only.
 RSS_GROWTH_MARGIN_KB = 32 * 1024
 FD_GROWTH_MARGIN = 64
+PIDFD_GROWTH_MARGIN = 32
+BPF_GROWTH_MARGIN = 4
+# Pre-arming (arming-window) floor-growth margins allow one full
+# admission while failing unbounded pre-GO growth; the pre-GO window is
+# short because GO must leave half the required window for judging:
+# - FDs 1024: honest arming rises ~30 to ~410 with the first pin batch
+#   (a ~937 spike lands at GO); 1024 allows a full admission plus
+#   ambient churn. No absolute FD cap exists, so this is the pre-GO
+#   FD guard.
+# - pidfds 512: honest admission reaches ~261; ~2x the max observed.
+# - BPF FDs 256: attach establishes ~127; 2x the observed topology.
+# Pre-GO RSS has no separate growth margin: any margin allowing the
+# honest +207 MB arming ramp (41 to 248 MB) would trip the 256 MB
+# absolute bound first, so the absolute peak is the pre-GO RSS bound.
+PRE_GO_FD_MARGIN = 1024
+PRE_GO_PIDFD_MARGIN = 512
+PRE_GO_BPF_MARGIN = 256
 STOP_LINE_RE = re.compile(
     r"p11scope: semantic calls: collected (\d+), joined (\d+), "
     r"shed (\d+), lost (\d+), bindings (\d+), refused (\d+)")
@@ -353,13 +391,17 @@ def gate_resource_accounting(evidence):
     except OSError as error:
         raise OracleError(f"cannot read resources trace: {error}") from error
     rows = []
+    widths = set()
     for line in lines:
         if line.startswith("#") or not line.strip():
             continue
         parts = line.split()
-        require(len(parts) == 4 and all(part.isdigit() for part in parts),
+        require(len(parts) in (4, 6) and all(part.isdigit() for part in parts),
                 f"malformed resources row: {line!r}")
+        widths.add(len(parts))
         rows.append(tuple(int(part) for part in parts))
+    require(len(widths) <= 1, "mixed resources row widths (4- and 6-column rows)")
+    breakdown = widths == {6}
     if len(rows) < 2:
         return False, "fewer than two resource samples"
     stamps = [row[0] for row in rows]
@@ -382,8 +424,13 @@ def gate_resource_accounting(evidence):
         return False, f"rss_max {rss_max} KiB exceeds the 256 MiB bound"
     # Growth is judged after arming completes: the vehicle stamps GO
     # (pass 0 published, observed in the sampler's clock domain) into
-    # run.json. Without that point, or with fewer than eight
-    # post-arming samples, the whole trace is judged (fail closed).
+    # run.json. The stamp must come from the vehicle's arming event
+    # (t_go_mono_ns == start_mono_ns: the vehicle stamps both from the
+    # same instant, so a sampler-domain GO edited on its own is not the
+    # arming point) and must leave at least half the required window
+    # for post-arming judging. Without that point, or with fewer than
+    # eight post-arming samples, the whole trace is judged (fail
+    # closed). Growth before GO is judged against pre-GO margins.
     timing = run.get("timing")
     go_ms = timing.get("t_go_sampler_ms") if isinstance(timing, dict) else None
     judged = rows
@@ -391,37 +438,76 @@ def gate_resource_accounting(evidence):
     if go_ms is not None:
         require(type(go_ms) is int and go_ms >= 0,
                 "timing t_go_sampler_ms must be a nonnegative integer")
+        go_mono = timing.get("t_go_mono_ns")
+        start_mono = timing.get("start_mono_ns")
+        if not (type(go_mono) is int and go_mono == start_mono):
+            return False, ("GO stamp is not from the vehicle's arming event "
+                           f"(t_go_mono_ns={go_mono!r}, start_mono_ns={start_mono!r})")
         post = [row for row in rows if row[0] >= go_ms]
-        if len(post) >= 8:
+        if len(post) < 8:
+            window = (f"whole trace judged (only {len(post)} "
+                      f"post-arming samples <8)")
+        else:
+            post_span_ms = stamps[-1] - go_ms
+            if post_span_ms < required * 1000 // 2:
+                return False, (f"arming too late to judge growth: {len(post)} "
+                               f"post-arming samples span {post_span_ms / 1000:.1f}s, "
+                               f"under half the required {required}s")
             judged = post
             window = (f"growth judged on {len(judged)} of {len(rows)} samples "
                       f"from arming at {go_ms}ms")
+            pre = [row for row in rows if row[0] < go_ms]
+            growth = growth_check([row[3] for row in pre], PRE_GO_FD_MARGIN,
+                                  "FDs", pre_arming=True)
+            if growth:
+                return False, f"{growth} [{window}]"
+            if breakdown:
+                growth = growth_check([row[4] for row in pre], PRE_GO_PIDFD_MARGIN,
+                                      "pidfds", pre_arming=True)
+                if growth:
+                    return False, f"{growth} [{window}]"
+                growth = growth_check([row[5] for row in pre], PRE_GO_BPF_MARGIN,
+                                      "BPF FDs", pre_arming=True)
+                if growth:
+                    return False, f"{growth} [{window}]"
     growth = growth_check([row[1] for row in judged], RSS_GROWTH_MARGIN_KB, "RSS")
     if growth:
         return False, f"{growth} [{window}]"
     growth = growth_check([row[3] for row in judged], FD_GROWTH_MARGIN, "FDs")
     if growth:
         return False, f"{growth} [{window}]"
-    return True, (f"{len(rows)} samples spanning {span_ms / 1000:.1f}s, worst gap "
-                  f"{worst_gap / 1000:.1f}s; rss_max={rss_max} "
-                  f"hwm_max={max(hwm_all)} KiB fds_max={max(fds_all)}; {window}")
+    detail = (f"{len(rows)} samples spanning {span_ms / 1000:.1f}s, worst gap "
+              f"{worst_gap / 1000:.1f}s; rss_max={rss_max} "
+              f"hwm_max={max(hwm_all)} KiB fds_max={max(fds_all)}")
+    if breakdown:
+        growth = growth_check([row[4] for row in judged], PIDFD_GROWTH_MARGIN, "pidfds")
+        if growth:
+            return False, f"{growth} [{window}]"
+        growth = growth_check([row[5] for row in judged], BPF_GROWTH_MARGIN, "BPF FDs")
+        if growth:
+            return False, f"{growth} [{window}]"
+        detail += (f" pidfd_max={max(row[4] for row in rows)} "
+                   f"bpf_max={max(row[5] for row in rows)}")
+    else:
+        detail += " [no FD breakdown columns: pidfd/BPF gates skipped]"
+    return True, f"{detail}; {window}"
 
 
-def growth_check(series, margin, label):
+def growth_check(series, margin, label, pre_arming=False):
     """Steady-growth veto on the judged window: the late-half floor
-    (10th percentile) must stay within margin of the early-half floor.
-    A retained leak raises the floor; a bounded oscillation between
-    fixed levels (or a lone spike, or a detach tail dip) does not move
-    it. Margins are absolute-or-quarter of the early floor."""
+    (10th percentile) must stay within an absolute margin of the
+    early-half floor, so the same leak fails on any base. A retained
+    leak raises the floor; a bounded oscillation between fixed levels
+    (or a lone spike, or a detach tail dip) does not move it."""
     if len(series) < 8:
         return None
     half = len(series) // 2
     floor_early = quantile(sorted(series[:half]), 0.10)
     floor_late = quantile(sorted(series[half:]), 0.10)
-    allowed = max(margin, floor_early / 4)
-    if floor_late > floor_early + allowed:
-        return (f"{label} grows steadily: floor {floor_early:.0f} "
-                f"-> {floor_late:.0f} (margin {allowed:.0f})")
+    if floor_late > floor_early + margin:
+        where = "grows pre-arming" if pre_arming else "grows steadily"
+        return (f"{label} {where}: floor {floor_early:.0f} "
+                f"-> {floor_late:.0f} (margin {margin:.0f})")
     return None
 
 

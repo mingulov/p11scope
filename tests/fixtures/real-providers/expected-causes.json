@@ -105,13 +105,34 @@
   ],
   "real-nss-certutil": [
    {
-    "observation": [],
+    "observation": [
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+     },
+     {
+      "cause": "surfaces",
+      "owner": "exec-scan-legacy32",
+      "reason": "SoftHSM 2.7 68-entry 3.2 table reads known_prefix"
+     },
+     {
+      "cause": "loader_discovery",
+      "owner": "exec-real-providers",
+      "reason": "live-loader timing gap with confirmed pause (unproven classification)"
+     },
+     {
+      "cause": "interface_selection",
+      "owner": "exec-real-providers",
+      "reason": "selection loss beside unverified tables"
+     }
+    ],
     "os": "fedora",
     "p11kit_skip": null,
     "p11kit_version": null,
     "pause": {
      "owner": "exec-real-providers",
-     "reason": "placeholder until the NSS probe lands",
+     "reason": "pause confirmed on every owner",
      "status": "sigstop"
     },
     "tool_version": "3.130.0-1.fc44"
@@ -119,13 +140,34 @@
   ],
   "real-nss-certutil-metrics": [
    {
-    "observation": [],
+    "observation": [
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+     },
+     {
+      "cause": "surfaces",
+      "owner": "exec-scan-legacy32",
+      "reason": "SoftHSM 2.7 68-entry 3.2 table reads known_prefix"
+     },
+     {
+      "cause": "loader_discovery",
+      "owner": "exec-real-providers",
+      "reason": "live-loader timing gap with confirmed pause (unproven classification)"
+     },
+     {
+      "cause": "discovery_truncated",
+      "owner": "exec-real-providers",
+      "reason": "a non-spied subject scan truncated with the spied counts exact"
+     }
+    ],
     "os": "fedora",
     "p11kit_skip": null,
     "p11kit_version": null,
     "pause": {
      "owner": "exec-real-providers",
-     "reason": "placeholder until the NSS probe lands",
+     "reason": "pause confirmed on every owner",
      "status": "sigstop"
     },
     "tool_version": "3.130.0-1.fc44"
@@ -276,44 +318,6 @@
      "status": "sigstop"
     },
     "tool_version": "0.27.1-2.fc44"
-   },
-   {
-    "observation": [
-     {
-      "cause": "skipped",
-      "owner": "exec-real-providers",
-      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
-     },
-     {
-      "cause": "unprotected_live_windows",
-      "owner": "exec-real-providers",
-      "reason": "a loader hit with no confirmed pause owner beside the partial pause"
-     },
-     {
-      "cause": "pause_partial",
-      "owner": "exec-real-providers",
-      "reason": "OpenSC partial pause; exec-real-providers lane"
-     },
-     {
-      "cause": "loader_discovery",
-      "owner": "exec-real-providers",
-      "reason": "live-loader timing gap beside the partial pause"
-     },
-     {
-      "cause": "interface_selection",
-      "owner": "exec-real-providers",
-      "reason": "selection loss beside unverified tables"
-     }
-    ],
-    "os": "ubuntu",
-    "p11kit_skip": null,
-    "p11kit_version": null,
-    "pause": {
-     "owner": "exec-real-providers",
-     "reason": "OpenSC partial pause; exec-real-providers lane",
-     "status": "partial"
-    },
-    "tool_version": "0.27.0~rc1-1"
    }
   ],
   "real-pkcs11tool-softhsm-metrics": [

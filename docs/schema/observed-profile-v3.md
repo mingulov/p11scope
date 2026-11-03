@@ -288,6 +288,26 @@ never merged into call or attribution shares, and settle no birth,
 admission, absence, or call (R57). `dlopen`-only provider use is
 invisible by design and reads `no_static_link_within_scope`.
 
+`gap_exit_mappings` is present under the same arming rule (extensive
+profile `--cgroup`/`--system` captures only; absent, never null,
+otherwise). It splits the same novel unmatched-exit subpopulation of
+`pid_descendant_gaps` (admissions and overflow sentinels carry no
+verdict) by the kernel's exit-time answer: `mapped` (the exiting
+leader had a watched provider file mapped when it exited, with no
+disqualifying refusal) and `unknown` (no record, shared mm, refused
+hooks, late watch, local fault, or empty slots). It is a kernel
+observation, not a static hint, so it carries no label or scope: the
+value is exactly `{"mapped", "unknown"}` as saturating u64s summing
+to the classified subpopulation, never to `pid_descendant_gaps`
+itself. Multi-threaded exits read `unknown`: a process with more
+than one mm user never localizes its mappings, so its empty slots
+are not a negative. A late watch (inserted between the process's
+exec and its exit) reads `unknown` for the same reason: mappings
+established before the watch are invisible. The two counts never
+feed calls, callers, shares, verdicts, or births, and an exit never
+settles a call (R57). There is no "did not map" publication: nothing
+here proves a process did not map a watched provider.
+
 `task_uprobe_link_losses` is a saturating u64 count of matched leader-exit
 records whose retained process generation proved that a member of the process
 group remained live. It is settled from the generation-bound process view, not

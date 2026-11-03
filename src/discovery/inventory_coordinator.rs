@@ -67,6 +67,7 @@ use crate::inventory_semantics::{AttestedSemanticLane, SemanticBatch};
 use crate::process::PidPin;
 use crate::scope::inventory_cgroup::{CgroupWalkLimits, CgroupWalkState, CollectionControl};
 use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT_MAPPINGS;
 use p11scope_ebpf_common::inventory_callers::CallerEvidence;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -5425,7 +5426,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Unproved final records are disposed, never queued for retry.
         let mut final_work = crate::process::leader_exit::LeaderExitReadBudget::for_commit();
         for record in &batch.records {
-            if record.kind != DISCOVERY_KIND_LEADER_EXIT {
+            // 6.14 Option A: kind 7 is a leader exit plus the mapping
+            // summary (inventory objects never emit it; defensive).
+            if !matches!(
+                record.kind,
+                DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+            ) {
                 continue;
             }
             let pid = (record.pid_tgid >> 32) as u32;

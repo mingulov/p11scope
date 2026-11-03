@@ -56,11 +56,14 @@ use crate::semantics_edge::resources::{
 };
 use crate::{plan, render};
 use anyhow::{Context as _, Result, anyhow, bail};
+use p11scope_ebpf_common::instance::{FILE_SLOTS, RECORD_SLOTS};
 use p11scope_ebpf_common::{
     CounterMode, DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
-    DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
-    DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
+    DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LEADER_EXIT_MAPPINGS, DISCOVERY_KIND_LOADER,
+    DISCOVERY_NAME_EXACT_STANDARD, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER,
+    DISCOVERY_NAME_UNREADABLE, DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED,
+    DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT, DISCOVERY_STATUS_EXIT_MAP_SHARED_MM,
     DISCOVERY_STATUS_LOADER_CONTEXT_INVALID, DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_OTHER,
     DISCOVERY_VERSION_UNREADABLE, DISCOVERY_VERSION_V2_40, DISCOVERY_VERSION_V3_0,
     DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, DiscoveryRecord, export_attach_cookie,
@@ -688,6 +691,10 @@ pub struct Engine {
     /// capture-local exe stash, scan-learned paths, and hint counts.
     /// Disabled unless the operator armed `--track-short-lived`.
     extensive: elf_needed::ExtensiveState,
+    /// 6.14 Option A exit-time mapping split: capture-local
+    /// mapped/unknown counts over the novel unmatched-exit
+    /// subpopulation. Read only while extensive mode is armed.
+    exit_map: ExitMappingState,
     task_uprobe_link_losses: u64,
     next_selection_binding_id: Option<u64>,
     selection_bindings: BTreeMap<u64, SelectionBindingFact>,
@@ -2828,6 +2835,14 @@ pub(crate) trait EngineSession {
     fn mutation_stopped(&self) -> bool {
         false
     }
+    /// 6.14 Option A: whether the session's instance-continuity hooks
+    /// are refused (or were never wanted), so an empty exit summary is
+    /// `unknown`, never a watched-provider negative. Fail-closed
+    /// default: sessions that cannot prove live hooks classify every
+    /// kind-7 summary as hooks-refused unknown.
+    fn instance_hooks_refused(&self) -> bool {
+        true
+    }
     fn bind_exec(
         &self,
         _: &ProcessView,
@@ -3087,6 +3102,9 @@ impl EngineSession for Session {
     }
     fn mutation_stopped(&self) -> bool {
         Session::mutation_stopped(self)
+    }
+    fn instance_hooks_refused(&self) -> bool {
+        Session::instance_tracking(self).refused().is_some()
     }
     fn bind_exec(
         &self,
@@ -9727,6 +9745,114 @@ fn process_view_is_current(
         .is_some_and(ProcessView::still_the_same)
 }
 
+/// 6.14 Option A exit-time verdict for one novel unmatched kind-7
+/// exit: `Mapped` (the kernel named a watched-provider slot with no
+/// disqualifying refusal) or one `unknown` reason. Publication
+/// collapses every non-`Mapped` reason into the single `unknown`
+/// count; the reasons exist so each arm stays testable and no
+/// negative ("did not map") can be smuggled through an unnamed
+/// path. There is deliberately no negative variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitMappingReason {
+    Mapped,
+    UnknownSharedMm,
+    UnknownHooksRefused,
+    UnknownLateWatch,
+    UnknownLocalFault,
+    UnknownEmpty,
+}
+
+/// 6.14 Option A capture-local state: the mapped/unknown counts plus
+/// the bounded per-PID exec-timing behind the late-watch rule.
+/// Active only while extensive mode is armed; the published key is
+/// `None` otherwise.
+#[derive(Debug, Default)]
+pub(crate) struct ExitMappingState {
+    enabled: bool,
+    mapped: u64,
+    unknown: u64,
+    execs: BTreeMap<u32, u64>,
+    #[cfg(test)]
+    reasons: Vec<ExitMappingReason>,
+}
+
+impl ExitMappingState {
+    fn set_enabled(&mut self, on: bool) {
+        self.enabled = on;
+    }
+
+    /// Record one EXEC observed during the capture. Every EXEC
+    /// counts as observed (observation, not authority: no ticket
+    /// gate); a re-exec overwrites, and a full table evicts the
+    /// smallest PID first, mirroring the Option B stash bound.
+    fn note_exec(&mut self, pid: u32, hook_ts_ns: u64) {
+        if !self.enabled {
+            return;
+        }
+        if self.execs.len() >= elf_needed::HINT_MAX_EXE_STASH_ENTRIES
+            && !self.execs.contains_key(&pid)
+        {
+            self.execs.pop_first();
+        }
+        self.execs.insert(pid, hook_ts_ns);
+    }
+
+    /// An admitted PID's exits match its admission, never a gap, so
+    /// its exec timing is dead. Dropping it also bounds the table
+    /// against long-lived processes that never gap.
+    fn drop_exec_for_pid(&mut self, pid: u32) {
+        self.execs.remove(&pid);
+    }
+
+    /// Classify one novel unmatched kind-7 exit (the caller checked
+    /// the kind) into exactly one split entry, in contract priority
+    /// order: refused hooks, shared mm, local fault, late watch,
+    /// then named slots. Unarmed captures record nothing. There is
+    /// no negative outcome: every non-`Mapped` reason feeds the
+    /// single `unknown` count.
+    fn classify(&mut self, record: &DiscoveryRecord, hooks_refused: bool) {
+        debug_assert_eq!(record.kind, DISCOVERY_KIND_LEADER_EXIT_MAPPINGS);
+        if !self.enabled {
+            return;
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        let status = record.status_flags;
+        let timely_exec = self
+            .execs
+            .get(&pid)
+            .is_some_and(|exec_ts| *exec_ts < record.hook_ts_ns);
+        let reason = if hooks_refused || status & DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED != 0 {
+            ExitMappingReason::UnknownHooksRefused
+        } else if status & DISCOVERY_STATUS_EXIT_MAP_SHARED_MM != 0 {
+            ExitMappingReason::UnknownSharedMm
+        } else if status & DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT != 0 {
+            ExitMappingReason::UnknownLocalFault
+        } else if !timely_exec {
+            ExitMappingReason::UnknownLateWatch
+        // OVERFLOW is deliberately not an arm: named slots still
+        // count as `mapped` when the leader record overflowed (the
+        // set may be partial, but what is named was observed).
+        } else if record.pointers[..RECORD_SLOTS]
+            .iter()
+            .any(|cell| (1..=u64::from(FILE_SLOTS)).contains(cell))
+        {
+            ExitMappingReason::Mapped
+        } else {
+            ExitMappingReason::UnknownEmpty
+        };
+        match reason {
+            ExitMappingReason::Mapped => {
+                self.mapped = self.mapped.saturating_add(1);
+            }
+            _ => {
+                self.unknown = self.unknown.saturating_add(1);
+            }
+        }
+        #[cfg(test)]
+        self.reasons.push(reason);
+    }
+}
+
 fn lifecycle_retirement(
     views: &[ProcessView],
     pid: u32,
@@ -9739,7 +9865,11 @@ fn lifecycle_retirement(
         .max_by_key(|view| view.admitted_ns())?;
     let cause = match kind {
         DISCOVERY_KIND_EXEC => RetirementCause::ExecRefresh,
-        DISCOVERY_KIND_LEADER_EXIT => RetirementCause::ExpectedRemoval,
+        // 6.14 Option A: kind 7 is a leader exit plus the mapping
+        // summary, so it retires exactly like kind 6.
+        DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS => {
+            RetirementCause::ExpectedRemoval
+        }
         _ => return None,
     };
     Some((view.id(), cause))
@@ -10056,6 +10186,7 @@ impl Engine {
             unmatched_leader_exit_events: BTreeSet::new(),
             cgroup_ingress_overflow: false,
             extensive: elf_needed::ExtensiveState::new(),
+            exit_map: ExitMappingState::default(),
             task_uprobe_link_losses: 0,
             next_selection_binding_id: Some(1),
             selection_bindings: BTreeMap::new(),
@@ -11025,8 +11156,13 @@ impl Engine {
             exit_ended,
             "the per-route exit-only buckets sum to the total"
         );
+        // 6.14 Option A: stamp the exit-mapping carrier from live
+        // engine state on every read, so the projection is always
+        // current without depending on projection timing.
+        let mut discovery = self.discovery.clone();
+        discovery.gap_exit_mappings = self.gap_exit_mappings();
         render::CaptureFacts {
-            discovery: self.discovery.clone(),
+            discovery,
             table_entries: self.plan.entries_seen,
             slots: self.plan.slots.len(),
             // U-14: mirrors how `slots` reads the plan, but counts only what
@@ -11072,6 +11208,21 @@ impl Engine {
         self.extensive.enabled().then_some(self.extensive.hints())
     }
 
+    /// 6.14 Option A exit-time split, present only when armed. Like
+    /// the gap counter it never moves calls or attribution; unlike
+    /// it, the split is `None` (key omitted) unless armed.
+    pub(crate) fn gap_exit_mappings(&self) -> Option<render::GapExitMappings> {
+        self.extensive.enabled().then(|| render::GapExitMappings {
+            mapped: self.exit_map.mapped,
+            unknown: self.exit_map.unknown,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exit_mapping_reasons_for_test(&self) -> &[ExitMappingReason] {
+        &self.exit_map.reasons
+    }
+
     /// 6.14 Option B: arm extensive mode from `--track-short-lived`
     /// before the session starts (run flow only; inventory never calls
     /// this, so its surface is unchanged). Arming snapshots the pinned
@@ -11083,6 +11234,9 @@ impl Engine {
     pub(crate) fn arm_extensive(&mut self, track_short_lived: bool) {
         let armed = track_short_lived && self.admits_generations();
         self.extensive.set_enabled(armed);
+        // 6.14 Option A: the exit-mapping split arms with the same
+        // flag; `gap_exit_mappings` reads `None` unless armed.
+        self.exit_map.set_enabled(armed);
         if armed {
             self.extensive.snapshot_watched(&self.pinned);
         }
@@ -11162,10 +11316,17 @@ impl Engine {
             // 6.14 Option B: an admitted PID's exits match its
             // admission, never a gap, so its stash entry is dead.
             self.extensive.drop_stash_for_pid(pid);
+            // 6.14 Option A: same for the exec timing behind the
+            // late-watch rule.
+            self.exit_map.drop_exec_for_pid(pid);
         }
     }
 
-    fn record_unmatched_cgroup_leader_exit(&mut self, record: &DiscoveryRecord) {
+    fn record_unmatched_cgroup_leader_exit(
+        &mut self,
+        record: &DiscoveryRecord,
+        hooks_refused: bool,
+    ) {
         if !self.admits_generations() {
             return;
         }
@@ -11199,6 +11360,12 @@ impl Engine {
         // exit in extensive mode. The gap count above never depends
         // on the hint outcome.
         self.extensive.classify_gap(record);
+        // 6.14 Option A: exactly one mapping verdict per novel
+        // unmatched kind-7 exit. Kind 6 never classifies; unarmed
+        // captures record nothing.
+        if record.kind == DISCOVERY_KIND_LEADER_EXIT_MAPPINGS {
+            self.exit_map.classify(record, hooks_refused);
+        }
     }
 
     fn close_cgroup_admission(&mut self, view: ProcessViewId, closed_ns: u64) {
@@ -11263,8 +11430,10 @@ impl Engine {
         records.retain(|queued| {
             let record = &queued.record;
             let pid = (record.pid_tgid >> 32) as u32;
-            let coalesced = record.kind == DISCOVERY_KIND_LEADER_EXIT
-                && admitted.iter().any(|view| {
+            let coalesced = matches!(
+                record.kind,
+                DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+            ) && admitted.iter().any(|view| {
                     self.admitted_cgroup_views
                         .get(view)
                         .is_some_and(|admission| {
@@ -20318,7 +20487,10 @@ impl Engine {
                         .admitted_cgroup_views
                         .get(view)
                         .is_some_and(|admission| {
-                            if record.kind == DISCOVERY_KIND_LEADER_EXIT {
+                            if matches!(
+                                record.kind,
+                                DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+                            ) {
                                 admission.covers(record.hook_ts_ns, pid)
                             } else {
                                 admission.pid == pid
@@ -20345,6 +20517,9 @@ impl Engine {
         // captures ignore the record's exe words entirely.
         if record.kind == DISCOVERY_KIND_EXEC {
             self.extensive.note_exec_record(record);
+            // 6.14 Option A: seed the exec timing behind the
+            // late-watch rule from the same EXEC.
+            self.exit_map.note_exec(pid, record.hook_ts_ns);
         }
         if let Some((view, cause)) = self.admitted_lifecycle_match(record) {
             if record.kind == DISCOVERY_KIND_EXEC && self.acknowledge_owned_initial_exec(view) {
@@ -20365,10 +20540,16 @@ impl Engine {
                 diag.matched_exec();
                 diag.note(DiagnosticPhase::Exec, DiagnosticOutcome::Begin, [None; 4]);
             }
-            if record.kind == DISCOVERY_KIND_LEADER_EXIT {
+            if matches!(
+                record.kind,
+                DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+            ) {
                 self.close_cgroup_admission(view, record.hook_ts_ns);
                 if !self.admitted_cgroup_views.contains_key(&view) {
-                    self.record_unmatched_cgroup_leader_exit(record);
+                    self.record_unmatched_cgroup_leader_exit(
+                        record,
+                        session.instance_hooks_refused(),
+                    );
                 }
             }
             let mut refreshed_serial = None;
@@ -20440,8 +20621,11 @@ impl Engine {
             self.request_refresh_consumed(pid, crate::attach::monotonic_ns());
             None
         } else {
-            if record.kind == DISCOVERY_KIND_LEADER_EXIT {
-                self.record_unmatched_cgroup_leader_exit(record);
+            if matches!(
+                record.kind,
+                DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+            ) {
+                self.record_unmatched_cgroup_leader_exit(record, session.instance_hooks_refused());
             }
             None
         }
@@ -20752,7 +20936,9 @@ impl Engine {
                 pending_views,
                 deferred_mismatches,
             ),
-            DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT => {
+            DISCOVERY_KIND_EXEC
+            | DISCOVERY_KIND_LEADER_EXIT
+            | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS => {
                 if let Some(view) = self.dispatch_lifecycle_record(session, &record, pending_views)
                 {
                     exec_refresh_views.insert(view);
@@ -28231,8 +28417,12 @@ impl Engine {
         if self.admits_generations() {
             deferred_exits.extend(queued.extract_if(.., |queued| {
                 let record = &queued.record;
-                record.kind == DISCOVERY_KIND_LEADER_EXIT
-                    && !retained_pids.contains(&((record.pid_tgid >> 32) as u32))
+                // 6.14 Option A: kind 7 defers like kind 6, so
+                // admission and coalescing see it in the same pass.
+                matches!(
+                    record.kind,
+                    DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+                ) && !retained_pids.contains(&((record.pid_tgid >> 32) as u32))
             }));
         }
         // The deferred exits above stay owned beside the queue while the
@@ -28447,10 +28637,14 @@ impl Engine {
         if self.admits_generations() {
             // Move-only: the deferred exits move out in encounter order;
             // both sides keep their original relative order.
+            // 6.14 Option A: kind 7 defers like kind 6, so admission
+            // and coalescing see it in the same pass.
             deferred_exits.extend(records.extract_if(.., |queued| {
                 let record = &queued.record;
-                record.kind == DISCOVERY_KIND_LEADER_EXIT
-                    && !retained_pids.contains(&((record.pid_tgid >> 32) as u32))
+                matches!(
+                    record.kind,
+                    DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+                ) && !retained_pids.contains(&((record.pid_tgid >> 32) as u32))
             }));
         }
 
@@ -29641,6 +29835,11 @@ pub(crate) mod session_fixture {
         /// T4b seam: report a logical retirement leaf (the G24 Singles
         /// twin takes no native path).
         pub(crate) logical_retirement: Cell<bool>,
+        /// 6.14 Option A seam: the instance-continuity hooks are live
+        /// for this scripted capture. Default false (refused), matching
+        /// the trait's fail-closed default; a test proving `mapped` sets
+        /// it explicitly, never by relying on the default.
+        pub(crate) instance_hooks_live: Cell<bool>,
         pub(crate) dequeues: VecDeque<Result<Option<crate::events::DiscoveryItem>>>,
         /// The staged FIFO, mirroring production: `stage_discovery` moves
         /// scripted ring outcomes here, `discovery_dequeue` serves it
@@ -29957,6 +30156,9 @@ pub(crate) mod session_fixture {
             self.pid_continuity
                 .as_ref()
                 .is_some_and(|state| !self.detach_failures.is_empty() || state.borrow().stopped())
+        }
+        fn instance_hooks_refused(&self) -> bool {
+            !self.instance_hooks_live.get()
         }
         fn bind_exec(
             &self,

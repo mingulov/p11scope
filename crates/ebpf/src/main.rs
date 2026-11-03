@@ -2091,6 +2091,30 @@ fn emit_loader_token_record(
     0
 }
 
+/// 6.14 Option A exit-time mapping summary. Mirrors `struct
+/// instance_exit_summary` in native/instance_epoch.h: eight slot+1
+/// cells then the record flag word, all u64. Detailed only; the
+/// kind-7 arm below is the sole user.
+#[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+#[repr(C)]
+struct InstanceExitSummary {
+    slot_plus1: [u64; p11scope_ebpf_common::instance::RECORD_SLOTS],
+    flags: u64,
+}
+
+/// Native record flag bits, aliased from the canonical
+/// `instance::RECORD_*` consts (pinned against the C header by the
+/// ebpf-common remap contract test): the exit hook projects each set
+/// bit to the ABI status bit one position higher and drops the rest.
+/// Detailed only; no kernel state means "hooks refused", so the
+/// 0x40 bit is never projected here.
+#[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+const EXIT_MAP_NATIVE_SHARED_MM: u64 = p11scope_ebpf_common::instance::RECORD_SHARED_MM;
+#[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+const EXIT_MAP_NATIVE_OVERFLOW: u64 = p11scope_ebpf_common::instance::RECORD_OVERFLOW;
+#[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+const EXIT_MAP_NATIVE_LOCAL_FAULT: u64 = p11scope_ebpf_common::instance::RECORD_LOCAL_FAULT;
+
 #[inline(never)]
 fn emit_lifecycle(kind: u8, case_id: u8, scope: ScopeAuth, pause_eligible: bool) {
     let Some(mut entry) = reserve_discovery() else {
@@ -2144,8 +2168,44 @@ fn emit_lifecycle(kind: u8, case_id: u8, scope: ScopeAuth, pause_eligible: bool)
             }
         }
     }
+    // 6.14 Option A: the exit-time mapping summary rides
+    // pointers[0..8] (slot+1 cells) and status_flags (the remapped
+    // record bits) only for kind 7, only in Detailed objects. The
+    // helper reads the exiting leader's existing record and nothing
+    // else; a missing record contributes zero cells and no flags.
+    // All other kinds retain the initializer's zeros, so their
+    // records are byte-identical with or without this arm.
+    #[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+    let mut exit_map_status = 0u8;
+    #[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+    if kind == p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT_MAPPINGS {
+        let mut summary = InstanceExitSummary {
+            slot_plus1: [0; p11scope_ebpf_common::instance::RECORD_SLOTS],
+            flags: 0,
+        };
+        let _ = unsafe { p11_instance_exit_summary(&mut summary) };
+        if summary.flags & EXIT_MAP_NATIVE_SHARED_MM != 0 {
+            exit_map_status |= p11scope_ebpf_common::DISCOVERY_STATUS_EXIT_MAP_SHARED_MM;
+        }
+        if summary.flags & EXIT_MAP_NATIVE_OVERFLOW != 0 {
+            exit_map_status |= p11scope_ebpf_common::DISCOVERY_STATUS_EXIT_MAP_OVERFLOW;
+        }
+        if summary.flags & EXIT_MAP_NATIVE_LOCAL_FAULT != 0 {
+            exit_map_status |= p11scope_ebpf_common::DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT;
+        }
+        for (index, cell) in summary.slot_plus1.iter().enumerate() {
+            unsafe {
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!((*raw).pointers[index]),
+                    *cell,
+                );
+            }
+        }
+    }
+    #[cfg(any(feature = "inventory-only", feature = "counter-broad"))]
+    let exit_map_status = 0u8;
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
-    finish_discovery_record(entry, scope, pause_eligible, pid_tgid, 0);
+    finish_discovery_record(entry, scope, pause_eligible, pid_tgid, exit_map_status);
 }
 
 #[raw_tracepoint(tracepoint = "sched_process_exec")]
@@ -2263,12 +2323,19 @@ fn sched_process_exit_impl(_ctx: RawTracePointContext) -> u32 {
         return 0;
     }
     if let Some(scope) = scope_auth() {
-        emit_lifecycle(
-            DISCOVERY_KIND_LEADER_EXIT,
-            DISCOVERY_EXEC_UNKNOWN,
-            scope,
-            false,
-        );
+        // 6.14 Option A: extensive mode replaces the bare leader-exit
+        // record with the exit-time mapping summary (kind 7). Every
+        // other capture keeps byte-identical kind 6; non-Detailed
+        // objects never select kind 7 (their arm is compiled out).
+        #[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+        let kind = if scope.flags & FLAG_TRACK_SHORT_LIVED != 0 {
+            p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+        } else {
+            DISCOVERY_KIND_LEADER_EXIT
+        };
+        #[cfg(any(feature = "inventory-only", feature = "counter-broad"))]
+        let kind = DISCOVERY_KIND_LEADER_EXIT;
+        emit_lifecycle(kind, DISCOVERY_EXEC_UNKNOWN, scope, false);
     }
     0
 }
@@ -3157,6 +3224,12 @@ unsafe extern "C" {
     fn p11_instance_return(key: *const StartKey, out: *mut InstanceContinuity) -> u32;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_instance_exec() -> u32;
+    /// 6.14 Option A exit-time mapping summary (native
+    /// instance_epoch.c, linked into Detailed and counter flavors):
+    /// a no-create read of the exiting leader's record into the
+    /// caller's summary. Only the Detailed kind-7 arm calls it.
+    #[cfg(all(not(feature = "inventory-only"), not(feature = "counter-broad")))]
+    fn p11_instance_exit_summary(out: *mut InstanceExitSummary) -> u32;
     /// H8-D post-attach birth marker (native instance_epoch.c, Detailed
     /// and journal): the exec half publishes READY on the leader row after
     /// closure; the gap half dirties it on an out-of-scope or refused

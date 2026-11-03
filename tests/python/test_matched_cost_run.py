@@ -184,6 +184,164 @@ class StatsTests(unittest.TestCase):
         self.assertIn("peak_rss_kb", text)
 
 
+def patch_main_globals(test, **overrides):
+    """Patch main()'s live globals (runpy returns a snapshot, not these)."""
+    live = MOD["main"].__globals__
+    saved = {name: live[name] for name in overrides if name in live}
+    missing = [name for name in overrides if name not in live]
+    live.update(overrides)
+    def restore():
+        for name in overrides:
+            if name in saved:
+                live[name] = saved[name]
+            else:
+                del live[name]
+    test.addCleanup(restore)
+    assert not missing, f"no driver global(s): {missing}"
+
+
+class UnevenPairingTests(unittest.TestCase):
+    """summarize() must survive arm gaps (round/pair keying, never raise)."""
+
+    def test_uneven_steady_pairs_matched_pair_only(self):
+        # Round 1 ABBA: new@0, old@1, old@2, new@3; new@3 lost steady.
+        samples = [
+            {"cell": "c", "tag": "new-c-r01-0", "steady_ns": 110.0},
+            {"cell": "c", "tag": "old-c-r01-1", "steady_ns": 100.0},
+            {"cell": "c", "tag": "old-c-r01-2", "steady_ns": 200.0},
+            {"cell": "c", "tag": "new-c-r01-3", "steady_ns": None},
+        ]
+        row = summarize(samples)["c"]["steady_ns"]
+        self.assertEqual(row["paired_median_delta"], 10.0)
+        self.assertEqual(row["paired_n"], 1)
+        self.assertEqual((row["old_n"], row["new_n"]), (2, 1))
+
+    def test_no_matched_pair_skips_metric(self):
+        samples = [
+            {"cell": "c", "tag": "new-c-r01-0", "steady_ns": 110.0},
+            {"cell": "c", "tag": "old-c-r01-1", "steady_ns": None},
+            {"cell": "c", "tag": "old-c-r02-2", "steady_ns": 200.0},
+            {"cell": "c", "tag": "new-c-r02-3", "steady_ns": None},
+        ]
+        table = summarize(samples)["c"]
+        self.assertNotIn("steady_ns", table)
+
+    def test_uneven_unkeyed_tags_skip_metric(self):
+        samples = [
+            {"cell": "c", "tag": "old-x", "steady_ns": 100.0},
+            {"cell": "c", "tag": "old-y", "steady_ns": 200.0},
+            {"cell": "c", "tag": "new-x", "steady_ns": 110.0},
+        ]
+        table = summarize(samples)["c"]
+        self.assertNotIn("steady_ns", table)
+
+    def test_main_survives_uneven_samples(self):
+        main = MOD["main"]
+        samples = [
+            {"cell": "c", "tag": "old-c-r01-1", "startup_ns": 1.0,
+             "wall_ns": 2.0, "peak_rss_kb": 3.0, "steady_ns": 100.0},
+            {"cell": "c", "tag": "old-c-r01-2", "startup_ns": 1.0,
+             "wall_ns": 2.0, "peak_rss_kb": 3.0, "steady_ns": 200.0},
+            {"cell": "c", "tag": "new-c-r01-0", "startup_ns": 1.0,
+             "wall_ns": 2.0, "peak_rss_kb": 3.0, "steady_ns": 110.0},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old"
+            new = Path(tmp) / "new"
+            old.write_bytes(b"old-bytes")
+            new.write_bytes(b"new-bytes")
+            out = Path(tmp) / "out"
+            out.mkdir()
+            patch_main_globals(self, run_campaign=lambda args: samples)
+            code = main(["--old", str(old), "--new", str(new),
+                         "--out", str(out)])
+            self.assertEqual(code, 0)
+            self.assertTrue((out / "comparison.json").is_file())
+
+    def test_main_converts_summarize_refusal_to_exit_1(self):
+        main = MOD["main"]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            out.mkdir()
+            patch_main_globals(
+                self,
+                run_campaign=lambda args: [],
+                summarize=lambda samples: (_ for _ in ()).throw(
+                    MatchedCostError("boom")),
+            )
+            code = main(["--old", "/bin/true", "--new", "/bin/false",
+                         "--out", str(out)])
+            self.assertEqual(code, 1)
+
+
+class ProvenanceTests(unittest.TestCase):
+    """comparison.json must identify the compared binaries and campaign."""
+
+    def test_binary_provenance_records_digests_and_campaign(self):
+        import hashlib
+        provenance = MOD["binary_provenance"]
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old"
+            new = Path(tmp) / "new"
+            old.write_bytes(b"old-bytes")
+            new.write_bytes(b"new-bytes")
+            meta = provenance(str(old), str(new), "30s", 40)
+        self.assertEqual(meta["old_path"], str(old))
+        self.assertEqual(meta["new_path"], str(new))
+        self.assertEqual(meta["old_sha256"], hashlib.sha256(b"old-bytes").hexdigest())
+        self.assertEqual(meta["new_sha256"], hashlib.sha256(b"new-bytes").hexdigest())
+        self.assertTrue(meta["kernel"])
+        self.assertEqual(meta["duration"], "30s")
+        self.assertEqual(meta["max_scan_pids"], 40)
+
+    def test_comparison_json_carries_meta(self):
+        import json
+        main = MOD["main"]
+        samples = [
+            {"cell": "c", "tag": "old-x", "startup_ns": 1.0,
+             "wall_ns": 2.0, "peak_rss_kb": 3.0},
+            {"cell": "c", "tag": "new-x", "startup_ns": 1.0,
+             "wall_ns": 2.0, "peak_rss_kb": 3.0},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old"
+            new = Path(tmp) / "new"
+            old.write_bytes(b"old-bytes")
+            new.write_bytes(b"new-bytes")
+            out = Path(tmp) / "out"
+            out.mkdir()
+            patch_main_globals(self, run_campaign=lambda args: samples)
+            code = main(["--old", str(old), "--new", str(new),
+                         "--out", str(out), "--duration", "30s",
+                         "--max-scan-pids", "40"])
+            self.assertEqual(code, 0)
+            doc = json.loads((out / "comparison.json").read_text(encoding="utf-8"))
+        self.assertIn("meta", doc)
+        self.assertEqual(doc["meta"]["duration"], "30s")
+        self.assertEqual(doc["meta"]["max_scan_pids"], 40)
+        self.assertTrue(doc["meta"]["old_sha256"])
+        self.assertTrue(doc["meta"]["new_sha256"])
+
+    def test_render_table_echoes_provenance(self):
+        render = MOD["render_table"]
+        meta = {
+            "old_path": "/b/old", "new_path": "/b/new",
+            "old_sha256": "a" * 64, "new_sha256": "b" * 64,
+            "kernel": "7.0.0-test", "duration": "30s", "max_scan_pids": 40,
+        }
+        samples = [
+            {"cell": "c", "tag": "old-x", "startup_ns": 1e9,
+             "wall_ns": 2e9, "peak_rss_kb": 2048.0},
+            {"cell": "c", "tag": "new-x", "startup_ns": 1e9,
+             "wall_ns": 2e9, "peak_rss_kb": 2048.0},
+        ]
+        text = render(summarize(samples), meta)
+        self.assertIn("/b/old", text)
+        self.assertIn("/b/new", text)
+        self.assertIn("7.0.0-test", text)
+        self.assertIn("30s", text)
+
+
 class RefusalTests(unittest.TestCase):
     def check(self, args, pattern):
         """validate_args as root must refuse with a message naming the cause."""

@@ -4550,6 +4550,21 @@ mod tests {
         Ok(Some(LifecycleFacts::default()))
     }
 
+    /// The saturated twins must script return values consistent
+    /// with `returned` (the `rv {0: returned}` production shape):
+    /// with no return values the torn-read guard would fire on
+    /// their window and mask a broken saturation latch.
+    fn assert_k0_read_rv_consistent(read: &CounterRead) {
+        for row in read.view().rows.expect("scripted rows") {
+            let view = row.view();
+            let sum: u64 = view.rv_counts.values().sum();
+            assert_eq!(
+                sum, view.returned,
+                "saturated twin scripts consistent return values"
+            );
+        }
+    }
+
     /// A scripted read with explicit producer health, through the
     /// genuine fold and pack (mirrors `scripted_read`, which is
     /// always healthy).
@@ -5281,6 +5296,7 @@ mod tests {
                 contended: false,
             },
         );
+        assert_k0_read_rv_consistent(&saturated_before);
         assert!(
             open_k0_window(
                 resolved,
@@ -5334,6 +5350,7 @@ mod tests {
                 contended: false,
             },
         );
+        assert_k0_read_rv_consistent(&saturated_after);
         close_k0_window(
             window,
             &scene.plan,

@@ -1179,13 +1179,20 @@ pub(crate) fn reset_reclaim_pass_heap_calls() {
 /// files and buffers the match; glibc otherwise retains the freed peak
 /// (about 200 MiB here) for the rest of the run, leaving the soak's
 /// 256 MiB bound no margin under load. A hint only: it never frees live
-/// state, and it is a cheap no-op when nothing is free. Linux/glibc only,
-/// like the rest of this binary.
+/// state, and it costs ~0.4 ms per pass once steady (first call ~45 ms
+/// on a 210 MiB fragmented heap; v060-manifest-soak-bounds round 2),
+/// far under the ~2-4 s pass period.
+///
+/// glibc only: musl provides no `malloc_trim` at all (absent from musl
+/// 1.2.5 and from rustc's self-contained musl libc, so an unconditional
+/// call would not link the static release observer), and the call is
+/// compiled out on non-glibc targets.
 fn reclaim_pass_heap() {
     #[cfg(test)]
     RECLAIM_PASS_HEAP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: malloc_trim takes a pad length and releases free top pages;
     // it is thread-safe, takes no pointers, and cannot free live state.
+    #[cfg(target_env = "gnu")]
     unsafe {
         libc::malloc_trim(0);
     }

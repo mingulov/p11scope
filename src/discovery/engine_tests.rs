@@ -55923,6 +55923,30 @@ fn scanned_module_copy_is_exact() {
     assert_eq!(count_steps(&source) - count_steps(&few), 1);
 }
 
+/// The stop-time exact-capacity copy keeps the scan-time operator-named
+/// `--module` match: a lossy copy would silently un-name retained rows.
+#[test]
+fn scanned_module_copy_preserves_the_operator_module_hint() {
+    let mut source = overlay_module(overlay_key(7));
+    source.module_hint = Some(PathBuf::from("/opt/operator/provider.so"));
+    let mut cursor = ScannedModuleCopy::new();
+    let mut rows = Vec::with_capacity(1);
+    let mut done = false;
+    for _ in 0..100_000 {
+        if cursor.step(&source, &mut rows) {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "the copy must complete");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].module_hint, source.module_hint,
+        "the copy keeps the operator-named signal"
+    );
+    assert_scanned_module_copy_is_exact(&rows[0], &source);
+}
+
 /// T4b helper: a collected retirement case whose leader exit is dispatched.
 /// The closer is released up front when `release` is set.
 fn graph_case_with_exit(release: bool) -> CollectedFinishGraphCase {

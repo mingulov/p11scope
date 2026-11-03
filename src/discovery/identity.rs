@@ -13971,6 +13971,42 @@ mod tests {
     }
 
     #[test]
+    fn scanned_input_measure_charges_the_operator_module_hint() {
+        use crate::discovery::scan::ScannedModule;
+        use std::os::unix::ffi::OsStrExt as _;
+        let key = overlay(9);
+        let plain = module(key);
+        let mut named = module(key);
+        named.module_hint = Some(PathBuf::from("/opt/operator/provider.so"));
+        let measured = |source: &ScannedModule| {
+            let mut measure = ScannedInputMeasure::new(1).unwrap();
+            for _ in 0..4096 {
+                if measure.step(source).unwrap() {
+                    return measure.bytes();
+                }
+            }
+            panic!("the tiny module must measure over finite steps");
+        };
+        let plain_bytes = measured(&plain);
+        let named_bytes = measured(&named);
+        let hint_len = named
+            .module_hint
+            .as_ref()
+            .unwrap()
+            .as_os_str()
+            .as_bytes()
+            .len();
+        let expected = hint_len
+            .checked_add(crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)
+            .unwrap();
+        assert_eq!(
+            named_bytes - plain_bytes,
+            expected,
+            "the hint bytes are reserved with the row"
+        );
+    }
+
+    #[test]
     fn conservative_tree_bound_covers_std_btree_allocations() {
         fn tight_nodes(entries: usize) -> usize {
             if entries == 0 {

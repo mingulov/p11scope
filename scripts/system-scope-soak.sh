@@ -64,7 +64,9 @@ OBSERVER_STUB=
 STUB_ARGS=
 KERNEL_PROFILE=current/default
 TEST_ID=
-SOURCE_MODULE=/usr/lib/softhsm/libsofthsm2.so
+# Probed at startup via release-matrix-contract.py --select-module (Debian
+# and Fedora layouts); SOURCE_MODULE in the environment overrides the probe.
+SOURCE_MODULE=${SOURCE_MODULE:-}
 MODULE=
 LOCK=${LOCK:-/var/tmp/p11scope-ws-tmp/privileged.lock}
 CARGO_LANE=${CARGO_LANE:-/var/tmp/p11scope-ws-tmp/v040-cargo-lane.lock}
@@ -205,6 +207,10 @@ command -v timeout >/dev/null || refuse "timeout required"
 command -v flock >/dev/null || refuse "flock required"
 if [ "$MODE" = live ]; then
     sudo -n true || refuse "passwordless sudo required for live mode"
+fi
+if [ -z "$SOURCE_MODULE" ]; then
+    SOURCE_MODULE=$(python3 -I scripts/release-matrix-contract.py --select-module) \
+        || refuse "no usable SoftHSM module (tried Debian/Fedora layouts)"
 fi
 test -f "$SOURCE_MODULE" || refuse "SoftHSM2 not installed at $SOURCE_MODULE"
 : "${TMPDIR:=/var/tmp/p11scope-ws-tmp}"

@@ -17,7 +17,14 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-MODULE=${P11SCOPE_PKCS11_MODULE:-/usr/lib/softhsm/libsofthsm2.so}
+# Probed via release-matrix-contract.py --select-module (Debian/Fedora
+# layouts) unless P11SCOPE_PKCS11_MODULE names an explicit module.
+if [ -n "${P11SCOPE_PKCS11_MODULE:-}" ]; then
+    MODULE=$P11SCOPE_PKCS11_MODULE
+else
+    MODULE=$(python3 -I scripts/release-matrix-contract.py --select-module) \
+        || { echo "no usable SoftHSM module (tried Debian/Fedora layouts)" >&2; exit 1; }
+fi
 WORK=${P11SCOPE_RECEIPT_WORK:-target/induced-gaps}
 case $WORK in /*) WORK_ABS=$WORK ;; *) WORK_ABS=$PWD/$WORK ;; esac
 FIX=scripts/fixtures

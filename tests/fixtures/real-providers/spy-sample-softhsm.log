@@ -1,0 +1,123 @@
+
+
+*************** OpenSC PKCS#11 spy *****************
+Loaded: "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+
+0: C_GetInterface
+P:2309949; T:0x138493420533824 2026-11-03 02:47:22.086
+[compat]
+[in] pInterfaceName 0000577a9e6f23ab / 7
+    00000000  50 4B 43 53 20 31 31                             PKCS 11         
+[in] pVersion = NULL
+[in] flags = 
+Returned:  0 CKR_OK
+
+1: C_Initialize
+P:2309949; T:0x138493420533824 2026-11-03 02:47:22.086
+[in] pInitArgs = (nil)
+Returned:  0 CKR_OK
+
+2: C_GetSlotList
+P:2309949; T:0x138493420533824 2026-11-03 02:47:22.088
+[in] tokenPresent = 0x0
+[out] pSlotList: 
+Count is 2
+[out] *pulCount = 0x2
+Returned:  0 CKR_OK
+
+3: C_GetSlotList
+P:2309949; T:0x138493420533824 2026-11-03 02:47:22.088
+[in] tokenPresent = 0x0
+[out] pSlotList: 
+Slot 1864663018
+Slot 1
+[out] *pulCount = 0x2
+Returned:  0 CKR_OK
+
+4: C_GetSlotInfo
+P:2309949; T:0x138493420533824 2026-11-03 02:47:22.088
+[in] slotID = 0x6f247fea
+[out] pInfo: 
+      slotDescription:        'SoftHSM slot ID 0x6f247fea      '
+                              '                                '
+      manufacturerID:         'SoftHSM project                 '
+      hardwareVersion:         2.6
+      firmwareVersion:         2.6
+      flags:                   1
+        CKF_TOKEN_PRESENT                
+Returned:  0 CKR_OK
+
+5: C_GetTokenInfo
+P:2309949; T:0x138493420533824 2026-11-03 02:47:22.088
+[in] slotID = 0x6f247fea
+[out] pInfo: 
+      label:                  'test                            '
+      manufacturerID:         'SoftHSM project                 '
+      model:                  'SoftHSM v2      '
+      serialNumber:           '2b1cbe61ef247fea'
+      ulMaxSessionCount:       0
+      ulSessionCount:          -1
+      ulMaxRwSessionCount:     0
+      ulRwSessionCount:        -1
+      ulMaxPinLen:             255
+      ulMinPinLen:             4
+      ulTotalPublicMemory:     -1
+      ulFreePublicMemory:      -1
+      ulTotalPrivateMemory:    -1
+      ulFreePrivateMemory:     -1
+      hardwareVersion:         2.6
+      firmwareVersion:         2.6
+      time:                   '2026110300472200'
+      flags:                   42d
+        CKF_RNG                          
+        CKF_LOGIN_REQUIRED               
+        CKF_USER_PIN_INITIALIZED         
+        CKF_RESTORE_KEY_NOT_NEEDED       
+        CKF_TOKEN_INITIALIZED            
+Returned:  0 CKR_OK
+
+6: C_GetSlotInfo
+P:2309949; T:0x138493420533824 2026-11-03 02:47:22.088
+[in] slotID = 0x1
+[out] pInfo: 
+      slotDescription:        'SoftHSM slot ID 0x1             '
+                              '                                '
+      manufacturerID:         'SoftHSM project                 '
+      hardwareVersion:         2.6
+      firmwareVersion:         2.6
+      flags:                   1
+        CKF_TOKEN_PRESENT                
+Returned:  0 CKR_OK
+
+7: C_GetTokenInfo
+P:2309949; T:0x138493420533824 2026-11-03 02:47:22.088
+[in] slotID = 0x1
+[out] pInfo: 
+      label:                  '                                '
+      manufacturerID:         'SoftHSM project                 '
+      model:                  'SoftHSM v2      '
+      serialNumber:           '                '
+      ulMaxSessionCount:       0
+      ulSessionCount:          -1
+      ulMaxRwSessionCount:     0
+      ulRwSessionCount:        -1
+      ulMaxPinLen:             255
+      ulMinPinLen:             4
+      ulTotalPublicMemory:     -1
+      ulFreePublicMemory:      -1
+      ulTotalPrivateMemory:    -1
+      ulFreePrivateMemory:     -1
+      hardwareVersion:         2.6
+      firmwareVersion:         2.6
+      time:                   '2026110300472200'
+      flags:                   c00025
+        CKF_RNG                          
+        CKF_LOGIN_REQUIRED               
+        CKF_RESTORE_KEY_NOT_NEEDED       
+        CKF_SO_PIN_LOCKED                
+        CKF_SO_PIN_TO_BE_CHANGED         
+Returned:  0 CKR_OK
+
+8: C_Finalize
+P:2309949; T:0x138493420533824 2026-11-03 02:47:22.088
+Returned:  0 CKR_OK

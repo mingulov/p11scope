@@ -1,0 +1,30 @@
+
+
+*************** OpenSC PKCS#11 spy *****************
+Loaded: "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so"
+
+0: C_GetInterface
+P:2358490; T:0x130673998809152 2026-11-03 02:54:18.208
+[compat]
+[in] pInterfaceName 00006112c46d73ab / 7
+    00000000  50 4B 43 53 20 31 31                             PKCS 11         
+[in] pVersion = NULL
+[in] flags = 
+Returned:  0 CKR_OK
+
+1: C_Initialize
+P:2358490; T:0x130673998809152 2026-11-03 02:54:18.208
+[in] pInitArgs = (nil)
+Returned:  0 CKR_OK
+
+2: C_GetSlotList
+P:2358490; T:0x130673998809152 2026-11-03 02:54:18.238
+[in] tokenPresent = 0x0
+[out] pSlotList: 
+Count is 0
+[out] *pulCount = 0x0
+Returned:  0 CKR_OK
+
+3: C_Finalize
+P:2358490; T:0x130673998809152 2026-11-03 02:54:18.254
+Returned:  0 CKR_OK

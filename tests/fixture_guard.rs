@@ -162,6 +162,44 @@ fn guarded_sleeper_dies_with_its_victim() {
     );
 }
 
+/// The victim helper itself must die with its spawner: it loops
+/// `sleep(3600)` forever, so an unguarded victim orphans its sleeper
+/// when the orchestrator dies first. A helper thread plays the
+/// orchestrator; the main thread then observes the victim's death and
+/// the sleeper's.
+#[test]
+fn victim_dies_with_spawning_thread() {
+    let mut tree = std::thread::spawn(|| Tree::spawn(true))
+        .join()
+        .expect("the spawner thread joins");
+    let deadline = Instant::now() + GONE_DEADLINE;
+    while proc_matches(tree.pid, &tree.start) && Instant::now() < deadline {
+        // Reap the victim through the retained handle once dead (it
+        // reparents to this process, whose group is alive).
+        let _ = tree.victim.try_wait();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let survived = proc_matches(tree.pid, &tree.start);
+    let victim_status = tree.victim.try_wait().expect("try_wait on the victim");
+    if victim_status.is_none() {
+        // SAFETY: signals only the owned victim pid.
+        unsafe {
+            libc::kill(tree.victim.id() as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = tree.victim.wait();
+    }
+    tree.cleanup();
+    assert!(
+        !survived,
+        "victim sleeper {} outlived its spawner past {GONE_DEADLINE:?}",
+        tree.pid
+    );
+    assert!(
+        victim_status.is_some(),
+        "the victim itself outlived its spawner"
+    );
+}
+
 /// Negative control: without the guard the same sleeper orphans, proving
 /// the cell can see orphans. Cleans up what it orphans.
 #[test]

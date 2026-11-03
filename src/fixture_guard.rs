@@ -327,6 +327,193 @@ mod tests {
         let _ = &tree.dir;
     }
 
+    /// Spawn `sleep 30` on a helper thread (guarded when asked), prove
+    /// it live, exit the thread, and return the recorded (pid, start
+    /// time). The child reparents to this process (whose group is
+    /// alive): guarded, it dies by the death signal; unguarded, it
+    /// survives. The dropped `Child` handle never waits; callers reap
+    /// through raw `waitpid`.
+    #[allow(clippy::zombie_processes)]
+    fn spawn_sleeper_on_exiting_thread(guarded: bool) -> (u32, String) {
+        std::thread::spawn(move || {
+            let mut sleeper = Command::new("sleep");
+            sleeper
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if guarded {
+                sleeper.die_with_parent();
+            }
+            let mut child = sleeper.spawn().expect("spawner spawns its sleeper");
+            let pid = child.id();
+            assert!(
+                child.try_wait().expect("try_wait").is_none(),
+                "sleeper live before the spawner thread exits"
+            );
+            let start = start_time(pid).expect("sleeper has a start time");
+            drop(child);
+            (pid, start)
+        })
+        .join()
+        .expect("the spawner thread joins")
+    }
+
+    /// The victim helper itself must die with its spawner: it loops
+    /// `sleep(3600)` forever, so an unguarded victim orphans its whole
+    /// subtree when the orchestrator dies first. A helper thread plays
+    /// the orchestrator (spawn returns only after the tree publishes,
+    /// so the thread cannot exit before the guard arms); the main
+    /// thread then observes the victim's death and the cascade.
+    #[test]
+    fn victim_dies_with_spawning_thread() {
+        let mut tree = std::thread::spawn(|| Tree::spawn(true))
+            .join()
+            .expect("the spawner thread joins");
+        let deadline = Instant::now() + GONE_DEADLINE;
+        let survivors = loop {
+            // Reap the victim through the retained handle once dead
+            // (it reparents to this process, whose group is alive).
+            let _ = tree.victim.try_wait();
+            let survivors = tree.survivors();
+            if survivors.is_empty() || Instant::now() >= deadline {
+                break survivors;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let victim_status = tree.victim.try_wait().expect("try_wait on the victim");
+        if victim_status.is_none() {
+            // SAFETY: signals only the owned victim pid.
+            unsafe {
+                libc::kill(tree.victim.id() as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = tree.victim.wait();
+        }
+        tree.cleanup();
+        assert!(
+            survivors.is_empty(),
+            "victim subtree outlived its spawner past {GONE_DEADLINE:?}: {survivors:?}"
+        );
+        assert!(
+            victim_status.is_some(),
+            "the victim itself outlived its spawner"
+        );
+    }
+
+    /// The orphan poll must reap test-owned zombies, not report them
+    /// forever. A guarded sleeper spawned on a helper thread is
+    /// SIGKILLed on thread exit and reparents to this process (group
+    /// alive) as a zombie; `survivors()` must reap it via `waitpid`
+    /// and report empty. Without the reap, the same zombie shape fails
+    /// the main cells whenever a process-wide subreaper window overlaps
+    /// a kill window.
+    #[test]
+    fn survivors_reaps_test_owned_zombies() {
+        let (pid, start) = spawn_sleeper_on_exiting_thread(true);
+        // Shape the assertion input exactly as `Tree::spawn` records
+        // it; the victim handle below is already reaped and never polled.
+        let mut victim = Command::new("true").spawn().expect("true spawns");
+        victim.wait().expect("true reaps");
+        let dir = tempfile::tempdir().expect("tree tempdir creates");
+        let tree = Tree {
+            pidfile: dir.path().join("tree.pids"),
+            dir,
+            victim,
+            members: BTreeMap::from([("sleeper".to_string(), (pid, start))]),
+        };
+        let deadline = Instant::now() + GONE_DEADLINE;
+        let survivors = loop {
+            let survivors = tree.survivors();
+            if survivors.is_empty() || Instant::now() >= deadline {
+                break survivors;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        tree.cleanup();
+        assert!(
+            survivors.is_empty(),
+            "test-owned zombie {pid} still reported past {GONE_DEADLINE:?}"
+        );
+    }
+
+    /// Thread-death twin for [`DieWithParent`]: a helper thread spawns
+    /// a guarded sleeper, proves it live, and exits; the death signal
+    /// must fire for the dead spawner thread even though the test
+    /// process lives on. The main thread observes the zombie and reaps
+    /// it, asserting the death signal (not an exit) killed it.
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn guarded_sleeper_dies_with_spawning_thread() {
+        let (pid, start) = spawn_sleeper_on_exiting_thread(true);
+        let deadline = Instant::now() + GONE_DEADLINE;
+        let status = loop {
+            let mut status = 0;
+            // SAFETY: `waitpid` on the owned sleeper pid; `WNOHANG`
+            // never blocks, `EINTR` retries.
+            let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            if waited == pid as libc::pid_t {
+                break status;
+            }
+            if waited < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EINTR),
+                    "waitpid on the owned sleeper {pid} failed"
+                );
+            } else {
+                assert!(
+                    Instant::now() < deadline,
+                    "guarded sleeper {pid} outlived its spawner thread past {GONE_DEADLINE:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+            "the sleeper died by signal 9, not an exit: status {status:#x}"
+        );
+        assert!(
+            !proc_matches(pid, &start),
+            "the reaped sleeper {pid} is gone from /proc"
+        );
+    }
+
+    /// Negative control: without the guard the same sleeper survives
+    /// the spawner thread's exit, proving the twin above can see
+    /// survival. Cleans up what it orphans.
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn unguarded_sleeper_survives_spawning_thread() {
+        let (pid, start) = spawn_sleeper_on_exiting_thread(false);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            proc_matches(pid, &start),
+            "the unguarded control must stay live to prove the twin sees survival"
+        );
+        // SAFETY: signals only the owned sleeper pid, then reaps it
+        // (it reparented to this process).
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        let mut status = 0;
+        // SAFETY: blocking reap of the SIGKILLed sleeper; `EINTR` retries.
+        loop {
+            let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+            if waited == pid as libc::pid_t {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR),
+                "reaping the control sleeper {pid} failed"
+            );
+        }
+        assert!(
+            !proc_matches(pid, &start),
+            "the control must clean up what it orphaned"
+        );
+    }
+
     /// Negative control: without the guard the same tree orphans, proving
     /// the cell can see orphans (a cell that passes either way proves
     /// nothing). Cleans up what it orphans.

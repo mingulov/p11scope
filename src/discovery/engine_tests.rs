@@ -7900,10 +7900,11 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     // The queued lifecycle refresh attempts admission on the same
     // ordinary tick and exhausts: the standard skip names the effective
     // value, the request stays queued for a later pass, and nothing is
-    // displaced. (The arrival-without-request deferral gap this tick
-    // used to assert first is pinned by
-    // retained_views_survive_ordinary_rotation_passes; a queued request
-    // attempts instead of deferring.)
+    // displaced. (A queued request attempts instead of deferring, so the
+    // arrival-without-request (3 processes / 1 deferred) gap this tick
+    // used to assert first is gone here; the same gap formatter stays
+    // pinned with (5 processes / 3 deferred) counts by
+    // retained_views_survive_ordinary_rotation_passes.)
     let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     assert_eq!(kept, admitted, "exhaustion keeps the admitted views");
     assert!(
@@ -22286,45 +22287,8 @@ fn publish_operation_counts(engine: &Engine) -> (u64, u64) {
 }
 
 fn assert_publish_deferral_history_equal(left: &CaptureHistory, right: &CaptureHistory) {
-    assert_eq!(left.modules, right.modules);
-    assert_eq!(left.decoded, right.decoded);
-    assert_eq!(left.surfaces, right.surfaces);
-    assert_eq!(left.tables, right.tables);
-    assert_eq!(left.skips, right.skips);
-    assert_eq!(left.losses, right.losses);
-    assert_eq!(left.scan_gap_tombstones, right.scan_gap_tombstones);
-    assert_eq!(left.refusals, right.refusals);
-    assert_eq!(left.fallbacks, right.fallbacks);
-    assert_eq!(
-        left.corroboration_tombstones,
-        right.corroboration_tombstones
-    );
-    assert_eq!(left.recorroborated, right.recorroborated);
-    assert_eq!(left.conflicted, right.conflicted);
-    assert_eq!(left.fallback_tombstones, right.fallback_tombstones);
-    assert_eq!(left.conflicts, right.conflicts);
-    assert_eq!(left.uncorroborated, right.uncorroborated);
-    assert_eq!(
-        left.uncorroborated_tombstones,
-        right.uncorroborated_tombstones
-    );
-    assert_eq!(
-        left.uncorroborated_candidates,
-        right.uncorroborated_candidates
-    );
-    assert_eq!(left.scan_unavailable, right.scan_unavailable);
-    assert_eq!(left.scan_ms, right.scan_ms);
-    assert_eq!(left.vendor_interfaces, right.vendor_interfaces);
-    assert_eq!(left.interface_list, right.interface_list);
-    assert_eq!(left.selection_inventory, right.selection_inventory);
-    assert_eq!(left.selection_surfaces, right.selection_surfaces);
-    assert_eq!(
-        left.manifest_selection_ordinals,
-        right.manifest_selection_ordinals
-    );
-    assert_eq!(left.selections, right.selections);
-    assert_eq!(left.selection_truncated, right.selection_truncated);
-    assert_eq!(left.standard_exports, right.standard_exports);
+    // Whole-struct: a later added field is compared automatically.
+    assert_eq!(left, right);
 }
 
 fn assert_publish_deferral_cache_equal(deferred: &Engine, full: &Engine) {
@@ -31168,9 +31132,11 @@ fn system_scope_refresh_admits_later_generation_in_same_engine() {
     // A foreign provider-mapping process that exits mid-preflight makes
     // this tick report `Ok` without admitting anything (generation-stale
     // preflight), so retry for the agreeing tick like the capped-selection
-    // sibling does. A deterministically broken admission never agrees and
-    // still fails the assertions below.
-    for _ in 0..25 {
+    // sibling does. The window also covers a slow spawn under host load
+    // (sibling settle waits run to 500); only the budget grew, the
+    // assertions below are unchanged. A deterministically broken
+    // admission never agrees and still fails them.
+    for _ in 0..250 {
         let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
         let mut tick_now = crate::attach::monotonic_ns;
         engine

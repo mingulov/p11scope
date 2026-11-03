@@ -947,7 +947,7 @@ enum TableOccurrence {
     },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct CaptureHistory {
     modules: BTreeMap<plan::ModuleId, render::DiscoveredModule>,
     decoded: BTreeSet<DecodedOccurrence>,

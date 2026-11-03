@@ -6789,11 +6789,12 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
     // before the fixture calls land, and the idle no-movement proof
     // would fail on correct spillover. Keep driving publishes until
     // every pre-release entered call is accounted (attributed, refused
-    // or disclosed-shed), so the asserts below read the drained
-    // publication. Pre-release entered is B's whole ledger plus A's
-    // SignInit (the held Sign has no END until the release; both A
-    // calls are semantic, pinned by the q2 split). Bounded: a product
-    // that never accounts them fails here with its name on it.
+    // or disclosed-shed) and both edges are minted, so the asserts
+    // below read the drained publication. Pre-release entered is B's
+    // whole ledger plus A's SignInit (the held Sign has no END until
+    // the release; both A calls are semantic, pinned by the q2 split).
+    // Bounded: a product that never accounts them fails here with its
+    // name on it.
     let caller_a = caller_of(&coordinator, process_a.pid())?;
     let caller_b = caller_of(&coordinator, process_b.pid())?;
     let q1_accounted_by = Instant::now() + Duration::from_secs(60);
@@ -6803,12 +6804,15 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         let engine_changed = q1_drives == 0;
         q1_polls += service_to_published(&mut lane, &mut coordinator, engine_changed, "r16-q1")?;
         q1_drives += 1;
-        let api_a_probe = joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so")
-            .ok()
+        let edge_a_probe =
+            joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so").ok();
+        let edge_b_probe = joint_edge_snapshot(&coordinator, process_b.pid(), "soft-copy.so").ok();
+        let api_a_probe = edge_a_probe
+            .as_ref()
             .and_then(|edge| edge.api_returns)
             .unwrap_or(0);
-        let api_b_probe = joint_edge_snapshot(&coordinator, process_b.pid(), "soft-copy.so")
-            .ok()
+        let api_b_probe = edge_b_probe
+            .as_ref()
             .and_then(|edge| edge.api_returns)
             .unwrap_or(0);
         let slot_probe = count_disclosed_gaps(
@@ -6828,18 +6832,32 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         let api_probe = api_a_probe + api_b_probe;
         eprintln!(
             "JOINT_R16 r16-q1-drive n={q1_drives} revision={} entered={} api={api_probe} \
-             shed={shed_probe} slot={slot_probe} inst={inst_probe}",
+             shed={shed_probe} slot={slot_probe} inst={inst_probe} \
+             a_edge={} b_edge={}",
             coordinator.registry().published_revision(),
             b_total + 1,
+            u8::from(edge_a_probe.is_some()),
+            u8::from(edge_b_probe.is_some()),
         );
-        if b_total + 1 == api_probe + shed_probe + slot_probe + inst_probe {
+        // A shed call is accounted but mints no edge: the idle
+        // fingerprint compares edge presence too, so the baseline needs
+        // both edges minted (a late bind mints in the next publish,
+        // requested or idle — waiting here keeps it out of the idle
+        // window). A product that never mints fails at the deadline.
+        if b_total + 1 == api_probe + shed_probe + slot_probe + inst_probe
+            && edge_a_probe.is_some()
+            && edge_b_probe.is_some()
+        {
             break;
         }
         ensure!(
             Instant::now() < q1_accounted_by,
             "r16-q1: calls still unaccounted after {q1_drives} pre-release publishes: entered {} \
-             vs api {api_probe} + shed {shed_probe} + slot {slot_probe} + inst {inst_probe}",
+             vs api {api_probe} + shed {shed_probe} + slot {slot_probe} + inst {inst_probe} \
+             a_edge={} b_edge={}",
             b_total + 1,
+            u8::from(edge_a_probe.is_some()),
+            u8::from(edge_b_probe.is_some()),
         );
     }
     s1_feed_check(

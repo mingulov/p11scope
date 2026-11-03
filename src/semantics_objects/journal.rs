@@ -13888,8 +13888,7 @@ pub(crate) mod tests {
             .open
             .values()
             .filter(|entry| {
-                entry.converted_ticket.is_none()
-                    && claim_names_shape(&shape_of_entry(entry), claim)
+                entry.converted_ticket.is_none() && claim_names_shape(&shape_of_entry(entry), claim)
             })
             .count()
             + adapter
@@ -14231,6 +14230,141 @@ pub(crate) mod tests {
         }
     }
 
+    /// A claim with the staged BEGIN's return words, read as a fresh
+    /// return of that exact entry, optionally with a different session.
+    fn keepup_claim_for_begin(begin: &ValidatedJournalBegin, session: u64) -> AdmittedJournalClaim {
+        AdmittedJournalClaim {
+            admission: 0,
+            return_ns: 0,
+            returned: CallFingerprint {
+                image: (begin.image_cookie(), begin.image_exec()),
+                function: begin.descriptor() - 1,
+                pid_tgid: begin.pid_tgid(),
+                entry_ns: begin.entry_ns(),
+                slot: begin.slot(),
+                session,
+                mechanism: begin.entry_mechanism(),
+                capture: begin.capture(),
+                slot_id: begin.slot_id(),
+                flags: begin.call_flags(),
+                user_type: begin.user_type(),
+            },
+            rv: 0,
+        }
+    }
+
+    /// The identity index narrows the scan but never replaces the
+    /// shape rules: a claim sharing a staged BEGIN's identity whose
+    /// returned session the producer could not have written is named
+    /// by no entry, open or refused, exactly as the per-claim scan
+    /// decides; the agreeing claim is named once.
+    #[test]
+    fn joint_keepup_retained_index_keeps_rewrite_rules() {
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 1,
+                thread_floors: 64,
+                refused_begins: 4,
+                domain_keys: 4,
+                image_sightings: 4,
+            },
+        );
+        let create = function_id("C_CreateObject");
+        let open = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&open), JournalDisposition::BeginAdmitted);
+        let refused = begin_bytes(2, 1, create, 0);
+        assert_eq!(
+            scene.ingest(&refused),
+            JournalDisposition::BeginRefusedCapacity
+        );
+        let open_begin = scene.adapter.open.values().next().expect("one open").begin;
+        let refused_shape = scene.adapter.refused[0].shape();
+        assert_eq!(
+            indexed_retained_counts(&scene.adapter),
+            naive_retained_counts(&scene.adapter)
+        );
+        let identity = identity_of_begin(&open_begin);
+        let agreeing = keepup_claim_for_begin(&open_begin, open_begin.session_word());
+        let foreign = keepup_claim_for_begin(&open_begin, open_begin.session_word() ^ 0x10);
+        assert_eq!(naive_retained_named(&scene.adapter, &agreeing), 1);
+        assert_eq!(scene.adapter.retained_named(&identity, &agreeing), 1);
+        assert_eq!(naive_retained_named(&scene.adapter, &foreign), 0);
+        assert_eq!(
+            scene.adapter.retained_named(&identity, &foreign),
+            0,
+            "an identity match with a disagreeing session names nothing"
+        );
+        // The refused member obeys the same rules through its fixed shape.
+        let mut refused_agreeing = agreeing;
+        refused_agreeing.returned.pid_tgid = refused_shape.identity.pid_tgid;
+        refused_agreeing.returned.entry_ns = refused_shape.identity.entry_ns;
+        refused_agreeing.returned.session = refused_shape.entry.session;
+        let mut refused_foreign = refused_agreeing;
+        refused_foreign.returned.session ^= 0x10;
+        let refused_identity = refused_shape.identity;
+        assert_eq!(refused_agreeing.returned.identity(), refused_identity);
+        assert_eq!(naive_retained_named(&scene.adapter, &refused_agreeing), 1);
+        assert_eq!(
+            scene
+                .adapter
+                .retained_named(&refused_identity, &refused_agreeing),
+            1
+        );
+        assert_eq!(naive_retained_named(&scene.adapter, &refused_foreign), 0);
+        assert_eq!(
+            scene
+                .adapter
+                .retained_named(&refused_identity, &refused_foreign),
+            0
+        );
+    }
+
+    /// Census drift never panics a release observer: a lost member marks
+    /// the census, and the next claim read rebuilds it from the staged
+    /// entries and answers exactly. (Debug builds stop at the removal;
+    /// this twin poses the drifted state directly.)
+    #[test]
+    fn joint_keepup_retained_census_drift_rebuilds_exactly() {
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let staged = scene.adapter.open.values().next().expect("one open").begin;
+        let identity = identity_of_begin(&staged);
+        let claim = keepup_claim_for_begin(&staged, staged.session_word());
+        // Drift: the census lost the member, as a missed update would.
+        scene.adapter.retained_counts.clear();
+        scene.adapter.retained_census_drift = true;
+        assert_eq!(scene.adapter.retained_named(&identity, &claim), 1);
+        assert!(!scene.adapter.retained_census_drift, "the read rebuilt it");
+        assert_eq!(
+            indexed_retained_counts(&scene.adapter),
+            naive_retained_counts(&scene.adapter)
+        );
+    }
+
+    /// Debug builds stop at a census removal that finds no member.
+    #[test]
+    #[should_panic(expected = "retained census drift")]
+    fn joint_keepup_retained_census_drift_stops_debug_builds() {
+        let mut scene = Scene::new(image_default());
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let (native, staged) = scene
+            .adapter
+            .open
+            .iter()
+            .map(|(native, entry)| (*native, entry.begin))
+            .next()
+            .expect("one open");
+        scene.adapter.retained_counts.clear();
+        scene
+            .adapter
+            .retained_member_dec(identity_of_begin(&staged), RetainedMember::Open(native));
+    }
+
     #[test]
     fn joint_keepup_prune_drops_only_dead_keys_and_makes_room() {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
@@ -14557,7 +14691,7 @@ pub(crate) mod tests {
                 assert_eq!(prunes, 0, "no prune below the claim cap");
             }
             assert_eq!(
-                scene.adapter.retained_counts,
+                indexed_retained_counts(&scene.adapter),
                 naive_retained_counts(&scene.adapter)
             );
             let success = scene
@@ -14565,7 +14699,7 @@ pub(crate) mod tests {
                 .expect("round seals");
             assert_eq!(success.prefix.settled().len(), BATCH);
             assert_eq!(
-                scene.adapter.retained_counts,
+                indexed_retained_counts(&scene.adapter),
                 naive_retained_counts(&scene.adapter)
             );
         }

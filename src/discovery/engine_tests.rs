@@ -18023,8 +18023,9 @@ struct FdInheritor {
 impl FdInheritor {
     fn spawn() -> Self {
         // SAFETY: fork in a multithreaded binary. The child calls only
-        // async-signal-safe functions (nanosleep on a stack timespec,
-        // _exit) and never returns to test code.
+        // async-signal-safe functions (prctl, getppid, nanosleep on a
+        // stack timespec, _exit) and never returns to test code.
+        let owner = std::process::id();
         let pid = unsafe { libc::fork() };
         assert!(
             pid >= 0,
@@ -18033,6 +18034,15 @@ impl FdInheritor {
         );
         if pid == 0 {
             unsafe {
+                // Parent-death guard (same body as
+                // `crate::fixture_guard::DieWithParent`): a test that dies
+                // abruptly must not strand the sleeping child.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    libc::_exit(127);
+                }
+                if libc::getppid() != owner as libc::pid_t {
+                    libc::_exit(127);
+                }
                 let delay = libc::timespec {
                     tv_sec: 60,
                     tv_nsec: 0,

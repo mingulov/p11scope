@@ -110,11 +110,22 @@ struct PausingChild {
 
 impl PausingChild {
     fn spawn() -> Self {
-        // SAFETY: the child only calls async-signal-safe pause() until killed.
+        // SAFETY: the child only calls async-signal-safe prctl, getppid
+        // and pause() until killed.
+        let owner = std::process::id();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe {
+                // Parent-death guard (same body as
+                // `crate::fixture_guard::DieWithParent`): a test that dies
+                // abruptly must not strand the parking child.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    libc::_exit(127);
+                }
+                if libc::getppid() != owner as libc::pid_t {
+                    libc::_exit(127);
+                }
                 loop {
                     libc::pause();
                 }
@@ -159,6 +170,19 @@ impl Drop for PausingChild {
 /// arrives as the argument), then parks in `pause()`. Raw syscalls only;
 /// this context shares the dead main's TLS slot, which nobody reads.
 extern "C" fn clone_survivor_main(arg: *mut std::ffi::c_void) -> libc::c_int {
+    // Parent-death guard (same body as
+    // `crate::fixture_guard::DieWithParent`, with the owner from the
+    // pre-fork store): a test that dies abruptly must not strand the
+    // parking survivor. Async-signal-safe: atomic load, prctl, getppid.
+    let owner = crate::fixture_guard::SURVIVOR_OWNER_PID.load(std::sync::atomic::Ordering::Acquire);
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+            libc::_exit(127);
+        }
+        if libc::getppid() != owner as libc::pid_t {
+            libc::_exit(127);
+        }
+    }
     let wfd = arg as usize as libc::c_int;
     let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
     let bytes = tid.to_ne_bytes();
@@ -209,6 +233,10 @@ impl ZombieLeaderGroup {
         );
         // SAFETY: the child only makes raw syscalls (close, clone, exit) on
         // the COW-inherited stack and pipe; no allocator, no pthread, no locks.
+        // The survivor's parent-death owner, stored before the fork it
+        // inherits (see `SURVIVOR_OWNER_PID`).
+        crate::fixture_guard::SURVIVOR_OWNER_PID
+            .store(std::process::id(), std::sync::atomic::Ordering::Release);
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {

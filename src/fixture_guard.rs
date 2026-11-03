@@ -28,13 +28,31 @@
 //!
 //! The setting survives `exec`, so one registration covers C fixtures
 //! too. A fixture that forks its own grandchildren must re-arm after each
-//! fork; every current C grandchild is finite or EOF-terminated on parent
-//! death, so only the spawn seam needs the guard.
+//! fork: raw-fork Rust children arm the same body at their fork site
+//! (parking children directly, `clone` survivors through
+//! [`SURVIVOR_OWNER_PID`]); every current C grandchild is finite or
+//! EOF-terminated on parent death, so C needs no arm.
 //!
 //! Integration tests cannot link this `cfg(test)` module; they use the
 //! mirror helper in `tests/support/mod.rs`. Keep the two bodies in sync.
 
 use std::process::Command;
+use std::sync::atomic::AtomicU32;
+
+/// Owner pid for raw-`clone` survivor threads (the zombie fixtures in
+/// `d4_zombie_cells`, `retained_member_tests` and `scan`): the spawner
+/// stores its own pid here immediately before `fork`, and the survivor
+/// loads it first in its clone entry, then arms `PR_SET_PDEATHSIG` and
+/// rechecks `getppid` against it (a spawner already gone exits 127 —
+/// reading the owner in the survivor instead would pass vacuously).
+/// `Release`/`Acquire`: the fork child inherits the stored value, and
+/// the survivor shares memory with it. The value is always the
+/// spawner's own pid, so concurrent tests store identically, and a
+/// helper-held inner group (spawned by a helper child) records the
+/// helper. The initial 0 fails closed (no `getppid` is 0). Atomic
+/// loads are lock-free on the supported target, keeping the clone
+/// entry async-signal-safe.
+pub(crate) static SURVIVOR_OWNER_PID: AtomicU32 = AtomicU32::new(0);
 
 /// A `Command` extension arming parent-death SIGKILL on the future child
 /// (see the module docs). Chainable: `Command::new(..).die_with_parent()`

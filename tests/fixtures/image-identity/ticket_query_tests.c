@@ -1001,6 +1001,28 @@ static void bank_witness_neutrality(void)
     assert(ctl_b.unavailable == 21 && ctl_b.create_failures == 23 && ctl_b.retry_exhausted == 29);
     witness_lost_race_cell = 0;
     puts("ASSERT witness_retry_flat");
+    /* Bank refusals: a quota or no-slot refusal through the witness
+     * leaves select->refusals flat; the ticket path still counts it. */
+    reset();
+    bpf_get_current_task_btf = stub_current_task;
+    stub_leader = 0;
+    ctl.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
+    select_stub.refusals = 31;
+    assert(p11_link_current_cookie() == 0);
+    assert(select_stub.refusals == 31);
+    select_stub.bank = 7;
+    assert(p11_link_current_cookie() == 0);
+    assert(select_stub.refusals == 31);
+    puts("ASSERT witness_refusals_flat");
+    reset();
+    ctl.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_QUOTA);
+    assert(ticket == 0 && select_stub.refusals == 1);
+    select_stub.bank = 7;
+    assert(p11_link_task_ticket(&leaders[1], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(select_stub.refusals == 2);
+    puts("ASSERT ticket_refusals_count");
     /* The ticket path keeps counting: quota still raises unavailable. */
     reset();
     ctl.next_ticket = IMAGE_IDENTITY_TICKET_LIMIT;

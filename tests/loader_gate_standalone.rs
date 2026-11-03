@@ -706,6 +706,8 @@ fn loader_ticket_harness_bank_witness_neutrality() {
             "ASSERT witness_create_flat",
             "ASSERT witness_bad_config_flat",
             "ASSERT witness_retry_flat",
+            "ASSERT witness_refusals_flat",
+            "ASSERT ticket_refusals_count",
             "ASSERT ticket_quota_counts",
             "ASSERT ticket_create_counts",
             "ASSERT ticket_retry_counts",

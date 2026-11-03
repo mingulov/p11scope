@@ -29,15 +29,17 @@ versioned separately and are opaque, exact dispatch keys.
   and the rest of the capture can still be `exact`.
 - Detailed captures keep a proxy closure array's leading-templates prefix
   in the leftover room when no real provider was refused or omitted, so
-  late-start remote-access clients (`p11-kit-client.so`, already mapped when
-  the capture's first plan is built) keep counting through their attached
-  templates; the report names the covered tables. The prefix is admitted
-  only for such late-start closures and never takes the reserve's slots,
-  so a provider decoded later still fits; a closure first mapped mid-capture
-  admits only its published tables, unless its opened file matches an
-  operator-named `--module` path (by identity, resolved basename or ELF
-  soname), in which case it may take the reserve-capped prefix after the
-  named non-closure modules are admitted. Shared scope stays
+  late-start closures beside a real provider, and operator-named
+  remote-access clients (`p11-kit-client.so`), keep counting through their
+  attached templates; the report names the covered tables. The prefix is
+  admitted only when the capture's first plan held the closure beside a
+  non-closure provider, or when the closure is operator-named, and never
+  takes the reserve's slots, so a provider needing up to the remaining
+  budget still fits; a closure alone in the first plan, or first mapped
+  mid-capture, admits only its published tables, unless its opened file
+  matches an operator-named `--module` path (by identity, resolved basename
+  or ELF soname), in which case it may take the reserve-capped prefix after
+  the named non-closure modules are admitted. Shared scope stays
   whole-or-nothing for closures (never a heuristic prefix). A later provider
   that still does not fit is refused by name with the `--exclude-module`
   remedy.

@@ -487,12 +487,13 @@ report format.
   `--module` admit providers in discovery order. A recognized proxy closure
   array is decided after every provider: whole when it fits (late-start,
   reserve-capped), otherwise a reserve-capped leading-templates prefix with
-  a named partial gap only when first seen in the capture's first plan or
-  when its opened file matches an operator-named `--module` path, and
-  its published tables only when first mapped mid-capture unnamed — refused
+  a named partial gap only when the capture's first plan held the closure
+  beside a non-closure provider, or when its opened file matches an
+  operator-named `--module` path, and its published tables only when
+  unnamed (mapped mid-capture, or alone in the first plan) — refused
   whole when none of those admit. The prefix leaves the reserve free, so a
-  provider
-  decoded later still fits, and a later provider that still does not fit is
+  provider needing up to the remaining budget still fits, and a later
+  provider that still does not fit is
   refused by name with the `--exclude-module` remedy. A `--cgroup` or `--system`
   capture without `--module` admits each provider whole or not at all, by
   value — `--manifest` providers first, then providers whose function table

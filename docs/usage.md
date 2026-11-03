@@ -171,19 +171,19 @@ the one-shot `inspect` verdict refuses p11-kit's fixed closure array whole —
 it exceeds the 512-slot ceiling — while the later-fitting SoftHSM2 backend
 attaches; the report is explicitly `PARTIAL`, not a claim that the proxy
 layer was captured. A live Detailed capture admits a late-start closure (one
-already mapped when the capture's first plan is built) as a reserve-capped
-leading-templates prefix with a named partial gap when no provider was
-refused or omitted; a closure first mapped mid-capture admits only its
-published tables, unless its opened file matches an operator-named
-`--module` path, which admits the reserve-capped prefix after the named
-non-closure modules. The terminal report names each refused or partially
-covered module
+mapped before the capture's first plan beside a non-closure provider) as a
+reserve-capped leading-templates prefix with a named partial gap when no
+provider was refused or omitted; a closure alone in the first plan, or first
+mapped mid-capture, admits only its published tables, unless its opened file
+matches an operator-named `--module` path, which admits the reserve-capped
+prefix after the named non-closure modules. The terminal report names each
+refused or partially covered module
 with its reason: `run` and `profile` print a `Module gaps` section with the
 first five and an "and K more" line, and `inventory` prints the admission
-reason under each refused module. A late-start capture whose only mapped
-provider is the proxy layer starts with that prefix partial (three template
-tables on the measured stack) and completes with the named gap; only a
-capture that can attach nothing at all stops at startup with a named refusal.
+reason under each refused module. A capture whose only mapped provider is
+the proxy layer refuses it whole — with no provider beside it in the first
+plan there is no prefix — and stops at startup with that named refusal;
+naming it with `--module` admits the reserve-capped prefix instead.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,

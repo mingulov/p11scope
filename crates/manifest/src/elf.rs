@@ -758,6 +758,57 @@ pub fn exports_matching(
     ElfSnapshot::read(file)?.exports_matching(wanted)
 }
 
+/// DT_NEEDED library names of an ELF object, in dynamic-section order.
+/// Parsed from a read-only mapping with the same classification and
+/// segment-range validation as the export queries, so corrupt headers
+/// refuse before any string is read. An object without a dynamic section
+/// (statically linked) needs nothing and yields an empty list. Names are
+/// returned verbatim; the caller decides which ones to resolve and how.
+pub fn needed_libraries(file: &std::fs::File) -> Result<Vec<String>, String> {
+    // SAFETY: a read-only shared mapping of the file; the bytes are only read
+    // through the parser's checked accessors, never written or retained.
+    // This relies on memmap2's no-concurrent-modification contract, the same
+    // residual exposure documented on `read_export_facts`.
+    let mmap =
+        unsafe { memmap2::Mmap::map(file) }.map_err(|error| format!("read failed: {error}"))?;
+    needed_libraries_from_mmap(&mmap)
+}
+
+fn needed_libraries_from_mmap(mmap: &memmap2::Mmap) -> Result<Vec<String>, String> {
+    let (object, _, _) = classified_validated_object(mmap)?;
+    needed_libraries_in_object(&object)
+}
+
+pub(crate) fn needed_libraries_in_object(object: &object::File<'_>) -> Result<Vec<String>, String> {
+    macro_rules! walk {
+        ($elf:expr) => {{
+            // Absent dynamic section means statically linked: no names.
+            // Corrupt table data refuses instead of yielding a partial list.
+            let table = $elf
+                .elf_dynamic_table()
+                .map_err(|_| "invalid ELF dynamic table".to_string())?;
+            let mut needed = Vec::new();
+            for entry in table.iter() {
+                if entry.tag != elf::DT_NEEDED {
+                    continue;
+                }
+                let bytes = table
+                    .string(entry)
+                    .map_err(|_| "invalid DT_NEEDED string".to_string())?;
+                let name = std::str::from_utf8(bytes)
+                    .map_err(|_| "DT_NEEDED name is not valid UTF-8".to_string())?;
+                needed.push(name.to_string());
+            }
+            return Ok(needed);
+        }};
+    }
+    match object {
+        object::File::Elf32(object) => walk!(object),
+        object::File::Elf64(object) => walk!(object),
+        _ => unreachable!("classified ELF"),
+    }
+}
+
 /// File offset of one defined symbol, or `Ok(None)` when it is not defined.
 pub fn symbol_file_offset(file: &std::fs::File, name: &str) -> Result<Option<u64>, String> {
     Ok(ElfSnapshot::read(file)?

@@ -31,9 +31,11 @@ use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope
 #[cfg(target_arch = "x86_64")]
 const NR_URETPROBE: u32 = 335;
 
-/// The self-probe's program: the cheapest `uretprobe` program in the
-/// capture object (1,477 instructions; `p11_return` is 4,960 and the
-/// session verifies it again seconds later).
+/// The self-probe's program: the cheapest-to-verify `uretprobe` program in
+/// the capture object (1,477 instructions, the fastest verification in the
+/// startup traces; `function_list_return` has fewer instructions at 1,434
+/// but verifies slower, and `p11_return` is 4,960 and the session verifies
+/// it again seconds later).
 ///
 /// It must stay a `uretprobe`-section program: aya derives return-vs-entry
 /// attach from the ELF section, and only a real return trampoline
@@ -405,7 +407,7 @@ fn evaluate_mode(
 ///
 /// The victim is a child of ours, so no target process is ever at risk of
 /// answering this question. The probe program is `SELF_PROBE_PROGRAM`,
-/// the cheapest `uretprobe` program in the capture object: which bytecode
+/// the cheapest-to-verify `uretprobe` program in the capture object: which bytecode
 /// runs cannot move the verdict — the signal is the kernel's return
 /// trampoline issuing the uretprobe syscall in the child's context, and any
 /// attached return probe exercises that path — while `p11_return` would

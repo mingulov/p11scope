@@ -146,7 +146,7 @@ fn real_retained_discovery_consumer_owns_one_exact_map() {
 }
 
 #[test]
-#[ignore = "loads p11_return and probes a fresh owned seccomp-confined child"]
+#[ignore = "loads the cheap self-probe return program and probes a fresh owned seccomp-confined child"]
 fn real_uretprobe_hazard_self_probe_reaches_a_verdict() {
     let verdict = crate::uretprobe_hazard::probe_kernel();
     println!("actual uretprobe self-probe: {verdict:?}");

@@ -299,6 +299,31 @@ earlier failed exact-count/final-drain run remains a historical failure.
 Longer runs (4 h, 24 h) remain unqualified. Startup and stop figures are
 declared per kernel, not a product guarantee.
 
+At high call rates the semantic lane can lose EVENTS records faster
+than it drains them: when the kernel ring is full it refuses new
+records (counted in `EVIDENCE_RING_LOSS`, never silently
+overwritten), and the observer discloses the cumulative loss in a
+`native capture events lost` gap with exact counts on the stop line
+(`lost`) and in `observation.semantic_capture.events_lost`. The
+counter counts records, not calls: at system/cgroup scope a refused
+FORK marker counts too, and on a linked (`--key-operations`) capture
+one call writes up to two records (its journal BEGIN and its END, or
+an ABANDON in place of the END), so one lost call can count up to
+twice. Prompt saturated-tick commits apply to
+legacy lanes only; joint-machine lanes service the machine instead
+and disclose loss at each publish. Measured sustained rate (one
+busy 12-CPU development host, release observer): without
+`--key-operations`, every call was joined at 10,000 calls/s for 5, 20
+and 60 seconds with no lost records, and entry-to-apply p99 stayed at
+or below 236 ms; this excludes the time until the next publication.
+With `--key-operations`, a 1,000 calls/s run kept the key-operation
+feed to the stop, but the key-operation rows appeared only in the
+final publication (p99 about 5.4 s from call to visible row). At
+10,000 calls/s the key-operation feed stopped mid-run within about 20
+seconds and was reported as lost (`authority_lost`, partial). Treat
+1,000 calls/s as the tested ceiling for `--key-operations` in this
+release.
+
 In long system-wide runs, a live publication can rarely stop making
 progress. After 6 seconds without progress, p11scope abandons that
 publication with a named gap and keeps running, and the report marks

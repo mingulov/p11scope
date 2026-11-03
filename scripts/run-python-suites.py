@@ -73,6 +73,7 @@ RUN = [
     ("test_canary_evidence.py", ["--target-bits", "64"]),
     ("test_canary_object.py", []),
     ("test_ci_dependency_selection.py", []),
+    ("test_ci_stop_races.py", []),
     ("test_counter_object.py", []),
     ("test_counter_timing_object.py", []),
     ("test_counter_softhsm_parity.py", []),

@@ -348,6 +348,28 @@ class OracleTests(unittest.TestCase):
             box["stderr"] = stderr_text(pending=8, oldest="2ms")
         self.run_case(mutate, mode="burst", command="profile-system")
 
+    def test_burst_pending_with_ambient_lossy_cause_fails(self):
+        # A pending backlog covers discovery-side loss only; ambient
+        # churn (descendant gaps, unprotected windows, pause windows)
+        # must fail even when every newcomer is counted or pending.
+        for cause, counter, value in (
+                ("pid_descendant_gaps", "pid_descendant_gaps", 5),
+                ("unprotected_live_windows", "unprotected_live_windows", 1),
+                ("pause_partial", "pause_partial", 1)):
+            def mutate(box, cause=cause, counter=counter, value=value):
+                box["report"]["functions"][0]["calls"] = 7 + 8
+                evidence = box["report"]["evidence"]
+                evidence["completeness"] = "PARTIAL"
+                evidence[counter] = value
+                evidence["gap_classes"]["observation"] = {"status": "lossy",
+                                                          "causes": [cause]}
+                evidence["verdict_detail"] = "concrete_gap"
+                evidence["scheduling"]["newcomer_queue"]["pending"] = 8
+                evidence["scheduling"]["newcomer_queue"]["oldest_pending_age_ms"] = 2
+                box["stderr"] = stderr_text(pending=8, oldest="2ms")
+            self.run_case(mutate, mode="burst", command="profile-system",
+                          want=1, detail_substr="non-newcomer lossy cause")
+
     def test_burst_pending_uncovered_fails(self):
         def mutate(box):
             box["report"]["functions"][0]["calls"] = 7 + 2

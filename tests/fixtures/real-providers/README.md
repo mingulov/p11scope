@@ -108,7 +108,14 @@ Each cell lists one entry per `(os-release ID, tool package version)`:
   the installed p11-kit version; `null` where no capacity skip is
   expected (any skip then fails).
 
-Counts, tool exit, report schema and the metrics no-skip rule are
-strict and never pinned. Cells whose prerequisites are missing (tool,
-module, SoftHSM, smart-card reader, usable slot daemon) are recorded
-`nonqualifying` with `SKIP (77): ...` and never pass.
+Counts, tool exit, report schema and the metrics skip rule are
+strict and never pinned: a metrics twin must skip nothing except,
+where the pin declares a p11-kit skip, exactly that pinned p11-kit
+closure skip (W3-2 finding 1; any other skip still fails). Cells whose
+prerequisites are missing (tool, module, SoftHSM, smart-card reader,
+usable slot daemon) are recorded `nonqualifying` with `SKIP (77): ...`
+and never pass.
+
+All p11-kit closure pins are provisional until re-taken on the
+integrated tree after p11kit-admission lands (batch 5b); their
+`modules_skipped` rows carry that owner.

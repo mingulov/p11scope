@@ -236,6 +236,17 @@ class JudgeTests(unittest.TestCase):
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
             self.judge(causes=("pause_partial",), pause="partial", mutate=mutate)
 
+    def test_fixed_cause_against_stale_pin_fails(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["observation"] = [
+                {"cause": "skipped", "reason": "pinned gap skipped",
+                 "owner": "exec-real-providers"},
+                {"cause": "surfaces", "reason": "pinned gap surfaces",
+                 "owner": "exec-real-providers"}]
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]) as raised:
+            self.judge(causes=("skipped",), mutate=mutate)
+        self.assertIn("fixed: surfaces", str(raised.exception))
+
     def test_new_cause_fails(self):
         doc = report_functions(OBS_COUNTS, causes=("event_loss",))
         rec = receipt()
@@ -329,6 +340,32 @@ class JudgeTests(unittest.TestCase):
                 {"name": "x", "reason": "module needs 10 more; only 512 slots are available"}]
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
             self.judge(mode="metrics", mutate=mutate)
+
+    def test_metrics_twin_with_pinned_closure_skip_passes(self):
+        qualification, detail = self.judge(causes=("modules_skipped", "skipped", "surfaces"),
+                                           skip=6120, mode="metrics")
+        self.assertEqual(qualification, "expected-failure")
+        self.assertIn("p11-kit skip pinned at 6120", detail)
+
+    def test_metrics_twin_with_spied_module_skip_fails(self):
+        def mutate(doc, rec, exp):
+            doc["evidence"]["modules_skipped"].append(
+                {"name": SPY_PATH,
+                 "reason": "module needs 10 more; only 512 slots are available"})
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]) as raised:
+            self.judge(causes=("modules_skipped", "skipped", "surfaces"), skip=6120,
+                       mode="metrics", mutate=mutate)
+        self.assertIn("metrics twin skipped modules", str(raised.exception))
+
+    def test_metrics_twin_with_other_module_skip_fails(self):
+        def mutate(doc, rec, exp):
+            doc["evidence"]["modules_skipped"].append(
+                {"name": "/usr/lib64/pkcs11-spy.so",
+                 "reason": "module needs 67 more; only 512 slots are available"})
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]) as raised:
+            self.judge(causes=("modules_skipped", "skipped", "surfaces"), skip=6120,
+                       mode="metrics", mutate=mutate)
+        self.assertIn("metrics twin skipped modules", str(raised.exception))
 
     def test_unknown_host_pin_is_a_harness_error(self):
         with self.assertRaises(ORACLE_MOD["HarnessError"]):

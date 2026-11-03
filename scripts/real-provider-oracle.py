@@ -24,10 +24,13 @@ appends one entry per forwarded call to a spy log. This oracle checks:
   names the pinned endpoint count for the installed p11-kit version
   (other subjects, such as the runtime-built spy table, are covered by
   the cause pin and listed in the detail);
-- metrics twins skipped no modules.
+- a metrics twin skipped nothing except, where the pin declares a p11-kit
+  skip, exactly that pinned p11-kit closure skip (W3-2 finding 1: the
+  closure skip is the same named product behaviour in metrics as in
+  profile; any other skip still fails).
 
 Counts, tool exit, report schema, the p11-kit skip text and the
-metrics no-skip rule are strict: any violation fails the cell. Only the
+metrics skip rule are strict: any violation fails the cell. Only the
 pause outcome and the observation-cause set are pinnable, and then only
 to exactly the pinned values.
 """
@@ -383,7 +386,16 @@ def judge(report_text, spy_text, receipt, expects, cell):
 
     if mode == "metrics":
         skipped = evidence.get("modules_skipped")
-        require(skipped == [], "metrics twin skipped modules: %s" % skipped)
+        if pinned_skip is None:
+            require(skipped == [], "metrics twin skipped modules: %s" % skipped)
+        else:
+            # The p11-kit check above already requires exactly one p11-kit
+            # capacity row naming the pinned count; here every remaining
+            # row must be that same exempted closure row, nothing else.
+            rest = [row for row in skipped
+                    if not (isinstance(row.get("name"), str) and "p11-kit" in row["name"]
+                            and skip_needed_count(row["reason"]) == pinned_skip)]
+            require(rest == [], "metrics twin skipped modules: %s" % skipped)
 
     deviations = []
     if actual_causes:

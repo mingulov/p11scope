@@ -5,8 +5,8 @@
     "observation": [
      {
       "cause": "modules_skipped",
-      "owner": "exec-real-providers",
-      "reason": "capacity refusals: p11-kit closure array exceeds the 512-slot ceiling (count pinned separately) plus the runtime-built spy table"
+      "owner": "p11kit-admission, batch 5b",
+      "reason": "capacity refusals: p11-kit closure array exceeds the 512-slot ceiling (count pinned separately) plus the runtime-built spy table. Provisional: re-take on the integrated tree after p11kit-admission lands (batch 5b)."
      },
      {
       "cause": "skipped",
@@ -43,8 +43,8 @@
     "observation": [
      {
       "cause": "modules_skipped",
-      "owner": "exec-real-providers",
-      "reason": "capacity refusals: p11-kit closure array exceeds the 512-slot ceiling (count pinned separately) plus the runtime-built spy table"
+      "owner": "p11kit-admission, batch 5b",
+      "reason": "capacity refusals: p11-kit closure array exceeds the 512-slot ceiling (count pinned separately) plus the runtime-built spy table. Provisional: re-take on the integrated tree after p11kit-admission lands (batch 5b)."
      },
      {
       "cause": "skipped",
@@ -78,8 +78,8 @@
     "observation": [
      {
       "cause": "modules_skipped",
-      "owner": "exec-real-providers",
-      "reason": "acknowledged for routing only: the metrics no-skip rule still fails this cell as a finding"
+      "owner": "p11kit-admission, batch 5b",
+      "reason": "W3-2 finding 1: the pinned p11-kit closure skip is exempt in metrics as in profile. Provisional: re-take on the integrated tree after p11kit-admission lands (batch 5b)."
      },
      {
       "cause": "skipped",
@@ -208,8 +208,8 @@
     "observation": [
      {
       "cause": "modules_skipped",
-      "owner": "exec-real-providers",
-      "reason": "capacity refusals: p11-kit closure array exceeds the 512-slot ceiling (count pinned separately) plus the runtime-built spy table"
+      "owner": "p11kit-admission, batch 5b",
+      "reason": "capacity refusals: p11-kit closure array exceeds the 512-slot ceiling (count pinned separately) plus the runtime-built spy table. Provisional: re-take on the integrated tree after p11kit-admission lands (batch 5b)."
      },
      {
       "cause": "skipped",
@@ -256,8 +256,8 @@
     "observation": [
      {
       "cause": "modules_skipped",
-      "owner": "exec-real-providers",
-      "reason": "capacity refusals: p11-kit closure array exceeds the 512-slot ceiling (count pinned separately) plus the runtime-built spy table"
+      "owner": "p11kit-admission, batch 5b",
+      "reason": "capacity refusals: p11-kit closure array exceeds the 512-slot ceiling (count pinned separately) plus the runtime-built spy table. Provisional: re-take on the integrated tree after p11kit-admission lands (batch 5b)."
      },
      {
       "cause": "skipped",
@@ -291,8 +291,8 @@
     "observation": [
      {
       "cause": "modules_skipped",
-      "owner": "exec-real-providers",
-      "reason": "acknowledged for routing only: the metrics no-skip rule still fails this cell as a finding"
+      "owner": "p11kit-admission, batch 5b",
+      "reason": "W3-2 finding 1: the pinned p11-kit closure skip is exempt in metrics as in profile. Provisional: re-take on the integrated tree after p11kit-admission lands (batch 5b)."
      },
      {
       "cause": "skipped",

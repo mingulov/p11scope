@@ -612,7 +612,9 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
         "- name: Install packaged bpftool",
         "set -euo pipefail",
-        // Pinned baseline b200e06f: the PID-scope birth witness on top of
+        // Pinned baseline cf46fc5e: the gate-1 loader frame and bank series
+        // (gate-1 regions only; default objects move only debug data) on
+        // top of b200e06f, the PID-scope birth witness on top of
         // the verifier-cost series (d0bfdfcf: 7.4-rc1 load fix, outlined
         // GetID facts, bpf_loop directory scan and cleanup sweep), the 7.3
         // exec-release and 6/7-argument copy_vma hooks (8b7ee11a), the
@@ -622,7 +624,7 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=b200e06fa3f45e4f69ee63c098f9fb1c9adfaf7d",
+        "BASELINE=cf46fc5edc705f0f337f418d92db8214dc0f8f4b",
         "python3 -I scripts/check-bpf-noninterference.py \\",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
@@ -9875,7 +9877,9 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         "needs: [dedupe, tests]",
         "!cancelled() && needs.dedupe.outputs.run == 'true'",
         "fetch-depth: 0",
-        // Pinned baseline b200e06f: the PID-scope birth witness on top of
+        // Pinned baseline cf46fc5e: the gate-1 loader frame and bank series
+        // (gate-1 regions only; default objects move only debug data) on
+        // top of b200e06f, the PID-scope birth witness on top of
         // the verifier-cost series (d0bfdfcf: 7.4-rc1 load fix, outlined
         // GetID facts, bpf_loop directory scan and cleanup sweep), the 7.3
         // exec-release and 6/7-argument copy_vma hooks (8b7ee11a), the
@@ -9885,7 +9889,7 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         // health-counter fix, the PID-scope EXEC ticket fix,
         // the reviewed loader + bank + journal delta since ba92b4e2 and the
         // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=b200e06fa3f45e4f69ee63c098f9fb1c9adfaf7d",
+        "BASELINE=cf46fc5edc705f0f337f418d92db8214dc0f8f4b",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"\n",

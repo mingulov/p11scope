@@ -647,7 +647,10 @@ fn order_by_cost(
         .collect();
     unknown.sort_unstable();
     if !unknown.is_empty() {
-        return Err(format!("baseline has unknown programs: {}", unknown.join(", ")));
+        return Err(format!(
+            "baseline has unknown programs: {}",
+            unknown.join(", ")
+        ));
     }
     let mut order: Vec<String> = expected.iter().cloned().collect();
     order.sort_by(|left, right| {
@@ -814,12 +817,11 @@ fn parallel_load_measures_kernel_overlap() {
         }
     };
     let (serial_reference_ns, serial_reference_source) = match baseline.as_ref() {
-        Some(costs) => (
-            costs.serial_reference_ns() as u64,
-            cost_source.clone(),
-        ),
+        Some(costs) => (costs.serial_reference_ns() as u64, cost_source.clone()),
         None => {
-            println!("{CELL}: no baseline; measuring an in-process serial reference (one full load)");
+            println!(
+                "{CELL}: no baseline; measuring an in-process serial reference (one full load)"
+            );
             let btf = aya::Btf::from_sys_fs().expect("reference BTF must load");
             let (mut ebpf, maps_wall) = load_object_maps(bytes, &btf);
             let mut program_sum = Duration::ZERO;
@@ -857,9 +859,9 @@ fn parallel_load_measures_kernel_overlap() {
                     );
                 }
             }
-            None if baseline.is_some() => println!(
-                "{CELL}: WARNING: workers={workers}: balance unknown (zero cost sum)"
-            ),
+            None if baseline.is_some() => {
+                println!("{CELL}: WARNING: workers={workers}: balance unknown (zero cost sum)")
+            }
             None => {}
         }
         let mut parts: Vec<Vec<(String, aya_obj::ProgramSection)>> = vec![Vec::new(); workers];
@@ -1171,11 +1173,7 @@ fn parallel_load_partial_failure_retains_cleanup_owner() {
 /// share and the per-object maps/programs share. The daemon pays BTF
 /// once (shared via `host_btf::shared`), so fleet projections must
 /// scale only the second; saturates because RSS samples can dip.
-fn split_hold_cost(
-    baseline_rss_kb: u64,
-    post_btf_rss_kb: u64,
-    idle_rss_kb: u64,
-) -> (u64, u64) {
+fn split_hold_cost(baseline_rss_kb: u64, post_btf_rss_kb: u64, idle_rss_kb: u64) -> (u64, u64) {
     (
         post_btf_rss_kb.saturating_sub(baseline_rss_kb),
         idle_rss_kb.saturating_sub(post_btf_rss_kb),
@@ -1397,11 +1395,7 @@ mod unit_tests {
     #[test]
     fn drop_caches_writes_only_with_opt_in() {
         let file = tempfile::NamedTempFile::new().expect("temp sysctl");
-        let path = file
-            .path()
-            .to_str()
-            .expect("utf8 temp path")
-            .to_string();
+        let path = file.path().to_str().expect("utf8 temp path").to_string();
         {
             let _env = EnvGuard::hold(DROP_CACHES_ENV, Some("1"));
             assert_eq!(drop_caches_for_cold_at(&path), "drop_caches");
@@ -1415,7 +1409,10 @@ mod unit_tests {
                 "fresh-process-first-trial",
                 "value {value:?} must not opt in"
             );
-            assert_eq!(fs::read_to_string(&path).expect("read back").as_str(), "seed");
+            assert_eq!(
+                fs::read_to_string(&path).expect("read back").as_str(),
+                "seed"
+            );
         }
     }
 
@@ -1492,8 +1489,8 @@ mod unit_tests {
     #[test]
     fn baseline_refuses_bad_json() {
         let (_file, path) = write_baseline(&["{bad json".to_string()]);
-        let error = baseline_program_costs(&path, "detailed")
-            .expect_err("corrupt line must fail loud");
+        let error =
+            baseline_program_costs(&path, "detailed").expect_err("corrupt line must fail loud");
         assert!(error.contains("bad JSON"), "unexpected: {error}");
     }
 

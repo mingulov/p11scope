@@ -10,7 +10,6 @@ Run: python3 -I tests/python/test_lifecycle_cli_oracle.py -v
 """
 
 import json
-import runpy
 import subprocess
 import sys
 import tempfile
@@ -45,7 +44,8 @@ def provider():
 
 
 def profile_report(*, calls, scope="pid", exact=True, hints=None,
-                   loop_end="expiry"):
+                   loop_end="expiry", causes=None, surfaces=None,
+                   observation_status=None):
     functions = []
     for name, count in calls.items():
         functions.append({
@@ -53,19 +53,35 @@ def profile_report(*, calls, scope="pid", exact=True, hints=None,
             "in_flight": 0, "pending_returns": 0,
             "target": {"file_offset": 1234, "object": dict(provider())},
         })
+    if causes is None:
+        causes = [] if exact else ["late_load"]
+    if observation_status is None:
+        observation_status = "exact" if exact else "partial"
     evidence = {
         "event_loss": 0, "semantic_capture_failures": 0,
         "gap_classes": {"observation": {
-            "status": "exact" if exact else "partial",
-            "causes": [] if exact else ["late_load"]}},
+            "status": observation_status,
+            "causes": causes}},
         "scheduling": {"phase_mono_ns": {"loop_end_reason": loop_end}},
         "discovery": [],
     }
+    if surfaces is not None:
+        evidence["surfaces"] = surfaces
     if hints is not None:
         evidence["gap_exe_hints"] = hints
     return {"schema": "p11scope/observed-profile/v3",
             "capture": {"scope": scope, "mode": "profile"},
             "functions": functions, "evidence": evidence}
+
+
+def known_prefix_surfaces():
+    return [{"walk": "known_prefix", "functions": 68,
+             "acquisition": "ok", "source": "legacy_function_list"}]
+
+
+def full_surfaces():
+    return [{"walk": "full", "functions": 68,
+             "acquisition": "ok", "source": "legacy_function_list"}]
 
 
 def cli_ledger(calls):
@@ -104,6 +120,67 @@ class ReloadTests(unittest.TestCase):
             rc, row = run_oracle(
                 Path(raw), cell="profile-pid-reload",
                 report=profile_report(calls={"C_GenerateRandom": 200}),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("profile-pid-reload"))
+        self.assertEqual(rc, 1)
+        self.assertFalse(row["pass"])
+
+    def test_surfaces_known_prefix_passes_with_label(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="profile-pid-reload",
+                report=profile_report(
+                    calls={"C_GenerateRandom": 100},
+                    causes=["surfaces"],
+                    observation_status="lossy",
+                    surfaces=known_prefix_surfaces()),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("profile-pid-reload"))
+        self.assertEqual(rc, 0)
+        self.assertTrue(row["pass"])
+        self.assertIn("SoftHSM 2.7 table shape; exec-scan-legacy32",
+                      row["detail"])
+
+    def test_surfaces_full_only_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="profile-pid-reload",
+                report=profile_report(
+                    calls={"C_GenerateRandom": 100},
+                    causes=["surfaces"],
+                    observation_status="lossy",
+                    surfaces=full_surfaces()),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("profile-pid-reload"))
+        self.assertEqual(rc, 1)
+        self.assertFalse(row["pass"])
+
+    def test_surfaces_acquisition_error_fails(self):
+        bad = [{"walk": "known_prefix", "functions": 68,
+                "acquisition": "error: boom",
+                "source": "legacy_function_list"}]
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="profile-pid-reload",
+                report=profile_report(
+                    calls={"C_GenerateRandom": 100},
+                    causes=["surfaces"],
+                    observation_status="lossy",
+                    surfaces=bad),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("profile-pid-reload"))
+        self.assertEqual(rc, 1)
+        self.assertFalse(row["pass"])
+
+    def test_surfaces_missing_surfaces_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="profile-pid-reload",
+                report=profile_report(
+                    calls={"C_GenerateRandom": 100},
+                    causes=["surfaces"],
+                    observation_status="lossy",
+                    surfaces=None),
                 ledger=cli_ledger({"C_GenerateRandom": 100}),
                 receipt=receipt_for("profile-pid-reload"))
         self.assertEqual(rc, 1)
@@ -204,6 +281,86 @@ class ShortLivedTests(unittest.TestCase):
                 receipt=receipt_for("track-short-lived-pid"))
         self.assertEqual(rc, 1)
         self.assertIn("exe hints", row["detail"])
+
+
+LIFECYCLE_CELLS = [
+    "profile-pid-reload", "run-exec-chain", "profile-system-exec-churn",
+    "profile-pid-reuse", "prearm-late-dlopen", "prearm-late-dlopen-noflag",
+    "track-short-lived-cgroup", "track-short-lived-refused",
+    "track-short-lived-pid",
+]
+
+
+def extract_python_block(path, marker):
+    text = Path(path).read_text(encoding="utf-8")
+    start = text.index(marker)
+    heredoc = text.index("<<'PY'", start) + len("<<'PY'")
+    code_start = text.index("\n", heredoc) + 1
+    code_end = text.index("\nPY", code_start)
+    return text[code_start:code_end]
+
+
+def write_results(tmp, *, nonqualifying_cell=None):
+    path = Path(tmp) / "results.jsonl"
+    with open(path, "w", encoding="utf-8") as handle:
+        for cell in LIFECYCLE_CELLS:
+            if cell == nonqualifying_cell:
+                row = {"cell": cell, "pass": False,
+                       "qualification": "nonqualifying",
+                       "detail": "smoke; not a qualifying proof"}
+            elif cell == "prearm-late-dlopen":
+                row = {"cell": cell, "pass": False,
+                       "qualification": "expected-failure",
+                       "detail": "lossy observation [WU-13]"}
+            else:
+                row = {"cell": cell, "pass": True,
+                       "qualification": "qualified",
+                       "detail": "ok"}
+            handle.write(json.dumps(row) + "\n")
+    return path
+
+
+class WrapperTests(unittest.TestCase):
+    def test_ci_wrapper_rejects_unlisted_nonqualifying(self):
+        code = extract_python_block(
+            ROOT / "scripts/ci/lifecycle-cli.sh", "python3 - ")
+        with tempfile.TemporaryDirectory() as raw:
+            bad = write_results(
+                raw, nonqualifying_cell="profile-pid-reload")
+            completed = subprocess.run(
+                [sys.executable, "-I", "-", str(bad)],
+                input=code, capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(
+                completed.returncode, 0,
+                f"unlisted nonqualifying accepted: {completed.stdout}")
+            good = write_results(raw, nonqualifying_cell=None)
+            completed = subprocess.run(
+                [sys.executable, "-I", "-", str(good)],
+                input=code, capture_output=True, text=True, timeout=30)
+            self.assertEqual(completed.returncode, 0,
+                             f"qualified rows rejected: {completed.stdout}")
+
+    def test_qualify_summary_rejects_unlisted_nonqualifying(self):
+        code = extract_python_block(
+            ROOT / "scripts/qualify-lifecycle-cli.sh", 'python3 - "$@"')
+        with tempfile.TemporaryDirectory() as raw:
+            write_results(raw, nonqualifying_cell="profile-pid-reload")
+            # The summary block reads results.jsonl from its cwd, which
+            # write_results already populates.
+            completed = subprocess.run(
+                [sys.executable, "-I", "-", *LIFECYCLE_CELLS],
+                input=code, capture_output=True, text=True, timeout=30,
+                cwd=raw)
+            self.assertNotEqual(
+                completed.returncode, 0,
+                f"unlisted nonqualifying accepted: {completed.stdout}")
+            write_results(raw, nonqualifying_cell=None)
+            completed = subprocess.run(
+                [sys.executable, "-I", "-", *LIFECYCLE_CELLS],
+                input=code, capture_output=True, text=True, timeout=30,
+                cwd=raw)
+            self.assertEqual(completed.returncode, 0,
+                             f"qualified rows rejected: {completed.stdout}")
 
 
 if __name__ == "__main__":

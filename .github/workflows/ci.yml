@@ -813,6 +813,8 @@ jobs:
           UNRUN: scripts/matrix/verify-pidns.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-proxy-stack.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/ci/soak-weekly.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/ci/lifecycle-cli.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/ci/scale-8192.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/qualify-real-providers.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           EOF
           cat "$RUNNER_TEMP/lanes.txt"

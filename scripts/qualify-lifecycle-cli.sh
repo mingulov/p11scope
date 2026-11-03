@@ -97,6 +97,13 @@ import json,sys
 rows=[json.loads(line) for line in open('results.jsonl')]
 expected=sys.argv[1:]; ids=[row['cell'] for row in rows]
 valid=len(ids)==len(set(ids)) and set(ids)==set(expected)
+# No lifecycle cell may be nonqualifying: any such row fails unless it
+# is explicitly listed here.
+allowed=set()
+unexpected=[r['cell'] for r in rows if r['qualification']=='nonqualifying' and r['cell'] not in allowed]
+if unexpected:
+ print('NONQUALIFYING NOT IN ALLOW LIST: %s' % (unexpected,))
+ sys.exit(1)
 failed=[r['cell'] for r in rows if not r['pass'] and r['qualification'] not in ('nonqualifying','expected-failure')]
 print('SUMMARY pass=%d fail=%d failed=%s terminal_rows_valid=%s' % (sum(r['pass'] for r in rows),len(failed),failed,valid))
 sys.exit(1 if failed or not valid else 0)

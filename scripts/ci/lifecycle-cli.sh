@@ -45,6 +45,15 @@ for row in rows:
     assert row["qualification"] in ("qualified", "nonqualifying",
                                     "expected-failure", "failed"), row
     assert isinstance(row["detail"], str) and row["detail"], row
+# No lifecycle cell may be nonqualifying: any such row fails unless it
+# is explicitly listed here.
+allowed_nonqualifying = set()
+unexpected = [r["cell"] for r in rows
+              if r["qualification"] == "nonqualifying"
+              and r["cell"] not in allowed_nonqualifying]
+if unexpected:
+    print(f"NONQUALIFYING NOT IN ALLOW LIST: {unexpected}")
+    sys.exit(1)
 failed = [r["cell"] for r in rows if not r["pass"] and
           r["qualification"] not in ("nonqualifying", "expected-failure")]
 if failed:

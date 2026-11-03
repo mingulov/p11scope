@@ -399,6 +399,13 @@ fn validate_identity_inventory<'a>(
 ) -> Result<()> {
     let mut storage = BTreeSet::new();
     for (name, unsupported) in maps {
+        if !gate
+            && GATE_IDENTITY_MAPS
+                .iter()
+                .any(|(candidate, _)| *candidate == name)
+        {
+            bail!("unexpected gate-1 map {name} in a gate-0 inventory");
+        }
         if unsupported {
             // Task 3 Stage A's process-epoch task storage is not an identity
             // map; the instance tracker validates its own metadata.
@@ -12245,6 +12252,62 @@ mod tests {
             error.to_string().contains("TASK_COOKIE_B"),
             "the refusal must name the map: {error:?}"
         );
+    }
+
+    #[test]
+    fn gate0_inventory_refuses_every_gate1_array_map() {
+        // Every gate-1 Array map is refused in a gate-0 inventory, in
+        // either variant: a gate-0 build must never silently accept
+        // gate-1 bytes, even without the bank task storage beside them.
+        let base = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        for name in [
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "LOADER_GATE",
+            "LOADER_GATE_CTL",
+        ] {
+            for unsupported in [false, true] {
+                let error = validate_identity_inventory(
+                    base.into_iter().chain([(name, unsupported)]),
+                    false,
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains(name),
+                    "the refusal must name {name}: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate1_inventory_accepts_every_gate1_array_map() {
+        // Each gate-1 Array map is individually accepted in a gate-1
+        // inventory: the gate-0 refusal above must not overreach.
+        let base = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("TASK_COOKIE_B", true),
+            ("COOKIE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        for name in [
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "LOADER_GATE",
+            "LOADER_GATE_CTL",
+        ] {
+            validate_identity_inventory(base.into_iter().chain([(name, false)]), true).unwrap();
+        }
     }
 
     #[test]

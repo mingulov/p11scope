@@ -28,13 +28,20 @@ versioned separately and are opaque, exact dispatch keys.
   soname. Excluded files are listed as "excluded by you" (never silent),
   and the rest of the capture can still be `exact`.
 - Detailed captures keep a proxy closure array's leading-templates prefix
-  in the leftover room when no real provider was refused, so remote-access
-  clients (`p11-kit-client.so`) keep counting through their attached
+  in the leftover room when no real provider was refused or omitted, so
+  late-start remote-access clients (`p11-kit-client.so`, already mapped when
+  the capture's first plan is built) keep counting through their attached
   templates; the report names the covered tables. The prefix is admitted
-  only after a pass with no new provider object and never takes the
-  reserve's slots, so a provider decoded later still fits; a later provider
-  that still does not fit is refused by name with the `--exclude-module`
-  remedy.
+  only for such late-start closures and never takes the reserve's slots,
+  so a provider decoded later still fits; a closure first mapped mid-capture
+  admits only its published tables, and shared scope stays whole-or-nothing
+  for closures (never a heuristic prefix). A later provider that still does
+  not fit is refused by name with the `--exclude-module` remedy.
+- Startup `--prearm-module`/`--manifest` versus `--exclude-module` checks
+  open each included path and match by identity, resolved basename and ELF
+  soname, so a prearm through `p11-kit-proxy.so` (a symlink whose soname is
+  `libp11-kit.so.0`) conflicting with `--exclude-module libp11-kit.so.0` is
+  refused at startup (exit 2).
 
 ### Fixed
 

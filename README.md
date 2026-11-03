@@ -485,22 +485,22 @@ report format.
   separate from Inventory's 4,096 default / 8,192 maximum physical endpoints
   and the explicit aggregate counter modes. Detailed `--pid`, `run`, and any capture aimed with
   `--module` admit providers in discovery order. A recognized proxy closure
-  array is decided after every provider: whole when it fits, otherwise refused
-  whole while providers are still arriving, and a leading-templates prefix
-  with a named partial gap only after a pass with no new provider object. In
-  Detailed captures a closure array that fits nowhere takes the leftover room
-  as that prefix when no provider was refused; in every scope the prefix
-  leaves the reserve free, so a provider decoded later still fits, and a later
-  provider that still does not fit is refused by name with the
-  `--exclude-module` remedy. A `--cgroup` or `--system`
+  array is decided after every provider: whole when it fits (late-start,
+  reserve-capped), otherwise a reserve-capped leading-templates prefix with
+  a named partial gap only when first seen in the capture's first plan, and
+  its published tables only when first mapped mid-capture — refused whole
+  when none of those admit. The prefix leaves the reserve free, so a provider
+  decoded later still fits, and a later provider that still does not fit is
+  refused by name with the `--exclude-module` remedy. A `--cgroup` or `--system`
   capture without `--module` admits each provider whole or not at all, by
   value — `--manifest` providers first, then providers whose function table
-  is corroborated, then heuristic finds, proxy closure arrays last. Heuristic
-  finds and closure arrays may not use the last 128 slots (25%), which stay
-  free for corroborated providers found later in the capture. A refusal names
-  what holds the slots; in such a shared capture it also names the reserve and
-  suggests `--module`. The terminal report names every refused or partially
-  covered module with its reason.
+  is corroborated, then heuristic finds, proxy closure arrays last (closures:
+  whole, or their published tables when the heuristic set is refused — never
+  a heuristic prefix). Heuristic finds and closure arrays may not use the last
+  128 slots (25%), which stay free for corroborated providers found later in
+  the capture. A refusal names what holds the slots; in such a shared capture
+  it also names the reserve and suggests `--module`. The terminal report names
+  every refused or partially covered module with its reason.
 - Kernel-side state has fixed limits too: a lifetime budget of 16,384 process
   identities per `profile`/`trace` capture (under `--cgroup` and `--system`
   every process created in scope spends them) and 16,448 concurrent in-flight

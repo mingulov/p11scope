@@ -32,7 +32,9 @@ def receipt(cell="real-pkcs11tool-softhsm", mode="profile"):
     return {"schema": "p11scope/real-provider-receipt/v1", "cell": cell, "mode": mode,
             "tool": "pkcs11-tool", "tool_version": "0.27.0~rc1-1", "os_id": "ubuntu",
             "spied_module": SPY_PATH, "provider_before": provider_pin(),
-            "provider_after": provider_pin(), "run_exit": 0, "p11kit_version": "0.26.2-2"}
+            "provider_after": provider_pin(), "run_exit": 0, "p11kit_version": "0.26.2-2",
+            "spied_exports": {"C_GetFunctionList": True, "C_GetInterface": False,
+                              "C_GetInterfaceList": False}}
 
 
 def expects(cell="real-pkcs11tool-softhsm", causes=(), pause="sigstop", skip=None):
@@ -87,32 +89,42 @@ def spy_log(counts, loaded=SPY_PATH):
     return "\n".join(lines) + "\n"
 
 
-COUNTS = {"C_Finalize": 1, "C_GetInterface": 1, "C_GetSlotInfo": 2,
-          "C_GetSlotList": 2, "C_GetTokenInfo": 2, "C_Initialize": 1}
+# Forwarded functions match exactly; the boundary pair does not: the tool's
+# C_GetInterface reaches the spy log but is never forwarded (SoftHSM
+# exports no C_GetInterface), while the spy's own C_GetFunctionList call
+# reaches the real module but never the log (once per client process).
+FWD = {"C_Finalize": 1, "C_GetSlotInfo": 2, "C_GetSlotList": 2,
+       "C_GetTokenInfo": 2, "C_Initialize": 1}
+SPY_COUNTS = dict(FWD, C_GetInterface=1)
+OBS_COUNTS = dict(FWD, C_GetFunctionList=1)
+COUNTS = SPY_COUNTS
 
 
 class SpyParserTests(unittest.TestCase):
     def test_real_softhsm_log_parses_exactly(self):
-        loaded, counts = ORACLE_MOD["parse_spy_log"](
+        loaded, counts, processes = ORACLE_MOD["parse_spy_log"](
             (FIXTURES / "spy-sample-softhsm.log").read_text())
         self.assertEqual(loaded, SPY_PATH)
         self.assertEqual(counts, COUNTS)
+        self.assertEqual(processes, 1)
 
     def test_real_opensc_log_parses_exactly(self):
-        loaded, counts = ORACLE_MOD["parse_spy_log"](
+        loaded, counts, processes = ORACLE_MOD["parse_spy_log"](
             (FIXTURES / "spy-sample-opensc.log").read_text())
         self.assertEqual(loaded, "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so")
         self.assertEqual(counts, {"C_Finalize": 1, "C_GetInterface": 1,
                                   "C_GetSlotList": 1, "C_Initialize": 1})
+        self.assertEqual(processes, 1)
 
     def test_shared_log_with_restarted_sequences_parses(self):
         text = (FIXTURES / "spy-sample-opensc.log").read_text()
-        loaded, counts = ORACLE_MOD["parse_spy_log"](text + text)
+        loaded, counts, processes = ORACLE_MOD["parse_spy_log"](text + text)
         self.assertEqual(counts["C_Initialize"], 2)
         self.assertEqual(sum(counts.values()), 8)
+        self.assertEqual(processes, 2)
 
     def test_truncated_entry_fails(self):
-        text = spy_log(COUNTS) + "9: C_Initialize\nP:1; T:0x1 2026-11-03 02:47:22.086\n"
+        text = spy_log(SPY_COUNTS) + "9: C_Initialize\nP:1; T:0x1 2026-11-03 02:47:22.086\n"
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
             ORACLE_MOD["parse_spy_log"](text)
 
@@ -137,18 +149,19 @@ class SpyParserTests(unittest.TestCase):
 
 
 class JudgeTests(unittest.TestCase):
-    def judge(self, counts=COUNTS, causes=(), pause="sigstop", mode="profile",
-              tool_version="0.27.0~rc1-1", skip=None, mutate=None):
+    def judge(self, obs_counts=OBS_COUNTS, spy_counts=SPY_COUNTS, causes=(),
+              pause="sigstop", mode="profile", tool_version="0.27.0~rc1-1",
+              skip=None, mutate=None):
         skips = ({"subject": "libp11-kit",
                   "reason": "module needs %d more; only 512 slots are available" % skip},) \
             if skip is not None else ()
-        doc = report_functions(counts, causes, pause, mode, skips=skips)
+        doc = report_functions(obs_counts, causes, pause, mode, skips=skips)
         rec = receipt(mode=mode)
         rec["tool_version"] = tool_version
         exp = expects(causes=causes, pause=pause, skip=skip)
         if mutate:
             mutate(doc, rec, exp)
-        return ORACLE_MOD["judge"](json.dumps(doc), spy_log(COUNTS), rec, exp, rec["cell"])
+        return ORACLE_MOD["judge"](json.dumps(doc), spy_log(spy_counts), rec, exp, rec["cell"])
 
     def test_qualified(self):
         qualification, detail = self.judge()
@@ -163,19 +176,59 @@ class JudgeTests(unittest.TestCase):
         self.assertIn("partial", detail)
 
     def test_tool_exit_nonzero_fails(self):
-        doc = report_functions(COUNTS)
+        doc = report_functions(OBS_COUNTS)
         rec = receipt()
         rec["run_exit"] = 1
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
-            ORACLE_MOD["judge"](json.dumps(doc), spy_log(COUNTS), rec, expects(), rec["cell"])
+            ORACLE_MOD["judge"](json.dumps(doc), spy_log(SPY_COUNTS), rec, expects(), rec["cell"])
 
     def test_mutated_spy_count_fails(self):
-        doc = report_functions(COUNTS)
+        doc = report_functions(OBS_COUNTS)
         rec = receipt()
-        bad = dict(COUNTS)
+        bad = dict(SPY_COUNTS)
         bad["C_GetSlotList"] += 1
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
             ORACLE_MOD["judge"](json.dumps(doc), spy_log(bad), rec, expects(), rec["cell"])
+
+    def test_getfunctionlist_internal_call_is_required(self):
+        obs = dict(OBS_COUNTS)
+        del obs["C_GetFunctionList"]
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]):
+            self.judge(obs_counts=obs)
+
+    def test_getinterface_seen_without_export_fails(self):
+        obs = dict(OBS_COUNTS, C_GetInterface=1)
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]):
+            self.judge(obs_counts=obs)
+
+    def test_getinterface_forwarded_when_exported(self):
+        def mutate(doc, rec, exp):
+            rec["spied_exports"]["C_GetInterface"] = True
+        obs = dict(OBS_COUNTS, C_GetInterface=1)
+        qualification, _ = self.judge(obs_counts=obs, mutate=mutate)
+        self.assertEqual(qualification, "qualified")
+
+    def test_getinterface_missed_when_exported_fails(self):
+        def mutate(doc, rec, exp):
+            rec["spied_exports"]["C_GetInterface"] = True
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]):
+            self.judge(mutate=mutate)
+
+    def test_two_processes_scale_the_internal_call(self):
+        text = spy_log(SPY_COUNTS) + spy_log(SPY_COUNTS)
+        obs = {name: count * 2 for name, count in FWD.items()}
+        obs["C_GetFunctionList"] = 2
+        doc = report_functions(obs)
+        rec = receipt()
+        qualification, _ = ORACLE_MOD["judge"](
+            json.dumps(doc), text, rec, expects(), rec["cell"])
+        self.assertEqual(qualification, "qualified")
+
+    def test_missing_spied_exports_is_an_evidence_error(self):
+        def mutate(doc, rec, exp):
+            del rec["spied_exports"]
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]):
+            self.judge(mutate=mutate)
 
     def test_dropped_expected_cause_fails(self):
         def mutate(doc, rec, exp):
@@ -184,26 +237,26 @@ class JudgeTests(unittest.TestCase):
             self.judge(causes=("pause_partial",), pause="partial", mutate=mutate)
 
     def test_new_cause_fails(self):
-        doc = report_functions(COUNTS, causes=("event_loss",))
+        doc = report_functions(OBS_COUNTS, causes=("event_loss",))
         rec = receipt()
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
-            ORACLE_MOD["judge"](json.dumps(doc), spy_log(COUNTS), rec, expects(), rec["cell"])
+            ORACLE_MOD["judge"](json.dumps(doc), spy_log(SPY_COUNTS), rec, expects(), rec["cell"])
 
     def test_pause_regression_fails(self):
-        doc = report_functions(COUNTS, pause="partial")
+        doc = report_functions(OBS_COUNTS, pause="partial")
         rec = receipt()
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
-            ORACLE_MOD["judge"](json.dumps(doc), spy_log(COUNTS), rec, expects(), rec["cell"])
+            ORACLE_MOD["judge"](json.dumps(doc), spy_log(SPY_COUNTS), rec, expects(), rec["cell"])
 
     def test_pause_fix_against_stale_pin_fails(self):
-        doc = report_functions(COUNTS, causes=("pause_partial",), pause="sigstop")
+        doc = report_functions(OBS_COUNTS, causes=("pause_partial",), pause="sigstop")
         rec = receipt()
         exp = expects(causes=("pause_partial",), pause="partial")
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
-            ORACLE_MOD["judge"](json.dumps(doc), spy_log(COUNTS), rec, exp, rec["cell"])
+            ORACLE_MOD["judge"](json.dumps(doc), spy_log(SPY_COUNTS), rec, exp, rec["cell"])
 
     def test_spied_ledger_mismatch_fails(self):
-        doc = report_functions(COUNTS)
+        doc = report_functions(OBS_COUNTS)
         rec = receipt()
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
             ORACLE_MOD["judge"](json.dumps(doc), spy_log(COUNTS, loaded="/other.so"),
@@ -279,34 +332,34 @@ class CliTests(unittest.TestCase):
             return proc.returncode, json.loads(proc.stdout)
 
     def test_cli_qualified_exits_zero(self):
-        doc = report_functions(COUNTS)
-        code, row = self.run_oracle(doc, receipt(), expects(), spy_log(COUNTS))
+        doc = report_functions(OBS_COUNTS)
+        code, row = self.run_oracle(doc, receipt(), expects(), spy_log(SPY_COUNTS))
         self.assertEqual(code, 0)
         self.assertEqual(row["qualification"], "qualified")
         self.assertTrue(row["pass"])
 
     def test_cli_expected_failure_exits_three(self):
-        doc = report_functions(COUNTS, causes=("pause_partial",), pause="partial")
+        doc = report_functions(OBS_COUNTS, causes=("pause_partial",), pause="partial")
         rec = receipt()
         exp = expects(causes=("pause_partial",), pause="partial")
-        code, row = self.run_oracle(doc, rec, exp, spy_log(COUNTS))
+        code, row = self.run_oracle(doc, rec, exp, spy_log(SPY_COUNTS))
         self.assertEqual(code, 3)
         self.assertEqual(row["qualification"], "expected-failure")
         self.assertTrue(row["pass"])
 
     def test_cli_failed_exits_one(self):
-        doc = report_functions(COUNTS)
+        doc = report_functions(OBS_COUNTS)
         rec = receipt()
         rec["run_exit"] = 1
-        code, row = self.run_oracle(doc, rec, expects(), spy_log(COUNTS))
+        code, row = self.run_oracle(doc, rec, expects(), spy_log(SPY_COUNTS))
         self.assertEqual(code, 1)
         self.assertEqual(row["qualification"], "failed")
         self.assertFalse(row["pass"])
 
     def test_cli_harness_error_exits_two(self):
-        doc = report_functions(COUNTS)
+        doc = report_functions(OBS_COUNTS)
         rec = receipt()
-        code, row = self.run_oracle(doc, rec, {"schema": "wrong"}, spy_log(COUNTS))
+        code, row = self.run_oracle(doc, rec, {"schema": "wrong"}, spy_log(SPY_COUNTS))
         self.assertEqual(code, 2)
         self.assertFalse(row["pass"])
 

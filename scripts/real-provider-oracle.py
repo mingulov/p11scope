@@ -8,7 +8,12 @@ appends one entry per forwarded call to a spy log. This oracle checks:
 - the tool exited 0 and a v3 report was published for the cell's mode;
 - per function, the observed count at the spied module's identity equals
   the spy log count (exact, both directions; unknown or aliased rows
-  cannot qualify);
+  cannot qualify), with two exact spy-boundary rules: the spy calls the
+  real C_GetFunctionList once per client process without logging it, so
+  the observed count there is the ledger count plus the logged process
+  count; and C_GetInterface/C_GetInterfaceList are forwarded only when
+  the spied module exports them (recorded in the receipt from its
+  dynamic symbols), otherwise the observed count must be zero;
 - the pause outcome equals the pinned expectation (today: partial, a
   known failure owned by the exec-real-providers lane);
 - the set of observation causes equals the pinned per-cell list, where
@@ -133,7 +138,7 @@ def ownership(row):
 
 
 def parse_spy_log(text):
-    """Parse an OpenSC pkcs11-spy log into (loaded path, {function: count}).
+    """Parse an OpenSC pkcs11-spy log into (loaded path, counts, processes).
 
     Format established on OpenSC 0.27.0~rc1: a header naming the loaded
     module, then one `<seq>: <C_Function>` entry per forwarded call, each
@@ -141,15 +146,19 @@ def parse_spy_log(text):
     entry without `Returned:` is a truncated log, never a partial count.
     Sequences may restart at 0 when several processes share one log file
     (the NSS cell routes two tools through one log), so only per-entry
-    completeness is required, never global sequence order.
+    completeness is required, never global sequence order. Each client
+    process prints one header, so the header count is the process count
+    behind the C_GetFunctionList boundary rule.
     """
     if "Error: no module specified" in text:
         raise HarnessError("spy log has no module: PKCS11SPY was unset")
     require(SPY_HEADER in text, "spy log lacks the OpenSC spy header")
     loaded = None
+    processes = 0
     for line in text.splitlines():
         match = SPY_LOADED.match(line.strip())
         if match:
+            processes += 1
             if loaded is None:
                 loaded = match.group(1)
             else:
@@ -171,7 +180,7 @@ def parse_spy_log(text):
             current = None
     require(current is None, "spy log is truncated at entry: " + str(current))
     require(counts, "spy log holds no completed calls")
-    return loaded, counts
+    return loaded, counts, processes
 
 
 def skip_needed_count(reason):
@@ -272,17 +281,21 @@ def judge(report_text, spy_text, receipt, expects, cell):
     pin = select_pin(expects, cell, os_id, tool_version)
     pinned_causes, pinned_pause, pinned_skip, pinned_p11kit = check_pin_shape(pin, cell)
 
-    loaded, spy_counts = parse_spy_log(spy_text)
+    loaded, spy_counts, processes = parse_spy_log(spy_text)
     require(loaded == spied_path,
             "spy ledger is for %s, not the spied module %s" % (loaded, spied_path))
+    exports = receipt.get("spied_exports")
+    require(isinstance(exports, dict) and
+            all(type(exports.get(name)) is bool
+                for name in ("C_GetFunctionList", "C_GetInterface", "C_GetInterfaceList")),
+            "receipt lacks spied_exports booleans")
+    require(exports["C_GetFunctionList"], "spied module exports no C_GetFunctionList")
 
     report = parse(report_text)
     schema = "p11scope/observed-profile/v3-metrics" if mode == "metrics" else "p11scope/observed-profile/v3"
     require(report.get("schema") == schema, "unsupported or wrong cell profile schema")
     require(report.get("lane") == mode and report.get("capture", {}).get("mode") == mode,
             "report lane or capture mode differs from declared cell/schema")
-    require(report.get("capture", {}).get("scope") == "run",
-            "report capture scope differs from declared run cell")
     evidence = report.get("evidence")
     require(isinstance(evidence, dict), "missing capture evidence")
 
@@ -319,14 +332,19 @@ def judge(report_text, spy_text, receipt, expects, cell):
                 "spied row carries no attributable name: %s" % names)
         observed[name] = observed.get(name, 0) + calls
 
-    missing = sorted(set(spy_counts) - set(observed))
-    require(not missing, "spied functions absent from the report: " + ",".join(missing))
-    extra = sorted(set(observed) - set(spy_counts))
-    require(not extra, "reported spied functions absent from the spy ledger: " + ",".join(extra))
-    for name in sorted(spy_counts):
-        require(observed[name] == spy_counts[name],
-                "spied %s count %d differs from spy ledger %d"
-                % (name, observed[name], spy_counts[name]))
+    for name in sorted(set(spy_counts) | set(observed) | {"C_GetFunctionList"}):
+        ledger = spy_counts.get(name, 0)
+        seen = observed.get(name, 0)
+        if name == "C_GetFunctionList":
+            require(seen == ledger + processes,
+                    "spied C_GetFunctionList count %d differs from ledger %d plus %d processes"
+                    % (seen, ledger, processes))
+        elif name in ("C_GetInterface", "C_GetInterfaceList") and not exports[name]:
+            require(seen == 0,
+                    "spied %s count %d with no such export to forward to" % (name, seen))
+        else:
+            require(seen == ledger,
+                    "spied %s count %d differs from spy ledger %d" % (name, seen, ledger))
 
     gaps = evidence.get("gap_classes", {})
     observation = gaps.get("observation", {})

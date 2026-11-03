@@ -1,0 +1,79 @@
+{
+ "cells": {
+  "real-gnutls-p11tool": [
+   {
+    "observation": [],
+    "os": "fedora",
+    "p11kit_skip": null,
+    "p11kit_version": null,
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "placeholder until the Fedora matrix lands",
+     "status": "sigstop"
+    },
+    "tool_version": "3.8.13-1.fc44"
+   }
+  ],
+  "real-nss-certutil": [
+   {
+    "observation": [],
+    "os": "fedora",
+    "p11kit_skip": null,
+    "p11kit_version": null,
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "placeholder until the Fedora matrix lands",
+     "status": "sigstop"
+    },
+    "tool_version": "TBD"
+   }
+  ],
+  "real-opencryptoki": [],
+  "real-p11kit-trust": [
+   {
+    "observation": [],
+    "os": "fedora",
+    "p11kit_skip": null,
+    "p11kit_version": null,
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "placeholder until the Fedora matrix lands",
+     "status": "sigstop"
+    },
+    "tool_version": "0.26.5-1.fc44"
+   }
+  ],
+  "real-pkcs11tool-opensc": [],
+  "real-pkcs11tool-softhsm": [
+   {
+    "observation": [
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "spy module builds its table at runtime; the memory scan cannot see it"
+     },
+     {
+      "cause": "surfaces",
+      "owner": "exec-scan-legacy32",
+      "reason": "SoftHSM 2.7 68-entry 3.2 table reads known_prefix"
+     },
+     {
+      "cause": "interface_selection",
+      "owner": "exec-real-providers",
+      "reason": "selection loss beside the unverified spy table"
+     }
+    ],
+    "os": "fedora",
+    "p11kit_skip": null,
+    "p11kit_version": null,
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "pause confirmed on every owner",
+     "status": "sigstop"
+    },
+    "tool_version": "0.27.1-2.fc44"
+   }
+  ]
+ },
+ "schema": "p11scope/real-provider-expected-causes/v1"
+}

@@ -668,6 +668,29 @@ fn deal_round_robin(order: &[String], workers: usize) -> Vec<Vec<String>> {
     parts
 }
 
+impl BaselineCosts {
+    /// Full serial load in the parallel configuration: program walls
+    /// plus one maps/object creation (BTF excluded — workers parse it
+    /// before the barrier, so the parallel wall never contains it).
+    fn serial_reference_ns(&self) -> f64 {
+        self.programs.values().sum::<f64>() + self.maps_mean_ns
+    }
+}
+
+/// Honest speedup of one parallel trial: serial reference over
+/// parallel wall — how much faster than today's serial load.
+fn honest_speedup(serial_reference_ns: u64, parallel_wall: Duration) -> f64 {
+    Duration::from_nanos(serial_reference_ns).as_secs_f64()
+        / parallel_wall.as_secs_f64().max(f64::EPSILON)
+}
+
+/// Overlap ratio: contended per-program sum over parallel wall. The
+/// per-program walls inflate under contention, so this measures
+/// overlap-ignoring-inflation — NOT a speedup claim.
+fn overlap_ratio(serial_sum: Duration, parallel_wall: Duration) -> f64 {
+    serial_sum.as_secs_f64() / parallel_wall.as_secs_f64().max(f64::EPSILON)
+}
+
 /// Max/min worker program-cost-sum ratio; `None` when a worker sum is
 /// zero (no numeric costs, or a degenerate empty worker).
 fn worker_balance(parts: &[Vec<String>], costs: &BTreeMap<String, f64>) -> Option<f64> {
@@ -697,9 +720,11 @@ struct WorkerOutcome {
 
 /// Root runs the parallel-load overlap probe: K worker threads each load
 /// a disjoint program subset from its own Ebpf instance behind a start
-/// barrier, measuring parallel wall against the serial sum. Reports the
-/// kernel-side serialization the design must live with. Nothing is
-/// attached or retained.
+/// barrier, reporting both the contended-sum overlap ratio and the
+/// honest speedup against a serial reference (baseline means when
+/// P11SCOPE_FEASIBILITY_BASELINE is set, else one in-process serial
+/// pass). Reports the kernel-side serialization the design must live
+/// with. Nothing is attached or retained.
 #[test]
 #[ignore = "privileged: parallel BPF load overlap probe; run as root with --ignored --test-threads=1"]
 fn parallel_load_measures_kernel_overlap() {
@@ -786,6 +811,33 @@ fn parallel_load_measures_kernel_overlap() {
                 "const-fallback-7.0".to_string(),
                 None,
             )
+        }
+    };
+    let (serial_reference_ns, serial_reference_source) = match baseline.as_ref() {
+        Some(costs) => (
+            costs.serial_reference_ns() as u64,
+            cost_source.clone(),
+        ),
+        None => {
+            println!("{CELL}: no baseline; measuring an in-process serial reference (one full load)");
+            let btf = aya::Btf::from_sys_fs().expect("reference BTF must load");
+            let (mut ebpf, maps_wall) = load_object_maps(bytes, &btf);
+            let mut program_sum = Duration::ZERO;
+            for (name, section) in &programs {
+                let variant = if is_uprobe_section(section) {
+                    Variant::Multi
+                } else {
+                    Variant::Single
+                };
+                program_sum += load_program_timed(&mut ebpf, name, section, variant, &btf).wall;
+            }
+            drop(ebpf);
+            let reference = maps_wall + program_sum;
+            println!(
+                "{CELL}: in-process serial reference: {:.3}s",
+                reference.as_secs_f64()
+            );
+            (reference.as_nanos() as u64, "in-process".to_string())
         }
     };
     for workers in [2usize, 4usize] {
@@ -892,18 +944,23 @@ fn parallel_load_measures_kernel_overlap() {
                 programs.len(),
                 "{CELL}: every program must load exactly once across workers"
             );
-            let speedup = serial_sum.as_secs_f64() / parallel_wall.as_secs_f64().max(f64::EPSILON);
+            let overlap = overlap_ratio(serial_sum, parallel_wall);
+            let honest = honest_speedup(serial_reference_ns, parallel_wall);
             sink.row(&serde_json::json!({
                 "cell": CELL, "run_id": id, "kernel": kernel,
                 "object": "detailed", "workers": workers, "trial": trial,
                 "phase": "summary", "parallel_wall_ns": parallel_wall.as_nanos() as u64,
-                "serial_sum_ns": serial_sum.as_nanos() as u64, "speedup": speedup,
+                "serial_sum_ns": serial_sum.as_nanos() as u64,
+                "overlap_ratio": overlap,
+                "serial_reference_ns": serial_reference_ns,
+                "serial_reference_source": serial_reference_source,
+                "honest_speedup": honest,
                 "cost_source": cost_source, "worker_balance": balance,
             }));
             println!(
-                "{CELL}: workers={workers} trial={trial}: parallel={:.3}s serial-sum={:.3}s speedup={speedup:.2}x",
+                "{CELL}: workers={workers} trial={trial}: parallel={:.3}s serial-ref={:.3}s honest={honest:.2}x overlap={overlap:.2}x",
                 parallel_wall.as_secs_f64(),
-                serial_sum.as_secs_f64(),
+                serial_reference_ns as f64 / 1e9,
             );
         }
     }
@@ -1453,5 +1510,30 @@ mod unit_tests {
         assert_eq!(worker_balance(&parts, &costs), Some(3.0));
         let empty: BTreeMap<String, f64> = BTreeMap::new();
         assert_eq!(worker_balance(&parts, &empty), None);
+    }
+
+    #[test]
+    fn serial_reference_sums_programs_and_maps() {
+        let costs = BaselineCosts {
+            programs: BTreeMap::from([("a".to_string(), 1e9), ("b".to_string(), 2e9)]),
+            maps_mean_ns: 0.5e9,
+        };
+        assert_eq!(costs.serial_reference_ns(), 3.5e9);
+    }
+
+    #[test]
+    fn honest_and_overlap_ratios_differ() {
+        // Contended per-program walls inflate the sum above the serial
+        // reference; overlap must exceed honest on the same trial.
+        let honest = honest_speedup(8_000_000_000, Duration::from_secs(4));
+        let overlap = overlap_ratio(Duration::from_secs(10), Duration::from_secs(4));
+        assert_eq!(honest, 2.0);
+        assert_eq!(overlap, 2.5);
+    }
+
+    #[test]
+    fn honest_speedup_guards_zero_wall() {
+        let honest = honest_speedup(8_000_000_000, Duration::ZERO);
+        assert!(honest.is_finite(), "zero wall must not yield NaN/inf");
     }
 }

@@ -2554,14 +2554,13 @@ mod tests {
             provider_copy_charge(&pins, &grown.slots),
             false,
         );
-        let bytes = std::fs::read(Path::new(env!("OUT_DIR")).join(format!(
-            "counter-bank-growth-v2/p11scope-ebpf-{}-bank-growth-v2",
-            mode.name()
-        )))
-        .unwrap();
+        // Embedded bytes, never staged OUT_DIR files: privileged cells
+        // also run from a delivered binary (CI shards, Fedora live
+        // hosts), where the build directory does not exist.
+        let bytes = crate::attach::counter_banks::counter_object_for_mode(mode);
         let mut session = Session::prepare_counter_banks(
             &Scope::Pid(fixture.0.id()),
-            &bytes,
+            bytes,
             base,
             &pool.reserver(),
         )
@@ -3829,7 +3828,7 @@ mod tests {
             use sha2::Digest;
             use std::io::Read;
             use std::os::unix::fs::MetadataExt;
-            use std::path::{Path, PathBuf};
+            use std::path::PathBuf;
             assert!(matches!(final_count, 513 | 8192));
             assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
             assert_eq!(
@@ -3929,19 +3928,18 @@ mod tests {
                 provider_copy_charge(&pins, &slots),
                 backend == crate::attach::AttachBackend::Multi,
             );
-            let artifact = std::fs::read(Path::new(env!("OUT_DIR")).join(format!(
-                "counter-bank-growth-v2/p11scope-ebpf-{}-bank-growth-v2",
-                mode.name()
-            )))
-            .unwrap();
+            // Embedded bytes, never staged OUT_DIR files: privileged cells
+            // also run from a delivered binary (CI shards, Fedora live
+            // hosts), where the build directory does not exist.
+            let artifact = crate::attach::counter_banks::counter_object_for_mode(mode);
             let scope = crate::attach::Scope::Pid(fixture.child.id());
             let mut session = match backend {
                 crate::attach::AttachBackend::Singles => {
-                    Session::prepare_counter_banks(&scope, &artifact, base, &pool.reserver())
+                    Session::prepare_counter_banks(&scope, artifact, base, &pool.reserver())
                 }
                 crate::attach::AttachBackend::Multi => Session::prepare_counter_banks_with_backend(
                     &scope,
-                    &artifact,
+                    artifact,
                     base,
                     &pool.reserver(),
                     backend,
@@ -5718,14 +5716,14 @@ mod tests {
                 metadata_bytes: 32 * 1024 * 1024,
                 file_descriptors: cpus.checked_mul(4).unwrap() + 512,
             };
-            let artifact = std::fs::read(std::path::Path::new(env!("OUT_DIR")).join(format!(
-                "counter-bank-growth-v2/p11scope-ebpf-{}-bank-growth-v2",
-                CounterMode::Counts.name()
-            )))
-            .unwrap();
+            // Embedded bytes, never staged OUT_DIR files: privileged cells
+            // also run from a delivered binary (CI shards, Fedora live
+            // hosts), where the build directory does not exist.
+            let artifact =
+                crate::attach::counter_banks::counter_object_for_mode(CounterMode::Counts);
             let scope = crate::attach::Scope::Pid(parts.fixture.child.id());
             let mut session =
-                Session::prepare_counter_banks(&scope, &artifact, base, &pool.reserver()).unwrap();
+                Session::prepare_counter_banks(&scope, artifact, base, &pool.reserver()).unwrap();
             let mut history = crate::plan::AttachPlan::from_slots_with_policy(
                 parts.slots[..512].to_vec(),
                 crate::plan::AdmissionPolicy::Counters(
@@ -6766,7 +6764,7 @@ mod tests {
     #[ignore = "requires prebuilt LP64 growth fixtures and a kernel that rejects the counter-bank object as too complex (E2BIG at load)"]
     fn counter_bank_session_verifier_complexity_refuses_clean_lp64() {
         use crate::attach::counter_banks::BankReservation;
-        use std::path::{Path, PathBuf};
+        use std::path::PathBuf;
         assert_eq!(env!("P11SCOPE_COUNTER_OBJECTS_ENABLED"), "1");
         assert_eq!(
             env!("P11SCOPE_COUNTER_OBJECTS_OUTPUTS"),
@@ -6789,13 +6787,12 @@ mod tests {
             metadata_bytes: 32 * 1024 * 1024,
             file_descriptors: cpus.checked_mul(4).unwrap() + 512,
         };
-        let artifact = std::fs::read(
-            Path::new(env!("OUT_DIR"))
-                .join("counter-bank-growth-v2/p11scope-ebpf-counts-bank-growth-v2"),
-        )
-        .unwrap();
+        // Embedded bytes, never staged OUT_DIR files: privileged cells
+        // also run from a delivered binary (CI shards, Fedora live
+        // hosts), where the build directory does not exist.
+        let artifact = crate::attach::counter_banks::counter_object_for_mode(CounterMode::Counts);
         let scope = crate::attach::Scope::Pid(fixture.child.id());
-        match Session::prepare_counter_banks(&scope, &artifact, base, &pool.reserver()) {
+        match Session::prepare_counter_banks(&scope, artifact, base, &pool.reserver()) {
             Ok(_) => panic!(
                 "this refusal cell runs only where the kernel rejects the counter object with E2BIG; preparation succeeded"
             ),

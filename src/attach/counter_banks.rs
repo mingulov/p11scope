@@ -5595,8 +5595,8 @@ pub(crate) mod tests {
         ] {
             let embedded = counter_object_for_mode(mode);
             assert!(!embedded.is_empty(), "{mode:?} embedded object is empty");
-            // The privileged cells read the staged OUT_DIR bytes; they must
-            // equal the bytes the build embeds.
+            // The privileged cells use the embedded bytes; the staged
+            // OUT_DIR files must equal them.
             let staged = std::fs::read(std::path::Path::new(env!("OUT_DIR")).join(format!(
                 "counter-bank-growth-v2/p11scope-ebpf-{}-bank-growth-v2",
                 mode.name()
@@ -11369,10 +11369,10 @@ pub(crate) mod tests {
             ),
             "this refusal cell runs only where the kernel lacks helper 181"
         );
-        let path = std::path::Path::new(env!("OUT_DIR"))
-            .join("counter-bank-growth-v2")
-            .join("p11scope-ebpf-counts-bank-growth-v2");
-        let bytes = std::fs::read(path).expect("compile the actual selected format2 artifact");
+        // Embedded bytes, never staged OUT_DIR files: privileged cells
+        // also run from a delivered binary (CI shards, Fedora live
+        // hosts), where the build directory does not exist.
+        let bytes = counter_object_for_mode(CounterMode::Counts);
         let pool = SemanticResourcePool::reference_limit(4 * 1024 * 1024 * 1024);
         let baseline = pool.snapshot().charged_bytes;
         let envelope = BankReservation {
@@ -11381,7 +11381,7 @@ pub(crate) mod tests {
             metadata_bytes: 64 * 1024 * 1024,
             file_descriptors: 1_048_576,
         };
-        let refused = CounterPreparation::new(&bytes, envelope, &pool.reserver());
+        let refused = CounterPreparation::new(bytes, envelope, &pool.reserver());
         let Err(error) = refused else {
             panic!("old-kernel preparation must refuse");
         };

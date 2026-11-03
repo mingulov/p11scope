@@ -2606,15 +2606,22 @@ def self_test():
 
     assert rejected(
         validate_policy_inventory, (UNSAFE_MAPS, SAFE_PROGRAMS, {"decode_params"}), diagnostic
-    ) == ["map added: ATTR_BOOL_BITS", "map added: PAIR_CALLS", "map removed: JOURNAL_MARKER_CTL"]
+    ) == [
+        "map added: ATTR_BOOL_BITS",
+        "map added: PAIR_CALLS",
+        "map removed: JOURNAL_MARKER_CTL",
+        "map removed: PID_START_TICK",
+    ]
     # Each variant is compared against ITS OWN freeze, not the other one's.
     assert rejected(validate_inventory, "diagnostic", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
         "map added: JOURNAL_MARKER_CTL",
+        "map added: PID_START_TICK",
         "map removed: ATTR_BOOL_BITS",
         "map removed: PAIR_CALLS",
     ]
     assert rejected(validate_inventory, "wide-default", SAFE_MAPS, SAFE_PROGRAMS, set()) == [
         "map added: JOURNAL_MARKER_CTL",
+        "map added: PID_START_TICK",
         "RV_COUNTS.max_entries: object=4096 frozen=8192",
         "SLOT_FILE.max_entries: object=512 frozen=2112",
         "STATS.max_entries: object=512 frozen=2112",
@@ -2623,6 +2630,7 @@ def self_test():
         "map added: ATTR_BOOL_BITS",
         "map added: PAIR_CALLS",
         "map removed: JOURNAL_MARKER_CTL",
+        "map removed: PID_START_TICK",
     ]
     # The default object requires the marker set; the other Detailed
     # variants forbid any of it; the journal requires the same marker set

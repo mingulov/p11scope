@@ -34,9 +34,13 @@ versioned separately and are opaque, exact dispatch keys.
   templates; the report names the covered tables. The prefix is admitted
   only for such late-start closures and never takes the reserve's slots,
   so a provider decoded later still fits; a closure first mapped mid-capture
-  admits only its published tables, and shared scope stays whole-or-nothing
-  for closures (never a heuristic prefix). A later provider that still does
-  not fit is refused by name with the `--exclude-module` remedy.
+  admits only its published tables, unless its opened file matches an
+  operator-named `--module` path (by identity, resolved basename or ELF
+  soname), in which case it may take the reserve-capped prefix after the
+  named non-closure modules are admitted. Shared scope stays
+  whole-or-nothing for closures (never a heuristic prefix). A later provider
+  that still does not fit is refused by name with the `--exclude-module`
+  remedy.
 - Startup `--prearm-module`/`--manifest` versus `--exclude-module` checks
   open each included path and match by identity, resolved basename and ELF
   soname, so a prearm through `p11-kit-proxy.so` (a symlink whose soname is

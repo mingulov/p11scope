@@ -35,12 +35,14 @@ the WIDE source build). A recognized proxy closure array (p11-kit's fixed
 wrapper tables) is decided after all providers in every scope: whole when
 it fits (late-start, reserve-capped), otherwise a reserve-capped
 leading-templates prefix with a named partial gap only when first seen in
-the capture's first plan, and its published tables only when first mapped
-mid-capture — refused whole when none of those admit. Shared scope stays
+the capture's first plan or when its opened file matches an operator-named
+`--module` path, and its published tables only when first mapped mid-capture
+unnamed — refused whole when none of those admit. Shared scope stays
 whole-or-nothing for closures (never a heuristic prefix). Its 6,530+
 endpoints exceed every current ceiling, so the proxy layer itself is only
-ever covered by that prefix (late-start) or its published tables
-(mid-capture) while the backends behind it attach (costs of covering it are
+ever covered by that prefix (late-start or operator-named) or its published
+tables (mid-capture) while the backends behind it attach (costs of covering
+it are
 measured in `docs/notes/2026-11-01-p11kit-proxy-layer-measurement.md`).
 
 Endpoint selection (`--select-endpoint` with `--mode metrics` and

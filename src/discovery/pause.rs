@@ -439,8 +439,12 @@ pub(crate) struct PauseCoordinator {
     /// First arm's `armed_at_ns` snapshot: the hold's start bound. Never
     /// overwritten by successor installs, which only move the live arm.
     hold_start_ns: Option<u64>,
+    /// A first arm already ran: the start snapshot is first-arm-only, so a
+    /// re-arm after a clockless first arm cannot smuggle in a later bound.
+    hold_armed_once: bool,
     /// Latest stopped-sample instant of the first epoch, frozen at the
-    /// first completing resume; later cycles never move it.
+    /// first completing resume; later cycles never move it, and the
+    /// accessor publishes it only once frozen.
     hold_end_ns: Option<u64>,
     /// Sticky pre-freeze gap latch (fail-closed): any unproven break
     /// before the first resume voids the from-start claim.
@@ -562,6 +566,7 @@ impl PauseCoordinator {
             armed: false,
             armed_at_ns: None,
             hold_start_ns: None,
+            hold_armed_once: false,
             hold_end_ns: None,
             hold_void: false,
             hold_frozen: false,
@@ -644,8 +649,10 @@ impl PauseCoordinator {
                 self.armed = true;
                 self.armed_at_ns = armed_at;
                 // The hold's start bound is the first arm's clock only: a
-                // re-arm or successor install never moves it.
-                if self.hold_start_ns.is_none() {
+                // re-arm or successor install never moves it, not even
+                // after a clockless first arm (which stays unboundable).
+                if !self.hold_armed_once {
+                    self.hold_armed_once = true;
                     self.hold_start_ns = armed_at;
                 }
                 self.successors_left = MAX_SUCCESSORS_PER_ARM;
@@ -2156,15 +2163,18 @@ impl PauseCoordinator {
 
     /// The first-hold proof for pre-arm exactness, once the coordinator
     /// armed: `None` while no arm proved a hold (a passive capture, a
-    /// failed or disabled arm, a missing arm clock, or an epoch whose
-    /// first resume never completed). A returned hold carries its own gap
-    /// flag; the builder trusts only a continuous one.
+    /// failed or disabled arm, or a missing arm clock). The end bound
+    /// publishes only after the first resume freezes it, so a cycle that
+    /// never completes can never lend a partial end to a proof. A
+    /// returned hold carries its own gap flag; the builder trusts only a
+    /// continuous one.
     pub(crate) fn pause_hold(&self) -> Option<PauseGateHold> {
         let start = self.hold_start_ns?;
-        let sane = self.hold_end_ns.is_none_or(|end| start <= end);
+        let end = self.hold_end_ns.filter(|_| self.hold_frozen);
+        let sane = end.is_none_or(|end| start <= end);
         Some(PauseGateHold {
             start_ns: Some(start),
-            end_ns: self.hold_end_ns,
+            end_ns: end,
             continuous: !self.hold_void && sane,
         })
     }
@@ -4127,8 +4137,8 @@ mod tests {
         assert_eq!(coordinator.pause_hold(), Some(frozen));
     }
 
-    /// A cycle that fails after stopping voids the from-start claim but
-    /// keeps the partial end: the flag, not an absent end, carries the gap.
+    /// A cycle that fails after stopping voids the from-start claim and
+    /// publishes no end: without a completing resume nothing freezes.
     #[test]
     fn pause_hold_failed_cycle_voids() {
         let mut io = successful_io(vec![record(10, 0, false)]);
@@ -4142,7 +4152,7 @@ mod tests {
             coordinator.pause_hold(),
             Some(PauseGateHold {
                 start_ns: Some(5),
-                end_ns: Some(1_000_013),
+                end_ns: None,
                 continuous: false,
             })
         );
@@ -4161,7 +4171,8 @@ mod tests {
     }
 
     /// An arm whose clock read failed proves no start bound: even a fully
-    /// confirmed cycle afterward yields no hold.
+    /// confirmed cycle afterward yields no hold, and a later re-arm cannot
+    /// smuggle in its own clock as the first bound.
     #[test]
     fn pause_hold_missing_arm_clock_yields_none() {
         let mut io = successful_io(vec![record(10, 0, false)]);
@@ -4172,6 +4183,10 @@ mod tests {
         coordinator.service(&mut io).unwrap();
 
         assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(coordinator.pause_hold(), None);
+
+        io.now.push_front(Ok(20));
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
         assert_eq!(coordinator.pause_hold(), None);
     }
 
@@ -4211,6 +4226,49 @@ mod tests {
             Some(PauseGateHold {
                 start_ns: Some(5),
                 end_ns: None,
+                continuous: false,
+            })
+        );
+    }
+
+    /// A refuted first epoch voids sticky: even a fully confirmed later
+    /// cycle freezes a gapped hold, never a clean one.
+    #[test]
+    fn pause_hold_refute_then_complete_freezes_gapped() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.now.push_front(Ok(5));
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        coordinator.successors_left = 0;
+
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: None,
+                continuous: false,
+            })
+        );
+
+        io.authorization = Some(PAUSE_REQUESTED);
+        io.queue = VecDeque::from([
+            Ok(Some(DiscoveryItem::Record(record(25, 0, false)))),
+            Ok(None),
+            Ok(None),
+        ]);
+        io.now.push_back(Ok(26));
+        io.now.push_back(Ok(27));
+        io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(stopped())]);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: Some(2_000_032),
                 continuous: false,
             })
         );

@@ -296,8 +296,9 @@ release.
 its proved offsets (`watch` on the discovery record, with `attached_at_ns`
 and `unobserved_windows` merged at capture end). A quiet pre-armed interval
 is a stated watch interval, not proven-exact coverage, except on an owned
-`run` whose pause gate held the child across the whole window: that capture
-publishes an explicitly empty `unobserved_windows` on the pre-armed module.
+`run` whose spawn barrier and pause-gate first hold together covered the
+child across the whole window: that capture publishes an explicitly empty
+`unobserved_windows` on the pre-armed module.
 Every other capture still discloses its window; ordering-evidence exactness
 for other scopes is later work.
 Inventory accepts and retains pre-arm inputs, attaches proved offsets

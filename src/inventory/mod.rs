@@ -8968,7 +8968,7 @@ mod tests {
     /// before the run renders one `prearm[]` row with its file
     /// identity, `mapped` and its terminal watch.
     #[test]
-    fn inventory_prearm_proved_offsets_attach_and_arm() {
+    fn inventory_prearm_mapped_renders_terminal_watch() {
         let lifecycle = compile_prearm_lifecycle();
         let mut barrier = PrearmBarrier::start(&lifecycle.driver, &lifecycle.provider);
         barrier.load();

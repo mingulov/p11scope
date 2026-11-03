@@ -436,6 +436,8 @@ fn main() {
     // image-identity contract test): adding or changing it cannot alter the
     // three objects above.
     build_identity_object();
+    // Pre-arm witness object (WU-13 P-C phase 2): standalone, like identity.
+    build_prearm_witness_object();
     if counter_artifacts {
         for flavor in [
             BpfFlavor::CounterCounts,
@@ -1460,4 +1462,98 @@ fn build_identity_object() {
     ));
     std::fs::write(out_dir.join("p11scope-identity-build-info.txt"), info)
         .expect("writing identity build info");
+}
+
+/// Pre-arm witness object (WU-13 P-C phase 2): `crates/ebpf/native/prearm_witness.c`
+/// compiled by clang-18 straight to a BPF ELF, like the identity object above.
+/// Uses `-mcpu=v3` (fetch-add and compare-exchange; 6.6 supports v3 atomics).
+/// Self-contained single-writer region: source reruns, compile, compiler/PATH
+/// reruns and receipt all live here; `main` holds the single call. The
+/// controller serializes this function with WU-2b.
+fn build_prearm_witness_object() {
+    println!("cargo:rerun-if-changed=crates/ebpf/native/prearm_witness.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/prearm_witness.h");
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    let compiler_path = resolve_clang18();
+
+    let target = match env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() {
+        Ok("big") => "bpfeb",
+        _ => "bpfel",
+    };
+    let mut file_prefix_map = OsString::from("-ffile-prefix-map=");
+    file_prefix_map.push(manifest_dir.as_os_str());
+    file_prefix_map.push("=/p11scope");
+    let cflags = [
+        "-target",
+        target,
+        "-mcpu=v3",
+        "-O2",
+        "-g",
+        "-gno-record-gcc-switches",
+        "-fdebug-compilation-dir=/p11scope/native",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-c",
+    ];
+    let source = manifest_dir.join("crates/ebpf/native/prearm_witness.c");
+    let mut compile_args: Vec<OsString> = cflags.iter().map(OsString::from).collect();
+    compile_args.push(file_prefix_map);
+    compile_args.push(source.into_os_string());
+    compile_args.push(OsString::from("-o"));
+    compile_args.push(OsString::from("p11scope-ebpf-prearm-witness"));
+    let status = Command::new(&compiler_path)
+        .current_dir(&out_dir)
+        .args(&compile_args)
+        .status()
+        .expect("failed to spawn clang-18 for the witness object");
+    assert!(
+        status.success(),
+        "building the witness object failed: {status}"
+    );
+    let path_env = env::var_os("PATH").unwrap_or_default();
+    let build_cwd = env::current_dir().expect("build cwd");
+    println!("cargo:rerun-if-changed={}", compiler_path.display());
+    for dir in clang_resolve::path_dirs_in(&path_env, &build_cwd) {
+        if dir.is_dir() {
+            println!("cargo:rerun-if-changed={}", dir.display());
+        }
+    }
+    let candidates = clang_resolve::candidate_files_in("clang-18", &path_env, &build_cwd);
+    for candidate in &candidates {
+        if *candidate != compiler_path {
+            println!("cargo:rerun-if-changed={}", candidate.display());
+        }
+    }
+    let compiler_realpath = compiler_path
+        .canonicalize()
+        .unwrap_or_else(|_| compiler_path.clone());
+    let object_path = out_dir.join("p11scope-ebpf-prearm-witness");
+    let mut info = format!(
+        "compiler_path={}\ncompiler_realpath={}\ncompiler_sha256={}\ntarget={target}\nmcpu=v3\ncflags={}\ncompile_cwd={}\n",
+        compiler_path.display(),
+        compiler_realpath.display(),
+        sha256_file_hex(&compiler_path),
+        cflags.join(" "),
+        out_dir.display(),
+    );
+    let mut compile_argv = vec![lossy(compiler_path.as_os_str())];
+    compile_argv.extend(compile_args.iter().map(|arg| lossy(arg)));
+    info.push_str(&format!("compile_argc={}\n", compile_argv.len()));
+    for (index, arg) in compile_argv.iter().enumerate() {
+        info.push_str(&format!("compile_arg{index}={arg}\n"));
+    }
+    info.push_str(&format!(
+        "path_env={}\nbuild_cwd={}\n",
+        path_env.to_string_lossy(),
+        build_cwd.display(),
+    ));
+    info.push_str(&format!(
+        "object_sha256={}\n",
+        sha256_file_hex(&object_path),
+    ));
+    std::fs::write(out_dir.join("p11scope-prearm-witness-build-info.txt"), info)
+        .expect("writing witness build info");
 }

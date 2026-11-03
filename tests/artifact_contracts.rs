@@ -7918,6 +7918,45 @@ fn instance_epoch_native_hooks_localize_globalize_and_fault_exactly() {
 }
 
 #[test]
+fn prearm_witness_native_harness_covers_every_path() {
+    let directory = tempfile::tempdir().expect("temporary native witness test");
+    let binary = directory.path().join("prearm-witness-tests");
+    let mut compiler = Command::new("clang-18");
+    compiler.args([
+        "-O2",
+        "-g",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wno-unknown-attributes",
+        "-I",
+        "crates/ebpf/native",
+        "tests/fixtures/prearm-witness/harness.c",
+    ]);
+    let compile = compiler
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("execute clang-18 for native witness regression");
+    assert!(
+        compile.status.success(),
+        "native witness compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&binary)
+        .output()
+        .expect("execute native witness regression");
+    assert!(
+        run.status.success(),
+        "native witness regression failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("prearm witness harness: all controls verified")
+    );
+}
+
+#[test]
 fn instance_epoch_journal_gap_selector_keeps_birth_and_exec_reads_separate() {
     let directory = tempfile::tempdir().expect("native selector objects");
     for (mode, flag, gap, birth) in [
@@ -14213,6 +14252,7 @@ const LICENSE_C_FIXTURES: &[&str] = &[
     "tests/fixtures/lane13-evidence/port-forward.c", // tests/python/test_lane13_evidence.py
     "tests/fixtures/live-discovery-driver.c",       // tests/discovery_scan.rs
     "tests/fixtures/live-discovery-provider.c", // tests/python/test_live_freeze_prepared_dependencies.py
+    "tests/fixtures/prearm-witness/harness.c", // tests/artifact_contracts.rs (prearm_witness_native_harness_*)
     "tests/fixtures/root-affiliation/birth_hook_tests.c", // tests/python/test_root_affiliation.py
     "tests/fixtures/root-affiliation/helper_tests.c", // tests/python/test_root_affiliation.py
     "tests/fixtures/root-fence-runtime.c",      // orphan fixture (no consumer); exempt by location

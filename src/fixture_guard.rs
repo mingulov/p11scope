@@ -16,13 +16,15 @@
 //! when the owner is already gone.
 //!
 //! `PR_SET_PDEATHSIG` fires when the forking *thread* exits. That is fine
-//! here because the spawning test thread outlives its children: tests
-//! spawn holders on the test thread itself and reap them before the test
-//! returns. Never spawn a guarded long-lived child on a short-lived
+//! here because the spawning *thread* outlives its children: normally
+//! the test thread itself, which reaps before the test returns
+//! (`run_workload_worker`'s scoped threads likewise reap before
+//! joining). Never spawn a guarded long-lived child on a short-lived
 //! helper thread (its exit would kill the child early); the
-//! `rust_owned_stopped_fixture_dies_with_its_spawner_thread` twin in
-//! `inventory_coordinator` pins exactly that thread-death semantic on
-//! purpose.
+//! `guarded_sleeper_dies_with_spawning_thread` twin below pins exactly
+//! that thread-death semantic for this guard (the older
+//! `rust_parent_death_kills_owned_fixture_without_c_flag` twin in
+//! `inventory_coordinator` pins the pre-existing `harden_spawn` path).
 //!
 //! The setting survives `exec`, so one registration covers C fixtures
 //! too. A fixture that forks its own grandchildren must re-arm after each
@@ -68,6 +70,23 @@ impl DieWithParent for Command {
             });
         }
         self
+    }
+}
+
+/// Reap `pid` if it is this process's adopted zombie, without blocking.
+/// A death-signalled descendant adopted by this process (its group was
+/// alive, or a process-wide subreaper window was open) lingers in
+/// `/proc` as a zombie until reaped. `ECHILD` (adopted elsewhere, e.g.
+/// init) and still-running children are precisely nothing to do: a
+/// zombie holds its pid against reuse, so this reaps exactly the
+/// recorded process or nothing. Call at the top of every orphan-poll
+/// iteration.
+pub(crate) fn reap_known_descendant(pid: u32) {
+    let mut status = 0;
+    // SAFETY: `waitpid` on a recorded pid with `WNOHANG` never blocks
+    // and never signals; see the function docs for exactness.
+    unsafe {
+        libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG);
     }
 }
 
@@ -219,8 +238,10 @@ mod tests {
     }
 
     impl Tree {
-        /// Spawn the victim helper (unguarded: it plays the dying test)
-        /// and wait for its three recorded descendants.
+        /// Spawn the victim helper (guarded: the guard watches the
+        /// orchestrator, so it is inert during the proof, which kills
+        /// the victim explicitly) and wait for its three recorded
+        /// descendants.
         fn spawn(guarded: bool) -> Self {
             let dir = tempfile::tempdir().expect("tree tempdir creates");
             let pidfile = dir.path().join("tree.pids");
@@ -233,6 +254,7 @@ mod tests {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::fs::File::create(&victim_log).expect("victim log creates"))
                 .stderr(std::process::Stdio::null());
+            victim.die_with_parent();
             let mut victim = victim.spawn().expect("orchestrator spawns its victim");
             let deadline = Instant::now() + PIDFILE_DEADLINE;
             let members = loop {
@@ -281,6 +303,12 @@ mod tests {
         }
 
         fn survivors(&self) -> Vec<String> {
+            // Reap test-adopted zombies first: a death-signalled
+            // descendant adopted by this process lingers in /proc
+            // until reaped.
+            for (pid, _) in self.members.values() {
+                super::reap_known_descendant(*pid);
+            }
             self.members
                 .iter()
                 .filter(|(_, (pid, start))| proc_matches(*pid, start))

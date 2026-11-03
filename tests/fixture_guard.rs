@@ -68,8 +68,9 @@ struct Tree {
 }
 
 impl Tree {
-    /// Spawn the victim helper (unguarded: it plays the dying test) and
-    /// wait for its recorded sleeper.
+    /// Spawn the victim helper (guarded: the guard watches the
+    /// orchestrator, so it is inert during the proof, which kills the
+    /// victim explicitly) and wait for its recorded sleeper.
     fn spawn(guarded: bool) -> Self {
         let dir = tempfile::tempdir().expect("tree tempdir creates");
         let pidfile = dir.path().join("tree.pid");
@@ -83,6 +84,7 @@ impl Tree {
             .stdin(Stdio::null())
             .stdout(victim_log)
             .stderr(Stdio::null());
+        victim.die_with_parent();
         let mut victim = victim.spawn().expect("orchestrator spawns its victim");
         let deadline = Instant::now() + PIDFILE_DEADLINE;
         let (pid, start) = loop {

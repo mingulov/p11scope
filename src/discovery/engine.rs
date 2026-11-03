@@ -10970,6 +10970,17 @@ impl Engine {
     /// rest of this snapshot stays exactly what the capture accepted (see
     /// `AttachPlan::active_slot_count`).
     pub fn capture_facts(&self) -> render::CaptureFacts {
+        // One accumulator, each source feeding it once (design §9.1).
+        let discovery_truncated = self
+            .discovery_truncated
+            .saturating_add(self.malformed_discovery)
+            .saturating_add(self.loader_registry.discovery_truncated())
+            .saturating_add(self.loader_registry.context_failures());
+        let exit_ended = self.exit_ended_truncations;
+        debug_assert!(
+            exit_ended <= discovery_truncated,
+            "exit-only stays a subset of the truncation total"
+        );
         render::CaptureFacts {
             discovery: self.discovery.clone(),
             table_entries: self.plan.entries_seen,
@@ -10994,15 +11005,10 @@ impl Engine {
             discovery_state_failures: self.counter_snapshot.export_state_failures,
             discovery_read_failures: self.counter_snapshot.export_bounded_read_failures,
             task_uprobe_link_losses: self.task_uprobe_link_losses,
-            // One accumulator, each source feeding it once (design §9.1).
-            discovery_truncated: self
-                .discovery_truncated
-                .saturating_add(self.malformed_discovery)
-                .saturating_add(self.loader_registry.discovery_truncated())
-                .saturating_add(self.loader_registry.context_failures()),
-            // The exit-ended subset of the engine's own truncation
-            // count above: K0 subtracts it from the total.
-            exit_ended_truncations: self.exit_ended_truncations,
+            discovery_truncated,
+            // The exit-ended subset of the truncation total above: K0
+            // subtracts it from the total.
+            exit_ended_truncations: exit_ended,
         }
     }
 
@@ -16159,10 +16165,11 @@ impl Engine {
                     required_complete &= outcome.required_complete();
                 }
                 Err(error) => {
-                    // A target that provably exited before its fallback ran
-                    // ended its loader transaction unfinished: a counted
-                    // truncation, never a reason to abandon the capture, and
-                    // no lost causal timing (`record_pending_loader_scan_end`).
+                    // A fallback that failed after its process provably
+                    // exited: the exit ended the loader observation the scan
+                    // belonged to, so the unresolved scan is a counted
+                    // truncation, never a reason to abandon the capture
+                    // (`record_pending_loader_scan_end`).
                     if self.original_exited(key.view) {
                         self.record_pending_loader_scan_end(
                             "a deferred loader memory scan was unresolved at expected process exit",
@@ -16337,8 +16344,10 @@ impl Engine {
                 pending_views,
             );
             if result.is_err() {
-                // An RT_ADD/RT_DELETE hit of a process that already ended:
-                // its transaction never reached RT_CONSISTENT.
+                // A scan that failed while its process provably ended: the
+                // exit ended the loader observation the scan belonged to, so
+                // the unresolved scan counts exit-only (the process may well
+                // have run; only its scan outlived it).
                 let ended = self.original_exited(view_id);
                 self.settle_pending_loader_scan(
                     key,

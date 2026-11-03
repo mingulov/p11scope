@@ -11719,7 +11719,7 @@ fn assert_profile_collection_wiring(run: &str, projection: &str) -> Result<(), S
         .1;
     require_contract_marker(
         terminal,
-        "context\n                .6\n                .terminal(context.1, context.0.plan(), context.0.pinned(), profile)?",
+        "context\n                .6\n                .terminal(context.1, context.0.plan(), context.0.pinned(), profile)",
         "profile terminal collection owner",
     )?;
 
@@ -11849,8 +11849,8 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             "profile live collection under cache gate",
         ),
         (
-            ".terminal(context.1, context.0.plan(), context.0.pinned(), profile)?",
-            ".fresh(context.1, context.0.plan(), context.0.pinned(), profile)?",
+            ".terminal(context.1, context.0.plan(), context.0.pinned(), profile)",
+            ".fresh(context.1, context.0.plan(), context.0.pinned(), profile)",
             "profile terminal collection owner",
         ),
     ] {
@@ -11971,7 +11971,7 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
         .1;
     for (first, second) in [
         (
-            ".terminal(context.1, context.0.plan(), context.0.pinned(), profile)?",
+            ".terminal(context.1, context.0.plan(), context.0.pinned(), profile)",
             "let reports = snapshot.reports();",
         ),
         (

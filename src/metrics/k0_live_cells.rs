@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! K0 live cells: `--select-endpoint` detail from the broad counter on
 //! a real SoftHSM workload (root). Every cell runs the real observer
 //! binary (`P11SCOPE_E2E_OBSERVER` or the `p11scope` sibling of this

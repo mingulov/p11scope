@@ -4520,6 +4520,34 @@ fn exit_mapping_children_guard_reaps_remainder_after_mid_reap_panic() {
     );
 }
 
+/// Parse this process's starting cgroup from `/proc/self/cgroup`
+/// (cgroup v2 `0::/relative/path`) into the absolute cgroupfs
+/// directory, so test guards move back to where the test started
+/// instead of escaping to the root. Unparsable input falls back to
+/// the root rather than refusing teardown.
+fn self_origin_cgroup(cgroup_file: &str) -> std::path::PathBuf {
+    const ROOT: &str = "/sys/fs/cgroup";
+    let relative = cgroup_file
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| path.trim().trim_start_matches('/'))
+        .unwrap_or("");
+    if relative.is_empty() {
+        std::path::PathBuf::from(ROOT)
+    } else {
+        std::path::PathBuf::from(ROOT).join(relative)
+    }
+}
+
+/// True when `members` (a `cgroup.procs` listing) still contains
+/// `pid`: the teardown kill-skip decision.
+fn cgroup_still_holds(members: &str, pid: u32) -> bool {
+    members
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .any(|member| member == pid)
+}
+
 /// The cgroup guards move the test back to the cgroup it started in
 /// (parsed from `/proc/self/cgroup`), never to the root: a test
 /// running under a CI or lane cgroup must not escape it for the rest
@@ -4619,6 +4647,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
 
     struct OwnedCgroup {
         path: std::path::PathBuf,
+        origin: std::path::PathBuf,
     }
 
     impl OwnedCgroup {
@@ -4647,7 +4676,14 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
                 "{what}: {} is not a live cgroup (no cgroup.procs)",
                 path.display()
             );
-            Self { path }
+            // Recorded before any move: the guards restore the test
+            // to this cgroup, never to the root.
+            let origin = std::fs::read_to_string("/proc/self/cgroup")
+                .map(|text| self_origin_cgroup(&text))
+                .unwrap_or_else(|error| {
+                    panic!("{what}: reading /proc/self/cgroup failed: {error}")
+                });
+            Self { path, origin }
         }
 
         fn move_in(&self, pid: u32, what: &str) {
@@ -4687,17 +4723,23 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             // after every owned process is reaped): a panic between
             // spawn and reap must not leak the cgroup. The child
             // guards drop first and already killed and reaped owned
-            // fixtures; move the test itself out so the kill below
+            // fixtures; move the test itself back to the cgroup it
+            // started in (never the root, which would escape a CI or
+            // lane cgroup for the rest of the run) so the kill below
             // can never SIGKILL this binary mid-unwind, then kill
-            // strays and retry removal while members drain.
+            // strays and retry removal while members drain. The kill
+            // is skipped while this process is still inside: a failed
+            // move-out must not kill the test itself.
             if !self.path.exists() {
                 return;
             }
-            let _ = std::fs::write(
-                "/sys/fs/cgroup/cgroup.procs",
-                std::process::id().to_string(),
-            );
-            let _ = std::fs::write(self.path.join("cgroup.kill"), "1");
+            let this = std::process::id();
+            let _ = std::fs::write(self.origin.join("cgroup.procs"), this.to_string());
+            let inside = std::fs::read_to_string(self.path.join("cgroup.procs"))
+                .is_ok_and(|members| cgroup_still_holds(&members, this));
+            if !inside {
+                let _ = std::fs::write(self.path.join("cgroup.kill"), "1");
+            }
             for _ in 0..20 {
                 if std::fs::remove_dir(&self.path).is_ok() {
                     return;
@@ -4710,12 +4752,17 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
 
     struct MoveOutGuard {
         pid: u32,
+        origin: std::path::PathBuf,
         armed: bool,
     }
 
     impl MoveOutGuard {
-        fn arm(pid: u32) -> Self {
-            Self { pid, armed: true }
+        fn arm(pid: u32, origin: std::path::PathBuf) -> Self {
+            Self {
+                pid,
+                origin,
+                armed: true,
+            }
         }
 
         fn disarm(&mut self) {
@@ -4723,7 +4770,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         }
 
         fn move_out(&mut self, what: &str) {
-            std::fs::write("/sys/fs/cgroup/cgroup.procs", self.pid.to_string())
+            std::fs::write(self.origin.join("cgroup.procs"), self.pid.to_string())
                 .unwrap_or_else(|error| panic!("{what}: moving {} out failed: {error}", self.pid));
             self.disarm();
         }
@@ -4732,7 +4779,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
     impl Drop for MoveOutGuard {
         fn drop(&mut self) {
             if self.armed {
-                let _ = std::fs::write("/sys/fs/cgroup/cgroup.procs", self.pid.to_string());
+                let _ = std::fs::write(self.origin.join("cgroup.procs"), self.pid.to_string());
             }
         }
     }
@@ -4929,8 +4976,23 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         // until the settle loop, so enumeration never observes the
         // test itself.
         let this = std::process::id();
+        let assert_moved_out = |cgroup: &OwnedCgroup, this: u32, what: &str| {
+            assert!(
+                !cgroup.members(what).contains(&this),
+                "{what}: the test must move back out of the owned cgroup"
+            );
+            let origin_members = std::fs::read_to_string(cgroup.origin.join("cgroup.procs"))
+                .unwrap_or_else(
+                    |error| panic!("{what}: reading the origin cgroup failed: {error}"),
+                );
+            assert!(
+                cgroup_still_holds(&origin_members, this),
+                "{what}: the test must move back to its origin cgroup {}",
+                cgroup.origin.display()
+            );
+        };
         cgroup.move_in(this, what);
-        let mut move_out = MoveOutGuard::arm(this);
+        let mut move_out = MoveOutGuard::arm(this, cgroup.origin.clone());
         assert!(
             cgroup.members(what).contains(&this),
             "{what}: the test must spawn from inside the cgroup"
@@ -4938,6 +5000,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         let mut holder_child =
             ExitMappingChildGuard(spawn_holder(what, &fixtures.holder, &fixtures.provider));
         move_out.move_out(what);
+        assert_moved_out(&cgroup, this, what);
         // Settle: tick the production cadence until a slot carries
         // a watch for exactly the fixture file. Only then can a
         // short-lived mapping name a slot.
@@ -4975,7 +5038,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         // The window: born in scope, reaped before the next tick, so
         // all three stay deterministically unmatched.
         cgroup.move_in(this, what);
-        let mut move_out = MoveOutGuard::arm(this);
+        let mut move_out = MoveOutGuard::arm(this, cgroup.origin.clone());
         let mapper_child = std::process::Command::new(&fixtures.mapper)
             .arg(&fixtures.provider)
             .stdout(std::process::Stdio::null())
@@ -5015,6 +5078,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             },
         );
         move_out.move_out(what);
+        assert_moved_out(&cgroup, this, what);
         let owned = [mapper_pid, plain_pid, threaded_pid];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         let mut exits = Vec::new();

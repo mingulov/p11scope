@@ -609,8 +609,8 @@ fn collapse_hint_misses(
         }
     }
     for (subject, pids) in missed {
-        let matched = object_paths.contains(subject)
-            || inventoried.iter().any(|pid| !pids.contains(pid));
+        let matched =
+            object_paths.contains(subject) || inventoried.iter().any(|pid| !pids.contains(pid));
         if !matched {
             kept.push(crate::inspect_system::PidGap {
                 pid: None,
@@ -9114,7 +9114,10 @@ pub(crate) mod tests {
         let mut notes = Vec::new();
         for view in [1u32, 2] {
             for hint in 0..121 {
-                notes.push(hint_miss_note(view, &format!("/providers/provider-{hint:03}.so")));
+                notes.push(hint_miss_note(
+                    view,
+                    &format!("/providers/provider-{hint:03}.so"),
+                ));
             }
         }
         notes.push(crate::inspect_system::PidGap {
@@ -9134,7 +9137,10 @@ pub(crate) mod tests {
         // answer, not one gap per view.
         let inventoried: BTreeSet<u32> = [1, 2].into_iter().collect();
         let object_paths: BTreeSet<&str> = BTreeSet::new();
-        let notes = vec![hint_miss_note(1, "/opt/typo.so"), hint_miss_note(2, "/opt/typo.so")];
+        let notes = vec![
+            hint_miss_note(1, "/opt/typo.so"),
+            hint_miss_note(2, "/opt/typo.so"),
+        ];
         let collapsed = collapse_hint_misses(&inventoried, &object_paths, &notes);
         assert_eq!(collapsed.len(), 1);
         assert_eq!(collapsed[0].pid, None);

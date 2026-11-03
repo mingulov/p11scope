@@ -8017,11 +8017,7 @@ mod tests {
         let getter = 0x1500u64;
         let mut snapshot = 0x2802u64.to_le_bytes().to_vec();
         for slot in 0..68u64 {
-            let word = if slot == 3 {
-                getter
-            } else {
-                0x1600 + slot * 8
-            };
+            let word = if slot == 3 { getter } else { 0x1600 + slot * 8 };
             snapshot.extend_from_slice(&word.to_le_bytes());
         }
         for _ in 0..4 {
@@ -8073,11 +8069,7 @@ mod tests {
         let getter = 0x1500u64;
         let mut snapshot = 0x2802u64.to_le_bytes().to_vec();
         for slot in 0..68u64 {
-            let word = if slot == 3 {
-                getter
-            } else {
-                0x1600 + slot * 8
-            };
+            let word = if slot == 3 { getter } else { 0x1600 + slot * 8 };
             snapshot.extend_from_slice(&word.to_le_bytes());
         }
         for _ in 0..36 {

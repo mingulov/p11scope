@@ -13118,6 +13118,98 @@ mod tests {
         );
     }
 
+    /// PA-9/C1 twin (reviewer's `--pid` probe): the capture attaches to a
+    /// running process with libp11-kit mapped but its backends not yet
+    /// loaded, so the first plan holds the closure alone. The closure takes
+    /// no heuristic prefix — published tables only, like a mid-capture one —
+    /// and every backend arriving later in one rebuild still fits: 68/68/104
+    /// with the closure at 0, never the held 309 that starved the third
+    /// backend ("needs 104 more … 445 in use … held by libp11-kit 309").
+    #[test]
+    fn closure_alone_in_first_plan_leaves_room_for_backends_arriving_together() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let opensc = provider_with_tables(34, OPENSC, 1, 104, false);
+        let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 31), 0, "closure alone takes no prefix");
+        assert!(
+            refusal_of(&first, P11_KIT).is_some(),
+            "closure alone is refused whole, never silent: {:?}",
+            first.modules_skipped
+        );
+        let rebuilt = first.rebuild_from_sources(
+            &[p11_kit, trust, softhsm, opensc],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(slots_of(&rebuilt, 32), 68, "trust fits");
+        assert_eq!(slots_of(&rebuilt, 33), 68, "softhsm fits");
+        assert_eq!(slots_of(&rebuilt, 34), 104, "opensc fits, not starved");
+        assert_eq!(
+            slots_of(&rebuilt, 31),
+            0,
+            "closure stays at published-only, never a held prefix"
+        );
+    }
+
+    /// PA-9/C1 twin, lazy-start shape: the first plan holds the closure
+    /// alone, and each backend arrives in its own rebuild (one lazy `dlopen`
+    /// at a time). Each is admitted in full; the closure never prefixes.
+    #[test]
+    fn closure_alone_in_first_plan_leaves_room_for_backends_arriving_lazily() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let opensc = provider_with_tables(34, OPENSC, 1, 104, false);
+        let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 31), 0, "closure alone takes no prefix");
+        let with_trust = first.rebuild_from_sources(
+            &[p11_kit.clone(), trust.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(slots_of(&with_trust, 32), 68, "trust admitted in full");
+        assert_eq!(slots_of(&with_trust, 31), 0, "no prefix after trust");
+        let with_softhsm = with_trust.rebuild_from_sources(
+            &[p11_kit.clone(), trust, softhsm.clone()],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(slots_of(&with_softhsm, 33), 68, "softhsm admitted in full");
+        assert_eq!(slots_of(&with_softhsm, 31), 0, "no prefix after softhsm");
+        let all = with_softhsm.rebuild_from_sources(
+            &[p11_kit, softhsm, opensc],
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(slots_of(&all, 34), 104, "opensc admitted in full");
+        assert_eq!(slots_of(&all, 31), 0, "no prefix after opensc");
+    }
+
+    /// PA-9/C1 guard: the named exception survives the late-start gate. A
+    /// closure alone in the first plan whose opened file matched an
+    /// operator-named `--module` input still takes its reserve-capped prefix.
+    #[test]
+    fn named_closure_alone_in_first_plan_keeps_its_prefix() {
+        let mut p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        p11_kit.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        // Nothing else admitted, reserve-capped ceiling 384: 3 tables (309)
+        // fit, the 4th would take the reserve.
+        assert_eq!(
+            slots_of(&first, 31),
+            3 * 103,
+            "the named closure keeps its prefix"
+        );
+        let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("3 of 64 template tables attached"),
+            "{}",
+            partial.reason
+        );
+    }
+
     /// PA-5 C1 late-start twin (`--pid` on a running process): the closure
     /// and providers are all mapped before the first plan. The prefix is
     /// admitted after the providers, and nothing is starved.

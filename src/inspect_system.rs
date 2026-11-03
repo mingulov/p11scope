@@ -302,6 +302,9 @@ struct MemberResult {
     application: InspectApplicationResult,
     /// Scanner-owned presentation fact, never an absence receipt or render input.
     mapping_scan_completed: bool,
+    /// Whether the scan reached its `--module` hint loop. Kernel threads
+    /// and refused-initial scans never do; their silence is not a match.
+    hints_examined: bool,
     modules: Vec<ScannedModule>,
     /// Objects this member's own deep scan examined without finding a
     /// module (C1b "examined" keys; empty unless the scan completed).
@@ -673,7 +676,7 @@ fn scan_pinned_member_inner(
         ),
         None => scan_process_view_examined(&request, view_handle, budget),
     };
-    let (outcome, examined) = match scanned {
+    let (outcome, examined, hints_examined) = match scanned {
         Ok(scanned) => scanned,
         Err(error) => {
             return member_not_scanned(
@@ -761,6 +764,7 @@ fn scan_pinned_member_inner(
         mapping_scan_completed,
         application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
         complete_scan,
+        hints_examined,
         pid,
         view,
         status,
@@ -818,6 +822,7 @@ fn member_not_scanned(
         mapping_scan_completed: false,
         application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
         complete_scan: None,
+        hints_examined: false,
         pid,
         view,
         status,
@@ -997,6 +1002,9 @@ pub(crate) struct ProcessRecord {
     pub complete_scan: Option<CompleteMemberScan>,
     /// Scan-local presentation only; never use this as event naming authority.
     pub application: InspectApplicationResult,
+    /// Whether the member's scan reached its `--module` hint loop.
+    /// Internal collapse input only; never rendered (schema-safe).
+    pub hints_examined: bool,
 }
 
 /// Both samples use the same retained reader and enclose the full physical
@@ -2233,6 +2241,9 @@ fn assemble(
             complete_scan: members_by_pid
                 .get(pid)
                 .and_then(|member| member.complete_scan.clone()),
+            hints_examined: members_by_pid
+                .get(pid)
+                .is_some_and(|member| member.hints_examined),
             pid: *pid,
             status,
             objects,
@@ -5394,6 +5405,7 @@ mod tests {
         fn member(pid: u32) -> MemberResult {
             MemberResult {
                 mapping_scan_completed: true,
+                hints_examined: true,
                 pid,
                 view: ProcessViewId(0),
                 status: MemberStatus::Scanned,
@@ -5428,6 +5440,7 @@ mod tests {
                 generation: member.generation,
                 complete_scan: member.complete_scan,
                 application: member.application,
+                hints_examined: member.hints_examined,
             }];
             catalog.skipped = member.gaps;
             catalog
@@ -5856,6 +5869,7 @@ mod tests {
                         InspectIdentityUnknown::NotExamined,
                     ),
                     complete_scan: None,
+                    hints_examined: true,
                     pid: 100,
                     status: MemberStatus::Scanned,
                     objects: vec![0],
@@ -5866,6 +5880,7 @@ mod tests {
                         InspectIdentityUnknown::NotExamined,
                     ),
                     complete_scan: None,
+                    hints_examined: true,
                     pid: 200,
                     status: MemberStatus::Scanned,
                     objects: if objects.len() > 1 { vec![1] } else { vec![] },
@@ -6037,6 +6052,7 @@ mod tests {
                 mapping_scan_completed: true,
                 application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
                 complete_scan: None,
+                hints_examined: true,
                 pid,
                 view: ProcessViewId(view),
                 status: MemberStatus::Scanned,
@@ -6826,6 +6842,7 @@ mod tests {
                         InspectIdentityUnknown::NotExamined,
                     ),
                     complete_scan: None,
+                    hints_examined: false,
                     pid: 1,
                     view: ProcessViewId(0),
                     generation: None,
@@ -6846,6 +6863,7 @@ mod tests {
                         InspectIdentityUnknown::NotExamined,
                     ),
                     complete_scan: None,
+                    hints_examined: false,
                     pid: 2,
                     view: ProcessViewId(1),
                     status: MemberStatus::Exited,

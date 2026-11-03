@@ -1030,6 +1030,7 @@ impl Scene {
                             crate::inspect_identity::InspectIdentityUnknown::NotExamined,
                         ),
                         complete_scan: None,
+                        hints_examined: true,
                         pid: *pid,
                         status: if is_joiner && self.joiner_maps_matched {
                             crate::inspect_system::MemberStatus::MapsMatched

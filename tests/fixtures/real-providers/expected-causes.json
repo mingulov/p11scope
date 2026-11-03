@@ -171,6 +171,29 @@
      "status": "sigstop"
     },
     "tool_version": "3.130.0-1.fc44"
+   },
+   {
+    "observation": [
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+     },
+     {
+      "cause": "loader_discovery",
+      "owner": "exec-real-providers",
+      "reason": "live-loader timing gap with confirmed pause (unproven classification)"
+     }
+    ],
+    "os": "ubuntu",
+    "p11kit_skip": null,
+    "p11kit_version": null,
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "pause confirmed on every owner",
+     "status": "sigstop"
+    },
+    "tool_version": "2:3.120-1ubuntu2.2"
    }
   ],
   "real-opencryptoki": [],
@@ -343,6 +366,24 @@
      "status": "sigstop"
     },
     "tool_version": "0.27.1-2.fc44"
+   },
+   {
+    "observation": [
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+     }
+    ],
+    "os": "ubuntu",
+    "p11kit_skip": null,
+    "p11kit_version": null,
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "pause confirmed on every owner",
+     "status": "sigstop"
+    },
+    "tool_version": "0.27.0~rc1-1"
    }
   ]
  },

@@ -4032,7 +4032,7 @@ impl ScannedModuleCopy {
             // Base shell: scalars plus exact-capacity vectors.
             0 => {
                 rows.push(ScannedModule {
-                    module_hint: None,
+                    module_hint: source.module_hint.clone(),
                     mapped_identity: source.mapped_identity,
                     view: source.view,
                     mount_namespace: source.mount_namespace,

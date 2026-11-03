@@ -4176,6 +4176,15 @@ mod conservative_copy {
                 .ok_or(GraphRefusal::Overflow)
         }
 
+        fn charge_hint(hint: &std::path::Path) -> Result<usize, GraphRefusal> {
+            use std::os::unix::ffi::OsStrExt as _;
+            hint.as_os_str()
+                .as_bytes()
+                .len()
+                .checked_add(OWNED_ALLOCATION_PADDING)
+                .ok_or(GraphRefusal::Overflow)
+        }
+
         fn normalization_bound(path: &str) -> Result<usize, GraphRefusal> {
             text_bytes(path)?
                 .checked_add(bytes_for::<usize>(path.len() / 2 + 1)?)
@@ -4555,6 +4564,9 @@ mod conservative_copy {
                 match self.stage {
                     0 => {
                         add(&mut self.bytes, charge_text(&source.path)?)?;
+                        if let Some(hint) = source.module_hint.as_ref() {
+                            add(&mut self.bytes, charge_hint(hint)?)?;
+                        }
                         add(
                             &mut self.bytes,
                             bytes_for::<String>(source.exports.capacity())?,

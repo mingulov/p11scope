@@ -10,8 +10,10 @@
 # every ledgered main/teardown call is post-attach and the per-caller
 # edge entries must equal the ledgers exactly. The sampler mirrors the
 # bench-inventory-native.sh resource loop (1 Hz RSS, HWM, FD into
-# resources.tsv). A PASS verdict in live mode qualifies; a dry-run
-# PASS proves wiring only and never qualifies.
+# resources.tsv) extended with pidfd and BPF-FD breakdown columns, so
+# the oracle can bound each retained class separately. A PASS verdict
+# in live mode qualifies; a dry-run PASS proves wiring only and never
+# qualifies.
 # Optional --diagnostics retains bounded native count decisions in
 # WORK/count-diagnostics.jsonl; it is off by default.
 #
@@ -434,11 +436,12 @@ STARGET_STARTTIME=$OWNED_COMMAND_STARTTIME
 
 # The resource sampler mirrors the bench-inventory-native.sh loop: a
 # separate process tracing the observer's RSS, HWM and FD count at
-# 1 Hz into resources.tsv. Samples count once the pid runs the
-# measured binary (live); a zombie or exiting observer is not a
-# sample. In live non-root mode the loop crosses privilege with sudo
+# 1 Hz into resources.tsv, plus the retained-FD breakdown (pidfds and
+# BPF FDs) the oracle bounds separately. Samples count once the pid
+# runs the measured binary (live); a zombie or exiting observer is not
+# a sample. In live non-root mode the loop crosses privilege with sudo
 # so /proc/<observer>/fd stays readable; the file is reclaimed after.
-echo "# ms rss_kb hwm_kb fds" > "$WORK/resources.tsv"
+echo "# ms rss_kb hwm_kb fds pidfds bpf_fds" > "$WORK/resources.tsv"
 SAMPLER_START_MS=$(now_ms)
 # The sampler body lives in a file so both privilege paths run the
 # same bytes; values cross in (and through sudo) via env, never
@@ -456,10 +459,18 @@ while kill -0 "$SAMPLER_TARGET" 2>/dev/null; do
     if [ "$exe_ok" = 1 ]; then
         rss=$(awk '/^VmRSS:/ {print $2}' "/proc/$SAMPLER_TARGET/status" 2>/dev/null)
         hwm=$(awk '/^VmHWM:/ {print $2}' "/proc/$SAMPLER_TARGET/status" 2>/dev/null)
-        fds=$(find "/proc/$SAMPLER_TARGET/fd" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+        # One listing per sample: every /proc/<pid>/fd entry is a
+        # symlink, so '^l' counts exactly what find|wc -l counted, and
+        # the targets classify the retained classes. BPF links read
+        # anon_inode:bpf_link (underscore) while maps/progs use a
+        # hyphen, hence the [-_] class.
+        fdlist=$(ls -l "/proc/$SAMPLER_TARGET/fd" 2>/dev/null)
+        fds=$(printf '%s\n' "$fdlist" | grep -c '^l')
+        pidfds=$(printf '%s\n' "$fdlist" | grep -c -F 'anon_inode:[pidfd]')
+        bpffds=$(printf '%s\n' "$fdlist" | grep -c 'anon_inode:bpf[-_]')
         ms=$(($(date +%s%N) / 1000000 - SAMPLER_START_MS))
         if [ -n "$rss" ] && [ -n "$hwm" ]; then
-            echo "$ms $rss $hwm $fds" >> "$SAMPLER_OUT"
+            echo "$ms $rss $hwm $fds $pidfds $bpffds" >> "$SAMPLER_OUT"
         fi
     fi
     sleep 1

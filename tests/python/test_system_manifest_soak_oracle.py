@@ -92,6 +92,13 @@ def _resources(rows):
     return "\n".join(out) + "\n"
 
 
+def _resources6(rows):
+    out = ["# ms rss_kb hwm_kb fds pidfds bpf_fds"]
+    out.extend(f"{ms} {rss} {hwm} {fds} {pidfds} {bpf}"
+               for ms, rss, hwm, fds, pidfds, bpf in rows)
+    return "\n".join(out) + "\n"
+
+
 def make_green(root, *, horizon=1800, callers=PIDS, mode="live",
                shed=0, refused=0, unrouted=0, lost=0, gaps=()):
     """Write a fully green fixture evidence directory; legs mutate copies."""
@@ -352,6 +359,16 @@ class SoakOracleTest(unittest.TestCase):
         text = vehicle.read_text(encoding="utf-8")
         self.assertIn("/usr/lib64/pkcs11/libsofthsm2.so", text,
                       "the soak vehicle must try the Fedora SoftHSM layout")
+
+    def test_vehicle_sampler_emits_fd_breakdown_columns(self):
+        vehicle = ROOT / "scripts" / "system-manifest-soak.sh"
+        text = vehicle.read_text(encoding="utf-8")
+        self.assertIn("# ms rss_kb hwm_kb fds pidfds bpf_fds", text,
+                      "the soak sampler must record the pidfd/BPF breakdown")
+        self.assertIn("anon_inode:[pidfd]", text)
+        self.assertIn("anon_inode:bpf[-_]", text,
+                      "BPF links read anon_inode:bpf_link (underscore) while "
+                      "maps/progs use a hyphen; the pattern must match both")
 
     def test_red_stop_rc(self):
         target = mutate_copy(self.green, "leg-stop-rc", lambda target: rewrite_json(
@@ -662,6 +679,276 @@ class SoakOracleTest(unittest.TestCase):
                 {"t_go_sampler_ms": 185000}))
         verdict = self.evaluate(mutate_copy(base, "leg-latego", late_go))
         self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+
+    def test_red_resources_post_arming_rss_leak_mid_base(self):
+        """The same +68 MB post-arming leak fails on a mid base.
+
+        Pairs with the low-base RSS leak twin: with a base-scaled
+        margin this 150 MB-base leak passed while the identical leak on
+        a 52 MB base failed. Absolute margins fail both; the peak
+        (218 MB) stays under the 256 MB bound so only the growth gate
+        can fail.
+        """
+        base = make_green(self.base / "rssleak-mid-base", horizon=120)
+        rows = []
+        for n in range(190):
+            fds = 30 + n * 2 if n < 20 else 410
+            if n < 20:
+                rss = 41_000 + n * 550
+            else:
+                rss = 150_000 + (n - 20) * 400
+            rows.append((n * 1000, rss, rss + 2000, fds))
+
+        def leak(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 20000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-rssleak-mid", leak))
+        self.assert_red_only(verdict, "resource_accounting")
+        self.assertIn("RSS", verdict["gates"]["resource_accounting"]["detail"])
+
+    def test_red_resources_post_arming_fd_leak_low_base(self):
+        """A +150 FD post-arming leak fails on a low base (control twin)."""
+        base = make_green(self.base / "fdleak-low-base", horizon=120)
+        rows = []
+        for n in range(190):
+            if n < 20:
+                fds = 30 + n
+            else:
+                fds = 40 + (n - 20) * 150 // 170
+            rows.append((n * 1000, 52_000 + (n % 5), 54_000, fds))
+
+        def leak(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 20000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-fdleak-low", leak))
+        self.assert_red_only(verdict, "resource_accounting")
+        self.assertIn("FDs", verdict["gates"]["resource_accounting"]["detail"])
+
+    def test_red_resources_post_arming_fd_leak_high_base(self):
+        """The same +150 FD post-arming leak fails on a high base.
+
+        Pairs with the low-base twin: with a base-scaled margin this
+        400-base leak passed (allowed 101) while the identical leak on
+        a 40 base failed. Absolute margins fail both.
+        """
+        base = make_green(self.base / "fdleak-high-base", horizon=120)
+        rows = []
+        for n in range(190):
+            if n < 20:
+                fds = 30 + n * 18
+            else:
+                fds = 400 + (n - 20) * 150 // 170
+            rows.append((n * 1000, 52_000 + (n % 5), 54_000, fds))
+
+        def leak(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 20000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-fdleak-high", leak))
+        self.assert_red_only(verdict, "resource_accounting")
+        self.assertIn("FDs", verdict["gates"]["resource_accounting"]["detail"])
+
+    def test_red_resources_post_arming_pidfd_leak(self):
+        """A +80 retained-pidfd leak fails on a low and a high base.
+
+        Total FDs stay flat and consistent (above pidfds + BPF), so only
+        the pidfd gate can fail; the detail must name it.
+        """
+        for name, fds_base, pidfd_base in (("low", 100, 10), ("high", 450, 260)):
+            with self.subTest(base=name):
+                green = make_green(self.base / f"pidleak-{name}-base", horizon=120)
+                rows = []
+                for n in range(190):
+                    if n < 20:
+                        pidfd = pidfd_base
+                    else:
+                        pidfd = pidfd_base + (n - 20) * 80 // 170
+                    rows.append((n * 1000, 52_000 + (n % 5), 54_000,
+                                 fds_base, pidfd, 4))
+
+                def leak(target):
+                    (target / "resources.tsv").write_text(
+                        _resources6(rows), encoding="utf-8")
+                    rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                        {"t_go_sampler_ms": 20000}))
+                verdict = self.evaluate(mutate_copy(green, f"leg-pidleak-{name}", leak))
+                self.assert_red_only(verdict, "resource_accounting")
+                self.assertIn("pidfds",
+                              verdict["gates"]["resource_accounting"]["detail"])
+
+    def test_red_resources_post_arming_bpf_leak(self):
+        """A +16 BPF-FD leak fails on a low and a high base.
+
+        Total FDs stay flat and consistent, so only the BPF gate can
+        fail; the detail must name it.
+        """
+        for name, fds_base, bpf_base in (("low", 100, 4), ("high", 450, 127)):
+            with self.subTest(base=name):
+                green = make_green(self.base / f"bpfleak-{name}-base", horizon=120)
+                rows = []
+                for n in range(190):
+                    if n < 20:
+                        bpf = bpf_base
+                    else:
+                        bpf = bpf_base + (n - 20) * 16 // 170
+                    rows.append((n * 1000, 52_000 + (n % 5), 54_000,
+                                 fds_base, 260 if name == "high" else 10, bpf))
+
+                def leak(target):
+                    (target / "resources.tsv").write_text(
+                        _resources6(rows), encoding="utf-8")
+                    rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                        {"t_go_sampler_ms": 20000}))
+                verdict = self.evaluate(mutate_copy(green, f"leg-bpfleak-{name}", leak))
+                self.assert_red_only(verdict, "resource_accounting")
+                self.assertIn("BPF", verdict["gates"]["resource_accounting"]["detail"])
+
+    def test_green_resources_post_arming_flat_low_and_high_base(self):
+        """A flat trace passes on a low and a high base (guard twin).
+
+        Mirrors the leak twins' bases on every resource: the absolute
+        margins must fail the leaks above without failing flat lines.
+        """
+        legs = (("low", 52_000, 40, 10, 4),
+                ("high", 150_000, 400, 260, 127))
+        for name, rss_base, fds_base, pidfd_base, bpf_base in legs:
+            with self.subTest(base=name):
+                green = make_green(self.base / f"flat-{name}-base", horizon=120)
+                rows = [(n * 1000, rss_base + (n % 5), rss_base + 2000,
+                         fds_base, pidfd_base, bpf_base) for n in range(190)]
+
+                def flat(target):
+                    (target / "resources.tsv").write_text(
+                        _resources6(rows), encoding="utf-8")
+                    rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                        {"t_go_sampler_ms": 20000}))
+                verdict = self.evaluate(mutate_copy(green, f"leg-flat-{name}", flat))
+                self.assertEqual(verdict["verdict"], "PASS",
+                                 json.dumps(verdict["gates"]))
+
+    def test_red_resources_late_go_hides_growth_fails(self):
+        """A GO stamped 8 samples before the end cannot bless a ramp.
+
+        The post-arming window must cover at least half the required
+        window; with less evidence than that the growth verdict fails
+        instead of judging only a flat tail.
+        """
+        base = make_green(self.base / "latego-hide-base", horizon=120)
+        rows = []
+        for n in range(190):
+            if n < 30:
+                rss = 41_000 + n * 6900
+                fds = 30 + n * 12
+            else:
+                rss = 248_000 + (n % 5)
+                fds = 410 + (n % 7) * 2
+            rows.append((n * 1000, rss, rss + 5000, fds))
+
+        def late_go(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 182000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-latego-hide", late_go))
+        self.assert_red_only(verdict, "resource_accounting")
+        self.assertIn("arming too late",
+                      verdict["gates"]["resource_accounting"]["detail"])
+
+    def test_red_resources_go_provenance_mismatch_fails(self):
+        """A GO stamp must come from the vehicle's arming event.
+
+        The vehicle stamps t_go_mono_ns and start_mono_ns from the same
+        arming instant; a sampler-domain GO without that counterpart is
+        not the vehicle's arming point, even at an otherwise valid time.
+        """
+        base = make_green(self.base / "goprovenance-base", horizon=120)
+        rows = []
+        for n in range(190):
+            if n < 30:
+                rss = 41_000 + n * 6900
+                fds = 30 + n * 12
+            else:
+                rss = 248_000 + (n % 5)
+                fds = 410 + (n % 7) * 2
+            rows.append((n * 1000, rss, rss + 5000, fds))
+
+        def forged_go(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+
+            def forge(run):
+                run["timing"].update({"t_go_sampler_ms": 30000})
+                run["timing"]["t_go_mono_ns"] += 1
+            rewrite_json(target / "run.json", forge)
+        verdict = self.evaluate(mutate_copy(base, "leg-goprovenance", forged_go))
+        self.assert_red_only(verdict, "resource_accounting")
+        self.assertIn("arming event",
+                      verdict["gates"]["resource_accounting"]["detail"])
+
+    def test_red_resources_pre_go_fd_leak_fails(self):
+        """Growth before GO is judged against a pre-GO bound.
+
+        A +2175 FD rise during arming fails even though the post-arming
+        floor is flat: the arming window allows one full admission, not
+        unbounded growth.
+        """
+        base = make_green(self.base / "prego-fd-base", horizon=120)
+        rows = []
+        for n in range(190):
+            fds = 30 + n * 75 if n < 30 else 410
+            rows.append((n * 1000, 52_000 + (n % 5), 54_000, fds))
+
+        def leak(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 30000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-prego-fd", leak))
+        self.assert_red_only(verdict, "resource_accounting")
+        self.assertIn("pre-arming",
+                      verdict["gates"]["resource_accounting"]["detail"])
+
+    def test_red_resources_pre_go_rss_over_bound_fails(self):
+        """Pre-GO samples stay under the absolute RSS bound.
+
+        The arming ramp is expected, but a pre-GO peak over 256 MiB fails
+        even when the post-arming trace is clean: the absolute bound
+        covers the whole trace including arming.
+        """
+        base = make_green(self.base / "prego-rss-base", horizon=120)
+        rows = []
+        for n in range(190):
+            rss = 41_000 + n * 7900 if n < 30 else 200_000 + (n % 5)
+            rows.append((n * 1000, rss, rss + 5000, 410))
+
+        def fat(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 30000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-prego-rss", fat))
+        self.assert_red_only(verdict, "resource_accounting")
+        self.assertIn("256 MiB", verdict["gates"]["resource_accounting"]["detail"])
+
+    def test_green_resources_late_go_fallback_names_short_post_window(self):
+        """A GO with fewer than eight post samples falls back, and says so."""
+        base = make_green(self.base / "f5-base", horizon=120)
+        rows = [(n * 1000, 52_000 + (n % 5), 54_000, 410) for n in range(190)]
+
+        def late_go(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 185000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-f5", late_go))
+        self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+        self.assertIn("only 5 post-arming samples <8",
+                      verdict["gates"]["resource_accounting"]["detail"])
 
     def test_red_journal_populated_claim(self):
         def populate(target):

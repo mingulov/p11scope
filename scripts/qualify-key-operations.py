@@ -18,8 +18,11 @@ refuses any unattributed, cancelled, unknown, active, lost, gapped or
 otherwise unsettled sign/verify outcome. The one exception follows the
 ledger: when the application itself could not establish a key's modulus
 size, that category's outcomes must sit under `metadata_unknown` with the
-ledger's exact counts (and generation under `not_applicable`), never under
-a size label. It never trusts the product's own
+ledger's exact counts (and generation under `not_applicable`), unless the
+private key inherits the size of its pair's public key from the same
+successful `C_GenerateKeyPair` return — proven by the two same-birth
+generate_pair objects — in which case the labeled `rsa_2048` row is
+required and the unknown bucket is refused. It never trusts the product's own
 accounting (`done`, `budgets.occupied`, `encoded_bytes`): occupancy is
 cross-checked against the rows the oracle counted, never used as a tally.
 Secondary `wrapped_object` rows and `message_contexts` units never count
@@ -580,9 +583,13 @@ def _dispatch(doc):
 # can honestly establish (labels come from established facts of the same
 # object only). PKCS #11 defines CKA_MODULUS_BITS for RSA public keys, not
 # private keys, so a provider may refuse it for the signing key
-# (CKR_ATTRIBUTE_TYPE_INVALID). Then the observer cannot label that key
-# either: its operations land in the unknown bucket as metadata_unknown,
-# exactly as many as the ledger counts, never under a fabricated label.
+# (CKR_ATTRIBUTE_TYPE_INVALID). The observer then labels that key only by
+# pair inheritance: the private key of the cell's one successful
+# C_GenerateKeyPair carries the pair-mate public key's established size,
+# proven by the two same-birth generate_pair objects below. An unpaired
+# key, or a pair the ledger cannot prove, still lands in the unknown
+# bucket as metadata_unknown with the ledger's exact counts, never under
+# a fabricated label.
 METADATA_UNKNOWN = "metadata_unknown"
 CELL_KEY_FOR = {"sign": "private", "verify": "public"}
 CELL_KEY_CLASS = {"private": 3, "public": 2}
@@ -596,13 +603,35 @@ def _zero_unknown():
     return {"completed": 0, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0}
 
 
+def _pair_inherited(application):
+    """Whether the ledger proves the private key's pair mate and its size.
+
+    The fixed cell generates exactly one RSA pair successfully (the
+    validator pins the single setup C_GenerateKeyPair at rv 0) and
+    always establishes the public modulus: the private key then
+    inherits that size from the same successful return. No new read.
+    """
+    return (application["calls_by_function"].get("C_GenerateKeyPair", 0) == 1
+            and application["established"]["public"]["modulus_bits"]
+            == {"status": "value", "value": 2048})
+
+
 def _unlabeled_categories(application):
-    """Cell categories whose key's modulus size the application could not establish."""
+    """Cell categories whose key's size stays unknown.
+
+    A category is unlabeled only when the application could not
+    establish its key's modulus size and no pair inheritance applies:
+    the private key of the cell's one successful pair inherits the
+    public mate's established 2048.
+    """
     unlabeled = []
     for category in CELL_CATEGORIES:
         cell = application["established"][CELL_KEY_FOR[category]]["modulus_bits"]
-        if cell != {"status": "value", "value": 2048}:
-            unlabeled.append(category)
+        if cell == {"status": "value", "value": 2048}:
+            continue
+        if category == "sign" and _pair_inherited(application):
+            continue
+        unlabeled.append(category)
     return unlabeled
 
 
@@ -642,6 +671,46 @@ def _check_unlabeled_key(section, category, application):
              f"observed {category} key object has a size the application could not establish")
     _require(row["successful_key_references"] == started,
              f"observed {category} key references {row['successful_key_references']}"
+             f" != expected {started}")
+
+
+def _check_inherited_key(section, application):
+    """The labeled private key proves its pair: exactly one valid RSA
+    private object carries the inherited rsa_2048 label while its own
+    modulus stays unknown (query refused or unsupported), exactly one
+    valid RSA public mate carries the established 2048, both were
+    created by generate_pair with the same birth (one successful
+    return), and its key references equal the ledger's started signs.
+    """
+    private = [row for row in section["objects"]
+               if row["established"]["class"] == {"status": "value", "value": 3}
+               and row["established"]["key_type"] == {"status": "value", "value": 0}]
+    _require(len(private) == 1, "observed sign key object is not unique")
+    row = private[0]
+    _require(row["attribution"] == "valid", "observed sign key object is downgraded")
+    _require(row["label"] == "rsa_2048"
+             and row["established"]["modulus_bits"]["status"] == "unknown"
+             and row["queries"]["modulus_bits"] in ("unavailable", "unsupported"),
+             "observed sign key object does not prove pair inheritance")
+    _require(row["creation"] == "generate_pair" and row["birth"] is not None,
+             "observed sign key object is not a generated pair mate")
+    mates = [mate for mate in section["objects"]
+             if mate["established"]["class"] == {"status": "value", "value": 2}
+             and mate["established"]["key_type"] == {"status": "value", "value": 0}
+             and mate["established"]["modulus_bits"] == {"status": "value",
+                                                         "value": 2048}]
+    _require(len(mates) == 1, "observed sign key object has no unique public mate")
+    mate = mates[0]
+    _require(mate["attribution"] == "valid",
+             "observed sign key object has no valid public mate")
+    _require(mate["label"] == "rsa_2048"
+             and mate["creation"] == "generate_pair"
+             and mate["birth"] == row["birth"],
+             "observed sign key object has no same-return public mate")
+    outcomes = application["operations"]["sign"]
+    started = outcomes["completed"] + outcomes["failed"]
+    _require(row["successful_key_references"] == started,
+             f"observed sign key references {row['successful_key_references']}"
              f" != expected {started}")
 
 
@@ -727,6 +796,9 @@ def compare(application_rows, observer_doc):
                  f"{expected['completed']}/{expected['failed']}")
         observed[category] = {"started": counters["started"], "completed": counters["completed"],
                               "failed": counters["failed"]}
+    private_cell = application["established"]["private"]["modulus_bits"]
+    if "sign" not in unlabeled and private_cell != {"status": "value", "value": 2048}:
+        _check_inherited_key(section, application)
     if mechanism_operations is None:
         observed["mechanism"] = None
     else:

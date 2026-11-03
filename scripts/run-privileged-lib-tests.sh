@@ -295,9 +295,15 @@ discovery::engine::tests::stamped_legacy_fixture_reports_no_surface_gap
 # request map admits the same head with zero loss, proving the twin's
 # refusal pins the full blocked map rather than the head. Expected
 # green on the fixed lane-A runtime (the pre-twin shape converges to
-# admitted-head under any working fix); the known-failing twin/episode
-# stay skipped below until the privileged campaign re-runs them.
+# admitted-head under any working fix).
 discovery::engine::pressure_native_tests::pressure_live256_unparked_head_control_admits
+# T8 live256 episodes, re-run green by hand at the fixed tip (waiter-
+# driven eviction converges the settle): the genuine 257-EXEC episode
+# admits its late head, and the all-blocked twin refuses exactly once.
+# Both refuse the cell on any ambient EXEC in the burst batch, so they
+# need a quiet window like the other live cells above.
+discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
+discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
 # T8 FIRST live control: quiet window arms nothing, then a 3-child owned
 # probe spends exactly tickets 1..=3 with zero loss (short; needs root,
 # host vmlinux BTF, gcc-built fixtures, and a quiet window — any ambient
@@ -679,32 +685,24 @@ discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_s
 # log strings that prove it, and owners name the source file that owns
 # the pin; all three stay index-aligned with the tests.
 EXPECTED_FAILURE_TESTS=(
-discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
-discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
 discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
 discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation
 inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
 inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
 )
 XFAIL_REASONS=(
-"expected failure: lane-A runtime does not converge, the rotation stalls (Known limit 2026-10-19, see src/discovery/pressure_native_tests.rs); an unexpected pass promotes the cell to the runnable campaign"
-"expected failure: lane-A view-capacity stall (Known limit 2026-10-19, see src/discovery/pressure_native_tests.rs): owned requests strand and the settle never converges; an unexpected pass promotes the cell to the runnable campaign"
 "expected failure: RED by design while the post-copy-up D-C7-3 re-edge stands (investigation target); an unexpected pass gets noticed for promotion"
 "expected failure: R57 future positive, RED until a provider-free settlement receipt lands (unprivileged, no BPF or root); an unexpected pass un-ignores the cell"
 "expected failure: D3d forced-kernel positive gate fails at exactly-one-module for gate-k1.so on loop and physical btrfs alike (stale-vs-product verdict belongs to src/inventory/privileged_tests.rs); an unexpected pass promotes the cell to the btrfs group"
 "expected failure: D3d forced-kernel positive gate fails at exactly-one-module for gate-k2.so on loop and physical btrfs alike (stale-vs-product verdict belongs to src/inventory/privileged_tests.rs); an unexpected pass promotes the cell to the btrfs group"
 )
 XFAIL_SIGNATURES=(
-"t8-live256: unsettled after"
-"t8-twin: unsettled after"
 "D-C7-3 stands: upper mapper re-edged to the stale anchor"
 "R57: balanced benign exit-time work needs a strong settlement receipt"
 "exactly one module for gate-k1.so"
 "exactly one module for gate-k2.so"
 )
 XFAIL_OWNERS=(
-"src/discovery/pressure_native_tests.rs"
-"src/discovery/pressure_native_tests.rs"
 "src/discovery/d4_overlay_cells.rs"
 "src/discovery/engine_tests.rs"
 "src/inventory/privileged_tests.rs"

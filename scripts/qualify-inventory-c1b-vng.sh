@@ -8,6 +8,8 @@
 # /var/tmp, so the binary and OUTDIR must live under /home; the cells run on
 # a guest-local root-owned tmpfs base. Take the privileged lock around this.
 # MODULE, when set, is forwarded to the guest (a provider path under /home or /usr).
+# Exit codes: the guest's cells exit (0 every cell held, 1 failed);
+# 1 when vng itself fails or the results are missing.
 set -u
 K=$1; BIN=$(realpath -e "$2"); OUT=$3; CELLS=${4:-"overlay cap"}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -26,4 +28,13 @@ echo "cells_exit=\$?" >> $OUT/cells.log
 INNER
 s=$(date +%s)
 vng --run "$K" --user root --cpus 4 --memory 6G --rwdir "$OUT" --exec "sh $OUT/inner.sh" > "$OUT/vng-console.log" 2>&1
-echo "vng_exit=$? wall=$(( $(date +%s)-s ))s kernel=$(cat "$OUT/uname.txt" 2>/dev/null) $(grep -E 'VERDICT|cells_exit' "$OUT/cells.log" 2>/dev/null | tr '\n' ' ')"
+vng_exit=$?
+echo "vng_exit=$vng_exit wall=$(( $(date +%s)-s ))s kernel=$(cat "$OUT/uname.txt" 2>/dev/null) $(grep -E 'VERDICT|cells_exit' "$OUT/cells.log" 2>/dev/null | tr '\n' ' ')"
+[ "$vng_exit" -eq 0 ] || exit 1
+[ -s "$OUT/cells.log" ] || { echo "qualify-inventory-c1b-vng: missing cells.log" >&2; exit 1; }
+cells_exit=$(sed -n 's/^cells_exit=//p' "$OUT/cells.log" | tail -n 1)
+case "$cells_exit" in
+    0) exit 0;;
+    1) exit 1;;
+    *) echo "qualify-inventory-c1b-vng: missing cells_exit in cells.log" >&2; exit 1;;
+esac

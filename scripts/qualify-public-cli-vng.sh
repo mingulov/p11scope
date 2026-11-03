@@ -5,6 +5,9 @@
 # The guest shares the host rootfs read-only and hides /tmp and /var/tmp, so the binary and
 # OUTDIR must live under /home. Take the VM lane lock around this script.
 # MODULE, when set, is forwarded to the guest (a provider path under /home or /usr).
+# Exit codes: the guest's qualify exit (0 qualifies, 1 fails, 2 is the
+# documented nonqualifying smoke); 1 when vng itself fails or the results
+# are missing.
 set -u
 K=$1; BIN=$(realpath -e "$2"); OUT=$3
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,4 +27,12 @@ cp -r /tmp/qual/cells $OUT/cells
 INNER
 s=$(date +%s)
 vng --run "$K" --user root --cpus 4 --memory 4G --rwdir "$OUT" --exec "sh $OUT/inner.sh" > "$OUT/vng-console.log" 2>&1
-echo "vng_exit=$? wall=$(( $(date +%s)-s ))s kernel=$(cat "$OUT/uname.txt" 2>/dev/null) $(cat "$OUT/cells/summary.txt" 2>/dev/null)"
+vng_exit=$?
+echo "vng_exit=$vng_exit wall=$(( $(date +%s)-s ))s kernel=$(cat "$OUT/uname.txt" 2>/dev/null) $(cat "$OUT/cells/summary.txt" 2>/dev/null)"
+[ "$vng_exit" -eq 0 ] || exit 1
+[ -s "$OUT/cells/summary.txt" ] || { echo "qualify-public-cli-vng: missing cells/summary.txt" >&2; exit 1; }
+qual_exit=$(sed -n 's/^qual_exit=//p' "$OUT/qual.log" 2>/dev/null | tail -n 1)
+case "$qual_exit" in
+    0|1|2) exit "$qual_exit";;
+    *) echo "qualify-public-cli-vng: missing qual_exit in qual.log" >&2; exit 1;;
+esac

@@ -4618,12 +4618,29 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         status.success() && manifest_path.is_file(),
         "{WHAT}: discover helper exited {status}"
     );
+    let fixtures = LiveFixtures {
+        provider,
+        manifest: manifest_path,
+        mapper,
+        plain,
+        threaded,
+        holder,
+    };
 
     struct LiveExits {
         gaps: u64,
         split: Option<(u64, u64)>,
         records: Vec<DiscoveryRecord>,
         pids: [u32; 3],
+    }
+
+    struct LiveFixtures {
+        provider: std::path::PathBuf,
+        manifest: std::path::PathBuf,
+        mapper: std::path::PathBuf,
+        plain: std::path::PathBuf,
+        threaded: std::path::PathBuf,
+        holder: std::path::PathBuf,
     }
 
     fn spawn_holder(
@@ -4654,20 +4671,15 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
     fn run_capture(
         what: &str,
         tag: &str,
-        provider: &std::path::Path,
-        manifest: &std::path::Path,
-        mapper: &std::path::Path,
-        plain: &std::path::Path,
-        threaded: &std::path::Path,
-        holder: &std::path::Path,
+        fixtures: &LiveFixtures,
         armed: bool,
     ) -> (LiveExits, Vec<crate::discovery::scan::Skipped>) {
         let cgroup = OwnedCgroup::create(tag, what);
         let args = crate::cli::CaptureArgs {
             track_short_lived: armed,
             kind: crate::cli::Kind::Profile,
-            modules: vec![provider.to_path_buf()],
-            manifests: vec![manifest.to_path_buf()],
+            modules: vec![fixtures.provider.clone()],
+            manifests: vec![fixtures.manifest.clone()],
             prearm_modules: vec![],
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             scope: crate::cli::ScopeArg::Cgroup(cgroup.path.clone()),
@@ -4714,13 +4726,13 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             cgroup.members(what).contains(&this),
             "{what}: the test must spawn from inside the cgroup"
         );
-        let mut holder_child = spawn_holder(what, holder, provider);
+        let mut holder_child = spawn_holder(what, &fixtures.holder, &fixtures.provider);
         move_out.move_out(what);
         // Settle: tick the production cadence until a slot carries
         // a watch for exactly the fixture file. Only then can a
         // short-lived mapping name a slot.
         use std::os::unix::fs::MetadataExt as _;
-        let fixture_meta = std::fs::metadata(provider).expect("stat fixture");
+        let fixture_meta = std::fs::metadata(&fixtures.provider).expect("stat fixture");
         let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             engine
@@ -4754,21 +4766,21 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         // all three stay deterministically unmatched.
         cgroup.move_in(this, what);
         let mut move_out = MoveOutGuard::arm(this);
-        let mapper_child = std::process::Command::new(mapper)
-            .arg(provider)
+        let mapper_child = std::process::Command::new(&fixtures.mapper)
+            .arg(&fixtures.provider)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn mapper");
         let mapper_pid = mapper_child.id();
-        let plain_child = std::process::Command::new(plain)
+        let plain_child = std::process::Command::new(&fixtures.plain)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn plain child");
         let plain_pid = plain_child.id();
-        let threaded_child = std::process::Command::new(threaded)
-            .arg(provider)
+        let threaded_child = std::process::Command::new(&fixtures.threaded)
+            .arg(&fixtures.provider)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -4855,17 +4867,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             .unwrap_or_else(|| panic!("{WHAT}: no exit record for owned pid {pid}"))
     };
 
-    let (armed_run, armed_skips) = run_capture(
-        WHAT,
-        "exitmap-armed",
-        &provider,
-        &manifest_path,
-        &mapper,
-        &plain,
-        &threaded,
-        &holder,
-        true,
-    );
+    let (armed_run, armed_skips) = run_capture(WHAT, "exitmap-armed", &fixtures, true);
     let mapper_exit = exit_for(&armed_run, armed_run.pids[0]);
     assert_eq!(
         mapper_exit.kind, DISCOVERY_KIND_LEADER_EXIT_MAPPINGS,
@@ -4911,17 +4913,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         "{WHAT}: kind 7 must never be live loss: {armed_skips:?}"
     );
 
-    let (twin_run, _) = run_capture(
-        WHAT,
-        "exitmap-twin",
-        &provider,
-        &manifest_path,
-        &mapper,
-        &plain,
-        &threaded,
-        &holder,
-        false,
-    );
+    let (twin_run, _) = run_capture(WHAT, "exitmap-twin", &fixtures, false);
     for pid in twin_run.pids {
         let exit = exit_for(&twin_run, pid);
         assert_eq!(

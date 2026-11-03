@@ -3027,12 +3027,17 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
         .collect();
     let _ = writeln!(out, "processes: {}", parts.join(", "));
     let mut unlisted = 0usize;
-    let with_gaps: BTreeSet<u32> = catalog.skipped.iter().filter_map(|gap| gap.pid).collect();
+    let with_gaps: BTreeSet<u32> = catalog
+        .skipped
+        .iter()
+        .chain(catalog.notes.iter())
+        .filter_map(|gap| gap.pid)
+        .collect();
     for process in &catalog.processes {
         // Kernel threads and other processes that map no provider object
         // are counted above; listing each would bury the few that matter.
-        // A process with an object, a reason or its own skipped record is
-        // always listed.
+        // A process with an object, a reason or its own gap record
+        // (skipped or note) is always listed.
         if process.objects.is_empty()
             && process.status.reason().is_none()
             && !with_gaps.contains(&process.pid)
@@ -7149,7 +7154,8 @@ mod tests {
 
     /// Kernel threads and other processes that map no provider are counted
     /// on the summary line; the text lists only processes that map an
-    /// object or carry a reason. JSON still lists every process.
+    /// object, carry a reason, or carry their own gap record (skipped or
+    /// note). JSON still lists every process.
     #[test]
     fn text_lists_only_processes_with_objects_or_reasons() {
         let mut catalog = catalog_with(vec![object(
@@ -7177,8 +7183,16 @@ mod tests {
                 reason: "opening object within retained target root: No such process".into(),
             },
         ));
+        catalog.notes.push(PidGap::member(
+            800,
+            Skipped {
+                subject: "/opt/lib.so".into(),
+                reason: "deleted mapping".into(),
+            },
+        ));
         catalog.processes.extend([
             plain(700, MemberStatus::Scanned),
+            plain(800, MemberStatus::Scanned),
             plain(300, MemberStatus::NotSelected { loss: None }),
             plain(400, MemberStatus::Exited),
             plain(
@@ -7213,6 +7227,10 @@ mod tests {
             text.contains("(PID 700) — scanned"),
             "a process with its own skipped record stays listed: {text}"
         );
+        assert!(
+            text.contains("(PID 800) — scanned"),
+            "a process with only a per-pid note stays listed: {text}"
+        );
         assert!(text.contains("maps changed"), "{text}");
         assert!(
             text.contains(
@@ -7223,7 +7241,7 @@ mod tests {
         let document = render_json(&catalog);
         assert_eq!(
             document["processes"].as_array().map(Vec::len),
-            Some(7),
+            Some(8),
             "{document}"
         );
     }

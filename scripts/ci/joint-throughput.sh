@@ -69,7 +69,12 @@
 # failure that matches the known product gap (the Session-loop seal
 # wire is pending in WU-2, so production captures stay
 # journal_unavailable) is an expected-failure with that reason in
-# detail; any other gate-4 reason stays failed. Exit 0 when every
+# detail; any other gate-4 reason stays failed. A joint cell whose
+# report shows no Joint feed at all (object_observations missing or
+# journal_unavailable) was an S1-only run: it is nonqualifying with
+# "s1-only" in detail, whichever gate the oracle failed first; a
+# Joint feed that ran and lost its output (authority_lost) stays
+# judged. Exit 0 when every
 # cell either passed or is nonqualifying/expected-failure, 1 when
 # any cell failed, 2 for caller/infra errors, 77 when the
 # environment cannot satisfy the cell contract (rows are written
@@ -502,6 +507,31 @@ run_oracle() {
     return 0
 }
 
+# Whether a joint cell's capture ran a Joint feed at all, from its
+# report: "absent" when object_observations is missing or reads
+# journal_unavailable (the run was S1-only), "present" for any other
+# reason (populated, authority_lost, ...), "unknown" when the report
+# is missing or unreadable (the flow arms judge that).
+joint_feed_state() {
+    python3 -I -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        doc = json.load(handle)
+except (OSError, ValueError):
+    print("unknown")
+    sys.exit(0)
+if type(doc) is not dict:
+    print("unknown")
+    sys.exit(0)
+observed = doc.get("object_observations")
+if type(observed) is not dict or observed.get("reason") == "journal_unavailable":
+    print("absent")
+else:
+    print("present")
+' "$1"
+}
+
 finish_cell() {
     cell=$1
     dir=$2
@@ -513,6 +543,19 @@ finish_cell() {
     qualification=${rest%%|*}
     marker=${rest#*|}
     detail="host=$(hostname) kernel=$(uname -r) rate=$RATE dur=$DURATION min_rate=$MIN_RATE load1=$LOAD_TRACE nproc=$cpus provider=$PROVIDER $detail_extra oracle_rc=$ORACLE_RC reason=$ORACLE_REASON dir=$dir"
+    # A joint cell whose capture never ran a Joint feed is an S1-only
+    # run: it says nothing about the Joint path, so it is never
+    # judged (nonqualifying), whatever the oracle found first.
+    case "$cell" in
+        joint-*)
+            if [ "$(joint_feed_state "$dir/report.json")" = "absent" ]; then
+                passed=false
+                qualification=nonqualifying
+                marker=
+                detail="$detail s1-only: no Joint feed (object_observations journal_unavailable)"
+            fi
+            ;;
+    esac
     if [ -n "$marker" ]; then
         detail="$detail expected-failure: $marker"
     fi

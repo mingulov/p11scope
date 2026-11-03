@@ -443,6 +443,48 @@ static void bank_select_validation(void)
     puts("ASSERT cut_flips_once_ready");
 }
 
+/* W2 publication twin: gate-1 issuance without the published select
+ * word refuses BAD_CONFIG and spends nothing; publishing the exact
+ * pinned image (bank 0, prepared {1,0}, zeros) issues ticket 1. */
+static void select_publication_issues(void)
+{
+    u64 ticket = 99;
+    u64 calls;
+    assert(&p11_image_bank_select && "publication twin needs select");
+    reset();
+    /* Unpublished: the loader has not written the select word yet, so
+     * every field is zero. */
+    memset(&select_stub, 0, sizeof(select_stub));
+    assert(p11_image_bank_select() == IMAGE_BANK_NO_SLOT);
+    calls = storage_calls;
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_BAD_CONFIG);
+    assert(ticket == 0);
+    assert(storage_calls == calls);
+    assert(ctl.next_ticket == 0);
+    puts("ASSERT unpublished_select_word_refuses_bad_config");
+    /* Publish the exact pinned image the loader writes before links:
+     * bank A current and prepared, every count and incarnation zero. */
+    select_stub = (struct image_bank_select){
+        .bank = 0,
+        .prepared = { 1, 0 },
+    };
+    assert(select_stub.bank == 0);
+    assert(select_stub.prepared[0] == 1 && select_stub.prepared[1] == 0);
+    assert(select_stub.cuts == 0 && select_stub.refusals == 0);
+    assert(select_stub.incarnation[0] == 0 && select_stub.incarnation[1] == 0);
+    assert(select_stub.folded[0] == 0 && select_stub.folded[1] == 0);
+    assert(select_stub.folds == 0 && select_stub.folded_issued == 0);
+    assert(select_stub.update_losses == 0);
+    puts("ASSERT pinned_select_image_exact");
+    assert(p11_image_bank_select() == 0);
+    ticket = 99;
+    assert(p11_link_task_ticket(&leaders[0], &ticket) == COOKIE_STATUS_OK);
+    assert(ticket == 1);
+    assert(ctl.next_ticket == 1);
+    puts("ASSERT published_select_word_issues_ticket");
+}
+
 /* A-bank task holds its identity while B reissues the local ticket:
  * identities stay distinct, re-queries stay stable, the local ticket
  * and the watermark keep their contracts. */
@@ -1300,6 +1342,8 @@ int main(int argc, char **argv)
         bank_query_routes();
     } else if (!strcmp(argv[1], "bank-select-validation")) {
         bank_select_validation();
+    } else if (!strcmp(argv[1], "select-publication-issues")) {
+        select_publication_issues();
     } else if (!strcmp(argv[1], "identity-distinct")) {
         identity_distinct();
     } else if (!strcmp(argv[1], "bank-fold-lifecycle")) {

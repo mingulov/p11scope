@@ -582,6 +582,47 @@ const NATIVE_OWNER_SUSPENDED_EXEC_REASON: &str = "the caller's image changed; na
 /// owner releases in the same pass.
 const NATIVE_OWNER_SUSPENDED_LOST_REASON: &str = "the caller failed its final permit proof after admission; native authority was cancelled and its native owner was released; scan-pinned fallback retained";
 
+/// Collapse per-view `--module` hint-miss notes into per-pass scope misses.
+///
+/// Every deep-scanned view reports each hint it does not map, so hints by
+/// views notes reach the registry: at system scale (121 hints, ~475 views)
+/// that drowns the gap store (~49k suppressed gaps) and hides real loss. A
+/// hint the scan matched in any inventoried view — or that maps identity
+/// attributed to a catalog object — is mapped: its miss notes are noise and
+/// drop. A hint missed everywhere is owed one pid-less scope answer. Match
+/// state comes from this pass's own notes and statuses, never from
+/// re-statting hints (fd and maps device domains must not be compared).
+fn collapse_hint_misses(
+    inventoried: &BTreeSet<u32>,
+    object_paths: &BTreeSet<&str>,
+    notes: &[crate::inspect_system::PidGap],
+) -> Vec<crate::inspect_system::PidGap> {
+    let mut missed: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
+    let mut kept: Vec<crate::inspect_system::PidGap> = Vec::with_capacity(notes.len());
+    for note in notes {
+        if note.reason == crate::discovery::scan::HINT_NOT_MAPPED_REASON
+            && let Some(pid) = note.pid
+        {
+            missed.entry(note.subject.as_str()).or_default().insert(pid);
+        } else {
+            kept.push(note.clone());
+        }
+    }
+    for (subject, pids) in missed {
+        let matched = object_paths.contains(subject)
+            || inventoried.iter().any(|pid| !pids.contains(pid));
+        if !matched {
+            kept.push(crate::inspect_system::PidGap {
+                pid: None,
+                subject: subject.into(),
+                reason: crate::discovery::scan::HINT_NOT_MAPPED_REASON.into(),
+                generic: false,
+            });
+        }
+    }
+    kept
+}
+
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
     // Retain the default constructor for existing internal harness callers;
     // the public runtime always supplies its already-resolved budget.
@@ -4543,7 +4584,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 budget: None,
             });
         }
-        for gap in catalog.skipped.iter().chain(catalog.notes.iter()) {
+        let inventoried: BTreeSet<u32> = catalog
+            .processes
+            .iter()
+            .filter(|process| process.status.inventoried())
+            .map(|process| process.pid)
+            .collect();
+        let object_paths: BTreeSet<&str> = catalog
+            .objects
+            .iter()
+            .map(|object| object.path.as_str())
+            .collect();
+        let notes = collapse_hint_misses(&inventoried, &object_paths, &catalog.notes);
+        for gap in catalog.skipped.iter().chain(notes.iter()) {
             self.registry.record_gap(RegistryGap {
                 caller: gap.pid.and_then(|pid| self.adapter.live_id(pid)),
                 module: None,
@@ -9039,6 +9092,68 @@ pub(crate) mod tests {
 
     fn fixture_image(pid: u32) -> Option<BoundImage> {
         BoundImage::scripted(fixture_domain(), u64::from(pid) + 1, 7)
+    }
+
+    fn hint_miss_note(pid: u32, subject: &str) -> crate::inspect_system::PidGap {
+        crate::inspect_system::PidGap {
+            pid: Some(pid),
+            subject: subject.into(),
+            reason: crate::discovery::scan::HINT_NOT_MAPPED_REASON.into(),
+            generic: false,
+        }
+    }
+
+    #[test]
+    fn hint_misses_for_matched_hints_collapse_to_no_gap() {
+        // Three deep-scanned views, 121 operator hints; the workload view
+        // maps every hint (no miss notes), the other two map none: 242
+        // per-view miss notes must collapse to nothing, or the gap store
+        // drowns (~49k suppressed gaps at system scale) and hides real loss.
+        let inventoried: BTreeSet<u32> = [1, 2, 7].into_iter().collect();
+        let object_paths: BTreeSet<&str> = BTreeSet::new();
+        let mut notes = Vec::new();
+        for view in [1u32, 2] {
+            for hint in 0..121 {
+                notes.push(hint_miss_note(view, &format!("/providers/provider-{hint:03}.so")));
+            }
+        }
+        notes.push(crate::inspect_system::PidGap {
+            pid: Some(7),
+            subject: "/providers/provider-000.so".into(),
+            reason: "matched a --module hint; no function table was found".into(),
+            generic: false,
+        });
+        let collapsed = collapse_hint_misses(&inventoried, &object_paths, &notes);
+        assert_eq!(collapsed.len(), 1, "only the non-hint note survives");
+        assert_eq!(collapsed[0].pid, Some(7));
+    }
+
+    #[test]
+    fn hint_matched_nowhere_collapses_to_one_scope_gap() {
+        // A hint missed in every inventoried view is owed one scope-level
+        // answer, not one gap per view.
+        let inventoried: BTreeSet<u32> = [1, 2].into_iter().collect();
+        let object_paths: BTreeSet<&str> = BTreeSet::new();
+        let notes = vec![hint_miss_note(1, "/opt/typo.so"), hint_miss_note(2, "/opt/typo.so")];
+        let collapsed = collapse_hint_misses(&inventoried, &object_paths, &notes);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].pid, None);
+        assert_eq!(collapsed[0].subject, "/opt/typo.so");
+        assert_eq!(
+            collapsed[0].reason,
+            crate::discovery::scan::HINT_NOT_MAPPED_REASON
+        );
+    }
+
+    #[test]
+    fn hint_matched_by_maps_identity_collapses_to_no_gap() {
+        // A hint no deep scan matched but maps identity attributed (a
+        // catalog object carries its path) is mapped: drop the miss notes.
+        let inventoried: BTreeSet<u32> = [1].into_iter().collect();
+        let object_paths: BTreeSet<&str> = ["/opt/pinned.so"].into_iter().collect();
+        let notes = vec![hint_miss_note(1, "/opt/pinned.so")];
+        let collapsed = collapse_hint_misses(&inventoried, &object_paths, &notes);
+        assert!(collapsed.is_empty(), "maps-matched hint is mapped");
     }
 
     impl ImageGuard for FixtureImages {

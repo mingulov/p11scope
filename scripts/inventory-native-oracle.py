@@ -93,6 +93,10 @@ MAPPING_LIVE = "mapped"
 MAPPING_ENDED = "ended"
 # A counted feed that lost records must say so in gaps[] (plan §3.5 note_capture_loss).
 LOSS_GAP = re.compile(r"\bloss\b|\blost\b|lossy", re.I)
+# The native lane binds counts but never claims the exact-image contract
+# (docs/schema/inventory-v1.md), so positives carry scan_pinned callers and
+# the report discloses the missing BPF image identity with this standing gap.
+AUTHORITY_DISCLOSURE_SUBJECT = "exact image authority unavailable"
 # O1 partial attach (fix round 1): failed endpoints make their module
 # undercount (PARTIAL_ATTACH_SUBJECT in
 # src/discovery/inventory_coordinator.rs) — counted uses are lower
@@ -7214,6 +7218,7 @@ def capacity_refusal_judgment(directory, manifest, providers, owners, calls, all
     module_keys = {module["id"]: key for key, module in {**admitted, **refused}.items()}
     caller_keys = {caller["id"]: (caller.get("pid"), caller.get("start_time")) for caller in doc.get("callers", [])}
     caller_authorities = {caller["id"]: caller.get("image", {}).get("authority") for caller in doc.get("callers", [])}
+    authority_disclosed = any(gap.get("subject") == AUTHORITY_DISCLOSURE_SUBJECT for gap in doc.get("gaps", []))
     edges = {}
     for edge in doc.get("edges", []):
         key = (caller_keys.get(edge.get("caller")), module_keys.get(edge.get("module")))
@@ -7222,8 +7227,11 @@ def capacity_refusal_judgment(directory, manifest, providers, owners, calls, all
             result.ok(name, "*", "CAPACITY-FOREIGN", key[0] in owners and key[1] in owners[key[0]]["providers"],
                       f"positive on an unexpected caller/provider pair: {key}")
             if lane == "native":
-                result.ok(name, str(key), "CAPACITY-AUTHORITY", caller_authorities.get(edge.get("caller")) == "native_exact",
-                          "native positive has no exact caller authority")
+                authority = caller_authorities.get(edge.get("caller"))
+                result.ok(name, str(key), "CAPACITY-AUTHORITY",
+                          authority == "scan_pinned" and authority_disclosed,
+                          f"native positive lacks documented scan-lane caller authority: "
+                          f"{authority!r}, disclosed={authority_disclosed}")
         if key in edges:
             result.add(name, "*", "CAPACITY-PAIR", "fail", f"duplicate edge: {key}")
         edges[key] = edge
@@ -7443,6 +7451,7 @@ def capacity_oracle(directory):
                           admission.get("endpoints") == len(offsets), f"owned provider refused or incorrect endpoint count:{admission}")
         caller_keys = {caller["id"]: (caller.get("pid"), caller.get("start_time")) for caller in doc.get("callers", [])}
         caller_authorities = {caller["id"]: caller.get("image", {}).get("authority") for caller in doc.get("callers", [])}
+        authority_disclosed = any(gap.get("subject") == AUTHORITY_DISCLOSURE_SUBJECT for gap in doc.get("gaps", []))
         edges = {}
         for edge in doc.get("edges", []):
             key = (caller_keys.get(edge.get("caller")), module_keys.get(edge.get("module")))
@@ -7451,8 +7460,11 @@ def capacity_oracle(directory):
                 result.ok(name, "*", "CAPACITY-FOREIGN", key[0] in owners and key[1] in owners[key[0]]["providers"],
                           f"positive on an unexpected caller/provider pair:{key}")
                 if lane == "native" and not stream_only:
-                    result.ok(name, str(key), "CAPACITY-AUTHORITY", caller_authorities.get(edge.get("caller")) == "native_exact",
-                              "native positive has no exact caller authority")
+                    authority = caller_authorities.get(edge.get("caller"))
+                    result.ok(name, str(key), "CAPACITY-AUTHORITY",
+                              authority == "scan_pinned" and authority_disclosed,
+                              f"native positive lacks documented scan-lane caller authority: "
+                              f"{authority!r}, disclosed={authority_disclosed}")
             if key in edges:
                 result.add(name, "*", "CAPACITY-PAIR", "fail", f"duplicate edge:{key}")
             edges[key] = edge

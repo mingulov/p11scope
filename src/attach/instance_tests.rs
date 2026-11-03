@@ -4411,19 +4411,28 @@ fn spawn_plain_with_pid(pid: u32) -> Result<ReusedProc> {
                 continue;
             }
         };
-        // The spawn exec is the admitted event: wait until the new image is
-        // observable, so the exec hook has run before the readback.
+        // The spawn exec is the admitted event: the readback must follow the
+        // exec hook. `/proc/PID/exe` alone is not enough: the kernel switches
+        // it in `begin_new_exec`, inside the ELF load, while the
+        // `sched_process_exec` tracepoint fires only after the whole binary
+        // and interpreter load returns, so a readback keyed on the image
+        // alone can see the spawn's unstamped row. Wait until the process
+        // is blocked in its own sleep syscall (`clock_nanosleep` 230, or
+        // `nanosleep` 35): it has returned to user space, after the hook.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
                 .map(|link| link.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if exe.contains("sleep") {
+            let syscall =
+                std::fs::read_to_string(format!("/proc/{pid}/syscall")).unwrap_or_default();
+            let sleeping = matches!(syscall.split_whitespace().next(), Some("230" | "35"));
+            if exe.contains("sleep") && sleeping {
                 break;
             }
             ensure!(
                 Instant::now() < deadline,
-                "the reused process never exec'd its image"
+                "the reused process never exec'd its image and reached its sleep"
             );
             std::thread::sleep(Duration::from_millis(20));
         }

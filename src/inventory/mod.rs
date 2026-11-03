@@ -5436,6 +5436,17 @@ impl ClassicDriver<'_> {
         Option<ZeroPassStop>,
     ) {
         self.suspended = true;
+        // Freeze the pre-arm stop boundary and probe result on entry: the
+        // retained drain never called `on_stop_requested`, so without this
+        // the terminal close samples the probe after the detach (native: a
+        // Ctrl-C during detach relabels a deadline end) or never samples it
+        // at all (scan-only: an operator stop ends `scope_end` with no
+        // bound). First wins; an earlier `on_stop_requested` freeze stands.
+        if self.prearm_probe_stop.is_none() {
+            self.prearm_probe_stop = self.prearm_stop_probe.map(|probe| probe());
+        }
+        self.coordinator
+            .freeze_prearm_stop(crate::attach::monotonic_ns());
         // Name a deadline-retained pending publication: a slow drain
         // is visible instead of a silent hang.
         if run.stop_cause == Some(crate::inventory_capture::ZeroPassCause::Deadline)
@@ -6002,9 +6013,13 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         // commit). Uses the frozen probe result and stop boundary from
         // `on_stop_requested`/`end_capture_coverage`, never a re-read: an
         // operator stop or failure ends `Stop`, a deadline `ScopeEnd`. A bare
-        // lane stop without a stop request still freezes here (tests).
+        // lane stop without a stop request still freezes here (tests), but
+        // never overwrites an entry freeze from the retained drain: first
+        // wins, so a Ctrl-C during detach cannot relabel a deadline end.
         if !self.stop_requested {
-            self.prearm_probe_stop = self.prearm_stop_probe.map(|probe| probe());
+            if self.prearm_probe_stop.is_none() {
+                self.prearm_probe_stop = self.prearm_stop_probe.map(|probe| probe());
+            }
             self.coordinator
                 .freeze_prearm_stop(crate::attach::monotonic_ns());
         }
@@ -15784,11 +15799,7 @@ mod tests {
         driver.on_stop_requested();
         assert_eq!(driver.prearm_probe_stop, Some(true));
         driver.on_lane_stopped();
-        let watch = driver.coordinator.prearm_rows()[0]
-            .watch
-            .as_ref()
-            .unwrap()
-            .clone();
+        let watch = *driver.coordinator.prearm_rows()[0].watch.as_ref().unwrap();
         assert_eq!(watch.state, crate::render::PrearmWatchState::Ended);
         assert_eq!(watch.ended_by, Some(crate::render::PrearmWatchEnd::Stop));
         assert!(watch.until_ns.is_some());
@@ -15810,17 +15821,45 @@ mod tests {
         driver.on_stop_requested();
         assert_eq!(driver.prearm_probe_stop, Some(false));
         driver.on_lane_stopped();
-        let watch = driver.coordinator.prearm_rows()[0]
-            .watch
-            .as_ref()
-            .unwrap()
-            .clone();
+        let watch = *driver.coordinator.prearm_rows()[0].watch.as_ref().unwrap();
         assert_eq!(watch.state, crate::render::PrearmWatchState::Ended);
         assert_eq!(
             watch.ended_by,
             Some(crate::render::PrearmWatchEnd::ScopeEnd)
         );
         assert!(watch.until_ns.is_some());
+    }
+
+    #[test]
+    fn lane_stopped_keeps_first_prearm_probe_result() {
+        // First-wins probe: a deadline freeze (probe false) on entry to the
+        // retained drain stands even when a Ctrl-C lands during the detach
+        // (the probe now reads stop). Without first-wins, the late sample
+        // relabels the deadline end as `stop`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(prearm_pinning_for_test(&dir, "probe-first-wins"));
+        coordinator.absorb_prearm_plan(1_000);
+        coordinator.take_target_delta();
+        let headless = headless_display();
+        // Entry freeze: deadline, no operator stop. Both probes outlive the
+        // driver (declared before it), so the late reassignment borrowsck's.
+        let deadline = || false;
+        let intruded = || true;
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.prearm_stop_probe = Some(&deadline);
+        driver.prearm_probe_stop = Some(false);
+        driver.coordinator.freeze_prearm_stop(Some(5_000));
+        // Ctrl-C during detach: the probe now reads stop, but the lane stop
+        // keeps the entry freeze.
+        driver.prearm_stop_probe = Some(&intruded);
+        driver.on_lane_stopped();
+        assert_eq!(driver.prearm_probe_stop, Some(false));
+        let watch = *driver.coordinator.prearm_rows()[0].watch.as_ref().unwrap();
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::ScopeEnd)
+        );
     }
 
     #[test]
@@ -17098,6 +17137,49 @@ mod tests {
                 && line.contains("joint publication")
                 && line.contains("retained run")),
             "the retained drain is named on stderr: {warned:?}"
+        );
+    }
+
+    #[test]
+    fn retained_operator_stop_freezes_prearm_probe_and_stop() {
+        // A scan-only retained run with a pending Joint publication and an
+        // operator stop freezes the pre-arm probe and stop instant on entry
+        // to the retained drain. Without the freeze, the probe stays None
+        // and the terminal watch ends `scope_end` with `until` omitted;
+        // with it, the watch ends `stop` with a bound.
+        let dir = tempfile::tempdir().unwrap();
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(prearm_pinning_for_test(&dir, "retained-stop"));
+        coordinator.absorb_prearm_plan(1_000);
+        coordinator.take_target_delta();
+        let headless = headless_display();
+        let stop = || true;
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.prearm_stop_probe = Some(&stop);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        driver.joint_commit_pending = true;
+        let outcome = retain_with_cause(&mut driver, ZeroPassCause::OperatorStop, None);
+        assert!(outcome.retained.is_some(), "the stop retains the run");
+        let stop_now = || false;
+        let clock = consume_clock(&stop_now);
+        let (stopped, error, _zero_pass) =
+            driver.consume_outcome(outcome, &clock, &mut |_, _| Ok(()));
+        assert!(error.is_none(), "the retained run finalizes");
+        assert_eq!(driver.prearm_probe_stop, Some(true));
+        assert!(stopped.is_none(), "a scan lane stops nothing");
+        assert!(driver.coordinator.has_prearm());
+        let stop = driver.prearm_probe_stop.unwrap_or(false) || driver.coordinator.capture_failed();
+        let cause = if stop {
+            crate::render::PrearmWatchEnd::Stop
+        } else {
+            crate::render::PrearmWatchEnd::ScopeEnd
+        };
+        driver.coordinator.finish_prearm_watches(cause, None);
+        let watch = *driver.coordinator.prearm_rows()[0].watch.as_ref().unwrap();
+        assert_eq!(watch.ended_by, Some(crate::render::PrearmWatchEnd::Stop));
+        assert!(
+            watch.until_ns.is_some(),
+            "the frozen stop bounds the watch: {watch:?}"
         );
     }
 

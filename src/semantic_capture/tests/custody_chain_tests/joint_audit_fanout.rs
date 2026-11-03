@@ -7849,28 +7849,62 @@ fn joint_machine_negative_dispositions_are_finite() {
             .adapter_mut()
             .resolve_birth_cut(&boundary, &fixture.scene.producers);
         if malformed {
-            assert_eq!(
-                cut.err(),
-                Some(crate::semantics_objects::journal::BirthCutRefusal::Gap),
-                "the completed malformed prefix permanently breaks this stream"
-            );
-            assert_eq!(fixture.service(1), Err(SemanticRefusal::Unavailable));
-            assert!(fixture.machine.retained_raw_for_test().is_none());
+            // The completed malformed prefix was disclosed and published
+            // as its own negative; the linked lane then re-syncs above a
+            // fence over that window instead of refusing every later
+            // quantum. The disclosure stays published, unhealed.
+            let disclosed: Vec<(String, String)> = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+                .collect();
             assert!(
-                fixture.machine.begin_commit(false).is_err(),
-                "a new demand cannot heal the original gap"
+                disclosed.contains(&(
+                    "semantic receipt refused".to_string(),
+                    "partition".to_string()
+                )),
+                "the malformed negative stays disclosed: {disclosed:?}"
+            );
+            assert!(
+                cut.is_ok(),
+                "the linked lane re-syncs after the disclosed malformed prefix: {:?}",
+                cut.err()
+            );
+            assert!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter()
+                    .voids_through_for_test(frontier),
+                "the malformed window is voided"
             );
             assert_eq!(
+                fixture.service(1).unwrap(),
+                crate::inventory_semantics::JointServiceProgress::Pending
+            );
+            assert!(
                 fixture
                     .scene
                     .real
                     .scene
                     .coordinator
                     .registry()
-                    .semantic_resource_snapshot()
-                    .charged_bytes,
-                charged
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "semantic receipt refused"
+                        && gap.reason == "partition"),
+                "a new demand cannot erase the original disclosure"
             );
+            let _ = charged;
+            continue;
         } else {
             assert!(cut.is_ok());
             assert_eq!(

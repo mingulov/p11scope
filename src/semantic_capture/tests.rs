@@ -1981,11 +1981,11 @@ fn joint_raw_negative_preserves_sealed_domain_loss_effects() {
 #[test]
 fn joint_unlocalized_raw_loss_retains_all_sealed_domains_and_effects() {
     use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+    use crate::semantics_objects::journal::JournalGap;
     use crate::semantics_objects::journal::joint_driver::{
         JointCaptureOwner, RawDisposeReason, RawJointQuantum, RawQuantumRefusal,
     };
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
-    use crate::semantics_objects::journal::{BirthCutRefusal, JournalGap};
     use crate::semantics_objects::{Lifetime, ObjectEffect, ObjectGap};
 
     let child = OwnedStoppedChild::new();
@@ -2067,15 +2067,31 @@ fn joint_unlocalized_raw_loss_retains_all_sealed_domains_and_effects() {
         |bytes| harness.pool.reserve(bytes),
         owner.adapter_mut(),
     );
-    assert!(matches!(
-        next,
-        Err(RawQuantumRefusal::Cut(BirthCutRefusal::Gap))
-    ));
+    // The linked lane re-syncs on a fresh stream above a fence over the
+    // lost window: the named gap stays disclosed, every original domain
+    // stays retired as lossy (no silent recovery), and no later birth can
+    // name a cut inside the voided interval.
     assert!(
-        harness.drain.consumption_cut().unwrap().same_boundary(&cut),
-        "refusal cannot consume the queued original or heal the invalid stream"
+        next.is_ok(),
+        "the linked lane re-syncs after the disclosed loss: {:?}",
+        next.as_ref().err()
     );
-    assert!(owner.adapter().consumed_frontier() == frontier);
+    assert!(
+        owner.adapter().voids_through_for_test(frontier),
+        "the lost window is voided"
+    );
+    assert!(
+        !harness.drain.consumption_cut().unwrap().same_boundary(&cut),
+        "the re-synced collect consumes the queued original"
+    );
+    for object in &before.objects {
+        assert_eq!(
+            owner.model().project().object(object.id).unwrap().lifetime,
+            Lifetime::Retired(ObjectGap::Loss),
+            "the affected window stays lossy after the re-sync"
+        );
+    }
+    assert_eq!(failure.gap, JournalGap::Malformed);
     assert_eq!(failure.effects.effects.len(), effects);
     assert!(
         domains.iter().all(|domain| failure.affects_domain(*domain)),

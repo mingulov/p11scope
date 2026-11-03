@@ -1261,6 +1261,13 @@ impl JournalAdapter {
     /// and its clearing on the next unlinked collect. Production
     /// resolves and clears this only through `resolve_birth_cut`.
     #[cfg(test)]
+    /// Whether history through `ordinal` is voided: births naming a cut
+    /// at or below the voided ordinal refuse.
+    #[cfg(test)]
+    pub(crate) fn voids_through_for_test(&self, ordinal: ConsumptionOrdinal) -> bool {
+        self.voided_through >= ordinal.0
+    }
+
     pub(crate) fn stream_broken_for_test(&self) -> bool {
         self.stream_broken
     }
@@ -3491,15 +3498,30 @@ impl JournalAdapter {
             // already disclosed the loss; refusing every future
             // quantum would strand the run for one discarded
             // reservation. Re-sync the next quantum on a fresh
-            // stream instead. Linked lanes keep the fail-closed
-            // refusal, and a stopped adapter never re-syncs.
-            if !producers.journal_linked() && !self.stopped {
-                self.stream_broken = false;
-                self.invalidated = false;
-                self.stream_boundary = Some(cut.clone());
-            } else {
+            // stream instead.
+            //
+            // A linked lane re-syncs only after an unlocalized raw
+            // disposal (`invalidated`): that disposal already refused
+            // every key (their Joint output stays lossy, never
+            // recovered), voided all staged custody and disclosed the
+            // named gap. Fencing the consumed interval makes every
+            // later birth name a cut above it, so nothing in the lost
+            // window is ever certified. A break without that disposal
+            // (staged custody still held across the hole), an
+            // exhausted ordinal space and a stopped adapter keep the
+            // fail-closed refusal.
+            let linked = producers.journal_linked();
+            let resyncs = !self.stopped
+                && (!linked || (self.invalidated && self.consumed_through != u64::MAX));
+            if !resyncs {
                 return Err(BirthCutRefusal::Gap);
             }
+            if linked {
+                self.voided_through = self.voided_through.max(self.consumed_through);
+            }
+            self.stream_broken = false;
+            self.invalidated = false;
+            self.stream_boundary = Some(cut.clone());
         }
         match &self.stream_boundary {
             Some(boundary) if boundary.same_boundary(cut) => {}

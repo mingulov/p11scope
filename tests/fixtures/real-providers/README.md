@@ -107,6 +107,10 @@ Each cell lists one entry per `(os-release ID, tool package version)`:
   expected, the exact endpoint count the skip reason must name, tied to
   the installed p11-kit version; `null` where no capacity skip is
   expected (any skip then fails).
+- `provisional`: optional boolean. Entries taken from a single sample
+  carry `"provisional": true` until a quiet host confirms them; the
+  ratchet still applies in full, and the marker never changes a
+  verdict. The oracle ignores any other unknown pin fields.
 
 Counts, tool exit, report schema and the metrics skip rule are
 strict and never pinned: a metrics twin must skip nothing except,

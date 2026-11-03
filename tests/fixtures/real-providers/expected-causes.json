@@ -15,13 +15,8 @@
      },
      {
       "cause": "surfaces",
-      "owner": "exec-real-providers",
-      "reason": "p11-kit closure templates read known_prefix (68-entry 3.2 tables)"
-     },
-     {
-      "cause": "surfaces",
-      "owner": "exec-scan-legacy32",
-      "reason": "SoftHSM 2.7 68-entry 3.2 table reads known_prefix"
+      "owner": "exec-real-providers, exec-scan-legacy32",
+      "reason": "p11-kit closure templates and the SoftHSM 2.7 68-entry 3.2 table read known_prefix"
      },
      {
       "cause": "interface_selection",
@@ -198,7 +193,8 @@
      "reason": "pause confirmed on every owner",
      "status": "sigstop"
     },
-    "tool_version": "2:3.120-1ubuntu2.2"
+    "tool_version": "2:3.120-1ubuntu2.2",
+    "provisional": true
    }
   ],
   "real-opencryptoki": [],
@@ -388,7 +384,8 @@
      "reason": "pause confirmed on every owner",
      "status": "sigstop"
     },
-    "tool_version": "0.27.0~rc1-1"
+    "tool_version": "0.27.0~rc1-1",
+    "provisional": true
    }
   ]
  },

@@ -383,6 +383,34 @@ class JudgeTests(unittest.TestCase):
         with self.assertRaises(ORACLE_MOD["HarnessError"]):
             self.judge(causes=("pause_partial",), pause="partial", mutate=mutate)
 
+    def test_duplicate_pinned_cause_is_a_harness_error(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["observation"] = [
+                {"cause": "skipped", "reason": "first justification",
+                 "owner": "exec-real-providers"},
+                {"cause": "skipped", "reason": "second justification",
+                 "owner": "exec-real-providers"}]
+        with self.assertRaises(ORACLE_MOD["HarnessError"]):
+            self.judge(causes=("skipped",), mutate=mutate)
+
+    def test_provisional_pin_judges_identically(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["provisional"] = True
+        qualification, _ = self.judge(mutate=mutate)
+        self.assertEqual(qualification, "qualified")
+
+    def test_unknown_pin_field_is_ignored(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["future_field"] = 123
+        qualification, _ = self.judge(mutate=mutate)
+        self.assertEqual(qualification, "qualified")
+
+    def test_malformed_provisional_is_a_harness_error(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["provisional"] = "yes"
+        with self.assertRaises(ORACLE_MOD["HarnessError"]):
+            self.judge(mutate=mutate)
+
 
 class CliTests(unittest.TestCase):
     def run_oracle(self, doc, rec, exp, spy):

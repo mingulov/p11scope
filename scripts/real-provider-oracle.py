@@ -19,7 +19,8 @@ appends one entry per forwarded call to a spy log. This oracle checks:
   exec-real-providers lane);
 - the set of observation causes equals the pinned per-cell list, where
   every pin carries a reason and an owner (the ratchet: a fixed cause or
-  a new cause both fail until the pin is updated);
+  a new cause both fail until the pin is updated); single-sample entries
+  carry `"provisional": true`, which never changes a verdict;
 - where the pin declares a p11-kit skip, the p11-kit-subject skip text
   names the pinned endpoint count for the installed p11-kit version
   (other subjects, such as the runtime-built spy table, are covered by
@@ -247,6 +248,9 @@ def check_pin_shape(pin, cell):
             value = row.get(key)
             if not isinstance(value, str) or not value.strip():
                 raise HarnessError("pinned cause lacks %s for cell: %s" % (key, cell))
+    names = [row["cause"] for row in causes]
+    if len(set(names)) != len(names):
+        raise HarnessError("pinned cause duplicated for cell: " + cell)
     pause = pin.get("pause")
     if not isinstance(pause, dict):
         raise HarnessError("pin lacks a pause expectation for cell: " + cell)
@@ -256,6 +260,8 @@ def check_pin_shape(pin, cell):
         value = pause.get(key)
         if not isinstance(value, str) or not value.strip():
             raise HarnessError("pinned pause lacks %s for cell: %s" % (key, cell))
+    if "provisional" in pin and type(pin["provisional"]) is not bool:
+        raise HarnessError("pin carries a non-boolean provisional marker for cell: " + cell)
     skip = pin.get("p11kit_skip")
     if not (skip is None or (integer(skip) and skip > 0)):
         raise HarnessError("pin names an invalid p11kit_skip for cell: " + cell)

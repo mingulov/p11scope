@@ -1749,9 +1749,13 @@ impl CaptureWorkBudget {
         self.loader_elf_facts.get(key).cloned()
     }
 
-    /// Retains one loader's facts under the same retained-cache accounting
-    /// as the export facts (bounded by the export entry limit and the shared
-    /// cache bytes under Inventory policy).
+    /// Retains one loader's facts under its own entry allowance: the loader
+    /// map is bounded by the export entry limit value, but counted
+    /// separately from the export facts map, so export-map fullness can
+    /// never refuse loader retention (a refused loader re-reads its file
+    /// bytes on every arm, which is what exhausted the capture I/O budget
+    /// before this cache existed). Bytes share the one retained
+    /// cache-bytes ceiling with every other retained map.
     pub(crate) fn note_loader_elf_facts(
         &mut self,
         key: LoaderFactsKey,
@@ -11804,6 +11808,100 @@ mod tests {
         assert_eq!(export_cache_bytes(&key, &one_over), exact_bytes + 1);
         assert!(!budget.note_elf_export_facts(key, one_over));
         assert_eq!(budget.elf_export_facts_for(&key), Some(exact));
+        assert_eq!(budget.retained_counts().5, exact_bytes);
+
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
+    /// The loader-facts wrapper keeps its own entry allowance: a full
+    /// export map refuses further exports but never loader retention, and
+    /// the loader map refuses its own second entry past the same limit
+    /// value. Bytes share the one ceiling; a sealed budget refuses.
+    #[test]
+    fn inventory_loader_cache_bounds_are_separate_and_exact() {
+        let pin = pin_of(&File::open("/bin/sh").unwrap()).unwrap();
+        let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
+        let retained = InventoryRetainedLimits::new(2, 1, 1, 1, 1, u64::MAX).unwrap();
+        let limits = InventoryDiscoveryLimits::new(1024, window, retained).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+
+        let export_key = |inode| InspectedFileKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+            pin,
+        };
+        let exports = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+            excluded_anchor_ranges: Vec::new(),
+        };
+        assert!(budget.note_elf_export_facts(export_key(1), exports.clone()));
+        assert!(!budget.note_elf_export_facts(export_key(2), exports));
+
+        let loader_key = |device| LoaderFactsKey { device, pin };
+        let loader_facts = LoaderElfFacts {
+            abi: ElfAbi::Lp64,
+            hook: Ok(None),
+            state_address: Ok(None),
+        };
+        // The export map is full, but the loader map counts separately.
+        assert!(budget.note_loader_elf_facts(loader_key(1), loader_facts.clone()));
+        assert_eq!(
+            budget.loader_elf_facts_for(&loader_key(1)),
+            Some(loader_facts.clone())
+        );
+        // The loader map's own allowance is the same limit value: one more
+        // entry refuses.
+        assert!(!budget.note_loader_elf_facts(loader_key(2), loader_facts.clone()));
+
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+
+        // Sealed on a fresh budget: the loader map is empty, so only the
+        // no-active-scan gate can refuse (on the budget above, entry
+        // fullness would refuse for the wrong reason).
+        let mut sealed = CaptureWorkBudget::for_inventory(limits);
+        let token = sealed.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = sealed.checkpoint(token.clone()).unwrap();
+        sealed.finish_scan(scan).unwrap();
+        assert!(!sealed.note_loader_elf_facts(loader_key(3), loader_facts));
+        sealed.finish_window(token).unwrap();
+    }
+
+    /// The loader-facts byte gate is exact: a value sized exactly to the
+    /// shared ceiling retains, and one byte over refuses with the old value
+    /// intact.
+    #[test]
+    fn inventory_loader_cache_byte_limit_accepts_exact_size_and_refuses_one_over() {
+        let pin = pin_of(&File::open("/bin/sh").unwrap()).unwrap();
+        let key = LoaderFactsKey { device: 9, pin };
+        let exact = LoaderElfFacts {
+            abi: ElfAbi::Lp64,
+            hook: Ok(None),
+            state_address: Ok(None),
+        };
+        let exact_bytes = loader_cache_bytes(&key, &exact);
+        let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
+        let retained = InventoryRetainedLimits::new(1, 1, 1, 1, 1, exact_bytes).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(
+            InventoryDiscoveryLimits::new(1024, window, retained).unwrap(),
+        );
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+
+        assert!(budget.note_loader_elf_facts(key, exact.clone()));
+        assert_eq!(budget.retained_counts().5, exact_bytes);
+        let one_over = LoaderElfFacts {
+            abi: exact.abi,
+            hook: Err("e".into()),
+            state_address: Ok(None),
+        };
+        assert_eq!(loader_cache_bytes(&key, &one_over), exact_bytes + 1);
+        assert!(!budget.note_loader_elf_facts(key, one_over));
+        assert_eq!(budget.loader_elf_facts_for(&key), Some(exact));
         assert_eq!(budget.retained_counts().5, exact_bytes);
 
         budget.finish_scan(scan).unwrap();

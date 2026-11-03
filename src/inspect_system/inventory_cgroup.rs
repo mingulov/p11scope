@@ -818,16 +818,13 @@ fn collect_with(
                 outcome = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::ScanIncomplete);
             }
         }
-        let excluded = kernel_thread_exclusions(&sweep, &sweep_unavailable, Path::new("/proc"));
-        for _ in &excluded {
-            budget.note_kernel_thread_absence();
-        }
-        let eligible: Vec<(u32, Vec<MapEntry>)> = sweep
-            .iter()
-            .filter(|(pid, _)| !excluded.contains(pid))
-            .cloned()
-            .collect();
-        selected = select_deep_scan_candidates(&eligible, cap);
+        selected = select_excluding_kernel_threads(
+            &sweep,
+            &sweep_unavailable,
+            Path::new("/proc"),
+            cap,
+            &mut budget,
+        );
     }
     let mut noise = DiscoveryNoiseAggregator::default();
     let mut members = Vec::new();

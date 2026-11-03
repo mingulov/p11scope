@@ -5975,9 +5975,6 @@ pub(crate) mod tests {
         assert!(out.contains("approximation"));
     }
 
-    /// U-14: the live evidence line must show the plan's currently-active
-    /// endpoint count next to the ever-growing allocation total, not just
-    /// the allocation total alone.
     fn mech_stat(calls: u64, errors: u64) -> crate::semantics::MechStat {
         crate::semantics::MechStat {
             calls,
@@ -6037,6 +6034,9 @@ pub(crate) mod tests {
         assert!(!out.contains("MECHANISM"), "{out}");
     }
 
+    /// U-14: the live evidence line must show the plan's currently-active
+    /// endpoint count next to the ever-growing allocation total, not just
+    /// the allocation total alone.
     #[test]
     fn live_view_shows_active_slots_next_to_allocated_slots() {
         let mut ev = evidence();

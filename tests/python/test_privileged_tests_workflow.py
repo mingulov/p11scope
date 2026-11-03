@@ -35,6 +35,16 @@ def renamed(problems):
     return [p.replace("bpf-kernels.yml", "privileged-tests.yml") for p in problems]
 
 
+def job_body(yml, name):
+    """The YAML text of one top-level job (jobs are 2-space keys)."""
+    bounds = [match.start() for match in
+              re.finditer(r"^  \S[^:\n]*:", yml, re.M)]
+    start = yml.index(f"  {name}:")
+    following = [bound for bound in bounds if bound > start]
+    end = min(following) if following else len(yml)
+    return yml[start:end]
+
+
 class PrivilegedTestsWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.ci = CI_YML.read_text(encoding="utf-8")
@@ -92,6 +102,36 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
 
     def test_workflow_cancels_superseded_runs(self):
         self.assertIn("cancel-in-progress: true", self.yml)
+
+    def test_filesystem_jobs_run_their_curated_groups(self):
+        for job, flag, package, section in (
+            ("privileged-btrfs", "--include-btrfs", "btrfs-progs", "btrfs"),
+            ("privileged-overlay", "--include-overlay", "e2fsprogs",
+             "overlay"),
+        ):
+            with self.subTest(job=job):
+                body = job_body(self.yml, job)
+                self.assertIn("needs: privileged-build", body)
+                self.assertIn(flag, body)
+                self.assertIn(package, body)
+                # Selectors derive from the curated --list section with
+                # a count check, never from a hand-kept copy.
+                self.assertIn(f"/^{section} \\(/", body)
+                self.assertIn('test "$count" -eq "$declared"', body)
+                # Failures, skips and leaked mounts fail the job.
+                self.assertIn("grep -E '^(FAIL|SKIP) '", body)
+                self.assertIn('test "$rc" -eq 0', body)
+                self.assertIn("if: ${{ always() }}", body)
+                self.assertIn("losetup -a", body)
+        overlay = job_body(self.yml, "privileged-overlay")
+        # The copy-up RED cell rides along through the expected-failure
+        # gate: it must still fail with its signature (XFAIL), so a fix
+        # or a changed failure breaks the job loudly.
+        self.assertIn("overlay_copy_up_userspace_edge_absent", overlay)
+        self.assertIn("--include-expected-failures", overlay)
+        self.assertIn("^XFAIL ", overlay)
+        btrfs = job_body(self.yml, "privileged-btrfs")
+        self.assertIn("--teardown", btrfs)
 
 
 if __name__ == "__main__":

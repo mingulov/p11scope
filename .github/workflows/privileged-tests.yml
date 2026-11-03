@@ -19,7 +19,11 @@ name: privileged-tests
 #   source tree), takes every SHARDS-th cell from the list and runs them
 #   through the curated runner as root;
 # - privileged-summary proves the shards together ran every listed cell
-#   exactly once, and fails on any FAIL, SKIP or missing result.
+#   exactly once, and fails on any FAIL, SKIP or missing result;
+# - privileged-btrfs runs the btrfs campaign (--include-btrfs) with the
+#   runner's own loop-mounted image, and privileged-overlay runs the
+#   overlay campaign (--include-overlay) plus the copy-up expected
+#   failure; both fail on any FAIL, SKIP or leaked mount.
 on:
   push:
   pull_request:
@@ -220,6 +224,178 @@ jobs:
             bad=1
           fi
           test "$bad" -eq 0
+  # The btrfs campaign: the 14 cells that need TMPDIR on btrfs. The
+  # curated runner loop-mounts its own image for them (no ambient
+  # btrfs needed) and tears it down afterwards; the cleanup step
+  # re-runs the idempotent teardown so a mount never leaks past the job.
+  privileged-btrfs:
+    needs: privileged-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo apt-get update && sudo apt-get install -y btrfs-progs gcc python3 softhsm2 util-linux
+      - name: Download the build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: privileged-inputs
+          path: ${{ runner.temp }}/privileged-inputs
+      - name: Run the btrfs campaign cells as root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/privileged-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$in/lib-tests" "$in/bin/p11scope" "$in/bin/p11scope-discover"
+          # Selectors come from the curated --list sections, never from a
+          # hand-kept copy: a renamed cell fails the count check loudly.
+          awk '/^btrfs \(/{f=1;next} /^(marker|overlay|expected-failures) \(/{f=0} f' "$in/list.txt" \
+            | sed 's/ :: .*//' | grep -v '^$' >"$RUNNER_TEMP/btrfs-cells.txt"
+          count=$(wc -l <"$RUNNER_TEMP/btrfs-cells.txt")
+          declared=$(sed -n 's/^btrfs (\([0-9]*\)).*/\1/p' "$in/list.txt")
+          echo "btrfs cells: $count (declared $declared)"
+          test "$count" -gt 0
+          test "$count" -eq "$declared"
+          sudo -n true
+          uname -a
+          out="$RUNNER_TEMP/privileged-btrfs-out"
+          mkdir -m 700 "$out"
+          rc=0
+          mapfile -t cells <"$RUNNER_TEMP/btrfs-cells.txt"
+          sudo -n scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-btrfs "${cells[@]}" || rc=$?
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          cat "$out/run/results.txt"
+          echo "runner rc=$rc"
+          if grep -E '^(FAIL|SKIP) ' "$out/run/results.txt"; then
+            echo "btrfs campaign has failed or skipped cells" >&2
+            exit 1
+          fi
+          test "$rc" -eq 0
+      - name: Upload the btrfs results and logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privileged-btrfs
+          path: |
+            ${{ runner.temp }}/privileged-btrfs-out/run/results.txt
+            ${{ runner.temp }}/privileged-btrfs-out/run/logs/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Clean up the btrfs mount
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/privileged-btrfs-out/run"
+          sudo -n scripts/ci/prepare-btrfs-tmpdir.sh --teardown "$out/btrfs.img" "$out/btrfs-mnt" || true
+          leaked=0
+          if mount | grep -F "$out" >/dev/null; then leaked=1; fi
+          if sudo -n losetup -a 2>/dev/null | grep -F "$out" >/dev/null; then leaked=1; fi
+          if [ "$leaked" -ne 0 ]; then
+            echo "btrfs teardown leaked a mount or loop device under $out" >&2
+            exit 1
+          fi
+  # The overlay campaign: the K1 deep-scan twins (lane B only; each
+  # mounts its own loop overlays and fails loud elsewhere) plus the
+  # copy-up cell through the expected-failure gate (it must still fail
+  # with its pinned signature). The xino parity cell already runs in
+  # the default shards.
+  privileged-overlay:
+    needs: privileged-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo apt-get update && sudo apt-get install -y e2fsprogs gcc python3 softhsm2 util-linux
+      - name: Download the build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: privileged-inputs
+          path: ${{ runner.temp }}/privileged-inputs
+      - name: Run the overlay campaign cells as root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/privileged-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$in/lib-tests" "$in/bin/p11scope" "$in/bin/p11scope-discover"
+          # Selectors come from the curated --list sections, never from a
+          # hand-kept copy: a renamed cell fails the count check loudly.
+          awk '/^overlay \(/{f=1;next} /^expected-failures \(/{f=0} f' "$in/list.txt" \
+            | sed 's/ :: .*//' | grep -v '^$' >"$RUNNER_TEMP/overlay-cells.txt"
+          count=$(wc -l <"$RUNNER_TEMP/overlay-cells.txt")
+          declared=$(sed -n 's/^overlay (\([0-9]*\)).*/\1/p' "$in/list.txt")
+          echo "overlay cells: $count (declared $declared)"
+          test "$count" -gt 0
+          test "$count" -eq "$declared"
+          sudo -n true
+          uname -a
+          out="$RUNNER_TEMP/privileged-overlay-out"
+          mkdir -m 700 "$out"
+          rc=0
+          mapfile -t cells <"$RUNNER_TEMP/overlay-cells.txt"
+          sudo -n scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/run" --include-overlay "${cells[@]}" || rc=$?
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          cat "$out/run/results.txt"
+          echo "runner rc=$rc"
+          if grep -E '^(FAIL|SKIP) ' "$out/run/results.txt"; then
+            echo "overlay campaign has failed or skipped cells" >&2
+            exit 1
+          fi
+          test "$rc" -eq 0
+      - name: Prove the copy-up cell still fails with its signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/privileged-inputs"
+          awk '/^expected-failures \(/{f=1;next} /^verify: /{f=0} f' "$in/list.txt" \
+            | grep -F overlay_copy_up_userspace_edge_absent | sed 's/ :: .*//' >"$RUNNER_TEMP/copyup-cell.txt"
+          test "$(wc -l <"$RUNNER_TEMP/copyup-cell.txt")" -eq 1
+          out="$RUNNER_TEMP/privileged-overlay-out"
+          rc=0
+          sudo -n scripts/run-privileged-lib-tests.sh "$in/lib-tests" "$out/xfail" --include-expected-failures "$(cat "$RUNNER_TEMP/copyup-cell.txt")" || rc=$?
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out/xfail"
+          cat "$out/xfail/results.txt"
+          echo "runner rc=$rc"
+          grep -q '^XFAIL discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent ' "$out/xfail/results.txt"
+          test "$rc" -eq 0
+      - name: Upload the overlay results and logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privileged-overlay
+          path: |
+            ${{ runner.temp }}/privileged-overlay-out/run/results.txt
+            ${{ runner.temp }}/privileged-overlay-out/run/logs/
+            ${{ runner.temp }}/privileged-overlay-out/xfail/results.txt
+            ${{ runner.temp }}/privileged-overlay-out/xfail/logs/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Verify no overlay mounts leaked
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/privileged-overlay-out"
+          mounts=$(mount | awk -v out="$out" '$3 ~ ("^" out "/") {print $3}')
+          if [ -n "$mounts" ]; then
+            while IFS= read -r mp; do sudo -n umount -l "$mp" || true; done <<<"$mounts"
+            echo "overlay cells leaked mounts under $out" >&2
+            exit 1
+          fi
+          if sudo -n losetup -a 2>/dev/null | grep -F "$out" >/dev/null; then
+            echo "overlay cells leaked a loop device under $out" >&2
+            exit 1
+          fi
   # The release observer for the installed-behavior jobs below: the four
   # system-scale cells, the public CLI cells on the runner kernel and in
   # virtme-ng guests, and the real-browser cells.

@@ -604,7 +604,7 @@ fn disclose_s1_birth_refusal(
         caller,
         module: None,
         pid: None,
-        subject: "Joint birth unavailable; retained S1".into(),
+        subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
         reason,
         budget: None,
     });

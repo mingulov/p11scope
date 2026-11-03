@@ -6,12 +6,16 @@
 //! (`crates/types/src/mechanism_official.rs` at the pinned rev):
 //! every official id maps to its header name, sorted by id. No
 //! hand-written literals: re-run the generator (see the S1 report)
-//! when the pin moves. Ids outside the official list — vendor ids
-//! (`>= 0x8000_0000`) and unregistered ids — have no name and render
-//! verbatim as `0x…`, never guessed.
+//! when the pin moves. Named vendor ids from the p11scope overlay
+//! (`vendor_mechanisms::VENDOR_MECHANISMS`, NSS `CKM_NSS_*`
+//! key-creation/derivation ids from `pkcs11n.h`) resolve through the
+//! fallthrough below. Every other id outside those two lists —
+//! vendor ids (`>= 0x8000_0000`) and unregistered ids — has no name
+//! and renders verbatim as `0x…`, never guessed.
 
-/// Official `CKM_*` name for a registered mechanism id, or `None`
-/// when the id is vendor-defined or otherwise unregistered. The
+/// Official `CKM_*` name for a registered mechanism id, falling back
+/// to the p11scope vendor overlay for named `CKM_NSS_*` ids, or `None`
+/// when the id is otherwise vendor-defined or unregistered. The
 /// caller renders `None` as the verbatim hex id.
 pub(crate) fn mechanism_name(id: u64) -> Option<&'static str> {
     match id {
@@ -478,7 +482,7 @@ pub(crate) fn mechanism_name(id: u64) -> Option<&'static str> {
         0x00004038 => Some("CKM_ECDH_X_AES_KEY_WRAP"),
         0x00004039 => Some("CKM_ECDH_COF_AES_KEY_WRAP"),
         0x0000403A => Some("CKM_PUB_KEY_FROM_PRIV_KEY"),
-        _ => None,
+        _ => crate::vendor_mechanisms::vendor_mechanism_name(id),
     }
 }
 

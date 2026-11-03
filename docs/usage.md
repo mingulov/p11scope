@@ -81,8 +81,14 @@ operation-state blobs, raw mechanism byte arrays, raw session handles, or
 ordinary buffers.
 
 Public profile evidence covers functions, registered mechanisms, return
-codes, latency and admitted lifecycle observations. Profile, trace and metrics
-publish no object handles or object attribute facts. `evidence.object_capture`
+codes, latency and admitted lifecycle observations. Key creation, derivation
+and destruction are shown the same way: calls such as `C_CreateObject`,
+`C_GenerateKey`, `C_GenerateKeyPair`, `C_DeriveKey`, `C_UnwrapKey`,
+`C_CopyObject` and `C_DestroyObject` appear as function rows with their
+mechanism id and call count, including named vendor key-generation
+mechanisms (for example NSS `CKM_NSS_*` ids); parameters and key material
+are never decoded. Profile, trace and metrics publish no object handles
+or object attribute facts. `evidence.object_capture`
 reports build availability, not an observed attribute. The unsafe diagnostic
 build described below does not enlarge the default allowlist.
 

@@ -187,6 +187,27 @@ jobs:
         run: |
           cargo +"$(cat .release-rust-version)" build --locked --offline
           test -x target/debug/p11scope
+      - name: Prove the default object carries no gate
+        shell: bash
+        run: |
+          # I2, gate-0 side: the default cell must test a gate-0 object.
+          # The build script always emits the gate flag line; here it must
+          # be 0 (never 1), and the OUT_DIR Detailed object must not carry
+          # the gate maps.
+          grep -q 'cargo:rustc-env=P11SCOPE_LOADER_GATE_ENABLED=0' target/debug/build/p11scope-*/output
+          if grep -q 'cargo:rustc-env=P11SCOPE_LOADER_GATE_ENABLED=1' target/debug/build/p11scope-*/output; then
+            echo "refusing: a gate-1 build-script output is present" >&2
+            exit 1
+          fi
+          detailed=(target/debug/build/p11scope-*/out/p11scope-ebpf)
+          test "${#detailed[@]}" -ge 1
+          for obj in "${detailed[@]}"; do
+            if nm "$obj" | grep -Eq ' (IMAGE_BANK_SELECT|TASK_COOKIE_B)$'; then
+              echo "refusing: gate maps in the default Detailed object: $obj" >&2
+              exit 1
+            fi
+          done
+          echo "default Detailed object carries no gate maps"
       - name: Build the verifier-stats probe
         shell: bash
         run: |
@@ -293,9 +314,10 @@ jobs:
           test -s "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
           # Fail when the guest doctor exits nonzero, as the host job does.
           grep -q '^# doctor rc=0$' "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
-          # The pipe exit is tee's, so also require the driver's own
-          # verdict: a budget-only FAIL (count over budget, missing row)
-          # with a healthy doctor must fail the step (P2F-5 F2).
+          # shell: bash runs with -eo pipefail, so a failing driver
+          # already fails the step through the pipe; still require the
+          # driver's own verdict line, pinning the pass to OVERALL: PASS
+          # even if a future driver exits 0 on a FAIL table (P2F-5 F2).
           grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
       - name: Check one stock pre-Multi host refuses before capture side effects
         if: matrix.refusal_control == true
@@ -399,6 +421,23 @@ jobs:
         run: |
           cargo +"$(cat .release-rust-version)" build --locked --offline
           test -x target/debug/p11scope
+      - name: Prove the gate-1 object carries the gate
+        shell: bash
+        run: |
+          # I2: the gate-1 cell must test a gate-1 object. Gate-0 counts
+          # fit under every gate-1 budget, so a mis-built gate-0 observer
+          # would pass and the 512 tripwire would go quiet: the
+          # environment check above is not enough. Require the build
+          # script's gate flag in its output and the gate maps in the
+          # OUT_DIR Detailed object.
+          grep -q 'cargo:rustc-env=P11SCOPE_LOADER_GATE_ENABLED=1' target/debug/build/p11scope-*/output
+          detailed=(target/debug/build/p11scope-*/out/p11scope-ebpf)
+          test "${#detailed[@]}" -ge 1
+          for obj in "${detailed[@]}"; do
+            nm "$obj" | grep -q ' IMAGE_BANK_SELECT$'
+            nm "$obj" | grep -q ' TASK_COOKIE_B$'
+          done
+          echo "gate-1 Detailed object carries IMAGE_BANK_SELECT and TASK_COOKIE_B"
       - name: Build the verifier-stats probe
         shell: bash
         run: |
@@ -504,9 +543,10 @@ jobs:
           test -s "$GITHUB_WORKSPACE/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt"
           # Fail when the guest doctor exits nonzero, as the host job does.
           grep -q '^# doctor rc=0$' "$GITHUB_WORKSPACE/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt"
-          # The pipe exit is tee's, so also require the driver's own
-          # verdict: a budget-only FAIL (count over budget, missing row)
-          # with a healthy doctor must fail the step (P2F-5 F2).
+          # shell: bash runs with -eo pipefail, so a failing driver
+          # already fails the step through the pipe; still require the
+          # driver's own verdict line, pinning the pass to OVERALL: PASS
+          # even if a future driver exits 0 on a FAIL table (P2F-5 F2).
           grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-gate1-out/table-${{ matrix.kernel }}.txt"
       - name: Upload the table and doctor output
         if: ${{ !cancelled() }}

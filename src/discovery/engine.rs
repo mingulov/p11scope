@@ -14396,6 +14396,31 @@ impl Engine {
             })
     }
 
+    /// Deferral module-table flag identity: `ScannedTable::eq` deliberately
+    /// ignores `live_return`/`manifest_supported` (admission-union
+    /// semantics), but the merge reads them, so leg 2 compares them
+    /// separately. Stability needs no such conjunct: flags only grow by
+    /// union over the same raw modules, which is already a rebuild
+    /// fixpoint, and stability gates the rebuild, never the merge.
+    fn table_flags_match_for_deferral(
+        candidate: &[ReconciledModule],
+        committed: &[ReconciledModule],
+    ) -> bool {
+        candidate.len() == committed.len()
+            && candidate.iter().zip(committed.iter()).all(|(left, right)| {
+                left.scanned.tables.len() == right.scanned.tables.len()
+                    && left
+                        .scanned
+                        .tables
+                        .iter()
+                        .zip(right.scanned.tables.iter())
+                        .all(|(left, right)| {
+                            left.live_return == right.live_return
+                                && left.manifest_supported == right.manifest_supported
+                        })
+            })
+    }
+
     /// The one complete finalization for a candidate whose links were already
     /// mutated. It never short-circuits and never returns: a lost generation
     /// downgrades the disposition and cleans up, it does not unwind.
@@ -14800,6 +14825,8 @@ impl Engine {
         // provenance so neither side pays for the other.
         let pins_reproduced =
             commit_provenance && Self::pins_match_for_deferral(&candidate.pinned, &self.pinned);
+        let table_flags_reproduced = commit_provenance
+            && Self::table_flags_match_for_deferral(&candidate.modules, &self.modules);
         let commit_reproduced = commit_provenance
             && plan_reproduced
             && modules_reproduced
@@ -14807,7 +14834,8 @@ impl Engine {
             && fallbacks_reproduced
             && claims_reproduced
             && tables_reproduced
-            && pins_reproduced;
+            && pins_reproduced
+            && table_flags_reproduced;
         // Committing a full rebuild with no post-build withdrawal installs
         // rebuild output only when the candidate actually converged: the
         // rebuild reads committed-plan reuse state, so a commit can move it
@@ -14880,6 +14908,11 @@ impl Engine {
         // proof alive. Successful stationary loader finalization may reseed.
         self.loader_plan_cache = None;
         let publication = if defer_publication {
+            // Tripwire: the only revision bump between the leg-1 snapshot
+            // and this gate is the commit's own install, so a future bump
+            // inserted in between fails loudly instead of deferring over
+            // dirtied inputs.
+            debug_assert_eq!(self.facts_revision, revision_before_commit + 1);
             self.published_facts_revision = self.facts_revision;
             Ok(())
         } else {
@@ -15060,6 +15093,9 @@ impl Engine {
             return false;
         }
         self.note_facts_mutated();
+        // The latch mutates plan state outside commits; the committed plan
+        // is no longer rebuild output, so stability must not survive it.
+        self.plan_rebuild_stable = false;
         self.discovery.module_ambiguous = self.plan.module_ambiguous as u64;
         true
     }

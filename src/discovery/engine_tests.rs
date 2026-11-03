@@ -2583,6 +2583,23 @@ fn publication_reuse_preserves_later_ambiguity() {
     assert_eq!(engine.published_facts_revision, engine.facts_revision);
 }
 
+/// The ambiguity latch mutates plan state outside commits, so it clears
+/// rebuild stability like any other committed-plan mutation.
+#[test]
+fn ambiguity_latch_clears_rebuild_stability() {
+    let (mut engine, raw) = retained_publication_engine(215, 1);
+    apply_publication_candidate(&mut engine, &raw);
+    let mut shared = engine.plan.slots[0].clone();
+    shared.module_ids.push(plan::ModuleId(99));
+    let candidate = plan::AttachPlan::from_slots(vec![shared]);
+    engine.plan_rebuild_stable = true;
+    assert!(engine.latch_candidate_ambiguity(&candidate));
+    assert!(
+        !engine.plan_rebuild_stable,
+        "the latch clears rebuild stability"
+    );
+}
+
 /// One live rebuild of `raw`, committed and published the way an accepted
 /// candidate is; returns its link delta.
 fn commit_live_rebuild(engine: &mut Engine, raw: &ScannedModule) -> plan::AttachDelta {

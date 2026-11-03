@@ -9,7 +9,7 @@
 //!
 //! Conventions:
 //! - Every target-memory access goes through caller-supplied `FnMut`
-//!   readers: `read_word(addr)` reads one target word (`W` bytes,
+//!   readers: `reader.read_word(addr, layout)` reads one target word (`W` bytes,
 //!   zero-extended) and `read_bytes(addr, buf)` reads exactly `buf.len()`
 //!   bytes. `Err(())` is a failed read, distinct from any value including
 //!   zero. Value readers are invoked at most once per eligible slot; the streamed
@@ -480,7 +480,7 @@ fn read_classified_value(
     ptr: u64,
     len: u64,
     layout: LinuxLayout,
-    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    reader: &mut impl crate::WordReader,
     read_bytes: &mut impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> Result<u16, u8> {
     match kind {
@@ -513,7 +513,9 @@ fn read_classified_value(
             Ok(safe_curve_code(curve))
         }
         _ => {
-            let word = read_word(ptr).map_err(|()| attr_status::UNREADABLE)?;
+            let word = reader
+                .read_word(ptr, layout)
+                .map_err(|()| attr_status::UNREADABLE)?;
             // Width discipline: ia32 readers zero-extend; a high-bit word
             // where ia32 allows none is refused, never narrowed.
             if layout == LinuxLayout::Ilp32 && word > u64::from(u32::MAX) {
@@ -620,7 +622,7 @@ pub fn apply_null_mechanism_cancel(
 pub fn classify_derive_mechanism(
     mechanism_ptr: u64,
     layout: LinuxLayout,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
 ) -> DeriveEntry {
     if mechanism_ptr == 0 {
         return DeriveEntry::Unavailable;
@@ -628,7 +630,7 @@ pub fn classify_derive_mechanism(
     if target_word_end(mechanism_ptr, layout).is_none() {
         return DeriveEntry::Unavailable;
     }
-    let mechanism = match read_word(mechanism_ptr) {
+    let mechanism = match reader.read_word(mechanism_ptr, layout) {
         Ok(word) => word,
         Err(()) => return DeriveEntry::Unavailable,
     };
@@ -648,9 +650,9 @@ pub fn capture_derive_entry(
     mechanism_ptr: u64,
     out5_ptr: u64,
     layout: LinuxLayout,
-    read_word: impl FnMut(u64) -> Result<u64, ()>,
+    reader: impl crate::WordReader,
 ) -> (DeriveEntry, Option<u64>) {
-    let entry = classify_derive_mechanism(mechanism_ptr, layout, read_word);
+    let entry = classify_derive_mechanism(mechanism_ptr, layout, reader);
     match entry {
         DeriveEntry::Accepted(_) => (entry, Some(out5_ptr)),
         DeriveEntry::Unavailable => (entry, None),
@@ -713,7 +715,7 @@ pub fn capture_return_handles(
     rv: u64,
     authority: ReturnAuthority,
     layout: LinuxLayout,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
 ) -> (ReturnHandlesVerdict, [u64; 2]) {
     let mut statuses = [handle_status::ABSENT; 2];
     let mut words = [0u64; 2];
@@ -785,7 +787,7 @@ pub fn capture_return_handles(
     let mut i = 0;
     while i < 2 {
         if readable[i] {
-            match read_word(result_ptrs[i]) {
+            match reader.read_word(result_ptrs[i], layout) {
                 Err(()) => statuses[i] = handle_status::UNREADABLE,
                 Ok(0) => statuses[i] = handle_status::INVALID_ZERO,
                 Ok(word) => {
@@ -835,7 +837,7 @@ pub fn capture_find_return(
     rv: u64,
     authority: ReturnAuthority,
     layout: LinuxLayout,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
 ) -> (FindVerdict, [u64; 8]) {
     let refused = |flags: u8| {
         (
@@ -855,7 +857,7 @@ pub fn capture_find_return(
     if count_ptr == 0 || target_word_end(count_ptr, layout).is_none() {
         return refused(find_flag::INVALID_COUNT);
     }
-    let count = match read_word(count_ptr) {
+    let count = match reader.read_word(count_ptr, layout) {
         Ok(count) => count,
         Err(()) => return refused(find_flag::INVALID_COUNT),
     };
@@ -889,7 +891,7 @@ pub fn capture_find_return(
             Some(addr) => addr,
             None => return refused(find_flag::INVALID_SPAN),
         };
-        match read_word(addr) {
+        match reader.read_word(addr, layout) {
             Err(()) => {
                 statuses[i as usize] = handle_status::UNREADABLE;
                 flags |= find_flag::UNREADABLE_ELEMENT;
@@ -906,7 +908,7 @@ pub fn capture_find_return(
         }
         i += 1;
     }
-    match read_word(count_ptr) {
+    match reader.read_word(count_ptr, layout) {
         Ok(stable) if stable == count => (),
         _ => return refused(find_flag::CHANGED_COUNT),
     }
@@ -933,7 +935,7 @@ pub fn inspect_request_template(
     count: u64,
     peer: Option<(u64, u64)>,
     layout: LinuxLayout,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
     mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> AttributeListOutcome {
     let mut outcome = AttributeListOutcome {
@@ -992,7 +994,7 @@ pub fn inspect_request_template(
             i += 1;
             continue;
         };
-        let selector = match read_word(sel_addr) {
+        let selector = match reader.read_word(sel_addr, layout) {
             Ok(selector) => selector,
             Err(()) => {
                 outcome.flags |= attr_list_flag::HEADER_READ_FAILURE;
@@ -1004,7 +1006,7 @@ pub fn inspect_request_template(
             i += 1;
             continue;
         };
-        let ptr = match read_word(ptr_addr) {
+        let ptr = match reader.read_word(ptr_addr, layout) {
             Ok(ptr) => ptr,
             Err(()) => {
                 outcome.cells[slot] = AttrCell {
@@ -1017,7 +1019,7 @@ pub fn inspect_request_template(
                 continue;
             }
         };
-        let len = match read_word(len_addr) {
+        let len = match reader.read_word(len_addr, layout) {
             Ok(len) => len,
             Err(()) => {
                 outcome.cells[slot] = AttrCell {
@@ -1058,7 +1060,7 @@ pub fn inspect_request_template(
                         j += 1;
                         continue;
                     };
-                    let selector = match read_word(sel_addr) {
+                    let selector = match reader.read_word(sel_addr, layout) {
                         Ok(selector) => selector,
                         Err(()) => {
                             outcome.flags |= attr_list_flag::HEADER_READ_FAILURE;
@@ -1070,7 +1072,10 @@ pub fn inspect_request_template(
                         j += 1;
                         continue;
                     };
-                    let peer_value = match (read_word(ptr_addr), read_word(len_addr)) {
+                    let peer_value = match (
+                        reader.read_word(ptr_addr, layout),
+                        reader.read_word(len_addr, layout),
+                    ) {
                         (Ok(ptr), Ok(len)) => (ptr, len),
                         _ => {
                             outcome.flags |= attr_list_flag::HEADER_READ_FAILURE;
@@ -1214,7 +1219,7 @@ pub fn inspect_request_template(
             ptrs[slot],
             lens[slot],
             layout,
-            &mut read_word,
+            &mut reader,
             &mut read_bytes,
         );
         let classified = match read {
@@ -1244,9 +1249,9 @@ pub fn inspect_request_template(
             }
         };
         match (
-            read_word(sel_addr),
-            read_word(ptr_addr),
-            read_word(len_addr),
+            reader.read_word(sel_addr, layout),
+            reader.read_word(ptr_addr, layout),
+            reader.read_word(len_addr, layout),
         ) {
             (Ok(sel), Ok(ptr), Ok(len))
                 if sel == selectors[slot] && ptr == ptrs[slot] && len == lens[slot] =>
@@ -1298,7 +1303,7 @@ pub fn capture_get_entry(
     count: u64,
     layout: LinuxLayout,
     state: &mut GetEntryState,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
 ) -> GetEntryVerdict {
     *state = GetEntryState::default();
     let mut verdict = GetEntryVerdict {
@@ -1344,7 +1349,7 @@ pub fn capture_get_entry(
             i += 1;
             continue;
         };
-        let selector = match read_word(sel_addr) {
+        let selector = match reader.read_word(sel_addr, layout) {
             Ok(selector) => selector,
             Err(()) => {
                 verdict.entry_flags |= attr_list_flag::HEADER_READ_FAILURE;
@@ -1356,7 +1361,7 @@ pub fn capture_get_entry(
             i += 1;
             continue;
         };
-        let ptr = match read_word(ptr_addr) {
+        let ptr = match reader.read_word(ptr_addr, layout) {
             Ok(ptr) => ptr,
             Err(()) => {
                 verdict.entry_flags |= attr_list_flag::HEADER_READ_FAILURE;
@@ -1364,7 +1369,7 @@ pub fn capture_get_entry(
                 continue;
             }
         };
-        let len = match read_word(len_addr) {
+        let len = match reader.read_word(len_addr, layout) {
             Ok(len) => len,
             Err(()) => {
                 verdict.entry_flags |= attr_list_flag::HEADER_READ_FAILURE;
@@ -1400,7 +1405,7 @@ pub fn capture_get_return(
     rv: u64,
     authority: ReturnAuthority,
     layout: LinuxLayout,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
     mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> AttributeListOutcome {
     let mut outcome = AttributeListOutcome {
@@ -1461,9 +1466,9 @@ pub fn capture_get_return(
             continue;
         };
         let header = (
-            read_word(sel_addr),
-            read_word(ptr_addr),
-            read_word(len_addr),
+            reader.read_word(sel_addr, layout),
+            reader.read_word(ptr_addr, layout),
+            reader.read_word(len_addr, layout),
         );
         let (Ok(sel), Ok(ptr), Ok(len)) = header else {
             outcome.cells[i as usize] = AttrCell {
@@ -1631,7 +1636,7 @@ pub fn capture_get_return(
             i += 1;
             continue;
         };
-        let read = read_classified_value(kind, ptr, len, layout, &mut read_word, &mut read_bytes);
+        let read = read_classified_value(kind, ptr, len, layout, &mut reader, &mut read_bytes);
         let classified = match read {
             Ok(value) => Some(value),
             Err(attr_status::UNREADABLE) => {
@@ -1657,9 +1662,9 @@ pub fn capture_get_return(
             }
         };
         match (
-            read_word(sel_addr),
-            read_word(ptr_addr),
-            read_word(len_addr),
+            reader.read_word(sel_addr, layout),
+            reader.read_word(ptr_addr, layout),
+            reader.read_word(len_addr, layout),
         ) {
             (Ok(sel), Ok(ptr2), Ok(len2))
                 if safe_attribute_kind(sel) == Some(kind) && ptr2 == ptr && len2 == len =>
@@ -1769,7 +1774,7 @@ pub fn alias_scan_core(
     ptr: u64,
     len: u64,
     layout: LinuxLayout,
-    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    reader: &mut impl crate::WordReader,
 ) -> (bool, u8) {
     let Some(table) = attribute_table_span(count, layout) else {
         return (false, 0);
@@ -1786,20 +1791,20 @@ pub fn alias_scan_core(
             if let Some((sel_addr, ptr_addr, len_addr)) =
                 attribute_header_addresses(base, j, layout)
             {
-                match read_word(sel_addr) {
+                match reader.read_word(sel_addr, layout) {
                     Ok(sel) if safe_attribute_kind(sel).is_some() => {
-                        let other_ptr = match read_word(ptr_addr) {
+                        let other_ptr = match reader.read_word(ptr_addr, layout) {
                             Ok(value) => value,
                             Err(()) => {
                                 // Preserve the selected header's length read
                                 // even when its pointer word is unreadable.
-                                let _ = read_word(len_addr);
+                                let _ = reader.read_word(len_addr, layout);
                                 flags |= attr_list_flag::HEADER_READ_FAILURE;
                                 j += 1;
                                 continue;
                             }
                         };
-                        match read_word(len_addr) {
+                        match reader.read_word(len_addr, layout) {
                             Ok(other_len) => {
                                 if (other_ptr | other_len) != 0
                                     && validate_target_span(other_ptr, other_len, layout).is_some()
@@ -1833,10 +1838,10 @@ pub fn alias_scan_packed(
     skip_tag: u64,
     ptr: u64,
     len: u64,
-    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    reader: &mut impl crate::WordReader,
 ) -> u64 {
     let (skip, layout) = decode_alias_skip_layout(skip_tag);
-    let (alias, flags) = alias_scan_core(base, count, skip, ptr, len, layout, read_word);
+    let (alias, flags) = alias_scan_core(base, count, skip, ptr, len, layout, reader);
     pack_alias_scan(alias, flags)
 }
 
@@ -1852,12 +1857,7 @@ fn request_alias_scan(
     ptr: u64,
     len: u64,
     layout: LinuxLayout,
-    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_word: &mut impl FnMut(
-        u64,
-    ) -> Result<
-        u64,
-        (),
-    >,
+    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] reader: &mut impl crate::WordReader,
 ) -> (bool, u8) {
     #[cfg(target_arch = "bpf")]
     {
@@ -1874,7 +1874,7 @@ fn request_alias_scan(
     }
     #[cfg(not(target_arch = "bpf"))]
     {
-        alias_scan_core(base, count, skip, ptr, len, layout, read_word)
+        alias_scan_core(base, count, skip, ptr, len, layout, reader)
     }
 }
 
@@ -1959,10 +1959,10 @@ pub fn stable_cell_core(
     ptr: u64,
     len: u64,
     layout: LinuxLayout,
-    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    reader: &mut impl crate::WordReader,
     read_bytes: &mut impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> (u8, u16, bool, u32) {
-    let classified = read_classified_value(kind, ptr, len, layout, read_word, read_bytes);
+    let classified = read_classified_value(kind, ptr, len, layout, reader, read_bytes);
     let value = match classified {
         Ok(value) => value,
         Err(attr_status::UNSUPPORTED) => 0,
@@ -1977,9 +1977,9 @@ pub fn stable_cell_core(
     // helper calls (the LLVM BPF backend miscompiles outlined
     // compare-across-call shapes with `R1 !read_ok`; M5). Read order and
     // failure priority are unchanged.
-    let sel_word = read_word(sel_addr);
-    let ptr_word = read_word(ptr_addr);
-    let len_word = read_word(len_addr);
+    let sel_word = reader.read_word(sel_addr, layout);
+    let ptr_word = reader.read_word(ptr_addr, layout);
+    let len_word = reader.read_word(len_addr, layout);
     let (selector_read, selector_same) = match sel_word {
         Ok(sel) => (true, safe_attribute_kind(sel) == Some(kind)),
         Err(()) => (false, false),
@@ -2089,14 +2089,14 @@ pub fn stable_cell_packed(
     kind_layout: u64,
     ptr: u64,
     len: u64,
-    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    reader: &mut impl crate::WordReader,
     read_bytes: &mut impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> u64 {
     let Some((kind, layout)) = decode_stable_kind_layout(kind_layout) else {
         return stable_cell_poison();
     };
     let (status, value, write_value, contrib) =
-        stable_cell_core(base, index, kind, ptr, len, layout, read_word, read_bytes);
+        stable_cell_core(base, index, kind, ptr, len, layout, reader, read_bytes);
     pack_stable_cell(status, value, write_value, contrib)
 }
 
@@ -2113,12 +2113,7 @@ fn stable_attribute_cell(
     len: u64,
     layout: LinuxLayout,
     out: &mut ObjectAttributeWire,
-    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_word: &mut impl FnMut(
-        u64,
-    ) -> Result<
-        u64,
-        (),
-    >,
+    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] reader: &mut impl crate::WordReader,
     #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_bytes: &mut impl FnMut(
         u64,
         &mut [u8],
@@ -2149,7 +2144,7 @@ fn stable_attribute_cell(
     #[cfg(not(target_arch = "bpf"))]
     {
         let (status, value, write_value, contrib) =
-            stable_cell_core(base, index, kind, ptr, len, layout, read_word, read_bytes);
+            stable_cell_core(base, index, kind, ptr, len, layout, reader, read_bytes);
         out.status = status;
         if write_value {
             out.value = value;
@@ -2282,7 +2277,7 @@ fn request_cell_core(
     index: u64,
     peer: Option<(u64, u64)>,
     layout: LinuxLayout,
-    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    reader: &mut impl crate::WordReader,
     #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_bytes: &mut impl FnMut(
         u64,
         &mut [u8],
@@ -2299,7 +2294,7 @@ fn request_cell_core(
         facts.list_flags = attr_list_flag::HEADER_READ_FAILURE;
         return facts;
     };
-    let selector = match read_word(selector_address) {
+    let selector = match reader.read_word(selector_address, layout) {
         Ok(selector) => selector,
         Err(()) => {
             facts.list_flags = attr_list_flag::HEADER_READ_FAILURE;
@@ -2310,7 +2305,7 @@ fn request_cell_core(
         return facts;
     };
     facts.kind = safe_kind_code(kind);
-    let ptr = match read_word(pointer_address) {
+    let ptr = match reader.read_word(pointer_address, layout) {
         Ok(ptr) => ptr,
         Err(()) => {
             facts.status = attr_status::UNREADABLE;
@@ -2318,7 +2313,7 @@ fn request_cell_core(
             return facts;
         }
     };
-    let len = match read_word(length_address) {
+    let len = match reader.read_word(length_address, layout) {
         Ok(len) => len,
         Err(()) => {
             facts.status = attr_status::UNREADABLE;
@@ -2333,12 +2328,11 @@ fn request_cell_core(
     } else if validate_target_span(ptr, len, layout).is_none() {
         facts.status = attr_status::INVALID_SPAN;
     } else {
-        let (mut alias, flags) =
-            request_alias_scan(base, count, index, ptr, len, layout, read_word);
+        let (mut alias, flags) = request_alias_scan(base, count, index, ptr, len, layout, reader);
         facts.list_flags |= flags;
         if let Some((peer_base, peer_count)) = peer {
             let (a, f) =
-                request_alias_scan(peer_base, peer_count, u64::MAX, ptr, len, layout, read_word);
+                request_alias_scan(peer_base, peer_count, u64::MAX, ptr, len, layout, reader);
             alias |= a;
             facts.list_flags |= f;
         }
@@ -2358,7 +2352,7 @@ fn request_cell_core(
             });
             #[cfg(not(target_arch = "bpf"))]
             let (status, value, write_value, contrib) =
-                stable_cell_core(base, index, kind, ptr, len, layout, read_word, read_bytes);
+                stable_cell_core(base, index, kind, ptr, len, layout, reader, read_bytes);
             facts.status = status;
             if write_value {
                 facts.value = value;
@@ -2379,7 +2373,7 @@ pub fn request_cell_packed(
     tag: u64,
     peer_base: u64,
     peer_count: u64,
-    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    reader: &mut impl crate::WordReader,
     read_bytes: &mut impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> u64 {
     let Some((index, layout, has_peer)) = decode_request_cell_tag(tag) else {
@@ -2402,7 +2396,7 @@ pub fn request_cell_packed(
         index,
         has_peer.then_some((peer_base, peer_count)),
         layout,
-        read_word,
+        reader,
         read_bytes,
     ))
     .unwrap_or_else(request_cell_poison)
@@ -2416,12 +2410,7 @@ fn request_cell(
     index: u64,
     peer: Option<(u64, u64)>,
     layout: LinuxLayout,
-    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_word: &mut impl FnMut(
-        u64,
-    ) -> Result<
-        u64,
-        (),
-    >,
+    #[cfg_attr(target_arch = "bpf", allow(unused_variables))] reader: &mut impl crate::WordReader,
     #[cfg_attr(target_arch = "bpf", allow(unused_variables))] read_bytes: &mut impl FnMut(
         u64,
         &mut [u8],
@@ -2441,9 +2430,7 @@ fn request_cell(
     #[cfg(target_arch = "bpf")]
     let packed = unsafe { p11_request_cell(base, count, tag, peer_base, peer_count) };
     #[cfg(not(target_arch = "bpf"))]
-    let packed = request_cell_packed(
-        base, count, tag, peer_base, peer_count, read_word, read_bytes,
-    );
+    let packed = request_cell_packed(base, count, tag, peer_base, peer_count, reader, read_bytes);
     unpack_request_cell(packed).unwrap_or(RequestCellFacts {
         list_flags: attr_list_flag::HEADER_READ_FAILURE,
         ..RequestCellFacts::default()
@@ -2461,7 +2448,7 @@ pub fn inspect_request_template_into(
     peer: Option<(u64, u64)>,
     layout: LinuxLayout,
     out: &mut ObjectAttributeListWire,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
     mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> u32 {
     clear_attribute_list(out);
@@ -2493,7 +2480,7 @@ pub fn inspect_request_template_into(
     }
     // Keep peer header failures visible even if no own value is viable.
     if let Some((base, count)) = peer {
-        out.flags |= request_alias_scan(base, count, u64::MAX, 0, 0, layout, &mut read_word).1;
+        out.flags |= request_alias_scan(base, count, u64::MAX, 0, 0, layout, &mut reader).1;
     }
     let mut contributed = 0;
     let mut i = 0;
@@ -2507,7 +2494,7 @@ pub fn inspect_request_template_into(
             i,
             peer,
             layout,
-            &mut read_word,
+            &mut reader,
             &mut read_bytes,
         );
         cell.kind = facts.kind;
@@ -2528,7 +2515,7 @@ pub fn capture_get_entry_into(
     count: u64,
     layout: LinuxLayout,
     side: &mut crate::object_wire::ObjectStart,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
 ) -> GetEntryVerdict {
     use crate::object_wire::{ObjectAttributeSlot, GET_ENTRY_FLAGS_MASK, GET_ENTRY_FLAGS_SHIFT};
     side.get_template_base = 0;
@@ -2564,7 +2551,7 @@ pub fn capture_get_entry_into(
                     i += 1;
                     continue;
                 };
-                let selector = match read_word(sel_addr) {
+                let selector = match reader.read_word(sel_addr, layout) {
                     Ok(sel) => sel,
                     Err(()) => {
                         verdict.entry_flags |= attr_list_flag::HEADER_READ_FAILURE;
@@ -2576,7 +2563,7 @@ pub fn capture_get_entry_into(
                     i += 1;
                     continue;
                 };
-                let ptr = match read_word(ptr_addr) {
+                let ptr = match reader.read_word(ptr_addr, layout) {
                     Ok(ptr) => ptr,
                     Err(()) => {
                         verdict.entry_flags |= attr_list_flag::HEADER_READ_FAILURE;
@@ -2584,7 +2571,7 @@ pub fn capture_get_entry_into(
                         continue;
                     }
                 };
-                let len = match read_word(len_addr) {
+                let len = match reader.read_word(len_addr, layout) {
                     Ok(len) => len,
                     Err(()) => {
                         verdict.entry_flags |= attr_list_flag::HEADER_READ_FAILURE;
@@ -2614,6 +2601,204 @@ pub fn capture_get_entry_into(
     verdict
 }
 
+/// Per-slot control flow of the outlined Get-return classifier below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GetSlotFlow {
+    /// No selected kind at this slot: stop the scan.
+    Break,
+    /// Slot classified without contribution: advance to the next slot.
+    Continue,
+    /// Slot classified: advance, merging the returned contributions.
+    Done,
+}
+
+/// Tag bit for the layout in a packed Get-slot scalar (see below).
+const GET_SLOT_LAYOUT_BIT: u64 = 1 << 8;
+
+/// Pack a slot index (<8 from the scan loop) with its layout into the one
+/// scalar the outlined classifier takes: BPF subprograms fit five
+/// registers, so the index cannot travel as its own argument. Only the
+/// low three bits travel, so the decoded index is structurally below 8
+/// and needs no checked projection (which would emit a cold panic path
+/// into the object and defeat old-verifier bounds tracking).
+#[inline(always)]
+fn encode_get_slot_layout(slot_index: usize, layout: LinuxLayout) -> u64 {
+    let tag = match layout {
+        LinuxLayout::Lp64 => 0,
+        LinuxLayout::Ilp32 => GET_SLOT_LAYOUT_BIT,
+    };
+    (slot_index as u64 & 0x07) | tag
+}
+
+/// Decode `encode_get_slot_layout`. Total: every input decodes to an
+/// in-range index plus a layout.
+#[inline(always)]
+fn decode_get_slot_layout(code: u64) -> (usize, LinuxLayout) {
+    let layout = if code & GET_SLOT_LAYOUT_BIT == 0 {
+        LinuxLayout::Lp64
+    } else {
+        LinuxLayout::Ilp32
+    };
+    ((code & 0x07) as usize, layout)
+}
+
+/// Pack the outlined classifier's `(flow, contributions)` into the one
+/// `u64` it returns: the low two bits carry the flow discriminant, the
+/// rest the contribution flags. A tuple return would cross the subprogram
+/// boundary by hidden out-pointer (sret): the machine args would shift up
+/// one register against the BTF prototype, and old kernels, which check
+/// static-subprogram arguments against BTF struct types, refuse the
+/// misaligned pointers. The scalar keeps BTF and machine code identical.
+#[inline(always)]
+fn encode_get_slot_result(flow: GetSlotFlow, contributed: u32) -> u64 {
+    let tag = match flow {
+        GetSlotFlow::Break => 0,
+        GetSlotFlow::Continue => 1,
+        GetSlotFlow::Done => 2,
+    };
+    (u64::from(contributed) << 2) | tag
+}
+
+/// Decode `encode_get_slot_result`. Total: the unreachable tag fails
+/// closed by stopping the scan.
+#[inline(always)]
+fn decode_get_slot_result(code: u64) -> (GetSlotFlow, u32) {
+    let flow = match code & 0x03 {
+        0 => GetSlotFlow::Break,
+        1 => GetSlotFlow::Continue,
+        2 => GetSlotFlow::Done,
+        _ => GetSlotFlow::Break,
+    };
+    (flow, (code >> 2) as u32)
+}
+
+/// One retained Get slot's header recheck, status classification and
+/// value establishment. Outlined (`#[inline(never)]`) so the verifier
+/// explores one slot's states once instead of multiplying them across
+/// all eight scan iterations: on 7.4 the inlined walker exceeds the
+/// million-instruction budget inside `object_emit_get_attributes`.
+/// Reads, order, status priority and contributions are exactly the
+/// inlined sequence; the host read-log suites pin them. Returns the
+/// packed `encode_get_slot_result` scalar, never a tuple: see there.
+#[inline(never)]
+fn classify_get_slot<R, B>(
+    side: &crate::object_wire::ObjectStart,
+    slot_layout: u64,
+    out: &mut ObjectAttributeListWire,
+    reader: &mut R,
+    read_bytes: &mut B,
+) -> u64
+where
+    R: crate::WordReader,
+    B: FnMut(u64, &mut [u8]) -> Result<(), ()>,
+{
+    let (slot_index, layout) = decode_get_slot_layout(slot_layout);
+    // Structurally in range: the codec masks to three bits.
+    let slot = &side.slots[slot_index];
+    let Some(kind) = kind_from_code(slot.kind) else {
+        return encode_get_slot_result(GetSlotFlow::Break, 0);
+    };
+    let n = side.get_inspected.min(8);
+    let i = u64::from(slot.slot_index);
+    if i >= u64::from(n) {
+        return encode_get_slot_result(GetSlotFlow::Continue, 0);
+    }
+    // Opaque mask: 6.6 does not narrow `i` from the data-dependent
+    // `i < n` comparison above (its reg-reg bounds need a constant
+    // side), so bound the index structurally. `black_box` keeps LLVM
+    // from folding the mask away as redundant (`i < n <= 8` already);
+    // the verifier sees `& 7` and bounds every use to [0,7], keeping
+    // one ranged state instead of an eight-way branch fan-out.
+    let j = core::hint::black_box(i) & 7;
+    let Some(cell) = out.cells.get_mut(j as usize) else {
+        return encode_get_slot_result(GetSlotFlow::Continue, 0);
+    };
+    // Preserve the reference protocol's first retained slot per index.
+    if cell.kind != 0 {
+        return encode_get_slot_result(GetSlotFlow::Continue, 0);
+    }
+    cell.kind = slot.kind;
+    let Some((sel_addr, ptr_addr, len_addr)) =
+        attribute_header_addresses(side.get_template_base, i, layout)
+    else {
+        cell.status = attr_status::INVALID_SPAN;
+        return encode_get_slot_result(GetSlotFlow::Continue, 0);
+    };
+    let header = (
+        reader.read_word(sel_addr, layout),
+        reader.read_word(ptr_addr, layout),
+        reader.read_word(len_addr, layout),
+    );
+    let (Ok(sel), Ok(ptr), Ok(len)) = header else {
+        cell.status = attr_status::UNREADABLE;
+        return encode_get_slot_result(GetSlotFlow::Continue, 0);
+    };
+    if sel != selector_for_kind(kind) {
+        cell.status = attr_status::CHANGED;
+        return encode_get_slot_result(GetSlotFlow::Done, object_flag::CHANGED_METADATA);
+    }
+    if slot.value_ptr == 0 {
+        cell.status = attr_status::SIZE_ONLY;
+        return encode_get_slot_result(GetSlotFlow::Done, 0);
+    }
+    if ptr != slot.value_ptr {
+        cell.status = attr_status::CHANGED;
+        return encode_get_slot_result(GetSlotFlow::Done, object_flag::CHANGED_METADATA);
+    }
+    if len == unavailable_len(layout) {
+        cell.status = attr_status::UNAVAILABLE;
+        return encode_get_slot_result(GetSlotFlow::Done, 0);
+    }
+    if slot.entry_capacity < min_exact_len(kind, layout) {
+        cell.status = attr_status::INSUFFICIENT_CAPACITY;
+        return encode_get_slot_result(GetSlotFlow::Done, 0);
+    }
+    if len > slot.entry_capacity || !valid_safe_attribute_length(kind, len, layout) {
+        cell.status = attr_status::INVALID_LENGTH;
+        return encode_get_slot_result(GetSlotFlow::Done, 0);
+    }
+    if validate_target_span(ptr, len, layout).is_none() {
+        cell.status = attr_status::INVALID_SPAN;
+        return encode_get_slot_result(GetSlotFlow::Done, 0);
+    }
+    let mut alias = spans_overlap(
+        ptr,
+        len,
+        side.get_template_base,
+        side.inspected_header_end
+            .saturating_sub(side.get_template_base),
+    );
+    let mut j = 0;
+    while j < 8 {
+        let other = &side.slots[j];
+        if !slot_kind_selected(other.kind) {
+            break;
+        }
+        if j != slot_index
+            && alias_capacity_hit(ptr, len, other.value_ptr, other.entry_capacity, layout)
+        {
+            alias = true;
+        }
+        j += 1;
+    }
+    if alias {
+        cell.status = attr_status::ALIAS;
+        return encode_get_slot_result(GetSlotFlow::Done, object_flag::ALIAS);
+    }
+    let contributed = stable_attribute_cell(
+        side.get_template_base,
+        i,
+        kind,
+        ptr,
+        len,
+        layout,
+        cell,
+        reader,
+        read_bytes,
+    );
+    encode_get_slot_result(GetSlotFlow::Done, contributed)
+}
+
 /// Read-only streamed Get return. Alias checks cover every retained entry
 /// capacity, including neighbors whose returned length would be rejected.
 /// No mutable reference or returned-length scratch is fabricated from `side`.
@@ -2625,7 +2810,7 @@ pub fn capture_get_return_into(
     authority: ReturnAuthority,
     layout: LinuxLayout,
     out: &mut ObjectAttributeListWire,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
     mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> u32 {
     use crate::object_wire::{GET_ENTRY_FLAGS_MASK, GET_ENTRY_FLAGS_SHIFT};
@@ -2646,101 +2831,22 @@ pub fn capture_get_return_into(
     let mut contributed = 0;
     let mut k = 0;
     while k < 8 {
-        let slot = &side.slots[k];
         // Dense selected prefix is produced by entry; do not inspect or read
         // beyond the first unused slot even if stale trailing bytes exist.
-        let Some(kind) = kind_from_code(slot.kind) else {
-            break;
-        };
-        let i = u64::from(slot.slot_index);
-        if i >= u64::from(n) {
-            k += 1;
-            continue;
+        // The per-slot body is outlined (see `classify_get_slot`): the loop
+        // here carries only the index and contributions.
+        let (flow, contrib) = decode_get_slot_result(classify_get_slot(
+            side,
+            encode_get_slot_layout(k, layout),
+            out,
+            &mut reader,
+            &mut read_bytes,
+        ));
+        contributed |= contrib;
+        match flow {
+            GetSlotFlow::Break => break,
+            GetSlotFlow::Continue | GetSlotFlow::Done => k += 1,
         }
-        // Use a finite checked projection as well as i<n: the BPF backend
-        // may lose the range fact through min8 and retained map metadata.
-        let Some(cell) = out.cells.get_mut(i as usize) else {
-            k += 1;
-            continue;
-        };
-        // Preserve the reference protocol's first retained slot per index.
-        if cell.kind != 0 {
-            k += 1;
-            continue;
-        }
-        cell.kind = slot.kind;
-        let Some((sel_addr, ptr_addr, len_addr)) =
-            attribute_header_addresses(side.get_template_base, i, layout)
-        else {
-            cell.status = attr_status::INVALID_SPAN;
-            k += 1;
-            continue;
-        };
-        let header = (
-            read_word(sel_addr),
-            read_word(ptr_addr),
-            read_word(len_addr),
-        );
-        let (Ok(sel), Ok(ptr), Ok(len)) = header else {
-            cell.status = attr_status::UNREADABLE;
-            k += 1;
-            continue;
-        };
-        if sel != selector_for_kind(kind) {
-            cell.status = attr_status::CHANGED;
-            contributed |= object_flag::CHANGED_METADATA;
-        } else if slot.value_ptr == 0 {
-            cell.status = attr_status::SIZE_ONLY;
-        } else if ptr != slot.value_ptr {
-            cell.status = attr_status::CHANGED;
-            contributed |= object_flag::CHANGED_METADATA;
-        } else if len == unavailable_len(layout) {
-            cell.status = attr_status::UNAVAILABLE;
-        } else if slot.entry_capacity < min_exact_len(kind, layout) {
-            cell.status = attr_status::INSUFFICIENT_CAPACITY;
-        } else if len > slot.entry_capacity || !valid_safe_attribute_length(kind, len, layout) {
-            cell.status = attr_status::INVALID_LENGTH;
-        } else if validate_target_span(ptr, len, layout).is_none() {
-            cell.status = attr_status::INVALID_SPAN;
-        } else {
-            let mut alias = spans_overlap(
-                ptr,
-                len,
-                side.get_template_base,
-                side.inspected_header_end
-                    .saturating_sub(side.get_template_base),
-            );
-            let mut j = 0;
-            while j < 8 {
-                let other = &side.slots[j];
-                if !slot_kind_selected(other.kind) {
-                    break;
-                }
-                if j != k
-                    && alias_capacity_hit(ptr, len, other.value_ptr, other.entry_capacity, layout)
-                {
-                    alias = true;
-                }
-                j += 1;
-            }
-            if alias {
-                cell.status = attr_status::ALIAS;
-                contributed |= object_flag::ALIAS;
-            } else {
-                contributed |= stable_attribute_cell(
-                    side.get_template_base,
-                    i,
-                    kind,
-                    ptr,
-                    len,
-                    layout,
-                    cell,
-                    &mut read_word,
-                    &mut read_bytes,
-                );
-            }
-        }
-        k += 1;
     }
     contributed
 }

@@ -5112,9 +5112,81 @@ fn probed_capture_entry(
     Ok((entry, reader_id))
 }
 
-/// Production byte probe: whether the linked entry reaches the request
-/// reader through real calls. The test-only `embedded_entry_reaches_reader`
-/// delegates here: malformed function info is an error, never a panic.
+/// Production byte probe: link the return root and locate the stable
+/// reader. Mirrors `probed_capture_entry`: every missing or ambiguous
+/// input is an error (a refusal), never a panic.
+fn probed_capture_return(
+    mut parsed: aya_obj::Object,
+) -> Result<(aya_obj::Function, u32), FlavorProbeError> {
+    let reader = "p11_stable_cell";
+    let mut matches = parsed
+        .functions
+        .values()
+        .filter(|function| function.name == reader);
+    let function = matches
+        .next()
+        .ok_or_else(|| FlavorProbeError::new("embedded Detailed object lacks stable reader"))?;
+    if matches.next().is_some() {
+        return Err(FlavorProbeError::new("ambiguous embedded stable reader"));
+    }
+    let reader_id = parsed
+        .btf
+        .as_ref()
+        .ok_or_else(|| FlavorProbeError::new("embedded object needs original BTF"))?
+        .id_by_type_name_kind(reader, aya_obj::btf::BtfKind::Func)
+        .map_err(|_| FlavorProbeError::new("embedded stable reader needs original BTF FUNC"))?;
+    if function.func_info.func_info.len() != 1 {
+        return Err(FlavorProbeError::new("ambiguous stable function info"));
+    }
+    if function.func_info.func_info[0].type_id != reader_id {
+        return Err(FlavorProbeError::new(
+            "stable reader function info must bind its original BTF FUNC",
+        ));
+    }
+    let entry = parsed
+        .programs
+        .get("p11_return")
+        .ok_or_else(|| FlavorProbeError::new("embedded Detailed object lacks return"))?;
+    let key = entry.function_key();
+    if parsed
+        .functions
+        .values()
+        .filter(|function| function.name == "p11_return")
+        .count()
+        != 1
+    {
+        return Err(FlavorProbeError::new("ambiguous embedded return function"));
+    }
+    if parsed
+        .functions
+        .get(&key)
+        .is_none_or(|function| function.name != "p11_return")
+    {
+        return Err(FlavorProbeError::new("ambiguous embedded return function"));
+    }
+    let text_sections = parsed
+        .functions
+        .keys()
+        .map(|(section, _)| *section)
+        .collect();
+    // Link only the return root. Inspect entry size independently, so changing
+    // an entry body cannot fabricate return-reader reachability.
+    parsed.programs.retain(|name, _| name == "p11_return");
+    parsed.relocate_calls(&text_sections).map_err(|error| {
+        FlavorProbeError::new(format!("embedded return calls do not relocate: {error}"))
+    })?;
+    let entry = parsed
+        .functions
+        .remove(&key)
+        .ok_or_else(|| FlavorProbeError::new("linked return went missing after relocation"))?;
+    Ok((entry, reader_id))
+}
+
+/// Production byte probe: whether the linked root reaches its reader
+/// through real calls. The entry side links the entry root against the
+/// request reader and the return side links the return root against the
+/// stable reader; the test-only `embedded_entry_reaches_reader` delegates
+/// here: malformed function info is an error, never a panic.
 fn probed_entry_reaches_reader(
     entry: &aya_obj::Function,
     reader_id: u32,
@@ -5173,9 +5245,13 @@ fn probed_entry_reaches_reader(
 
 /// Production byte probe: stubbed vs wired attribute capture from parsed
 /// bytes. The test-only `embedded_object_capture_is_stubbed` delegates
-/// here: the return adapter must match exactly and be small exactly when
-/// the entry root does not reach the request reader. Missing, ambiguous or
-/// half-wired evidence is an error (a refusal), never a panic.
+/// here: the return adapter must match exactly, and be stubbed exactly
+/// when the entry root does not reach the request reader. A return
+/// adapter is stubbed only when it is small (under 300 instructions)
+/// and blind (its root never reaches the stable reader): outlining for
+/// verifier headroom shrinks wired adapters without unwiring them.
+/// Missing, ambiguous or half-wired evidence is an error (a refusal),
+/// never a panic.
 fn probed_capture_is_stubbed(parsed: aya_obj::Object) -> Result<bool, FlavorProbeError> {
     let mut matches = parsed.functions.values().filter(|function| {
         embedded_adapter_symbol_matches(&function.name, "object_emit_get_attributes")
@@ -5192,9 +5268,17 @@ fn probed_capture_is_stubbed(parsed: aya_obj::Object) -> Result<bool, FlavorProb
             "embedded Detailed object has several exact return adapters",
         ));
     }
-    let emit_stub = emit < 300;
-    let (entry, reader_id) = probed_capture_entry(parsed)?;
+    let (entry, reader_id) = probed_capture_entry(parsed.clone())?;
     let entry_stub = !probed_entry_reaches_reader(&entry, reader_id)?;
+    // Big adapters are wired without further evidence (the historical
+    // rule); small ones must also prove blindness before they count as
+    // stubbed, so an outlined-but-wired adapter cannot misclassify.
+    let emit_stub = if emit < 300 {
+        let (ret, stable_id) = probed_capture_return(parsed)?;
+        !probed_entry_reaches_reader(&ret, stable_id)?
+    } else {
+        false
+    };
     if entry_stub != emit_stub {
         return Err(FlavorProbeError::new(
             "half-wired embedded object: the entry program and the return adapter disagree about attribute capture",
@@ -17969,16 +18053,19 @@ mod tests {
             .type_id = 0;
         refused(wrong_btf, "original BTF FUNC");
         let mut half_wired = parsed;
-        let body = &mut half_wired.functions.get_mut(&emit).unwrap().instructions;
-        let instruction = *body.last().unwrap();
-        body.resize(
-            if cfg!(feature = "stub-object-attributes") {
-                300
-            } else {
-                49
-            },
-            instruction,
-        );
+        let adapter = half_wired.functions.get_mut(&emit).unwrap();
+        if cfg!(feature = "stub-object-attributes") {
+            // Big-but-blind still disagrees with a stubbed entry.
+            let instruction = *adapter.instructions.last().unwrap();
+            adapter.instructions.resize(300, instruction);
+        } else {
+            // Blind the wired adapter: a lone exit reaches no reader, so
+            // the small return side probes stubbed against a wired entry.
+            let exit = *adapter.instructions.last().unwrap();
+            adapter.instructions.clear();
+            adapter.instructions.push(exit);
+            adapter.func_info.func_info.truncate(1);
+        }
         refused(half_wired, "half-wired embedded object");
     }
 
@@ -18172,16 +18259,19 @@ mod tests {
             .type_id = 0;
         refused(wrong_btf, "original BTF FUNC");
         let mut half_wired = parsed;
-        let body = &mut half_wired.functions.get_mut(&emit).unwrap().instructions;
-        let instruction = *body.last().unwrap();
-        body.resize(
-            if cfg!(feature = "stub-object-attributes") {
-                300
-            } else {
-                49
-            },
-            instruction,
-        );
+        let adapter = half_wired.functions.get_mut(&emit).unwrap();
+        if cfg!(feature = "stub-object-attributes") {
+            // Big-but-blind still disagrees with a stubbed entry.
+            let instruction = *adapter.instructions.last().unwrap();
+            adapter.instructions.resize(300, instruction);
+        } else {
+            // Blind the wired adapter: a lone exit reaches no reader, so
+            // the small return side probes stubbed against a wired entry.
+            let exit = *adapter.instructions.last().unwrap();
+            adapter.instructions.clear();
+            adapter.instructions.push(exit);
+            adapter.func_info.func_info.truncate(1);
+        }
         refused(half_wired, "half-wired embedded object");
     }
 
@@ -18635,6 +18725,7 @@ mod tests {
                 "pub(crate) fn embedded_flavor()",
                 "pub(crate) fn embedded_flavor_from_bytes(",
                 "fn probed_capture_entry(",
+                "fn probed_capture_return(",
                 "fn probed_entry_reaches_reader(",
                 "fn probed_capture_is_stubbed(",
                 "fn probed_unsafe_is_present(",

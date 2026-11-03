@@ -183,7 +183,7 @@ pub fn adapter_fill_return_control(
     mech_status: u32,
     mech: u64,
     gate: u32,
-    read_word: impl FnMut(u64) -> Result<u64, ()>,
+    reader: impl crate::WordReader,
 ) -> bool {
     let Some((layout, joined)) = decode_return_gate(gate) else {
         return false;
@@ -197,7 +197,7 @@ pub fn adapter_fill_return_control(
         mech_status,
         mech,
         joined,
-        read_word,
+        reader,
     )
 }
 
@@ -212,12 +212,12 @@ pub unsafe fn adapter_emit_find_control(
     row: Option<&ObjectDescriptorWire>,
     rv: u64,
     gate: u32,
-    read_word: impl FnMut(u64) -> Result<u64, ()>,
+    reader: impl crate::WordReader,
 ) -> bool {
     let Some((layout, joined)) = decode_return_gate(gate) else {
         return false;
     };
-    unsafe { adapter_emit_find(tail, side, descriptor, row, layout, rv, joined, read_word) }
+    unsafe { adapter_emit_find(tail, side, descriptor, row, layout, rv, joined, reader) }
 }
 
 /// Actual controlled Get body.
@@ -232,7 +232,7 @@ pub unsafe fn adapter_emit_get_control(
     row: Option<&ObjectDescriptorWire>,
     rv: u64,
     gate: u32,
-    read_word: impl FnMut(u64) -> Result<u64, ()>,
+    reader: impl crate::WordReader,
     read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> bool {
     let Some((layout, joined)) = decode_return_gate(gate) else {
@@ -240,7 +240,7 @@ pub unsafe fn adapter_emit_get_control(
     };
     unsafe {
         adapter_emit_get_attributes(
-            tail, side, descriptor, row, layout, rv, joined, read_word, read_bytes,
+            tail, side, descriptor, row, layout, rv, joined, reader, read_bytes,
         )
     }
 }
@@ -258,7 +258,7 @@ pub fn continuity_joins(continuity: &InstanceContinuity) -> bool {
 /// pointer, classify through the shared guard, then acquire arg 5 ONLY on
 /// membership. Refused mechanisms never fetch arg 5. `fetch_arg` supplies
 /// entry arguments (probe registers/stack on BPF, a spy on host);
-/// `read_word` reads one target word. Returns false only on custody/row
+/// `reader` reads one target word. Returns false only on custody/row
 /// failure, never on a refused mechanism.
 #[inline(always)]
 pub fn adapter_derive_entry(
@@ -267,7 +267,7 @@ pub fn adapter_derive_entry(
     row: Option<&ObjectDescriptorWire>,
     layout: LinuxLayout,
     fetch_arg: &mut impl FnMut(u8) -> Option<u64>,
-    read_word: impl FnMut(u64) -> Result<u64, ()>,
+    reader: impl crate::WordReader,
 ) -> bool {
     let Some(side) = side else {
         return false;
@@ -299,7 +299,7 @@ pub fn adapter_derive_entry(
     // the accepted mechanisms, so refused calls never read arg 5 (on
     // ia32, never read its stack word).
     let mechanism_ptr = fetch_arg(1).unwrap_or(0);
-    let derive = classify_derive_mechanism(mechanism_ptr, layout, read_word);
+    let derive = classify_derive_mechanism(mechanism_ptr, layout, reader);
     let retained = match derive {
         DeriveEntry::Accepted(_) => fetch_arg(5),
         DeriveEntry::Unavailable => None,
@@ -354,7 +354,7 @@ pub fn adapter_attributes_entry(
     row: Option<&ObjectDescriptorWire>,
     layout: LinuxLayout,
     fetch_arg: &mut impl FnMut(u8) -> Option<u64>,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
     mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> bool {
     let Some(side) = side else {
@@ -379,17 +379,10 @@ pub fn adapter_attributes_entry(
         return true;
     }
     if row.action == OBJECT_ACTION_GET {
-        capture_get_template(side, row, layout, fetch_arg, &mut read_word);
+        capture_get_template(side, row, layout, fetch_arg, &mut reader);
         return true;
     }
-    capture_request_pairs(
-        side,
-        row,
-        layout,
-        fetch_arg,
-        &mut read_word,
-        &mut read_bytes,
-    );
+    capture_request_pairs(side, row, layout, fetch_arg, &mut reader, &mut read_bytes);
     true
 }
 
@@ -399,7 +392,7 @@ pub(crate) fn capture_get_template(
     row: &ObjectDescriptorWire,
     layout: LinuxLayout,
     fetch_arg: &mut impl FnMut(u8) -> Option<u64>,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
 ) {
     let (ptr_arg, count_arg) = (row.template_args[0], row.template_args[1]);
     if ptr_arg == ARG_NONE || count_arg == ARG_NONE {
@@ -409,12 +402,12 @@ pub(crate) fn capture_get_template(
     let count = fetch_arg(count_arg);
     match (ptr, count) {
         (Some(ptr), Some(count)) => {
-            let _ = production_capture_get_entry(ptr, count, layout, side, &mut read_word);
+            let _ = production_capture_get_entry(ptr, count, layout, side, &mut reader);
         }
         _ => {
             // Clear every retained field/slot before marking acquisition
             // unavailable, including host reuse or a future retry path.
-            let _ = production_capture_get_entry(0, 0, layout, side, &mut read_word);
+            let _ = production_capture_get_entry(0, 0, layout, side, &mut reader);
             side.flags |=
                 object_flag::ARG_READ_FAILURE as u16 | crate::object_wire::GET_ENTRY_UNINSPECTED;
         }
@@ -430,7 +423,7 @@ pub(crate) fn capture_request_pairs(
     row: &ObjectDescriptorWire,
     layout: LinuxLayout,
     fetch_arg: &mut impl FnMut(u8) -> Option<u64>,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
     mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) {
     let present0 = row.template_args[0] != ARG_NONE && row.template_args[1] != ARG_NONE;
@@ -487,7 +480,7 @@ pub(crate) fn capture_request_pairs(
             pair1,
             layout,
             &mut side.requested[0],
-            &mut read_word,
+            &mut reader,
             &mut read_bytes,
         );
     }
@@ -498,7 +491,7 @@ pub(crate) fn capture_request_pairs(
             pair0,
             layout,
             &mut side.requested[1],
-            &mut read_word,
+            &mut reader,
             &mut read_bytes,
         );
     }
@@ -540,7 +533,7 @@ pub const KEM_CAPTURE_WIRED: bool = !cfg!(feature = "stub-object-attributes");
 /// entry output-pointer verdict (encapsulation query shapes retain
 /// no result); `null_cancel` mirrors the entry core's suppression.
 /// `fetch_arg` supplies entry argument scalars (registers/stack);
-/// `read_word` reads exactly one target word: the arg-7 stack slot.
+/// `reader` reads exactly one target word: the arg-7 stack slot.
 /// Template headers/values, ciphertext and length values are never
 /// read; args 3/4/5/6 scalars only bound span guards. Performs no
 /// read for slot 1 (always absent).
@@ -556,7 +549,7 @@ pub fn adapter_kem_entry(
     output_non_null: bool,
     null_cancel: bool,
     fetch_arg: &mut impl FnMut(u8) -> Option<u64>,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
 ) -> bool {
     let Some(side) = side else {
         return false;
@@ -633,7 +626,7 @@ pub fn adapter_kem_entry(
     let Some(arg7) = object_result_arg7_address(row, stack_pointer, layout) else {
         return false;
     };
-    let Ok(cell) = read_word(arg7) else {
+    let Ok(cell) = reader.read_word(arg7, layout) else {
         side.result_ptrs = [0, 0];
         side.phase = 2;
         return true;
@@ -733,12 +726,8 @@ fn slot_span(ptr: u64, layout: LinuxLayout) -> (bool, u8) {
 }
 
 #[inline(always)]
-fn slot_word(
-    ptr: u64,
-    layout: LinuxLayout,
-    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
-) -> (u8, u64) {
-    match read_word(ptr) {
+fn slot_word(ptr: u64, layout: LinuxLayout, reader: &mut impl crate::WordReader) -> (u8, u64) {
+    match reader.read_word(ptr, layout) {
         Err(()) => (handle_status::UNREADABLE, 0),
         Ok(0) => (handle_status::INVALID_ZERO, 0),
         Ok(observed) => {
@@ -774,7 +763,7 @@ pub fn adapter_fill_return(
     mech_status: u32,
     mech: u64,
     joined: bool,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
 ) -> bool {
     // H7-E1 enforcement inside the executed flow: refused continuity reads
     // nothing, however the adapter was reached.
@@ -861,12 +850,12 @@ pub fn adapter_fill_return(
                     flags |= object_flag::ALIAS;
                 } else {
                     if readable0 {
-                        let (status, word) = slot_word(ptr0, layout, &mut read_word);
+                        let (status, word) = slot_word(ptr0, layout, &mut reader);
                         status0 = status;
                         word0 = word;
                     }
                     if readable1 {
-                        let (status, word) = slot_word(ptr1, layout, &mut read_word);
+                        let (status, word) = slot_word(ptr1, layout, &mut reader);
                         status1 = status;
                         word1 = word;
                     }
@@ -1104,7 +1093,7 @@ pub unsafe fn adapter_emit_find(
     layout: LinuxLayout,
     rv: u64,
     joined: bool,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
 ) -> bool {
     // H7-E1 enforcement inside the executed flow: refused continuity reads
     // nothing, however the adapter was reached.
@@ -1140,7 +1129,7 @@ pub unsafe fn adapter_emit_find(
         }
         return true;
     }
-    let count = match read_word(count_ptr) {
+    let count = match reader.read_word(count_ptr, layout) {
         Ok(count) => count,
         Err(()) => {
             // SAFETY: `tail` is the exclusively owned reserved tail.
@@ -1212,7 +1201,7 @@ pub unsafe fn adapter_emit_find(
         // SAFETY: `tail` is the exclusively owned reserved tail; `i` is
         // bounded by `take <= 8`.
         unsafe {
-            match read_word(addr) {
+            match reader.read_word(addr, layout) {
                 Err(()) => {
                     core::ptr::addr_of_mut!((*tail).find_status[i as usize])
                         .write(handle_status::UNREADABLE);
@@ -1236,7 +1225,7 @@ pub unsafe fn adapter_emit_find(
         }
         i += 1;
     }
-    match read_word(count_ptr) {
+    match reader.read_word(count_ptr, layout) {
         Ok(stable) if stable == count => (),
         _ => {
             // SAFETY: `tail` is ours; the changed count discards the batch.
@@ -1281,7 +1270,7 @@ pub unsafe fn adapter_emit_get_attributes(
     layout: LinuxLayout,
     rv: u64,
     joined: bool,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut reader: impl crate::WordReader,
     mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> bool {
     // H7-E1 enforcement inside the executed flow: refused continuity reads
@@ -1337,7 +1326,7 @@ pub unsafe fn adapter_emit_get_attributes(
         // SAFETY: `tail` is the exclusively owned reserved tail; the
         // result list is ours (zeroed by the tail fill, marked for Get).
         unsafe { &mut (*tail).result_attributes },
-        &mut read_word,
+        &mut reader,
         &mut read_bytes,
     );
     if contributed != 0 {
@@ -1436,7 +1425,7 @@ pub fn production_inspect_request_template(
     peer: Option<(u64, u64)>,
     layout: LinuxLayout,
     out: &mut ObjectAttributeListWire,
-    read_word: impl FnMut(u64) -> Result<u64, ()>,
+    reader: impl crate::WordReader,
     read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> u32 {
     crate::object_capture::inspect_request_template_into(
@@ -1445,7 +1434,7 @@ pub fn production_inspect_request_template(
         peer,
         layout,
         out,
-        read_word,
+        reader,
         read_bytes,
     )
 }
@@ -1469,9 +1458,9 @@ pub fn production_capture_get_entry(
     count: u64,
     layout: LinuxLayout,
     side: &mut ObjectStart,
-    read_word: impl FnMut(u64) -> Result<u64, ()>,
+    reader: impl crate::WordReader,
 ) -> GetEntryVerdict {
-    crate::object_capture::capture_get_entry_into(template_ptr, count, layout, side, read_word)
+    crate::object_capture::capture_get_entry_into(template_ptr, count, layout, side, reader)
 }
 
 /// Production GetAttributeValue return path (H7-E4 seam).
@@ -1493,11 +1482,11 @@ pub fn production_capture_get_return(
     authority: ReturnAuthority,
     layout: LinuxLayout,
     out: &mut ObjectAttributeListWire,
-    read_word: impl FnMut(u64) -> Result<u64, ()>,
+    reader: impl crate::WordReader,
     read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> u32 {
     crate::object_capture::capture_get_return_into(
-        side, rv, authority, layout, out, read_word, read_bytes,
+        side, rv, authority, layout, out, reader, read_bytes,
     )
 }
 
@@ -1578,10 +1567,10 @@ mod tests {
                     .find(|(slot, _)| *slot == index)
                     .and_then(|(_, value)| *value)
             };
-            let read = |address: u64| {
+            let read = crate::FnReader(|address: u64, _layout: LinuxLayout| {
                 reads.push(address);
                 cell
-            };
+            });
             adapter_kem_entry(
                 side,
                 descriptor,
@@ -2203,11 +2192,11 @@ mod tests {
                         0,
                         0,
                         true,
-                        |address| {
+                        crate::FnReader(|address, _layout| {
                             reads.set(reads.get() + 1);
                             assert_eq!(address, 0x7000);
                             Ok(cell)
-                        },
+                        }),
                     );
                     assert!(ok);
                     assert_eq!(reads.get(), 1);
@@ -2239,7 +2228,7 @@ mod tests {
                     0,
                     0,
                     true,
-                    |_| Err(()),
+                    crate::FnReader(|_, _| Err(())),
                 ));
                 assert_eq!(side.result_statuses, [hst::UNREADABLE, hst::ABSENT]);
                 assert_eq!(side.result_ptrs, [0, 0]);
@@ -2268,10 +2257,10 @@ mod tests {
                         0,
                         0,
                         joined,
-                        |_| {
+                        crate::FnReader(|_, _| {
                             reads.set(reads.get() + 1);
                             Ok(0x777)
-                        },
+                        }),
                     );
                     assert_eq!(reads.get(), 0, "rv {rv:#x} joined {joined} ptr {ptr:#x}");
                     if !joined {
@@ -2569,11 +2558,11 @@ mod tests {
                     0,
                     0,
                     true,
-                    |address| {
+                    crate::FnReader(|address, _layout| {
                         reads.set(reads.get() + 1);
                         assert_eq!(address, 0x7000, "variant {variant}");
                         Ok(0x777)
-                    },
+                    }),
                 ),
                 "variant {variant}"
             );
@@ -2816,11 +2805,11 @@ mod tests {
                     0,
                     0,
                     true,
-                    |address| {
+                    crate::FnReader(|address, _layout| {
                         reads.set(reads.get() + 1);
                         assert_eq!(address, stack_cell, "variant {variant}");
                         Ok(0x777)
-                    },
+                    }),
                 ),
                 "variant {variant}"
             );
@@ -2943,11 +2932,11 @@ mod tests {
         ));
         assert_eq!(side.phase, 2);
         let reads = core::cell::Cell::new(0u32);
-        let read = |address: u64| {
+        let read = crate::FnReader(|address: u64, _layout: LinuxLayout| {
             reads.set(reads.get() + 1);
             assert_eq!(address, 0x7000);
             Ok(0x777)
-        };
+        });
         assert!(adapter_fill_return(
             Some(&mut side),
             descriptor,
@@ -2963,11 +2952,11 @@ mod tests {
         assert_eq!(side.result_statuses, [hst::VALUE, hst::ABSENT]);
         assert_eq!(side.phase, 3);
         // A duplicate return on the consumed row refuses.
-        let read = |address: u64| {
+        let read = crate::FnReader(|address: u64, _layout: LinuxLayout| {
             reads.set(reads.get() + 1);
             assert_eq!(address, 0x7000);
             Ok(0x777)
-        };
+        });
         assert!(!adapter_fill_return(
             Some(&mut side),
             descriptor,
@@ -2988,11 +2977,11 @@ mod tests {
             ..ObjectStart::default()
         };
         stale.result_ptrs = [0x7000, 0];
-        let read = |address: u64| {
+        let read = crate::FnReader(|address: u64, _layout: LinuxLayout| {
             reads.set(reads.get() + 1);
             assert_eq!(address, 0x7000);
             Ok(0x777)
-        };
+        });
         assert!(!adapter_fill_return(
             Some(&mut stale),
             descriptor,
@@ -3006,10 +2995,10 @@ mod tests {
         ));
         assert_eq!(reads.get(), 1, "stale return reads nothing");
         // A lost side refuses.
-        let read = |_: u64| {
+        let read = crate::FnReader(|_: u64, _layout: LinuxLayout| {
             reads.set(reads.get() + 1);
             Ok(0x777)
-        };
+        });
         assert!(!adapter_fill_return(
             None,
             descriptor,
@@ -3028,10 +3017,10 @@ mod tests {
             ..ObjectStart::default()
         };
         side.result_ptrs = [0x7000, 0];
-        let read = |_: u64| {
+        let read = crate::FnReader(|_: u64, _layout: LinuxLayout| {
             reads.set(reads.get() + 1);
             Ok(0x777)
-        };
+        });
         assert!(!adapter_fill_return(
             Some(&mut side),
             descriptor,
@@ -3050,10 +3039,10 @@ mod tests {
             ..ObjectStart::default()
         };
         side.result_ptrs = [0x7000, 0];
-        let read = |_: u64| {
+        let read = crate::FnReader(|_: u64, _layout: LinuxLayout| {
             reads.set(reads.get() + 1);
             Ok(0x777)
-        };
+        });
         assert!(!adapter_fill_return(
             Some(&mut side),
             descriptor,
@@ -3109,10 +3098,10 @@ mod tests {
                 0,
                 0,
                 false,
-                |_: u64| {
+                crate::FnReader(|_: u64, _layout: LinuxLayout| {
                     lreads.set(lreads.get() + 1);
                     Ok(0x777)
-                },
+                }),
             ));
             assert_eq!(lreads.get(), 0, "unjoined loss reads nothing");
             assert_eq!(lside.phase, 2, "unjoined loss advances nothing");
@@ -3200,11 +3189,11 @@ mod tests {
                 0,
                 0,
                 true,
-                |address: u64| {
+                crate::FnReader(|address: u64, _layout: LinuxLayout| {
                     breads.set(breads.get() + 1);
                     assert_eq!(address, 0x7000);
                     Ok(word)
-                },
+                }),
             ));
             assert_eq!(breads.get(), 1, "boundary word read once");
             assert_eq!(

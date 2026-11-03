@@ -15,6 +15,48 @@ pub mod object_wire;
 pub use counter_policy::CounterMode;
 pub use pkcs11_module::layout::LinuxLayout;
 
+/// Target-word reader for the shared object adapters.
+///
+/// BPF passes a zero-sized reader whose always-inlined method dissolves
+/// into the adapter: no closure, no `FnMut::call_mut` shim, and no
+/// 16-byte `Result` crossing a subprogram boundary (the 7.4 verifier
+/// rejects the caller-stack out-pointer such a return leaves in R2).
+/// Host tests wrap closures in `FnReader`. The `subprog_return_shape`
+/// test enforces the BPF side.
+pub trait WordReader {
+    // `()` error is the established reader protocol: failure distinct
+    // from any value including zero. A custom error type would ripple
+    // through every adapter and spy for no benefit.
+    #[allow(clippy::result_unit_err)]
+    fn read_word(&mut self, addr: u64, layout: LinuxLayout) -> Result<u64, ()>;
+}
+
+/// Closure-backed reader for host tests (a concrete type, so it never
+/// overlaps the `&mut R` impl below).
+pub struct FnReader<F>(pub F);
+
+impl<F> WordReader for FnReader<F>
+where
+    F: FnMut(u64, LinuxLayout) -> Result<u64, ()>,
+{
+    #[inline(always)]
+    #[allow(clippy::result_unit_err)]
+    fn read_word(&mut self, addr: u64, layout: LinuxLayout) -> Result<u64, ()> {
+        (self.0)(addr, layout)
+    }
+}
+
+impl<R> WordReader for &mut R
+where
+    R: WordReader,
+{
+    #[inline(always)]
+    #[allow(clippy::result_unit_err)]
+    fn read_word(&mut self, addr: u64, layout: LinuxLayout) -> Result<u64, ()> {
+        (**self).read_word(addr, layout)
+    }
+}
+
 /// Conventional x86 userspace code selectors accepted by the observer.
 /// Exact equality is intentional: masking or narrowing would authorize an
 /// ABI-dependent read for an unqualified selector.

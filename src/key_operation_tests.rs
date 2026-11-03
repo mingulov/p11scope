@@ -12428,6 +12428,7 @@ fn key_operation_kem_jsonl_unknown_version_refused() {
 /// authority and unchanged S1 against literal controls.
 #[test]
 fn key_operation_kem_adapter_reads_reach_original_wire_and_commit() {
+    use p11scope_ebpf_common::FnReader;
     use p11scope_ebpf_common::LinuxLayout;
     use p11scope_ebpf_common::object_flow::{adapter_fill_return, adapter_kem_entry};
     use p11scope_ebpf_common::object_wire::{
@@ -12471,10 +12472,10 @@ fn key_operation_kem_adapter_reads_reach_original_wire_and_commit() {
                         .iter()
                         .find_map(|slot| (slot.0 == index).then_some(slot.1).flatten())
                 },
-                |address| {
+                FnReader(|address, _layout| {
                     self.reads.push(address);
                     self.cell
-                },
+                }),
             )
         }
     }
@@ -12543,10 +12544,10 @@ fn key_operation_kem_adapter_reads_reach_original_wire_and_commit() {
             0,
             0,
             joined,
-            |address| {
+            FnReader(|address, _layout| {
                 ret_reads.push(address);
                 Ok(result_word)
-            },
+            }),
         );
         (
             (inputs.0[0], inputs.1[0]),

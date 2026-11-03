@@ -14,6 +14,7 @@
 //! the root. A moved gate fails the read counters even if the emitted tail
 //! is later suppressed.
 
+use p11scope_ebpf_common::LinuxLayout;
 use p11scope_ebpf_common::object_capture::{CKR_OK, ReturnAuthority};
 use std::cell::RefCell;
 
@@ -124,11 +125,13 @@ impl FakeTarget {
 pub fn readers(
     target: &RefCell<FakeTarget>,
 ) -> (
-    impl FnMut(u64) -> Result<u64, ()> + '_,
+    impl p11scope_ebpf_common::WordReader + '_,
     impl FnMut(u64, &mut [u8]) -> Result<(), ()> + '_,
 ) {
     (
-        |addr: u64| target.borrow_mut().read_word(addr),
+        p11scope_ebpf_common::FnReader(|addr: u64, _layout: LinuxLayout| {
+            target.borrow_mut().read_word(addr)
+        }),
         |addr: u64, buf: &mut [u8]| target.borrow_mut().read_bytes(addr, buf),
     )
 }

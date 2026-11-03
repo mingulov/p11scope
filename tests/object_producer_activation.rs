@@ -1251,10 +1251,10 @@ fn object_kem_policy_and_flavor_zero_new_reads() {
                         .iter()
                         .find_map(|slot| (slot.0 == index).then_some(slot.1).flatten())
                 },
-                |address| {
+                p11scope_ebpf_common::FnReader(|address, _layout| {
                     reads.push(address);
                     Ok(0x7000)
-                },
+                }),
             );
             if p0 {
                 // P0 is blind to the S1 verdict: the gate refuses first
@@ -3176,6 +3176,14 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// and its declaration widened to the combined
 /// `any(p11scope_birth_marker, p11scope_journal_roots)` cfg, +58 stripped
 /// B: 144578 B, measured with this same lexer on the integrated source.
+/// Re-baselined for the 7.4 register-pair return fix (the only BPF
+/// source change: `arg_u64` and `capture_scalar` are `#[inline(always)]`,
+/// and every target-word reader closure is the zero-sized `BpfReader`
+/// whose always-inlined `WordReader::read_word` method dissolves into
+/// the adapter, so no 16-byte `Result` crosses a subprogram boundary;
+/// plus its comment lines and the `result_unit_err` allow on the new
+/// method): 144504 B, measured with this same lexer on the integrated
+/// source.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3185,8 +3193,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            144578,
-            "340dc418e9ec9740da866264f3add2f7a47f0cf3eacab6dfdcca2e022d938667"
+            144504,
+            "85824d418e798e9c1bd987b3fce025b0af63a0ae0a73c060ff279b853ce9d44f"
         ),
         "stripped BPF dump must stay byte-identical"
     );

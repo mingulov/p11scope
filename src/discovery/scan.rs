@@ -3139,8 +3139,12 @@ fn detect_tables_for_layout(
 /// decode, adds no coverage; equal-length unvalidated ties go to the
 /// earlier start. Accepted residuals: same-start pairs where a future
 /// longer decode covers the shorter (the survivor covers the same words;
-/// admission dedups by object+offset), and validated discards that hide
-/// an overlapping candidate from a future validated survivor (contrived).
+/// admission dedups by object+offset); overlapping decodes performed
+/// before their dominator appears — a shorter (or equal-length
+/// later-start) decode the overlap pass drops once the longer (or
+/// earlier-start) overlapper decodes, since the skip only sees the past;
+/// and validated discards that hide an overlapping candidate from a
+/// future validated survivor (contrived).
 fn anchor_kept_dominates(
     kept_start: usize,
     kept_len: usize,

@@ -10052,7 +10052,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn private_count_table_without_manifest_keeps_the_shared_reserve() {
+    fn private_count_table_without_manifest_admits_first_come_without_reserve() {
         let fixture = CountManifestFixture::new();
         let coordinator = fixture.scan(false);
         // GT-5: pid-scope with --module hints is Named, first-come with no reserve.
@@ -10258,7 +10258,7 @@ pub(crate) mod tests {
         assert_eq!(
             catalog.lowering.as_ref().unwrap().plan.slots.len(),
             32,
-            "a valid but oversized-for-this-window document cannot bypass collection I/O"
+            "an oversized manifest is refused but the scan's 32 targets still admit first-come"
         );
         assert!(
             catalog

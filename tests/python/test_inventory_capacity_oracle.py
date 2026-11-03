@@ -320,7 +320,7 @@ class CapacityOracleTests(unittest.TestCase):
             next(row for row in ledger if row["kind"] == "call").update(t0=1, t1=2)
         self.run_case(outside, 1, "CAPACITY-WINDOW")
 
-    def test_native_positive_requires_exact_caller_authority(self):
+    def test_scan_lane_positive_requires_caller_authority(self):
         self.run_case(lambda _m, _l, _a, last: last["callers"][0].pop("image"),
                       1, "CAPACITY-AUTHORITY")
 
@@ -1946,6 +1946,34 @@ class AttachDrainGateTests(unittest.TestCase):
                          (40, "gap_repeated", {"index": 4, "repeats": 3}),
                          (40, "ended", {}))
         self.assertTrue(drained(rows))
+
+    def test_drained_stream_past_deadline_returns(self):
+        gate = self.oracle["wait_until_attach_drained"]
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "pass_committed", {"pass": 1}))
+        custody = mock.Mock()
+        gate(time.monotonic() - 1, lambda: rows, custody, None)
+        custody.checkpoint.assert_called()
+
+    def test_undrained_stream_past_deadline_raises(self):
+        gate = self.oracle["wait_until_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "gap_recorded", gap))
+        with self.assertRaisesRegex(ValueError, "did not drain"):
+            gate(time.monotonic() - 1, lambda: rows, mock.Mock(), None)
+
+    def test_observer_exit_before_drain_raises(self):
+        gate = self.oracle["wait_until_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "gap_recorded", gap))
+        observer = mock.Mock()
+        observer.poll.return_value = 1
+        with self.assertRaisesRegex(ValueError, "observer exited"):
+            gate(time.monotonic() + 60, lambda: rows, mock.Mock(), observer)
 
 
 def parse_native_row(line):

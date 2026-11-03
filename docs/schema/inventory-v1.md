@@ -210,12 +210,16 @@ non-null values needs a new allowlist row.
   endpoint budget (`--max-endpoints`, default 4096, range 1..=8192), not the 512-slot detailed ceiling
   `inspect --system` reports, so the two can disagree either way: an
   object `inspect` refuses can read `admitted` here, and one it admits
-  can read `refused` here. Each pass lowers under that budget with the
-  same shared-scope reserve `inspect` applies (uncorroborated providers
-  — unlinked heuristic tables, proxy closure arrays — leave the larger
-  of one quarter of the selected limit, rounded down, and 104 entries
-  reserved, capped by the selected limit; below 104 the whole budget is
-  reserved), and
+  can read `refused` here. Each pass lowers under that budget. An
+  unaimed pass — system or cgroup scope without `--module` — keeps the
+  same shared-scope reserve `inspect` applies to unaimed captures
+  (uncorroborated providers — unlinked heuristic tables, proxy closure
+  arrays — leave the larger of one quarter of the selected limit,
+  rounded down, and 104 entries reserved, capped by the selected limit;
+  below 104 the whole budget is reserved). A pass the operator aimed —
+  `--pid`, or `--module` naming the providers to capture — admits
+  first-come in discovery order with no reserve, as
+  `inspect --system --module` does, and
   endpoints admitted earlier in the run stay counted
   for the whole run: an endpoint ID is never reused, so a module can be
   refused once earlier modules hold the budget. Refusals by the run's

@@ -6165,7 +6165,8 @@ pub(crate) mod tests {
             reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
                  (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a \
                  prefix of its 64 lookalike function tables (a proxy closure array is admitted \
-                 whole, as a prefix when first seen, or as published tables)"
+                 whole, as a prefix when mapped before the capture's first plan, or as published \
+                 tables)"
                 .into(),
         });
         ev.verdict();
@@ -6288,8 +6289,8 @@ pub(crate) mod tests {
             name: "/opt/libp11-kit.so".into(),
             reason: "module needs 6530 more; only 512 attach slots are available; 0 are in use \
                  (0 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
-                 tables (a proxy closure array is admitted whole, as a prefix when first seen, \
-                 or as published tables)"
+                 tables (a proxy closure array is admitted whole, as a prefix when mapped before \
+                 the capture's first plan, or as published tables)"
                 .into(),
         });
         ev.verdict();
@@ -6310,8 +6311,8 @@ pub(crate) mod tests {
             name: "/opt/libp11-kit.so".into(),
             reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
                  (68 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
-                 tables (a proxy closure array is admitted whole, as a prefix when first seen, \
-                 or as published tables)"
+                 tables (a proxy closure array is admitted whole, as a prefix when mapped before \
+                 the capture's first plan, or as published tables)"
                 .into(),
         });
         ev.verdict();

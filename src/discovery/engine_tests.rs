@@ -11333,6 +11333,80 @@ fn prearm_non_run_scope_with_hold_keeps_window() {
     assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
 }
 
+/// A declared first-stamp dated after the barrier release proves nothing:
+/// the child runs free between release and its first pause stop, so the
+/// window stays even when the frozen hold reaches the stamp. Modeled
+/// release at 800 precedes the 900 stamps below.
+#[test]
+fn prearm_pause_hold_post_release_stamp_keeps_window() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(900), true)),
+        true,
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
+}
+
+/// Synthetic two-slot plan: one declared stamp after the modeled release
+/// withholds the proof for its object. Modeled release at 5s, one member
+/// stamped 100ns after, the frozen hold reaching it.
+#[test]
+fn pause_gate_proofs_post_release_stamp_must_not_prove() {
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::plan::{AttachKey, AttachPlan, ModuleId, Slot};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn slot(index: u32, object: u32, file_offset: u64, module: u32) -> Slot {
+        Slot {
+            index,
+            descriptor_index: 1,
+            object: PinnedObjectId(object),
+            object_path: format!("/proc/self/fd/{object}"),
+            file_offset,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[1],
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(module)],
+        }
+    }
+
+    let plan = AttachPlan::from_slots(vec![slot(0, 7, 0x1000, 3), slot(1, 7, 0x2000, 3)]);
+    let key = |file_offset| AttachKey {
+        object: PinnedObjectId(7),
+        file_offset,
+    };
+    let watches = BTreeMap::from([(
+        PinnedObjectId(7),
+        crate::prearm_module::PrearmWatch::new(BTreeSet::from([key(0x1000), key(0x2000)])),
+    )]);
+    let hold = Some(scripted_hold(Some(50), Some(5_000_000_100), true));
+    let proofs = Engine::pause_gate_exactness_proofs(
+        &watches,
+        &plan,
+        &BTreeMap::from([(0, 5_000_000_000), (1, 5_000_000_100)]),
+        hold,
+        true,
+    );
+    assert!(
+        proofs.is_empty(),
+        "post-release declared stamp must withhold the proof, got {proofs:?}"
+    );
+}
+
 /// U-14: pins "0 after a scan-only `--pid` exit" through the real engine
 /// exit path (conservative replay -> `extend_exact_prepared` key
 /// retirement, `engine.rs:8695-8712` -> `plan.rs`), not just at plan level

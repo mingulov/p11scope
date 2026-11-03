@@ -13884,6 +13884,100 @@ mod tests {
     }
 
     #[test]
+    fn prearm_terminal_pause_hold_post_release_stamp_keeps_window() {
+        use crate::attach::BackendSelection;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+        use crate::discovery::hooks::HookRegistry;
+
+        // Twin of the emptying terminal above with the declared stamps dated
+        // after the modeled barrier release (800): the child ran free before
+        // its first pause stop, so the exact window stays.
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/discovery-lifecycle.c");
+        let provider = dir.path().join("hold-provider.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args([
+                    "-std=c11",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-shared",
+                    "-fPIC",
+                    "-DDISCOVERY_LIFECYCLE_PROVIDER",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&provider)
+                .arg("-ldl")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pid = std::process::id();
+        let args = CaptureArgs {
+            kind: Kind::Profile,
+            modules: Vec::new(),
+            manifests: Vec::new(),
+            prearm_modules: vec![provider],
+            hooks: HookRegistry::builtin(),
+            scope: ScopeArg::Pid(pid),
+            metrics: false,
+            counter_mode: None,
+            select_endpoint: None,
+            track_short_lived: false,
+            duration: None,
+            out: None,
+            max_events: None,
+            max_scan_pids: None,
+            ring_bytes: None,
+            drain_interval: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            attach_backend: BackendSelection::default(),
+        };
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the self view");
+        let mut engine =
+            Engine::discover(&args, &Scope::Pid(pid), Some(view)).expect("pre-arm discover");
+        assert!(engine.has_prearm_watches());
+        engine.set_scope_start_ns(Some(50));
+        let mut session = ScriptedSession::default();
+        for slot in engine.plan().slots.iter() {
+            session.scripted_links.insert(slot.index);
+            session.scripted_stamps.insert(slot.index, 900);
+        }
+        let reports: Vec<metrics::SlotReport> = Vec::new();
+        finish_prearm_terminal(
+            &mut engine,
+            &session,
+            &[],
+            CaptureEnd::DurationExpired,
+            &reports,
+            &metrics::KernelEvidence::default(),
+            0,
+            Some(5000),
+            Some(crate::discovery::pause::PauseGateHold {
+                start_ns: Some(50),
+                end_ns: Some(900),
+                continuous: true,
+            }),
+            true,
+        );
+        let record = &engine.discovery().modules[0];
+        assert_eq!(record.attached_at_ns, Some(Some(900)));
+        assert_eq!(
+            record.unobserved_windows,
+            Some(vec![crate::render::UnobservedWindow {
+                start_ns: 50,
+                end_ns: 900,
+                reason: crate::render::UnobservedReason::PreAttach,
+            }])
+        );
+    }
+
+    #[test]
     fn prearm_stop_uses_first_stop_not_later_loop_end() {
         use crate::attach::FirstStop;
         // The earliest stop wins; a later loop-end sample never extends it.

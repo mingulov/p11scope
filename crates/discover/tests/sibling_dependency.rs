@@ -165,9 +165,9 @@ fn provider_with_a_sibling_dependency_in_its_own_directory_is_discovered() {
 }
 
 /// Safety pin: a symlink inside the provider directory pointing at an
-/// outside library must never be preloaded — the fallback loads regular
-/// files only, so this stays refused. (If the fallback followed links,
-/// the load below would succeed.)
+/// outside library must never be preloaded — only regular files and
+/// in-directory links load, so this stays refused. (If the fallback
+/// followed outside links, the load below would succeed.)
 #[test]
 fn provider_whose_sibling_is_a_symlink_pointing_outside_is_refused() {
     let _guard = DISCOVER_LOCK.lock().unwrap();

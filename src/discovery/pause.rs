@@ -259,6 +259,14 @@ impl std::fmt::Display for PauseError {
 
 impl std::error::Error for PauseError {}
 
+/// One task's `/proc` state letter and kernel start time (boot-relative
+/// clock ticks), taken from a single read of its `stat` file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TaskSample {
+    pub(crate) state: u8,
+    pub(crate) start: Option<u64>,
+}
+
 /// The coordinator owns policy, not Aya. This fixed-purpose seam is also the
 /// complete failure-injection surface: one clock, task reader, task-start
 /// reader, hook-attach clock, discovery owner, authorization map, Engine batch
@@ -267,10 +275,11 @@ pub(crate) trait PauseIo {
     fn now_ns(&mut self) -> Result<u64, String>;
     fn wait_one_ms(&mut self) -> Result<(), String>;
     fn task_states(&mut self, pid: u32) -> Result<BTreeMap<u32, u8>, String>;
-    /// Kernel start time of each task of `pid`, in boot-relative clock ticks
-    /// (`/proc/<pid>/task/<tid>/stat` field 22). A task absent from the map
-    /// has an unreadable start time and is never treated as covered.
-    fn task_starts(&mut self, pid: u32) -> Result<BTreeMap<u32, u64>, String>;
+    /// Every task of `pid` with its state letter and kernel start time in
+    /// boot-relative clock ticks (`/proc/<pid>/task/<tid>/stat` fields 3 and
+    /// 22), both from one read of each `stat` file. A `None` start is undated
+    /// and never treated as covered.
+    fn task_samples(&mut self, pid: u32) -> Result<BTreeMap<u32, TaskSample>, String>;
     /// When the last provider hook attach completed, in `CLOCK_BOOTTIME`
     /// nanoseconds (the start-time-tick domain). `None` when no attach has
     /// completed or one is still in flight: then no thread born after
@@ -459,12 +468,13 @@ impl PauseCoordinator {
             .pin()
             .probe_signal_authority()
             .map_err(|error| Self::policy_error(policy, error, true))?;
-        let expected_tasks = io
-            .task_states(child.pid())
+        let samples = io
+            .task_samples(child.pid())
             .map_err(|error| Self::policy_error(policy, error, true))?;
-        let task_starts = io
-            .task_starts(child.pid())
-            .map_err(|error| Self::policy_error(policy, error, true))?;
+        let expected_tasks: BTreeMap<u32, u8> = samples
+            .iter()
+            .map(|(tid, sample)| (*tid, sample.state))
+            .collect();
         if expected_tasks.is_empty() || !child.pin().still_the_same() {
             return Err(Self::policy_error(
                 policy,
@@ -480,7 +490,7 @@ impl PauseCoordinator {
         );
         let tids: Vec<u32> = coordinator.expected_tasks.keys().copied().collect();
         for tid in tids {
-            let Some(start) = task_starts.get(&tid).copied() else {
+            let Some(start) = samples.get(&tid).and_then(|sample| sample.start) else {
                 return Err(Self::policy_error(
                     policy,
                     format!("cannot read task {tid} start time during pause preflight"),
@@ -849,8 +859,7 @@ impl PauseCoordinator {
             match authorization {
                 Some(PAUSE_REQUESTED) => return self.service_requested(io, deadline),
                 Some(PAUSE_ARMED) => {
-                    if let Err(error) = self.apply_unowned(io, Some(deadline)) {
-                        self.begin_attempt();
+                    if let Err(error) = self.apply_unowned_opening_on_error(io, deadline) {
                         return self.fail_cycle(io, error.to_string(), error.lifecycle());
                     }
                     match io.authorization() {
@@ -1305,6 +1314,32 @@ impl PauseCoordinator {
         }
     }
 
+    /// A bounded unowned apply whose failure ends this cycle. On error it
+    /// opens the attempt, so the partial closes one, and keeps the category
+    /// the failed apply recorded, which opening the attempt would otherwise
+    /// clear as a leftover. A category left from before is set aside for the
+    /// apply and restored only when it succeeds, as without this wrapper.
+    fn apply_unowned_opening_on_error(
+        &mut self,
+        io: &mut impl PauseIo,
+        deadline: u64,
+    ) -> Result<(), PauseError> {
+        let leftover = if self.attempt_open {
+            None
+        } else {
+            self.pending_diagnostic.take()
+        };
+        let result = self.apply_unowned(io, Some(deadline));
+        if result.is_err() {
+            let recorded = self.pending_diagnostic.take();
+            self.begin_attempt();
+            self.pending_diagnostic = recorded;
+        } else if leftover.is_some() {
+            self.pending_diagnostic = leftover;
+        }
+        result
+    }
+
     fn remove_and_account(&mut self, io: &mut impl PauseIo) -> Result<(), PauseError> {
         let disposition = if self.epoch.rejected {
             RemovalDisposition::Rejected
@@ -1415,9 +1450,10 @@ impl PauseCoordinator {
         self.finish_nonconfirmed(retained_error.unwrap_or_else(|| MSG_PAUSE_HELPER_REJECTED.into()))
     }
 
-    /// A strict sample: every thread must already be stopped. Used once the
-    /// stop was seen complete, where a running thread means it was continued
-    /// under the stop.
+    /// A strict sample: every thread must already be stopped and the task set
+    /// must be exactly the expected one. Used once the stop was seen complete:
+    /// a stopped group cannot clone, so a running or new thread means
+    /// something ran under the stop.
     fn sample_stopped(&mut self, io: &mut impl PauseIo, deadline: u64) -> Result<u64, String> {
         self.sample_tasks(io, deadline, false)?
             .ok_or_else(|| MSG_TASK_SET_CHANGED.into())
@@ -1429,94 +1465,95 @@ impl PauseCoordinator {
     /// the existing 1 ms cadence until every thread is stopped, inside the
     /// stop's existing deadline and never more than one cycle of samples. A
     /// thread still not stopped then keeps today's task-set refusal; a
-    /// changed set (vanished, reused or undated thread) refuses at once.
-    /// Nothing is attached before this returns, so a thread that ran while the
-    /// stop settled only ran before the hooks changed. The error carries
-    /// whether it is a lifecycle failure (a failed wait).
+    /// changed set (vanished, reused or undated thread) or a thread that can
+    /// never reach the stop refuses at once. Nothing is attached before this
+    /// returns, so a thread that ran while the stop settled only ran before
+    /// the hooks changed. The error carries whether it is a lifecycle failure
+    /// (a failed wait).
     fn sample_until_stopped(
         &mut self,
         io: &mut impl PauseIo,
         deadline: u64,
     ) -> Result<u64, (String, bool)> {
-        for attempt in 0..=MAX_SETTLE_SAMPLES {
-            match self.sample_tasks(io, deadline, true) {
-                Ok(Some(now)) => return Ok(now),
-                Ok(None) => {}
-                Err(error) if attempt > 0 && error == MSG_PAUSE_CONFIRMATION_DEADLINE => {
-                    return Err((MSG_TASK_SET_CHANGED.into(), false));
-                }
-                Err(error) => return Err((error, false)),
+        for _ in 0..=MAX_SETTLE_SAMPLES {
+            if let Some(now) = self
+                .sample_tasks(io, deadline, true)
+                .map_err(|error| (error, false))?
+            {
+                return Ok(now);
             }
             io.wait_one_ms().map_err(|error| (error, true))?;
         }
         Err((MSG_TASK_SET_CHANGED.into(), false))
     }
 
-    /// One task sample. `Ok(None)` (only while `settling`): the set is valid
-    /// but some thread is not stopped yet; nothing is adopted from it.
+    /// One task sample, a single `stat` read per thread. The task set and
+    /// thread states are judged before the deadline: a sample that is not
+    /// fully stopped is today's task-set refusal (or, only while `settling`
+    /// and still inside the deadline, `Ok(None)`: wait for a thread that is
+    /// on its way into the stop), and a fully stopped sample past the deadline
+    /// keeps the deadline message. New threads are adopted only by a fully
+    /// stopped settling sample.
     fn sample_tasks(
         &mut self,
         io: &mut impl PauseIo,
         deadline: u64,
         settling: bool,
     ) -> Result<Option<u64>, String> {
-        let states = io.task_states(self.pid)?;
-        let starts = io.task_starts(self.pid)?;
+        let samples = io.task_samples(self.pid)?;
         // Read after the starts: a later read can only see a later attach.
         let last_attach = io.last_hook_attach_boot_ns();
         let now = io.now_ns()?;
-        if now > deadline {
-            return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
-        }
-        let births = self.covered_births(&states, &starts, last_attach)?;
-        if states.values().any(|state| *state != b'T') {
-            if settling {
+        let births = self.covered_births(&samples, last_attach, settling)?;
+        if samples.values().any(|sample| sample.state != b'T') {
+            let settles = |sample: &TaskSample| matches!(sample.state, b'T' | b'R' | b'S' | b'D');
+            if settling && now <= deadline && samples.values().all(settles) {
                 return Ok(None);
             }
             return Err(MSG_TASK_SET_CHANGED.into());
         }
+        if now > deadline {
+            return Err(MSG_PAUSE_CONFIRMATION_DEADLINE.into());
+        }
         for (tid, start) in births {
-            if let Some(state) = states.get(&tid) {
-                self.expected_tasks.insert(tid, *state);
-            }
+            self.expected_tasks.insert(tid, b'T');
             self.expected_starts.insert(tid, start);
         }
         Ok(Some(now))
     }
 
     /// Threads whose floored birth is strictly after the last completed
-    /// provider hook attach (see [`birth_covered`]), which this sample may
-    /// adopt into the expected set. Uprobes are per file: once attached they
-    /// fire for every thread, so such a thread never ran with a provider
-    /// unhooked. The pause arm is
-    /// deliberately not the instant: a frame or successor re-arm is no attach.
-    /// Every other change — a missing expected tid, a reused tid (same tid,
-    /// different start time), a floored birth at or before the attach, an
-    /// unreadable start time, no recorded attach or one in flight — keeps
-    /// today's task-set refusal. An adopted thread is then held to every later
-    /// sample like a preflight thread, so this stop's own attach (which it was
-    /// verified stopped through) does not undo it.
+    /// provider hook attach (see [`birth_covered`]), which a settling sample
+    /// may adopt into the expected set. Uprobes are per file: once attached
+    /// they fire for every thread, so such a thread is no more exposed than a
+    /// thread that existed at preflight. The pause arm is deliberately not the
+    /// instant: a frame or successor re-arm is no attach. Only the first
+    /// (`settling`) sample admits a new thread; at a strict sample any unknown
+    /// tid is a refusal. Every other change — a missing expected tid, a
+    /// reused tid (same tid, different start time), a floored birth at or
+    /// before the attach, an unreadable start time, no recorded attach or one
+    /// in flight — keeps today's task-set refusal. An adopted thread is then
+    /// held to every later sample like a preflight thread, so this stop's own
+    /// attach (which it was verified stopped through) does not undo it.
     fn covered_births(
         &self,
-        states: &BTreeMap<u32, u8>,
-        starts: &BTreeMap<u32, u64>,
+        samples: &BTreeMap<u32, TaskSample>,
         last_attach_boot_ns: Option<u64>,
+        admit_births: bool,
     ) -> Result<Vec<(u32, u64)>, String> {
         for tid in self.expected_tasks.keys() {
-            if !states.contains_key(tid) {
+            if !samples.contains_key(tid) {
                 return Err(MSG_TASK_SET_CHANGED.into());
             }
         }
         let mut births = Vec::new();
-        for tid in states.keys() {
+        for (tid, sample) in samples {
             let known = self.expected_tasks.contains_key(tid);
-            match (
-                known,
-                self.expected_starts.get(tid),
-                starts.get(tid).copied(),
-            ) {
+            match (known, self.expected_starts.get(tid), sample.start) {
                 (true, Some(recorded), Some(start)) if start == *recorded => {}
-                (false, None, Some(start)) if birth_covered(start, last_attach_boot_ns) => {
+                (false, None, Some(start))
+                    if admit_births && birth_covered(start, last_attach_boot_ns) =>
+                {
                     births.push((*tid, start));
                 }
                 _ => return Err(MSG_TASK_SET_CHANGED.into()),
@@ -2235,8 +2272,8 @@ impl PauseIo for SessionPauseIo<'_> {
         read_task_states(pid)
     }
 
-    fn task_starts(&mut self, pid: u32) -> Result<BTreeMap<u32, u64>, String> {
-        read_task_starts(pid)
+    fn task_samples(&mut self, pid: u32) -> Result<BTreeMap<u32, TaskSample>, String> {
+        read_task_samples(pid)
     }
 
     fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
@@ -2846,16 +2883,16 @@ fn parse_task_state(stat: &[u8]) -> Option<u8> {
         .flatten()
 }
 
-/// Every task of `pid` and its kernel start time in boot-relative clock ticks
-/// (`/proc/<pid>/task/<tid>/stat` field 22). A task whose `stat` file cannot
-/// be read is absent from the map: it exited mid-sample or is otherwise
-/// unreadable, and the coordinator treats an undated task as a changed set,
-/// never as covered. Only a wholesale enumeration failure, an invalid task
-/// directory, or a successfully read but unparseable line is an error.
-pub(crate) fn read_task_starts(pid: u32) -> Result<BTreeMap<u32, u64>, String> {
+/// Every task of `pid` with its state letter and kernel start time, from one
+/// read of each `/proc/<pid>/task/<tid>/stat` (fields 3 and 22), so a
+/// thread's state and identity come from the same read. As in
+/// [`read_task_states`], an unreadable `stat` file or state is an error (the
+/// sample then refuses); a start time that cannot be parsed is undated
+/// (`None`), which the coordinator treats as a changed set, never as covered.
+pub(crate) fn read_task_samples(pid: u32) -> Result<BTreeMap<u32, TaskSample>, String> {
     let directory = std::fs::read_dir(format!("/proc/{pid}/task"))
-        .map_err(|error| format!("cannot enumerate task starts for pid {pid}: {error}"))?;
-    let mut starts = BTreeMap::new();
+        .map_err(|error| format!("cannot enumerate task set for pid {pid}: {error}"))?;
+    let mut samples = BTreeMap::new();
     for entry in directory {
         let entry =
             entry.map_err(|error| format!("cannot enumerate task for pid {pid}: {error}"))?;
@@ -2864,15 +2901,18 @@ pub(crate) fn read_task_starts(pid: u32) -> Result<BTreeMap<u32, u64>, String> {
             .to_string_lossy()
             .parse()
             .map_err(|_| format!("invalid task directory for pid {pid}"))?;
-        let Ok(stat) = std::fs::read(entry.path().join("stat")) else {
-            continue;
-        };
-        let Some(start) = parse_task_start(&stat) else {
-            return Err(format!("cannot parse task {tid} start"));
-        };
-        starts.insert(tid, start);
+        let stat = std::fs::read(entry.path().join("stat"))
+            .map_err(|error| format!("cannot read task {tid} state: {error}"))?;
+        let state =
+            parse_task_state(&stat).ok_or_else(|| format!("cannot parse task {tid} state"))?;
+        let start = parse_task_start(&stat);
+        samples.insert(tid, TaskSample { state, start });
     }
-    Ok(starts)
+    if samples.is_empty() {
+        Err(format!("pid {pid} has an empty task set"))
+    } else {
+        Ok(samples)
+    }
 }
 
 /// Whether a thread's birth provably follows the last completed provider hook
@@ -2890,8 +2930,12 @@ pub(crate) fn read_task_starts(pid: u32) -> Result<BTreeMap<u32, u64>, String> {
 /// is an exact floor division, so `start_ticks * tick_ns <= birth_ns`; a
 /// truncated `tick_ns` only lowers the bound. Hence a floor strictly after
 /// the attach proves the birth is after it. Checked against the 6.6.157,
-/// 6.12.111 and 7.0.14 sources. Equality is not covered, and neither is a
-/// missing instant (none recorded or one in flight) or a saturated one.
+/// 6.12.111 and 7.0.14 sources. Without a margin, this also relies on the
+/// kernel's boot clock being ordered across CPUs: an attach completion read on
+/// one CPU before a `clone` on another never reads later than that child's
+/// `start_boottime` (both come from the one system-wide timekeeper). Equality
+/// is not covered, and neither is a missing instant (none recorded or one in
+/// flight) or a saturated one.
 fn birth_covered(start_ticks: u64, last_attach_boot_ns: Option<u64>) -> bool {
     let Some(attach) = last_attach_boot_ns else {
         return false;
@@ -2943,9 +2987,10 @@ pub(crate) fn boot_ns() -> Option<u64> {
 /// When provider hook attaches completed, in the boot clock. Uprobes are per
 /// file, so once a provider's hooks are live they fire for every thread of
 /// every process mapping it: a thread born strictly after the last completed
-/// attach never ran with a provider unhooked. One process-wide maximum is
-/// kept, which is conservative: an attach for any provider anywhere in this
-/// observer moves the instant later, never earlier.
+/// attach is no more exposed than a thread that existed at preflight (a
+/// provider mapped but not yet attached is unhooked for every thread alike).
+/// One process-wide maximum is kept, which is conservative: an attach for any
+/// provider anywhere in this observer moves the instant later, never earlier.
 pub(crate) struct HookAttachClock {
     in_flight: AtomicU64,
     /// Latest completion stamp; zero when none is recorded. An unreadable
@@ -3203,6 +3248,18 @@ mod tests {
         }
     }
 
+    impl FakeIo {
+        /// The scripted start times for one sample, read after its states.
+        fn scripted_starts(&mut self) -> Result<BTreeMap<u32, u64>, String> {
+            if let Some(starts) = self.starts.pop_front() {
+                return starts;
+            }
+            // Unscripted tasks date at tick zero, matching the default test
+            // baseline; a scripted birth dates against the scripted attach.
+            Ok(self.last_states.keys().map(|tid| (*tid, 0)).collect())
+        }
+    }
+
     impl PauseIo for FakeIo {
         fn now_ns(&mut self) -> Result<u64, String> {
             if self.resumed
@@ -3255,13 +3312,16 @@ mod tests {
             states
         }
 
-        fn task_starts(&mut self, _: u32) -> Result<BTreeMap<u32, u64>, String> {
-            if let Some(starts) = self.starts.pop_front() {
-                return starts;
-            }
-            // Unscripted tasks date at tick zero, matching the default test
-            // baseline; a scripted birth dates against the scripted attach.
-            Ok(self.last_states.keys().map(|tid| (*tid, 0)).collect())
+        fn task_samples(&mut self, pid: u32) -> Result<BTreeMap<u32, TaskSample>, String> {
+            let states = self.task_states(pid)?;
+            let starts = self.scripted_starts()?;
+            Ok(states
+                .into_iter()
+                .map(|(tid, state)| {
+                    let start = starts.get(&tid).copied();
+                    (tid, TaskSample { state, start })
+                })
+                .collect())
         }
 
         fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {
@@ -4627,7 +4687,7 @@ mod tests {
     /// (ruling PT-5).
     #[test]
     fn settling_fails_fast_on_a_state_that_cannot_reach_the_stop() {
-        for state in [b'Z', b'X', b'x', b't'] {
+        for state in *b"ZXxt" {
             let mut io = successful_io(vec![record(10, 0, false)]);
             let unreachable: BTreeMap<u32, u8> = [(41, b'T'), (42, state)].into_iter().collect();
             io.states = std::iter::repeat_with(|| Ok(unreachable.clone()))
@@ -4792,9 +4852,9 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
-        let starts = read_task_starts(child.id()).expect("task starts read");
+        let samples = read_task_samples(child.id()).expect("task samples read");
         let boot_after = boot_ns().expect("the boot clock reads");
-        let leader = starts.get(&child.id()).copied();
+        let leader = samples.get(&child.id()).and_then(|sample| sample.start);
         child.kill().unwrap();
         child.wait().unwrap();
 

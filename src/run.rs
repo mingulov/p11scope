@@ -11444,11 +11444,14 @@ mod tests {
             crate::discovery::pause::read_task_states(pid)
         }
 
-        fn task_starts(
+        fn task_samples(
             &mut self,
             pid: u32,
-        ) -> std::result::Result<std::collections::BTreeMap<u32, u64>, String> {
-            crate::discovery::pause::read_task_starts(pid)
+        ) -> std::result::Result<
+            std::collections::BTreeMap<u32, crate::discovery::pause::TaskSample>,
+            String,
+        > {
+            crate::discovery::pause::read_task_samples(pid)
         }
 
         fn last_hook_attach_boot_ns(&mut self) -> Option<u64> {

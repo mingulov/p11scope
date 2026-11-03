@@ -22949,6 +22949,59 @@ fn publish_deferral_matches_full_publication_step_for_step() {
         1,
         1,
     );
+    // Step 13: a pre-arm watch transition between stationary arms publishes
+    // on both. The merge renders watches, and the transition path
+    // re-renders discovery directly without dirtying the facts revision,
+    // so a deferred commit would leave the stored history watch stale
+    // while the full engine merges the ended watch. Watch presence denies
+    // the proof; both sides merge.
+    use crate::prearm_module::PrearmWatch;
+    use crate::render::PrearmWatchEnd;
+    let fixture = LoaderPlanningFixture::new();
+    let (mut deferred, mut full) = clean_deferral_pair(&fixture);
+    let module = deferred.plan.modules[0].clone();
+    assert_eq!(module.object, full.plan.modules[0].object);
+    for engine in [&mut deferred, &mut full] {
+        engine
+            .prearm
+            .install_watch_for_test(module.object, PrearmWatch::new(BTreeSet::new()));
+        assert!(engine.has_prearm_watches());
+        // Converge both histories on the live watch render first, so the
+        // step below twins the transition, not watch creation.
+        engine.publish_current_capture_facts().unwrap();
+        let live = engine.capture_facts.history.modules[&module.id]
+            .watch
+            .clone()
+            .expect("the merge renders the live watch");
+        assert_eq!(live.ended_by, None);
+    }
+    // The production scope-end driver: ends every watch and re-renders
+    // the discovery records. A fixed instant keeps both sides identical.
+    for engine in [&mut deferred, &mut full] {
+        engine.end_prearm_watches_at(PrearmWatchEnd::ScopeEnd, Some(9_000));
+    }
+    let mut deferred_counts = publish_operation_counts(&deferred);
+    let mut full_counts = publish_operation_counts(&full);
+    apply_both(
+        &fixture,
+        &mut deferred,
+        &mut full,
+        &mut deferred_counts,
+        &mut full_counts,
+        1,
+        1,
+        1,
+        1,
+    );
+    // Non-vacuity: the ended watch actually landed in merged history.
+    for engine in [&deferred, &full] {
+        let ended = engine.capture_facts.history.modules[&module.id]
+            .watch
+            .as_ref()
+            .expect("history renders the ended watch");
+        assert_eq!(ended.ended_by, Some(PrearmWatchEnd::ScopeEnd));
+        assert_eq!(ended.until_ns, Some(9_000));
+    }
 }
 
 #[test]

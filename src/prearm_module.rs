@@ -516,6 +516,16 @@ impl PrearmState {
         }
     }
 
+    /// Installs a watch without the pin-alias precondition, for the
+    /// publication-deferral twin only: the twin drives production
+    /// transitions, re-rendering and merge reads over it. Watch creation
+    /// itself (`create_watches`, pin-gated) is covered by the pre-arm
+    /// packet tests; the deferral bug is about transitions, not creation.
+    #[cfg(test)]
+    pub(crate) fn install_watch_for_test(&mut self, id: PinnedObjectId, watch: PrearmWatch) {
+        self.watches.insert(id, watch);
+    }
+
     /// Ends every watch's tracking exactly once (scope end / stop driver).
     pub(crate) fn end_all(&mut self, cause: PrearmWatchEnd, now: Option<u64>) {
         for watch in self.watches.values_mut() {

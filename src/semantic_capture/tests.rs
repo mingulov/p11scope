@@ -1983,7 +1983,7 @@ fn joint_unlocalized_raw_loss_retains_all_sealed_domains_and_effects() {
     use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
     use crate::semantics_objects::journal::JournalGap;
     use crate::semantics_objects::journal::joint_driver::{
-        JointCaptureOwner, RawDisposeReason, RawJointQuantum, RawQuantumRefusal,
+        JointCaptureOwner, RawDisposeReason, RawJointQuantum,
     };
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
     use crate::semantics_objects::{Lifetime, ObjectEffect, ObjectGap};

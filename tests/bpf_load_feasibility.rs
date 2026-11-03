@@ -7,7 +7,10 @@
 //! resident-service cost parts. Uses the embedded objects through the
 //! existing `pub` statics only; never changes product code paths. Nothing
 //! is attached, pinned, executed or retained: every load is dropped at the
-//! end of its trial.
+//! end of its trial. The page-cache drop behind cache-cold trial 0 is
+//! system-wide: it runs only with `P11SCOPE_FEASIBILITY_DROP_CACHES=1`
+//! in an exclusive window; the default labels trial 0
+//! fresh-process-first-trial without touching the cache.
 //!
 //! Rows go to stdout as JSONL and, when `P11SCOPE_FEASIBILITY_OUT` names a
 //! directory, are appended to `<dir>/<cell>.jsonl` with a `run_id` per
@@ -128,11 +131,25 @@ fn kernel_release() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// Sysctl releasing page cache; the write is system-wide.
+const DROP_CACHES_SYSCTL: &str = "/proc/sys/vm/drop_caches";
+
+/// Opt-in for the system-wide page-cache drop; exclusive windows only.
+const DROP_CACHES_ENV: &str = "P11SCOPE_FEASIBILITY_DROP_CACHES";
+
 /// Attempt the cold-load precondition: drop page cache (including the
-/// cached `/sys/kernel/btf/vmlinux` blob) so trial 0 is cache-cold.
+/// cached `/sys/kernel/btf/vmlinux` blob) so trial 0 is cache-cold —
+/// but only with explicit opt-in, since the write is system-wide.
 /// Returns the cold method label actually achieved.
 fn drop_caches_for_cold() -> &'static str {
-    match fs::write("/proc/sys/vm/drop_caches", "3") {
+    drop_caches_for_cold_at(DROP_CACHES_SYSCTL)
+}
+
+fn drop_caches_for_cold_at(path: &str) -> &'static str {
+    if std::env::var(DROP_CACHES_ENV).as_deref() != Ok("1") {
+        return "fresh-process-first-trial";
+    }
+    match fs::write(path, "3") {
         Ok(()) => "drop_caches",
         Err(_) => "fresh-process-first-trial",
     }
@@ -1038,5 +1055,100 @@ mod unit_tests {
             assert_eq!(read_sysctl(&path).as_deref(), Some("1"));
         }
         assert_eq!(read_sysctl(&path).as_deref(), Some("1"));
+    }
+
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    /// Serializes tests that mutate process env and restores the prior
+    /// value on drop, so parallel tests never observe a half-set var.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn hold(key: &'static str, value: Option<&str>) -> Self {
+            let lock = ENV_LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let prior = std::env::var_os(key);
+            // SAFETY: the static mutex serializes every test that touches
+            // process env, and no other thread in this binary reads this var.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self {
+                _lock: lock,
+                key,
+                prior,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: same serialization as `hold`; restores the pre-test value.
+            unsafe {
+                match self.prior.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drop_caches_defaults_to_fresh_process_label() {
+        let _env = EnvGuard::hold(DROP_CACHES_ENV, None);
+        let mut file = tempfile::NamedTempFile::new().expect("temp sysctl");
+        file.write_all(b"seed").expect("seed sysctl");
+        file.flush().expect("flush sysctl");
+        let path = file.path().to_str().expect("utf8 temp path");
+        assert_eq!(drop_caches_for_cold_at(path), "fresh-process-first-trial");
+        assert_eq!(
+            fs::read_to_string(path).expect("read back").as_str(),
+            "seed",
+            "default path must not write"
+        );
+    }
+
+    #[test]
+    fn drop_caches_writes_only_with_opt_in() {
+        let file = tempfile::NamedTempFile::new().expect("temp sysctl");
+        let path = file
+            .path()
+            .to_str()
+            .expect("utf8 temp path")
+            .to_string();
+        {
+            let _env = EnvGuard::hold(DROP_CACHES_ENV, Some("1"));
+            assert_eq!(drop_caches_for_cold_at(&path), "drop_caches");
+            assert_eq!(fs::read_to_string(&path).expect("read back").as_str(), "3");
+        }
+        for value in ["0", "yes", ""] {
+            let _env = EnvGuard::hold(DROP_CACHES_ENV, Some(value));
+            fs::write(&path, "seed").expect("reseed");
+            assert_eq!(
+                drop_caches_for_cold_at(&path),
+                "fresh-process-first-trial",
+                "value {value:?} must not opt in"
+            );
+            assert_eq!(fs::read_to_string(&path).expect("read back").as_str(), "seed");
+        }
+    }
+
+    #[test]
+    fn drop_caches_opt_in_failure_keeps_fresh_label() {
+        let _env = EnvGuard::hold(DROP_CACHES_ENV, Some("1"));
+        let missing = std::env::temp_dir().join("p11scope-feasibility-no-such-dir/sysctl");
+        assert_eq!(
+            drop_caches_for_cold_at(missing.to_str().expect("utf8")),
+            "fresh-process-first-trial"
+        );
     }
 }

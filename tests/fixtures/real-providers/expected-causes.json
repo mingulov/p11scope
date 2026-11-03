@@ -96,6 +96,35 @@
      "status": "sigstop"
     },
     "tool_version": "3.8.13-1.fc44"
+   },
+   {
+    "observation": [
+     {
+      "cause": "modules_skipped",
+      "owner": "p11kit-admission, batch 5b",
+      "reason": "W3-2 finding 1: the pinned p11-kit closure skip is exempt in metrics as in profile. Provisional: re-take on the integrated tree after p11kit-admission lands (batch 5b)."
+     },
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+     },
+     {
+      "cause": "surfaces",
+      "owner": "exec-real-providers",
+      "reason": "p11-kit closure templates read known_prefix (68-entry 3.2 tables)"
+     }
+    ],
+    "os": "ubuntu",
+    "p11kit_skip": 6120,
+    "p11kit_version": "0.26.2-2",
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "pause confirmed on every owner",
+     "status": "sigstop"
+    },
+    "tool_version": "3.8.12-2ubuntu1.1",
+    "provisional": true
    }
   ],
   "real-nss-certutil": [
@@ -136,6 +165,35 @@
      "status": "sigstop"
     },
     "tool_version": "3.130.0-1.fc44"
+   },
+   {
+    "observation": [
+     {
+      "cause": "interface_selection",
+      "owner": "exec-real-providers",
+      "reason": "selection loss beside unverified tables"
+     },
+     {
+      "cause": "loader_discovery",
+      "owner": "exec-real-providers",
+      "reason": "live-loader timing gap with confirmed pause (unproven classification)"
+     },
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+     }
+    ],
+    "os": "ubuntu",
+    "p11kit_skip": null,
+    "p11kit_version": null,
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "pause confirmed on every owner",
+     "status": "sigstop"
+    },
+    "tool_version": "2:3.120-1ubuntu2.2",
+    "provisional": true
    }
   ],
   "real-nss-certutil-metrics": [
@@ -310,6 +368,35 @@
      "status": "sigstop"
     },
     "tool_version": "0.26.5-1.fc44"
+   },
+   {
+    "observation": [
+     {
+      "cause": "modules_skipped",
+      "owner": "p11kit-admission, batch 5b",
+      "reason": "W3-2 finding 1: the pinned p11-kit closure skip is exempt in metrics as in profile. Provisional: re-take on the integrated tree after p11kit-admission lands (batch 5b)."
+     },
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+     },
+     {
+      "cause": "surfaces",
+      "owner": "exec-real-providers",
+      "reason": "p11-kit closure templates read known_prefix (68-entry 3.2 tables)"
+     }
+    ],
+    "os": "ubuntu",
+    "p11kit_skip": 6120,
+    "p11kit_version": "0.26.2-2",
+    "pause": {
+     "owner": "exec-real-providers",
+     "reason": "pause confirmed on every owner",
+     "status": "sigstop"
+    },
+    "tool_version": "0.26.2-2",
+    "provisional": true
    }
   ],
   "real-pkcs11tool-opensc": [],
@@ -342,6 +429,110 @@
      "status": "sigstop"
     },
     "tool_version": "0.27.1-2.fc44"
+   },
+   {
+    "observation": [
+     {
+      "cause": "in_flight_at_end",
+      "owner": "exec-real-providers",
+      "reason": "one call in flight at capture end"
+     },
+     {
+      "cause": "interface_selection",
+      "owner": "exec-real-providers",
+      "reason": "selection loss beside unverified tables"
+     },
+     {
+      "cause": "skipped",
+      "owner": "exec-real-providers",
+      "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+     }
+    ],
+    "os": "ubuntu",
+    "p11kit_skip": null,
+    "p11kit_version": null,
+    "pause": {
+     "owner": "pause-thread-births, batch 5b",
+     "reason": "timing-dependent pause outcome: sigstop shape (3 coherent samples); recheck on the batch-5b tree",
+     "status": "sigstop"
+    },
+    "tool_version": "0.27.0~rc1-1",
+    "provisional": true,
+    "alternates": [
+     {
+      "observation": [
+       {
+        "cause": "interface_selection",
+        "owner": "exec-real-providers",
+        "reason": "selection loss beside unverified tables"
+       },
+       {
+        "cause": "loader_discovery",
+        "owner": "exec-real-providers",
+        "reason": "live-loader timing gap beside the partial pause"
+       },
+       {
+        "cause": "pause_partial",
+        "owner": "exec-real-providers",
+        "reason": "OpenSC partial pause; exec-real-providers lane"
+       },
+       {
+        "cause": "skipped",
+        "owner": "exec-real-providers",
+        "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+       },
+       {
+        "cause": "unprotected_live_windows",
+        "owner": "exec-real-providers",
+        "reason": "a loader hit with no confirmed pause owner beside the partial pause"
+       }
+      ],
+      "pause": {
+       "owner": "pause-thread-births, batch 5b",
+       "reason": "timing-dependent pause outcome: partial shape A (1 sample); recheck on the batch-5b tree",
+       "status": "partial"
+      }
+     },
+     {
+      "observation": [
+       {
+        "cause": "in_flight_at_end",
+        "owner": "exec-real-providers",
+        "reason": "one call in flight at capture end beside the partial pause"
+       },
+       {
+        "cause": "interface_selection",
+        "owner": "exec-real-providers",
+        "reason": "selection loss beside unverified tables"
+       },
+       {
+        "cause": "loader_discovery",
+        "owner": "exec-real-providers",
+        "reason": "live-loader timing gap beside the partial pause"
+       },
+       {
+        "cause": "pause_partial",
+        "owner": "exec-real-providers",
+        "reason": "OpenSC partial pause; exec-real-providers lane"
+       },
+       {
+        "cause": "skipped",
+        "owner": "exec-real-providers",
+        "reason": "entry-level skips: runtime-built spy table outside the scan; static-probe detach/reattach pairs"
+       },
+       {
+        "cause": "unprotected_live_windows",
+        "owner": "exec-real-providers",
+        "reason": "a loader hit with no confirmed pause owner beside the partial pause"
+       }
+      ],
+      "pause": {
+       "owner": "pause-thread-births, batch 5b",
+       "reason": "timing-dependent pause outcome: partial shape C with in-flight calls at end (1 sample); recheck on the batch-5b tree",
+       "status": "partial"
+      }
+     }
+    ]
    }
   ],
   "real-pkcs11tool-softhsm-metrics": [

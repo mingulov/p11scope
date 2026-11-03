@@ -12484,9 +12484,11 @@ mod tests {
         }
     }
 
-    /// The raw-clone survivor for the scan cold-route twin: parks in
-    /// `pause()`. Raw syscalls only (it runs on a COW-inherited stack).
-    extern "C" fn pause_survivor_main(_arg: *mut std::ffi::c_void) -> libc::c_int {
+    /// The raw-clone survivor for the scan cold-route twin: reports one
+    /// readiness byte over the pipe (whose write end arrives as the
+    /// argument) after arming, then parks in `pause()`. Raw syscalls
+    /// only (it runs on a COW-inherited stack).
+    extern "C" fn pause_survivor_main(arg: *mut std::ffi::c_void) -> libc::c_int {
         // Parent-death guard (same body as
         // `crate::fixture_guard::DieWithParent`, with the owner from the
         // pre-fork store): a test that dies abruptly must not strand the
@@ -12500,6 +12502,25 @@ mod tests {
             if libc::getppid() != owner as libc::pid_t {
                 libc::_exit(127);
             }
+        }
+        // Readiness: the spawner returns only after this write, so a
+        // returned group is always armed. Without it, the spawner thread
+        // can exit before the survivor arms, and the `getppid` recheck
+        // cannot observe thread death, so the survivor misses its death
+        // signal and keeps the group alive forever.
+        let wfd = arg as usize as libc::c_int;
+        let byte = [1u8; 1];
+        // SAFETY: writing the stack byte to the pipe.
+        let wrote = unsafe { libc::write(wfd, byte.as_ptr().cast(), byte.len()) };
+        if wrote != byte.len() as isize {
+            unsafe {
+                libc::syscall(libc::SYS_exit, 1);
+            }
+        }
+        // SAFETY: the readiness byte was reported; the write end served
+        // its single byte.
+        unsafe {
+            libc::close(wfd);
         }
         loop {
             // SAFETY: `pause()` takes no arguments and only returns on a signal.
@@ -12529,6 +12550,12 @@ mod tests {
             let mut go = [0; 2];
             // SAFETY: a valid two-element array for pipe2.
             assert_eq!(unsafe { libc::pipe2(go.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            let mut ready = [0; 2];
+            // SAFETY: a valid two-element array for pipe2.
+            assert_eq!(
+                unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
             // SAFETY: the child only closes one end, reads one go byte,
             // clones, and exits its leader thread; no allocator, no
             // pthread, no locks.
@@ -12541,6 +12568,7 @@ mod tests {
             if pid == 0 {
                 unsafe {
                     libc::close(go[1]);
+                    libc::close(ready[0]);
                     let mut byte = [0u8; 1];
                     let got = libc::read(go[0], byte.as_mut_ptr().cast(), byte.len());
                     if got != byte.len() as isize {
@@ -12552,7 +12580,12 @@ mod tests {
                         | libc::CLONE_SIGHAND
                         | libc::CLONE_THREAD
                         | libc::CLONE_SYSVSEM;
-                    let cloned = libc::clone(pause_survivor_main, top, FLAGS, std::ptr::null_mut());
+                    let cloned = libc::clone(
+                        pause_survivor_main,
+                        top,
+                        FLAGS,
+                        ready[1] as isize as *mut std::ffi::c_void,
+                    );
                     if cloned < 0 {
                         libc::_exit(1);
                     }
@@ -12565,6 +12598,7 @@ mod tests {
             // copy, so the child reads EOF (never hangs) if the parent dies.
             unsafe {
                 libc::close(go[0]);
+                libc::close(ready[1]);
             }
             let tgid = pid as u32;
             let view = ProcessView::open(ProcessViewId(7501), tgid)
@@ -12577,6 +12611,32 @@ mod tests {
             // SAFETY: the write end served its single write.
             unsafe {
                 libc::close(go[1]);
+            }
+            // The survivor reports readiness after arming: one byte proves
+            // this returns only an armed group (a survivor that died first
+            // closes its ends, so a short read ends as EOF, never a hang).
+            let mut armed = [0u8; 1];
+            loop {
+                // SAFETY: `read` into the live stack buffer.
+                let got = unsafe { libc::read(ready[0], armed.as_mut_ptr().cast(), armed.len()) };
+                if got == armed.len() as isize {
+                    break;
+                }
+                if got == 0 {
+                    panic!("the survivor died before reporting readiness");
+                }
+                if got < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    panic!("survivor readiness read failed: {error}");
+                }
+            }
+            // SAFETY: the readiness byte was consumed; the read end served
+            // its single byte.
+            unsafe {
+                libc::close(ready[0]);
             }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !crate::process::process_is_zombie(tgid) {

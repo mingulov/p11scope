@@ -740,6 +740,12 @@
     },
     {
       "file": "src/discovery/engine_tests.rs",
+      "path": "discovery::engine::tests::stamped_legacy_fixture_reports_no_surface_gap",
+      "reason": "privileged: stamped legacy 3.x verdict cell, BPF-free",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/engine_tests.rs",
       "path": "discovery::engine::tests::lifecycle_manifest_helper_entrypoint",
       "reason": "private manifest helper; invoked by DiscoveryLifecycleFixture",
       "cell": "helper"

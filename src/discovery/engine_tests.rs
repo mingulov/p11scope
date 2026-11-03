@@ -56161,7 +56161,7 @@ fn stamped_legacy_twins_keep_the_raw_prefix_walk() {
 /// anywhere the privileged campaign runs. The getter and executable-tail
 /// twins keep the surface gap.
 #[test]
-#[ignore]
+#[ignore = "privileged: stamped legacy 3.x verdict cell, BPF-free"]
 fn stamped_legacy_fixture_reports_no_surface_gap() {
     let cells = [0u8, 1, 2, 3, 255]
         .map(|minor| (minor, StampedLegacyKnob::Plain, false))

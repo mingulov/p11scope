@@ -480,6 +480,14 @@ fn exec_generation_ticket_is_never_acquired_under_pid_scope() {
         ("detailed", p11scope::EBPF_OBJECT),
         ("callers", p11scope::EBPF_INVENTORY_CALLERS_OBJECT),
     ];
+    // The journal variant is covered exactly in journal builds: a build
+    // that selected the journal but embedded no object fails here instead
+    // of passing on the two ordinary objects alone.
+    assert_eq!(
+        p11scope::EBPF_JOURNAL_OBJECT.is_empty(),
+        env!("P11SCOPE_JOURNAL_ENABLED") != "1",
+        "the journal object is embedded exactly when the build selects it"
+    );
     if !p11scope::EBPF_JOURNAL_OBJECT.is_empty() {
         variants.push(("journal", p11scope::EBPF_JOURNAL_OBJECT));
     }

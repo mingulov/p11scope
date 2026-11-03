@@ -3834,6 +3834,36 @@ mod tests {
         }
     }
 
+    /// Delivery tolerance covers only a task still on its way to the stop
+    /// (R/S/D): a zombie, a dead task or a tracing stop at the first
+    /// sample will never become `T`, so the sample fails at once, without
+    /// spending the causal deadline waiting for delivery.
+    #[test]
+    fn a_task_outside_r_s_d_t_fails_without_waiting_for_delivery() {
+        for state in [b'Z', b'X', b't'] {
+            let mut io = successful_io(vec![record(10, 0, false)]);
+            let tasks: BTreeMap<u32, u8> = [(41, state), (42, b'T')].into_iter().collect();
+            io.states = VecDeque::from([Ok(tasks)]);
+            let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+            coordinator.arm_for_test();
+
+            coordinator.service(&mut io).unwrap();
+
+            assert_eq!(
+                coordinator.counters(),
+                PauseCounters::partial(1),
+                "state {}",
+                state as char
+            );
+            assert_eq!(
+                io.events.iter().filter(|event| **event == "wait").count(),
+                0,
+                "state {} fails fast",
+                state as char
+            );
+        }
+    }
+
     /// Delivery tolerance ends at the first sample: a task running again
     /// after stopped samples means SIGCONT, not a late SIGSTOP, so the
     /// later samples never wait out a re-stop (SIGTTIN, Ctrl-Z). Staged

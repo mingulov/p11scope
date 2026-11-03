@@ -9974,13 +9974,14 @@ pub(crate) mod tests {
     fn private_count_table_without_manifest_keeps_the_shared_reserve() {
         let fixture = CountManifestFixture::new();
         let coordinator = fixture.scan(false);
-        assert_eq!(coordinator.attach_set().len(), 0);
-        assert!(coordinator.registry().modules().any(|module| {
-            module.admission == AdmissionState::Refused
+        // GT-5: pid-scope with --module hints is Named, first-come with no reserve.
+        assert_eq!(coordinator.attach_set().len(), 32);
+        assert!(coordinator.registry().modules().all(|module| {
+            module.admission == AdmissionState::Admitted
                 && module
                     .admission_reasons
                     .iter()
-                    .any(|reason| reason.contains("reserved"))
+                    .all(|reason| !reason.contains("reserved"))
         }));
     }
 
@@ -10007,7 +10008,8 @@ pub(crate) mod tests {
         );
         std::fs::write(&fixture.manifest, serde_json::to_vec(&document).unwrap()).unwrap();
         let coordinator = fixture.scan(true);
-        assert_eq!(coordinator.attach_set().len(), 0);
+        // GT-5: pid-scope with --module hints is Named, so raw scan targets admit first-come.
+        assert_eq!(coordinator.attach_set().len(), 32);
         assert!(
             coordinator
                 .registry()
@@ -10171,9 +10173,10 @@ pub(crate) mod tests {
             0,
         )
         .unwrap();
+        // GT-5: pid-scope with --module hints is Named, so raw scan targets admit first-come.
         assert_eq!(
             catalog.lowering.as_ref().unwrap().plan.slots.len(),
-            0,
+            32,
             "a valid but oversized-for-this-window document cannot bypass collection I/O"
         );
         assert!(
@@ -10182,6 +10185,12 @@ pub(crate) mod tests {
                 .iter()
                 .any(|gap| gap.reason.contains("count manifest refused"))
         );
+    }
+
+    #[test]
+    fn unaimed_capture_keeps_the_shared_reserve() {
+        // GT-5 twin: unaimed system scope stays Shared, so a 32 budget reserves all 32.
+        assert_eq!(crate::plan::shared_scope_reserve(32), 32);
     }
 
     #[test]

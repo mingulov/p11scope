@@ -757,6 +757,109 @@ class LinkedControlTests(unittest.TestCase):
         self.assertIn("TRAPPED", out)
 
 
+    def test_eperm_retry_delivers_once_and_gives_up_loudly(self):
+        text = SCRIPT.read_text()
+
+        def extract(name):
+            start = text.index(f"{name}() {{")
+            end = text.index("\n}\n", start) + len("\n}\n")
+            return text[start:end]
+
+        functions = extract("pid_alive") + "\n" + extract("signal_observer")
+        # Fail closed when the control script's shape moves on: the twin
+        # must exercise the real functions, never an empty paste.
+        self.assertIn("/proc/", functions)
+        self.assertIn("tries", functions)
+        self.assertIn("could not signal observer", functions)
+        driver = self.directory / "eperm-twin.sh"
+        counter = self.directory / "deliveries"
+        # Python, not shell, counts deliveries: a bourne shell defers a
+        # trapped TERM until its foreground sleep finishes, while a
+        # sigaction handler appends at once and keeps sleeping.
+        sleeper_py = self.directory / "eperm-sleeper.py"
+        sleeper_py.write_text(
+            "import signal, sys, time\n"
+            "counter = sys.argv[1]\n"
+            "def on_term(signum, frame):\n"
+            '    with open(counter, "a") as handle:\n'
+            '        handle.write("x\\n")\n'
+            "signal.signal(signal.SIGTERM, on_term)\n"
+            "time.sleep(30)\n"
+        )
+        driver.write_text(
+            "#!/bin/sh\n"
+            "# EPERM-retry twin driver: the real pid_alive/signal_observer\n"
+            "# with a kill() stub. $1 = delivery counter file, $2 = sleeper.\n"
+            "set -u\n"
+            "counter=$1\n"
+            "sleeper_py=$2\n"
+            "KILL_FAILS=0\n"
+            "KILL_ALWAYS=0\n"
+            "kill() {\n"
+            '  if [ "$KILL_ALWAYS" = 1 ]; then return 1; fi\n'
+            '  if [ "$KILL_FAILS" -gt 0 ]; then KILL_FAILS=$((KILL_FAILS - 1)); return 1; fi\n'
+            '  command kill "$@"\n'
+            "}\n"
+            f"{functions}\n"
+            "sleeper() {\n"
+            '  python3 -I "$sleeper_py" "$counter" </dev/null >/dev/null 2>&1 &\n'
+            "  echo $!\n"
+            "}\n"
+            "reap() {\n"
+            '  command kill -KILL "$1" 2>/dev/null || true\n'
+            '  wait "$1" 2>/dev/null || true\n'
+            "}\n"
+            "# Case A: one refusal while the observer lives: retried once,\n"
+            "# delivered exactly once.\n"
+            ': > "$counter"\n'
+            "pid=$(sleeper)\n"
+            "sleep 0.5\n"
+            "KILL_FAILS=1\n"
+            "OBSERVER_PID=$pid\n"
+            "if ! signal_observer TERM; then\n"
+            '  echo "case A: signal_observer failed" >&2; reap "$pid"; exit 1\n'
+            "fi\n"
+            "tries=0\n"
+            'while [ "$(wc -l < "$counter" | tr -d " ")" -lt 1 ] && [ "$tries" -lt 100 ]; do\n'
+            "  sleep 0.05; tries=$((tries + 1))\n"
+            "done\n"
+            'n=$(wc -l < "$counter" | tr -d " ")\n'
+            'reap "$pid"\n'
+            '[ "$n" -eq 1 ] || { echo "case A: delivered $n times, want 1" >&2; exit 1; }\n'
+            "echo CASE-A-OK\n"
+            "# Case B: persistent refusal while the observer lives: loud give-up.\n"
+            "pid=$(sleeper)\n"
+            "sleep 0.5\n"
+            "KILL_ALWAYS=1\n"
+            "OBSERVER_PID=$pid\n"
+            'signal_observer TERM 2> "$counter.err"; rc=$?\n'
+            "KILL_ALWAYS=0\n"
+            'reap "$pid"\n'
+            'err=$(cat "$counter.err")\n'
+            '[ "$rc" -ne 0 ] || { echo "case B: silent success" >&2; exit 1; }\n'
+            'case "$err" in *"could not signal observer"*) ;;\n'
+            '  *) echo "case B: no loud refusal: $err" >&2; exit 1;; esac\n'
+            "echo CASE-B-OK\n"
+            "# Case C: a pid the kernel can never issue: prompt quiet give-up.\n"
+            "OBSERVER_PID=$(($(cat /proc/sys/kernel/pid_max) + 100))\n"
+            "before=$(date +%s)\n"
+            "if ! signal_observer TERM; then\n"
+            '  echo "case C: failed on a dead pid" >&2; exit 1\n'
+            "fi\n"
+            "after=$(date +%s)\n"
+            '[ $((after - before)) -lt 5 ] || { echo "case C: slow give-up" >&2; exit 1; }\n'
+            "echo CASE-C-OK\n"
+        )
+        proc = subprocess.run(
+            ["sh", str(driver), str(counter), str(sleeper_py)],
+            capture_output=True, text=True, timeout=120,
+            preexec_fn=_restore_int_quit)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("CASE-A-OK", proc.stdout)
+        self.assertIn("CASE-B-OK", proc.stdout)
+        self.assertIn("CASE-C-OK", proc.stdout)
+
+
 class LossVocabularyTests(unittest.TestCase):
     """The s1 loss subjects fail the shared zero-loss gate by subject.
 

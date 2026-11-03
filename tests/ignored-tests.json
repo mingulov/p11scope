@@ -64,6 +64,12 @@
     },
     {
       "file": "src/attach/counter_banks.rs",
+      "path": "attach::counter_banks::tests::counter_object_preflight_loads_all_modes",
+      "reason": "C1 live twin; privileged: every counter object loads through Session preparation (gate-1 must accept gate-free counter objects)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/counter_banks.rs",
       "path": "attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels",
       "reason": "historical/private opt-in control outside current live-positive qualification: pre-5.17 kernel lane; proves preparation refuses cleanly without the bpf_loop helper",
       "cell": "privileged"

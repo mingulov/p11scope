@@ -282,7 +282,7 @@ fn assert_abi_routing_identity_contract(attach: &str, example: &str) -> Result<(
         "#[doc(hidden)]\npub fn prepare_qualification_identity(",
         "\n}\n\nfn validate_policy_map",
     )?;
-    let direct = "ebpf: &mut Ebpf, pid: NonZeroU32) -> Result<()> {\n    prepare_identity(ebpf, &Scope::Pid(pid.get()), None)";
+    let direct = "ebpf: &mut Ebpf, pid: NonZeroU32) -> Result<()> {\n    prepare_identity(ebpf, &Scope::Pid(pid.get()), None, LOADER_GATE_BUILD)";
     if wrapper != direct {
         return Err(
             "qualification identity wrapper must directly return unowned PID-scoped preparation"
@@ -3747,8 +3747,8 @@ fn abi_routing_example_prepares_unowned_identity_before_either_attach() {
     assert_abi_routing_identity_contract(&attach, &example).unwrap();
 
     let swallowed = attach.replacen(
-        "    prepare_identity(ebpf, &Scope::Pid(pid.get()), None)\n",
-        "    let _ = prepare_identity(ebpf, &Scope::Pid(pid.get()), None);\n    Ok(())\n",
+        "    prepare_identity(ebpf, &Scope::Pid(pid.get()), None, LOADER_GATE_BUILD)\n",
+        "    let _ = prepare_identity(ebpf, &Scope::Pid(pid.get()), None, LOADER_GATE_BUILD);\n    Ok(())\n",
         1,
     );
     assert_ne!(attach, swallowed, "swallowed-error mutation must apply");

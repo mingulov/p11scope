@@ -376,6 +376,15 @@ pub(crate) const LOADER_GATE_BUILD: bool = {
     bytes.len() == 1 && bytes[0] == b'1'
 };
 
+/// Per-object gate requirement: only Detailed and journal sessions load a
+/// gate-carrying object in gate-1 builds. Counter objects never carry the
+/// gate maps (build.rs gates `BpfFlavor::Detailed` only), so a gate-1
+/// build requires no gate for them; requiring it refused every counter
+/// mode (C1) while doctor reported them available.
+fn identity_gate_required(is_counter_object: bool) -> bool {
+    LOADER_GATE_BUILD && !is_counter_object
+}
+
 /// Exact metadata for every map a gate-1 Detailed object adds, read from
 /// the built object (BTF DATASEC plus the Rust `maps` section). Counter
 /// and inventory objects never carry these; a gate-0 build refuses them.
@@ -682,11 +691,16 @@ fn owner_limit_from_start(ebpf: &Ebpf) -> Result<u64> {
     owner_limit_for_start(read_map_metadata("START", data)?)
 }
 
-fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) -> Result<()> {
+fn prepare_identity(
+    ebpf: &mut Ebpf,
+    scope: &Scope,
+    child: Option<&OwnedChild>,
+    gate: bool,
+) -> Result<()> {
     validate_identity_inventory(
         ebpf.maps()
             .map(|(name, map)| (name, matches!(map, Map::Unsupported(_)))),
-        LOADER_GATE_BUILD,
+        gate,
     )?;
     for (name, _) in IDENTITY_MAPS {
         identity_map_data(
@@ -695,7 +709,7 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
                 .with_context(|| format!("missing {name} map"))?,
         )?;
     }
-    if LOADER_GATE_BUILD {
+    if gate {
         validate_gate_map_presence(ebpf.maps().map(|(name, _)| name))?;
         for (name, _) in GATE_IDENTITY_MAPS {
             identity_map_data(
@@ -719,7 +733,7 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
         .transpose()?;
     let root = initial_root_control(root_pidfd.is_some());
     let bank_select = initial_bank_select();
-    prepare_identity_with(root_pidfd.is_some(), LOADER_GATE_BUILD, |step| {
+    prepare_identity_with(root_pidfd.is_some(), gate, |step| {
         match step {
             IdentityPreparation::WriteCookie => {
                 let mut control: Array<_, ImageIdentityControl> =
@@ -799,7 +813,7 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
 /// that authority internally.
 #[doc(hidden)]
 pub fn prepare_qualification_identity(ebpf: &mut Ebpf, pid: NonZeroU32) -> Result<()> {
-    prepare_identity(ebpf, &Scope::Pid(pid.get()), None)
+    prepare_identity(ebpf, &Scope::Pid(pid.get()), None, LOADER_GATE_BUILD)
 }
 
 fn validate_policy_map(ebpf: &Ebpf, name: &str, expected: ExactMapMetadata) -> Result<()> {
@@ -7286,7 +7300,10 @@ impl Session {
                     debug_assert!(process_creation_capture_enabled(scope, policy));
                 }
                 SessionPreparation::PrepareIdentity => {
-                    prepare_identity(&mut ebpf, scope, owned_child)
+                    // Per-object gate (C1): counter sessions load the
+                    // gate-free counter object even in gate-1 builds.
+                    let gate = identity_gate_required(counter.is_some());
+                    prepare_identity(&mut ebpf, scope, owned_child, gate)
                         .context("preparing required image identity and thread ownership")?;
                     // START metadata is immutable. Retain the same validated
                     // capacity-derived limit initialized and read back above.
@@ -12327,8 +12344,37 @@ mod tests {
 
     #[test]
     fn gate_inventory_refuses_missing_gate1_task_storage() {
-        // A gate-1 build refuses an object without its required bank map.
+        // A gate-1 Detailed object without its required bank map is
+        // refused: the gate Array maps are present but TASK_COOKIE_B is
+        // missing. (Counter-shaped inventories take gate=false via
+        // identity_gate_required and are accepted; see below.)
         let no_bank = [
+            ("TASK_COOKIE", true),
+            ("THREAD_OWNER", true),
+            ("ROOT_AFFILIATION", true),
+            ("COOKIE_CTL", false),
+            ("COOKIE_CTL_B", false),
+            ("IMAGE_BANK_SELECT", false),
+            ("LOADER_GATE", false),
+            ("LOADER_GATE_CTL", false),
+            ("OWNER_CTL", false),
+            ("ROOT_CTL", false),
+        ];
+        let error = validate_identity_inventory(no_bank.into_iter(), true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing required task-storage maps"),
+            "a gate-1 Detailed object without TASK_COOKIE_B is refused: {error:?}"
+        );
+    }
+
+    #[test]
+    fn gate1_counter_inventory_is_accepted() {
+        // C1: counter objects never carry the gate maps, so a gate-1
+        // build requires no gate for them. Before the per-object fix,
+        // counter sessions validated with gate=true and refused here.
+        let counter = [
             ("TASK_COOKIE", true),
             ("THREAD_OWNER", true),
             ("ROOT_AFFILIATION", true),
@@ -12336,7 +12382,15 @@ mod tests {
             ("OWNER_CTL", false),
             ("ROOT_CTL", false),
         ];
-        assert!(validate_identity_inventory(no_bank.into_iter(), true).is_err());
+        validate_identity_inventory(counter.into_iter(), identity_gate_required(true)).unwrap();
+    }
+
+    #[test]
+    fn identity_gate_is_required_per_object() {
+        // Only Detailed/journal objects take the build's gate flag;
+        // counter objects never require it, in either build flavour.
+        assert!(!identity_gate_required(true));
+        assert_eq!(identity_gate_required(false), LOADER_GATE_BUILD);
     }
 
     #[test]

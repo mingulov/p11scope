@@ -5,9 +5,10 @@
 A sweep trial stops one capture with SIGINT at a seeded offset and judges:
 the exit is a clean stop, a report is published, owned counts never exceed
 the independent workload ledger (and equal it when the ledger finished
-before the signal), cleanup completed, nothing panicked, and no storage
-refusal appeared unless one was injected. The seed and offset ride along in
-every detail string so a failing trial replays with --seed.
+before the signal), the stop receipt printed (cleanup completed for
+profile/run, the native-stopped line for inventory), nothing panicked, and
+no storage refusal appeared unless one was injected. The seed and offset
+ride along in every detail string so a failing trial replays with --seed.
 
 The burst judges one `profile --system` run whose last 300 ms started 32
 short-lived processes: the long workload stays exact, each provider
@@ -212,7 +213,16 @@ def judge_sweep_profile(command, report_text, workload_text, stderr_text, exit_c
 
 def judge_sweep_inventory(report_text, workload_text, stderr_text, exit_code,
                           ledger_complete, before_text, after_text, allow_storage_refusal):
-    check_hygiene(stderr_text, report_text, exit_code, allow_storage_refusal)
+    # Inventory drives its own native stop path, not the Detailed link
+    # cleanup printer: its positive stop receipt is the native-stopped
+    # line (measured on a live --system --manifest stop), plus the same
+    # exit/panic/refusal hygiene as the profile commands.
+    require(exit_code == 0, "observer exit is not a clean stop: %r" % exit_code)
+    require("native capture stopped after " in stderr_text, "missing native-stopped line")
+    require("panicked" not in stderr_text, "observer panicked")
+    if not allow_storage_refusal:
+        require(STORAGE_REFUSAL not in stderr_text, "storage refusal on stderr")
+        require(STORAGE_REFUSAL not in report_text, "storage refusal in report")
     provider = pinned_provider(before_text, after_text)
     expected, _, targets, _, workload_pid = workload_ledger(workload_text)
     check_targets(targets, provider)
@@ -262,13 +272,16 @@ def newcomer_pending(report, stderr_text):
 
 
 def judge_burst(report_text, workload_text, stderr_text, exit_code,
-                before_text, after_text, newcomer_function, provider_newcomers):
+                before_text, after_text, newcomer_functions, provider_newcomers):
     require(exit_code == 0, "observer exit is not a clean stop: %r" % exit_code)
     require("cleanup completed" in stderr_text, "missing cleanup-completed line")
     require("panicked" not in stderr_text, "observer panicked")
     require(STORAGE_REFUSAL not in stderr_text, "storage refusal on stderr")
     require(STORAGE_REFUSAL not in report_text, "storage refusal in report")
-    require(newcomer_function in NAMES, "unknown newcomer function")
+    require(isinstance(newcomer_functions, list) and newcomer_functions and
+            all(name in NAMES for name in newcomer_functions) and
+            len(set(newcomer_functions)) == len(newcomer_functions),
+            "unknown or duplicate newcomer function")
     require(integer(provider_newcomers) and provider_newcomers > 0,
             "invalid provider newcomer count")
     provider = pinned_provider(before_text, after_text)
@@ -287,6 +300,7 @@ def judge_burst(report_text, workload_text, stderr_text, exit_code,
     check_kernel_clean(evidence)
     require(evidence.get("drain_proven") is True, "final drain is not proven")
     totals = join_profile_rows(report, physical, provider)
+    extras = {}
     for name in NAMES:
         attempts, successes = expected[name]
         require(attempts == successes, "workload had failed calls: " + name)
@@ -295,10 +309,11 @@ def judge_burst(report_text, workload_text, stderr_text, exit_code,
             require(ownership(row) == provider,
                     "owned target has a different publishing module: " + name)
             require(row["errors"] == 0, "owned target has failed calls: " + name)
-        if name == newcomer_function:
+        if name in newcomer_functions:
             extra = total - successes
             require(0 <= extra <= provider_newcomers,
-                    "newcomer counts outside the burst population: %d" % extra)
+                    "newcomer counts outside the burst population: %s=%d" % (name, extra))
+            extras[name] = extra
         else:
             require(total == successes,
                     "long-workload count differs from independent ledger: " + name)
@@ -308,11 +323,11 @@ def judge_burst(report_text, workload_text, stderr_text, exit_code,
                             "long-workload target has unsettled returns: " + name)
     pending = newcomer_pending(report, stderr_text)
     observation = evidence.get("gap_classes", {}).get("observation", {})
-    extra = totals[newcomer_function][0] - expected[newcomer_function][1]
     if pending > 0:
         require(observation.get("status") != "exact", "pending coexists with exact observation")
-        require(extra + pending >= provider_newcomers,
-                "provider newcomers neither counted nor pending")
+        for name, extra in extras.items():
+            require(extra + pending >= provider_newcomers,
+                    "provider newcomers neither counted nor pending: %s" % name)
         branch = "pending-covered"
     else:
         require(observation.get("status") == "exact" and observation.get("causes") == [],
@@ -320,10 +335,12 @@ def judge_burst(report_text, workload_text, stderr_text, exit_code,
         for key in LOSS_COUNTERS:
             require(type(evidence.get(key)) is int and evidence[key] == 0,
                     "loss or unknown " + key)
-        require(extra == provider_newcomers, "provider newcomers missing with none pending")
+        for name, extra in extras.items():
+            require(extra == provider_newcomers,
+                    "provider newcomers missing with none pending: %s" % name)
         branch = "exact-all-counted"
     return ("newcomer-burst",
-            "system burst %s: newcomer extra=%d pending=%d" % (branch, extra, pending))
+            "system burst %s: newcomer fns=%d pending=%d" % (branch, len(extras), pending))
 
 
 def main(argv=None):
@@ -358,7 +375,8 @@ def main(argv=None):
             result["cell"] = "system-newcomer-burst"
             qualification, detail = judge_burst(
                 report_text, workload_text, stderr_text, args.exit,
-                before_text, after_text, args.newcomer_function, args.provider_newcomers)
+                before_text, after_text, args.newcomer_function.split(","),
+                args.provider_newcomers)
         elif args.command == "inventory-system":
             result["cell"] = "stop-race-sweep.inventory-system"
             qualification, detail = judge_sweep_inventory(

@@ -119,8 +119,13 @@ def ledger_lines(calls=7, complete=True, pid=123):
     return lines
 
 
-def stderr_text(pending=0, oldest="n/a", cleanup=True, panic=False, storage_refusal=False):
+def stderr_text(pending=0, oldest="n/a", cleanup=True, panic=False, storage_refusal=False,
+                native_stopped=True):
     lines = ["p11scope: capturing: single-shot\n"]
+    if native_stopped:
+        lines.append("p11scope: native capture stopped after 1 pass: 68 endpoints attached "
+                     "(uprobe-multi links), 0 failed; retirement closed (3 of 3 links closed); "
+                     "settlement unsettled\n")
     if panic:
         lines.append("thread 'main' panicked at src/main.rs:29\n")
     if storage_refusal:
@@ -302,6 +307,15 @@ class OracleTests(unittest.TestCase):
             box["report"]["modules"][0]["identity"]["inode"] = 999
         self.run_case(mutate, command="inventory-system", want=1)
 
+    def test_sweep_inventory_needs_no_cleanup_line(self):
+        self.run_case(lambda box: box.update(stderr=stderr_text(cleanup=False)),
+                      command="inventory-system")
+
+    def test_sweep_inventory_missing_native_stopped_fails(self):
+        self.run_case(lambda box: box.update(stderr=stderr_text(native_stopped=False)),
+                      command="inventory-system", want=1,
+                      detail_substr="missing native-stopped line")
+
     def test_burst_exact_all_counted_pass(self):
         def mutate(box):
             box["report"]["functions"][0]["calls"] = 7 + 16
@@ -360,6 +374,39 @@ class OracleTests(unittest.TestCase):
             box["report"]["functions"][0]["calls"] = 7 + 16
             box["report"]["functions"][1]["calls"] = 6
         self.run_case(mutate, mode="burst", command="profile-system", want=1)
+
+    def test_burst_multi_function_newcomers_covered_pass(self):
+        def mutate(box):
+            box["report"]["functions"][0]["calls"] = 7 + 16
+            box["report"]["functions"][1]["calls"] = 7 + 10
+            evidence = box["report"]["evidence"]
+            evidence["completeness"] = "PARTIAL"
+            evidence["discovery_truncated"] = 1
+            evidence["gap_classes"]["observation"] = {"status": "lossy",
+                                                      "causes": ["discovery_truncated"]}
+            evidence["verdict_detail"] = "concrete_gap"
+            evidence["scheduling"]["newcomer_queue"]["pending"] = 8
+            evidence["scheduling"]["newcomer_queue"]["oldest_pending_age_ms"] = 2
+            box["stderr"] = stderr_text(pending=8, oldest="2ms")
+        self.run_case(mutate, mode="burst", command="profile-system",
+                      newcomer_function="C_GenerateRandom,C_DigestInit")
+
+    def test_burst_multi_function_newcomer_uncovered_fails(self):
+        def mutate(box):
+            box["report"]["functions"][0]["calls"] = 7 + 16
+            box["report"]["functions"][1]["calls"] = 7 + 2
+            evidence = box["report"]["evidence"]
+            evidence["completeness"] = "PARTIAL"
+            evidence["discovery_truncated"] = 1
+            evidence["gap_classes"]["observation"] = {"status": "lossy",
+                                                      "causes": ["discovery_truncated"]}
+            evidence["verdict_detail"] = "concrete_gap"
+            evidence["scheduling"]["newcomer_queue"]["pending"] = 8
+            evidence["scheduling"]["newcomer_queue"]["oldest_pending_age_ms"] = 2
+            box["stderr"] = stderr_text(pending=8, oldest="2ms")
+        self.run_case(mutate, mode="burst", command="profile-system",
+                      newcomer_function="C_GenerateRandom,C_DigestInit", want=1,
+                      detail_substr="neither counted nor pending: C_DigestInit")
 
     def test_burst_stderr_pending_must_match_report(self):
         def mutate(box):

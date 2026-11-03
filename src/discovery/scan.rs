@@ -3313,6 +3313,25 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                     104
                 };
                 let count = ((snapshot.len() - candidate - width) / width).min(limit);
+                // Skip anchor decodes the overlap pass below would discard:
+                // a candidate covered by a validated table, or by an
+                // overlapping decode at least as long, adds no coverage but
+                // burns a table candidate each. An aliased export tail
+                // otherwise spends ~36 candidates per provider and exhausts
+                // the per-pass budget at system scale. Same-start
+                // extensions, longer recoveries, and candidates touching a
+                // kept decode still decode; the version sweep is unaffected,
+                // so version-readable tables always decode.
+                let candidate_len = table_bytes(layout, count).expect("bounded catalog");
+                let dominated = found.iter().any(|(start, kept_len, validated, _)| {
+                    candidate != *start
+                        && candidate < start.saturating_add(*kept_len)
+                        && *start < candidate.saturating_add(candidate_len)
+                        && (*validated || *kept_len >= candidate_len)
+                });
+                if dominated {
+                    continue;
+                }
                 let words: Vec<_> = (0..count)
                     .map(|slot| {
                         read_function_pointer(&snapshot[candidate..], layout, slot)

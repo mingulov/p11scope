@@ -4520,6 +4520,41 @@ fn exit_mapping_children_guard_reaps_remainder_after_mid_reap_panic() {
     );
 }
 
+/// The cgroup guards move the test back to the cgroup it started in
+/// (parsed from `/proc/self/cgroup`), never to the root: a test
+/// running under a CI or lane cgroup must not escape it for the rest
+/// of the run.
+#[test]
+fn exit_mapping_cgroup_origin_restores_the_nested_starting_cgroup() {
+    // Shaped like a real systemd user slice (cgroup v2): the origin
+    // is nested, never the root.
+    let nested = self_origin_cgroup("0::/user.slice/user-1000.slice/session-c2.scope\n");
+    assert_eq!(
+        nested,
+        std::path::PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/session-c2.scope")
+    );
+    // Already at the root: the origin is the root.
+    let root = self_origin_cgroup("0::/\n");
+    assert_eq!(root, std::path::PathBuf::from("/sys/fs/cgroup"));
+    // Unparsable input (v1 controller lines, garbage) falls back to
+    // the root rather than refusing teardown.
+    let v1_only = self_origin_cgroup("2:cpu,cpuacct:/foo\n");
+    assert_eq!(v1_only, std::path::PathBuf::from("/sys/fs/cgroup"));
+    let garbage = self_origin_cgroup("not a cgroup file\n");
+    assert_eq!(garbage, std::path::PathBuf::from("/sys/fs/cgroup"));
+}
+
+/// Teardown never kills while this process is still inside the owned
+/// cgroup: a failed move-out must not SIGKILL the test binary.
+#[test]
+fn exit_mapping_cgroup_kill_is_skipped_while_self_is_still_inside() {
+    assert!(cgroup_still_holds("123\n456\n", 123));
+    assert!(cgroup_still_holds("  456  \n123\n", 123));
+    assert!(!cgroup_still_holds("456\n789\n", 123));
+    assert!(!cgroup_still_holds("", 123));
+    assert!(!cgroup_still_holds("garbage\n456\n", 123));
+}
+
 /// Privileged live cell (6.14 Option A): a real extensive capture
 /// classifies three owned short-lived children, and the unarmed twin
 /// records byte-identical kind 6.

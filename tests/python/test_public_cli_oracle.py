@@ -147,7 +147,8 @@ def replace_successful_totals(report, ledger, totals):
 
 
 class OracleTests(unittest.TestCase):
-    def run_case(self, mutate=None, *, cell="profile-pid", want=0):
+    def run_case(self, mutate=None, *, cell="profile-pid", want=0,
+                 allow_pid_descendant_gaps=False):
         report, ledger, receipt = inputs(metrics=cell == "metrics-pid", system=cell == "system")
         receipt["cell"] = cell
         if mutate:
@@ -163,10 +164,12 @@ class OracleTests(unittest.TestCase):
                 paths[key].write_text(text)
             paths["ledger"] = tmp / "ledger"
             paths["ledger"].write_text("\n".join(ledger) + "\n")
-            proc = subprocess.run([sys.executable, "-I", str(ORACLE),
-                                   "--cell", cell, *sum((["--" + key, str(path)]
-                                                        for key, path in paths.items()), [])],
-                                  capture_output=True, text=True, timeout=5)
+            args = [sys.executable, "-I", str(ORACLE),
+                    "--cell", cell, *sum((["--" + key, str(path)]
+                                         for key, path in paths.items()), [])]
+            if allow_pid_descendant_gaps:
+                args.append("--allow-pid-descendant-gaps")
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=5)
         self.assertEqual(proc.returncode, want, proc.stdout + proc.stderr)
         result = json.loads(proc.stdout)
         self.assertEqual(result["cell"], cell)
@@ -580,6 +583,68 @@ class ProfileVerdictModeTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.run_case(lambda d, l, r: d["evidence"].update({key: profile["evidence"][key]}),
                               cell="metrics-pid", want=1)
+
+
+class RunnerNoiseTests(unittest.TestCase):
+    """Ruling CI-GAP-1: hosted host system cell discloses runner noise."""
+    run_case = OracleTests.run_case
+
+    def test_exact_with_noise_passes_when_allowed(self):
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-runner-noise")
+        self.assertIn("disclosed runner noise", result["detail"])
+        self.assertIn("pid_descendant_gaps=1", result["detail"])
+
+    def test_exact_with_other_class_fails_when_allowed(self):
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["multi_rebuild_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps", "multi_rebuild_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        self.run_case(mutate, cell="system", allow_pid_descendant_gaps=True, want=1)
+
+    def test_count_mismatch_with_noise_fails_when_allowed(self):
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 2
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+            d["functions"][0]["calls"] = 499
+        self.run_case(mutate, cell="system", allow_pid_descendant_gaps=True, want=1)
+
+    def test_noise_fails_in_strict_mode(self):
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        self.run_case(mutate, cell="system", want=1)
+
+    def test_attribution_gap_without_noise_passes_in_both_modes(self):
+        # The system counts cell never gated attribution/semantics gaps
+        # (strict discloses them via PARTIAL); relaxed mode must accept
+        # them too, otherwise it would be stricter than strict. Shape
+        # mirrors hosted run 41743410302 (attribution_only, zero noise).
+        def mutate(d, l, r):
+            d["evidence"].update(semantic_unverified_slots=6,
+                                  completeness="PARTIAL",
+                                  verdict_detail="attribution_only")
+            d["evidence"]["gap_classes"]["attribution"] = {
+                "status": "withheld", "causes": ["semantic_unverified_slots"]}
+            d["evidence"]["gap_classes"]["semantics"] = {
+                "status": "not_applicable", "causes": []}
+        strict = self.run_case(mutate, cell="system")
+        self.assertEqual(strict["qualification"], "owned-provider-counts")
+        relaxed = self.run_case(mutate, cell="system",
+                                allow_pid_descendant_gaps=True)
+        self.assertTrue(relaxed["pass"])
+        self.assertIn("disclosed runner noise", relaxed["detail"])
 
 
 # Test-only independent mapping code runs in both separate lifecycle children.

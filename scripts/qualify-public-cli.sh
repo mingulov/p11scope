@@ -5,6 +5,8 @@
 # executes one bounded profile-pid, mt-exact or system lifecycle unprivileged.
 # Every terminal result has cell/pass/detail/qualification. Exit 1 means failed
 # evidence, 2 means valid smoke/nonqualifying evidence, 0 qualifies the subset.
+# P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 (ruling CI-GAP-1) discloses hosted
+# runner noise on the system cell only; default 0 keeps every cell strict.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 64
 ORACLE=$HERE/public-cli-oracle.py
@@ -163,7 +165,14 @@ print(json.dumps({'schema':'p11scope/public-cli-receipt/v1','cell':cell,'scope':
 PY
 }
 judge() {
-  python3 -I "$ORACLE" --report "$1" --ledger "$2" --receipt "$3" --cell "$4" | tee -a results.jsonl
+  # Ruling CI-GAP-1: P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 discloses hosted
+  # runner noise on the system cell only. Every other cell stays strict,
+  # and unset/0 keeps the system cell strict (fedora, sm1, vng guests).
+  local -a extra=()
+  if [ "${4:-}" = system ] && [ "${P11SCOPE_ALLOW_PID_DESCENDANT_GAPS:-0}" = 1 ]; then
+    extra=(--allow-pid-descendant-gaps)
+  fi
+  python3 -I "$ORACLE" --report "$1" --ledger "$2" --receipt "$3" --cell "$4" "${extra[@]}" | tee -a results.jsonl
   return "${PIPESTATUS[0]}"
 }
 # The real lifecycle is also the unprivileged seam: clean every prior artifact,

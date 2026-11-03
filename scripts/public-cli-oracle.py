@@ -234,8 +234,11 @@ def common(receipt, cell):
             "provider physical identity or hash changed")
 
 
-def judge(report_text, ledger_text, receipt, cell):
+def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=False):
     require(cell in COUNT_CELLS | SMOKE_CELLS, "undeclared cell")
+    # Ruling CI-GAP-1: only the hosted-runner host system cell may disclose
+    # short-lived descendant exits as runner noise, via an explicit flag.
+    relaxed = cell == "system" and allow_pid_descendant_gaps is True
     common(receipt, cell)
     expected, physical = fixture(ledger_text, receipt, cell)
     if cell == "trace-pid":
@@ -258,8 +261,14 @@ def judge(report_text, ledger_text, receipt, cell):
     for key in LOSS_COUNTERS:
         require(type(evidence.get(key)) is int and evidence[key] == 0, "loss or unknown " + key)
     observation = evidence.get("gap_classes", {}).get("observation", {})
-    require(observation.get("status") == "exact" and observation.get("causes") == [],
-            "lossy or unknown observation gap class")
+    if relaxed:
+        ok_exact = observation.get("status") == "exact" and observation.get("causes") == []
+        ok_noise = (observation.get("status") == "lossy" and
+                    observation.get("causes") == ["pid_descendant_gaps"])
+        require(ok_exact or ok_noise, "lossy or unknown observation gap class")
+    else:
+        require(observation.get("status") == "exact" and observation.get("causes") == [],
+                "lossy or unknown observation gap class")
     kernel = evidence.get("kernel_control", {})
     require(kernel.get("capture_halted") is False and kernel.get("owner_poison") == [] and
             kernel.get("root_affiliation_failures") == [], "kernel capture halted or unknown")
@@ -270,6 +279,21 @@ def judge(report_text, ledger_text, receipt, cell):
         evidence.get("attach_mechanisms") if mode == "profile" else None,
         report)
     terminal(evidence, profile=mode == "profile")
+    if relaxed and evidence.get("pid_descendant_gaps", 0) > 0:
+        # The pre-terminal observation pin plus terminal consistency already
+        # prove the single observation class: any nonzero multi_rebuild_gaps
+        # or other loss would have failed above, and PARTIAL/concrete_gap
+        # follow necessarily. Attribution and semantics gaps are not gated
+        # by the system counts cell -- strict mode discloses them via
+        # PARTIAL without failing -- so relaxed mode must accept them too;
+        # otherwise it would be stricter than strict. The only added ruling
+        # requirement is the provider-subject check below. Hints are never
+        # required; when present they must not place a gap subject in the
+        # watched provider set.
+        hints = evidence.get("gap_exe_hints")
+        if hints is not None:
+            require(hints.get("links_provider", 0) == 0,
+                    "runner noise subject links the watched provider")
     provider = identity(receipt["provider_before"])
     admitted = evidence.get("discovery")
     require(isinstance(admitted, list) and any(identity(row) == provider for row in admitted
@@ -332,6 +356,17 @@ def judge(report_text, ledger_text, receipt, cell):
         return "verdict-consistency", "clean owned target verdict is consistent"
     if cell == "names-pid":
         return "semantic-names", "six independent physical targets carry expected semantic names"
+    if relaxed:
+        gaps = evidence.get("pid_descendant_gaps", 0)
+        if gaps > 0:
+            return "owned-provider-counts-with-runner-noise", (
+                "owned physical-provider counts match independent successful ledger; "
+                f"disclosed runner noise: pid_descendant_gaps={gaps}; "
+                "per-caller attribution is not established")
+        return "owned-provider-counts", (
+            "owned physical-provider counts match independent successful ledger; "
+            "disclosed runner noise: pid_descendant_gaps=0; "
+            "per-caller attribution is not established")
     return "owned-provider-counts", ("owned physical-provider counts match independent successful ledger; "
                                      "per-caller attribution is not established")
 
@@ -340,11 +375,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for option in ("report", "ledger", "receipt", "cell"):
         parser.add_argument("--" + option, required=True)
+    parser.add_argument("--allow-pid-descendant-gaps", action="store_true",
+                        help="CI-GAP-1: on the system cell only, disclose nonzero "
+                             "pid_descendant_gaps as runner noise instead of failing")
     args = parser.parse_args(argv)
     result = {"cell": args.cell, "pass": False, "detail": "", "qualification": "failed"}
     try:
         qualification, detail = judge(read(Path(args.report)), read(Path(args.ledger)),
-                                      parse(read(Path(args.receipt))), args.cell)
+                                      parse(read(Path(args.receipt))), args.cell,
+                                      allow_pid_descendant_gaps=args.allow_pid_descendant_gaps)
         result.update({"pass": True, "qualification": qualification, "detail": detail})
         code = 0
     except Nonqualifying as error:

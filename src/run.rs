@@ -454,13 +454,91 @@ fn check_launch_file(launch_file: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// Where snapd installs its command launchers: symlinks to `/usr/bin/snap`,
+/// which starts the application through `snap-confine`.
+const SNAP_LAUNCHER_DIR: &str = "/snap/bin";
+
+/// The attach alternative named by the launcher refusals: a process that
+/// is already running is observed by PID or by provider, never launched.
+const ATTACH_HINT: &str = "or start the application normally and attach to it: find it with \
+    `p11scope inspect --system`, then `p11scope profile --pid <pid>` or `p11scope profile \
+    --system --module <provider.so>`";
+
+/// Refuses a snap command (`/snap/bin/<name>`, named directly or found
+/// first on `path`) before the fork. snapd starts every snap application
+/// through `snap-confine`, which needs its file capabilities; the owned
+/// child runs with no_new_privs, which withholds them, so the launch can
+/// only fail later inside snap-confine. `exists` is injectable for tests.
+fn snap_launcher_refusal(
+    program: &OsStr,
+    path: Option<&OsStr>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<io::Error> {
+    let launcher_dir = Path::new(SNAP_LAUNCHER_DIR);
+    let launcher = if program.as_bytes().contains(&b'/') {
+        let candidate = Path::new(program);
+        (candidate.parent() == Some(launcher_dir) && exists(candidate))
+            .then(|| candidate.to_path_buf())?
+    } else {
+        // Like the PATH search: the first directory holding the name wins.
+        std::env::split_paths(path.unwrap_or_default())
+            .map(|directory| directory.join(program))
+            .find(|candidate| exists(candidate))
+            .filter(|candidate| candidate.parent() == Some(launcher_dir))?
+    };
+    let name = launcher.file_name()?.to_string_lossy().into_owned();
+    Some(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{name} is a snap application ({}): snap starts it through snap-confine, whose \
+             file capabilities the owned child's no_new_privs withholds, so it cannot start \
+             under `p11scope run`. Name the program inside the snap directly when it runs \
+             outside confinement (Firefox: `p11scope run -- \
+             /snap/firefox/current/usr/lib/firefox/firefox`), {ATTACH_HINT}",
+            launcher.display()
+        ),
+    ))
+}
+
+/// The `#!` interpreter of a script launch file, when it has one.
+fn script_interpreter(launch_file: &File) -> Option<String> {
+    use std::os::unix::fs::FileExt as _;
+    let mut head = [0u8; 256];
+    let read = launch_file.read_at(&mut head, 0).ok()?;
+    let line = head[..read].strip_prefix(b"#!")?;
+    let line = line.split(|byte| *byte == b'\n').next()?;
+    let interpreter = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .find(|word| !word.is_empty())?;
+    Some(String::from_utf8_lossy(interpreter).into_owned())
+}
+
 /// Refuses a command that cannot run as an owned target by name, before
 /// anything is forked. Name errors precede hazard errors: a script is
 /// told about its interpreter before any kernel verdict is consulted.
 fn check_owned_target_runnable(program: &OsStr) -> io::Result<()> {
+    if let Some(refusal) = snap_launcher_refusal(
+        program,
+        std::env::var_os("PATH").as_deref(),
+        &|candidate: &Path| std::fs::symlink_metadata(candidate).is_ok(),
+    ) {
+        return Err(refusal);
+    }
     let resolved = resolve_program(program)?;
     let launch_file = File::open(&resolved)?;
-    check_launch_file(&launch_file)
+    check_launch_file(&launch_file).map_err(|error| match script_interpreter(&launch_file) {
+        Some(interpreter) if error.kind() == io::ErrorKind::InvalidInput => io::Error::new(
+            error.kind(),
+            format!(
+                "{error}. {} is a script for {interpreter}: run `p11scope run -- {interpreter} \
+                 {}` (a script that starts a snap application still cannot run here), \
+                 {ATTACH_HINT}",
+                resolved.display(),
+                resolved.display()
+            ),
+        ),
+        _ => error,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12334,6 +12412,75 @@ mod tests {
             "{text}"
         );
         assert!(check_owned_target_runnable(std::ffi::OsStr::new("/bin/true")).is_ok());
+    }
+
+    /// A `#!` launcher (Ubuntu's `/usr/bin/firefox`) is named as a script,
+    /// with its interpreter and the attach alternative, not just "unknown
+    /// file magic".
+    #[test]
+    fn script_refusal_names_the_interpreter_and_the_attach_alternative() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("browser");
+        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/browser \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let text = check_owned_target_runnable(script.as_os_str())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("invoke scripts through an interpreter"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{} is a script for /bin/sh: run `p11scope run -- /bin/sh {}`",
+                script.display(),
+                script.display()
+            )),
+            "{text}"
+        );
+        assert!(text.contains("p11scope profile --pid <pid>"), "{text}");
+    }
+
+    /// Snap commands start through snap-confine, whose file capabilities
+    /// no_new_privs withholds: refuse by name before the fork with the
+    /// working alternatives instead of letting snap-confine fail later.
+    #[test]
+    fn snap_launchers_are_refused_by_name_with_the_attach_alternative() {
+        for (program, path) in [
+            ("/snap/bin/firefox", None),
+            ("firefox", Some("/nonexistent-dir:/snap/bin")),
+        ] {
+            let error = snap_launcher_refusal(
+                std::ffi::OsStr::new(program),
+                path.map(std::ffi::OsStr::new),
+                &|candidate: &Path| candidate == Path::new("/snap/bin/firefox"),
+            )
+            .unwrap_or_else(|| panic!("{program} must be refused"));
+            let text = error.to_string();
+            assert!(text.contains("firefox is a snap application"), "{text}");
+            assert!(text.contains("no_new_privs"), "{text}");
+            assert!(text.contains("p11scope profile --pid <pid>"), "{text}");
+            assert!(text.contains("p11scope inspect --system"), "{text}");
+        }
+        // Not a snap: an ordinary binary, a PATH hit before /snap/bin, or
+        // a /snap/bin name that does not exist.
+        for (program, path) in [
+            ("/usr/bin/true", None),
+            ("firefox", Some("/usr/bin:/snap/bin")),
+            ("/snap/bin/absent", None),
+        ] {
+            assert!(
+                snap_launcher_refusal(
+                    std::ffi::OsStr::new(program),
+                    path.map(std::ffi::OsStr::new),
+                    &|candidate: &Path| candidate == Path::new("/snap/bin/firefox")
+                        || candidate == Path::new("/usr/bin/firefox")
+                        || candidate == Path::new("/usr/bin/true"),
+                )
+                .is_none(),
+                "{program} {path:?}"
+            );
+        }
     }
 
     /// Sol-full F8: an earlier PATH directory's readable but

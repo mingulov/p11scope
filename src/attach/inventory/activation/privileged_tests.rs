@@ -8494,13 +8494,14 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
     // OBJECT_START/OBJECT_ZERO/OBJECT_DESCRIPTORS from 9d9a9a443 and the
     // three selected-detail maps linked by 4b5c780bb, named
     // SELECTED_DETAIL/SELECTED_BCTL/SELECTED_DSTATE since feb152a9c),
-    // plus JOURNAL_MARKER_CTL when this build carries the birth marker
-    // (shipped by default since the WU-2b journal+marker activation);
-    // 13 base programs, four continuity hooks and one loaded task
-    // iterator (the selected programs stay unloaded outside a selected
-    // session); seven base links plus four hook links. Query links are
-    // temporary and absent from this retained census.
-    let detailed_census = (42 + usize::from(cfg!(p11scope_birth_marker)), 18, 11);
+    // plus the two birth-marker maps when this build carries the birth
+    // marker (shipped by default since the WU-2b journal+marker
+    // activation): JOURNAL_MARKER_CTL and the PID-scope birth witness
+    // PID_START_TICK; 13 base programs, four continuity hooks and one
+    // loaded task iterator (the selected programs stay unloaded outside a
+    // selected session); seven base links plus four hook links. Query
+    // links are temporary and absent from this retained census.
+    let detailed_census = (42 + 2 * usize::from(cfg!(p11scope_birth_marker)), 18, 11);
     let first_census = (
         first_ids.maps.len(),
         first_ids.programs.len(),

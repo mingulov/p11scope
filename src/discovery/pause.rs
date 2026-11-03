@@ -1470,8 +1470,8 @@ impl PauseCoordinator {
     /// be woken into the group stop when the record is serviced. Re-sample at
     /// the existing 1 ms cadence until every thread is stopped, inside the
     /// stop's existing deadline and never more than one cycle of samples. A
-    /// thread still on its way at the deadline reports the deadline; a
-    /// changed set (vanished, reused or undated thread) or a thread that can
+    /// thread still on its way at the deadline, or when the samples run out,
+    /// reports the deadline; a changed set (vanished, reused or undated thread) or a thread that can
     /// never reach the stop refuses at once. Nothing is attached before this
     /// returns, so a thread that ran while the stop settled only ran before
     /// the hooks changed. The error carries whether it is a lifecycle failure
@@ -1490,7 +1490,9 @@ impl PauseCoordinator {
             }
             io.wait_one_ms().map_err(|error| (error, true))?;
         }
-        Err((MSG_TASK_SET_CHANGED.into(), false))
+        // Every sample found the threads on their way into the stop: running
+        // out of samples is the deadline's twin.
+        Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
     }
 
     /// One task sample, a single `stat` read per thread. The task set and
@@ -2966,11 +2968,14 @@ fn birth_covered(start_ticks: u64, last_attach_boot_ns: Option<u64>) -> bool {
 /// tick boundary its floor is at or past that boundary, strictly after the
 /// attach. This changes only when the child resumes, never which births are
 /// covered. The hold makes at most one tick's worth of the existing 1 ms
-/// waits (each may oversleep), and never one that could end past the stop
-/// `deadline`: a resume observed late fails the run, so the hold resumes at
-/// once when the next wait could cross the deadline or the stop clock cannot
-/// be read. A birth inside the attach's tick then stays partial at the next
-/// stop, the safe direction. With no recorded attach, an unreadable boot
+/// waits (each may oversleep). A resume observed after the stop `deadline`
+/// fails the run, so the hold only starts a wait while the wait, plus one
+/// clock tick of headroom for oversleep, the resume and the observer's first
+/// read, still fits before the deadline; otherwise, or when the stop clock
+/// cannot be read or the margin overflows, it resumes at once. This makes a
+/// late observation unlikely, not impossible: a wait that oversleeps by more
+/// than the headroom can still end past the deadline. A birth inside the
+/// attach's tick then stays partial at the next stop, the safe direction. With no recorded attach, an unreadable boot
 /// clock, a saturated instant or a zero tick there is nothing to wait for.
 /// Only a failed wait is an error.
 fn hold_until_the_attach_tick_passes(io: &mut impl PauseIo, deadline: u64) -> Result<(), String> {
@@ -2992,8 +2997,12 @@ fn hold_until_the_attach_tick_passes(io: &mut impl PauseIo, deadline: u64) -> Re
         if boot >= boundary {
             return Ok(());
         }
-        match io.now_ns() {
-            Ok(now) if now.saturating_add(SAMPLE_NS) <= deadline => {}
+        let wait_end = io.now_ns().ok().and_then(|now| {
+            now.checked_add(SAMPLE_NS)
+                .and_then(|end| end.checked_add(tick))
+        });
+        match wait_end {
+            Some(end) if end <= deadline => {}
             _ => return Ok(()),
         }
         io.wait_one_ms()?;

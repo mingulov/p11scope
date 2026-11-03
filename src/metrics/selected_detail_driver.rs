@@ -6974,15 +6974,23 @@ mod tests {
     fn open_k0_production_consults_the_owned_clock_refusal() {
         // Only the pure helper is unit-tested, so deleting the call
         // inside `open_k0_production` would stay green. Pin the call
-        // and its order: the refusal precedes the window open.
+        // and its order: the clock read precedes the refusal, which
+        // precedes the window open. The exact clock-read line kills a
+        // `comparable = true` mutant.
         let body = open_k0_production_body();
+        let comparable = body
+            .find("let comparable = clock_origins_comparable();")
+            .expect("the open reads comparable clocks");
         let refusal = body
             .find("k0_owned_clock_refusal(owned, comparable)")
             .expect("the open consults the owned-clock refusal");
         let open = body
             .find("open_k0_window_with_losses(")
             .expect("the open opens the window");
-        assert!(refusal < open, "the refusal precedes the window open");
+        assert!(
+            comparable < refusal && refusal < open,
+            "the clock read precedes the refusal, which precedes the window open"
+        );
     }
 
     #[test]

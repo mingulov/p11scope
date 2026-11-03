@@ -17252,8 +17252,9 @@ fn exit_ended_loader_scan_counts_exit_only_on_expected_removal() {
 
 /// Site 1 (`service_pending_loader_scans` fallback after exit): the
 /// fallback scan fails on the dead process, the live pin proves the
-/// exit, and the truncation counts exit-only. No retirement is
-/// queued, so this pins site 1 rather than site 3.
+/// exit, and the truncation counts exit-only. Driven directly (not
+/// via a batch) so no route-3 retirement sweep runs: the view stays
+/// retained, which pins site 1 rather than site 3.
 #[test]
 fn exit_ended_loader_scan_counts_exit_only_on_fallback_after_exit() {
     let (mut fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
@@ -17266,16 +17267,69 @@ fn exit_ended_loader_scan_counts_exit_only_on_fallback_after_exit() {
     assert!(engine.original_exited(ProcessViewId(0)));
 
     let before = engine.capture_facts().discovery_losses()[3];
-    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    let due: BTreeSet<PendingLoaderScanKey> =
+        engine.pending_loader_scans.keys().copied().collect();
+    let mut additions_allowed = true;
+    let mut pending_views = PendingViewRetirements::new();
+    engine
+        .service_pending_loader_scans(due, &mut session, &mut additions_allowed, &mut pending_views)
+        .unwrap();
 
     assert!(engine.pending_loader_scans.is_empty());
     assert!(engine.retirement_intents.is_empty());
+    assert!(
+        engine
+            .views
+            .iter()
+            .any(|view| view.id() == ProcessViewId(0)),
+        "site 1 keeps the view retained (no route-3 retirement)"
+    );
     assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
     assert_eq!(engine.capture_facts().exit_ended_truncations(), 1);
     assert!(engine.counters.object_skips.iter().any(|skip| {
         skip.subject == "live loader memory discovery"
             && skip.reason.contains("expected process exit")
     }));
+}
+
+/// Route 1 negative: the fallback scan fails but exit is unproven
+/// (scripted `Ok(false)` on a dead child), so the truncation stays a
+/// real loss: the batch fails, the total grows, and exit-only stays
+/// 0. Kills the live-failure-branch mutant (always exit-only).
+#[test]
+fn fallback_scan_failure_without_exit_proof_stays_loss() {
+    let (mut fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    record.announced_count = 1;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    // Dead child, but exit unproven: script route 1's predicate false.
+    engine
+        .pin_probe_script
+        .borrow_mut()
+        .extend([PinProbeAnswer::Exited(Ok(false))]);
+
+    let before = engine.capture_facts().discovery_losses()[3];
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect_err("an unproven fallback failure aborts the batch");
+
+    assert!(engine.pending_loader_scans.is_empty());
+    assert!(
+        engine
+            .views
+            .iter()
+            .any(|view| view.id() == ProcessViewId(0)),
+        "the loss keeps the view retained"
+    );
+    assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+    assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "route 1 consumed its scripted exit probe: {:?}",
+        engine.pin_probe_script.borrow()
+    );
 }
 
 /// Site 2 (`process_loader_record` RT_ADD settle after exit): the
@@ -17314,6 +17368,40 @@ fn exit_ended_loader_scan_counts_exit_only_on_rt_add_settle_after_exit() {
     assert!(engine.pending_loader_scans.is_empty());
     assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
     assert_eq!(engine.capture_facts().exit_ended_truncations(), 1);
+}
+
+/// Route 2 predicate pin (T-1): `process_loader_record` settles a
+/// failed RT_ADD/RT_DELETE export-hook scan with
+/// `ended = original_exited(view)`. Only the settle helper is
+/// behavior-tested, so replacing the predicate with `true` would
+/// stay green. Pin the predicate and its order: the exit check
+/// precedes the settle, and the first settle passes `ended`.
+#[test]
+fn rt_add_settle_consults_the_exit_predicate_in_order() {
+    let source = include_str!("engine.rs");
+    let route = source
+        .split_once("    fn process_loader_record(")
+        .unwrap()
+        .1
+        .split_once("    fn record_selection_occurrences(")
+        .unwrap()
+        .0;
+    let predicate = route
+        .find("let ended = self.original_exited(view_id)")
+        .expect("route 2 checks the exit predicate");
+    let settle = route
+        .find("self.settle_pending_loader_scan(")
+        .expect("route 2 settles the scan");
+    assert!(predicate < settle, "the exit check precedes the settle");
+    // The first settle passes `ended`, not a literal: kills `ended = true`.
+    let call = &route[settle..];
+    let end = call.find(");").expect("settle call end");
+    let call = &call[..end];
+    assert!(call.contains("ended"), "the settle passes the predicate");
+    assert!(
+        !call.contains("true") && !call.contains("false"),
+        "the settle passes no literal: {call}"
+    );
 }
 
 /// The exit-only split counts nothing on the loss routes: an

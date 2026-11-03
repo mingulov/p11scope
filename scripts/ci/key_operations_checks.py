@@ -33,7 +33,7 @@ import sys
 # and semantics.rs); reason tokens are the real lifecycle/EVENTS
 # phrasings (src/attach/inventory/capture.rs, caller_registry.rs).
 LOSS_RE = re.compile(
-    r"ring[ _]loss|event[ _]loss|events[ _]lost"
+    r"ring[ _]loss|event[ _]loss|events[ _]lost|events[ _]loss[ _]unknown"
     r"|lost[ _]+[0-9]+[ _]+(events|records?)"
     r"|discovery[ _]loss|truncat|overflow|dropped[ _]+events?"
     r"|semantic[ _]capture[ _]loss|semantic[ _]calls[ _]lost"

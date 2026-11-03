@@ -24,6 +24,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/ci/key-operations-linked-control.sh"
 
+sys.path.insert(0, str(ROOT / "scripts/ci"))
+import key_operations_checks as checks  # noqa: E402
+
 
 def _restore_int_quit():
     """Restore default SIGINT/SIGQUIT in the script subtree (preexec_fn).
@@ -752,6 +755,46 @@ class LinkedControlTests(unittest.TestCase):
                 proc.communicate()
         self.assertEqual(proc.returncode, 0)
         self.assertIn("TRAPPED", out)
+
+
+class LossVocabularyTests(unittest.TestCase):
+    """The s1 loss subjects fail the shared zero-loss gate by subject.
+
+    The linked script only reads object_observations today, so these
+    pin the shared checker directly: each subject must fail with the
+    current reason text and with a reason that names no events_lost
+    token (the batch-4 review probe).
+    """
+
+    def doc(self, gaps):
+        return {"object_observations": {"status": "unavailable",
+                                       "reason": "journal_unavailable"},
+                "observation": {"lifecycle": {"ring_loss": 0}},
+                "gaps": gaps}
+
+    def test_s1_events_lost_subject_fails_zero_loss_gate(self):
+        current = ("the EVENTS ring was full; the kernel refused records "
+                   "before the drain could read them "
+                   "(kernel reserve failures; exact count in events_lost)")
+        without_token = ("the EVENTS ring was full; the kernel refused "
+                         "records before the drain could read them")
+        for reason in (current, without_token):
+            gap = {"subject": "native capture events lost", "reason": reason}
+            ok, detail = checks.check_no_loss_gap(self.doc(gaps=[gap]))
+            self.assertFalse(ok, reason)
+            self.assertIn("loss gap", detail)
+
+    def test_s1_events_loss_unknown_subject_fails_zero_loss_gate(self):
+        current = ("the EVENTS ring-loss counter could not be read; "
+                   "events_lost may undercount until a later good read "
+                   "restores the exact cumulative total")
+        probe = "the EVENTS ring-loss counter could not be read"
+        for reason in (current, probe):
+            gap = {"subject": "native capture events loss unknown",
+                   "reason": reason}
+            ok, detail = checks.check_no_loss_gap(self.doc(gaps=[gap]))
+            self.assertFalse(ok, reason)
+            self.assertIn("loss gap", detail)
 
 
 if __name__ == "__main__":

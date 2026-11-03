@@ -218,6 +218,29 @@ class SystemScriptTests(unittest.TestCase):
         self.assertEqual((ledger["pass"], ledger["qualification"]),
                          (True, "qualified"))
 
+    def test_populated_oracle_refusal_is_failed_row(self):
+        proc, outdir, rows = self.run_script(
+            "oo-populated", "clean",
+            extra_env={"FAKE_EXIT": "1",
+                       "FAKE_TEXT": "refused: simulated churn shape text"})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
+        row = rows["churn-on-ledger"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("oracle refused the populated linked shape",
+                      row["detail"])
+        self.assertIn("simulated churn shape text", row["detail"])
+        self.assertIn("simulated churn shape text", proc.stdout)
+        self.assertTrue((outdir / "churn-linked-sample.json").exists())
+
+    def test_journal_unavailable_oracle_pass_is_stale_failed(self):
+        proc, outdir, rows = self.run_script("clean", "clean")
+        self.assertEqual(proc.returncode, 1)
+        row = rows["churn-on-ledger"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("went stale", row["detail"])
+
     def test_ring_loss_fails_with_clean_twin_attribution(self):
         proc, outdir, rows = self.run_script("ring-loss", "clean")
         self.assertEqual(proc.returncode, 1)
@@ -379,6 +402,35 @@ class CheckHelperTests(unittest.TestCase):
         )
         for reason in reasons:
             gap = {"subject": "capture discovery", "reason": reason}
+            ok, detail = checks.check_no_loss_gap(self.doc(gaps=[gap]))
+            self.assertFalse(ok, reason)
+            self.assertIn("loss gap", detail)
+
+    def test_s1_events_lost_subject_fails_zero_loss_gate(self):
+        # semantics.rs disclose_events_ring_loss: the subject alone must
+        # fail the gate, with the current reason text or without it.
+        current = ("the EVENTS ring was full; the kernel refused records "
+                   "before the drain could read them "
+                   "(kernel reserve failures; exact count in events_lost)")
+        without_token = ("the EVENTS ring was full; the kernel refused "
+                         "records before the drain could read them")
+        for reason in (current, without_token):
+            gap = {"subject": "native capture events lost", "reason": reason}
+            ok, detail = checks.check_no_loss_gap(self.doc(gaps=[gap]))
+            self.assertFalse(ok, reason)
+            self.assertIn("loss gap", detail)
+
+    def test_s1_events_loss_unknown_subject_fails_zero_loss_gate(self):
+        # semantics.rs poll_and_disclose_events_ring_loss: the subject
+        # alone must fail the gate even when the reason names no
+        # events_lost token (the batch-4 review probe).
+        current = ("the EVENTS ring-loss counter could not be read; "
+                   "events_lost may undercount until a later good read "
+                   "restores the exact cumulative total")
+        probe = "the EVENTS ring-loss counter could not be read"
+        for reason in (current, probe):
+            gap = {"subject": "native capture events loss unknown",
+                   "reason": reason}
             ok, detail = checks.check_no_loss_gap(self.doc(gaps=[gap]))
             self.assertFalse(ok, reason)
             self.assertIn("loss gap", detail)

@@ -113,8 +113,9 @@ count, and `observation.semantic_capture.events_lost` holds the same total.
 These records are counted only there, never in `unrouted_returns` or in the
 stop line's shed count. If p11scope cannot read the kernel's counter, the
 report carries a `native capture events loss unknown` gap instead, and
-`events_lost` may be lower than the real loss until a later read succeeds (the
-kernel's counter is cumulative, so that read restores the exact total). Two
+`events_lost` is never lower once the counter has been read; until a later
+read succeeds it may undercount the real loss (the kernel's counter is
+cumulative, so that read restores the exact total). Two
 limits apply. Prompt draining of a full ring applies only when the capture has
 fallen back to its older path (after a `joint machine unavailable` gap), so it
 does not raise the call rate an ordinary capture keeps up with. The counter

@@ -422,6 +422,8 @@ fn drive<L: CaptureLane<PidPin>>(
         identity: None,
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
+        prearm_stop_probe: None,
+        prearm_probe_stop: None,
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
@@ -477,6 +479,82 @@ fn drive<L: CaptureLane<PidPin>>(
             .expect("a synchronous loop failure has its error")
     })?;
     stopped.context("a native run stops its lane")
+}
+
+/// Pre-arm live cell (pid scope): the declared proved set attaches through
+/// the activating extend and the watch reaches `armed` live (exact positive:
+/// `since` set, `attached_at` set), then ends terminally with its arm instant
+/// intact. Runs under the privileged lock with `sudo -n`.
+#[test]
+#[ignore = "privileged: live pre-arm reaches armed on pid scope"]
+fn privileged_prearm_reaches_armed_pid() -> Result<()> {
+    use crate::render::PrearmWatchState;
+    let workload = Workload::build()?;
+    let gate = workload.path("gate");
+    let gate_arg = gate.to_str().context("gate path")?.to_string();
+    let target = workload.spawn(
+        "target",
+        &[
+            "mech", "--cell", "T", "--module", SOFTHSM, "--iters", "2", "--gate", &gate_arg,
+            "--hold",
+        ],
+    )?;
+    let mut coordinator = pid_coordinator(target.pid(), Path::new(SOFTHSM))?;
+    // Pin the live provider as pre-arm before the lane starts: proved
+    // offsets lower into the attach set and ride the activating extend.
+    let pinning = crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+        &[PathBuf::from(SOFTHSM)],
+        &[],
+        None,
+        0,
+        0,
+        &mut crate::discovery::scan::CaptureWorkBudget::default(),
+    )
+    .map_err(|error| anyhow::anyhow!("--prearm-module: {}", error.problems().join("; ")))?;
+    ensure!(
+        !pinning.inputs.is_empty() && !pinning.inputs[0].proved.is_empty(),
+        "SoftHSM pins with no proved offsets; the fixture or oracle is broken"
+    );
+    coordinator.set_prearm_pinning(pinning);
+    coordinator.absorb_prearm_plan(crate::attach::monotonic_ns().unwrap_or(1));
+    let probe = pid_probe(target.pid(), &coordinator)?;
+    let lane = NativeLane::start(probe, &mut coordinator, LaneWindows::PROVISIONAL, None)
+        .map_err(|(_, reason)| anyhow::anyhow!("{reason}"))?;
+    // The activating extend already attached the declared set (I3): after
+    // three passes the terminal watch must carry the arm it reached (exact
+    // positive: `since` set at arm, preserved through the end).
+    let stopped = drive(
+        &mut coordinator,
+        InspectScope::Pid(target.pid()),
+        lane,
+        &mut |passes| {
+            if passes >= 1 && !gate.exists() {
+                std::fs::write(&gate, b"")?;
+            }
+            Ok(passes >= 3)
+        },
+    )?;
+    let rows = coordinator.prearm_rows();
+    ensure!(rows.len() == 1, "one pre-arm row: {rows:?}");
+    let watch = rows[0].watch.as_ref().context("terminal watch")?;
+    let since_ns = watch
+        .since_ns
+        .context("the watch never armed (no arm instant)")?;
+    let attached_ns = rows[0]
+        .attached_at_ns
+        .context("armed without an attach instant")?;
+    ensure!(since_ns > 0 && attached_ns > 0, "nonzero arm bounds");
+    ensure!(
+        watch.state == PrearmWatchState::Ended,
+        "terminal state: {watch:?}"
+    );
+    ensure!(watch.until_ns.is_some(), "terminal bound: {watch:?}");
+    ensure!(
+        matches!(stopped.summary.retirement, Retirement::Closed(_)),
+        "retirement: {:?}",
+        stopped.summary.retirement
+    );
+    Ok(())
 }
 
 /// C5.1 cell 1: PID scope through the production loop. The two facade stamp
@@ -3086,6 +3164,8 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         identity: None,
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
+        prearm_stop_probe: None,
+        prearm_probe_stop: None,
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
@@ -4298,6 +4378,8 @@ fn privileged_joint_driver_live_finish_begin_poll_wound_down_lp64() -> Result<()
         identity: None,
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
+        prearm_stop_probe: None,
+        prearm_probe_stop: None,
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
@@ -6307,6 +6389,8 @@ fn joint_finish_driver<'a>(
         identity: None,
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
+        prearm_stop_probe: None,
+        prearm_probe_stop: None,
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,

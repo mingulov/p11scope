@@ -1532,6 +1532,8 @@ fn run_with_terminal_budget(
         retiring: None,
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
+        prearm_stop_probe: Some(stop),
+        prearm_probe_stop: None,
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
@@ -1634,21 +1636,25 @@ fn run_with_terminal_budget(
     };
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
-    // Terminal pre-arm close: end every watch exactly once before the
-    // final view, so pass views show live watches and the report shows
-    // terminal ones. An operator stop ends `Stop`, a deadline `ScopeEnd`.
-    // The plain commit publishes the hook's staged changed-identity gap
-    // (gaps stage, then publish); while a publication pends it refuses
-    // and the final keeps its prior view, gap and all, as before.
-    let watch_end = if stop() {
-        crate::render::PrearmWatchEnd::Stop
-    } else {
-        crate::render::PrearmWatchEnd::ScopeEnd
-    };
-    driver
-        .coordinator
-        .finish_prearm_watches(watch_end, Some(now_ns()));
-    let _ = driver.coordinator.commit_batch(false);
+    // Terminal pre-arm close for the scan lane only (no `on_lane_stopped`):
+    // the native lane already closed before its final commit. Uses the
+    // frozen probe result from `on_stop_requested` plus any capture failure,
+    // never a re-read past retirement: an operator stop or failure ends
+    // `Stop`, a deadline `ScopeEnd`. The guarded lane-aware commit publishes
+    // the staged changed-identity gap; runs without pre-arm commit nothing
+    // extra, and a pending publication still keeps its prior view.
+    if stopped.is_none() && driver.coordinator.has_prearm() {
+        let stop = driver.prearm_probe_stop.unwrap_or(false)
+            || capture_error.is_some()
+            || driver.coordinator.capture_failed();
+        let cause = if stop {
+            crate::render::PrearmWatchEnd::Stop
+        } else {
+            crate::render::PrearmWatchEnd::ScopeEnd
+        };
+        driver.coordinator.finish_prearm_watches(cause, None);
+        let _ = driver.commit(false);
+    }
     let presentation =
         final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
     // Both owners stay alive through the final commit, the immutable
@@ -1838,16 +1844,23 @@ fn finish_failed_startup_guarded<Source: ProcessSource>(
             format!("capture failed before event stream started: {error:#}"),
         );
     }
-    // Terminal pre-arm close on failed startup: the scope ended
-    // without arming, so watches end `ScopeEnd` (no `failed` variant).
+    // Terminal pre-arm close on failed startup: a capture failure ends
+    // `Stop` (6.13 maps errors to stop, never a deadline `ScopeEnd`).
     // Staged before the failure gap so the one commit below publishes
     // both.
-    coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(now_ns()));
+    coordinator.freeze_prearm_stop(crate::attach::monotonic_ns());
+    coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::Stop, None);
     coordinator.note_scope_gap("inventory capture failed".into(), format!("{error:#}"));
     let _ = coordinator.commit_batch(false);
     stdout.begin_finalization();
     let presentation = match (pending, prior) {
-        (true, Some(prior)) => prior.clone(),
+        (true, Some(prior)) => {
+            // Pending without a fresh read still shows terminal pre-arm
+            // rows (pure coordinator read, like the final-view guard).
+            let mut view = prior.clone();
+            view.prearm = coordinator.prearm_rows();
+            view
+        }
         _ => Presentation::capture(
             coordinator,
             scope_label,
@@ -2186,6 +2199,16 @@ struct ClassicDriver<'a> {
     /// begun-but-unfinished Joint finish to the typed exit instead of
     /// re-running the stop path.
     stop_requested: bool,
+    /// The operator-stop probe for pre-arm terminal cause (`stop` on the
+    /// classic path, `ending` on the dashboard): sampled once at
+    /// `on_stop_requested`, never re-read after retirement, so a Ctrl-C
+    /// during detach cannot relabel a deadline end. `None` in tests that
+    /// close watches directly.
+    prearm_stop_probe: Option<&'a dyn Fn() -> bool>,
+    /// The frozen probe result from `on_stop_requested`: `Some(true)` is an
+    /// operator stop (`Stop`), `Some(false)` a deadline/normal end
+    /// (`ScopeEnd`), `None` when no probe was set (tests).
+    prearm_probe_stop: Option<bool>,
     /// The second operator signal probe: when it fires at the lane
     /// stop, a begun-but-unfinished Joint finish escalates to the
     /// typed exit instead of stepping on. `None` without a signal
@@ -2294,6 +2317,8 @@ pub(crate) fn classic_semantic_ticks_for_test(
         retiring: None,
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
+        prearm_stop_probe: None,
+        prearm_probe_stop: None,
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
@@ -2362,6 +2387,8 @@ pub(crate) fn classic_semantic_pass_for_test(
         retiring: None,
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
+        prearm_stop_probe: None,
+        prearm_probe_stop: None,
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
@@ -2543,6 +2570,8 @@ pub(crate) fn classic_semantic_stop_for_test(
         retiring: None,
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
+        prearm_stop_probe: None,
+        prearm_probe_stop: None,
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
@@ -2637,6 +2666,8 @@ pub(crate) fn classic_promotion_full_loop_for_test(
         retiring: None,
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
+        prearm_stop_probe: None,
+        prearm_probe_stop: None,
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
@@ -5890,6 +5921,15 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         }
         let first_stop = !self.stop_requested;
         self.stop_requested = true;
+        if first_stop {
+            // Freeze the pre-arm stop boundary and probe result once: the
+            // terminal close uses these, never a later re-read past the
+            // detach. First wins; the native lane's `end_capture_coverage`
+            // freeze (if any) stands beside this loop-end instant.
+            self.prearm_probe_stop = self.prearm_stop_probe.map(|probe| probe());
+            self.coordinator
+                .freeze_prearm_stop(crate::attach::monotonic_ns());
+        }
         self.coordinator.stop_caller_metadata();
         if let Some(observer) = self
             .cgroup
@@ -5957,6 +5997,28 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         // Terminal coverage disclosure first: post-last-pass EXEC
         // newcomers stage before the final commit publishes them.
         self.coordinator.note_post_pass_exec_newcomers();
+        // Terminal pre-arm close, staged before the loop's final commit so
+        // the staged changed-identity gap publishes with it (no extra plain
+        // commit). Uses the frozen probe result and stop boundary from
+        // `on_stop_requested`/`end_capture_coverage`, never a re-read: an
+        // operator stop or failure ends `Stop`, a deadline `ScopeEnd`. A bare
+        // lane stop without a stop request still freezes here (tests).
+        if !self.stop_requested {
+            self.prearm_probe_stop = self.prearm_stop_probe.map(|probe| probe());
+            self.coordinator
+                .freeze_prearm_stop(crate::attach::monotonic_ns());
+        }
+        if self.coordinator.has_prearm() {
+            let stop = self.prearm_probe_stop.unwrap_or(false)
+                || self.coordinator.capture_failed();
+            let cause = if stop {
+                crate::render::PrearmWatchEnd::Stop
+            } else {
+                crate::render::PrearmWatchEnd::ScopeEnd
+            };
+            // `None` relies on the frozen boundary (unknown if never frozen).
+            self.coordinator.finish_prearm_watches(cause, None);
+        }
         // A stop request already disclosed the unjoined winding; a
         // bare lane stop discloses it here instead, still once and
         // still before the final commit.
@@ -7233,6 +7295,8 @@ fn run_dashboard(
         retiring: None,
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
+        prearm_stop_probe: None,
+        prearm_probe_stop: None,
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,
@@ -7267,6 +7331,7 @@ fn run_dashboard(
         started_ns.max(1),
     ));
     let ending = || stop() || quit.get();
+    driver.prearm_stop_probe = Some(&ending);
     let clock = LoopClock {
         deadline: Some(deadline.unwrap_or_else(unbounded_dashboard_deadline)),
         stop: &ending,
@@ -7353,20 +7418,22 @@ fn run_dashboard(
     };
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
-    // Terminal pre-arm close, as on the classic path: the dashboard
-    // quit flag is an operator-initiated end (`Stop`), a deadline end
-    // is `ScopeEnd`. The plain commit publishes the hook's staged
-    // changed-identity gap; while a publication pends it refuses and
-    // the final keeps its prior view, as before.
-    let watch_end = if ending() {
-        crate::render::PrearmWatchEnd::Stop
-    } else {
-        crate::render::PrearmWatchEnd::ScopeEnd
-    };
-    driver
-        .coordinator
-        .finish_prearm_watches(watch_end, Some(now_ns()));
-    let _ = driver.coordinator.commit_batch(false);
+    // Terminal pre-arm close for the scan lane only, as on the classic
+    // path (the dashboard quit flag is an operator-initiated end): the
+    // native lane already closed before its final commit. Frozen probe
+    // plus failure, never a re-read; guarded lane-aware commit.
+    if stopped.is_none() && driver.coordinator.has_prearm() {
+        let stop = driver.prearm_probe_stop.unwrap_or(false)
+            || capture_error.is_some()
+            || driver.coordinator.capture_failed();
+        let cause = if stop {
+            crate::render::PrearmWatchEnd::Stop
+        } else {
+            crate::render::PrearmWatchEnd::ScopeEnd
+        };
+        driver.coordinator.finish_prearm_watches(cause, None);
+        let _ = driver.commit(false);
+    }
     let presentation =
         final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
     begin_scan_stdout(stdout, stopped.is_some());
@@ -8818,6 +8885,14 @@ mod tests {
         p11scope_manifest::identity::hex(&sha2::Sha256::digest(bytes))
     }
 
+    /// Sorted key list of a JSON object: the exact-shape half of the row
+    /// pins — any renamed, added or dropped key fails.
+    fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     /// The `tests/fixtures/discovery-lifecycle.c` provider plus its
     /// acknowledged loader driver, compiled like the engine-tests
     /// fixture (inventory twins need only a pid plus a mapping).
@@ -8991,6 +9066,23 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
 
+        // Exact row shape: any renamed, added or dropped key fails.
+        assert_eq!(
+            sorted_keys(row),
+            ["attached_at_ns", "identity", "mapped", "path", "watch"],
+            "the prearm[] row keys: {row}"
+        );
+        assert_eq!(
+            sorted_keys(&row["identity"]),
+            ["device", "inode", "sha256"],
+            "the identity keys: {row}"
+        );
+        assert_eq!(
+            sorted_keys(&row["identity"]["device"]),
+            ["major", "minor"],
+            "the device keys: {row}"
+        );
+
         // Operator spelling plus the pinned file's identity (the
         // mapped-device key and an independently computed digest).
         assert_eq!(
@@ -9017,6 +9109,11 @@ mod tests {
         // Every production row carries a watch; the scan lane never
         // arms it, so the terminal hook ends the unarmed wait.
         assert!(row["watch"].is_object(), "a watch interval: {row}");
+        assert_eq!(
+            sorted_keys(&row["watch"]),
+            ["ended_by", "since_ns", "state", "until_ns"],
+            "no change bracket on an unchanged watch: {row}"
+        );
         assert_eq!(row["watch"]["state"], "ended");
         assert_eq!(row["watch"]["ended_by"], "scope_end");
         assert!(row["watch"]["until_ns"].as_u64().unwrap() > 0);
@@ -12771,6 +12868,8 @@ mod tests {
                 retiring: None,
                 joint_finish: JointFinishDriver::NotBegun,
                 stop_requested: false,
+                prearm_stop_probe: None,
+                prearm_probe_stop: None,
                 joint_first_error: None,
                 suspended: false,
                 joint_commit_pending: false,
@@ -13203,6 +13302,8 @@ mod tests {
                 retiring: None,
                 joint_finish: JointFinishDriver::NotBegun,
                 stop_requested: false,
+                prearm_stop_probe: None,
+                prearm_probe_stop: None,
                 joint_first_error: None,
                 suspended: false,
                 joint_commit_pending: false,
@@ -15668,6 +15769,62 @@ mod tests {
     }
 
     #[test]
+    fn lane_stopped_close_ends_stop_for_operator_stop() {
+        // The Stop branch through the staged hooks: an operator stop (frozen
+        // probe true) ends watches `Stop` in `on_lane_stopped` before the
+        // final commit. Kills the mutant that always ends `ScopeEnd`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(prearm_pinning_for_test(&dir, "stop-branch"));
+        coordinator.absorb_prearm_plan(1_000);
+        coordinator.take_target_delta();
+        let headless = headless_display();
+        let stop = || true;
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.prearm_stop_probe = Some(&stop);
+        driver.on_stop_requested();
+        assert_eq!(driver.prearm_probe_stop, Some(true));
+        driver.on_lane_stopped();
+        let watch = driver.coordinator.prearm_rows()[0]
+            .watch
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(watch.state, crate::render::PrearmWatchState::Ended);
+        assert_eq!(watch.ended_by, Some(crate::render::PrearmWatchEnd::Stop));
+        assert!(watch.until_ns.is_some());
+    }
+
+    #[test]
+    fn lane_stopped_close_ends_scope_end_for_deadline() {
+        // Deadline twin: a frozen probe false (no operator stop, no failure)
+        // ends watches `ScopeEnd` through the same staged hooks.
+        let dir = tempfile::tempdir().unwrap();
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(prearm_pinning_for_test(&dir, "deadline-branch"));
+        coordinator.absorb_prearm_plan(1_000);
+        coordinator.take_target_delta();
+        let headless = headless_display();
+        let stop = || false;
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.prearm_stop_probe = Some(&stop);
+        driver.on_stop_requested();
+        assert_eq!(driver.prearm_probe_stop, Some(false));
+        driver.on_lane_stopped();
+        let watch = driver.coordinator.prearm_rows()[0]
+            .watch
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(watch.state, crate::render::PrearmWatchState::Ended);
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::ScopeEnd)
+        );
+        assert!(watch.until_ns.is_some());
+    }
+
+    #[test]
     fn presentation_guard_final_refreshes_terminal_prearm_rows() {
         // While a publication pends, the final keeps the prior view —
         // except `prearm[]`, which refreshes to the terminal watches
@@ -15717,10 +15874,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_startup_final_publishes_scope_end_watches_with_failure_gap() {
-        // The failure choke ends pre-arm watches `ScopeEnd` and stages
-        // the failure gap before the one commit, so the fresh final
-        // publishes both together.
+    fn failed_startup_final_publishes_stop_watches_with_failure_gap() {
+        // The failure choke ends pre-arm watches `Stop` (6.13 maps errors
+        // to stop) and stages the failure gap before the one commit, so the
+        // fresh final publishes both together.
         let dir = tempfile::tempdir().unwrap();
         let mut coordinator = coordinator();
         coordinator.set_prearm_pinning(prearm_pinning_for_test(&dir, "failed-startup"));
@@ -15757,7 +15914,7 @@ mod tests {
             .expect("the fresh final renders prearm[]");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["watch"]["state"], "ended");
-        assert_eq!(rows[0]["watch"]["ended_by"], "scope_end");
+        assert_eq!(rows[0]["watch"]["ended_by"], "stop");
         assert!(
             rows[0]["watch"]["until_ns"].as_u64().unwrap() > 0,
             "the choke ends the watch: {rows:?}"
@@ -17591,6 +17748,8 @@ mod promotion_driver_tests {
             retiring: None,
             joint_finish: JointFinishDriver::NotBegun,
             stop_requested: false,
+            prearm_stop_probe: None,
+            prearm_probe_stop: None,
             joint_first_error: None,
             suspended: false,
             joint_commit_pending: false,
@@ -23871,6 +24030,8 @@ mod promotion_driver_tests {
             retiring: None,
             joint_finish: JointFinishDriver::NotBegun,
             stop_requested: false,
+            prearm_stop_probe: None,
+            prearm_probe_stop: None,
             joint_first_error: None,
             suspended: false,
             joint_commit_pending: false,

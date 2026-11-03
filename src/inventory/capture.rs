@@ -461,6 +461,13 @@ pub(crate) trait LaneHost<Pin> {
     fn note_extend_receipt(&mut self, receipt: &ExtendReceipt);
     fn note_capture_custody(&mut self, custody: &ScopeCustody);
     fn take_target_delta(&mut self) -> TargetDelta;
+    /// Whether the host holds a pending target delta (pre-arm proved
+    /// offsets absorbed before passes): `NativeLane::start` sends it with
+    /// the activation extend instead of after the first pass. Defaults to
+    /// no pending work (empty activation, as before).
+    fn has_pending_targets(&self) -> bool {
+        false
+    }
     fn capture_targets(&self) -> &dyn CaptureTargets;
     fn stage_native(
         &mut self,
@@ -514,6 +521,10 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
 
     fn take_target_delta(&mut self) -> TargetDelta {
         InventoryCoordinator::take_target_delta(self)
+    }
+
+    fn has_pending_targets(&self) -> bool {
+        InventoryCoordinator::has_pending_targets(self)
     }
 
     fn capture_targets(&self) -> &dyn CaptureTargets {
@@ -690,11 +701,16 @@ impl<L> NativeLane<L> {
         H: LaneHost<Pin> + ?Sized,
     {
         host.begin_capture_coverage(capture.scope_coverage());
-        let receipt = capture.extend(
-            TargetDelta::default(),
-            host.capture_targets(),
-            windows.extend(),
-        );
+        // The activation extend carries the host's pending delta (pre-arm
+        // proved offsets absorbed before passes), so the module is watched
+        // before it is mapped instead of after the first full scan pass. An
+        // empty host still activates empty, exactly as before.
+        let delta = if host.has_pending_targets() {
+            host.take_target_delta()
+        } else {
+            TargetDelta::default()
+        };
+        let receipt = capture.extend(delta, host.capture_targets(), windows.extend());
         if let Some(reason) = receipt.refused.clone() {
             host.abandon_capture_coverage();
             return Err((capture, reason));

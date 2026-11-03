@@ -445,6 +445,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     diagnostic_health: Option<u16>,
     diagnostic_refresh_loss: bool,
     diagnostic_native_unavailable: bool,
+    /// A capture failure was staged (`inventory capture failed` gap): the
+    /// pre-arm terminal cause reads `Stop` (6.13 maps errors to stop), never
+    /// a deadline `ScopeEnd`. Set by `note_scope_gap` on that pinned subject.
+    capture_failed: bool,
 }
 
 fn inventory_config(endpoint_budget: InventoryBudget) -> Result<InventoryDiscoveryConfig> {
@@ -782,6 +786,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             diagnostic_health: None,
             diagnostic_refresh_loss: false,
             diagnostic_native_unavailable: false,
+            capture_failed: false,
         })
     }
 
@@ -1129,6 +1134,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(prearm) = self.prearm.as_ref() else {
             return Vec::new();
         };
+        let undeclared_max = self.prearm_undeclared_max_all();
         let mut rows = Vec::with_capacity(prearm.inputs.len());
         for input in &prearm.inputs {
             let object = prearm.pins.id_for_prearm(input.key, &input.path);
@@ -1144,7 +1150,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     end_ns: end,
                     reason: crate::render::UnobservedReason::PreAttach,
                 });
-                if let Some(end) = object.and_then(|id| self.prearm_undeclared_max(id)) {
+                if let Some(end) = object.and_then(|id| undeclared_max.get(&id).copied()) {
                     windows.push(crate::render::UnobservedWindow {
                         start_ns: start,
                         end_ns: end,
@@ -1205,42 +1211,70 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         latest
     }
 
-    /// Max attach stamp over this object's attached endpoints outside its
-    /// declared set (scan-corroborated unproved offsets), if any: same-object
-    /// endpoints matched by retained identity over the dense id range,
-    /// skipping keys the declared set already owns.
-    fn prearm_undeclared_max(
+    /// Max attach stamp per pre-armed object over its attached endpoints
+    /// outside its declared set (scan-corroborated unproved offsets):
+    /// same-object endpoints matched by retained identity, skipping keys the
+    /// declared set already owns. One pass over the dense id range for all
+    /// inputs (not one scan per input per view).
+    fn prearm_undeclared_max_all(
         &self,
-        object: crate::discovery::identity::PinnedObjectId,
-    ) -> Option<u64> {
-        let capture = self.capture.as_ref()?;
-        let watch = self.prearm_state.get(object)?;
-        let declared = watch.declared();
-        let pins = &self.prearm.as_ref()?.pins;
-        let mut latest: Option<u64> = None;
+    ) -> BTreeMap<crate::discovery::identity::PinnedObjectId, u64> {
+        let mut max_by_object: BTreeMap<crate::discovery::identity::PinnedObjectId, u64> =
+            BTreeMap::new();
+        let (Some(capture), Some(prearm)) = (self.capture.as_ref(), self.prearm.as_ref()) else {
+            return max_by_object;
+        };
+        let pins = &prearm.pins;
+        // Attach-object → pinned-object index from the declared endpoints
+        // (one target per pre-armed file; undeclared same-object endpoints
+        // share it), so each endpoint resolves without scanning all inputs.
+        let mut attach_to_pin: BTreeMap<AttachObjectId, crate::discovery::identity::PinnedObjectId> =
+            BTreeMap::new();
+        for (key, endpoint_id) in &self.prearm_endpoints {
+            if let Some(endpoint) = self.attach_set.endpoint(*endpoint_id) {
+                attach_to_pin.insert(endpoint.object, key.object);
+            }
+        }
+        // Endpoints whose target predates the declared index (absorbed
+        // without a declared endpoint, e.g. scan-only same-object offsets)
+        // still resolve by retained identity, one lookup per endpoint.
         for raw in 0..self.attach_set.len() {
             let id = EndpointId(raw as u32);
             let Some(endpoint) = self.attach_set.endpoint(id) else {
                 continue;
             };
-            let Some(target) = self.attach_set.target(endpoint.object) else {
+            let pin = match attach_to_pin.get(&endpoint.object).copied() {
+                Some(pin) => pin,
+                None => {
+                    let Some(target) = self.attach_set.target(endpoint.object) else {
+                        continue;
+                    };
+                    let Some(pin) = self.prearm_state.watches().keys().copied().find(|pin| {
+                        target.same_object_as(pins, *pin)
+                    }) else {
+                        continue;
+                    };
+                    pin
+                }
+            };
+            let Some(watch) = self.prearm_state.get(pin) else {
                 continue;
             };
-            if !target.same_object_as(pins, object) {
-                continue;
-            }
             let key = crate::plan::AttachKey {
-                object,
+                object: pin,
                 file_offset: endpoint.file_offset,
             };
-            if declared.contains(&key) || self.prearm_endpoints.contains_key(&key) {
+            if watch.declared().contains(&key) || self.prearm_endpoints.contains_key(&key) {
                 continue;
             }
             if let Some(stamped) = capture.attached_at.get(&id).copied() {
-                latest = Some(latest.map_or(stamped, |known| known.max(stamped)));
+                max_by_object
+                    .entry(pin)
+                    .and_modify(|max| *max = (*max).max(stamped))
+                    .or_insert(stamped);
             }
         }
-        latest
+        max_by_object
     }
 
     /// Whether any registry module record names this retained object: the
@@ -2343,6 +2377,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// mismatch (`pidns::numbering_gap`, review F4), capture failures,
     /// and the zero-pass stop diagnostic all ride this path.
     pub(crate) fn note_scope_gap(&mut self, subject: String, reason: String) {
+        if subject == "inventory capture failed" {
+            self.capture_failed = true;
+        }
         self.registry.record_gap(RegistryGap {
             caller: None,
             module: None,
@@ -2367,6 +2404,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// however many quanta run unlinked.
     pub(crate) fn disclose_joint_journal_unavailable_once(&mut self) {
         self.registry.disclose_joint_journal_unavailable_once();
+    }
+
+    /// Whether a capture failure was staged this run (the pre-arm terminal
+    /// cause reads `Stop` for failures, per 6.13).
+    pub(crate) fn capture_failed(&self) -> bool {
+        self.capture_failed
+    }
+
+    /// Whether this run retains any `--prearm-module` pinning (the terminal
+    /// close and its guarded scan commit run only then, never on every run).
+    pub(crate) fn has_prearm(&self) -> bool {
+        self.prearm.is_some()
     }
 
     /// Stages one pass-wide count-refresh loss boundary from the lane
@@ -2441,6 +2490,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take_target_delta(&mut self) -> TargetDelta {
         std::mem::take(&mut self.pending_targets)
+    }
+
+    /// Whether a target delta pends (pre-arm proved offsets absorbed before
+    /// passes): the lane's activation extend carries it instead of waiting
+    /// for the first pass.
+    pub(crate) fn has_pending_targets(&self) -> bool {
+        !self.pending_targets.is_empty()
     }
 
     /// Native capture starts: from now on each scan projection stages a
@@ -11058,6 +11114,53 @@ pub(crate) mod tests {
                     reason: crate::render::UnobservedReason::MappedUnattached,
                 },
             ]),
+        );
+    }
+
+    #[test]
+    fn prearm_mapped_requires_matching_digest() {
+        // Digest negative: the same physical key (device, inode) with a
+        // different digest does not count as mapped. Kills mutants of the
+        // `is_none_or` / `!pin_sha.is_empty()` guard.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "digest-neg");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let summary = pinning.pins.pinned().next().expect("one pinned object");
+        let (key, sha256) = (summary.key, summary.sha256.to_string());
+        assert!(!sha256.is_empty(), "the pin carries a proven digest");
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        coordinator.take_target_delta();
+        // Same key, wrong digest: unmapped.
+        coordinator.registry_mut().scripted_module_edge(
+            ModuleKey::physical(
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                Some("deadbeef".repeat(8)),
+                "/scripted/prearm.so",
+            ),
+            CallerId(7),
+        );
+        assert!(
+            !coordinator.prearm_rows()[0].mapped,
+            "a digest mismatch is not the pinned object"
+        );
+        // Same key, matching digest: mapped.
+        coordinator.registry_mut().scripted_module_edge(
+            ModuleKey::physical(
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                Some(sha256),
+                "/scripted/prearm.so",
+            ),
+            CallerId(7),
+        );
+        assert!(
+            coordinator.prearm_rows()[0].mapped,
+            "the matching digest names the pinned object"
         );
     }
 

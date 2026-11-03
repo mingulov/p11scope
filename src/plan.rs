@@ -4761,8 +4761,9 @@ struct OwnedPiece {
     object: PinnedObjectId,
     key: ObjectKey,
     path: String,
-    // PA-7 scaffold: the stop-time copy drops the operator-named signal
-    // until this carries `piece.module_named`; the PA-7 twin fails on it.
+    /// The scanned piece's opened file matched an operator-named `--module`
+    /// input, carried from [`Discovered::module_named`] so the stop-time
+    /// owned copy preserves the signal every admission pass reads.
     module_named: bool,
     source: &'static str,
     tables: Vec<TableSummary>,
@@ -4779,7 +4780,7 @@ fn own_piece(piece: Discovered<'_>) -> OwnedPiece {
         object: piece.object,
         key: piece.key,
         path: piece.path.to_owned(),
-        module_named: false,
+        module_named: piece.module_named,
         source: piece.source,
         tables: piece.tables,
         interfaces: piece.interfaces,
@@ -13325,8 +13326,7 @@ mod tests {
             "the C1 closure stays unnamed through the stop-time copy"
         );
         let settled = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Named);
-        let rebuilt =
-            settled.rebuild_from_sources(&[provider, lone], &[], &PinnedObjects::empty());
+        let rebuilt = settled.rebuild_from_sources(&[provider, lone], &[], &PinnedObjects::empty());
         assert_eq!(
             slots_of(&rebuilt, 31),
             68,

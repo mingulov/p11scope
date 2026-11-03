@@ -20,8 +20,15 @@ fn fixture_dir(tag: &str) -> PathBuf {
 }
 
 fn build_dep(dir: &Path, soname: &str) -> PathBuf {
+    build_dep_as(dir, soname, soname)
+}
+
+/// Variant of [`build_dep`] with a file name distinct from the soname,
+/// for the SONAME-symlink twin (DT_NEEDED names the soname; the file on
+/// disk carries the real versioned name).
+fn build_dep_as(dir: &Path, file_name: &str, soname: &str) -> PathBuf {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
-    let dep = dir.join(soname);
+    let dep = dir.join(file_name);
     assert!(
         Command::new("gcc")
             .arg(format!("-m{}", usize::BITS))
@@ -33,9 +40,35 @@ fn build_dep(dir: &Path, soname: &str) -> PathBuf {
             .status()
             .unwrap()
             .success(),
-        "gcc {soname} failed"
+        "gcc {file_name} failed"
     );
     dep
+}
+
+/// The middle of a two-deep chain (P → A → B): a sibling that itself
+/// needs the leaf, linked with no rpath so only the fallback can order
+/// the loads.
+fn build_mid(dir: &Path, lib_dir: &Path, soname: &str, leaf_soname: &str) -> PathBuf {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+    let mid = dir.join(soname);
+    assert!(
+        Command::new("gcc")
+            .arg(format!("-m{}", usize::BITS))
+            .args(["-shared", "-fPIC"])
+            .arg(format!("-Wl,-soname,{soname}"))
+            .arg("-o")
+            .arg(&mid)
+            .arg(src.join("sibling_dep.c"))
+            .arg(format!("-L{}", lib_dir.display()))
+            .arg("-Wl,--no-as-needed")
+            .arg(format!("-l:{leaf_soname}"))
+            .arg("-Wl,--as-needed")
+            .status()
+            .unwrap()
+            .success(),
+        "gcc {soname} failed"
+    );
+    mid
 }
 
 /// The standard fixture provider (`provider.c` + `helper.c` in one object,
@@ -230,6 +263,59 @@ fn corrupt_needed_sibling_without_system_copy_is_still_refused() {
         error.contains("cannot dlopen"),
         "corrupt needed sibling with no system copy must refuse, got: {error}"
     );
+}
+
+/// Order twin: the provider needs A, A needs B, all three live in one
+/// directory outside the loader search. A failed load must never pin
+/// its position: B loads first, then A retries, then the provider.
+/// (Single-pass preloading tries A before B is known and refuses.)
+#[test]
+fn chained_sibling_dependencies_load_in_dependency_order() {
+    let _guard = DISCOVER_LOCK.lock().unwrap();
+    let tag = "chain";
+    let leaf = soname(&format!("{tag}-leaf"));
+    let mid = soname(&format!("{tag}-mid"));
+    let dir = fixture_dir(tag);
+    build_dep(&dir, &leaf);
+    let mid_path = build_mid(&dir, &dir, &mid, &leaf);
+    assert_sibling_needed_without_rpath(&mid_path, &leaf);
+    let provider = build_provider(&dir, &dir, &mid);
+    assert_sibling_needed_without_rpath(&provider, &mid);
+
+    let m = discover(&provider).unwrap();
+    let legacy = &m.surfaces[0];
+    assert!(matches!(legacy.walk, WalkOutcome::Full));
+    assert_eq!(legacy.functions.len(), 68);
+    for soname in [&leaf, &mid] {
+        assert!(
+            m.provenance_objects
+                .iter()
+                .any(|object| object.path.ends_with(soname)),
+            "both chain links must be part of provenance: {soname}"
+        );
+    }
+}
+
+/// SONAME twin: DT_NEEDED names `libfoo.so.1`, which is a symlink to the
+/// real versioned file in the same directory. An in-directory link
+/// whose target stays inside the directory loads; only outside links
+/// refuse (see the twin below).
+#[test]
+fn sibling_soname_symlink_inside_the_directory_is_accepted() {
+    let _guard = DISCOVER_LOCK.lock().unwrap();
+    let tag = "soname-link";
+    let linkname = soname(tag);
+    let realname = format!("{linkname}.1.2.3");
+    let dir = fixture_dir(tag);
+    build_dep_as(&dir, &realname, &linkname);
+    std::os::unix::fs::symlink(&realname, dir.join(&linkname)).unwrap();
+    let provider = build_provider(&dir, &dir, &linkname);
+    assert_sibling_needed_without_rpath(&provider, &linkname);
+
+    let m = discover(&provider).unwrap();
+    let legacy = &m.surfaces[0];
+    assert!(matches!(legacy.walk, WalkOutcome::Full));
+    assert_eq!(legacy.functions.len(), 68);
 }
 
 #[test]

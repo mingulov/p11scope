@@ -7534,6 +7534,8 @@ mod b17_wire_projection {
         assert!(control.instance_reload_not_excluded.is_none());
         assert_eq!(evidence.completeness, control.completeness);
         assert_eq!(evidence.verdict_detail, control.verdict_detail);
+        // Cause-level equality: any future verdict wiring that reads
+        // the key must trip this even when the strings still agree.
         assert_eq!(evidence.gap_classes, control.gap_classes);
     }
 

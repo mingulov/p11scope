@@ -562,6 +562,75 @@ def _dispatch(doc):
     return doc
 
 
+# The application's own provider query decides which key label the observer
+# can honestly establish (labels come from established facts of the same
+# object only). PKCS #11 defines CKA_MODULUS_BITS for RSA public keys, not
+# private keys, so a provider may refuse it for the signing key
+# (CKR_ATTRIBUTE_TYPE_INVALID). Then the observer cannot label that key
+# either: its operations land in the unknown bucket as metadata_unknown,
+# exactly as many as the ledger counts, never under a fabricated label.
+METADATA_UNKNOWN = "metadata_unknown"
+CELL_KEY_FOR = {"sign": "private", "verify": "public"}
+CELL_KEY_CLASS = {"private": 3, "public": 2}
+# Frozen product contract (src/semantics_key_use.rs NOT_APPLICABLE_CATEGORIES):
+# generation binds no key, so its terminals aggregate as not_applicable.
+KEYGEN_CATEGORY = "generate_key_pair"
+KEYGEN_REASON = "not_applicable"
+
+
+def _zero_unknown():
+    return {"completed": 0, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0}
+
+
+def _unlabeled_categories(application):
+    """Cell categories whose key's modulus size the application could not establish."""
+    unlabeled = []
+    for category in CELL_CATEGORIES:
+        cell = application["established"][CELL_KEY_FOR[category]]["modulus_bits"]
+        if cell != {"status": "value", "value": 2048}:
+            unlabeled.append(category)
+    return unlabeled
+
+
+def _expected_unknown(application):
+    """The only nonzero unknown-key rows the ledger can explain, with exact counts."""
+    expected = {}
+    keygen = application["calls_by_function"].get("C_GenerateKeyPair", 0)
+    if keygen:
+        expected[(KEYGEN_CATEGORY, KEYGEN_REASON)] = dict(_zero_unknown(), completed=keygen)
+    for category in _unlabeled_categories(application):
+        outcomes = application["operations"][category]
+        expected[(category, METADATA_UNKNOWN)] = dict(
+            _zero_unknown(), completed=outcomes["completed"], failed=outcomes["failed"])
+    return expected
+
+
+def _check_unlabeled_key(section, category, application):
+    """The unlabeled operations still name one proved key of the ledger's class.
+
+    Exactly one valid RSA object of that class carries no label because its
+    modulus size query did not establish a value, and its successful key
+    references equal the ledger's started operations of that category.
+    """
+    key = CELL_KEY_FOR[category]
+    outcomes = application["operations"][category]
+    started = outcomes["completed"] + outcomes["failed"]
+    matches = [row for row in section["objects"]
+               if row["established"]["class"] == {"status": "value",
+                                                  "value": CELL_KEY_CLASS[key]}
+               and row["established"]["key_type"] == {"status": "value", "value": 0}]
+    _require(len(matches) == 1, f"observed {category} key object is not unique")
+    row = matches[0]
+    _require(row["attribution"] == "valid", f"observed {category} key object is downgraded")
+    _require(row["label"] is None
+             and row["established"]["modulus_bits"]["status"] == "unknown"
+             and row["queries"]["modulus_bits"] in ("unavailable", "unsupported"),
+             f"observed {category} key object has a size the application could not establish")
+    _require(row["successful_key_references"] == started,
+             f"observed {category} key references {row['successful_key_references']}"
+             f" != expected {started}")
+
+
 def compare(application_rows, observer_doc):
     """Compare the independent ledger with the observed section.
 
@@ -569,7 +638,8 @@ def compare(application_rows, observer_doc):
     observed sign/verify units equal the ledger's, else raises OracleRefusal
     naming the finite cause.
     """
-    checked = check_section(_dispatch(observer_doc))
+    section = _dispatch(observer_doc)
+    checked = check_section(section)
     try:
         application = LEDGER.validate_ledger(application_rows)
     except LEDGER.LedgerError as error:
@@ -587,16 +657,41 @@ def compare(application_rows, observer_doc):
         raise OracleRefusal(f"observation gap {first['subject']}/{first['reason']}"
                             f" repeats {first['repeats']}")
     _require(gaps["suppressed"] == 0, "suppressed observation gaps")
+    expected_unknown = _expected_unknown(application)
     for category, reason, unit, counters in checked["unknown"]:
         _require(unit == "operations", f"unexpected observed unit {unit}")
-        _require(all(value == 0 for value in counters.values()),
+        if all(value == 0 for value in counters.values()):
+            continue
+        expected = expected_unknown.get((category, reason))
+        _require(expected is not None,
                  f"unattributed {category} outcomes under {reason}:"
                  f" completed {counters['completed']} failed {counters['failed']}"
                  f" cancelled {counters['cancelled']} unknown {counters['unknown']}"
                  f" active {counters['active']}")
+        _require(counters == expected,
+                 f"{category} under {reason} completed/failed/cancelled/unknown/active"
+                 f" {counters['completed']}/{counters['failed']}/{counters['cancelled']}"
+                 f"/{counters['unknown']}/{counters['active']} != expected"
+                 f" {expected['completed']}/{expected['failed']}/0/0/0")
     mechanism_operations = _check_mechanisms(observer_doc)
     observed = {}
+    unlabeled = _unlabeled_categories(application)
+    for category in unlabeled:
+        _require(not any(row_category == category and any(row.values())
+                         for row_category, row in checked["rows"]),
+                 f"observed {category} under a key label the application could not establish")
+        reason_key = (category, METADATA_UNKNOWN)
+        counters = next((row[3] for row in checked["unknown"]
+                         if (row[0], row[1]) == reason_key), None)
+        _require(counters is not None and counters == expected_unknown[reason_key],
+                 f"observed {category} is missing from the {METADATA_UNKNOWN} bucket")
+        _check_unlabeled_key(section, category, application)
+        observed[category] = {"completed": counters["completed"],
+                              "failed": counters["failed"],
+                              "unknown_reason": METADATA_UNKNOWN}
     for category in CELL_CATEGORIES:
+        if category in unlabeled:
+            continue
         counters = {"started": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0,
                     "active": 0, "key_join_lost": 0}
         for row_category, row in checked["rows"]:

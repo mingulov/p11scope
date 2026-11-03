@@ -159,6 +159,40 @@ def paired_deltas(old_values, new_values):
     return [new - old for old, new in zip(old_values, new_values)]
 
 
+TAG_RE = re.compile(r"^(old|new)-(.+)-r(\d+)-(\d+)$")
+
+
+def pair_key(tag):
+    """(round, pair) interleaving key, or None for unkeyed tags.
+
+    Campaign tags are {arm}-{cell}-r{round:02d}-{position}; two
+    adjacent positions form one ABBA/BAAB half-round (position //
+    2), so each key holds the temporally adjacent old/new samples.
+    """
+    match = TAG_RE.match(tag)
+    if not match:
+        return None
+    return (int(match.group(3)), int(match.group(4)) // 2)
+
+
+def binary_provenance(old, new, duration, max_scan_pids):
+    """Campaign identity for comparison.json: who was compared, where."""
+    try:
+        old_digest = sha256_file(old)
+        new_digest = sha256_file(new)
+    except OSError as exc:
+        raise MatchedCostError(f"cannot hash compared binaries ({exc})") from exc
+    return {
+        "old_path": old,
+        "new_path": new,
+        "old_sha256": old_digest,
+        "new_sha256": new_digest,
+        "kernel": os.uname().release,
+        "duration": duration,
+        "max_scan_pids": max_scan_pids,
+    }
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -351,7 +385,13 @@ METRICS = ("startup_ns", "firstpass_ns", "steady_ns", "wall_ns", "peak_rss_kb")
 
 
 def summarize(samples):
-    """Per cell per metric: old/new p50/p95 plus paired-median delta."""
+    """Per cell per metric: old/new p50/p95 plus paired-median delta.
+
+    Pairing is by (round, pair) tag key, so a lost metric in one arm
+    drops that pair instead of aborting the campaign; a metric with
+    no shared pair — or with unkeyed tags whose arm lengths differ —
+    is skipped, never raised.
+    """
     table = {}
     cells = sorted({sample["cell"] for sample in samples})
     for cell in cells:
@@ -363,7 +403,23 @@ def summarize(samples):
             new_values = [s[metric] for s in new if s.get(metric) is not None]
             if not old_values or not new_values:
                 continue
-            deltas = paired_deltas(old_values, new_values)
+            old_keys = [pair_key(s["tag"]) for s in old if s.get(metric) is not None]
+            new_keys = [pair_key(s["tag"]) for s in new if s.get(metric) is not None]
+            if all(key is not None for key in old_keys + new_keys):
+                by_old = {}
+                for key, value in zip(old_keys, old_values):
+                    by_old.setdefault(key, value)
+                by_new = {}
+                for key, value in zip(new_keys, new_values):
+                    by_new.setdefault(key, value)
+                shared = sorted(set(by_old) & set(by_new))
+                if not shared:
+                    continue
+                deltas = [by_new[key] - by_old[key] for key in shared]
+            elif len(old_values) != len(new_values):
+                continue
+            else:
+                deltas = paired_deltas(old_values, new_values)
             median_delta = p50(deltas)
             base = p50(old_values)
             table[cell][metric] = {
@@ -377,6 +433,7 @@ def summarize(samples):
                 ),
                 "old_n": len(old_values),
                 "new_n": len(new_values),
+                "paired_n": len(deltas),
             }
     return table
 
@@ -389,8 +446,15 @@ def format_ns(value):
     return f"{value / 1e3:.0f}us"
 
 
-def render_table(table):
+def render_table(table, meta=None):
     lines = []
+    if meta is not None:
+        lines.append(f"old: {meta['old_path']} sha256:{meta['old_sha256'][:12]}")
+        lines.append(f"new: {meta['new_path']} sha256:{meta['new_sha256'][:12]}")
+        lines.append(
+            f"kernel {meta['kernel']} duration {meta['duration']} "
+            f"K {meta['max_scan_pids']}"
+        )
     header = (
         f"{'cell':<16} {'metric':<12} {'old p50':>10} {'new p50':>10} "
         f"{'d%':>7} {'old p95':>10} {'new p95':>10} {'n':>5}"
@@ -492,17 +556,18 @@ def main(argv):
     args = parser.parse_args(argv)
     try:
         samples = run_campaign(args)
+        table = summarize(samples)
+        meta = binary_provenance(args.old, args.new, args.duration, args.max_scan_pids)
     except MatchedCostError as exc:
         print(f"matched-cost-run: refused: {exc}", file=sys.stderr)
         return 1
-    table = summarize(samples)
     out = Path(args.out)
     with open(out / "comparison.json", "w", encoding="utf-8") as handle:
-        json.dump({"samples": samples, "table": table}, handle, indent=2)
+        json.dump({"meta": meta, "samples": samples, "table": table}, handle, indent=2)
     if args.json:
         print(json.dumps(table, indent=2))
     else:
-        print(render_table(table))
+        print(render_table(table, meta))
     return 0
 
 

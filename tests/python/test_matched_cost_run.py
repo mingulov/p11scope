@@ -294,6 +294,11 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(meta["duration"], "30s")
         self.assertEqual(meta["max_scan_pids"], 40)
 
+    def test_binary_provenance_refuses_unreadable(self):
+        provenance = MOD["binary_provenance"]
+        with self.assertRaisesRegex(MatchedCostError, "cannot hash"):
+            provenance("/nonexistent/old", "/nonexistent/new", "30s", 40)
+
     def test_comparison_json_carries_meta(self):
         import json
         main = MOD["main"]

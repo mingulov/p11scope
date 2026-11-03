@@ -53,9 +53,12 @@ def observed(name):
         return json.load(stream)
 
 
-def full_doc(section, edges):
-    return {"schema": "p11scope/inventory/v1",
-            "object_observations": section, "edges": edges}
+def full_doc(section, edges, semantic_edges=None):
+    doc = {"schema": "p11scope/inventory/v1",
+           "object_observations": section, "edges": edges}
+    if semantic_edges is not None:
+        doc["semantic_edges"] = semantic_edges
+    return doc
 
 
 def mech_row(mechanism=0x40, name="CKM_SHA256_RSA_PKCS",
@@ -340,6 +343,48 @@ class ObservedRsaTests(unittest.TestCase):
                     ORACLE.compare(rows, doc)
                 self.assertIn(token, str(caught.exception))
                 self.assertNotIn("HOSTILE-MECH-NAME", str(caught.exception))
+
+    def test_mechanism_only_on_child_matches(self):
+        rows = APP_TESTS.application_rows()
+        doc = full_doc(observed("clean.json"), [{"mechanisms": None}],
+                       [{"mechanisms": [keygen_row(), mech_row()]}])
+        result = ORACLE.compare(rows, doc)
+        self.assertTrue(result.get("match"))
+        self.assertEqual(result["observed"]["mechanism"],
+                         {"mechanism": 64, "mechanism_hex": "0x40",
+                          "name": "CKM_SHA256_RSA_PKCS",
+                          "operations": ["sign", "verify"]})
+
+    def test_mechanism_on_neither_is_refused(self):
+        rows = APP_TESTS.application_rows()
+        cases = [
+            ("parent and child null",
+             full_doc(observed("clean.json"), [{"mechanisms": None}],
+                      [{"mechanisms": None}]),
+             "missing expected mechanism"),
+            ("parent null and no child",
+             full_doc(observed("clean.json"), [{"mechanisms": None}]),
+             "missing expected mechanism"),
+            ("child mechanisms not a list",
+             full_doc(observed("clean.json"), [{"mechanisms": None}],
+                      [{"mechanisms": {"0x40": {}}}]),
+             "unexpected mechanisms shape"),
+            ("child edges not a list",
+             full_doc(observed("clean.json"), [{"mechanisms": None}],
+                      {"mechanisms": [mech_row()]}),
+             "unexpected edges shape"),
+            ("sign under other id on child",
+             full_doc(observed("clean.json"), [{"mechanisms": None}],
+                      [{"mechanisms": [mech_row(), mech_row(
+                          mechanism=0x41, name="CKM_SHA1_RSA_PKCS",
+                          operations=("sign",))]}]),
+             "inconsistent_mechanism"),
+        ]
+        for label, doc, token in cases:
+            with self.subTest(label):
+                with self.assertRaises(ORACLE.OracleRefusal) as caught:
+                    ORACLE.compare(rows, doc)
+                self.assertIn(token, str(caught.exception))
 
     def test_row_budget_occupancy_cannot_exceed_limit(self):
         rows = APP_TESTS.application_rows()

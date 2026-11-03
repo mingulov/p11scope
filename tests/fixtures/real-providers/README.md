@@ -26,8 +26,8 @@ Facts the oracle relies on (all verified by capture, not by reading
 the spy source):
 
 - The log **appends** across runs sharing one `PKCS11SPY_OUTPUT` path:
-  every cell removes its spy log before running. The NSS cell routes two
-  tools through one log on purpose; sequences restart at 0 per process.
+  every cell removes its spy log before running. Sequences restart at 0
+  per process if several processes ever share one log file.
 - Every entry must close. A trailing entry without `Returned:` is a
   truncated log, never a partial count.
 - Without `PKCS11SPY` the log holds `Error: no module specified` and no
@@ -77,8 +77,16 @@ x-trust-lookup: pkcs11:library-description=PKCS%2311%20Kit%20Trust%20Module
 Without the `trust-policy` line, `trust list` reports "no modules
 containing trust policy"; with it, the full CA list returns through the
 spy (verified: exit 0, tens of thousands of ledger lines). `p11tool`
-instead takes `--provider <spy>` directly (see `p11tool --help`), and
-NSS takes `modutil -add spy -libfile <spy>` into an owned DB.
+instead takes `--provider <spy>` directly (see `p11tool --help`).
+NSS registers the spy into an owned DB with `modutil -add spy -libfile
+<spy>`, falling back to `modutil -rawadd "library=<spy> name=spy"`
+where `-add` verification fails (Fedora NSS 3.130 rejects even plain
+SoftHSM with "Unknown PKCS #11 error", while the module loads fine at
+use time). Registration is verified by listing, never by exit code
+(`modutil` exits 0 on failure). The observed command is `certutil -L -h
+all` alone: `run` does not track descendants, so a wrapper running two
+tools would hide both; `modutil -list` exercises the same registration
+unobserved in setup.
 
 ## expected-causes.json: the ratchet
 

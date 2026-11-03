@@ -19,8 +19,10 @@ appends one entry per forwarded call to a spy log. This oracle checks:
 - the set of observation causes equals the pinned per-cell list, where
   every pin carries a reason and an owner (the ratchet: a fixed cause or
   a new cause both fail until the pin is updated);
-- where the pin declares a p11-kit skip, the report's skip text names
-  the pinned endpoint count for the installed p11-kit version;
+- where the pin declares a p11-kit skip, the p11-kit-subject skip text
+  names the pinned endpoint count for the installed p11-kit version
+  (other subjects, such as the runtime-built spy table, are covered by
+  the cause pin and listed in the detail);
 - metrics twins skipped no modules.
 
 Counts, tool exit, report schema, the p11-kit skip text and the
@@ -144,11 +146,10 @@ def parse_spy_log(text):
     module, then one `<seq>: <C_Function>` entry per forwarded call, each
     closed by a `Returned:` line. Every entry must close: a trailing
     entry without `Returned:` is a truncated log, never a partial count.
-    Sequences may restart at 0 when several processes share one log file
-    (the NSS cell routes two tools through one log), so only per-entry
-    completeness is required, never global sequence order. Each client
-    process prints one header, so the header count is the process count
-    behind the C_GetFunctionList boundary rule.
+    Sequences may restart at 0 when several processes share one log file,
+    so only per-entry completeness is required, never global sequence
+    order. Each client process prints one header, so the header count is
+    the process count behind the C_GetFunctionList boundary rule.
     """
     if "Error: no module specified" in text:
         raise HarnessError("spy log has no module: PKCS11SPY was unset")
@@ -195,18 +196,18 @@ def skip_needed_count(reason):
 
 
 def skipped_counts(evidence):
-    """Parsed counts from every evidence-level modules_skipped reason."""
+    """Parsed (subject, count) pairs from every modules_skipped reason."""
     skipped = evidence.get("modules_skipped")
     require(isinstance(skipped, list), "missing evidence modules_skipped")
-    counts = []
+    pairs = []
     for row in skipped:
         require(isinstance(row, dict), "invalid modules_skipped row")
         reason = row.get("reason")
         require(isinstance(reason, str), "modules_skipped row lacks a reason")
         parsed = skip_needed_count(reason)
         if parsed is not None:
-            counts.append(parsed)
-    return counts
+            pairs.append((row.get("name"), parsed))
+    return pairs
 
 
 def select_pin(expects, cell, os_id, tool_version):
@@ -363,12 +364,14 @@ def judge(report_text, spy_text, receipt, expects, cell):
     require(pause == pinned_pause["status"],
             "pause is %s, pinned %s" % (pause, pinned_pause["status"]))
 
-    counts = skipped_counts(evidence)
+    pairs = skipped_counts(evidence)
+    p11kit = sorted(count for name, count in pairs
+                    if isinstance(name, str) and "p11-kit" in name)
     if pinned_skip is None:
-        require(not counts, "unpinned capacity skip names: %s" % counts)
+        require(not p11kit, "unpinned p11-kit capacity skip names: %s" % p11kit)
     else:
-        require(counts == [pinned_skip],
-                "p11-kit skip names %s, pinned %d" % (counts, pinned_skip))
+        require(p11kit == [pinned_skip],
+                "p11-kit skip names %s, pinned %d" % (p11kit, pinned_skip))
         installed = receipt.get("p11kit_version")
         require(installed == pinned_p11kit,
                 "installed p11-kit %s differs from pinned %s" % (installed, pinned_p11kit))
@@ -385,6 +388,12 @@ def judge(report_text, spy_text, receipt, expects, cell):
                           % (pause, pinned_pause["reason"], pinned_pause["owner"]))
     if pinned_skip is not None:
         deviations.append("p11-kit skip pinned at %d endpoints" % pinned_skip)
+    others = sorted("%s=%d" % (name.rsplit("/", 1)[-1] if isinstance(name, str) else "?",
+                                       count)
+                    for name, count in pairs
+                    if not (isinstance(name, str) and "p11-kit" in name))
+    if others:
+        deviations.append("other capacity skips: %s" % ",".join(others))
     if deviations:
         return "expected-failure", "; ".join(deviations)
     return "qualified", ("spied counts match the independent ledger; "

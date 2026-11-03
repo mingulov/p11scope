@@ -15,7 +15,8 @@
 #   real-pkcs11tool-softhsm   pkcs11-tool --module spy -L -M -O, spy -> SoftHSM
 #   real-pkcs11tool-opensc    same, spy -> opensc-pkcs11.so (needs a reader)
 #   real-p11kit-trust         trust list --filter=ca-anchors, spy -> p11-kit-trust
-#   real-nss-certutil         certutil -L -h all + modutil -list, spy -> SoftHSM
+#   real-nss-certutil         certutil -L -h all -d sql:DB, spy -> SoftHSM
+#                             (modutil -list verifies the registration in setup)
 #   real-gnutls-p11tool       p11tool --provider spy --list-tokens, spy -> SoftHSM
 #   real-opencryptoki         pkcs11-tool --module spy -L, spy -> libopencryptoki
 # The p11-kit-proxy transparency cells (real-p11kit-spy, owned SoftHSM
@@ -52,6 +53,11 @@
 #   are missing is recorded nonqualifying with detail "SKIP (77): ..." and
 #   never passes. Exit: 0 every cell qualified or pinned; 1 a cell failed;
 #   2 harness error; 77 a cell skipped and none failed.
+#
+# Every observer invocation runs under the workspace privileged lock
+# (/var/tmp/p11scope-ws-tmp/privileged.lock), so concurrent BPF captures
+# from other lanes cannot interfere. Callers must not hold that lock
+# around this script (flock self-deadlocks).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 64
 ORACLE=$HERE/real-provider-oracle.py
@@ -145,7 +151,8 @@ run_and_judge() {
   for i in "${ENV_ARGS[@]}"; do args+=("$i"); done
   for i in "${CMD_ARGS[@]}"; do args+=("$i"); done
   local rc
-  timeout "$TIMEOUT" sudo -n "$P" "${args[@]}" >"$OUT/$CELL.tool.out" 2>"$OUT/$CELL.run.stderr"; rc=$?
+  flock /var/tmp/p11scope-ws-tmp/privileged.lock \
+    timeout "$TIMEOUT" sudo -n "$P" "${args[@]}" >"$OUT/$CELL.tool.out" 2>"$OUT/$CELL.run.stderr"; rc=$?
   if [ "$rc" = 124 ]; then FAILED=1; result "$CELL" 0 "observer timed out after ${TIMEOUT}s" failed; return 1; fi
   sudo -n chown "$(id -u):$(id -g)" "$OUT/$CELL.json" 2>/dev/null || true
   after=$(pin "$SPIED") || { HARNESS=1; result "$CELL" 0 'harness: spied re-pin failed' failed; return 1; }
@@ -269,30 +276,37 @@ nss_cell() {
   local nssdb=$WORK/nssdb
   mkdir -p "$nssdb"
   if [ ! -f "$nssdb/cert9.db" ]; then
-    certutil -N --empty-password -d "sql:$nssdb" >/dev/null 2>&1 || {
+    "$certbin" -N --empty-password -d "sql:$nssdb" >/dev/null 2>&1 || {
       skip "$base" 'owned NSS DB setup failed'; skip "$base-metrics" 'owned NSS DB setup failed'; return 0; }
   fi
-  if ! modutil -list -dbdir "sql:$nssdb" 2>/dev/null | grep -q '\. spy$'; then
+  if ! "$modbin" -list -dbdir "sql:$nssdb" 2>/dev/null | grep -q '\. spy$'; then
+    # modutil exits 0 even when -add fails, so registration is verified by
+    # listing, never by exit code. Fedora NSS 3.130 rejects -add verification
+    # (plain SoftHSM fails identically: "Unknown PKCS #11 error"), while the
+    # same module loads fine at use time; -rawadd writes the same spec
+    # without that verification step.
     rm -f -- "$WORK/nss-add.spy.log"
-    if ! SOFTHSM2_CONF=$SOFTHSM_CONF PKCS11SPY=$spied PKCS11SPY_OUTPUT=$WORK/nss-add.spy.log \
-      modutil -add spy -libfile "$SPY" -dbdir "sql:$nssdb" -force >/dev/null 2>&1; then
-      skip "$base" 'NSS spy registration failed'; skip "$base-metrics" 'NSS spy registration failed'; return 0;
+    SOFTHSM2_CONF=$SOFTHSM_CONF PKCS11SPY=$spied PKCS11SPY_OUTPUT=$WORK/nss-add.spy.log \
+      "$modbin" -add spy -libfile "$SPY" -dbdir "sql:$nssdb" -force </dev/null >/dev/null 2>&1 || true
+    if ! "$modbin" -list -dbdir "sql:$nssdb" 2>/dev/null | grep -q '\. spy$'; then
+      "$modbin" -rawadd "library=$SPY name=spy" -dbdir "sql:$nssdb" -force </dev/null >/dev/null 2>&1 || true
     fi
     rm -f -- "$WORK/nss-add.spy.log"
+    if ! "$modbin" -list -dbdir "sql:$nssdb" 2>/dev/null | grep -q '\. spy$'; then
+      skip "$base" 'NSS spy registration failed (-add and -rawadd)';
+      skip "$base-metrics" 'NSS spy registration failed (-add and -rawadd)'; return 0;
+    fi
   fi
-  cat > "$WORK/nss-tool.sh" <<EOF
-"$certbin" -L -h all -d "sql:$nssdb"
-c=\$?
-"$modbin" -list -dbdir "sql:$nssdb"
-m=\$?
-exit \$((c || m))
-EOF
+  # The observed tool is certutil alone: `run` does not track descendants
+  # (pid_descendant_gaps is cgroup-only), so a shell wrapper running two
+  # tools would hide both. modutil -list still exercises the same
+  # registration unobserved in setup verification above.
   local mode
   for mode in profile metrics; do
     CELL=$base; MODE=$mode; TOOL=certutil; TOOL_VERSION=$version; SPIED=$spied
     [ "$mode" = metrics ] && CELL=$base-metrics
     ENV_ARGS=("SOFTHSM2_CONF=$SOFTHSM_CONF" "PKCS11SPY=$spied" "PKCS11SPY_OUTPUT=$OUT/$CELL.spy.log")
-    CMD_ARGS=(/bin/sh "$WORK/nss-tool.sh")
+    CMD_ARGS=("$certbin" -L -h all -d "sql:$nssdb")
     run_and_judge || true
   done
 }

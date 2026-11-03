@@ -152,7 +152,7 @@ class JudgeTests(unittest.TestCase):
     def judge(self, obs_counts=OBS_COUNTS, spy_counts=SPY_COUNTS, causes=(),
               pause="sigstop", mode="profile", tool_version="0.27.0~rc1-1",
               skip=None, mutate=None):
-        skips = ({"subject": "libp11-kit",
+        skips = ({"name": "libp11-kit",
                   "reason": "module needs %d more; only 512 slots are available" % skip},) \
             if skip is not None else ()
         doc = report_functions(obs_counts, causes, pause, mode, skips=skips)
@@ -284,6 +284,32 @@ class JudgeTests(unittest.TestCase):
         qualification, _ = self.judge(causes=("modules_skipped",), skip=6530)
         self.assertEqual(qualification, "expected-failure")
 
+    def test_second_non_p11kit_skip_is_listed_not_judged(self):
+        def mutate(doc, rec, exp):
+            doc["evidence"]["modules_skipped"].append(
+                {"name": "/usr/lib64/pkcs11-spy.so",
+                 "reason": "module needs 67 more; only 512 slots are available"})
+        qualification, detail = self.judge(causes=("modules_skipped",), skip=6530,
+                                            mutate=mutate)
+        self.assertEqual(qualification, "expected-failure")
+        self.assertIn("pkcs11-spy.so=67", detail)
+
+    def test_unpinned_p11kit_skip_fails(self):
+        def mutate(doc, rec, exp):
+            doc["evidence"]["modules_skipped"] = [
+                {"name": "libp11-kit",
+                 "reason": "module needs 6530 more; only 512 slots are available"}]
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]):
+            self.judge(causes=("modules_skipped",), mutate=mutate)
+
+    def test_non_p11kit_skip_without_pin_passes(self):
+        def mutate(doc, rec, exp):
+            doc["evidence"]["modules_skipped"] = [
+                {"name": "/usr/lib64/pkcs11-spy.so",
+                 "reason": "module needs 67 more; only 512 slots are available"}]
+        qualification, _ = self.judge(causes=("modules_skipped",), mutate=mutate)
+        self.assertEqual(qualification, "expected-failure")
+
     def test_p11kit_skip_wrong_count_fails(self):
         def mutate(doc, rec, exp):
             doc["evidence"]["modules_skipped"][0]["reason"] = \
@@ -300,7 +326,7 @@ class JudgeTests(unittest.TestCase):
     def test_metrics_twin_with_skips_fails(self):
         def mutate(doc, rec, exp):
             doc["evidence"]["modules_skipped"] = [
-                {"subject": "x", "reason": "module needs 10 more; only 512 slots are available"}]
+                {"name": "x", "reason": "module needs 10 more; only 512 slots are available"}]
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
             self.judge(mode="metrics", mutate=mutate)
 

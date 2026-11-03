@@ -126,7 +126,11 @@ always renders (possibly empty).
    regressed, fold overflow) or `GenerationChanged` ⇒ `broad_plan_topology`.
    (Producer saturation, contention and kernel-evidence loss latch inside
    `CounterRead::validate`, so the collector is the loss detector; no
-   separate loss check exists.)
+   separate loss check exists.) A torn window — any row whose `rv_counts`
+   sum differs from its `returned` delta, because a call completed between
+   the read's return-value pass and its slot-stats pass — also refuses as
+   `broad_plan_topology`, checked over every windowed row before the slot
+   filter; on a busy `--pid` target this can withhold most windows.
 
 Any void records the named refusal on the selection record; `lineage`,
 `aggregate` and `detail` stay absent and `events` stays empty. The main

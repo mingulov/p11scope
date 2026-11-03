@@ -819,7 +819,11 @@ Limits that matter in pods:
   cannot tie to the exit. Those withhold the detail
   as `broad_stopping`, so a `run` child that loads and exits at once may
   still void intermittently, about 1 in 10 runs in local testing; a child
-  that runs on for a few seconds after loading is unaffected. With
+  that runs on for a few seconds after loading is unaffected. Each
+  bracketing read samples the return-value table before the slot
+  counters, so a call that completes between the two passes leaves a
+  torn window and the detail is withheld as `broad_plan_topology`;
+  against a busy `--pid` target this can withhold most windows. With
   `run`, the window must
   tell the child's own startup exec apart from the window by kernel
   and userspace monotonic time; where the two clocks cannot be

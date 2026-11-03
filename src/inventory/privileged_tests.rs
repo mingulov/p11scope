@@ -6227,13 +6227,20 @@ fn assert_quiet_twins_except_stopped(
         }
         let subject = gap.subject.to_lowercase();
         let reason = gap.reason.to_lowercase();
-        ensure!(
-            !subject.contains("loss")
+        // Gap labels judge loss; a bare file-path subject (an absolute
+        // path, such as a hint gap's `.so` under TMPDIR) is not a
+        // label, so a temp dir containing "loss" must not fail a
+        // quiet cell. Labels with an embedded path still count, and
+        // the reason check applies to every gap.
+        let subject_is_path = gap.subject.starts_with('/');
+        let subject_quiet = subject_is_path
+            || (!subject.contains("loss")
                 && !subject.contains("lost")
                 && !subject.contains("refused")
                 && !subject.contains("shed")
-                && !subject.contains("unsettled")
-                && !reason.contains("loss"),
+                && !subject.contains("unsettled"));
+        ensure!(
+            subject_quiet && !reason.contains("loss"),
             "{tag}: unexpected gap {}: {} (caller={:?} pid={:?} module={:?} repeats={:?})",
             gap.subject,
             gap.reason,
@@ -8934,6 +8941,58 @@ mod joint_ledger_parse_tests {
             api_returns: Some(12),
         };
         assert!(assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[edge]).is_err());
+        Ok(())
+    }
+
+    /// The quiet loss twins judge gap labels, never bare file paths: a
+    /// hint gap whose subject is a `.so` under a temp dir containing
+    /// "loss" passes, while a real loss label still fails — a loss
+    /// subject, a label with an embedded path, and a loss reason on a
+    /// path subject alike.
+    #[test]
+    fn quiet_twins_ignore_file_path_subjects_but_keep_loss_labels() -> anyhow::Result<()> {
+        use crate::discovery::caller_registry::{CallerId, RegistryGap};
+        let check = |subject: &str, reason: &str| -> anyhow::Result<()> {
+            let mut coordinator = system_joint_coordinator(&[])?;
+            coordinator.registry_mut().record_gap(RegistryGap {
+                caller: Some(CallerId(0)),
+                module: None,
+                pid: Some(1),
+                subject: subject.into(),
+                reason: reason.into(),
+                budget: None,
+            });
+            coordinator.registry_mut().publish();
+            assert_quiet_twins_except_stopped(&coordinator, "t", &[], &[])
+        };
+        assert!(
+            check(
+                "/var/tmp/p11scope-ws-tmp/h3loss/live-joint-held.so",
+                "not mapped in the target",
+            )
+            .is_ok(),
+            "a bare path subject is not a label"
+        );
+        assert!(
+            check("semantic capture loss", "test probe").is_err(),
+            "a loss label still fails"
+        );
+        assert!(
+            check(
+                "semantic provider file /var/tmp/p11scope-ws-tmp/x.so admission refused",
+                "mapping_incomplete",
+            )
+            .is_err(),
+            "a label with an embedded path still fails"
+        );
+        assert!(
+            check(
+                "/var/tmp/p11scope-ws-tmp/h3loss/live-joint-held.so",
+                "native capture lifecycle evidence loss",
+            )
+            .is_err(),
+            "a loss reason still fails on a path subject"
+        );
         Ok(())
     }
 

@@ -325,9 +325,10 @@ impl KeyMetadataFlags {
     }
 }
 
-/// H9 receipt snapshot: established-only label (sizes/curve, never
-/// key material), attribution validity, and the one proven
-/// accessing session — everything a positional receipt may carry.
+/// H9 receipt snapshot: resolved label (own established sizes/curve
+/// or a pair-inherited RSA size, never key material), attribution
+/// validity, and the one proven accessing session — everything a
+/// positional receipt may carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReceiptSnapshot {
     pub label: Option<KeyLabel>,
@@ -818,7 +819,8 @@ pub(crate) enum ObjectEffect {
         /// between the join and receipt assembly cannot backfill an
         /// earlier use.
         metadata: KeyMetadataFlags,
-        /// The established-only combined label at the join.
+        /// The resolved combined label at the join (own established
+        /// or pair-inherited size).
         label: Option<KeyLabel>,
         /// Whether attribution was valid at the join.
         attribution_valid: bool,
@@ -966,7 +968,10 @@ pub(crate) fn field_index(kind: SafeAttributeKind) -> usize {
     }
 }
 
-/// A combined label from established facts of the same view only.
+/// A combined label from established facts of the same view only,
+/// except an RSA private key's pair-inherited size (resolved by the
+/// model state): the mate's established public-key size from the
+/// same successful `C_GenerateKeyPair` return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyLabel {
     Aes { value_len: u16 },
@@ -1261,8 +1266,9 @@ impl ObjectSemantics {
         self.state.key_metadata_flags(key)
     }
 
-    /// H9 receipt snapshot: the established-only label, attribution
-    /// validity and accessing session for one object. No access
+    /// H9 receipt snapshot: the resolved label (own established or
+    /// pair-inherited size), attribution validity and accessing
+    /// session for one object. No access
     /// counts (those need the relations scan; receipts never carry
     /// them).
     pub(crate) fn receipt_snapshot(&self, key: ObjectId) -> Option<ReceiptSnapshot> {

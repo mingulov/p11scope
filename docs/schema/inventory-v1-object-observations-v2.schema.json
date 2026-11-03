@@ -464,7 +464,7 @@
         "ec_p384",
         "ec_p521"
       ],
-      "description": "Frozen label from established facts only: RSA modulus bits, AES value length in bits, EC finite curve. Requested-only sizes never label; success never certifies a requested size."
+      "description": "Frozen label from established facts only: RSA modulus bits, AES value length in bits, EC finite curve. Requested-only sizes never label; success never certifies a requested size. One provenance exception: an RSA private key from C_GenerateKeyPair carries its pair-mate public key's established size when both handles came from the same successful return; its own established.modulus_bits stays unknown."
     },
     "gap_reason": {
       "enum": [

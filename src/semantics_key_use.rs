@@ -1401,8 +1401,9 @@ pub(crate) fn metadata_label(label: crate::semantics_objects::KeyLabel) -> &'sta
     }
 }
 
-/// The usable metadata-at-use label (H9 §72): established-only,
-/// valid attribution, non-conflicting required fields. Decides
+/// The usable metadata-at-use label (H9 §72): resolved-only (own
+/// established or pair-inherited size), valid attribution,
+/// non-conflicting required fields. Decides
 /// admission: usable receipts reserve proved aggregate buckets;
 /// unusable ones count in fixed unknown summaries. Later-learned
 /// metadata never rewrites a bucket's label: receipts carry the

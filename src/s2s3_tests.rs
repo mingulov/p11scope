@@ -2624,6 +2624,91 @@ fn s2s3_metadata_provenance_curve_and_type_labels() {
     assert_eq!(view(&h.project(), other).label, None);
 }
 
+/// A private key inherits the size of its pair's public key when both
+/// handles come from one successful `C_GenerateKeyPair` return: the
+/// private view labels `rsa_2048` although its own modulus query was
+/// refused. No new read: the public key's established size is reused.
+#[test]
+fn s2s3_pair_mate_private_key_inherits_public_size() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(
+        3,
+        call("C_GenerateKeyPair").on(SA),
+        4,
+        ok().result(0, H1).result(1, H2),
+    );
+    let public = attrs(&[
+        scalar(CKA_CLASS, 2),
+        scalar(CKA_KEY_TYPE, 0),
+        scalar(CKA_MODULUS_BITS, 2048),
+    ]);
+    h.run(5, get_attrs(SA, H1), 6, ok().attrs(public));
+    // The provider refuses CKA_MODULUS_BITS on the private key: it is
+    // not an RSA private-key attribute (CKR_ATTRIBUTE_TYPE_INVALID).
+    let private = attrs(&[
+        scalar(CKA_CLASS, 3),
+        scalar(CKA_KEY_TYPE, 0),
+        AttrObservation::unavailable(CKA_MODULUS_BITS),
+    ]);
+    h.run(7, get_attrs(SA, H2), 8, ok().attrs(private));
+    let e = h.settle(8);
+    created(&e, x, 0).expect("the public mate is created");
+    let private_id = created(&e, x, 1).expect("the private mate is created");
+    assert_eq!(
+        view(&h.project(), private_id).label,
+        Some(KeyLabel::Rsa { modulus_bits: 2048 })
+    );
+}
+
+/// An unpaired private key never inherits a size: without a pair mate
+/// from the same successful return, the view stays unlabeled.
+#[test]
+fn s2s3_unpaired_private_key_stays_unlabeled() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(3, create(SA), 4, ok().result(0, H1));
+    let private = attrs(&[
+        scalar(CKA_CLASS, 3),
+        scalar(CKA_KEY_TYPE, 0),
+        AttrObservation::unavailable(CKA_MODULUS_BITS),
+    ]);
+    h.run(5, get_attrs(SA, H1), 6, ok().attrs(private));
+    let e = h.settle(6);
+    let id = created(&e, x, 0).expect("the created view exists");
+    assert_eq!(view(&h.project(), id).label, None);
+}
+
+/// A failed `C_GenerateKeyPair` mints no pair: the handles never bind
+/// mate views, so a later private-key view on one stays unlabeled.
+#[test]
+fn s2s3_failed_key_pair_creates_no_inheritable_mate() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(
+        3,
+        call("C_GenerateKeyPair").on(SA),
+        4,
+        rv(CkRv::FUNCTION_FAILED).result(0, H1).result(1, H2),
+    );
+    let g = h.run(
+        5,
+        get_attrs(SA, H2),
+        6,
+        ok().attrs(attrs(&[
+            scalar(CKA_CLASS, 3),
+            scalar(CKA_KEY_TYPE, 0),
+            AttrObservation::unavailable(CKA_MODULUS_BITS),
+        ])),
+    );
+    let e = h.settle(6);
+    assert_eq!(created(&e, x, 0), None);
+    assert_eq!(created(&e, x, 1), None);
+    assert!(!has_created(&e), "a failed creation mints no view");
+    let id = sole(first_observed(&e, g));
+    assert_eq!(view(&h.project(), id).label, None);
+}
+
 #[test]
 fn s2s3_metadata_provenance_classifiers_reject_unsupported_values() {
     let l = LinuxLayout::Lp64;

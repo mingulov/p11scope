@@ -13436,8 +13436,7 @@ mod tests {
         let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
         closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
         let empty = scoped_plan(&[], AdmissionScope::Named);
-        let rebuilt =
-            empty.rebuild_from_sources(&[big, closure], &[], &PinnedObjects::empty());
+        let rebuilt = empty.rebuild_from_sources(&[big, closure], &[], &PinnedObjects::empty());
         assert_eq!(slots_of(&rebuilt, 32), 0, "oversized provider refused");
         assert_eq!(slots_of(&rebuilt, 31), 0, "prefix blocked behind the loss");
         let refusal = refusal_of(&rebuilt, P11_KIT).expect("whole refusal recorded");

@@ -10703,6 +10703,70 @@ mod tests {
         assert!(inventory.contains("ElfAbi::Ilp32 => \"p11_usage_entry_ia32\""));
     }
 
+    /// Pause thread-birth dating trusts the attach clock: every provider
+    /// attach body must stamp it before its first link mutation, and the
+    /// loader and diagnostic probes (no provider hooks) must not. Deleting a
+    /// stamp would date births against an older attach, the unsafe direction.
+    #[test]
+    fn hook_attach_stamps_cover_every_provider_attach_and_skip_the_loader_and_diagnostic_probes() {
+        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+            source
+                .split_once(signature)
+                .unwrap()
+                .1
+                .split_once("\n    }")
+                .unwrap()
+                .0
+        }
+        const STAMP: &str = "crate::discovery::pause::hook_attach_window";
+        const PROVIDER_ATTACHES: [(&str, &str); 3] = [
+            (
+                "    pub(crate) fn attach_targets(",
+                "self.native_retirement.collected_blocking()",
+            ),
+            (
+                "    pub(crate) fn attach_dynamic_export(",
+                "attach_dynamic_export_with(",
+            ),
+            ("    fn rebuild_affected_groups(", "multi_prog_fd("),
+        ];
+        const UNHOOKED: [&str; 2] = [
+            "    pub(crate) fn attach_dynamic_loader(",
+            "    pub(crate) fn attach_diagnostic_probe(",
+        ];
+        fn contract(source: &str) -> bool {
+            PROVIDER_ATTACHES.iter().all(|(signature, mutation)| {
+                let text = body(source, signature);
+                text.matches(STAMP).count() == 1
+                    && text
+                        .find(mutation)
+                        .is_some_and(|at| text.find(STAMP) < Some(at))
+            }) && UNHOOKED
+                .iter()
+                .all(|signature| !body(source, signature).contains(STAMP))
+        }
+        let source = include_str!("attach.rs");
+        assert!(contract(source));
+        for (signature, _) in PROVIDER_ATTACHES {
+            let start = source.find(signature).unwrap();
+            let tail = source[start..].replacen(STAMP, "crate::discovery::pause::unstamped", 1);
+            assert!(
+                !contract(&format!("{}{}", &source[..start], tail)),
+                "removed the stamp from {signature}"
+            );
+        }
+        for signature in UNHOOKED {
+            let start = source.find(signature).unwrap();
+            let opened = source[start..].find('{').unwrap() + start + 1;
+            let stamped = format!(
+                "{}\n        let _window = {STAMP}();{}",
+                &source[..opened],
+                &source[opened..]
+            );
+            assert!(!contract(&stamped), "stamped {signature}");
+        }
+    }
+
     #[test]
     fn admission_refusals_precede_the_actual_session_factory_for_every_backend() {
         use super::{BackendSelection, CapturePolicy, Scope, Session};

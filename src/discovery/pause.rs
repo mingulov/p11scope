@@ -4708,8 +4708,8 @@ mod tests {
     }
 
     /// The settling is bounded by the stop's existing deadline: a thread still
-    /// running when it passes keeps today's task-set partial, after at most
-    /// one wait per millisecond of the cycle.
+    /// running when it passes ends the stop partial on the deadline message
+    /// (ruling PT-7), after at most one wait per millisecond of the cycle.
     #[test]
     fn thread_still_running_at_the_stop_deadline_keeps_partial() {
         let mut io = successful_io(vec![record(10, 0, false)]);
@@ -4870,6 +4870,26 @@ mod tests {
         assert_eq!(waits_before_resume(&io), 0, "{:?}", io.events);
     }
 
+    /// A 1 ms wait started with exactly 1 ms left ends past the deadline once
+    /// the resume and the observer's first read follow it, so the hold also
+    /// keeps a clock tick of headroom: with 1 ms plus less than a tick left it
+    /// resumes at once.
+    #[test]
+    fn resume_hold_keeps_a_tick_of_headroom_before_the_deadline() {
+        let tick = test_tick_ns();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.now = [10, 11, 495_999_999].into_iter().map(Ok).collect();
+        io.fallback_attach = Some(100 * tick + 1);
+        io.fallback_boot = Some(100 * tick + 2);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(waits_before_resume(&io), 0, "{:?}", io.events);
+    }
+
     /// The hold resumes at once when it cannot read the stop's clock: it has
     /// no way to know the next wait is inside the deadline.
     #[test]
@@ -4984,6 +5004,40 @@ mod tests {
             format!("{error}").contains(MSG_PAUSE_CONFIRMATION_DEADLINE),
             "{error}"
         );
+    }
+
+    /// The settle loop's sample cap is the deadline's twin: a stop whose
+    /// threads are all still on their way into it when the samples run out
+    /// reports the deadline message, as when the deadline passes first, while
+    /// a thread that can never reach the stop still refuses at once on the
+    /// task set.
+    #[test]
+    fn settle_samples_running_out_report_the_deadline() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        let mut io = FakeIo {
+            states: std::iter::repeat_with(|| Ok(running_42()))
+                .take(2_000)
+                .collect(),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut io, u64::MAX / 2),
+            Err((MSG_PAUSE_CONFIRMATION_DEADLINE.into(), false))
+        );
+        assert_eq!(waits(&io), MAX_SETTLE_SAMPLES as usize + 1);
+
+        let unreachable: BTreeMap<u32, u8> = [(41, b'T'), (42, b'Z')].into_iter().collect();
+        let mut io = FakeIo {
+            states: std::iter::repeat_with(|| Ok(unreachable.clone()))
+                .take(2_000)
+                .collect(),
+            ..FakeIo::default()
+        };
+        assert_eq!(
+            coordinator.sample_until_stopped(&mut io, u64::MAX / 2),
+            Err((MSG_TASK_SET_CHANGED.into(), false))
+        );
+        assert_eq!(waits(&io), 0);
     }
 
     /// The other direction: a strict sample with a running thread, and a
@@ -5541,8 +5595,9 @@ mod tests {
                 io.states = VecDeque::from([Ok([(41, b'T'), (43, b'T')].into_iter().collect())]);
             } else if failure == "tasks" {
                 // A thread that never reaches the stop: the first sample now
-                // re-samples until the stop deadline (ruling PT-3), so the
-                // ordinary task failure is one that persists through it.
+                // re-samples until the stop deadline (ruling PT-3) and then
+                // ends on the deadline message (ruling PT-7), an ordinary
+                // failure all the same.
                 let running: BTreeMap<u32, u8> = [(41, b'R'), (42, b'T')].into_iter().collect();
                 io.states = std::iter::repeat_with(|| Ok(running.clone()))
                     .take(2_000)

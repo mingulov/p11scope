@@ -8,6 +8,12 @@ compares them both ways against tests/ignored-tests.json:
 
 - an ignore site with no inventory entry fails;
 - an inventory entry with no matching site fails;
+- a skip entry (its path is curated in the runner's SKIP_TESTS list)
+  without an `until` field fails, and so does an `until` on any other
+  entry: `until` is either a dotted version ("0.7.0") or an object
+  {"item": work item, "owner": lane/role that revisits it}. A version
+  at or below the release under development fails as expired, so a
+  deferral ("deferred to 0.6.0") cannot outlive its release silently.
 - a `feature` entry without a non-empty `owner` fails: the owner names
   the lane that runs the test (a runner list or a dedicated build).
   The owner must be one of ALLOWED_OWNERS, and every allowed owner has
@@ -48,14 +54,29 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INVENTORY = "tests/ignored-tests.json"
 DEFAULT_RUNNER = "scripts/run-privileged-lib-tests.sh"
+DEFAULT_MANIFEST = "Cargo.toml"
+# Skip-expiry source: the release under development. Cargo.toml still
+# carries the last RELEASED version, so expiry cannot be judged from it
+# alone ("deferred to 0.6.0" would never expire while 0.6.0 is built).
+# The checker judges against the greater of this constant and the
+# Cargo.toml version; bump the constant when development moves to the
+# next release (the Cargo.toml side then covers the release-cut window
+# even if the bump lags).
+DEVELOPMENT_VERSION = "0.6.0"
 SCAN_DIRS = ("src", "tests", "crates")
 EXCLUDED_SEGMENTS = ("third-party", "target")
 RUNNER_LISTS = (
     "DEFAULT_TESTS",
     "ALTERNATIVE_TESTS",
     "LONG_TESTS",
+    "BTRFS_TESTS",
+    "EXPECTED_FAILURE_TESTS",
     "SKIP_TESTS",
 )
+# Fixture membership, not a campaign list: documents which DEFAULT_TESTS
+# members need runner-built inputs. Sized in the counts line; it never
+# curates by itself.
+FIXTURE_LIST = "COUNTER_FIXTURE_TESTS"
 WIDE_LIST = "WIDE_DETAILED_2112_TESTS"
 WIDE_OWNER = "wide-detailed-2112 runner"
 COUNTER_PROOF_LIST = "COUNTER_BANK_PROOF_TESTS"
@@ -76,6 +97,7 @@ INTEGRATION_LIST = "INTEGRATION_TESTS"
 INTEGRATION_CELLS = ("live-kernel", "privileged")
 COUNT_LISTS = (
     *RUNNER_LISTS,
+    FIXTURE_LIST,
     *(name for _, name, _ in OWNER_LISTS),
     INTEGRATION_LIST,
 )
@@ -414,12 +436,80 @@ def runner_lists(runner_path):
 
 
 def runner_registered(runner_path):
-    """Test paths curated by the privileged runner's four default lists."""
+    """Test paths curated by the privileged runner's campaign lists."""
     lists = runner_lists(runner_path)
     registered = set()
     for name in RUNNER_LISTS:
         registered |= lists[name]
     return registered
+
+
+def parse_version(text):
+    """(1, 2, 3) from "1.2.3"; None when not a dotted-int version."""
+    if not isinstance(text, str):
+        return None
+    match = re.fullmatch(r"\d+(?:\.\d+)*", text.strip())
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.group(0).split("."))
+
+
+def version_at_most(a, b):
+    """True when version tuple a <= b (shorter side zero-padded)."""
+    width = max(len(a), len(b))
+    left = a + (0,) * (width - len(a))
+    right = b + (0,) * (width - len(b))
+    return left <= right
+
+
+def manifest_version(root):
+    """The root Cargo.toml package version, or None when unreadable."""
+    try:
+        text = (Path(root) / DEFAULT_MANIFEST).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    if match is None:
+        return None
+    return parse_version(match.group(1))
+
+
+def current_version(root):
+    """The release under development: max(manifest, DEVELOPMENT_VERSION).
+
+    Returns None only when Cargo.toml is missing or unparseable, in
+    which case expiry cannot be judged and the check fails closed.
+    """
+    manifest = manifest_version(root)
+    development = parse_version(DEVELOPMENT_VERSION)
+    if manifest is None or development is None:
+        return None
+    if version_at_most(development, manifest):
+        return manifest
+    return development
+
+
+def until_problem(until, current):
+    """Failure detail for an `until` value, or None when it stands.
+
+    A version fails when it is malformed or at/below the release under
+    development; a work item fails when it is not exactly
+    {"item": ..., "owner": ...} with non-empty strings.
+    """
+    if isinstance(until, str):
+        version = parse_version(until)
+        if version is None:
+            return f"until {until!r} is not a dotted version"
+        if version_at_most(version, current):
+            dotted = ".".join(str(part) for part in current)
+            return f"until {until!r} expired at {dotted}"
+        return None
+    if not isinstance(until, dict) or set(until) != {"item", "owner"}:
+        return f"until {until!r} must be a version or {{\"item\", \"owner\"}}"
+    for key in ("item", "owner"):
+        if not isinstance(until[key], str) or not until[key].strip():
+            return f"until {key} must be a non-empty string"
+    return None
 
 
 def cfg_blocked_above(stripped, original, offset):
@@ -515,8 +605,13 @@ def check(root=ROOT, inventory=None, runner=None):
     registered = set()
     for name in RUNNER_LISTS:
         registered |= lists.get(name, set())
+    skip_paths = lists.get("SKIP_TESTS", set())
     wide = lists.get(WIDE_LIST, set())
     integration = lists.get(INTEGRATION_LIST, set())
+    current = current_version(root)
+    if current is None:
+        failures.append(f"FAIL {root / DEFAULT_MANIFEST}: cannot read "
+                        "a package version, skip expiry cannot be judged")
     owned = {owner: (name, lists.get(name, set()), form)
              for owner, name, form in OWNER_LISTS}
 
@@ -537,11 +632,28 @@ def check(root=ROOT, inventory=None, runner=None):
         keys = set(entry)
         is_feature = (isinstance(entry.get("cell"), str)
                       and entry["cell"] == "feature")
-        want = ("file/path/reason/cell/owner" if is_feature
-                else "file/path/reason/cell")
-        if keys != set(want.split("/")):
-            failures.append(f"FAIL {where}: keys must be exactly {want}")
+        is_skip = (isinstance(entry.get("path"), str)
+                   and entry["path"] in skip_paths)
+        want = ["file", "path", "reason", "cell"]
+        if is_feature:
+            want.append("owner")
+        if is_skip:
+            want.append("until")
+        if keys != set(want):
+            detail = []
+            missing = sorted(set(want) - keys)
+            extra = sorted(keys - set(want))
+            if missing:
+                detail.append("missing: " + ",".join(missing))
+            if extra:
+                detail.append("unexpected: " + ",".join(extra))
+            failures.append(f"FAIL {where}: keys must be exactly "
+                            f"{'/'.join(want)} ({'; '.join(detail)})")
             continue
+        if "until" in entry and current is not None:
+            problem = until_problem(entry["until"], current)
+            if problem is not None:
+                failures.append(f"FAIL {where}: {entry['path']} {problem}")
         key = (entry["file"], entry["path"])
         if key in seen:
             failures.append(f"FAIL {where}: duplicate of {key[0]} {key[1]}")

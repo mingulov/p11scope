@@ -70,6 +70,74 @@ INTEGRATION_EXPECTED = [
     "tests/run_abandon_report.rs:second_sigint_during_teardown_publishes_truthful_report_and_exits_130",
 ]
 
+# The revived opt-in groups, pinned literally so a dropped or renamed
+# member fails here, not silently.
+BTRFS_EXPECTED = [
+    "attach::instance_tests::privileged_instance_routing_on_btrfs_tmpdir",
+    "discovery::sweep_attribution::tests::privileged_a_btrfs_collision_on_a_data_range_keeps_the_exec_proven_edge",
+    "discovery::sweep_attribution::tests::privileged_a_file_swapped_behind_an_identical_line_is_proved_as_the_new_file",
+    "discovery::sweep_attribution::tests::privileged_d4_btrfs_subvolume_collision_backend_parity",
+    "discovery::sweep_attribution::tests::privileged_d4_btrfs_same_line_remap_backend_parity",
+    "discovery::sweep_attribution::tests::privileged_d4_btrfs_deleted_mapping_backend_parity",
+    "discovery::sweep_attribution::tests::privileged_d4_btrfs_hardlink_alias_backend_parity",
+    "discovery::sweep_attribution::tests::privileged_d4_btrfs_bind_alias_backend_parity",
+    "discovery::sweep_attribution::tests::privileged_d4_btrfs_live_thread_private_files_backend_parity",
+    "discovery::sweep_attribution::tests::privileged_d4_btrfs_clone_without_files_backend_parity",
+    "discovery::sweep_attribution::tests::privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity",
+    "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins",
+    "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_cold_admission_backend_parity",
+    "discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors",
+    "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64",
+    "inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64",
+]
+
+XFAIL_EXPECTED = [
+    "discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head",
+    "discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once",
+    "discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent",
+    "discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation",
+]
+
+COUNTER_FIXTURE_EXPECTED = [
+    "metrics::counter_reader::tests::counter_bank_session_old_return_survives_append_lp64",
+    "metrics::counter_reader::tests::counter_bank_session_timing_old_return_survives_append_lp64",
+    "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_lp64",
+    "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_timestamps_growth_lp64",
+    "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_latency_growth_lp64",
+    "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_multi_lp64",
+    "metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_lp64",
+    "metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_multi_lp64",
+    "metrics::counter_reader::tests::counter_bank_session_useful_8192_timestamps_growth_multi_lp64",
+    "metrics::counter_reader::tests::counter_bank_session_useful_8192_latency_growth_multi_lp64",
+    "metrics::counter_reader::tests::counter_engine_stages_first_512_counts_multi_lp64",
+    "metrics::counter_reader::tests::counter_engine_growth_over_ceiling_refuses_atomically_lp64",
+    "metrics::counter_reader::tests::counter_engine_growth_cgroup_counts_multi_lp64",
+    "metrics::counter_reader::tests::counter_engine_growth_system_counts_multi_lp64",
+    "metrics::counter_reader::tests::counter_engine_growth_timestamps_multi_lp64",
+    "metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64",
+    "metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64",
+    "metrics::counter_reader::tests::counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64",
+    "metrics::counter_reader::tests::counter_collection_reads_live_and_terminal_lp64",
+    "metrics::counter_reader::tests::counter_singles_stop_prints_detach_estimate_lp64",
+    "metrics::counter_reader::tests::counter_multi_stop_prints_no_detach_estimate_lp64",
+    "metrics::counter_reader::tests::counter_singles_stop_second_signal_abandons_lp64",
+    "metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledger_lp64",
+    "metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_ledger_lp64",
+    "metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64",
+    "metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64",
+    "metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64",
+]
+
+# The DEFAULT_TESTS counter-reader members that need no runner-built
+# fixture: the two map-reader cells plus the owned-child run cell (which
+# needs CARGO_TARGET_TMPDIR instead). Any other counter-reader default
+# member must join COUNTER_FIXTURE_TESTS.
+COUNTER_READER_NOFIXTURE_EXPECTED = [
+    "metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes",
+    "metrics::counter_reader::tests::counter_reader_requires_exact_maps_and_health",
+    "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64",
+]
+
 INTEGRATION_SOURCES = {
     "tests/foo.rs": (
         '#[test]\n'
@@ -83,10 +151,14 @@ INTEGRATION_ENTRY = {
     "reason": "needs the kernel lane", "cell": "live-kernel",
 }
 
-# The two src/ live-kernel cells no runner executes: each needs a SKIP
-# entry with a reason, pinned literally so a dropped curation fails here.
+# The src/ live-kernel cells and their campaign lists: the nonleader anchor
+# stays a static skip, while the btrfs zombie parity cell runs in the
+# btrfs group. Pinned literally so a dropped curation fails here.
 SRC_LIVE_KERNEL_SKIP_EXPECTED = [
     "attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing",
+]
+
+SRC_LIVE_KERNEL_BTRFS_EXPECTED = [
     "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins",
 ]
 
@@ -106,21 +178,27 @@ RESIDUAL_SKIP_EXPECTED = [
 ]
 
 # The R57 future positive: an unprivileged expected-RED cell that stays in
-# the performance inventory cell but must still be curated (as a static
-# skip) so the runner's exact-cover check matches the binary.
-RESIDUAL_REDBYDESIGN_SKIP_EXPECTED = (
+# the performance inventory cell but is curated as an expected failure so
+# the runner's exact-cover check matches the binary and an unexpected
+# pass gets noticed.
+RESIDUAL_REDBYDESIGN_XFAIL_EXPECTED = (
     "discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation"
 )
 
 
 def write_fixture(root, sources, entries, registered, wide_registered=(),
                   integration_registered=(), counter_proof_registered=(),
-                  counter_artifacts_registered=()):
+                  counter_artifacts_registered=(), skip_registered=(),
+                  manifest_version="0.5.0"):
     """A minimal checkable tree: sources {rel: text}, inventory, runner."""
     for rel, text in sources.items():
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
+    (root / "Cargo.toml").write_text(
+        f'[package]\nname = "fixture"\nversion = "{manifest_version}"\n',
+        encoding="utf-8",
+    )
     inv = root / "tests" / "ignored-tests.json"
     inv.parent.mkdir(parents=True, exist_ok=True)
     inv.write_text(
@@ -143,7 +221,10 @@ def write_fixture(root, sources, entries, registered, wide_registered=(),
             ("DEFAULT_TESTS", registered),
             ("ALTERNATIVE_TESTS", []),
             ("LONG_TESTS", []),
-            ("SKIP_TESTS", []),
+            ("BTRFS_TESTS", []),
+            ("EXPECTED_FAILURE_TESTS", []),
+            ("SKIP_TESTS", skip_registered),
+            ("COUNTER_FIXTURE_TESTS", []),
             ("WIDE_DETAILED_2112_TESTS", wide_registered),
             ("INTEGRATION_TESTS", integration_registered),
             ("COUNTER_BANK_PROOF_TESTS", counter_proof_registered),
@@ -292,7 +373,9 @@ class IgnoredTestsTests(unittest.TestCase):
                              if entry["path"] in proof), 13)
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
         self.assertTrue(proof <= lists["SKIP_TESTS"])
-        for group in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS"):
+        for group in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS",
+                      "BTRFS_TESTS",
+                      "EXPECTED_FAILURE_TESTS"):
             self.assertFalse(proof & lists[group])
         reasons = dict(zip(runner_array_lines(RUNNER, "SKIP_TESTS"),
                            runner_array_lines(RUNNER, "SKIP_REASONS")))
@@ -314,7 +397,9 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(len(proof), 14)
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
         full = set().union(*(lists[group] for group in
-                            ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS", "SKIP_TESTS"))) | proof
+                            ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
+                             "LONG_TESTS", "BTRFS_TESTS",
+                             "EXPECTED_FAILURE_TESTS", "SKIP_TESTS"))) | proof
         with tempfile.TemporaryDirectory() as raw:
             binary = Path(raw) / "libtest-proof"
             # A run-shaped invocation fails; only the literal list request
@@ -351,7 +436,9 @@ class IgnoredTestsTests(unittest.TestCase):
                  if entry["path"].startswith(prefix)}
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
         full = set().union(*(lists[group] for group in
-                            ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS", "SKIP_TESTS")))
+                            ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
+                             "LONG_TESTS", "BTRFS_TESTS",
+                             "EXPECTED_FAILURE_TESTS", "SKIP_TESTS")))
         ordinary = full - proof
         with tempfile.TemporaryDirectory() as raw:
             binary = Path(raw) / "libtest-ordinary"
@@ -435,7 +522,9 @@ class IgnoredTestsTests(unittest.TestCase):
         parent = "count_manifest_full_and_tail_share_the_scan_inspection_cache"
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
         self.assertIn(name, lists["SKIP_TESTS"])
-        for group in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS"):
+        for group in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS",
+                      "BTRFS_TESTS",
+                      "EXPECTED_FAILURE_TESTS"):
             self.assertNotIn(name, lists[group])
         names = runner_array_lines(RUNNER, "SKIP_TESTS")
         reason = runner_array_lines(RUNNER, "SKIP_REASONS")[names.index(name)]
@@ -751,6 +840,10 @@ class IgnoredTestsTests(unittest.TestCase):
         for name in SRC_LIVE_KERNEL_SKIP_EXPECTED:
             with self.subTest(name=name):
                 self.assertIn(name, lists["SKIP_TESTS"])
+        for name in SRC_LIVE_KERNEL_BTRFS_EXPECTED:
+            with self.subTest(name=name):
+                self.assertIn(name, lists["BTRFS_TESTS"])
+                self.assertNotIn(name, lists["SKIP_TESTS"])
 
     def test_residual_privileged_cells_are_curated_in_their_campaign_lists(self):
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
@@ -769,12 +862,17 @@ class IgnoredTestsTests(unittest.TestCase):
                 reason = reasons[names.index(name)]
                 self.assertIn("lane-B", reason)
                 self.assertIn("by hand", reason)
-        with self.subTest(name=RESIDUAL_REDBYDESIGN_SKIP_EXPECTED):
-            self.assertIn(RESIDUAL_REDBYDESIGN_SKIP_EXPECTED,
-                          lists["SKIP_TESTS"])
-            self.assertFalse({RESIDUAL_REDBYDESIGN_SKIP_EXPECTED} & runnable)
-            reason = reasons[names.index(RESIDUAL_REDBYDESIGN_SKIP_EXPECTED)]
-            self.assertIn("RED by design", reason)
+        xfail_names = runner_array_lines(RUNNER, "EXPECTED_FAILURE_TESTS")
+        xfail_reasons = runner_array_lines(RUNNER, "XFAIL_REASONS")
+        with self.subTest(name=RESIDUAL_REDBYDESIGN_XFAIL_EXPECTED):
+            self.assertIn(RESIDUAL_REDBYDESIGN_XFAIL_EXPECTED,
+                          lists["EXPECTED_FAILURE_TESTS"])
+            self.assertFalse({RESIDUAL_REDBYDESIGN_XFAIL_EXPECTED} & runnable)
+            self.assertNotIn(RESIDUAL_REDBYDESIGN_XFAIL_EXPECTED,
+                             lists["SKIP_TESTS"])
+            reason = xfail_reasons[
+                xfail_names.index(RESIDUAL_REDBYDESIGN_XFAIL_EXPECTED)]
+            self.assertIn("expected failure", reason)
             self.assertIn("R57", reason)
 
     def test_residual_inventory_cells_match_what_each_test_needs(self):
@@ -783,7 +881,7 @@ class IgnoredTestsTests(unittest.TestCase):
         for name in RESIDUAL_DEFAULT_EXPECTED + RESIDUAL_SKIP_EXPECTED:
             with self.subTest(name=name):
                 self.assertEqual(entries[name]["cell"], "privileged")
-        self.assertEqual(entries[RESIDUAL_REDBYDESIGN_SKIP_EXPECTED]["cell"],
+        self.assertEqual(entries[RESIDUAL_REDBYDESIGN_XFAIL_EXPECTED]["cell"],
                          "performance")
 
     def test_skip_reasons_align_with_skip_tests(self):
@@ -793,28 +891,32 @@ class IgnoredTestsTests(unittest.TestCase):
             len(tests), len(reasons),
             f"SKIP_TESTS={len(tests)} SKIP_REASONS={len(reasons)}",
         )
-        for name, needs_fixture in [
-            ("metrics::counter_reader::tests::"
-             "counter_cli_profile_counts_matches_workload_ledger_lp64", True),
-            ("metrics::counter_reader::tests::"
-             "counter_cli_profile_timestamps_matches_workload_ledger_lp64", True),
-            ("metrics::counter_reader::tests::"
-             "counter_cli_profile_latency_matches_workload_ledger_lp64", True),
-            ("metrics::counter_reader::tests::"
-             "counter_cli_run_counts_with_owned_child_lp64", False),
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        for name in [
+            "metrics::counter_reader::tests::"
+            "counter_cli_profile_counts_matches_workload_ledger_lp64",
+            "metrics::counter_reader::tests::"
+            "counter_cli_profile_timestamps_matches_workload_ledger_lp64",
+            "metrics::counter_reader::tests::"
+            "counter_cli_profile_latency_matches_workload_ledger_lp64",
+            "metrics::counter_reader::tests::"
+            "counter_cli_run_counts_with_owned_child_lp64",
         ]:
             with self.subTest(name=name):
-                self.assertIn(name, tests)
-                reason = reasons[tests.index(name)]
-                self.assertIn("needs root", reason)
-                self.assertIn("by hand", reason)
-                if needs_fixture:
-                    self.assertIn(
-                        "P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER", reason)
-                    self.assertIn(
-                        "P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD", reason)
-                else:
-                    self.assertIn("no fixture", reason)
+                self.assertIn(name, lists["DEFAULT_TESTS"])
+                self.assertNotIn(name, tests)
+
+    def test_xfail_reasons_align_with_expected_failure_tests(self):
+        tests = runner_array_lines(RUNNER, "EXPECTED_FAILURE_TESTS")
+        reasons = runner_array_lines(RUNNER, "XFAIL_REASONS")
+        self.assertEqual(
+            len(tests), len(reasons),
+            f"EXPECTED_FAILURE_TESTS={len(tests)} "
+            f"XFAIL_REASONS={len(reasons)}",
+        )
+        for name, reason in zip(tests, reasons):
+            with self.subTest(name=name):
+                self.assertIn("expected failure", reason.lower())
 
     def test_runner_list_refuses_skip_misalignment(self):
         text = RUNNER.read_text(encoding="utf-8")
@@ -823,7 +925,7 @@ class IgnoredTestsTests(unittest.TestCase):
         lines = match.group(1).splitlines()
         dropped = "\n".join(
             line for line in lines
-            if not line.strip().startswith('"needs punch-hole support'))
+            if not line.strip().startswith('"needs a P11SCOPE_SMALL_STATE_MAPS=1'))
         self.assertLess(len(dropped.splitlines()), len(lines),
                         "fixture must drop one reason")
         broken = text[:match.start(1)] + dropped + text[match.end(1):]
@@ -840,6 +942,32 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertNotEqual(
             result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("differ in length", result.stderr)
+        self.assertIn("SKIP_TESTS", result.stderr)
+
+    def test_runner_list_refuses_xfail_misalignment(self):
+        text = RUNNER.read_text(encoding="utf-8")
+        match = re.search(r"^XFAIL_REASONS=\(\n(.*?)\n\)", text, re.M | re.S)
+        self.assertIsNotNone(match, "real runner has no XFAIL_REASONS list")
+        lines = match.group(1).splitlines()
+        dropped = "\n".join(
+            line for line in lines if "R57 future positive" not in line)
+        self.assertLess(len(dropped.splitlines()), len(lines),
+                        "fixture must drop one reason")
+        broken = text[:match.start(1)] + dropped + text[match.end(1):]
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = Path(tmp) / "run-privileged-lib-tests.sh"
+            runner.write_text(broken, encoding="utf-8")
+            runner.chmod(0o755)
+            binary = Path(tmp) / "libtest-empty"
+            write_fake_binary(binary, [])
+            result = subprocess.run(
+                [str(runner), "--list", str(binary)],
+                capture_output=True, text=True, cwd=ROOT,
+            )
+        self.assertNotEqual(
+            result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("differ in length", result.stderr)
+        self.assertIn("EXPECTED_FAILURE_TESTS", result.stderr)
 
     def test_binary_has_ignored_reports_present_on_large_early_match_lists(self):
         # The membership probe once ran `... | grep -qxF` under pipefail,
@@ -870,6 +998,293 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
 
+    def test_cell_branch_suffix_records_the_taken_arm(self):
+        # Branch recording: the runner appends ` branch=<name>` for the
+        # arm a dual-outcome cell printed, the last branch line wins, a
+        # cell without one gets no suffix, and a malformed value is
+        # INVALID rather than silently dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = {
+                "none.log": "test result: ok. 1 passed\n",
+                "one.log": ("IDENTITY_515_DENIAL outcome=eligible\n"
+                            "P11SCOPE_CELL_BRANCH=eligible\n"
+                            "test result: ok. 1 passed\n"),
+                "two.log": ("P11SCOPE_CELL_BRANCH=first\n"
+                            "P11SCOPE_CELL_BRANCH=second\n"),
+                "bad.log": "P11SCOPE_CELL_BRANCH=has space\n",
+                "empty.log": "P11SCOPE_CELL_BRANCH=\n",
+            }
+            paths = {}
+            for name, body in logs.items():
+                path = Path(tmp) / name
+                path.write_text(body, encoding="utf-8")
+                paths[name] = path
+            probes = "; ".join(
+                f'printf \'<@@%s@@>\\n\' "$(cell_branch_suffix "{path}")"'
+                for path in paths.values()
+            )
+            script = (f'source "{RUNNER}" --help >/dev/null 2>&1; {probes}')
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True, text=True, cwd=ROOT,
+            )
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["<@@@@>", "<@@ branch=eligible@@>", "<@@ branch=second@@>",
+             "<@@ branch=INVALID@@>", "<@@ branch=INVALID@@>"],
+        )
+
+    def test_run_loop_appends_the_branch_suffix_after_the_result_text(self):
+        # The ` branch=` token goes after the test-result text so the
+        # downstream `PASS <path> rc=0 seconds=<n> :: test result: ...`
+        # shape keeps matching; pin the wiring, not just the helper.
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertIn('branch_suffix=$(cell_branch_suffix "$log")', text)
+        self.assertIn(
+            '"$verdict $name rc=$rc seconds=$seconds :: '
+            '$result_line$branch_suffix"',
+            text,
+        )
+
+    def test_revived_group_membership_is_exact(self):
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        self.assertEqual(set(lists["BTRFS_TESTS"]), set(BTRFS_EXPECTED))
+        self.assertEqual(set(lists["EXPECTED_FAILURE_TESTS"]),
+                         set(XFAIL_EXPECTED))
+        self.assertEqual(set(lists["COUNTER_FIXTURE_TESTS"]),
+                         set(COUNTER_FIXTURE_EXPECTED))
+        for group in ("BTRFS_TESTS",
+                      "EXPECTED_FAILURE_TESTS"):
+            with self.subTest(group=group):
+                self.assertFalse(set(lists[group]) & lists["SKIP_TESTS"])
+                self.assertFalse(set(lists[group]) & lists["DEFAULT_TESTS"])
+        self.assertTrue(set(COUNTER_FIXTURE_EXPECTED)
+                        <= lists["DEFAULT_TESTS"])
+
+    def test_counter_fixture_classification_is_complete(self):
+        # Every DEFAULT_TESTS counter-reader member is classified: it
+        # either needs the runner-built fixtures or is one of the three
+        # named cells that do not. A new counter cell fails here until
+        # its author classifies it.
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        default_counter = {name for name in lists["DEFAULT_TESTS"]
+                           if name.startswith("metrics::counter_reader::tests::")}
+        self.assertEqual(default_counter,
+                         set(COUNTER_FIXTURE_EXPECTED)
+                         | set(COUNTER_READER_NOFIXTURE_EXPECTED))
+        self.assertFalse(set(COUNTER_FIXTURE_EXPECTED)
+                         & set(COUNTER_READER_NOFIXTURE_EXPECTED))
+
+    def test_branch_prints_exist_in_dual_outcome_cells(self):
+        inspect = (ROOT / "src/inspect_system.rs").read_text()
+        self.assertEqual(inspect.count("P11SCOPE_CELL_BRANCH=denied"), 1)
+        self.assertEqual(inspect.count("P11SCOPE_CELL_BRANCH=eligible"), 1)
+        capture = (ROOT / "src/attach/inventory/capture"
+                   / "privileged_tests.rs").read_text()
+        self.assertEqual(
+            capture.count("P11SCOPE_CELL_BRANCH=pid_filter_refused"), 1)
+
+    def test_usage_names_the_group_flags(self):
+        result = run_runner("--help")
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        for flag in ("--include-long", "--include-btrfs",
+                     "--include-expected-failures",
+                     "--wide-detailed-2112"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, result.stdout)
+
+    def test_list_mode_prints_the_revived_groups(self):
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        full = set().union(*(lists[group] for group in
+                             ("DEFAULT_TESTS", "ALTERNATIVE_TESTS",
+                              "LONG_TESTS", "BTRFS_TESTS",
+                              "EXPECTED_FAILURE_TESTS", "SKIP_TESTS")))
+        prefix = "attach::image_bank_proof::tests::privileged_image_bank_"
+        proof = {name for name in full if name.startswith(prefix)}
+        self.assertEqual(len(proof), 14)
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "libtest-groups"
+            write_fake_binary(binary, sorted(full - proof))
+            result = run_runner("--list", str(binary))
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        # The fake lists both load-gate alternatives (a real binary has
+        # exactly one), so the default section shows 182 + 2.
+        self.assertIn("default (184)", result.stdout)
+        self.assertIn("btrfs (16, --include-btrfs only)", result.stdout)
+        self.assertIn("expected-failures (4, --include-expected-failures "
+                      "only)", result.stdout)
+        self.assertIn(BTRFS_EXPECTED[0], result.stdout)
+        self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
+        self.assertIn("verify: curation matches the binary (243 tests)",
+                      result.stdout)
+
+    def test_real_tree_skip_entries_carry_until(self):
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        skip = lists["SKIP_TESTS"]
+        entries = json.loads(INVENTORY.read_text())["sites"]
+        for entry in entries:
+            with self.subTest(path=entry["path"]):
+                if entry["path"] in skip:
+                    self.assertIn("until", entry)
+                else:
+                    self.assertNotIn("until", entry)
+
+    def test_skip_entry_without_until_fails(self):
+        sources = {
+            "src/lib.rs": "mod a;\n",
+            "src/a.rs": (
+                "#[test]\n"
+                '#[ignore = "privileged: needs the lane"]\n'
+                "fn t_skip() {}\n"
+            ),
+        }
+        entries = [
+            {"file": "src/a.rs", "path": "a::t_skip",
+             "reason": "privileged: needs the lane", "cell": "privileged"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, sources, entries, [],
+                          skip_registered=["a::t_skip"])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("a::t_skip", result.stdout)
+        self.assertIn("until", result.stdout)
+
+    def test_skip_entry_with_expired_until_fails(self):
+        # Cargo.toml still says 0.5.0 while 0.6.0 is under development,
+        # so "0.6.0" (the stale "deferred to 0.6.0") is already expired.
+        for until in ("0.5.0", "0.6.0", "0.6"):
+            with self.subTest(until=until):
+                sources = {
+                    "src/lib.rs": "mod a;\n",
+                    "src/a.rs": (
+                        "#[test]\n"
+                        '#[ignore = "privileged: needs the lane"]\n'
+                        "fn t_skip() {}\n"
+                    ),
+                }
+                entries = [
+                    {"file": "src/a.rs", "path": "a::t_skip",
+                     "reason": "privileged: needs the lane",
+                     "cell": "privileged", "until": until},
+                ]
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    write_fixture(root, sources, entries, [],
+                                  skip_registered=["a::t_skip"])
+                    result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("expired", result.stdout)
+
+    def test_skip_entry_with_standing_until_passes(self):
+        for until in ("0.7.0",
+                      {"item": "kernel lanes", "owner": "WP-9"}):
+            with self.subTest(until=until):
+                sources = {
+                    "src/lib.rs": "mod a;\n",
+                    "src/a.rs": (
+                        "#[test]\n"
+                        '#[ignore = "privileged: needs the lane"]\n'
+                        "fn t_skip() {}\n"
+                    ),
+                }
+                entries = [
+                    {"file": "src/a.rs", "path": "a::t_skip",
+                     "reason": "privileged: needs the lane",
+                     "cell": "privileged", "until": until},
+                ]
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    write_fixture(root, sources, entries, [],
+                                  skip_registered=["a::t_skip"])
+                    result = run_checker(root)
+                self.assertEqual(result.returncode, 0,
+                                 result.stdout + result.stderr)
+                self.assertIn("all 1 inventoried site(s) match",
+                              result.stdout)
+
+    def test_malformed_until_fails(self):
+        for until in ("0.6.x", "soon", 7,
+                      {"item": "kernel lanes"},
+                      {"item": "kernel lanes", "owner": ""},
+                      {"item": "", "owner": "WP-9"},
+                      {"item": "kernel lanes", "owner": "WP-9",
+                       "extra": 1}):
+            with self.subTest(until=until):
+                sources = {
+                    "src/lib.rs": "mod a;\n",
+                    "src/a.rs": (
+                        "#[test]\n"
+                        '#[ignore = "privileged: needs the lane"]\n'
+                        "fn t_skip() {}\n"
+                    ),
+                }
+                entries = [
+                    {"file": "src/a.rs", "path": "a::t_skip",
+                     "reason": "privileged: needs the lane",
+                     "cell": "privileged", "until": until},
+                ]
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    write_fixture(root, sources, entries, [],
+                                  skip_registered=["a::t_skip"])
+                    result = run_checker(root)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("until", result.stdout)
+
+    def test_until_on_a_nonskip_entry_fails(self):
+        sources = {
+            "src/lib.rs": "mod a;\n",
+            "src/a.rs": (
+                "#[test]\n"
+                '#[ignore = "privileged: needs the lane"]\n'
+                "fn t_run() {}\n"
+            ),
+        }
+        entries = [
+            {"file": "src/a.rs", "path": "a::t_run",
+             "reason": "privileged: needs the lane",
+             "cell": "privileged", "until": "0.7.0"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, sources, entries, ["a::t_run"])
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("a::t_run", result.stdout)
+        self.assertIn("until", result.stdout)
+
+    def test_manifest_version_rules_past_development(self):
+        # After the 0.9.0 release is cut (Cargo.toml at 0.9.0) an
+        # "0.8.0" deferral is expired even though the development
+        # constant still says 0.6.0.
+        sources = {
+            "src/lib.rs": "mod a;\n",
+            "src/a.rs": (
+                "#[test]\n"
+                '#[ignore = "privileged: needs the lane"]\n'
+                "fn t_skip() {}\n"
+            ),
+        }
+        entries = [
+            {"file": "src/a.rs", "path": "a::t_skip",
+             "reason": "privileged: needs the lane",
+             "cell": "privileged", "until": "0.8.0"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, sources, entries, [],
+                          skip_registered=["a::t_skip"],
+                          manifest_version="0.9.0")
+            result = run_checker(root)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("expired", result.stdout)
+
     def test_checker_prints_exact_per_list_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -878,7 +1293,9 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(
             "ignored-tests counts: DEFAULT_TESTS=2 ALTERNATIVE_TESTS=0 "
-            "LONG_TESTS=0 SKIP_TESTS=0 WIDE_DETAILED_2112_TESTS=1 "
+            "LONG_TESTS=0 BTRFS_TESTS=0 "
+            "EXPECTED_FAILURE_TESTS=0 SKIP_TESTS=0 "
+            "COUNTER_FIXTURE_TESTS=0 WIDE_DETAILED_2112_TESTS=1 "
             "COUNTER_BANK_PROOF_TESTS=0 COUNTER_ARTIFACTS_TESTS=0 "
             "INTEGRATION_TESTS=0",
             result.stdout,
@@ -888,10 +1305,13 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=152",
+            "DEFAULT_TESTS=182",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
-            "SKIP_TESTS=87",
+            "BTRFS_TESTS=16",
+            "EXPECTED_FAILURE_TESTS=4",
+            "SKIP_TESTS=37",
+            "COUNTER_FIXTURE_TESTS=27",
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",

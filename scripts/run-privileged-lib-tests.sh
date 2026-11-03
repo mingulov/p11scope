@@ -3,9 +3,12 @@
 # Reproducible runner for the privileged (ignored) p11scope lib tests.
 #
 # Usage:
-#   scripts/run-privileged-lib-tests.sh LIB_TEST_BINARY OUTDIR [--include-long] [SELECTOR...]
+#   scripts/run-privileged-lib-tests.sh LIB_TEST_BINARY OUTDIR [GROUP-FLAG...] [SELECTOR...]
 #   scripts/run-privileged-lib-tests.sh --list LIB_TEST_BINARY
 #   scripts/run-privileged-lib-tests.sh --list-integration TEST_BINARY_DIR
+#
+# Group flags (each runs its group plus the default campaign, narrowed by
+# any SELECTORs): --include-long, --include-btrfs, --include-expected-failures.
 #
 # Run mode executes each selected ignored test once, one at a time, from the
 # repo root, as:
@@ -39,12 +42,15 @@
 #     and P11SCOPE_T3A_RATE (SoftHSM continuity experiment, defaults 60 s and
 #     0 unrelated mapping ops/s): optional Task 3 Stage A sizing knobs with
 #     defaults; the runner leaves them unset.
-#   P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER / _WORKLOAD: prebuilt LP64
-#     fixtures for the default-build Counts-bank Session test. The runner
-#     does not build or supply these inputs, so that cell is a documented skip.
-#   P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER / _WORKLOAD: distinct8192
-#     endpoint LP64 provider/driver for separately admitted boundary/population
-#     cells; the default campaign neither builds nor supplies these inputs.
+#   P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER / _WORKLOAD and
+#     P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER / _WORKLOAD: the runner
+#     builds tests/fixtures/counter-banks.c and counter-bank-growth.c
+#     with cc (scripts/ci/build-counter-fixtures.sh) and points these at
+#     the provider/driver pairs for the counter-bank default cells.
+#     Without cc those cells SKIP with a reason instead of failing.
+#   CARGO_TARGET_TMPDIR: the runner points this at an
+#     owned-child-writable dir under OUTDIR for the owned-child counter
+#     run cell only; every other cell inherits the ambient value.
 #   RLIMIT_NOFILE: the Task 4 gates sample soft/hard nofile per phase, the
 #     T7 boundary cell pref lights live FD occupancy against it, and
 #     Session::start may raise soft to hard at attach; wide cells attach
@@ -54,6 +60,12 @@
 #   "test result: ok. 1 passed"
 # (exactly one test ran) and the harness exited 0. An exit code alone is not
 # accepted, and "0 passed" (renamed/missing test) is a FAIL.
+#
+# Dual-outcome cells print one `P11SCOPE_CELL_BRANCH=<name>` line for the
+# arm they took; the runner appends ` branch=<name>` to that cell's
+# results.txt line (after the test-result text). Judges match the branch
+# against a per-host expectation table. The last branch line wins; a
+# malformed value is recorded as `branch=INVALID`.
 #
 # Gate-run step (not a curated cell): doctor::tests::
 # no_bpf_program_link_or_map_survives_a_doctor_probe is a non-ignored test,
@@ -77,9 +89,21 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Curation: default tests run normally, long tests only with --include-long,
-# and static skips require their documented external prerequisites, with a
-# reason. The feature-alternative load gates contribute exactly one member
+# Btrfs group (--include-btrfs): the 16 cells that assert TMPDIR is on
+# btrfs. The runner loop-mounts one btrfs image for the group
+# (scripts/ci/prepare-btrfs-tmpdir.sh), runs those cells with TMPDIR
+# pointed at the mount, and unmounts it afterwards. Without mkfs.btrfs
+# (or loop/btrfs support) the cells SKIP with a reason.
+#
+# Expected-failure group (--include-expected-failures): known-failing
+# reproducers. A failing cell records XFAIL (counts as passed); a passing
+# cell records XPASS and fails the run, so a silent fix gets noticed and
+# the cell can be promoted to the runnable campaign.
+#
+# Curation: default tests run normally, the btrfs/long/
+# expected-failure groups only with their --include-* flag, and static
+# skips require their documented external prerequisites, with a reason.
+# The feature-alternative load gates contribute exactly one member
 # per binary (default vs stub-object-attributes builds). Both modes verify
 # the curation against the binary's own `--list --ignored` output and refuse
 # on drift, so a new ignored test can never be silently dropped and a
@@ -395,6 +419,82 @@ inventory::manifest_e2e_tests::privileged_inventory_system_manifest_scale4097_so
 # attach, external workload or opt-in object build required.
 metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes
 metrics::counter_reader::tests::counter_reader_requires_exact_maps_and_health
+# Revived fixture-free skips: the punch-hole renewal cell (needs a
+# punch-hole-capable runner TMPDIR), the bank-mode object load cell
+# (embedded counter objects, no fixture), and the owned-child
+# counter run cell (the runner provides CARGO_TARGET_TMPDIR).
+attach::instance_tests::privileged_instance_cross_process_punch_hole_renews
+attach::counter_banks::tests::counter_bank_mode_objects_load_lp64
+metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64
+# Revived counter-bank cells: the runner builds
+# tests/fixtures/counter-banks.c and counter-bank-growth.c with cc
+# and points P11SCOPE_COUNTER_BANK/GROWTH_FIXTURE_PROVIDER/WORKLOAD
+# at them. Session append legs, 511/512 boundary and 8192
+# population cells (Singles and Multi), engine-driven growth, the
+# nofile twins, live/terminal collection, stop estimates,
+# CLI-shaped captures and selected-detail controls.
+metrics::counter_reader::tests::counter_bank_session_old_return_survives_append_lp64
+metrics::counter_reader::tests::counter_bank_session_timing_old_return_survives_append_lp64
+metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_lp64
+metrics::counter_reader::tests::counter_bank_session_boundary_511_512_timestamps_growth_lp64
+metrics::counter_reader::tests::counter_bank_session_boundary_511_512_latency_growth_lp64
+metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_multi_lp64
+metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_lp64
+metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_multi_lp64
+metrics::counter_reader::tests::counter_bank_session_useful_8192_timestamps_growth_multi_lp64
+metrics::counter_reader::tests::counter_bank_session_useful_8192_latency_growth_multi_lp64
+metrics::counter_reader::tests::counter_engine_stages_first_512_counts_multi_lp64
+metrics::counter_reader::tests::counter_engine_growth_over_ceiling_refuses_atomically_lp64
+metrics::counter_reader::tests::counter_engine_growth_cgroup_counts_multi_lp64
+metrics::counter_reader::tests::counter_engine_growth_system_counts_multi_lp64
+metrics::counter_reader::tests::counter_engine_growth_timestamps_multi_lp64
+metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64
+metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64
+metrics::counter_reader::tests::counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64
+metrics::counter_reader::tests::counter_collection_reads_live_and_terminal_lp64
+metrics::counter_reader::tests::counter_singles_stop_prints_detach_estimate_lp64
+metrics::counter_reader::tests::counter_multi_stop_prints_no_detach_estimate_lp64
+metrics::counter_reader::tests::counter_singles_stop_second_signal_abandons_lp64
+metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledger_lp64
+metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_ledger_lp64
+metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64
+metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64
+metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64
+)
+
+# Counter-fixture membership: the DEFAULT_TESTS members that need the
+# runner-built P11SCOPE_COUNTER_*_FIXTURE_* inputs (not a campaign list:
+# every member also runs as a default cell). The runner builds the
+# fixtures when any member is selected, points the variables at them for
+# exactly these cells, and SKIPs them (with a reason) when cc is missing.
+COUNTER_FIXTURE_TESTS=(
+metrics::counter_reader::tests::counter_bank_session_old_return_survives_append_lp64
+metrics::counter_reader::tests::counter_bank_session_timing_old_return_survives_append_lp64
+metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_lp64
+metrics::counter_reader::tests::counter_bank_session_boundary_511_512_timestamps_growth_lp64
+metrics::counter_reader::tests::counter_bank_session_boundary_511_512_latency_growth_lp64
+metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_multi_lp64
+metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_lp64
+metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_multi_lp64
+metrics::counter_reader::tests::counter_bank_session_useful_8192_timestamps_growth_multi_lp64
+metrics::counter_reader::tests::counter_bank_session_useful_8192_latency_growth_multi_lp64
+metrics::counter_reader::tests::counter_engine_stages_first_512_counts_multi_lp64
+metrics::counter_reader::tests::counter_engine_growth_over_ceiling_refuses_atomically_lp64
+metrics::counter_reader::tests::counter_engine_growth_cgroup_counts_multi_lp64
+metrics::counter_reader::tests::counter_engine_growth_system_counts_multi_lp64
+metrics::counter_reader::tests::counter_engine_growth_timestamps_multi_lp64
+metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64
+metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64
+metrics::counter_reader::tests::counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64
+metrics::counter_reader::tests::counter_collection_reads_live_and_terminal_lp64
+metrics::counter_reader::tests::counter_singles_stop_prints_detach_estimate_lp64
+metrics::counter_reader::tests::counter_multi_stop_prints_no_detach_estimate_lp64
+metrics::counter_reader::tests::counter_singles_stop_second_signal_abandons_lp64
+metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledger_lp64
+metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_ledger_lp64
+metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64
+metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64
+metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64
 )
 
 # Feature-alternative load gates: exactly one exists per binary. Default
@@ -460,8 +560,6 @@ attach::image_bank_proof::tests::privileged_image_bank_exec_query_span_cut
 attach::image_bank_proof::tests::privileged_image_bank_attach_cookie_through_dispatcher
 attach::image_bank_proof::tests::privileged_image_bank_inflight_cut_counts_once
 attach::image_bank_proof::tests::privileged_image_bank_per_call_overhead
-attach::instance_tests::privileged_instance_cross_process_punch_hole_renews
-attach::instance_tests::privileged_instance_routing_on_btrfs_tmpdir
 attach::instance_tests::privileged_instance_small_state_lru_eviction_never_joins
 attach::inventory::activation::privileged_tests::privileged_inventory_retirement_controlled_churn
 discovery::engine::tests::lifecycle_manifest_helper_entrypoint
@@ -469,44 +567,15 @@ discovery::identity::tests::count_manifest_actual_full_copy_and_tail_fit_the_cac
 discovery::identity::tests::map_files_name_timing_per_thousand
 discovery::scan::tests::maps_reuse_timing_per_thousand_reads
 discovery::scan::tests::privileged_cross_device_same_inode_alias_is_refused_on_scan_path
-discovery::sweep_attribution::tests::privileged_a_btrfs_collision_on_a_data_range_keeps_the_exec_proven_edge
-discovery::sweep_attribution::tests::privileged_a_file_swapped_behind_an_identical_line_is_proved_as_the_new_file
-discovery::sweep_attribution::tests::privileged_d4_btrfs_subvolume_collision_backend_parity
-discovery::sweep_attribution::tests::privileged_d4_btrfs_same_line_remap_backend_parity
 first_use_probe::native::system_capture_observer_facts
 process::tests::pidfd_denial::pidfd_denial_helper
 run::root_fence_runtime::actual_original_exit_delayed_first_admission_retires_pending
-inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
-inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
-metrics::counter_reader::tests::counter_bank_session_old_return_survives_append_lp64
 s1_tests::resource_probe::native_semantic_resource_final_probe
 s1_tests::resource_probe::native_semantic_resource_registry_probe
 semantics_edge::resource_tests::native_semantic_resource_probe
-# T8 live256 episodes: documented known-failing repros (see reasons); they
-# re-enter the runnable campaign once the lane-A runtime fix lands.
-discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
-discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
-discovery::sweep_attribution::tests::privileged_d4_btrfs_deleted_mapping_backend_parity
-metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_lp64
-metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_lp64
-discovery::sweep_attribution::tests::privileged_d4_btrfs_hardlink_alias_backend_parity
-discovery::sweep_attribution::tests::privileged_d4_btrfs_bind_alias_backend_parity
-metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_multi_lp64
-discovery::sweep_attribution::tests::privileged_d4_btrfs_live_thread_private_files_backend_parity
 discovery::sweep_attribution::tests::d4_thread_mapping_helper
-metrics::counter_reader::tests::counter_bank_session_useful_8192_counts_growth_multi_lp64
-metrics::counter_reader::tests::counter_engine_stages_first_512_counts_multi_lp64
-metrics::counter_reader::tests::counter_engine_growth_over_ceiling_refuses_atomically_lp64
-metrics::counter_reader::tests::counter_start_raises_nofile_from_soft_1024_lp64
-metrics::counter_reader::tests::counter_start_without_raise_refuses_fd_exhausted_from_soft_1024_lp64
-metrics::counter_reader::tests::counter_collection_reads_live_and_terminal_lp64
-discovery::sweep_attribution::tests::privileged_d4_btrfs_clone_without_files_backend_parity
 discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper
-discovery::sweep_attribution::tests::privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity
 discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper
-# D4 copy-up RED reproducer: fails by design (the post-copy-up D-C7-3
-# re-edge stands), investigation target, never qualifies.
-discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
 # K1 deep-scan overlay twins (lanes B only): the stale-lower row must
 # refuse and the fresh-upper row must join, per xino mode. Each fails
 # loud off lane B, so both stay hand-run skips with reasons.
@@ -515,53 +584,13 @@ discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_s
 # TID-scoped nonleader anchor run (installs nothing live; strict BPF
 # load): needs root with a live nonleader thread, run by hand.
 attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing
-# Zombie survivor collision parity: needs root Btrfs disk TMPDIR and
-# eligible BTF/task_vma identity, run by hand.
-discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins
-# Cold zombie admission parity: needs root Btrfs disk TMPDIR and
-# eligible BTF/task_vma identity, run by hand.
-discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_cold_admission_backend_parity
-# Kernel-positive population excludes watched anchors: needs root Btrfs
-# disk TMPDIR and eligible BTF/task_vma identity, run by hand.
-discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors
-attach::counter_banks::tests::counter_bank_mode_objects_load_lp64
-metrics::counter_reader::tests::counter_bank_session_timing_old_return_survives_append_lp64
-metrics::counter_reader::tests::counter_bank_session_boundary_511_512_timestamps_growth_lp64
-metrics::counter_reader::tests::counter_bank_session_boundary_511_512_latency_growth_lp64
-metrics::counter_reader::tests::counter_bank_session_useful_8192_timestamps_growth_multi_lp64
-metrics::counter_reader::tests::counter_bank_session_useful_8192_latency_growth_multi_lp64
 attach::tests::bpf_loop_probe_reports_helper_presence_on_live_kernel
 # Historical/private opt-in counter refusals; never current host positives.
 attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels
 metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses_clean_lp64
-# Engine-driven counter growth and stop cells (cgroup/system scopes, timing
-# modes, Singles/Multi stop estimates): root with prebuilt growth fixtures.
-metrics::counter_reader::tests::counter_engine_growth_cgroup_counts_multi_lp64
-metrics::counter_reader::tests::counter_engine_growth_system_counts_multi_lp64
-metrics::counter_reader::tests::counter_singles_stop_prints_detach_estimate_lp64
-metrics::counter_reader::tests::counter_multi_stop_prints_no_detach_estimate_lp64
-metrics::counter_reader::tests::counter_singles_stop_second_signal_abandons_lp64
-metrics::counter_reader::tests::counter_engine_growth_timestamps_multi_lp64
-metrics::counter_reader::tests::counter_engine_growth_latency_multi_lp64
-# CLI-shaped counter captures (parsed argv, real policy, real profile loop
-# to -o JSON, numbers equal to the workload ledger): root with prebuilt
-# growth fixtures.
-metrics::counter_reader::tests::counter_cli_profile_counts_matches_workload_ledger_lp64
-metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_ledger_lp64
-metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64
-# 6.15 selected-detail root controls (live-plan resolution positive plus
-# system-scope neighbor): root with prebuilt growth fixtures, run by hand.
-metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64
-metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64
-metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64
 # Unprivileged system-population graph sizing: memory, drain and release
 # are hard gates, the stop time is measured and disclosed (R-40).
 discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale
-# R57 future positive (expected RED, unprivileged): a balanced benign
-# exit-time transaction needs no terminal truncation once a provider-free
-# settlement receipt lands. No BPF or root; stays a hand-run skip until
-# then, so the exact-cover check matches the binary.
-discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation
 )
 SKIP_REASONS=(
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
@@ -578,8 +607,6 @@ SKIP_REASONS=(
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; prior E3 acceptance, a quiet exclusive host and matched production cost inputs P11_BANK_N5_PRODUCTION_NS_1/P11_BANK_N5_PRODUCTION_NS_4 required; run this --exact selector --ignored as root in an authorized BPF lane (E4/N5)"
-"needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
-"needs TMPDIR on btrfs (it asserts the statfs magic); no BPF; run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
 "needs a P11SCOPE_SMALL_STATE_MAPS=1 libtest build (the default binary fails its build gate by design); run by hand as root from that build with the variable set"
 "needs an external barrier controller: P11SCOPE_I3A_RETIREMENT_MODE=worker|synchronous plus a root-owned 0700 CONTROL_DIR, a NONCE, and an external party to write the release file; no in-repo controller exists, so run once per mode by hand"
 "private helper re-executed by DiscoveryLifecycleFixture with P11SCOPE_TEST_DISCOVERY_PROVIDER/MANIFEST; its own docs say it is not a separate passing test"
@@ -587,70 +614,62 @@ SKIP_REASONS=(
 "unprivileged C7 A2 timing loop (indicative wall time, no pass/fail bar); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture, ideally from a --release build"
 "unprivileged C7 A2 timing loop (indicative wall time, no pass/fail bar); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture, ideally from a --release build"
 "needs a live root-owned target with two private cross-device mounts (same inode, distinct dev) plus P11SCOPE_ALIAS_COLLISION_PID/HINT/TARGET/HARDLINK"
-"needs TMPDIR on btrfs (it creates two subvolumes there and asserts the filesystem); no BPF; run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
-"needs TMPDIR on btrfs (it creates two subvolumes there and asserts the filesystem); no BPF; run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
-"needs root Btrfs disk TMPDIR and eligible BTF/task_vma kernel identity; no compiler/provider fixture; run exact ignored test in an authorized BPF lane with --test-threads=1 --nocapture"
-"needs root Btrfs disk TMPDIR and eligible BTF/task_vma kernel identity; actual same-line remap parity with held physical files; no compiler/provider fixture; run exact ignored test in an authorized BPF lane with --test-threads=1 --nocapture"
 "needs a frozen supervisor config via P11SCOPE_FIRST_USE_PROBE_CONFIG plus an exclusive BPF lane; its verdict requires an external owned oracle"
 "private seccomp helper re-executed by real_pidfd_denial_preserves_proc_identity_without_signal_authority with P11SCOPE_TEST_PIDFD_DENIAL_*; that unprivileged test is its only passing form"
 "needs a separately reviewed native stage via P11SCOPE_ROOT_RUNTIME_STAGE (provider.so, driver, provider.json); the test documents no runtime skip"
-"needs TMPDIR on btrfs (it asserts the statfs magic) plus a kernel-identity-capable host (BTF, task_iter pidfd); run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
-"needs TMPDIR on btrfs (it asserts the statfs magic) plus a kernel-identity-capable host (BTF, task_iter pidfd); run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
-"needs a default libtest build with embedded counter objects and explicitly prebuilt LP64 fixtures via P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER/P11SCOPE_COUNTER_BANK_FIXTURE_WORKLOAD; run the exact ignored test as root in an authorized BPF lane"
 "requires explicit controller-granted host measurement; spawns bounded child probes for the final multi-profile large4096 registry measurement, so schedule under a separate authorized measurement plan"
 "requires explicit controller-granted host measurement; spawns bounded child probes for the multi-profile large4096 registry measurement, so schedule under a separate authorized measurement plan"
 "requires explicit controller-granted host measurement; spawns bounded reducer-profile probes with at most 32 edges per profile, so schedule under a separate authorized measurement plan"
-"known-failing repro (doc Known limit 2026-10-19: lane-A runtime does not converge, the rotation stalls); rerun by hand as root after the runtime fix: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
-"known-failing repro (doc Known limit: same lane-A view-capacity stall, post-settle refusal asserts unreachable until the runtime fix); rerun by hand as root after the runtime fix: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
-"needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; actual before-unlink positive and deleted-mapping negative; no compiler/provider fixture; run exact ignored test in an authorized BPF lane"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separate authorized 513-endpoint native admission after resource preflight"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separate authorized 8192-endpoint native FD/memory admission after boundary pilot"
-"needs root Btrfs disk TMPDIR and eligible task_vma/BTF for required actual hardlink alias kernel/userspace parity; run exact selector with --ignored --test-threads=1 on a matching prebuilt binary"
-"needs root/CAP_SYS_ADMIN, private child mount namespaces, Btrfs disk TMPDIR and eligible task_vma/BTF; actual bind alias parity requires a separately admitted exact ignored run with unchanged parent mounts"
-"needs the default prebuilt libtest with embedded V2 objects and growth provider/workload inputs; explicit Multi PID-filter capability and separately admitted 513-endpoint native FD/memory/cleanup qualification, preserving required Singles coverage"
-"needs root/proc access, Btrfs disk TMPDIR and eligible task_vma/BTF; explicit live nonleader/shared-and-private FD-table parity with owned re-exec helpers, separately admitted exact ignored run"
 "private entrypoint re-executed only by the owned live-thread/private-files parity fixture; missing owned configuration fails and this helper never qualifies independently"
-"needs qualified Multi513 pilot, the default prebuilt libtest with embedded V2 objects and growth provider/workload inputs; separately admitted 8192-endpoint FD/memory/native qualification with unchanged ledger/N+1/cleanup/deadline assertions, preserving required Singles coverage"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven first-512 native Multi staging"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separately admitted Engine-driven growth to 8192 plus an atomic over-ceiling refusal with the prefix intact"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; a high hard RLIMIT_NOFILE and separately admitted Engine-driven Multi staging from a soft-1024 start"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; a high hard RLIMIT_NOFILE and authorized native BPF for the bypassed-preparation FD-exhaustion twin"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven Multi staging for live and terminal collection"
-"needs root/proc access, Btrfs disk TMPDIR, x86-64 raw clone support and eligible task_vma/BTF; actual CLONE_THREAD without CLONE_FILES attribution parity requires a separately admitted exact ignored run"
 "private re-exec entrypoint for the owned literal-clone parity fixture; missing owned configuration fails and this helper never qualifies independently"
-"needs root x86-64 LP64 Btrfs disk TMPDIR and eligible BTF/task_vma; required single-survivor zombie-leader positive baseline currently exposes an unqualified production path; run exact ignored test in a separately admitted native lane"
 "private re-exec entrypoint for the owned single-survivor zombie fixture; missing owning socket/source fails and this helper never qualifies independently"
-"RED by design (post-copy-up D-C7-3 re-edge stands; investigation target, never qualifies): run by hand as root to reproduce: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
 "needs root loop overlay mounts plus eligible BTF/task_vma identity on an overlay lane-B host (fails loud on other lanes); K1 deep-scan fresh-positive twin; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "needs root loop overlay mounts plus eligible BTF/task_vma identity on an overlay lane-B host (fails loud on other lanes); K1 deep-scan stale-negative twin; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "needs root with a live nonleader thread for the TID-scoped anchor run (strict BPF load, installs nothing live); run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
-"needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; zombie survivor collision parity; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
-"needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; cold zombie admission parity; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
-"needs root Btrfs disk TMPDIR and eligible BTF/task_vma identity; kernel-positive population excludes watched anchors; run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
-"needs the default build with embedded counter objects; run exact --ignored as root in an authorized BPF lane with LP64 map/program load and uprobe_multi"
-"needs a default libtest build with embedded counter objects and explicitly prebuilt LP64 fixtures via P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER/P11SCOPE_COUNTER_BANK_FIXTURE_WORKLOAD; runs counts/timestamps/latency held-return legs; run the exact ignored test as root in an authorized BPF lane"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; explicit Multi PID-filter capability and separately admitted 513-endpoint timestamps native staging"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; explicit Multi PID-filter capability and separately admitted 513-endpoint latency native staging"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted 8192-endpoint timestamps native FD/memory admission after boundary pilot"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted 8192-endpoint latency native FD/memory admission after boundary pilot"
 "live-kernel BPF lane: reports bpf_loop helper presence without asserting it; run exact --ignored as root in an authorized BPF lane"
 "pre-5.17 kernel lane: proves preparation refuses cleanly without the bpf_loop helper (passes vacuously on newer hosts); run exact --ignored as root on that kernel lane"
 "6.1 E2BIG lane: proves the verifier-budget refusal maps before lifecycle without activating; run exact --ignored as root on the 6.1 verifier-budget host"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; a cgroup v2 hierarchy, proven kernel Multi PID filtering and separately admitted Engine-driven cgroup growth to 8192 plus an atomic over-ceiling refusal"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven system growth to 8192 plus an atomic over-ceiling refusal"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separately admitted Engine-driven Singles growth to 8192, then a stop that prints the one-at-a-time detach estimate"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and a separately admitted Engine-driven Multi stop that prints no one-at-a-time detach estimate"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; separately admitted Engine-driven Singles staging; a second stop signal abandons the counter detach with the typed interruption"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven timestamps growth to 8192 plus an atomic over-ceiling refusal"
-"needs the default build with embedded V2 objects and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER/_WORKLOAD; proven kernel Multi PID filtering and separately admitted Engine-driven latency growth to 8192 plus an atomic over-ceiling refusal"
-"needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
-"needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
-"needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
-"needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
-"needs root and prebuilt LP64 growth provider/workload via P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER and P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD; run the exact ignored test by hand as root with TMPDIR, fixtures and timeout as in the evidence run"
-"needs root with no fixture (the owned child maps no provider); run the exact ignored test by hand as root with TMPDIR and CARGO_TARGET_TMPDIR as in the evidence run"
 "unprivileged system-population graph sizing (4096 pin files plus 16384 native links; memory, drain and release asserts gate, the stop time is measured, not gated); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture on a host whose hard RLIMIT_NOFILE fits the population"
-"RED by design (R57 future positive: expected RED until a provider-free transaction receipt lands; un-ignore when a settlement receipt lands); unprivileged gcc fixture, no BPF or root needed; run by hand to confirm the boundary: <binary> --exact <path> --ignored --test-threads=1 --nocapture"
+)
+
+# Btrfs campaign cells: run only with --include-btrfs. Each needs
+# TMPDIR on btrfs; the runner loop-mounts one image for the group
+# (scripts/ci/prepare-btrfs-tmpdir.sh) and unmounts it afterwards.
+BTRFS_TESTS=(
+attach::instance_tests::privileged_instance_routing_on_btrfs_tmpdir
+discovery::sweep_attribution::tests::privileged_a_btrfs_collision_on_a_data_range_keeps_the_exec_proven_edge
+discovery::sweep_attribution::tests::privileged_a_file_swapped_behind_an_identical_line_is_proved_as_the_new_file
+discovery::sweep_attribution::tests::privileged_d4_btrfs_subvolume_collision_backend_parity
+discovery::sweep_attribution::tests::privileged_d4_btrfs_same_line_remap_backend_parity
+discovery::sweep_attribution::tests::privileged_d4_btrfs_deleted_mapping_backend_parity
+discovery::sweep_attribution::tests::privileged_d4_btrfs_hardlink_alias_backend_parity
+discovery::sweep_attribution::tests::privileged_d4_btrfs_bind_alias_backend_parity
+discovery::sweep_attribution::tests::privileged_d4_btrfs_live_thread_private_files_backend_parity
+discovery::sweep_attribution::tests::privileged_d4_btrfs_clone_without_files_backend_parity
+discovery::sweep_attribution::tests::privileged_d4_btrfs_zombie_leader_single_survivor_backend_parity
+discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins
+discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_cold_admission_backend_parity
+discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors
+inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
+inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
+)
+
+# Expected-failure campaign cells: run only with
+# --include-expected-failures. A cell that fails records XFAIL
+# (counts as passed); a cell that passes records XPASS and fails
+# the run, so a silent fix or change gets noticed. Reasons name
+# the expected failure and stay index-aligned with the tests.
+EXPECTED_FAILURE_TESTS=(
+discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
+discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
+discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
+discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation
+)
+XFAIL_REASONS=(
+"expected failure: lane-A runtime does not converge, the rotation stalls (doc Known limit 2026-10-19); an unexpected pass promotes the cell to the runnable campaign"
+"expected failure: lane-A view-capacity stall (doc Known limit; the post-settle refusal asserts unreachable until the runtime fix); an unexpected pass promotes the cell to the runnable campaign"
+"expected failure: RED by design while the post-copy-up D-C7-3 re-edge stands (investigation target); an unexpected pass gets noticed for promotion"
+"expected failure: R57 future positive, RED until a provider-free settlement receipt lands (unprivileged, no BPF or root); an unexpected pass un-ignores the cell"
 )
 
 # Wide-Detailed campaign: the ignored tests that exist only in a
@@ -707,7 +726,8 @@ tests/run_abandon_report.rs:second_sigint_during_teardown_publishes_truthful_rep
 
 usage() {
     cat <<EOF
-usage: $PROG LIB_TEST_BINARY OUTDIR [--include-long] [SELECTOR...]
+usage: $PROG LIB_TEST_BINARY OUTDIR [--include-long] [--include-btrfs]
+           [--include-expected-failures] [SELECTOR...]
        $PROG LIB_TEST_BINARY OUTDIR --wide-detailed-2112 [SELECTOR...]
        $PROG --list LIB_TEST_BINARY
        $PROG --list --wide-detailed-2112 LIB_TEST_BINARY
@@ -718,12 +738,18 @@ Run the curated privileged (ignored) p11scope lib tests, one at a time.
 SELECTORs are literal substrings matched against full test paths; a test
 runs when any SELECTOR matches (no SELECTOR runs the whole campaign).
 --include-long additionally runs the long campaign cells.
+--include-btrfs additionally runs the btrfs campaign cells (the runner
+loop-mounts a btrfs image for them).
+--include-expected-failures additionally runs the known-failing
+reproducers with inverted judging (failures record XFAIL, passes fail
+the run as XPASS).
 --wide-detailed-2112 runs only the wide-Detailed campaign cells (a binary
 built with --features wide-detailed-2112 is required; any other binary
-is refused). It cannot be combined with --include-long.
---list prints the curated default, long, and skipped-with-reason lists and
-verifies them against the binary, without running anything. With
---wide-detailed-2112 it prints and verifies only the wide-Detailed list.
+is refused). It cannot be combined with any --include-* flag.
+--list prints the curated default, long, skipped-with-reason, btrfs,
+and expected-failure lists and verifies them against the binary,
+without running anything. With --wide-detailed-2112 it prints and
+verifies only the wide-Detailed list.
 --list-integration prints the curated integration-test selectors and
 verifies each against the built test binaries in TEST_BINARY_DIR
 (exactly one binary and exactly one selected test per entry), without
@@ -752,15 +778,39 @@ binary_has_ignored() {
     binary_ignored_list "$1" | grep -xF -- "$2" >/dev/null
 }
 
-# Static skips pair each test with its reason by index. A length mismatch
-# would print wrong reasons and, under `set -u` inside a `| tee` pipeline,
-# fail only the forked subshell while the loop reports phantoms and exits 0.
-# Refuse loudly before any print or selection touches the arrays.
-check_skip_alignment() {
-    if [ "${#SKIP_TESTS[@]}" -ne "${#SKIP_REASONS[@]}" ]; then
-        echo "$PROG: SKIP_TESTS (${#SKIP_TESTS[@]}) and SKIP_REASONS (${#SKIP_REASONS[@]}) differ in length" >&2
+# Branch recording: a dual-outcome cell prints one
+# `P11SCOPE_CELL_BRANCH=<name>` line for the arm it took, and the run
+# loop appends ` branch=<name>` to that cell's results.txt line, after
+# the test-result text so downstream `PASS ...` parsers keep matching.
+# Prints the suffix for a cell log, or nothing when the cell printed no
+# branch line. The last branch line wins; a value outside the token
+# charset is recorded as INVALID, never silently dropped.
+cell_branch_suffix() {
+    local line name
+    line=$(command grep -F 'P11SCOPE_CELL_BRANCH=' "$1" | tail -n 1 || true)
+    [ -n "$line" ] || return 0
+    name=${line##*P11SCOPE_CELL_BRANCH=}
+    case $name in
+        ''|*[!A-Za-z0-9_.-]*|[.-]*) printf ' branch=INVALID' ;;
+        *) printf ' branch=%s' "$name" ;;
+    esac
+}
+
+# Static skips pair each test with its reason by index, and so do the
+# expected-failure cells. A length mismatch would print wrong reasons
+# and, under `set -u` inside a `| tee` pipeline, fail only the forked
+# subshell while the loop reports phantoms and exits 0. Refuse loudly
+# before any print or selection touches the arrays.
+check_pair_alignment() {
+    local -n _tests=$1 _reasons=$2
+    if [ "${#_tests[@]}" -ne "${#_reasons[@]}" ]; then
+        echo "$PROG: $1 (${#_tests[@]}) and $2 (${#_reasons[@]}) differ in length" >&2
         return 1
     fi
+}
+check_skip_alignment() {
+    check_pair_alignment SKIP_TESTS SKIP_REASONS \
+        && check_pair_alignment EXPECTED_FAILURE_TESTS XFAIL_REASONS
 }
 
 # Compare curation against the binary. Prints drift details to stderr and
@@ -806,6 +856,8 @@ check_curation() {
         printf '%s\n' "${DEFAULT_TESTS[@]}"
         printf '%s\n' "${ALTERNATIVE_TESTS[@]}"
         printf '%s\n' "${LONG_TESTS[@]}"
+        printf '%s\n' "${BTRFS_TESTS[@]}"
+        printf '%s\n' "${EXPECTED_FAILURE_TESTS[@]}"
         printf '%s\n' "${SKIP_TESTS[@]}"
     } | sort -u >"$cur_list"
     missing_bin=$(comm -13 "$bin_list" "$cur_list" || true)
@@ -946,6 +998,12 @@ list_mode() {
     for i in "${!SKIP_TESTS[@]}"; do
         echo "${SKIP_TESTS[$i]} :: ${SKIP_REASONS[$i]}"
     done
+    echo "btrfs (${#BTRFS_TESTS[@]}, --include-btrfs only)"
+    printf '%s\n' "${BTRFS_TESTS[@]}"
+    echo "expected-failures (${#EXPECTED_FAILURE_TESTS[@]}, --include-expected-failures only)"
+    for i in "${!EXPECTED_FAILURE_TESTS[@]}"; do
+        echo "${EXPECTED_FAILURE_TESTS[$i]} :: ${XFAIL_REASONS[$i]}"
+    done
     if check_curation "$bin"; then
         local actual_count
         actual_count=$(binary_ignored_list "$bin" | wc -l) || return 1
@@ -1020,13 +1078,35 @@ selected() {
     return 1
 }
 
+# Btrfs mount teardown: globals, because a trap handler runs after
+# main()'s locals are gone. Set only by the btrfs setup in main(), for
+# paths the runner itself constructed under OUTDIR.
+BTRFS_TEARDOWN_IMG=
+BTRFS_TEARDOWN_MNT=
+cleanup_btrfs_mount() {
+    [ -n "$BTRFS_TEARDOWN_MNT" ] || return 0
+    if ! "$REPO_ROOT/scripts/ci/prepare-btrfs-tmpdir.sh" --teardown \
+        "$BTRFS_TEARDOWN_IMG" "$BTRFS_TEARDOWN_MNT" 2>/dev/null; then
+        echo "$PROG: warning: btrfs teardown failed for $BTRFS_TEARDOWN_MNT" >&2
+    fi
+    BTRFS_TEARDOWN_IMG=
+    BTRFS_TEARDOWN_MNT=
+}
+
 main() {
-    local bin outdir include_long=0 wide=0
+    local bin outdir include_long=0 include_btrfs=0 include_xfail=0 wide=0
     local selected_runnable=() selected_skipped=()
-    local arg name i pass=0 fail=0 skipped=0 seq=0
+    local arg name i pass=0 fail=0 skipped=0 xfail=0 xpass=0 seq=0
     local tmpdir logdir eviddir results log evdir short start end seconds rc
-    local result_line verdict m32_ok=0 p11kit_ok=0 need_m32=0 need_p11kit=0
+    local result_line verdict branch_suffix
+    local m32_ok=0 p11kit_ok=0 need_m32=0 need_p11kit=0
     local need_ext4loop=0 ext4loop_skip=
+    local need_counter=0 counter_skip=
+    local need_btrfs_run=0 btrfs_mnt= btrfs_skip=
+    local need_target_tmp=0 target_tmpdir=
+    local cell_tmpdir
+    local -A counter_fixture_set=() btrfs_set=() xfail_reason=()
+    local -a cell_env=()
 
     if [ $# -eq 0 ]; then
         usage >&2
@@ -1047,13 +1127,16 @@ main() {
     for arg in "$@"; do
         case $arg in
             --include-long) include_long=1 ;;
+            --include-btrfs) include_btrfs=1 ;;
+            --include-expected-failures) include_xfail=1 ;;
             --wide-detailed-2112) wide=1 ;;
             --*) echo "$PROG: unknown option: $arg" >&2; usage >&2; return 2 ;;
             *) SELECTORS+=("$arg") ;;
         esac
     done
-    if [ "$wide" -eq 1 ] && [ "$include_long" -eq 1 ]; then
-        echo "$PROG: --wide-detailed-2112 selects only the wide campaign; --include-long does not apply" >&2
+    if [ "$wide" -eq 1 ] && { [ "$include_long" -eq 1 ] || [ "$include_btrfs" -eq 1 ] \
+        || [ "$include_xfail" -eq 1 ]; }; then
+        echo "$PROG: --wide-detailed-2112 selects only the wide campaign; --include-* flags do not apply" >&2
         return 2
     fi
 
@@ -1101,6 +1184,20 @@ main() {
                 fi
             done
         fi
+        if [ "$include_btrfs" -eq 1 ]; then
+            for name in "${BTRFS_TESTS[@]}"; do
+                if selected "$name"; then
+                    selected_runnable+=("$name")
+                fi
+            done
+        fi
+        if [ "$include_xfail" -eq 1 ]; then
+            for name in "${EXPECTED_FAILURE_TESTS[@]}"; do
+                if selected "$name"; then
+                    selected_runnable+=("$name")
+                fi
+            done
+        fi
         for i in "${!SKIP_TESTS[@]}"; do
             if selected "${SKIP_TESTS[$i]}"; then
                 selected_skipped+=("$i")
@@ -1115,7 +1212,9 @@ main() {
                 case $candidate in *"$arg"*) matched=1; break ;; esac
             done
         else
-            for candidate in "${DEFAULT_TESTS[@]}" "${ALTERNATIVE_TESTS[@]}" "${LONG_TESTS[@]}" "${SKIP_TESTS[@]}"; do
+            for candidate in "${DEFAULT_TESTS[@]}" "${ALTERNATIVE_TESTS[@]}" "${LONG_TESTS[@]}" \
+                "${BTRFS_TESTS[@]}" "${EXPECTED_FAILURE_TESTS[@]}" \
+                "${SKIP_TESTS[@]}"; do
                 case $candidate in *"$arg"*) matched=1; break ;; esac
             done
         fi
@@ -1128,6 +1227,26 @@ main() {
                 case $candidate in
                     *"$arg"*)
                         echo "$PROG: note: '$arg' matches --include-long tests, skipped without the flag" >&2
+                        break
+                        ;;
+                esac
+            done
+        fi
+        if [ "$wide" -eq 0 ] && [ "$include_btrfs" -eq 0 ]; then
+            for candidate in "${BTRFS_TESTS[@]}"; do
+                case $candidate in
+                    *"$arg"*)
+                        echo "$PROG: note: '$arg' matches --include-btrfs tests, skipped without the flag" >&2
+                        break
+                        ;;
+                esac
+            done
+        fi
+        if [ "$wide" -eq 0 ] && [ "$include_xfail" -eq 0 ]; then
+            for candidate in "${EXPECTED_FAILURE_TESTS[@]}"; do
+                case $candidate in
+                    *"$arg"*)
+                        echo "$PROG: note: '$arg' matches --include-expected-failures tests, skipped without the flag" >&2
                         break
                         ;;
                 esac
@@ -1197,6 +1316,70 @@ main() {
         rm -rf "$probe_img" "$probe_mnt"
     fi
 
+    # Counter fixtures, the owned-child marker dir, and the btrfs mount:
+    # prepared only when a selected cell needs them. A missing tool (cc,
+    # mkfs.btrfs) SKIPs the affected cells with a reason; a failure with
+    # the tools present fails the run loudly.
+    for name in "${COUNTER_FIXTURE_TESTS[@]}"; do counter_fixture_set[$name]=1; done
+    for name in "${BTRFS_TESTS[@]}"; do btrfs_set[$name]=1; done
+    for i in "${!EXPECTED_FAILURE_TESTS[@]}"; do
+        xfail_reason[${EXPECTED_FAILURE_TESTS[$i]}]=${XFAIL_REASONS[$i]}
+    done
+    for name in ${selected_runnable[@]+"${selected_runnable[@]}"}; do
+        if [ -n "${counter_fixture_set[$name]+present}" ]; then need_counter=1; fi
+        if [ -n "${btrfs_set[$name]+present}" ]; then need_btrfs_run=1; fi
+        if [ "$name" = "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64" ]; then
+            need_target_tmp=1
+        fi
+    done
+    if [ "$need_counter" -eq 1 ]; then
+        "$REPO_ROOT/scripts/ci/build-counter-fixtures.sh" "$outdir/counter-fixtures" \
+            >"$tmpdir/counter-fixtures.log" 2>&1
+        rc=$?
+        if [ "$rc" -eq 77 ]; then
+            counter_skip="cc cannot build the counter fixtures ($(tail -n 1 "$tmpdir/counter-fixtures.log"))"
+        elif [ "$rc" -ne 0 ]; then
+            echo "$PROG: counter fixture build failed, see $tmpdir/counter-fixtures.log" >&2
+            return 1
+        else
+            for fixture in counter-bank-provider.so counter-bank-driver \
+                counter-bank-growth-provider.so counter-bank-growth-driver; do
+                if [ ! -f "$outdir/counter-fixtures/$fixture" ]; then
+                    echo "$PROG: fixture build reported success but $fixture is missing" >&2
+                    return 1
+                fi
+            done
+        fi
+    fi
+    if [ "$need_target_tmp" -eq 1 ]; then
+        target_tmpdir=$outdir/target-tmp
+        mkdir -p "$target_tmpdir" || return 1
+        if [ -n "${SUDO_UID:-}" ]; then
+            chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$target_tmpdir" || return 1
+        fi
+        chmod 0700 "$target_tmpdir" || return 1
+    fi
+    if [ "$need_btrfs_run" -eq 1 ]; then
+        "$REPO_ROOT/scripts/ci/prepare-btrfs-tmpdir.sh" "$outdir/btrfs.img" "$outdir/btrfs-mnt" \
+            >"$tmpdir/btrfs-mnt.path" 2>"$tmpdir/btrfs.err"
+        rc=$?
+        if [ "$rc" -eq 77 ]; then
+            btrfs_skip="btrfs unavailable: $(cat "$tmpdir/btrfs.err")"
+        elif [ "$rc" -ne 0 ]; then
+            echo "$PROG: btrfs setup failed, see $tmpdir/btrfs.err" >&2
+            return 1
+        else
+            btrfs_mnt=$(cat "$tmpdir/btrfs-mnt.path")
+            if [ "$btrfs_mnt" != "$outdir/btrfs-mnt" ]; then
+                echo "$PROG: btrfs helper mounted an unexpected path: $btrfs_mnt" >&2
+                return 1
+            fi
+            BTRFS_TEARDOWN_IMG=$outdir/btrfs.img
+            BTRFS_TEARDOWN_MNT=$outdir/btrfs-mnt
+            trap cleanup_btrfs_mount EXIT
+        fi
+    fi
+
     # Opt-in tolerances are declared in the results, never applied silently.
     if [ -n "${P11SCOPE_TEST_TIME_SCALE:-}" ] \
         && ! awk -v s="$P11SCOPE_TEST_TIME_SCALE" \
@@ -1208,6 +1391,8 @@ main() {
         echo "# $PROG run: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "# binary: $bin"
         echo "# include_long: $include_long"
+        echo "# include_btrfs: $include_btrfs"
+        echo "# include_expected_failures: $include_xfail"
         echo "# wide_detailed_2112: $wide"
         echo "# selectors: ${SELECTORS[*]:-<none>}"
         if [ -n "${P11SCOPE_PRIV_LIFECYCLE_LOSS:-}" ]; then
@@ -1258,13 +1443,38 @@ main() {
                 fi
                 ;;
         esac
+        cell_env=()
+        cell_tmpdir=$TMPDIR
+        if [ -n "${counter_fixture_set[$name]+present}" ]; then
+            if [ -n "$counter_skip" ]; then
+                echo "SKIP $name :: $counter_skip" | tee -a "$results"
+                skipped=$((skipped + 1))
+                continue
+            fi
+            cell_env+=(P11SCOPE_COUNTER_BANK_FIXTURE_PROVIDER="$outdir/counter-fixtures/counter-bank-provider.so"
+                P11SCOPE_COUNTER_BANK_FIXTURE_WORKLOAD="$outdir/counter-fixtures/counter-bank-driver"
+                P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER="$outdir/counter-fixtures/counter-bank-growth-provider.so"
+                P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD="$outdir/counter-fixtures/counter-bank-growth-driver")
+        fi
+        if [ -n "${btrfs_set[$name]+present}" ]; then
+            if [ -n "$btrfs_skip" ]; then
+                echo "SKIP $name :: $btrfs_skip" | tee -a "$results"
+                skipped=$((skipped + 1))
+                continue
+            fi
+            cell_tmpdir=$btrfs_mnt
+        fi
+        if [ "$name" = "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64" ]; then
+            cell_env+=(CARGO_TARGET_TMPDIR="$target_tmpdir")
+        fi
         short=${name##*::}
         log=$logdir/$short.log
         evdir=$eviddir/$seq-$short
         mkdir -p "$evdir" || { echo "$PROG: cannot create $evdir" >&2; return 1; }
         echo "RUN $name [case_index=$seq]"
         start=$(date +%s)
-        P11SCOPE_TASK4_EVIDENCE_DIR=$evdir P11SCOPE_TASK4_CASE_INDEX=$seq \
+        P11SCOPE_TASK4_EVIDENCE_DIR=$evdir P11SCOPE_TASK4_CASE_INDEX=$seq TMPDIR=$cell_tmpdir \
+            env ${cell_env[@]+"${cell_env[@]}"} \
             "$bin" --exact "$name" --ignored --test-threads=1 --nocapture \
             >"$log" 2>&1
         rc=$?
@@ -1278,16 +1488,27 @@ main() {
             && command grep -qF 'test result: ok. 1 passed' "$log"; then
             verdict=PASS
         fi
-        if [ "$verdict" = "PASS" ]; then
-            pass=$((pass + 1))
+        branch_suffix=$(cell_branch_suffix "$log")
+        if [ -n "${xfail_reason[$name]+present}" ]; then
+            if [ "$verdict" = "PASS" ]; then
+                xpass=$((xpass + 1))
+                echo "XPASS $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (UNEXPECTED PASS; expected: ${xfail_reason[$name]})" | tee -a "$results"
+            else
+                xfail=$((xfail + 1))
+                echo "XFAIL $name rc=$rc seconds=$seconds :: $result_line$branch_suffix (expected: ${xfail_reason[$name]})" | tee -a "$results"
+            fi
         else
-            fail=$((fail + 1))
+            if [ "$verdict" = "PASS" ]; then
+                pass=$((pass + 1))
+            else
+                fail=$((fail + 1))
+            fi
+            echo "$verdict $name rc=$rc seconds=$seconds :: $result_line$branch_suffix" | tee -a "$results"
         fi
-        echo "$verdict $name rc=$rc seconds=$seconds :: $result_line" | tee -a "$results"
     done
 
-    echo "SUMMARY pass=$pass fail=$fail skipped=$skipped" | tee -a "$results"
-    [ "$fail" -eq 0 ]
+    echo "SUMMARY pass=$pass fail=$fail skipped=$skipped xfail=$xfail xpass=$xpass" | tee -a "$results"
+    [ "$fail" -eq 0 ] && [ "$xpass" -eq 0 ]
 }
 
 main "$@"

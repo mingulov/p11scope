@@ -1,7 +1,7 @@
 {
   "schema": "p11scope/ignored-tests/v1",
   "cells": {
-    "privileged": "ignored lib test curated in scripts/run-privileged-lib-tests.sh (default, long, skip or alternative list)",
+    "privileged": "ignored lib test curated in scripts/run-privileged-lib-tests.sh (default, long, btrfs, expected-failure, skip or alternative list)",
     "live-kernel": "ignored integration test needing a real kernel/verifier lane outside the lib runner",
     "feature": "ignored test needing a cargo feature or a dedicated build configuration; `owner` names the lane that runs it",
     "performance": "ignored timing loop with no pass/fail bar, run by hand",
@@ -42,7 +42,11 @@
       "file": "src/attach.rs",
       "path": "attach::tests::bpf_loop_probe_reports_helper_presence_on_live_kernel",
       "reason": "live-kernel BPF lane; reports bpf_loop helper presence without asserting it",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": {
+        "item": "old-kernel live lanes in CI",
+        "owner": "WP-9"
+      }
     },
     {
       "file": "src/attach.rs",
@@ -72,7 +76,11 @@
       "file": "src/attach/counter_banks.rs",
       "path": "attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels",
       "reason": "historical/private opt-in control outside current live-positive qualification: pre-5.17 kernel lane; proves preparation refuses cleanly without the bpf_loop helper",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": {
+        "item": "pre-5.17 kernel lane in CI",
+        "owner": "WP-9"
+      }
     },
     {
       "file": "src/attach/identity_iter.rs",
@@ -102,7 +110,8 @@
       "file": "src/attach/identity_iter.rs",
       "path": "attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing",
       "reason": "privileged: nonleader anchor run installs nothing live (root strict BPF load; run by hand on a live kernel lane, outside the lib runner)",
-      "cell": "live-kernel"
+      "cell": "live-kernel",
+      "until": "0.7.0"
     },
     {
       "file": "src/attach/instance_tests.rs",
@@ -216,7 +225,8 @@
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_instance_small_state_lru_eviction_never_joins",
       "reason": "privileged: needs a small-state build, run by hand",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": "0.7.0"
     },
     {
       "file": "src/attach/instance_tests.rs",
@@ -469,7 +479,8 @@
       "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::privileged_inventory_retirement_controlled_churn",
       "reason": "root-owned BPF lane and external lifecycle ledger; explicit controlled worker/synchronous comparison",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": "0.7.0"
     },
     {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
@@ -724,13 +735,15 @@
       "file": "src/discovery/d4_overlay_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_fresh_upper_joins",
       "reason": "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only); fresh-positive twin, fail-loud-unprivileged by design, run by hand",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": "0.7.0"
     },
     {
       "file": "src/discovery/d4_overlay_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_stale_lower_refuses",
       "reason": "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only); stale-negative twin, fail-loud-unprivileged by design, run by hand",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": "0.7.0"
     },
     {
       "file": "src/discovery/d4_population_cells.rs",
@@ -760,13 +773,21 @@
       "file": "src/discovery/engine_tests.rs",
       "path": "discovery::engine::tests::lifecycle_manifest_helper_entrypoint",
       "reason": "private manifest helper; invoked by DiscoveryLifecycleFixture",
-      "cell": "helper"
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
     },
     {
       "file": "src/discovery/engine_tests.rs",
       "path": "discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale",
       "reason": "scale: system-population graph sizing, time measured not gated (R-40); run by exact selector at V2 and L",
-      "cell": "performance"
+      "cell": "performance",
+      "until": {
+        "item": "permanent: hand-run sizing gate, not a campaign cell",
+        "owner": "maintainer"
+      }
     },
     {
       "file": "src/discovery/engine_tests.rs",
@@ -778,13 +799,21 @@
       "file": "src/discovery/identity.rs",
       "path": "discovery::identity::tests::map_files_name_timing_per_thousand",
       "reason": "manual: indicative map_files-name timing loop, no pass/fail bar; run by hand single-threaded",
-      "cell": "performance"
+      "cell": "performance",
+      "until": {
+        "item": "permanent: timing loop with no pass/fail bar",
+        "owner": "maintainer"
+      }
     },
     {
       "file": "src/discovery/identity.rs",
       "path": "discovery::identity::tests::count_manifest_actual_full_copy_and_tail_fit_the_cached_read_allowance",
       "reason": "private count-manifest cache helper; invoked by count_manifest_full_and_tail_share_the_scan_inspection_cache",
-      "cell": "helper"
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
     },
     {
       "file": "src/discovery/inventory_workload_tests.rs",
@@ -880,13 +909,18 @@
       "file": "src/discovery/scan.rs",
       "path": "discovery::scan::tests::maps_reuse_timing_per_thousand_reads",
       "reason": "manual: indicative maps-reuse timing loop, no pass/fail bar; run by hand single-threaded",
-      "cell": "performance"
+      "cell": "performance",
+      "until": {
+        "item": "permanent: timing loop with no pass/fail bar",
+        "owner": "maintainer"
+      }
     },
     {
       "file": "src/discovery/scan.rs",
       "path": "discovery::scan::tests::privileged_cross_device_same_inode_alias_is_refused_on_scan_path",
       "reason": "requires a root-owned target with two private cross-device mounts",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": "0.7.0"
     },
     {
       "file": "src/discovery/sweep_attribution_tests.rs",
@@ -952,7 +986,11 @@
       "file": "src/discovery/sweep_attribution_tests.rs",
       "path": "discovery::sweep_attribution::tests::d4_thread_mapping_helper",
       "reason": "private D4 thread fixture entrypoint; invoked only by its owning parity test with an owned socket/configuration",
-      "cell": "helper"
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
     },
     {
       "file": "src/discovery/sweep_attribution_tests.rs",
@@ -964,7 +1002,11 @@
       "file": "src/discovery/sweep_attribution_tests.rs",
       "path": "discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper",
       "reason": "private D4 literal-clone fixture entrypoint; requires its owning parity test socket/configuration",
-      "cell": "helper"
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
     },
     {
       "file": "src/discovery/sweep_attribution_tests.rs",
@@ -976,7 +1018,11 @@
       "file": "src/discovery/sweep_attribution_tests.rs",
       "path": "discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper",
       "reason": "private D4 zombie fixture entrypoint; requires owning socket and source configuration",
-      "cell": "helper"
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
     },
     {
       "file": "src/events/runtime_tests.rs",
@@ -1000,7 +1046,8 @@
       "file": "src/first_use_probe/native.rs",
       "path": "first_use_probe::native::system_capture_observer_facts",
       "reason": "owned root first-use observer; frozen config, supervisor and exclusive BPF lane required",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": "0.7.0"
     },
     {
       "file": "src/inspect_system.rs",
@@ -1258,7 +1305,11 @@
       "file": "src/metrics/counter_reader.rs",
       "path": "metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses_clean_lp64",
       "reason": "historical/private opt-in control outside current live-positive qualification: 6.1 E2BIG lane; proves the verifier-budget refusal maps before lifecycle without activating",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": {
+        "item": "6.1 verifier-budget lane in CI",
+        "owner": "WP-9"
+      }
     },
     {
       "file": "src/metrics/counter_reader.rs",
@@ -1348,31 +1399,48 @@
       "file": "src/process.rs",
       "path": "process::tests::pidfd_denial::pidfd_denial_helper",
       "reason": "private seccomp helper; invoked by real_pidfd_denial_preserves_proc_identity_without_signal_authority",
-      "cell": "helper"
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
     },
     {
       "file": "src/run/root_fence_runtime.rs",
       "path": "run::root_fence_runtime::actual_original_exit_delayed_first_admission_retires_pending",
       "reason": "requires separately reviewed native stage, capture activation derivative, and kernel privileges",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": "0.7.0"
     },
     {
       "file": "src/s1_tests/resource_probe.rs",
       "path": "s1_tests::resource_probe::native_semantic_resource_final_probe",
       "reason": "explicit controller-granted host measurement; spawns bounded children",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": {
+        "item": "controller-authorized measurement plan",
+        "owner": "controller"
+      }
     },
     {
       "file": "src/s1_tests/resource_probe.rs",
       "path": "s1_tests::resource_probe::native_semantic_resource_registry_probe",
       "reason": "explicit controller-granted host measurement; spawns bounded children",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": {
+        "item": "controller-authorized measurement plan",
+        "owner": "controller"
+      }
     },
     {
       "file": "src/semantics_edge/resource_tests.rs",
       "path": "semantics_edge::resource_tests::native_semantic_resource_probe",
       "reason": "explicit controller-granted host measurement; spawns bounded children",
-      "cell": "privileged"
+      "cell": "privileged",
+      "until": {
+        "item": "controller-authorized measurement plan",
+        "owner": "controller"
+      }
     },
     {
       "file": "tests/entry_object_paired.rs",
@@ -1434,85 +1502,99 @@
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_verifier_stats",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N1-N4 verifier/object cells"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N1-N4 verifier/object cells",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_exhaustion_16384_then_quota",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N6 exhaustion and N16 saturation cells"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N6 exhaustion and N16 saturation cells",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_cut_16385th_leader_in_b",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N7 cut cell with 16,385 leaders"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N7 cut cell with 16,385 leaders",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_concurrent_cut_counts_once",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N8 concurrent cut counting cell"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N8 concurrent cut counting cell",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_held_return_across_cut",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N9 held-return-across-cut cell"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N9 held-return-across-cut cell",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_late_incarnation_refused",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N10 late-incarnation refusal cell"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N10 late-incarnation refusal cell",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_failure_modes_refuse_and_balance",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N11 failure-modes cell"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N11 failure-modes cell",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_fork_burn_sentinel",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N12 fork-burn and N4 memlock cells"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N12 fork-burn and N4 memlock cells",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_second_rollover",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N11 second-rollover cell"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N11 second-rollover cell",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_omitted_route_refuses",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N13 omitted-route cell"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N13 omitted-route cell",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_exec_query_span_cut",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N14 exec/query-span cell"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N14 exec/query-span cell",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_attach_cookie_through_dispatcher",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N15 attach-cookie cell"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N15 attach-cookie cell",
+      "until": "0.7.0"
     },
     {
       "cell": "privileged",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_inflight_cut_counts_once",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N8 in-flight cut counting cell (flip while calling)"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane; N8 in-flight cut counting cell (flip while calling)",
+      "until": "0.7.0"
     },
     {
       "cell": "performance",
       "file": "src/attach/image_bank_proof.rs",
       "path": "attach::image_bank_proof::tests::privileged_image_bank_per_call_overhead",
-      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane on a quiet host (E4); N5 per-call overhead cell"
+      "reason": "image-bank-proof build (P11SCOPE_IMAGE_BANK_PROOF=1) and root BPF lane on a quiet host (E4); N5 per-call overhead cell",
+      "until": "0.7.0"
     },
     {
       "file": "src/inventory/privileged_tests.rs",

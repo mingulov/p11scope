@@ -31,7 +31,8 @@ import key_operations_checks as checks  # noqa: E402
 FAKE_OBSERVER = """#!/bin/sh
 # Fake observer: seal line, self-stop after FAKE_OBSERVE_S, canned doc.
 # KEYOPS_SELFTEST_SCENARIO: clean | ring-loss | loss-gap | dirty-stop |
-# oo-populated | garbage-doc (each: unavailable oo except oo-populated).
+# oo-populated | oo-unavailable-other | garbage-doc (each: unavailable
+# oo except oo-populated).
 out=""
 prev=""
 for arg in "$@"; do
@@ -60,6 +61,9 @@ case $scenario in
     oo-populated)
         status=populated
         reason="rev 1" ;;
+    oo-unavailable-other)
+        status=unavailable
+        reason="bootstrap_unavailable" ;;
     garbage-doc)
         echo "NOT JSON{{{" > "$out"
         exit "${FAKE_OBS_EXIT:-0}" ;;
@@ -240,6 +244,21 @@ class SystemScriptTests(unittest.TestCase):
         self.assertEqual((row["pass"], row["qualification"]),
                          (False, "failed"))
         self.assertIn("went stale", row["detail"])
+
+    def test_unavailable_wrong_reason_is_not_expected_failure(self):
+        # Reason exactness: unavailable with any reason other than
+        # journal_unavailable is not the pinned signature, even when
+        # the oracle refuses exactly as the pinned case does.
+        proc, outdir, rows = self.run_script(
+            "oo-unavailable-other", "clean",
+            extra_env={"FAKE_EXIT": "1",
+                       "FAKE_TEXT": "unavailable: none"})
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
+        row = rows["churn-on-ledger"]
+        self.assertEqual((row["pass"], row["qualification"]),
+                         (False, "failed"))
+        self.assertIn("not the pinned signature", row["detail"])
+        self.assertIn("bootstrap_unavailable", row["detail"])
 
     def test_ring_loss_fails_with_clean_twin_attribution(self):
         proc, outdir, rows = self.run_script("ring-loss", "clean")

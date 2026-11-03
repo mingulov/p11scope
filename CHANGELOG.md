@@ -32,6 +32,16 @@ versioned separately and are opaque, exact dispatch keys.
   a fixed argument slot, so an `MREMAP_DONTUNMAP` move of a watched provider
   mapping went unnoticed there; it now reads the returned VMA on every
   `copy_vma` shape.
+- Aimed captures admit first-come with no shared-scope reserve: `--pid`,
+  or `--module` naming the providers to capture, admits in discovery
+  order, while unaimed system/cgroup captures keep the GT-5 reserve for
+  late corroborated providers. Previously the collector held the reserve
+  on every pass, so an aimed 8,192-endpoint capture stalled at the
+  6,144 heuristic ceiling.
+- `inspect --system --module` mirrors capture admission: an aimed
+  inspection admits first-come (an over-budget heuristic provider admits
+  its strongest prefix with the spill disclosed) instead of refusing
+  whole modules at the shared reserve.
 
 ## [0.5.0]
 

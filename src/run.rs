@@ -457,10 +457,15 @@ fn check_launch_file(launch_file: &File) -> io::Result<()> {
 /// Where snapd installs its command launchers: symlinks to `/usr/bin/snap`,
 /// which starts the application through `snap-confine`.
 const SNAP_LAUNCHER_DIR: &str = "/snap/bin";
+/// The system launcher directory snapd manages on some installations:
+/// the same launchers, the same confined start.
+const SNAP_SYSTEM_LAUNCHER_DIR: &str = "/var/lib/snapd/snap/bin";
+/// The snap binary every launcher resolves to.
+const SNAP_BINARY: &str = "/usr/bin/snap";
 
 /// The attach alternative named by the launcher refusals: a process that
 /// is already running is observed by PID or by provider, never launched.
-const ATTACH_HINT: &str = "or start the application normally and attach to it: find it with \
+const ATTACH_HINT: &str = "start the application normally and attach to it: find it with \
     `p11scope inspect --system`, then `p11scope profile --pid <pid>` or `p11scope profile \
     --system --module <provider.so>`";
 
@@ -476,42 +481,155 @@ fn snap_path_candidate_is_runnable(candidate: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Refuses a snap command (`/snap/bin/<name>`, named directly or found
-/// first on `path`) before the fork. snapd starts every snap application
-/// through `snap-confine`, which needs its file capabilities; the owned
-/// child runs with no_new_privs, which withholds them, so the launch can
-/// only fail later inside snap-confine. `exists` (direct path: lstat
-/// existence) and `is_runnable` (PATH: stat + file + exec, mirroring
-/// resolution) are injectable for tests.
-fn snap_launcher_refusal(
-    program: &OsStr,
-    path: Option<&OsStr>,
-    exists: &dyn Fn(&Path) -> bool,
-    is_runnable: &dyn Fn(&Path) -> bool,
-) -> Option<io::Error> {
-    let launcher_dir = Path::new(SNAP_LAUNCHER_DIR);
-    let launcher = if program.as_bytes().contains(&b'/') {
-        let candidate = Path::new(program);
-        (candidate.parent() == Some(launcher_dir) && exists(candidate))
-            .then(|| candidate.to_path_buf())?
+/// Filesystem probes for the snap pre-check, injectable for tests:
+/// `exists` is lstat existence, `is_runnable` is stat + file + exec
+/// (mirroring resolution), `resolve` follows the whole chain
+/// (production: `canonicalize`).
+struct SnapProbes<'a> {
+    exists: &'a dyn Fn(&Path) -> bool,
+    is_runnable: &'a dyn Fn(&Path) -> bool,
+    resolve: &'a dyn Fn(&Path) -> Option<PathBuf>,
+}
+
+/// `candidate` absolutized against `cwd` with `.` and `..` collapsed
+/// lexically, without touching the filesystem: the launcher itself is a
+/// symlink, so canonicalization would lose its directory.
+fn snap_spelling_absolute(candidate: &Path, cwd: &Path) -> PathBuf {
+    use std::path::Component;
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
     } else {
-        // Like the PATH search: the first runnable candidate wins.
-        std::env::split_paths(path.unwrap_or_default())
-            .map(|directory| directory.join(program))
-            .find(|candidate| is_runnable(candidate))
-            .filter(|candidate| candidate.parent() == Some(launcher_dir))?
+        cwd.join(candidate)
     };
-    let name = launcher.file_name()?.to_string_lossy().into_owned();
-    Some(io::Error::new(
+    let mut parts: Vec<Component> = Vec::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(parts.last(), Some(Component::Normal(_))) {
+                    parts.pop();
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.iter().collect()
+}
+
+/// Whether `candidate` names a file directly inside a snap launcher
+/// directory, after lexical normalization — so `..` and relative
+/// spellings match, and a `..` escape does not.
+fn snap_launcher_dir_contains(candidate: &Path, cwd: &Path) -> bool {
+    let parent = snap_spelling_absolute(candidate, cwd)
+        .parent()
+        .map(Path::to_path_buf);
+    parent.is_some_and(|parent| {
+        parent == Path::new(SNAP_LAUNCHER_DIR) || parent == Path::new(SNAP_SYSTEM_LAUNCHER_DIR)
+    })
+}
+
+/// The shared tail of every snap refusal: why the launch cannot work,
+/// the recommended attach path first, the in-snap binary second with
+/// its confinement cost. The example names Firefox's binary only for
+/// Firefox; every other snap gets the generic in-snap path.
+fn snap_refusal_tail(name: &str) -> String {
+    let example = if name == "firefox" {
+        "`p11scope run -- /snap/firefox/current/usr/lib/firefox/firefox`"
+    } else {
+        "`p11scope run -- /snap/<snap>/current/<program>`"
+    };
+    format!(
+        "snap starts it through snap-confine, whose file capabilities the owned child's \
+         no_new_privs withholds, so it cannot start under `p11scope run`. Recommended: \
+         {ATTACH_HINT}. Alternatively, name the program inside the snap directly ({example}), \
+         but that runs outside snap confinement; browser sandboxes are weaker under \
+         no_new_privs, so use a throwaway profile."
+    )
+}
+
+/// A snap launcher (or any name resolving to the snap binary) refused by name.
+fn snap_refusal_error(name: &str, launcher: &str) -> io::Error {
+    io::Error::new(
         io::ErrorKind::InvalidInput,
         format!(
-            "{name} is a snap application ({}): snap starts it through snap-confine, whose \
-             file capabilities the owned child's no_new_privs withholds, so it cannot start \
-             under `p11scope run`. Name the program inside the snap directly when it runs \
-             outside confinement (Firefox: `p11scope run -- \
-             /snap/firefox/current/usr/lib/firefox/firefox`), {ATTACH_HINT}",
-            launcher.display()
+            "{name} is a snap application ({launcher}): {}",
+            snap_refusal_tail(name)
         ),
+    )
+}
+
+/// `snap run` refused by name: `app` is the snap application when the
+/// arguments name one.
+fn snap_run_refusal_error(app: Option<&str>, resolved: &str) -> io::Error {
+    let (head, name) = match app {
+        Some(app) => (
+            format!("{app} is a snap application (`snap run {app}`)"),
+            app,
+        ),
+        None => (
+            format!("`snap run` starts a snap application ({resolved})"),
+            "snap run",
+        ),
+    };
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{head}: {}", snap_refusal_tail(name)),
+    )
+}
+
+/// Refuses a snap command before the fork. snapd starts every snap
+/// application through `snap-confine`, which needs its file capabilities;
+/// the owned child runs with no_new_privs, which withholds them, so the
+/// launch can only fail later inside snap-confine. Three rules: a
+/// launcher inside a snap bin directory (named directly or found first
+/// on `path`), any other spelling resolving to the snap binary, and
+/// `snap run` itself (`snap` with other subcommands is not a confined
+/// launch). The filesystem probes are injectable for tests; `cwd`
+/// anchors relative spellings.
+fn snap_launcher_refusal(
+    program: &OsStr,
+    args: &[OsString],
+    path: Option<&OsStr>,
+    cwd: &Path,
+    probes: &SnapProbes,
+) -> Option<io::Error> {
+    let direct = program.as_bytes().contains(&b'/');
+    // The candidate the shell would run: the direct spelling, or the
+    // first runnable PATH hit (mirroring resolution's skip rule).
+    let candidate = if direct {
+        Path::new(program).to_path_buf()
+    } else {
+        std::env::split_paths(path.unwrap_or_default())
+            .map(|directory| directory.join(program))
+            .find(|candidate| (probes.is_runnable)(candidate))?
+    };
+    if snap_launcher_dir_contains(&candidate, cwd) && (!direct || (probes.exists)(&candidate)) {
+        let name = candidate.file_name()?.to_string_lossy().into_owned();
+        return Some(snap_refusal_error(&name, &candidate.display().to_string()));
+    }
+    let resolved = (probes.resolve)(&candidate)?;
+    let snap = (probes.resolve)(Path::new(SNAP_BINARY))?;
+    if resolved != snap {
+        return None;
+    }
+    let file_name = candidate.file_name()?.to_string_lossy();
+    if file_name != "snap" {
+        return Some(snap_refusal_error(
+            &file_name,
+            &candidate.display().to_string(),
+        ));
+    }
+    if !args.first().is_some_and(|arg| arg == "run") {
+        return None;
+    }
+    let app = args
+        .iter()
+        .skip(1)
+        .find(|arg| !arg.as_bytes().starts_with(b"-"))
+        .map(|app| app.to_string_lossy().into_owned());
+    Some(snap_run_refusal_error(
+        app.as_deref(),
+        &candidate.display().to_string(),
     ))
 }
 
@@ -528,33 +646,102 @@ fn script_interpreter(launch_file: &File) -> Option<String> {
     Some(String::from_utf8_lossy(interpreter).into_owned())
 }
 
+/// A script launch file refused with its interpreter and the attach
+/// alternative.
+fn script_refusal_error(resolved: &Path, token: &str, error: &io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{error}. {} is a script for {token}: run `p11scope run -- {token} {}` (a script \
+             that starts a snap application still cannot run here), or {ATTACH_HINT}",
+            resolved.display(),
+            resolved.display()
+        ),
+    )
+}
+
+/// A script that starts a snap application, refused with the snap reason.
+fn script_snap_refusal_error(
+    resolved: &Path,
+    token: &str,
+    name: &str,
+    launcher: &Path,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{} is a script for {token} that starts the snap application {name} ({}): {}",
+            resolved.display(),
+            launcher.display(),
+            snap_refusal_tail(name),
+        ),
+    )
+}
+
 /// Refuses a command that cannot run as an owned target by name, before
 /// anything is forked. Name errors precede hazard errors: a script is
 /// told about its interpreter before any kernel verdict is consulted.
-fn check_owned_target_runnable(program: &OsStr) -> io::Result<()> {
-    if let Some(refusal) = snap_launcher_refusal(
+fn check_owned_target_runnable(program: &OsStr, args: &[OsString]) -> io::Result<()> {
+    let probes = SnapProbes {
+        exists: &|candidate: &Path| std::fs::symlink_metadata(candidate).is_ok(),
+        is_runnable: &snap_path_candidate_is_runnable,
+        resolve: &|candidate: &Path| std::fs::canonicalize(candidate).ok(),
+    };
+    check_owned_target_runnable_with(
         program,
+        args,
         std::env::var_os("PATH").as_deref(),
-        &|candidate: &Path| std::fs::symlink_metadata(candidate).is_ok(),
-        &snap_path_candidate_is_runnable,
-    ) {
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        ChildIdentity::for_invoker()
+            .ok()
+            .map(|identity| (identity.uid, identity.gid)),
+        &probes,
+    )
+}
+
+/// [`check_owned_target_runnable`] with injectable environment (search
+/// path, working directory, invoker identity) and filesystem probes, so
+/// tests pin the refusal without touching `/snap/bin` or the process
+/// environment. Production passes the real values; behavior is identical.
+fn check_owned_target_runnable_with(
+    program: &OsStr,
+    args: &[OsString],
+    path: Option<&OsStr>,
+    cwd: &Path,
+    _invoker: Option<(u32, u32)>,
+    probes: &SnapProbes,
+) -> io::Result<()> {
+    if let Some(refusal) = snap_launcher_refusal(program, args, path, cwd, probes) {
         return Err(refusal);
     }
-    let resolved = resolve_program(program)?;
+    let resolved = resolve_program_in_path(program, path)?;
     let launch_file = File::open(&resolved)?;
-    check_launch_file(&launch_file).map_err(|error| match script_interpreter(&launch_file) {
-        Some(interpreter) if error.kind() == io::ErrorKind::InvalidInput => io::Error::new(
-            error.kind(),
-            format!(
-                "{error}. {} is a script for {interpreter}: run `p11scope run -- {interpreter} \
-                 {}` (a script that starts a snap application still cannot run here), \
-                 {ATTACH_HINT}",
-                resolved.display(),
-                resolved.display()
-            ),
-        ),
-        _ => error,
-    })
+    let error = match check_launch_file(&launch_file) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let token = if error.kind() == io::ErrorKind::InvalidInput {
+        script_interpreter(&launch_file)
+    } else {
+        None
+    };
+    let Some(token) = token else {
+        return Err(error);
+    };
+    // A script that starts a snap application (Ubuntu's /usr/bin/firefox
+    // wrapper): the snap reason, not the interpreter detour that would
+    // fail later inside snap-confine. Lstat only: the launcher is a
+    // symlink, and its target's state is irrelevant to the refusal.
+    if let Some(file_name) = resolved.file_name() {
+        let launcher = Path::new(SNAP_LAUNCHER_DIR).join(file_name);
+        if (probes.exists)(&launcher) {
+            let name = file_name.to_string_lossy();
+            return Err(script_snap_refusal_error(
+                &resolved, &token, &name, &launcher,
+            ));
+        }
+    }
+    Err(script_refusal_error(&resolved, &token, &error))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3482,7 +3669,7 @@ fn run_owned_inner_with_host(
     // Name errors precede hazard errors: a script (or a non-executable)
     // is refused with its interpreter fix before any kernel verdict is
     // consulted, exactly as `spawn` would refuse it at the fork.
-    check_owned_target_runnable(&program)
+    check_owned_target_runnable(&program, &args.command[1..])
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let _host = host()?;
     // Before the fork: the owned child can install a seccomp filter after
@@ -12483,10 +12670,8 @@ mod tests {
             ("/snap/bin/firefox", None),
             ("firefox", Some("/nonexistent-dir:/snap/bin")),
         ] {
-            let exists =
-                |candidate: &Path| candidate == Path::new("/snap/bin/firefox");
-            let is_runnable =
-                |candidate: &Path| candidate == Path::new("/snap/bin/firefox");
+            let exists = |candidate: &Path| candidate == Path::new("/snap/bin/firefox");
+            let is_runnable = |candidate: &Path| candidate == Path::new("/snap/bin/firefox");
             let resolve_none = |_: &Path| None;
             let probes = snap_probes(&exists, &is_runnable, &resolve_none);
             let error = snap_launcher_refusal(
@@ -12561,8 +12746,7 @@ mod tests {
     #[test]
     fn snap_refusal_uses_a_generic_example_for_other_snaps() {
         let exists = |candidate: &Path| candidate == Path::new("/snap/bin/spotify");
-        let is_runnable =
-            |candidate: &Path| candidate == Path::new("/snap/bin/spotify");
+        let is_runnable = |candidate: &Path| candidate == Path::new("/snap/bin/spotify");
         let resolve_none = |_: &Path| None;
         let probes = snap_probes(&exists, &is_runnable, &resolve_none);
         let text = snap_launcher_refusal(
@@ -12575,10 +12759,7 @@ mod tests {
         .expect("spotify must be refused")
         .to_string();
         assert!(text.contains("spotify is a snap application"), "{text}");
-        assert!(
-            text.contains("/snap/<snap>/current/<program>"),
-            "{text}"
-        );
+        assert!(text.contains("/snap/<snap>/current/<program>"), "{text}");
         assert!(!text.contains("/snap/firefox/"), "{text}");
     }
 
@@ -12640,8 +12821,7 @@ mod tests {
     fn snap_precheck_follows_resolution_to_the_snap_binary_and_snap_run() {
         let exists = |_: &Path| false;
         let is_runnable = |candidate: &Path| {
-            candidate == Path::new("/usr/bin/snap")
-                || candidate == Path::new("/opt/alias/spotify")
+            candidate == Path::new("/usr/bin/snap") || candidate == Path::new("/opt/alias/spotify")
         };
         let resolve = |candidate: &Path| -> Option<PathBuf> {
             if candidate == Path::new("/opt/alias/spotify")
@@ -12789,8 +12969,7 @@ mod tests {
     #[test]
     fn snap_precheck_skips_an_earlier_shadow_for_the_snap_launcher() {
         let exists = |candidate: &Path| {
-            candidate == Path::new("/tmp/shadow/tool")
-                || candidate == Path::new("/snap/bin/tool")
+            candidate == Path::new("/tmp/shadow/tool") || candidate == Path::new("/snap/bin/tool")
         };
         let is_runnable = |candidate: &Path| candidate == Path::new("/snap/bin/tool");
         let resolve_none = |_: &Path| None;

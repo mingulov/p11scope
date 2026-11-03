@@ -18363,10 +18363,13 @@ exit 0
             .find(|edge| edge.caller == caller)
             .expect("the caller has an edge");
         assert_eq!(edge.entry_count, 10, "the pre-loss count stages");
-        native.scene.coordinator.note_capture_custody(&ScopeCustody::PidLost {
-            at_ns: 2_000,
-            reason: "scripted PID custody loss".into(),
-        });
+        native
+            .scene
+            .coordinator
+            .note_capture_custody(&ScopeCustody::PidLost {
+                at_ns: 2_000,
+                reason: "scripted PID custody loss".into(),
+            });
         native.counts_read(Vec::new(), vec![(41, 1, 0, 40)]);
         native.scene.coordinator.commit_batch(false).unwrap();
         let held = native
@@ -18410,6 +18413,83 @@ exit 0
             "frozen at {} with {coverage:?}: a stopped counter under disclosed loss \
              must read lossy, never counted/lossy:false",
             edge.entry_count
+        );
+    }
+
+    #[test]
+    fn a_count_placed_after_lifecycle_loss_reads_lossy() {
+        // The production shape: the lifecycle ring loses records before
+        // the driver is admitted, and the driver's pair places its
+        // first count after the loss. The first-sight install lands via
+        // pending placement while the later refresh is withheld once
+        // bound — either way the edge must read lossy, never
+        // counted/lossy:false.
+        let mut scene = CaptureScene::new(2);
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
+        let mut lost = witness_batch();
+        lost.health_read_ns = 60;
+        lost.lifecycle_loss = Some(crate::attach::capture::LifecycleLoss {
+            at_ns: 60,
+            reason: "the lifecycle ring lost records (DISCOVERY ring loss 0 -> 4411): \
+                 an exec or exit of a watched caller may be among them"
+                .into(),
+        });
+        scene.coordinator.note_witness_batch(&lost);
+        scene.coordinator.registry.publish();
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 70)
+            .unwrap();
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::System);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 130, 0);
+        let key = PairKey::of(&row);
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 10)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let held = native
+            .scene
+            .coordinator
+            .pair_counts
+            .get(&key)
+            .map(|held| held.count)
+            .unwrap_or(0);
+        assert_eq!(held, 10, "the churn refresh reached the held pair");
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native capture lifecycle evidence lost"),
+            "the lifecycle loss is a disclosed gap"
+        );
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(
+            edge.entry_count, 1,
+            "the first-sight install lands; the refresh is withheld once bound"
+        );
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 130,
+                lossy: true
+            },
+            "a count placed after lifecycle loss reads lossy"
         );
     }
 

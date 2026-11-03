@@ -498,6 +498,11 @@ else
     exit 1
 fi
 T_GO=$(mono_ns)
+# GO in the sampler's clock domain (wall ms since the sampler start):
+# the oracle judges growth on samples at or after arming (pass 0
+# published). Same wall clock as SAMPLER_START_MS, so a step shifts
+# both together and sample ordering against GO stays correct.
+GO_SAMPLER_MS=$(( $(now_ms) - SAMPLER_START_MS ))
 LOADAVG=$(cat /proc/loadavg)
 owned_live_status=0
 owned_require_live "$STARGET_PID" "$STARGET_STARTTIME" || owned_live_status=$?
@@ -602,7 +607,7 @@ fi
 export WORK CELL TEST_ID KERNEL_PROFILE MODE HORIZON REQUIRE_DURATION
 export OBSERVER_SLACK_S OBSERVER_DURATION CALLERS ITERS SLEEP_US DELAY_MS SEED
 export GIT_REV GIT_TREE HARNESS_START_ISO HARNESS_ARGV_JSON
-export OBS_ARGV_JSON T_SPAWN T_GO T_EXIT MODULE
+export OBS_ARGV_JSON T_SPAWN T_GO T_EXIT MODULE GO_SAMPLER_MS
 export OBS_RC OBSERVER_SIGNAL OBSERVER_TIMED_OUT SAMPLER_EXIT SAMPLER_SIGNAL
 export INSTALLED INSTALLED_SHA_PRE=${INSTALLED_SHA_PRE-} INSTALLED_SHA_POST=${INSTALLED_SHA_POST-}
 export INSTALLED_SIZE=${INSTALLED_SIZE-}
@@ -678,6 +683,7 @@ run = {
     "sampler": {"exit": integer("SAMPLER_EXIT"), "signal": signal("SAMPLER_SIGNAL")},
     "timing": {"t_spawn_mono_ns": integer("T_SPAWN"),
                "t_go_mono_ns": integer("T_GO"),
+               "t_go_sampler_ms": integer("GO_SAMPLER_MS"),
                "start_mono_ns": integer("T_GO"),
                "end_mono_ns": integer("T_EXIT")},
     "host": {"kernel": os.environ["KERNEL"], "cpu": os.environ["CPU"],

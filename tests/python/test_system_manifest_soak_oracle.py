@@ -534,6 +534,135 @@ class SoakOracleTest(unittest.TestCase):
             self.evaluate(mutate_copy(self.green, "leg-trace", truncate)),
             "resource_accounting")
 
+    def test_green_resources_arming_ramp_then_flat_passes(self):
+        """An arming ramp that ends at GO is bounded, not growth.
+
+        Live shape (proof mode): RSS climbs 41 MB to 248 MB while pass 0
+        admits the system, FDs climb 30 to 410, then both hold flat with
+        a small post-arming drift. Judged after the product-reported
+        arming point, neither grows steadily.
+        """
+        base = make_green(self.base / "arming-base", horizon=120)
+        rows = []
+        for n in range(190):
+            if n < 30:
+                rss = 41_000 + n * 6900
+                fds = 30 + n * 12
+            else:
+                rss = 248_000 + (n - 30) * 30 + (n % 5)
+                fds = 410 + (n % 7) * 2
+            rows.append((n * 1000, rss, rss + 5000, fds))
+
+        def ramp(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 30000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-arming", ramp))
+        self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+
+    def test_green_resources_bounded_post_arming_oscillation_passes(self):
+        """A bounded pass-synchronous FD sawtooth is not growth.
+
+        Live shape: after GO the observer holds ~530 module files open
+        during each pass's match phase and releases them, so FDs swing
+        400 to 920 every few seconds with a flat envelope. Quartile
+        medians alias the phase; the floor trend stays flat.
+        """
+        base = make_green(self.base / "sawtooth-base", horizon=120)
+        rows = []
+        for n in range(190):
+            if n < 20:
+                fds = 30 + n * 18
+            else:
+                fds = 400 if (n % 6) < 2 else 920
+            rss = 248_000 + (n % 5)
+            rows.append((n * 1000, rss, rss + 5000, fds))
+
+        def sawtooth(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 20000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-sawtooth", sawtooth))
+        self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+
+    def test_red_resources_post_arming_fd_leak(self):
+        """A real FD leak after arming still fails (mutation twin)."""
+        base = make_green(self.base / "fdleak-base", horizon=120)
+        rows = []
+        for n in range(190):
+            if n < 20:
+                fds = 30 + n * 18
+            else:
+                fds = 400 + (n - 20) * 2
+            rows.append((n * 1000, 52_000 + (n % 5), 54_000, fds))
+
+        def leak(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 20000}))
+        self.assert_red_only(
+            self.evaluate(mutate_copy(base, "leg-fdleak", leak)),
+            "resource_accounting")
+
+    def test_red_resources_post_arming_rss_leak(self):
+        """A real RSS leak after arming still fails (mutation twin)."""
+        base = make_green(self.base / "rssleak-base", horizon=120)
+        rows = []
+        for n in range(190):
+            fds = 30 + n * 2 if n < 20 else 410
+            if n < 20:
+                rss = 41_000 + n * 550
+            else:
+                rss = 52_000 + (n - 20) * 400
+            rows.append((n * 1000, rss, rss + 2000, fds))
+
+        def leak(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 20000}))
+        self.assert_red_only(
+            self.evaluate(mutate_copy(base, "leg-rssleak", leak)),
+            "resource_accounting")
+
+    def test_red_resources_missing_arming_point_judges_whole_trace(self):
+        """Without a product-reported arming point the whole trace is
+        judged (fail closed): an arming ramp with no GO stamp fails."""
+        base = make_green(self.base / "nogo-base", horizon=120)
+        rows = []
+        for n in range(190):
+            if n < 30:
+                rss = 41_000 + n * 6900
+                fds = 30 + n * 12
+            else:
+                rss = 248_000 + (n % 5)
+                fds = 410 + (n % 7) * 2
+            rows.append((n * 1000, rss, rss + 5000, fds))
+
+        def ramp(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+        self.assert_red_only(
+            self.evaluate(mutate_copy(base, "leg-nogo", ramp)),
+            "resource_accounting")
+
+    def test_green_resources_late_arming_falls_back_to_whole_trace(self):
+        """Fewer than eight post-arming samples judges the whole trace;
+        a flat trace still passes through the fallback."""
+        base = make_green(self.base / "latego-base", horizon=120)
+        rows = [(n * 1000, 52_000 + (n % 5), 54_000, 410) for n in range(190)]
+
+        def late_go(target):
+            (target / "resources.tsv").write_text(
+                _resources(rows), encoding="utf-8")
+            rewrite_json(target / "run.json", lambda run: run["timing"].update(
+                {"t_go_sampler_ms": 185000}))
+        verdict = self.evaluate(mutate_copy(base, "leg-latego", late_go))
+        self.assertEqual(verdict["verdict"], "PASS", json.dumps(verdict["gates"]))
+
     def test_red_journal_populated_claim(self):
         def populate(target):
             rewrite_json(target / "report.json", lambda report: report.update(

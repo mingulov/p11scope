@@ -1695,3 +1695,6 @@ mod inventory_present_key_ops_tests;
 #[cfg(test)]
 #[path = "present/reload_disclosure_privileged_tests.rs"]
 mod reload_disclosure_privileged_tests;
+
+#[path = "present/reload_disclosure.rs"]
+pub(crate) mod reload_disclosure;

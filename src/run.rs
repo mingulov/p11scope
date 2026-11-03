@@ -12937,6 +12937,138 @@ mod tests {
         );
     }
 
+    /// The refusal is printed to a terminal: control bytes in the `#!`
+    /// token and in the resolved path render escaped, never raw.
+    #[test]
+    fn script_refusal_escapes_control_bytes_in_token_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("we\x11ird");
+        std::fs::write(&script, "#!bad\x07interp --flag\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invoker = ChildIdentity::for_invoker()
+            .ok()
+            .map(|identity| (identity.uid, identity.gid));
+        let exists = |_: &Path| false;
+        let is_runnable = |_: &Path| false;
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let text = check_owned_target_runnable_with(
+            script.as_os_str(),
+            &[],
+            Some(std::ffi::OsStr::new("")),
+            Path::new("/"),
+            invoker,
+            &probes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            text.contains("bad\\u{7}interp"),
+            "the token must render escaped: {text}"
+        );
+        assert!(
+            !text.contains("bad\x07interp"),
+            "no raw control byte from the token: {text}"
+        );
+        assert!(
+            text.contains("we\\u{11}ird"),
+            "the path must render escaped: {text}"
+        );
+        assert!(
+            !text.contains("we\x11ird"),
+            "no raw control byte from the path: {text}"
+        );
+    }
+
+    /// The refusal runs as the observer (possibly root via sudo) but the
+    /// `#!` token is only shown when the invoker could read the file
+    /// itself: owner, primary group, or other read bits decide.
+    #[test]
+    fn script_token_is_hidden_from_an_invoker_who_cannot_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("guarded.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let meta = std::fs::metadata(&script).unwrap();
+        let (owner, group) = (meta.uid(), meta.gid());
+        let other = owner.wrapping_add(1);
+        let other_group = group.wrapping_add(1);
+        assert_ne!(other, owner);
+        assert_ne!(other_group, group);
+        let exists = |_: &Path| false;
+        let is_runnable = |_: &Path| false;
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let refusal = |invoker: Option<(u32, u32)>| {
+            check_owned_target_runnable_with(
+                script.as_os_str(),
+                &[],
+                Some(std::ffi::OsStr::new("")),
+                Path::new("/"),
+                invoker,
+                &probes,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        // Owner-readable: the owner sees the token, anyone else does not.
+        let text = refusal(Some((owner, group)));
+        assert!(text.contains("is a script for /bin/sh"), "{text}");
+        let text = refusal(Some((other, other_group)));
+        assert!(
+            text.contains("is not shown because the invoking user cannot read this file"),
+            "{text}"
+        );
+        assert!(!text.contains("is a script for"), "{text}");
+        // Group-readable: the primary group sees the token.
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let text = refusal(Some((other, group)));
+        assert!(text.contains("is a script for /bin/sh"), "{text}");
+        let text = refusal(Some((other, other_group)));
+        assert!(
+            text.contains("is not shown because the invoking user cannot read this file"),
+            "{text}"
+        );
+        // Other-readable: everyone sees the token.
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o705)).unwrap();
+        let text = refusal(Some((other, other_group)));
+        assert!(text.contains("is a script for /bin/sh"), "{text}");
+    }
+
+    /// The snap-starting script refusal hides the token the same way when
+    /// the invoker could not read the file.
+    #[test]
+    fn snap_script_refusal_hides_an_unreadable_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("firefox");
+        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/firefox \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let meta = std::fs::metadata(&script).unwrap();
+        let invoker = Some((meta.uid().wrapping_add(1), meta.gid().wrapping_add(1)));
+        let exists = |candidate: &Path| candidate == Path::new("/snap/bin/firefox");
+        let is_runnable = |_: &Path| false;
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let text = check_owned_target_runnable_with(
+            script.as_os_str(),
+            &[],
+            Some(std::ffi::OsStr::new("")),
+            Path::new("/"),
+            invoker,
+            &probes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            text.contains(
+                "is a script that starts the snap application firefox (/snap/bin/firefox)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("is a script for"), "{text}");
+        assert!(text.contains("snap-confine"), "{text}");
+    }
+
     /// Over-refusal: a dangling `/snap/bin/tool` (lstat hit, not runnable)
     /// with a later runnable `/usr/bin/tool` must not refuse — resolution
     /// runs the later binary. `exists` simulates lstat (true for the

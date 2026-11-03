@@ -2374,6 +2374,7 @@ fn finish_prearm_terminal(
     kernel: &metrics::KernelEvidence,
     malformed_records: u64,
     stop_ns: Option<u64>,
+    hold: Option<crate::discovery::pause::PauseGateHold>,
 ) {
     let used = if engine.has_prearm_watches() {
         prearm_used_modules(reports, engine.plan(), engine.pinned())
@@ -2388,6 +2389,7 @@ fn finish_prearm_terminal(
         stop_ns,
         kernel,
         malformed_records,
+        hold,
     );
 }
 
@@ -6374,6 +6376,7 @@ fn capture_profile(
             &kernel_evidence,
             *consumers.malformed_records,
             stop_ns,
+            None,
         );
         let settle_start = crate::attach::monotonic_ns();
         context.0.settle_terminal_drain();
@@ -7232,6 +7235,7 @@ fn capture_trace(
                         &watch_kernel,
                         *consumers.malformed_records,
                         watch_stop_ns,
+                        None,
                     );
                     let settle_start = crate::attach::monotonic_ns();
                     context.0.settle_terminal_drain();
@@ -13681,6 +13685,7 @@ mod tests {
                 &metrics::KernelEvidence::default(),
                 0,
                 Some(1000),
+                None,
             );
             let watch = engine.discovery().modules[0]
                 .watch
@@ -13689,6 +13694,95 @@ mod tests {
             assert_eq!(watch.until_ns, Some(1000));
             assert_eq!(watch.ended_by, Some(cause));
         }
+    }
+
+    #[test]
+    fn prearm_terminal_pause_hold_empties_windows() {
+        use crate::attach::BackendSelection;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+        use crate::discovery::hooks::HookRegistry;
+
+        // A real provider shape (proved exports, so plan slots exist),
+        // never mapped here: the hold alone carries the exactness.
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/discovery-lifecycle.c");
+        let provider = dir.path().join("hold-provider.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args([
+                    "-std=c11",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-shared",
+                    "-fPIC",
+                    "-DDISCOVERY_LIFECYCLE_PROVIDER",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&provider)
+                .arg("-ldl")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pid = std::process::id();
+        let args = CaptureArgs {
+            kind: Kind::Profile,
+            modules: Vec::new(),
+            manifests: Vec::new(),
+            prearm_modules: vec![provider],
+            hooks: HookRegistry::builtin(),
+            scope: ScopeArg::Pid(pid),
+            metrics: false,
+            counter_mode: None,
+            select_endpoint: None,
+            track_short_lived: false,
+            duration: None,
+            out: None,
+            max_events: None,
+            max_scan_pids: None,
+            ring_bytes: None,
+            drain_interval: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            attach_backend: BackendSelection::default(),
+        };
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the self view");
+        let mut engine =
+            Engine::discover(&args, &Scope::Pid(pid), Some(view)).expect("pre-arm discover");
+        assert!(engine.has_prearm_watches());
+        assert!(
+            !engine.plan().slots.is_empty(),
+            "bare pre-arm must plan its proved exports"
+        );
+        engine.set_scope_start_ns(Some(50));
+        let mut session = ScriptedSession::default();
+        for slot in engine.plan().slots.iter() {
+            session.scripted_links.insert(slot.index);
+            session.scripted_stamps.insert(slot.index, 900);
+        }
+        let reports: Vec<metrics::SlotReport> = Vec::new();
+        finish_prearm_terminal(
+            &mut engine,
+            &session,
+            &[],
+            CaptureEnd::DurationExpired,
+            &reports,
+            &metrics::KernelEvidence::default(),
+            0,
+            Some(5000),
+            Some(crate::discovery::pause::PauseGateHold {
+                start_ns: Some(50),
+                end_ns: Some(900),
+                continuous: true,
+            }),
+        );
+        let record = &engine.discovery().modules[0];
+        assert_eq!(record.attached_at_ns, Some(Some(900)));
+        assert_eq!(record.unobserved_windows, Some(Vec::new()));
     }
 
     #[test]

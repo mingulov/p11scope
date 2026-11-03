@@ -29011,6 +29011,7 @@ impl Engine {
         now: Option<u64>,
         kernel: &crate::metrics::KernelEvidence,
         malformed_records: u64,
+        hold: Option<crate::discovery::pause::PauseGateHold>,
     ) {
         // Generic attach/window assembly is independent of the optional
         // pre-arm watch transitions below: a capture without pre-arm
@@ -29109,6 +29110,7 @@ impl Engine {
         // No R2-D1-6 producer ships in this packet: proofs stay empty until
         // C6-D wires installed proof, so attached modules always disclose
         // their window here.
+        let _ = hold;
         let proofs = BTreeMap::new();
         self.prearm
             .assemble(&mut self.discovery.modules, &self.plan, &stamps, &proofs);

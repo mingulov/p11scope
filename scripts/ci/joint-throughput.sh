@@ -302,6 +302,52 @@ event_args() {
     printf '%s --events %s\n' "$args" "$dir/events.jsonl"
 }
 
+# Capture bpftool EVIDENCE[0] sums while the observer still runs (maps are
+# unpinned and vanish on exit). Runs after DONE, before the observer-stop
+# wait returns. The privileged lock is held here, so no other p11scope
+# observer runs concurrently and every EVIDENCE map found is ours (main plus
+# journal objects; the double-count check needs both summed). Writes
+# $dir/bpftool-evidence.json (helper summary JSON) and logs one line.
+# Always succeeds: measurement failures warn and continue, never failing
+# the cell.
+capture_bpf_evidence() {
+    dir=$1
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/bpf-evidence.XXXXXX") || return 0
+    if ! sudo -n bpftool map show -j > "$tmp/show.json" 2>/dev/null; then
+        log "$dir: bpftool map show failed; skipping EVIDENCE capture"
+        rm -rf "$tmp"
+        return 0
+    fi
+    ids=$(python3 -I "$ROOT/scripts/bpf-evidence-sum.py" \
+        --show "$tmp/show.json" --list-ids 2>/dev/null) || ids=""
+    if [ -z "$ids" ]; then
+        log "$dir: no EVIDENCE maps visible; skipping EVIDENCE capture"
+        rm -rf "$tmp"
+        return 0
+    fi
+    args=""
+    # shellcheck disable=SC2086 # ids are bpftool integers, one per line.
+    for id in $ids; do
+        case $id in ''|*[!0-9]*) continue ;; esac
+        if sudo -n bpftool map dump id "$id" -j > "$tmp/dump-$id.json" \
+            2>/dev/null; then
+            args="$args --dump $id=$tmp/dump-$id.json"
+        else
+            log "$dir: bpftool dump of map $id raced away; skipping it"
+        fi
+    done
+    # shellcheck disable=SC2086 # args are helper paths built above.
+    if python3 -I "$ROOT/scripts/bpf-evidence-sum.py" \
+        --show "$tmp/show.json" $args > "$dir/bpftool-evidence.json" \
+        2>"$tmp/helper.err"; then
+        log "$dir: bpftool EVIDENCE: $(cat "$dir/bpftool-evidence.json")"
+    else
+        log "$dir: bpf-evidence-sum failed: $(cat "$tmp/helper.err")"
+    fi
+    rm -rf "$tmp"
+    return 0
+}
+
 # Take evidence ownership after the observer stops: the report,
 # the live event log and any rotated parts (rotation may leave a
 # part root-only). Returns nonzero when the chmod fails.
@@ -571,6 +617,7 @@ run_joint_cell() {
         return 0
     fi
     log "$cell: DONE printed; waiting for the observer to stop"
+    capture_bpf_evidence "$dir"
     obs_rc=0
     wait "$(cat "$dir/observer.pid")" || obs_rc=$?
     sample_load
@@ -675,6 +722,7 @@ run_twin_cell() {
         return 0
     fi
     log "$cell: DONE printed; waiting for the observer to stop"
+    capture_bpf_evidence "$dir"
     obs_rc=0
     wait "$(cat "$dir/observer.pid")" || obs_rc=$?
     sample_load

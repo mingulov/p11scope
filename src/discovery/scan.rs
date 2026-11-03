@@ -7974,6 +7974,63 @@ mod tests {
     }
 
     #[test]
+    fn aliased_export_tail_charges_one_table_not_one_per_alias() {
+        // Mirror of the capacity fixture layout: a 2.40 table whose words
+        // past the distinct bodies all alias the exported getter. Every
+        // alias occurrence is an anchor candidate; only the real table may
+        // charge the table budget. Charging one candidate per alias burns
+        // ~36 candidates per provider and exhausts the 512-candidate
+        // ceiling at 14 providers (952 endpoints), starving system scale.
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [("C_GetFunctionList".to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+        };
+        // Anchor address: the r-x mapping runs 0x1000-0x3000 at file
+        // offset 0, so file offset 0x500 lands at 0x1500.
+        let getter = 0x1500u64;
+        let mut snapshot = 0x2802u64.to_le_bytes().to_vec();
+        for slot in 0..68u64 {
+            let word = if slot == 3 {
+                getter
+            } else {
+                0x1600 + slot * 8
+            };
+            snapshot.extend_from_slice(&word.to_le_bytes());
+        }
+        for _ in 0..36 {
+            snapshot.extend_from_slice(&getter.to_le_bytes());
+        }
+        let mut budget = CaptureWorkBudget::default();
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut budget,
+            Some(&exports),
+            &[],
+            || Some(0),
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(tables.len(), 1, "one real table, no anchor phantoms");
+        assert_eq!(tables[0].address, 0x7000);
+        assert_eq!(tables[0].version, (2, 40));
+        assert_eq!(tables[0].entries.len(), 68);
+        assert_eq!(
+            budget.table_candidates_count(),
+            1,
+            "aliases must not charge the table budget"
+        );
+        assert_eq!(budget.decoded_table_entries_count(), 68);
+    }
+
+    #[test]
     fn private_capacity_tail_exposes_shared_reserve_without_api_name_proof() {
         use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
         use crate::plan::{

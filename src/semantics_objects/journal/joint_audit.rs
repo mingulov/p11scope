@@ -417,33 +417,59 @@ fn vector_capacity(required: usize) -> Option<usize> {
 /// Retained result only; transition temporaries remain covered by the existing
 /// serialized scratch reservation. Recompute from current populations before
 /// EVERY seal: a previous domain may have grown the model since acquisition.
-pub(super) fn result_storage_bound(adapter: &JournalAdapter, model: &ObjectSemantics) -> Option<usize> {
+///
+/// Linear in retained calls. One seal applies its calls once, in place, to
+/// one model, and every broad action (contradiction, void, session end,
+/// alias retirement, uncertain mutation) emits at most once per object or
+/// session over the whole seal, not once per call:
+/// - `Retired`/`AccessEnded`/`Destroyed`: only a `Live` view ends, and an
+///   ended view never becomes `Live` again (`end_view`, `destroy_view`).
+/// - `Downgraded`: only a `Valid` view downgrades, and only allocation
+///   makes a view `Valid` (`contradict`).
+/// - `SessionEnded`: only a `Live` session ends (`end_session`).
+/// - `MetadataInvalidated`: only a view holding an established or
+///   conflicting field emits, and a field is re-established only by
+///   `establish` on one of a call's input handles. So each object emits
+///   once for its state at seal start, plus once per input-handle
+///   re-establishment.
+/// Objects created during the seal are bounded by the touched handles of
+/// each call, and sessions by one per call.
+pub(super) fn result_storage_bound(
+    adapter: &JournalAdapter,
+    model: &ObjectSemantics,
+) -> Option<usize> {
     let calls = adapter.open.len().checked_add(adapter.refused.len())?;
     let (objects, sessions) = model.audit_loss_record_counts();
     let handles = MAX_INPUT_HANDLES
         .checked_add(MAX_RESULT_HANDLES)?
         .checked_add(MAX_FIND_HANDLES)?;
-    let prospective_objects =
-        objects.checked_add(calls.checked_mul(MAX_RESULT_HANDLES.max(MAX_FIND_HANDLES))?)?;
+    let prospective_objects = objects.checked_add(calls.checked_mul(handles)?)?;
     let prospective_sessions = sessions.checked_add(calls)?;
     // state::apply_action selects one finite action. Per touched handle,
     // establishment may emit one conflict for each bounded observation and
     // one established summary; creation/first-observation, reference,
     // destruction/retirement and unresolved/gap each add at most one.
     let per_handle = MAX_TEMPLATE_ATTRIBUTES.checked_add(1)?.checked_add(4)?;
-    // A broad action can downgrade, invalidate metadata and retire a live
-    // view, and end a session. Include the direct session first/open and
-    // call gap/unresolved summaries separately. Repeated broad actions are
-    // conservatively counted per actual retained call, not assumed away.
+    // Direct per-call effects: the touched handles, the session first/open
+    // and call gap/unresolved summaries, and one repeated metadata
+    // invalidation for each input handle the call may re-establish.
     let per_call = handles
         .checked_mul(per_handle)?
         .checked_add(4)?
-        .checked_add(prospective_objects.checked_mul(3)?)?
+        .checked_add(MAX_INPUT_HANDLES)?;
+    // Broad effects, once per object or session across the whole seal:
+    // lifetime end, downgrade and first invalidation per object, and one
+    // end per session.
+    let broad = prospective_objects
+        .checked_mul(3)?
         .checked_add(prospective_sessions)?;
     let loss = objects
         .checked_add(sessions)?
         .checked_add(adapter.keys.len().checked_mul(2)?)?;
-    let effects = calls.checked_mul(per_call)?.checked_add(loss)?;
+    let effects = calls
+        .checked_mul(per_call)?
+        .checked_add(broad)?
+        .checked_add(loss)?;
     allocation_bytes::<ObjectDomain>(adapter.keys.len())?
         .checked_add(allocation_bytes::<ObjectEffect>(vector_capacity(effects)?)?)?
         .checked_add(allocation_bytes::<SealedCall>(vector_capacity(

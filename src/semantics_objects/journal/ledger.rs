@@ -171,6 +171,12 @@ impl StagingLedger {
         self.table.as_ref().map_or(0, ReservationTable::census)
     }
 
+    /// Reservations this ledger can still mint before its fixed table is
+    /// full. Scheduling only: every charge still preflights its own slot.
+    pub(crate) fn reservation_room(&self) -> usize {
+        MAX_UNSETTLED_STAGED.saturating_sub(self.census())
+    }
+
     fn key(value: u64) -> RoleKey {
         RoleKey {
             namespace: 0,

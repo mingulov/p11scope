@@ -727,6 +727,13 @@ impl RawJointQuantum {
             Some((&mut adapter.ledger, &adapter.open, producers)),
             0,
         )?;
+        // Read no more records than the shared ledger can reserve for. At
+        // least one record keeps a requested first poll real; a full ledger
+        // then refuses that START exactly as before, with its loss disclosed.
+        let initial_work = match raw.shared_intake_room(&adapter.ledger) {
+            Some(room) => initial_work.min(room.max(1)),
+            None => initial_work,
+        };
         let poll = (initial_work != 0).then(|| {
             raw.poll_slice_using(
                 drain,
@@ -827,10 +834,15 @@ impl RawJointQuantum {
         self.observe_counters(drain.malformed(), drain.discarded());
         self.observe_fault(fault.fault_epoch())
             .map_err(RawQuantumRefusal::Fault)?;
+        // The same shared-ledger bound as the first slice; the machine
+        // closes a quantum whose room is spent rather than asking for more.
+        let room = self
+            .shared_intake_room(&adapter.ledger)
+            .map_or(usize::MAX, |room| room.max(1));
         let poll = self.poll_slice_using(
             drain,
             descriptors,
-            work.min(self.capacity - self.attempted),
+            work.min(self.capacity - self.attempted).min(room),
             fault,
             Some((&mut adapter.ledger, &adapter.open, producers)),
             |drain, rows, work, ordinary, journal| {
@@ -905,6 +917,21 @@ impl RawJointQuantum {
     /// Read-only.
     pub(crate) fn begin_table_full_or_refused(&self) -> bool {
         self.resource_refused || self.invocations.len() >= self.invocations.capacity()
+    }
+
+    /// Scheduling only: how many more wire records this quantum may read
+    /// while reservations held outside it (key associations, STARTs
+    /// carried from earlier quanta) share the ledger's fixed table. A
+    /// record mints at most one reservation, so reading no more than the
+    /// room never refuses a START for want of one. None when nothing
+    /// outside holds a slot: the quantum keeps its own BEGIN-table bound.
+    pub(crate) fn shared_intake_room(&self, ledger: &StagingLedger) -> Option<usize> {
+        let owned = self
+            .invocations
+            .iter()
+            .filter(|entry| entry.owns_raw)
+            .count();
+        (ledger.census() > owned).then(|| ledger.reservation_room())
     }
 
     #[cfg(test)]

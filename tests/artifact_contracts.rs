@@ -7952,7 +7952,8 @@ fn prearm_witness_native_harness_covers_every_path() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&run.stdout).contains("prearm witness harness: all controls verified")
+        String::from_utf8_lossy(&run.stdout)
+            .contains("prearm witness harness: all controls verified")
     );
 }
 
@@ -14255,7 +14256,7 @@ const LICENSE_C_FIXTURES: &[&str] = &[
     "tests/fixtures/prearm-witness/harness.c", // tests/artifact_contracts.rs (prearm_witness_native_harness_*)
     "tests/fixtures/root-affiliation/birth_hook_tests.c", // tests/python/test_root_affiliation.py
     "tests/fixtures/root-affiliation/helper_tests.c", // tests/python/test_root_affiliation.py
-    "tests/fixtures/root-fence-runtime.c",      // orphan fixture (no consumer); exempt by location
+    "tests/fixtures/root-fence-runtime.c",     // orphan fixture (no consumer); exempt by location
     "tests/fixtures/task-owner/helper_tests.c", // tests/task_owner_contracts.rs (also included by root-affiliation/helper_tests.c)
 ];
 

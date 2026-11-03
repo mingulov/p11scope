@@ -595,6 +595,12 @@ static PW_INLINE int pw_migrate_one(u64 leader_addr)
         pw_busy_dec(s);
         return 0;
     }
+    /* Migrations matter only for --cgroup (leaving the scope); --pid and
+     * --system membership is unaffected by cgroup moves. */
+    if (cfg->scope_kind != PW_SCOPE_CGROUP) {
+        pw_busy_dec(s);
+        return 0;
+    }
     if (!leader_addr) {
         pw_busy_dec(s);
         return 0;

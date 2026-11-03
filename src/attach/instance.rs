@@ -314,7 +314,7 @@ fn hooks_disabled_by_env() -> bool {
 /// kernel, whose inlined hook-target copies escape fentry. Arch capability
 /// lines (`CONFIG_ARCH_SUPPORTS_LTO_*`) and `# ... is not set` comments
 /// never match; a config without LTO lines predates LTO and is LTO-off.
-pub(crate) fn lto_enabled_in_config(config: &str) -> bool {
+pub(super) fn lto_enabled_in_config(config: &str) -> bool {
     config.lines().any(|line| {
         let line = line.trim();
         line.starts_with("CONFIG_LTO") && line != "CONFIG_LTO_NONE=y" && line.ends_with("=y")
@@ -329,7 +329,7 @@ pub(crate) fn lto_enabled_in_config(config: &str) -> bool {
 /// same container-mismatch hazard as `/boot` without adding authority.
 /// Stage 5 per-cell preflight re-verifies LTO status on every matrix cell
 /// (DR-T3A-2); relaxing the unverifiable arm needs an owner decision.
-fn lto_refusal() -> Option<String> {
+pub(super) fn lto_refusal() -> Option<String> {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|release| release.trim().to_owned())
         .unwrap_or_default();
@@ -733,7 +733,10 @@ impl InstanceTracking {
 
 /// Verify the actual BTF prototype rather than accepting the function name
 /// alone. This is separate from the no-LTO cross-file call coverage premise.
-fn validate_exec_release_proto(host: &super::host_btf::HostBtf, btf: &Btf) -> Result<()> {
+pub(super) fn validate_exec_release_proto(
+    host: &super::host_btf::HostBtf,
+    btf: &Btf,
+) -> Result<()> {
     let raw = host
         .original_bytes_for(btf)
         .context("instance hook BTF differs from cached host BTF")?;
@@ -758,7 +761,7 @@ fn validate_copy_vma_proto(host: &super::host_btf::HostBtf, btf: &Btf) -> Result
     Ok(())
 }
 
-fn exec_release_proto_is_exact(raw: &[u8]) -> bool {
+pub(super) fn exec_release_proto_is_exact(raw: &[u8]) -> bool {
     let word = |bytes: &[u8], at: usize| -> Option<u32> {
         Some(u32::from_le_bytes(
             bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,

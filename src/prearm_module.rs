@@ -387,15 +387,14 @@ pub(crate) struct ExactnessProof {
     pub(crate) kind: ExactnessProofKind,
 }
 
-/// The two R2-D1-6 proof sources. `OrderingEvidence` keeps its staging
-/// until its producer lands; nothing constructs it outside tests yet.
+/// The two R2-D1-6 proof sources: the pause-gate hold (owned `run`)
+/// and the pre-arm witness ordering evidence (WU-13 P-C phase 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExactnessProofKind {
     /// The `run` child held by pause/loader gate across the load.
     PauseGateHeld,
     /// Capture-held ordering evidence: attach-complete strictly before
     /// first mapping of that inode in every scope member.
-    #[allow(dead_code)]
     OrderingEvidence,
 }
 
@@ -498,6 +497,10 @@ impl PrearmState {
     /// cannot understate the gap).
     pub(crate) fn set_scope_start_ns(&mut self, scope_start_ns: Option<u64>) {
         self.scope_start_ns = scope_start_ns;
+    }
+
+    pub(crate) fn scope_start_ns(&self) -> Option<u64> {
+        self.scope_start_ns
     }
 
     /// Records the initial build's module objects. A module absent here at

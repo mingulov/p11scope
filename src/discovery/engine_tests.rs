@@ -11969,7 +11969,7 @@ fn generic_terminal_assembly_discloses_late_discovery_window() {
 /// provider loads for real (sources gain `scan`, so the base window
 /// applies), the scope start pins to 50, and every declared slot links and
 /// stamps at `stamp`. Keeps the fixture alive for the engine's views.
-fn prearm_mapped_engine_with_declared_stamps(
+pub(crate) fn prearm_mapped_engine_with_declared_stamps(
     stamp: u64,
 ) -> (DiscoveryLifecycleFixture, Engine, ScriptedSession, Vec<u32>) {
     let mut fixture = DiscoveryLifecycleFixture::start();
@@ -12007,7 +12007,7 @@ fn prearm_mapped_engine_with_declared_stamps(
 }
 
 /// The one watched pre-arm record after the terminal finish.
-fn watched_prearm_record(engine: &Engine) -> &crate::render::DiscoveredModule {
+pub(crate) fn watched_prearm_record(engine: &Engine) -> &crate::render::DiscoveredModule {
     let watched: Vec<_> = engine
         .discovery
         .modules

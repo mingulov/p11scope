@@ -384,6 +384,20 @@ pub(crate) struct ViewLogEntry {
     pub(crate) armed: ViewLogArmed,
 }
 
+/// One finalized witness proof input (WU-13 P-C phase 2, §6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WitnessProof {
+    pub(crate) verdict: crate::attach::prearm_witness::FileVerdict,
+    pub(crate) active_ns: u64,
+    /// The scope-start stamp the witness preceded, recorded by the engine
+    /// right after `set_scope_start_ns` (§6.2). A later override (run)
+    /// fails condition 3.
+    pub(crate) scope_start_ns: Option<u64>,
+    pub(crate) walk_started_ns: u64,
+    pub(crate) fd_dev: u64,
+    pub(crate) fd_ino: u64,
+}
+
 pub struct Engine {
     return_probe_admission: Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
     plan: plan::AttachPlan,
@@ -417,6 +431,17 @@ pub struct Engine {
     manifest_inputs: Vec<ManifestInput>,
     prearm_input: Option<PrearmInput>,
     prearm: crate::prearm_module::PrearmState,
+    /// Pre-arm witness verdicts (WU-13 P-C phase 2): None until a non-run
+    /// start_session finalizes the witness; run sessions and failed
+    /// startups leave it None (inert builder).
+    prearm_witness: Option<BTreeMap<PinnedObjectId, WitnessProof>>,
+    /// Live pre-arm witness between `discover_plan` and `start_session`
+    /// (WU-13 P-C phase 2, §6.2): started before the scope-start stamp,
+    /// finalized after attach. None without `--prearm-module`, when
+    /// startup is unavailable, or once finalized.
+    prearm_witness_live: Option<
+        crate::attach::prearm_witness::StartupWitness<crate::attach::prearm_witness::LiveBackend>,
+    >,
     base_counters: DiscoveryCounters,
     budget: CaptureWorkBudget,
     inventory: Option<inventory::InventoryState>,
@@ -6657,12 +6682,33 @@ fn discover_plan(
     discovered.hooks = a.hooks.clone();
     discovered.module_hints = a.modules.clone();
     discovered.budget.set_excludes(a.exclude_modules.clone());
+    // P-C phase 2 (§6.2): start the pre-arm witness BEFORE the scope-start
+    // stamp, so its hooks precede every observation. No pre-arm modules
+    // or an unavailable startup leaves no witness: today's output.
+    let mut prearm_witness_live = if a.prearm_modules.is_empty() {
+        None
+    } else {
+        crate::attach::prearm_witness::start(
+            &a.prearm_modules,
+            scope,
+            matches!(
+                crate::pidns::observer(),
+                crate::pidns::ObserverPidNs::Initial
+            ),
+        )
+        .ok()
+    };
     // The capture's scope start, before any observation: the outer bound of
     // every unobserved window. (The `run` path overrides with its pre-spawn
     // instant once it knows it.)
     discovered
         .prearm
         .set_scope_start_ns(crate::attach::monotonic_ns());
+    // The witness records the stamp it precedes (condition 3).
+    if let Some(witness) = prearm_witness_live.as_mut() {
+        witness.scope_start_ns = discovered.prearm.scope_start_ns();
+    }
+    discovered.prearm_witness_live = prearm_witness_live;
     discovered.max_scan_pids = a
         .max_scan_pids
         .filter(|cap| *cap > 0)
@@ -10227,6 +10273,8 @@ impl Engine {
             manifest_inputs: Vec::new(),
             prearm_input: None,
             prearm: crate::prearm_module::PrearmState::empty(),
+            prearm_witness: None,
+            prearm_witness_live: None,
             base_counters: DiscoveryCounters::default(),
             budget: CaptureWorkBudget::default(),
             inventory: None,
@@ -29459,6 +29507,134 @@ impl Engine {
         proofs
     }
 
+    /// Ordering-evidence proofs (WU-13 P-C phase 2, §6.2): per-object
+    /// OrderingEvidence when the finalized witness verdict is Clear and
+    /// conditions 3-5 (ordering, pin identity, stamps) all agree.
+    /// Anything else yields no proof (today's window stays).
+    fn ordering_evidence_exactness_proofs(
+        watches: &BTreeMap<PinnedObjectId, crate::prearm_module::PrearmWatch>,
+        plan: &plan::AttachPlan,
+        stamps: &BTreeMap<u32, u64>,
+        verdict: &Option<BTreeMap<PinnedObjectId, WitnessProof>>,
+        scope_start: Option<u64>,
+        pins: &PinnedObjects,
+    ) -> BTreeMap<PinnedObjectId, crate::prearm_module::ExactnessProof> {
+        let mut proofs = BTreeMap::new();
+        let (Some(verdict), Some(scope_start)) = (verdict.as_ref(), scope_start) else {
+            return proofs;
+        };
+        for (object, watch) in watches {
+            let Some(input) = verdict.get(object) else {
+                continue;
+            };
+            if input.verdict != crate::attach::prearm_witness::FileVerdict::Clear {
+                continue;
+            }
+            // Condition 3: active strictly before the scope start, and the
+            // engine's scope start still equals the recorded stamp.
+            if input.active_ns >= scope_start {
+                continue;
+            }
+            if input.scope_start_ns != Some(scope_start) {
+                continue;
+            }
+            if !Self::witness_pin_matches(input.fd_dev, input.fd_ino, *object, pins) {
+                continue;
+            }
+            // Declared-set attached_at, the same rule as `assemble`.
+            let mut latest: Option<u64> = None;
+            for key in watch.declared() {
+                let Some(stamped_at) = plan
+                    .slot_index_for_key(*key)
+                    .and_then(|index| stamps.get(&index).copied())
+                else {
+                    latest = None;
+                    break;
+                };
+                latest = Some(latest.map_or(stamped_at, |known| known.max(stamped_at)));
+            }
+            let Some(attached_at) = latest else {
+                continue;
+            };
+            if input.walk_started_ns <= attached_at {
+                continue;
+            }
+            proofs.insert(
+                *object,
+                crate::prearm_module::ExactnessProof {
+                    interval_start_ns: scope_start,
+                    interval_end_ns: attached_at,
+                    kind: crate::prearm_module::ExactnessProofKind::OrderingEvidence,
+                },
+            );
+        }
+        proofs
+    }
+
+    /// Condition 4: the witness fd's `(st_dev, st_ino)` equals one of the
+    /// object's pinned raw keys.
+    fn witness_pin_matches(
+        fd_dev: u64,
+        fd_ino: u64,
+        object: PinnedObjectId,
+        pins: &PinnedObjects,
+    ) -> bool {
+        pins.raw_keys_for(object).iter().any(|key| {
+            u64::from(libc::major(fd_dev as libc::dev_t)) == key.device.major
+                && u64::from(libc::minor(fd_dev as libc::dev_t)) == key.device.minor
+                && fd_ino == key.inode
+        })
+    }
+
+    /// Finalizes the live witness after a successful start (§6.2): the
+    /// driver verdict's slots key to watched objects by pin identity.
+    /// Owned `run` sessions drop the witness without a verdict (inert);
+    /// no live witness (or a dropped one) is a no-op.
+    fn finalize_prearm_witness(&mut self, owned_run: bool) {
+        let live = self.prearm_witness_live.take();
+        let Some(live) = live else {
+            return;
+        };
+        let Some(verdict) = live.finalize(owned_run) else {
+            return;
+        };
+        self.prearm_witness = Some(Self::map_verdict_slots_to_objects(
+            self.prearm.watches(),
+            &self.pinned,
+            &verdict,
+        ));
+    }
+
+    /// Keys a driver verdict's input-ordered slots to watched objects by
+    /// pin identity (condition 4): a slot names every object whose pinned
+    /// raw keys contain the witness fd's `(st_dev, st_ino)`. Identities no
+    /// object pins are dropped, never attributed.
+    fn map_verdict_slots_to_objects(
+        watches: &BTreeMap<PinnedObjectId, crate::prearm_module::PrearmWatch>,
+        pins: &PinnedObjects,
+        verdict: &crate::attach::prearm_witness::WitnessVerdict,
+    ) -> BTreeMap<PinnedObjectId, WitnessProof> {
+        let mut map = BTreeMap::new();
+        for slot in &verdict.slots {
+            for object in watches.keys() {
+                if Self::witness_pin_matches(slot.fd_dev, slot.fd_ino, *object, pins) {
+                    map.insert(
+                        *object,
+                        WitnessProof {
+                            verdict: slot.verdict,
+                            active_ns: verdict.active_ns,
+                            scope_start_ns: verdict.scope_start_ns,
+                            walk_started_ns: verdict.walk_started_ns,
+                            fd_dev: slot.fd_dev,
+                            fd_ino: slot.fd_ino,
+                        },
+                    );
+                }
+            }
+        }
+        map
+    }
+
     /// Closes the capture for every pre-arm watch (packet 6.13, R2-D1-4/5/7):
     /// final link evaluation, idle qualification over the closed interval
     /// (armed + clean terminal observation/scope/link health + no observed
@@ -29585,6 +29761,22 @@ impl Engine {
             hold,
             owned_run,
             release_ns,
+        ));
+        // Owned `run` sessions never see ordering proofs, even with a
+        // planted verdict: the witness is dropped at finalize (§3 guard),
+        // and the call site withholds the verdict independently.
+        let verdict = if owned_run {
+            &None
+        } else {
+            &self.prearm_witness
+        };
+        proofs.extend(Self::ordering_evidence_exactness_proofs(
+            self.prearm.watches(),
+            &self.plan,
+            &stamps,
+            verdict,
+            self.prearm.scope_start_ns(),
+            &self.pinned,
         ));
         self.prearm
             .assemble(&mut self.discovery.modules, &self.plan, &stamps, &proofs);
@@ -30282,7 +30474,19 @@ impl Engine {
             self.publish_current_capture_facts()?;
             Ok(session)
         })();
-        self.finish_start_capture_attempt(snapshot, result)
+        let session = match self.finish_start_capture_attempt(snapshot, result) {
+            Ok(session) => session,
+            // A failed start drops the witness: no verdict, and no stale
+            // live witness survives for a later retry.
+            Err(error) => {
+                self.prearm_witness_live = None;
+                return Err(error);
+            }
+        };
+        // P-C phase 2 (§6.2): finalize after attach, before the return
+        // (hence before the ready line). Owned `run` drops it inert.
+        self.finalize_prearm_witness(owned_child.is_some());
+        Ok(session)
     }
 }
 
@@ -31367,6 +31571,10 @@ impl Engine {
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "prearm_witness_tests.rs"]
+mod prearm_witness_tests;
 
 #[cfg(test)]
 #[path = "engine_counter_tests.rs"]

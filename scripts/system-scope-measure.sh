@@ -52,7 +52,9 @@ WORK=/var/tmp/p11scope-system-scope-measure
 PROFILE=release
 BINARY=
 NO_BUILD=0
-SOURCE_MODULE=/usr/lib/softhsm/libsofthsm2.so
+# Probed at startup via release-matrix-contract.py --select-module (Debian
+# and Fedora layouts); SOURCE_MODULE in the environment overrides the probe.
+SOURCE_MODULE=${SOURCE_MODULE:-}
 MODULE=
 DETAILED_PROFILE=
 DETAILED_CALCULATOR=
@@ -160,6 +162,10 @@ command -v softhsm2-util >/dev/null || { echo "softhsm2-util required"; exit 1; 
 command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
 command -v timeout >/dev/null || { echo "timeout required"; exit 1; }
 sudo -n true || { echo "passwordless sudo required"; exit 1; }
+if [ -z "$SOURCE_MODULE" ]; then
+    SOURCE_MODULE=$(python3 -I scripts/release-matrix-contract.py --select-module) \
+        || { echo "no usable SoftHSM module (tried Debian/Fedora layouts)"; exit 1; }
+fi
 test -f "$SOURCE_MODULE" || { echo "SoftHSM2 not installed at $SOURCE_MODULE"; exit 1; }
 export TMPDIR=/var/tmp/p11scope-ws-tmp
 mkdir -p "$TMPDIR" "$WORK"

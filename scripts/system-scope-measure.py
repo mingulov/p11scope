@@ -1914,7 +1914,14 @@ def main(argv):
                               f"(unknown); {owned['note']}; total coverage "
                               "unprovable")
             else:
-                counts_match = owned["owned_calls"] >= truth_total
+                # Exact equality: the harness runs the workload against a
+                # private provider inode that only the workload maps, so
+                # owned-attributed calls are exactly the workload's
+                # post-go ledger. Overcounting (doubled or phantom calls)
+                # fails, as undercounting does. A future mode over a
+                # shared system library would need `>=` with a named
+                # reason; no such mode exists here.
+                counts_match = owned["owned_calls"] == truth_total
                 match_note = (
                     "system scan-only: names unavailable (unknown); "
                     "owned-attributed coverage "
@@ -1928,12 +1935,20 @@ def main(argv):
                           f"workload module; {owned['note']}")
             window_coverage_detail = match_note
         else:
+            # Exact per-name equality on the private provider copy (see
+            # above): each truth name must match exactly, and any
+            # owned-attributed name outside the truth is a phantom.
             owned_observed = owned["owned_observed"] or {}
-            counts_match = all(owned_observed.get(k, 0) >= v
+            counts_match = all(owned_observed.get(k, 0) == v
                                for k, v in truth.items())
+            extras = {k: v for k, v in owned_observed.items()
+                      if k not in truth and v}
+            if extras:
+                counts_match = False
             match_note = ("system scope: receipt-attributed per-name rows must "
-                          f"cover workload truth ({owned_observed} vs {truth}); "
-                          f"{owned['note']}")
+                          f"equal workload truth exactly ({owned_observed} vs {truth}); "
+                          f"{owned['note']}" + ("" if not extras else
+                             f"; unexpected owned calls: {extras}"))
             if not counts_match:
                 window_coverage_detail = match_note
 

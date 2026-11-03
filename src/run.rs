@@ -5425,6 +5425,7 @@ fn capture_profile(
                 mode,
                 policy,
                 scope.kind(),
+                state.mechanisms(),
             );
             if let Some(bytes) = live_display.frame_bytes(&frame, false) {
                 write_stdout(stdout, &mut stdout_open, bytes.as_bytes())?;
@@ -5981,6 +5982,7 @@ fn capture_profile(
             mode,
             policy,
             scope.kind(),
+            consumers.state.mechanisms(),
         );
         if let Some(bytes) = live_display.frame_bytes(&frame, true) {
             write_stdout(context.3, context.4, bytes.as_bytes())?;

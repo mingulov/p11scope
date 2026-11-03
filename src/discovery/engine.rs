@@ -6150,6 +6150,39 @@ pub(crate) fn select_deep_scan_candidates(
         .collect()
 }
 
+/// Pids in `sweep` that are kernel threads with no user address space, to
+/// be excluded before the deep-scan cap is applied: a successfully-read
+/// but empty maps snapshot (never an unavailable one) plus the
+/// `PF_KTHREAD` flag in `{proc_root}/<pid>/stat`. Callers count every
+/// excluded pid on the pass budget's kernel-thread note and select from
+/// the rest, so leftover slots reach user processes instead of threads
+/// that can never call a provider. Fail-closed: an unreadable or
+/// unparsable stat, a missing flag, a non-empty snapshot, or an
+/// unavailable pid all stay eligible. Selection reads a snapshot: a pid
+/// recycled between the sweep and the stat read is handled no worse than
+/// today's deep-scan classification of a changed generation.
+pub(crate) fn kernel_thread_exclusions(
+    sweep: &SweepSnapshots,
+    unavailable: &BTreeSet<u32>,
+    proc_root: &Path,
+) -> BTreeSet<u32> {
+    let mut excluded = BTreeSet::new();
+    for (pid, entries) in sweep {
+        if !entries.is_empty() || unavailable.contains(pid) {
+            continue;
+        }
+        let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat"));
+        let is_kthread = stat.is_ok_and(|text| {
+            process::stat_flags_from_stat_text(&text)
+                .is_some_and(|flags| flags & process::PF_KTHREAD != 0)
+        });
+        if is_kthread {
+            excluded.insert(*pid);
+        }
+    }
+    excluded
+}
+
 /// Rotation's fairness-tiered variant of the selection above: identical
 /// grouping, global rarity census, and group order — but within each group
 /// the representative is the lowest never-evicted member (falling back to
@@ -6480,8 +6513,8 @@ fn discover_plan(
     // the identity, so the sweep (and its budget charge) is skipped there.
     let selected = if pids.len() > max_scan_pids {
         let sweep_start = crate::attach::monotonic_ns();
-        let (sweep, unavailable) =
-            sweep_process_maps(&pids, &mut discovered.budget).into_selection();
+        let (sweep, sweep_unavailable, unavailable) =
+            sweep_process_maps(&pids, &mut discovered.budget).into_selection_with_unavailable();
         discovered.stage_timings.span(
             crate::timing::StageKind::Scan,
             "sweep_process_maps",
@@ -6493,7 +6526,15 @@ fn discover_plan(
             discovered.base_counters.object_skips.push(skipped);
         }
         let select_start = crate::attach::monotonic_ns();
-        let selected = select_deep_scan_candidates(&sweep, max_scan_pids);
+        let excluded = kernel_thread_exclusions(&sweep, &sweep_unavailable, Path::new("/proc"));
+        for _ in &excluded {
+            discovered.budget.note_kernel_thread_absence();
+        }
+        let eligible: SweepSnapshots = sweep
+            .into_iter()
+            .filter(|(pid, _)| !excluded.contains(pid))
+            .collect();
+        let selected = select_deep_scan_candidates(&eligible, max_scan_pids);
         discovered.stage_timings.span(
             crate::timing::StageKind::Scan,
             "select_deep_scan_candidates",

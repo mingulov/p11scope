@@ -22681,6 +22681,53 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn clean_hold_prints_exactly_one_settlement_line() {
+        // The negative twin of the re-disclosure above: a held lane
+        // whose terminal commit applies nothing prints the diagnostic
+        // settlement line once, beside its one stop line.
+        take_warned_for_test();
+        let io = WindDownIo::completing();
+        let mut lane = joint_lane(io, false);
+        lane.set_scripted_stop_counts_for_test(Some(scripted_nonzero_stop_counts()));
+        lane.note_joint_finish_failure(
+            crate::inventory_semantics::SemanticRefusal::ProviderStorage,
+        );
+        assert!(
+            lane.joint_finish_disposition_required(),
+            "the twin latches the lane"
+        );
+        let mut coordinator = coordinator();
+        coordinator.set_diagnostic_settlement_latency(true);
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            lane,
+            &mut coordinator,
+            "joint finish disposition required",
+            "joint finish abandoned for exit",
+            &mut warn,
+            None,
+        );
+        let summary = coordinator
+            .settlement_latency_summary()
+            .expect("diagnostic enabled");
+        assert_eq!(summary.samples, 0, "nothing applied during the hold");
+        let warned = take_warned_for_test();
+        let settlement = warned
+            .iter()
+            .filter(|line| line.contains("settlement latency"))
+            .count();
+        let stop = warned
+            .iter()
+            .filter(|line| line.starts_with("p11scope: semantic calls:"))
+            .count();
+        assert_eq!(settlement, 1, "one settlement line: {warned:?}");
+        assert_eq!(stop, 1, "one stop line: {warned:?}");
+    }
+
+    #[test]
     fn latched_abandon_hold_discloses_ring_loss_on_its_stop_line() {
         // Isolate from lines other tests on this thread warned: the
         // recorder is thread-local and every read drains.

@@ -7428,6 +7428,7 @@ mod b17_wire_projection {
         assert!(control.instance_reload_not_excluded.is_none());
         assert_eq!(evidence.completeness, control.completeness);
         assert_eq!(evidence.verdict_detail, control.verdict_detail);
+        assert_eq!(evidence.gap_classes, control.gap_classes);
     }
 
     // Producer absent-half: a staged but clean ledger projects `None`

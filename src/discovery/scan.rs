@@ -7976,11 +7976,13 @@ mod tests {
     #[test]
     fn aliased_export_tail_charges_one_table_not_one_per_alias() {
         // Mirror of the capacity fixture layout: a 2.40 table whose words
-        // past the distinct bodies all alias the exported getter. Every
-        // alias occurrence is an anchor candidate; only the real table may
-        // charge the table budget. Charging one candidate per alias burns
-        // ~36 candidates per provider and exhausts the 512-candidate
-        // ceiling at 14 providers (952 endpoints), starving system scale.
+        // past the distinct bodies alias the exported getter. Every alias
+        // occurrence is an anchor candidate, but candidates the overlap
+        // pass would discard must not charge the table budget: charging one
+        // candidate per alias burns ~36 candidates per provider and
+        // exhausts the 512-candidate ceiling at 14 providers (952
+        // endpoints), starving system scale. Four aliases keep every
+        // candidate inside the real table, so exactly one table decodes.
         let maps = mislabelled_fixture_maps();
         let index = MapIndex::new(&maps).unwrap();
         let symbols = [("C_GetFunctionList".to_string(), 0x500)];
@@ -8003,7 +8005,7 @@ mod tests {
             };
             snapshot.extend_from_slice(&word.to_le_bytes());
         }
-        for _ in 0..36 {
+        for _ in 0..4 {
             snapshot.extend_from_slice(&getter.to_le_bytes());
         }
         let mut budget = CaptureWorkBudget::default();
@@ -8028,6 +8030,64 @@ mod tests {
             "aliases must not charge the table budget"
         );
         assert_eq!(budget.decoded_table_entries_count(), 68);
+    }
+
+    #[test]
+    fn long_aliased_tail_charges_two_tables_for_thirty_six_aliases() {
+        // The full capacity tail: 36 alias occurrences. The first candidate
+        // past the real table's end touches but does not overlap it, so the
+        // overlap pass keeps it (a second charged table); every later alias
+        // overlaps that kept decode and must not charge. Burn per provider
+        // drops from ~36 candidates to 2, fitting 121 providers (8192
+        // endpoints) in the per-pass budget. The kept adjacent decode is
+        // downstream-harmless: its targets repeat the real table's.
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let symbols = [("C_GetFunctionList".to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+        };
+        let getter = 0x1500u64;
+        let mut snapshot = 0x2802u64.to_le_bytes().to_vec();
+        for slot in 0..68u64 {
+            let word = if slot == 3 {
+                getter
+            } else {
+                0x1600 + slot * 8
+            };
+            snapshot.extend_from_slice(&word.to_le_bytes());
+        }
+        for _ in 0..36 {
+            snapshot.extend_from_slice(&getter.to_le_bytes());
+        }
+        // Pad past the alias run so every candidate decodes a full width.
+        for _ in 0..68 {
+            snapshot.extend_from_slice(&0u64.to_le_bytes());
+        }
+        let mut budget = CaptureWorkBudget::default();
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut budget,
+            Some(&exports),
+            &[],
+            || Some(0),
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(tables.len(), 2, "real table plus one adjacent decode");
+        assert_eq!(tables[0].address, 0x7000);
+        assert_eq!(tables[0].entries.len(), 68);
+        assert_eq!(
+            budget.table_candidates_count(),
+            2,
+            "one kept adjacent decode, no cascade"
+        );
     }
 
     #[test]

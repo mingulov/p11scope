@@ -6059,7 +6059,7 @@ mod tests {
             assert_eq!(notes[0].pid, None);
             assert_eq!(
                 notes[0].reason,
-                "2 deep-scanned processes are kernel threads with no user memory to scan"
+                "2 processes examined are kernel threads with no user memory to scan"
             );
             assert!(
                 catalog
@@ -6746,14 +6746,14 @@ mod tests {
         assert_eq!(one.subject, "kernel threads");
         assert_eq!(
             one.reason,
-            "1 deep-scanned process is a kernel thread with no user memory to scan"
+            "1 process examined is a kernel thread with no user memory to scan"
         );
         let many = kernel_thread_absence_note(117).expect("many absences are noted");
         assert_eq!(many.pid, None);
         assert_eq!(many.subject, "kernel threads");
         assert_eq!(
             many.reason,
-            "117 deep-scanned processes are kernel threads with no user memory to scan"
+            "117 processes examined are kernel threads with no user memory to scan"
         );
     }
 

@@ -2041,12 +2041,16 @@ fn excluded_lines(ev: &Evidence) -> String {
     if total > 0 {
         out.push_str(&format!("Excluded by you ({total} files):\n"));
         for excluded in &ev.discovery.excluded_modules {
+            let processes = if excluded.processes == 1 {
+                "1 process mapped it".to_string()
+            } else {
+                format!("{} processes mapped it", excluded.processes)
+            };
             out.push_str(&format!(
-                "  {}: excluded by you (device {} inode {}, {} processes mapped it); calls into this file were not observed\n",
+                "  {}: excluded by you (device {} inode {}, {processes}); calls into this file were not observed\n",
                 escape_controls(&excluded.path),
                 excluded.dev,
                 excluded.ino,
-                excluded.processes
             ));
         }
     }
@@ -6159,7 +6163,7 @@ pub(crate) mod tests {
             reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
                  (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a \
                  prefix of its 64 lookalike function tables (a proxy closure array is admitted \
-                 whole or not at all)"
+                 whole, as a prefix when first seen, or as published tables)"
                 .into(),
         });
         ev.verdict();
@@ -6282,7 +6286,8 @@ pub(crate) mod tests {
             name: "/opt/libp11-kit.so".into(),
             reason: "module needs 6530 more; only 512 attach slots are available; 0 are in use \
                  (0 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
-                 tables (a proxy closure array is admitted whole or not at all)"
+                 tables (a proxy closure array is admitted whole, as a prefix when first seen, \
+                 or as published tables)"
                 .into(),
         });
         ev.verdict();
@@ -6303,7 +6308,8 @@ pub(crate) mod tests {
             name: "/opt/libp11-kit.so".into(),
             reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
                  (68 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
-                 tables (a proxy closure array is admitted whole or not at all)"
+                 tables (a proxy closure array is admitted whole, as a prefix when first seen, \
+                 or as published tables)"
                 .into(),
         });
         ev.verdict();

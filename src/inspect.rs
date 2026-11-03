@@ -133,13 +133,17 @@ fn render_text_with_application(
     if !excluded.is_empty() {
         let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
         for item in excluded {
+            let processes = if item.processes == 1 {
+                "1 process mapped it".to_string()
+            } else {
+                format!("{} processes mapped it", item.processes)
+            };
             let _ = writeln!(
                 out,
-                "  {}: excluded by you (device {} inode {}, {} processes mapped it); calls into this file were not observed",
+                "  {}: excluded by you (device {} inode {}, {processes}); calls into this file were not observed",
                 crate::render::escape_controls(&item.path),
                 item.dev,
                 item.ino,
-                item.processes
             );
         }
     }

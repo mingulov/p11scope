@@ -8,12 +8,15 @@ use crate::discovery::elf_needed::{
 };
 use crate::discovery::scan::Skipped;
 use crate::kinds;
+use crate::mechanism_names::mechanism_name;
 use crate::metrics::{SlotReport, percentile_ns};
 use crate::plan::{ModuleId, TableSummary};
 use crate::semantic_capture::InstanceReloadNotExcluded;
+use crate::semantics::MechStat;
 use p11scope_ebpf_common::CounterMode;
 use p11scope_manifest::manifest::{SelectionAuthority, SelectionRequest};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Target-controlled bytes reach a terminal here. Only control characters —
@@ -1941,6 +1944,7 @@ pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> Stri
 
 /// One refreshing screen for consumers without a retained scope kind.
 /// Rows with no activity are omitted; the evidence line is always present.
+/// Mechanism rows are never shown here; `live_scoped` renders them.
 pub fn live(
     reports: &[SlotReport],
     ev: &Evidence,
@@ -1949,7 +1953,16 @@ pub fn live(
     mode: &str,
     policy: CapturePolicy,
 ) -> String {
-    live_scoped(reports, ev, elapsed, module, mode, policy, "selected")
+    live_scoped(
+        reports,
+        ev,
+        elapsed,
+        module,
+        mode,
+        policy,
+        "selected",
+        &BTreeMap::new(),
+    )
 }
 
 /// Derive the extra observation gap from the protected snapshot. This is
@@ -1978,8 +1991,18 @@ pub(crate) fn live_snapshot_scoped(
     mode: &str,
     policy: CapturePolicy,
     scope: &str,
+    mechanisms: &BTreeMap<u64, MechStat>,
 ) -> String {
-    let mut frame = live_scoped(snapshot.reports(), ev, elapsed, module, mode, policy, scope);
+    let mut frame = live_scoped(
+        snapshot.reports(),
+        ev,
+        elapsed,
+        module,
+        mode,
+        policy,
+        scope,
+        mechanisms,
+    );
     if let Some(summary) = snapshot.counter_summary() {
         frame.push_str(&summary);
     }
@@ -1987,6 +2010,10 @@ pub(crate) fn live_snapshot_scoped(
 }
 
 /// The capture renderer receives only the validated scope kind.
+/// `mechanisms` is the same per-id map the JSON `mechanisms[]` carries
+/// (`State::mechanisms`): an empty map renders nothing new, a nonempty one
+/// renders a compact name/calls/errors table under the function table. No
+/// parameters are shown, so no decoder policy applies here.
 pub fn live_scoped(
     reports: &[SlotReport],
     ev: &Evidence,
@@ -1995,6 +2022,7 @@ pub fn live_scoped(
     mode: &str,
     policy: CapturePolicy,
     scope: &str,
+    mechanisms: &BTreeMap<u64, MechStat>,
 ) -> String {
     let mut s = String::new();
     s.push_str(&format!(
@@ -2045,6 +2073,25 @@ pub fn live_scoped(
         ));
     }
     s.push_str("(~ = log2-bucket approximation, lower bound)\n");
+    if !mechanisms.is_empty() {
+        s.push_str(&format!(
+            "{:<28} {:>8} {:>6}\n",
+            "MECHANISM", "CALLS", "ERR"
+        ));
+        let mut rows: Vec<(&u64, &MechStat)> = mechanisms.iter().collect();
+        rows.sort_by(|(a_id, a), (b_id, b)| b.calls.cmp(&a.calls).then(a_id.cmp(b_id)));
+        for (id, stat) in rows {
+            let name = mechanism_name(*id)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("0x{id:x}"));
+            s.push_str(&format!(
+                "{:<28} {:>8} {:>6}\n",
+                escape_controls(&name),
+                stat.calls,
+                stat.errors
+            ));
+        }
+    }
     let mut evidence_line = format!(
         "Evidence: {}/{} probes attached · {} slots ({} active) · {} aliased · {} skipped · {} in-flight",
         ev.attached_probes,
@@ -3253,7 +3300,8 @@ pub(crate) mod tests {
                     "owned",
                     "profile",
                     capture.policy,
-                    "pid"
+                    "pid",
+                    &BTreeMap::new()
                 ),
                 live_scoped(
                     snapshot.reports(),
@@ -3262,7 +3310,8 @@ pub(crate) mod tests {
                     "owned",
                     "profile",
                     capture.policy,
-                    "pid"
+                    "pid",
+                    &BTreeMap::new()
                 ),
             );
             assert!(
@@ -3374,6 +3423,7 @@ pub(crate) mod tests {
                 "metrics",
                 CapturePolicy::AggregateOnly,
                 "pid",
+                &BTreeMap::new(),
             );
             assert!(frame.contains("last read stale"), "{frame}");
             assert!(frame.contains("PARTIAL"), "{frame}");

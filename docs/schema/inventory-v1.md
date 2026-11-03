@@ -873,6 +873,14 @@ never imply S1 loss.
   `ec_p256`, `ec_p384`, `ec_p521`) or null. It is withheld when class
   conflicts or an established class is incompatible with the key type
   (AES needs `secret_key`; RSA/EC need `public_key`/`private_key`).
+  One provenance exception: an RSA private key created by
+  `C_GenerateKeyPair` carries its pair-mate public key's established
+  size when both handles came from the same successful return
+  (CKA_MODULUS_BITS is defined on RSA public keys only, so the
+  private size is never read directly). Such a label is recognizable:
+  the view's own `established.modulus_bits` stays `unknown` while the
+  label names the inherited size. Unpaired keys and failed generations
+  stay unlabeled (`metadata_unknown` at use).
 - `key_operations[]` (sorted by instance, object, category, role and
   metadata label) holds proved-key aggregate rows
   `{instance, object, category, role, metadata_at_use, unit,

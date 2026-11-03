@@ -459,6 +459,13 @@ struct ViewRecord {
     /// name this object for the capture, so pruning must keep it
     /// and capacity pressure must refuse the newcomer instead.
     key_retained: bool,
+    /// The pair-mate view minted beside this one by the same
+    /// successful `C_GenerateKeyPair` return, when both result
+    /// handles minted views. The private key inherits the public
+    /// key's established size through it; never cleared, since the
+    /// pairing fact outlives use and destruction. A pruned mate
+    /// simply ends inheritance.
+    pair_mate: Option<ObjectId>,
     requested: [FieldState; METADATA_FIELDS],
     established: [FieldState; METADATA_FIELDS],
     queries: [QueryStatus; METADATA_FIELDS],
@@ -2068,6 +2075,7 @@ impl ModelState {
                 references: 0,
                 key_uses: 0,
                 key_retained: false,
+                pair_mate: None,
                 requested,
                 established: [FieldState::Unknown; METADATA_FIELDS],
                 queries: [QueryStatus::NotQueried; METADATA_FIELDS],
@@ -2512,7 +2520,7 @@ impl ModelState {
                                     object: id,
                                     key_use,
                                     metadata: Self::metadata_flags_of(view),
-                                    label: view.label(),
+                                    label: self.resolved_label(id),
                                     attribution_valid: view.attribution
                                         == super::Attribution::Valid,
                                     lost: false,
@@ -2812,6 +2820,51 @@ impl ModelState {
         }
     }
 
+    /// The published label for one view: its own established label,
+    /// or — for an RSA private key without one — the established size
+    /// of its pair-mate public key from the same successful
+    /// `C_GenerateKeyPair` return. CKA_MODULUS_BITS is defined on RSA
+    /// public keys only, so the provider never establishes the
+    /// private size directly; reusing the mate's established read
+    /// adds no new read. Anything else (an unpaired view, a failed
+    /// call, a non-RSA or non-private mate, an unestablished mate
+    /// size) stays unlabeled. Every snapshot site (references,
+    /// receipts, projections) resolves through here, so admission
+    /// and publication cannot disagree.
+    fn resolved_label(&self, id: ObjectId) -> Option<KeyLabel> {
+        let view = self.objects.get(&id)?;
+        if let Some(label) = view.label() {
+            return Some(label);
+        }
+        if view.origin != ViewOrigin::Created(CreationFamily::GeneratePair) {
+            return None;
+        }
+        let scalar = |kind| match view.established[field_index(kind)] {
+            FieldState::Value(FieldValue::Scalar(value)) => Some(value),
+            _ => None,
+        };
+        if scalar(SafeAttributeKind::Class) != Some(3)
+            || scalar(SafeAttributeKind::KeyType) != Some(0)
+        {
+            return None;
+        }
+        let mate = view.pair_mate?;
+        let mate_view = self.objects.get(&mate)?;
+        if mate_view.origin != ViewOrigin::Created(CreationFamily::GeneratePair) {
+            return None;
+        }
+        if !matches!(
+            mate_view.established[field_index(SafeAttributeKind::Class)],
+            FieldState::Value(FieldValue::Scalar(2))
+        ) {
+            return None;
+        }
+        match mate_view.label() {
+            Some(KeyLabel::Rsa { modulus_bits }) => Some(KeyLabel::Rsa { modulus_bits }),
+            _ => None,
+        }
+    }
+
     fn reference(
         &mut self,
         token: CallToken,
@@ -2827,7 +2880,7 @@ impl ModelState {
             return;
         };
         let metadata = Self::metadata_flags_of(view);
-        let label = view.label();
+        let label = self.resolved_label(id);
         let attribution_valid = view.attribution == super::Attribution::Valid;
         if let Some(view) = self.objects.get_mut(&id) {
             view.references = view.references.saturating_add(1);
@@ -2996,6 +3049,7 @@ impl ModelState {
             self.unresolved(effects, token, ObjectGap::OutputCollision);
             return;
         }
+        let mut created: [Option<ObjectId>; 2] = [None, None];
         for (slot, handle) in candidates {
             if let Some(Binding::View(old)) = self.domains[&call.domain]
                 .bindings
@@ -3023,16 +3077,34 @@ impl ModelState {
                 requested,
                 Lifetime::Live,
             ) {
-                Ok(id) => effects.push(ObjectEffect::Created {
-                    call: token,
-                    slot,
-                    object: id,
-                    session,
-                }),
+                Ok(id) => {
+                    created[slot as usize] = Some(id);
+                    effects.push(ObjectEffect::Created {
+                        call: token,
+                        slot,
+                        object: id,
+                        session,
+                    });
+                }
                 Err(reason) => {
                     self.set_binding(call.domain, session, handle, None);
                     self.unresolved(effects, token, reason);
                 }
+            }
+        }
+        // Both handles of one successful `C_GenerateKeyPair` return
+        // minted views: each is the other's pair mate, so the
+        // private key can inherit the public key's established size.
+        // Anything else (a refused allocation, a duplicate pair, a
+        // single-handle family) leaves no mate, hence no inheritance.
+        if family == CreationFamily::GeneratePair
+            && let [Some(first), Some(second)] = created
+        {
+            if let Some(view) = self.objects.get_mut(&first) {
+                view.pair_mate = Some(second);
+            }
+            if let Some(view) = self.objects.get_mut(&second) {
+                view.pair_mate = Some(first);
             }
         }
     }
@@ -4151,7 +4223,7 @@ impl ModelState {
     pub(super) fn receipt_snapshot(&self, key: ObjectId) -> Option<super::ReceiptSnapshot> {
         let view = self.objects.get(&key)?;
         Some(super::ReceiptSnapshot {
-            label: view.label(),
+            label: self.resolved_label(key),
             attribution_valid: view.attribution == super::Attribution::Valid,
             session: view.session,
         })
@@ -4366,7 +4438,7 @@ impl ModelState {
                     fields: v.established,
                 },
                 queries: v.queries,
-                label: v.label(),
+                label: self.resolved_label(*id),
                 accessing_sessions: relations.get(id).copied().unwrap_or(0),
             })
             .collect();
@@ -4567,6 +4639,7 @@ mod tests {
             references: 0,
             key_uses: 0,
             key_retained: false,
+            pair_mate: None,
             requested: [FieldState::Unknown; METADATA_FIELDS],
             established,
             queries: [QueryStatus::NotQueried; METADATA_FIELDS],

@@ -4607,8 +4607,7 @@ mod tests {
                 counts[index].1,
             )];
             rows.push(
-                CounterRow::fold(slot, mode, cells, slot_rvs, limits)
-                    .expect("explicit cells fold"),
+                CounterRow::fold(slot, mode, cells, slot_rvs, limits).expect("explicit cells fold"),
             );
         }
         let reservation = ReadReservation::reserve(rows.len(), rows.len(), &pool.reserver())

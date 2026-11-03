@@ -23,6 +23,11 @@
 #   OBS_MARGIN
 #             observer seconds beyond DURATION for startup, the two
 #             admission passes and drain (default 90)
+#   SETTLEMENT_LAT
+#             =1 records the diagnostic per-call ENTRY-to-settle
+#             delays in the observer (1 ms buckets) and prints the
+#             cumulative p50/p99/max line beside the stop line in
+#             observer.out (default unset records nothing)
 #
 # Cells:
 #   joint-10k-single  --system --key-operations over keyed RATE/DURATION
@@ -93,6 +98,17 @@ log() {
 
 # --- library (the python suite sources this file with
 # --- JOINT_TP_SOURCED=1 and calls these functions directly) ---
+
+# Echo the sudo command-line passthrough for the diagnostic
+# settlement toggle, or nothing. Sudo scrubs the environment, so
+# SETTLEMENT_LAT=1 must ride the sudo command line as an explicit
+# assignment; anything else prints nothing. The output is empty or
+# exactly one assignment (never user text).
+observer_env() {
+    if [ "${SETTLEMENT_LAT:-0}" = "1" ]; then
+        echo "P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY=1"
+    fi
+}
 
 # Print the provider path, or nothing when no candidate exists.
 select_provider() {
@@ -467,7 +483,8 @@ run_joint_cell() {
     # The lock fd is inherited; run sudo directly under the held lock.
     # Stdout stays unprivileged by design (the -o outputs are chmodded
     # after the run); shellcheck SC2024 does not apply.
-    sudo -n "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
+    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment.
+    sudo -n $(observer_env) "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
         --key-operations --duration "$obs_dur" --json -o "$dir/report.json" \
         --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
     echo $! > "$dir/observer.pid"
@@ -621,7 +638,8 @@ run_twin_cell() {
     # The lock fd is inherited; run sudo directly under the held lock.
     # Stdout stays unprivileged by design (the -o outputs are chmodded
     # after the run); shellcheck SC2024 does not apply.
-    sudo -n "$P11SCOPE" inventory --pid "$gen_pid" --manifest "$MANIFEST" \
+    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment.
+    sudo -n $(observer_env) "$P11SCOPE" inventory --pid "$gen_pid" --manifest "$MANIFEST" \
         --duration "$obs_dur" --json -o "$dir/report.json" \
         --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
     echo $! > "$dir/observer.pid"
@@ -710,7 +728,8 @@ usage: joint-throughput.sh P11SCOPE OUTDIR
   OUTDIR    fresh results directory
   env RATE (1k/10k/100k, default 10k), DURATION seconds (default 20),
       MIN_RATE calls/s (default 10000), CELLS subset, SOFTHSM_LIB
-      override, OBS_MARGIN observer seconds beyond DURATION (default 90)
+      override, OBS_MARGIN observer seconds beyond DURATION (default 90),
+      SETTLEMENT_LAT=1 for the diagnostic settlement-latency line
 USAGE
 }
 

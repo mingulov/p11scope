@@ -2661,6 +2661,13 @@ impl CallerRegistry {
             );
             return;
         }
+        // Diagnostic settlement latency: every call past the
+        // pre-application refusals is applied (api_returns counts
+        // this same population), so record its ENTRY-to-application
+        // delay here. One branch when the diagnostic is off.
+        if let Some(hist) = self.settlement_latency.as_mut() {
+            hist.record(input.facts.ts_ns, super::now_ns());
+        }
         let state = &self.instance_state.semantics[&id];
         let historical = if self.instance_state.negative_exhausted {
             Some(InstanceReason::NegativeStateCapacity)

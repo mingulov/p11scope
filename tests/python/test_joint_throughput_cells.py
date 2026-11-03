@@ -29,7 +29,7 @@ SCRIPT = ROOT / "scripts/ci/joint-throughput.sh"
 def run_script(argv, env=None, timeout=60):
     base = {key: value for key, value in os.environ.items()
             if key not in ("RATE", "DURATION", "MIN_RATE", "CELLS",
-                           "SOFTHSM_LIB", "OBS_MARGIN")}
+                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT")}
     if env:
         base.update(env)
     return subprocess.run([str(SCRIPT), *argv], capture_output=True,
@@ -43,7 +43,7 @@ def run_sourced(shell, env=None, timeout=60):
     """
     base = {key: value for key, value in os.environ.items()
             if key not in ("RATE", "DURATION", "MIN_RATE", "CELLS",
-                           "SOFTHSM_LIB", "OBS_MARGIN")}
+                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT")}
     if env:
         base.update(env)
     base["JOINT_TP_SOURCED"] = "1"
@@ -58,6 +58,7 @@ class CellScriptCLI(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertIn("usage: joint-throughput.sh P11SCOPE OUTDIR",
                       proc.stderr)
+        self.assertIn("SETTLEMENT_LAT", proc.stderr)
 
     def test_missing_args_are_exit_2(self):
         for argv in ([], ["/bin/true"], ["/bin/true", "a", "b"]):
@@ -122,6 +123,17 @@ class CellScriptLibrary(unittest.TestCase):
                            env={"SOFTHSM_LIB": "/override/lib.so"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "/override/lib.so")
+
+    def test_observer_env_passes_the_settlement_toggle(self):
+        proc = run_sourced('observer_env', env={"SETTLEMENT_LAT": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(),
+                         "P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY=1")
+        for env in ({}, {"SETTLEMENT_LAT": "0"},
+                    {"SETTLEMENT_LAT": "yes"}):
+            proc = run_sourced('observer_env', env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "", env)
 
     def test_select_provider_finds_a_live_library(self):
         proc = run_sourced('select_provider')

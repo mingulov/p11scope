@@ -1525,6 +1525,30 @@ pub(crate) fn semantic_stop_line(
     )
 }
 
+/// One stderr line for the diagnostic settlement-latency summary:
+/// cumulative samples with p50/p99/max in ms, overflow past the 10 s
+/// buckets, and unknown-timestamp samples. Percentiles print `-`
+/// without samples. Counts only; no identities, paths or payloads.
+/// Diagnostic-only: printed beside the stop line only while the
+/// diagnostic toggle enables recording, never a contract.
+pub(crate) fn settlement_latency_line(
+    summary: &crate::discovery::caller_registry::SettlementLatencySummary,
+) -> String {
+    fn ms(value: Option<u64>) -> String {
+        value.map_or_else(|| "-".to_string(), |ms| format!("{ms}ms"))
+    }
+    format!(
+        "p11scope: settlement latency: samples={} p50={} p99={} max={}ms overflow={} \
+         unknown_ts={} (1ms buckets, entry-based)",
+        summary.samples,
+        ms(summary.p50_ms),
+        ms(summary.p99_ms),
+        summary.max_ms,
+        summary.overflow,
+        summary.unknown_ts,
+    )
+}
+
 /// The live lane: the owned Detailed `Session` (the sole retained EVENTS
 /// cursor, maps and links), its H0 `SemanticCapture` driver, the sealed
 /// attachment receipt, and the terminal ownership state. Counts only;
@@ -2819,6 +2843,70 @@ impl AttestedSemanticLane {
         self.finish_for_exit();
         coordinator.note_scope_gap(subject.into(), reason.into());
         Ok(batch)
+    }
+
+    /// Finish an unlatched held lane whose collected finish was
+    /// requested: the settle bound (or a second stop) can hold a
+    /// finish that never latched a disposition and never completed,
+    /// and the latched abandon above refuses it. The request
+    /// disabled the H0 stop, so nothing else can finish the lane;
+    /// leaving it unfinished stalls the served summary at
+    /// partial/not_requested/null. Run the H0 stop, mark the lane
+    /// finished and exit-retained, and name the unmatched
+    /// remainder. Admitted only for a requested, unfinished,
+    /// non-retained lane: unrequested holds (mid-run conversions,
+    /// scripted in-flight finishes) keep their pinned no-abandon
+    /// shape, the latched abandon stays the only disposition path,
+    /// and an already-finished lane is untouched. Returns the
+    /// terminal batch for the hold to stage and commit.
+    pub(crate) fn finish_unfinished_held_lane(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        cause: &str,
+    ) -> Option<SemanticBatch> {
+        if self.exit_retained || self.is_finished() {
+            return None;
+        }
+        if !self.collected_finish_requested {
+            return None;
+        }
+        let domain = self.domain;
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            let batch = test.finish(domain);
+            self.finish_for_exit();
+            coordinator.note_scope_gap(
+                "joint finish abandoned for exit".to_string(),
+                format!("{cause}; finish incomplete, remainder unstaged"),
+            );
+            return Some(batch);
+        }
+        let batch = match self.live.as_mut() {
+            Some(live) => {
+                let live = &mut **live;
+                let mut io = LiveStopIo {
+                    session: &mut live.session,
+                    capture: &mut live.capture,
+                    pins: Vec::new(),
+                    domain,
+                    stash: None,
+                    collected: &mut live.collected_calls,
+                };
+                io.finish_h0()
+            }
+            // A shell lane has no H0 to stop; still finish it so
+            // the served summary never stalls unfinished.
+            None => {
+                SemanticBatch::from_tick_report(domain, TickReport::default(), Vec::new(), now_ns())
+                    .ok()?
+            }
+        };
+        self.finish_for_exit();
+        coordinator.note_scope_gap(
+            "joint finish abandoned for exit".to_string(),
+            format!("{cause}; finish incomplete, remainder unstaged"),
+        );
+        Some(batch)
     }
 
     /// Mark the lane finished and exit-retained: nothing else moves.

@@ -8609,7 +8609,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     ) {
                         Ok(owner) => semantic_prepared.push((candidate, owner)),
                         Err(reason) => {
-                            self.semantic_admission_refused(attempt.caller, &reason.to_string())
+                            self.semantic_admission_prepare_failed(attempt.caller, reason)
                         }
                     }
                     if !work.charge(0) {

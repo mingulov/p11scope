@@ -91,7 +91,8 @@ impl SemanticRefusal {
 
 /// Which admission-preparation site refused with
 /// [`SemanticRefusal::Unavailable`]. Finite vocabulary for the
-/// `semantic admission refused` gap: the reason carries
+/// `semantic admission refused` gap (and, for [`Self::NoReceipt`], the
+/// non-loss `semantic admission deferred` note): the reason carries
 /// `semantic_unavailable:<label>`. The production-live leg is the
 /// refresh scan outcome ([`Self::NoReceipt`]); the rest are
 /// teardown races, defense-in-depth (a lane that lost its live
@@ -171,6 +172,16 @@ impl AdmissionPreparationError {
     #[cfg(test)]
     pub(crate) fn site(self) -> Option<AdmissionUnavailableSite> {
         self.site
+    }
+    /// A receipt-less refresh pass ([`AdmissionUnavailableSite::NoReceipt`])
+    /// defers admission to the next pass: the caller stays an
+    /// unbound candidate and is retried, its queued calls wait for
+    /// that retry, and any call shed while it stays unbound is
+    /// disclosed under `semantic calls unrouted`. The deferral itself
+    /// loses no call, so it is a note, not a loss gap.
+    pub(crate) fn is_deferral(self) -> bool {
+        self.refusal == SemanticRefusal::Unavailable
+            && self.site == Some(AdmissionUnavailableSite::NoReceipt)
     }
 }
 

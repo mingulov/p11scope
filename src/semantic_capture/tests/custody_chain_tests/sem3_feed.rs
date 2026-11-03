@@ -55,7 +55,7 @@ fn refused_admission_names_the_unavailable_site() {
     assert_eq!(
         semantic_gap_subjects(&scene),
         vec![(
-            "semantic admission refused".to_string(),
+            "semantic admission deferred".to_string(),
             "semantic_unavailable:no_receipt".to_string()
         )]
     );

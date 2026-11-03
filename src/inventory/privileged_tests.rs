@@ -7766,14 +7766,14 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
             max: Some(b_count_only),
         },
         QuietExemption {
-            subject: "semantic admission refused",
+            subject: "semantic admission deferred",
             reason: "semantic_unavailable:no_receipt",
             caller: Some(caller_a),
             min: 0,
             max: None,
         },
         QuietExemption {
-            subject: "semantic admission refused",
+            subject: "semantic admission deferred",
             reason: "semantic_unavailable:no_receipt",
             caller: Some(caller_b),
             min: 0,
@@ -8476,14 +8476,14 @@ fn privileged_joint_promotion_a_to_b_lp64() -> Result<()> {
             max: Some(b_count_only),
         },
         QuietExemption {
-            subject: "semantic admission refused",
+            subject: "semantic admission deferred",
             reason: "semantic_unavailable:no_receipt",
             caller: Some(caller_a),
             min: 0,
             max: None,
         },
         QuietExemption {
-            subject: "semantic admission refused",
+            subject: "semantic admission deferred",
             reason: "semantic_unavailable:no_receipt",
             caller: Some(caller_b),
             min: 0,
@@ -9479,7 +9479,7 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     ensure!(
         count_disclosed_gaps(
             &coordinator,
-            "semantic admission refused",
+            "semantic admission deferred",
             "semantic_unavailable:no_receipt",
             Some(caller_s),
         ) >= 1,
@@ -9496,7 +9496,7 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
         u8::from(coordinator.semantic_bindings().get(caller_s).is_some()),
         count_disclosed_gaps(
             &coordinator,
-            "semantic admission refused",
+            "semantic admission deferred",
             "semantic_unavailable:no_receipt",
             Some(caller_s),
         ),
@@ -9890,7 +9890,7 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
     };
     let s_refusals = count_disclosed_gaps(
         &coordinator,
-        "semantic admission refused",
+        "semantic admission deferred",
         "semantic_unavailable:no_receipt",
         Some(caller_s),
     );
@@ -10005,28 +10005,28 @@ fn privileged_joint_absence_and_s1only_siblings_lp64() -> Result<()> {
             max: Some(h_count_only),
         },
         QuietExemption {
-            subject: "semantic admission refused",
+            subject: "semantic admission deferred",
             reason: "semantic_unavailable:no_receipt",
             caller: Some(caller_e),
             min: 0,
             max: None,
         },
         QuietExemption {
-            subject: "semantic admission refused",
+            subject: "semantic admission deferred",
             reason: "semantic_unavailable:no_receipt",
             caller: Some(caller_c),
             min: 0,
             max: None,
         },
         QuietExemption {
-            subject: "semantic admission refused",
+            subject: "semantic admission deferred",
             reason: "semantic_unavailable:no_receipt",
             caller: Some(caller_h),
             min: 0,
             max: None,
         },
         QuietExemption {
-            subject: "semantic admission refused",
+            subject: "semantic admission deferred",
             reason: "semantic_unavailable:no_receipt",
             caller: Some(caller_s),
             min: s_floor,

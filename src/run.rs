@@ -646,35 +646,80 @@ fn script_interpreter(launch_file: &File) -> Option<String> {
     Some(String::from_utf8_lossy(interpreter).into_owned())
 }
 
+/// Whether the mode bits grant (`uid`, `gid`) read access to a file
+/// owned by (`meta_uid`, `meta_gid`): owner bits, else the primary
+/// group's, else other's. Supplementary groups are ignored (fail-closed:
+/// the `#!` token stays hidden when the check cannot prove the invoker
+/// could read it). Root reads anything.
+fn invoker_can_read_file(meta_uid: u32, meta_gid: u32, mode: u32, uid: u32, gid: u32) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    if uid == meta_uid {
+        mode & 0o400 != 0
+    } else if gid == meta_gid {
+        mode & 0o040 != 0
+    } else {
+        mode & 0o004 != 0
+    }
+}
+
 /// A script launch file refused with its interpreter and the attach
-/// alternative.
-fn script_refusal_error(resolved: &Path, token: &str, error: &io::Error) -> io::Error {
-    io::Error::new(
-        error.kind(),
-        format!(
-            "{error}. {} is a script for {token}: run `p11scope run -- {token} {}` (a script \
-             that starts a snap application still cannot run here), or {ATTACH_HINT}",
-            resolved.display(),
-            resolved.display()
+/// alternative. `token` is `None` when the invoker could not read the
+/// file: the refusal then names no interpreter. Control bytes in the
+/// token and the path render escaped: the refusal is printed to a
+/// terminal.
+fn script_refusal_error(resolved: &Path, token: Option<&str>, error: &io::Error) -> io::Error {
+    let resolved_text = resolved.display().to_string();
+    let resolved = crate::render::escape_controls(&resolved_text);
+    let message = match token {
+        Some(token) => {
+            let token = crate::render::escape_controls(token);
+            format!(
+                "{error}. {resolved} is a script for {token}: run `p11scope run -- {token} \
+                 {resolved}` (a script that starts a snap application still cannot run here), \
+                 or {ATTACH_HINT}"
+            )
+        }
+        None => format!(
+            "{error}. {resolved} is a script: run `p11scope run -- <interpreter> {resolved}` \
+             with its interpreter (the `#!` line is not shown because the invoking user \
+             cannot read this file; a script that starts a snap application still cannot run \
+             here), or {ATTACH_HINT}"
         ),
-    )
+    };
+    io::Error::new(error.kind(), message)
 }
 
 /// A script that starts a snap application, refused with the snap reason.
+/// The token is dropped (and every interpolated field escaped) exactly
+/// like [`script_refusal_error`].
 fn script_snap_refusal_error(
     resolved: &Path,
-    token: &str,
+    token: Option<&str>,
     name: &str,
     launcher: &Path,
 ) -> io::Error {
+    let resolved_text = resolved.display().to_string();
+    let resolved = crate::render::escape_controls(&resolved_text);
+    let name = crate::render::escape_controls(name);
+    let launcher_text = launcher.display().to_string();
+    let launcher = crate::render::escape_controls(&launcher_text);
+    let head = match token {
+        Some(token) => {
+            let token = crate::render::escape_controls(token);
+            format!(
+                "{resolved} is a script for {token} that starts the snap application {name} \
+                 ({launcher})"
+            )
+        }
+        None => {
+            format!("{resolved} is a script that starts the snap application {name} ({launcher})")
+        }
+    };
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        format!(
-            "{} is a script for {token} that starts the snap application {name} ({}): {}",
-            resolved.display(),
-            launcher.display(),
-            snap_refusal_tail(name),
-        ),
+        format!("{head}: {}", snap_refusal_tail(&name)),
     )
 }
 
@@ -708,7 +753,7 @@ fn check_owned_target_runnable_with(
     args: &[OsString],
     path: Option<&OsStr>,
     cwd: &Path,
-    _invoker: Option<(u32, u32)>,
+    invoker: Option<(u32, u32)>,
     probes: &SnapProbes,
 ) -> io::Result<()> {
     if let Some(refusal) = snap_launcher_refusal(program, args, path, cwd, probes) {
@@ -728,6 +773,24 @@ fn check_owned_target_runnable_with(
     let Some(token) = token else {
         return Err(error);
     };
+    // The refusal runs as the observer (possibly root via sudo): the
+    // token is only shown when the invoker could read the file itself.
+    // An unknown invoker or unreadable metadata hides it (fail-closed).
+    let visible = launch_file
+        .metadata()
+        .ok()
+        .and_then(|meta| {
+            let (uid, gid) = invoker?;
+            Some(invoker_can_read_file(
+                meta.uid(),
+                meta.gid(),
+                meta.mode(),
+                uid,
+                gid,
+            ))
+        })
+        .unwrap_or(false);
+    let token = visible.then_some(token.as_str());
     // A script that starts a snap application (Ubuntu's /usr/bin/firefox
     // wrapper): the snap reason, not the interpreter detour that would
     // fail later inside snap-confine. Lstat only: the launcher is a
@@ -737,11 +800,11 @@ fn check_owned_target_runnable_with(
         if (probes.exists)(&launcher) {
             let name = file_name.to_string_lossy();
             return Err(script_snap_refusal_error(
-                &resolved, &token, &name, &launcher,
+                &resolved, token, &name, &launcher,
             ));
         }
     }
-    Err(script_refusal_error(&resolved, &token, &error))
+    Err(script_refusal_error(&resolved, token, &error))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12935,6 +12998,163 @@ mod tests {
             !text.contains("p11scope run -- /bin/sh"),
             "the failing interpreter detour must not be suggested: {text}"
         );
+    }
+
+    /// The refusal is printed to a terminal: control bytes in the `#!`
+    /// token and in the resolved path render escaped, never raw.
+    #[test]
+    fn script_refusal_escapes_control_bytes_in_token_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("we\x11ird");
+        std::fs::write(&script, "#!bad\x07interp --flag\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invoker = ChildIdentity::for_invoker()
+            .ok()
+            .map(|identity| (identity.uid, identity.gid));
+        let exists = |_: &Path| false;
+        let is_runnable = |_: &Path| false;
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let text = check_owned_target_runnable_with(
+            script.as_os_str(),
+            &[],
+            Some(std::ffi::OsStr::new("")),
+            Path::new("/"),
+            invoker,
+            &probes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            text.contains("bad\\u{7}interp"),
+            "the token must render escaped: {text}"
+        );
+        assert!(
+            !text.contains("bad\x07interp"),
+            "no raw control byte from the token: {text}"
+        );
+        assert!(
+            text.contains("we\\u{11}ird"),
+            "the path must render escaped: {text}"
+        );
+        assert!(
+            !text.contains("we\x11ird"),
+            "no raw control byte from the path: {text}"
+        );
+    }
+
+    /// The refusal runs as the observer (possibly root via sudo) but the
+    /// `#!` token is only shown when the invoker could read the file
+    /// itself: owner, primary group, or other read bits decide.
+    #[test]
+    fn script_token_is_hidden_from_an_invoker_who_cannot_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("guarded.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let meta = std::fs::metadata(&script).unwrap();
+        let (owner, group) = (meta.uid(), meta.gid());
+        let other = owner.wrapping_add(1);
+        let other_group = group.wrapping_add(1);
+        assert_ne!(other, owner);
+        assert_ne!(other_group, group);
+        let exists = |_: &Path| false;
+        let is_runnable = |_: &Path| false;
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let refusal = |invoker: Option<(u32, u32)>| {
+            check_owned_target_runnable_with(
+                script.as_os_str(),
+                &[],
+                Some(std::ffi::OsStr::new("")),
+                Path::new("/"),
+                invoker,
+                &probes,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        // Owner-readable: the owner sees the token, anyone else does not.
+        let text = refusal(Some((owner, group)));
+        assert!(text.contains("is a script for /bin/sh"), "{text}");
+        let text = refusal(Some((other, other_group)));
+        assert!(
+            text.contains("is not shown because the invoking user cannot read this file"),
+            "{text}"
+        );
+        assert!(!text.contains("is a script for"), "{text}");
+        // Group-readable: the primary group sees the token.
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let text = refusal(Some((other, group)));
+        assert!(text.contains("is a script for /bin/sh"), "{text}");
+        let text = refusal(Some((other, other_group)));
+        assert!(
+            text.contains("is not shown because the invoking user cannot read this file"),
+            "{text}"
+        );
+        // Other-readable: everyone sees the token.
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o705)).unwrap();
+        let text = refusal(Some((other, other_group)));
+        assert!(text.contains("is a script for /bin/sh"), "{text}");
+    }
+
+    /// The readability check behind the token drop: owner bits, else
+    /// the primary group's, else other's; root reads anything. Write
+    /// and execute bits never grant a read.
+    #[test]
+    fn invoker_read_check_follows_owner_group_other_bits() {
+        for (meta_uid, meta_gid, mode, uid, gid, expected) in [
+            (1000, 100, 0o600, 1000, 100, true),
+            (1000, 100, 0o000, 1000, 100, false),
+            (1000, 100, 0o100, 1000, 100, false),
+            (1000, 100, 0o040, 2000, 100, true),
+            (1000, 100, 0o040, 2000, 200, false),
+            (1000, 100, 0o400, 2000, 100, false),
+            (1000, 100, 0o004, 2000, 200, true),
+            (1000, 100, 0o006, 2000, 200, true),
+            (1000, 100, 0o002, 2000, 200, false),
+            (1000, 100, 0o000, 0, 0, true),
+        ] {
+            assert_eq!(
+                invoker_can_read_file(meta_uid, meta_gid, mode, uid, gid),
+                expected,
+                "meta {meta_uid}:{meta_gid} {mode:o} invoker {uid}:{gid}"
+            );
+        }
+    }
+
+    /// The snap-starting script refusal hides the token the same way when
+    /// the invoker could not read the file.
+    #[test]
+    fn snap_script_refusal_hides_an_unreadable_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("firefox");
+        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/firefox \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let meta = std::fs::metadata(&script).unwrap();
+        let invoker = Some((meta.uid().wrapping_add(1), meta.gid().wrapping_add(1)));
+        let exists = |candidate: &Path| candidate == Path::new("/snap/bin/firefox");
+        let is_runnable = |_: &Path| false;
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let text = check_owned_target_runnable_with(
+            script.as_os_str(),
+            &[],
+            Some(std::ffi::OsStr::new("")),
+            Path::new("/"),
+            invoker,
+            &probes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            text.contains(
+                "is a script that starts the snap application firefox (/snap/bin/firefox)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("is a script for"), "{text}");
+        assert!(text.contains("snap-confine"), "{text}");
     }
 
     /// Over-refusal: a dangling `/snap/bin/tool` (lstat hit, not runnable)

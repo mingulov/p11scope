@@ -10438,6 +10438,9 @@ fn prearm_finish_closes_watches_and_merges_assembly_keys() {
         None,
         &crate::metrics::KernelEvidence::default(),
         0,
+        None,
+        false,
+        None,
     );
     assert_eq!(engine.discovery.modules.len(), 1);
     let record = &engine.discovery.modules[0];
@@ -10487,6 +10490,9 @@ fn finish_prearm_terminal_health(
         Some(5000),
         &kernel,
         malformed_records,
+        None,
+        false,
+        None,
     );
     assert_eq!(engine.discovery.modules.len(), 1);
     *engine.discovery.modules[0]
@@ -10572,6 +10578,9 @@ fn prearm_scope_identity_refusal_ends_scope_uncertain() {
         Some(5000),
         &crate::metrics::KernelEvidence::default(),
         0,
+        None,
+        false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10622,6 +10631,9 @@ fn prearm_link_gaps_refuse_idle() {
         Some(5000),
         &crate::metrics::KernelEvidence::default(),
         0,
+        None,
+        false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10689,6 +10701,9 @@ fn prearm_object_change_detected_after_stop_never_exceeds_first_stop() {
         Some(1000),
         &crate::metrics::KernelEvidence::default(),
         0,
+        None,
+        false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10771,6 +10786,9 @@ fn prearm_unknown_first_stop_keeps_end_unknown_after_object_change() {
         None,
         &crate::metrics::KernelEvidence::default(),
         0,
+        None,
+        false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10817,6 +10835,9 @@ fn prearm_unknown_first_stop_healthy_watch_ends_unknown() {
         None,
         &crate::metrics::KernelEvidence::default(),
         0,
+        None,
+        false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10875,6 +10896,9 @@ fn prearm_unknown_first_stop_preserves_pre_stop_close() {
         None,
         &crate::metrics::KernelEvidence::default(),
         0,
+        None,
+        false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10940,6 +10964,9 @@ fn generic_terminal_assembly_discloses_late_discovery_window() {
         Some(5000),
         &crate::metrics::KernelEvidence::default(),
         0,
+        None,
+        false,
+        None,
     );
     let record = &engine.discovery.modules[0];
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -10953,6 +10980,550 @@ fn generic_terminal_assembly_discloses_late_discovery_window() {
                 .iter()
                 .any(|window| { window.reason == crate::render::UnobservedReason::LateDiscovery }),
         "a real late module carries a late_discovery window: {windows:?}"
+    );
+}
+
+/// Mapped pre-arm engine with scripted declared-set stamps: the fixture
+/// provider loads for real (sources gain `scan`, so the base window
+/// applies), the scope start pins to 50, and every declared slot links and
+/// stamps at `stamp`. Keeps the fixture alive for the engine's views.
+fn prearm_mapped_engine_with_declared_stamps(
+    stamp: u64,
+) -> (DiscoveryLifecycleFixture, Engine, ScriptedSession, Vec<u32>) {
+    let mut fixture = DiscoveryLifecycleFixture::start();
+    let mut engine = fixture.discover_prearm_before_load();
+    assert!(engine.has_prearm_watches());
+    fixture.load();
+    engine.request_refresh(fixture.pid(), None);
+    refresh_inventory_once(&mut engine);
+    engine.publish_current_capture_facts().unwrap();
+    engine.set_scope_start_ns(Some(50));
+    let keys: Vec<_> = engine
+        .prearm
+        .watches()
+        .values()
+        .flat_map(|watch| watch.declared().iter().copied())
+        .collect();
+    assert!(
+        !keys.is_empty(),
+        "bare pre-arm must declare its proved exports"
+    );
+    let declared: Vec<u32> = keys
+        .iter()
+        .filter_map(|key| engine.plan().slot_index_for_key(*key))
+        .collect();
+    assert!(
+        !declared.is_empty(),
+        "bare pre-arm must plan its proved exports"
+    );
+    let mut session = ScriptedSession::default();
+    for slot in &declared {
+        session.scripted_links.insert(*slot);
+        session.scripted_stamps.insert(*slot, stamp);
+    }
+    (fixture, engine, session, declared)
+}
+
+/// The one watched pre-arm record after the terminal finish.
+fn watched_prearm_record(engine: &Engine) -> &crate::render::DiscoveredModule {
+    let watched: Vec<_> = engine
+        .discovery
+        .modules
+        .iter()
+        .filter(|module| module.watch.is_some())
+        .collect();
+    assert_eq!(
+        watched.len(),
+        1,
+        "one watched pre-arm record: {:?}",
+        engine
+            .discovery
+            .modules
+            .iter()
+            .map(|module| (&module.sources, module.watch.is_some()))
+            .collect::<Vec<_>>()
+    );
+    watched[0]
+}
+
+fn scripted_hold(
+    start_ns: Option<u64>,
+    end_ns: Option<u64>,
+    continuous: bool,
+) -> crate::discovery::pause::PauseGateHold {
+    crate::discovery::pause::PauseGateHold {
+        start_ns,
+        end_ns,
+        continuous,
+    }
+}
+
+fn pre_attach_window() -> Vec<crate::render::UnobservedWindow> {
+    vec![crate::render::UnobservedWindow {
+        start_ns: 50,
+        end_ns: 900,
+        reason: crate::render::UnobservedReason::PreAttach,
+    }]
+}
+
+/// A pause hold across the whole `[scope_start, declared-set attach]`
+/// window with every member stamped proves exactness: no window.
+#[test]
+fn prearm_pause_hold_across_window_empties_windows() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(900), true)),
+        true,
+        Some(1000),
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(Vec::new()));
+}
+
+/// A gapped hold proves nothing: the window stays, exactly.
+#[test]
+fn prearm_pause_hold_gap_keeps_window() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(900), false)),
+        true,
+        Some(1000),
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
+}
+
+/// A hold released before the last declared stamp ends early: the window
+/// stays, exactly.
+#[test]
+fn prearm_pause_hold_released_before_last_stamp_keeps_window() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(800), true)),
+        true,
+        Some(1000),
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
+}
+
+/// A hold with a missing clock on either bound is unboundable: the window
+/// stays, exactly, on both sides.
+#[test]
+fn prearm_pause_hold_missing_clock_keeps_window() {
+    use crate::render::PrearmWatchEnd;
+
+    for hold in [
+        scripted_hold(None, Some(900), true),
+        scripted_hold(Some(50), None, true),
+    ] {
+        let (_fixture, mut engine, session, _declared) =
+            prearm_mapped_engine_with_declared_stamps(900);
+        engine.finish_prearm_capture(
+            &session,
+            PrearmWatchEnd::ScopeEnd,
+            &BTreeSet::new(),
+            &[],
+            Some(5000),
+            &crate::metrics::KernelEvidence::default(),
+            0,
+            Some(hold),
+            true,
+            Some(1000),
+        );
+        let record = watched_prearm_record(&engine);
+        assert_eq!(record.attached_at_ns, Some(Some(900)), "hold {hold:?}");
+        assert_eq!(
+            record.unobserved_windows,
+            Some(pre_attach_window()),
+            "hold {hold:?}"
+        );
+    }
+}
+
+/// One declared member without a stamp leaves the attach instant unknown:
+/// no proof is emittable and nothing is disclosed.
+#[test]
+fn prearm_pause_hold_unstamped_member_discloses_nothing() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, mut session, declared) =
+        prearm_mapped_engine_with_declared_stamps(900);
+    let dropped = declared.last().expect("a declared slot to unstamp");
+    session.scripted_links.remove(dropped);
+    session.scripted_stamps.remove(dropped);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(900), true)),
+        true,
+        Some(1000),
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(None));
+    assert_eq!(record.unobserved_windows, None);
+}
+
+/// No hold means no proof on either scope shape: a non-`run` capture and
+/// a passive owned run keep the identical window from the same stamps.
+#[test]
+fn prearm_no_pause_hold_keeps_window() {
+    use crate::render::PrearmWatchEnd;
+
+    for owned_run in [false, true] {
+        let (_fixture, mut engine, session, _declared) =
+            prearm_mapped_engine_with_declared_stamps(900);
+        engine.finish_prearm_capture(
+            &session,
+            PrearmWatchEnd::ScopeEnd,
+            &BTreeSet::new(),
+            &[],
+            Some(5000),
+            &crate::metrics::KernelEvidence::default(),
+            0,
+            None,
+            owned_run,
+            owned_run.then_some(1000),
+        );
+        let record = watched_prearm_record(&engine);
+        assert_eq!(record.attached_at_ns, Some(Some(900)), "owned {owned_run}");
+        assert_eq!(
+            record.unobserved_windows,
+            Some(pre_attach_window()),
+            "owned {owned_run}"
+        );
+    }
+}
+
+/// The proofs builder reads the declared-set maximum over every member
+/// (never a subset maximum) and emits one proof per covered object:
+/// synthetic two-slot plan, no fixture.
+#[test]
+fn pause_gate_proofs_need_every_declared_stamp_per_object() {
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::plan::{AttachKey, AttachPlan, ModuleId, Slot};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn slot(index: u32, object: u32, file_offset: u64, module: u32) -> Slot {
+        Slot {
+            index,
+            descriptor_index: 1,
+            object: PinnedObjectId(object),
+            object_path: format!("/proc/self/fd/{object}"),
+            file_offset,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[1],
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(module)],
+        }
+    }
+
+    let plan = AttachPlan::from_slots(vec![slot(0, 7, 0x1000, 3), slot(1, 7, 0x2000, 3)]);
+    let key = |file_offset| AttachKey {
+        object: PinnedObjectId(7),
+        file_offset,
+    };
+    let watches = BTreeMap::from([(
+        PinnedObjectId(7),
+        crate::prearm_module::PrearmWatch::new(BTreeSet::from([key(0x1000), key(0x2000)])),
+    )]);
+    let hold = Some(scripted_hold(Some(50), Some(1200), true));
+
+    // Both members stamped: one proof at the declared-set maximum.
+    let proofs = Engine::pause_gate_exactness_proofs(
+        &watches,
+        &plan,
+        &BTreeMap::from([(0, 900), (1, 1200)]),
+        hold,
+        true,
+        Some(5000),
+    );
+    assert_eq!(proofs.len(), 1);
+    assert_eq!(
+        proofs.get(&PinnedObjectId(7)),
+        Some(&crate::prearm_module::ExactnessProof {
+            interval_start_ns: 50,
+            interval_end_ns: 1200,
+            kind: crate::prearm_module::ExactnessProofKind::PauseGateHeld,
+        })
+    );
+
+    // Either member unstamped: no proof for the object.
+    for stamps in [BTreeMap::from([(0, 900)]), BTreeMap::from([(1, 1200)])] {
+        let proofs =
+            Engine::pause_gate_exactness_proofs(&watches, &plan, &stamps, hold, true, Some(5000));
+        assert!(proofs.is_empty(), "stamps {stamps:?}");
+    }
+
+    // A non-`run` scope emits no proof however complete the hold.
+    let proofs = Engine::pause_gate_exactness_proofs(
+        &watches,
+        &plan,
+        &BTreeMap::from([(0, 900), (1, 1200)]),
+        hold,
+        false,
+        None,
+    );
+    assert!(proofs.is_empty());
+}
+
+/// A hold naming a later start than the scope start mismatches the
+/// would-be window: the assembly gate fails closed to the window.
+#[test]
+fn prearm_pause_hold_late_start_keeps_window() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(60), Some(900), true)),
+        true,
+        Some(1000),
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
+}
+
+/// A non-`run` scope with identical stamps, a complete scripted hold
+/// and a known release bound still keeps the window: only the owned
+/// child's hold proves exactness, so this test isolates the scope gate.
+#[test]
+fn prearm_non_run_scope_with_hold_keeps_window() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(900), true)),
+        false,
+        Some(1000),
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
+}
+
+/// A declared first-stamp dated after the barrier release proves nothing:
+/// the child may run its command before the first *verified* pause stop,
+/// so the window stays even when the frozen hold reaches the stamp.
+/// Release at 800 precedes the 900 stamps below.
+#[test]
+fn prearm_pause_hold_post_release_stamp_keeps_window() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(900), true)),
+        true,
+        Some(800),
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
+}
+
+/// A declared first-stamp exactly at the barrier release still proves:
+/// the bound withholds only strictly post-release stamps (`>` at the
+/// builder, not `>=`), so the window empties. Release and stamps at 900.
+#[test]
+fn prearm_release_equal_to_stamp_still_proves() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(900), true)),
+        true,
+        Some(900),
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(Vec::new()));
+}
+
+/// Synthetic two-slot plan: one declared stamp after the release
+/// withholds the proof for its object. Release at 5s, one member stamped
+/// 100ns after, the frozen hold reaching it.
+#[test]
+fn pause_gate_proofs_post_release_stamp_must_not_prove() {
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::plan::{AttachKey, AttachPlan, ModuleId, Slot};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn slot(index: u32, object: u32, file_offset: u64, module: u32) -> Slot {
+        Slot {
+            index,
+            descriptor_index: 1,
+            object: PinnedObjectId(object),
+            object_path: format!("/proc/self/fd/{object}"),
+            file_offset,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[1],
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(module)],
+        }
+    }
+
+    let plan = AttachPlan::from_slots(vec![slot(0, 7, 0x1000, 3), slot(1, 7, 0x2000, 3)]);
+    let key = |file_offset| AttachKey {
+        object: PinnedObjectId(7),
+        file_offset,
+    };
+    let watches = BTreeMap::from([(
+        PinnedObjectId(7),
+        crate::prearm_module::PrearmWatch::new(BTreeSet::from([key(0x1000), key(0x2000)])),
+    )]);
+    let hold = Some(scripted_hold(Some(50), Some(5_000_000_100), true));
+    let proofs = Engine::pause_gate_exactness_proofs(
+        &watches,
+        &plan,
+        &BTreeMap::from([(0, 5_000_000_000), (1, 5_000_000_100)]),
+        hold,
+        true,
+        Some(5_000_000_000),
+    );
+    assert!(
+        proofs.is_empty(),
+        "post-release declared stamp must withhold the proof, got {proofs:?}"
+    );
+}
+
+/// An unboundable release (clock failure or unreleased child) withholds
+/// every proof however complete the hold and stamps.
+#[test]
+fn prearm_pause_hold_missing_release_keeps_window() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(900), true)),
+        true,
+        None,
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
+}
+
+/// Synthetic two-slot plan: a missing release bound withholds the proof
+/// for a fully stamped, hold-covered object.
+#[test]
+fn pause_gate_proofs_missing_release_must_not_prove() {
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::plan::{AttachKey, AttachPlan, ModuleId, Slot};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn slot(index: u32, object: u32, file_offset: u64, module: u32) -> Slot {
+        Slot {
+            index,
+            descriptor_index: 1,
+            object: PinnedObjectId(object),
+            object_path: format!("/proc/self/fd/{object}"),
+            file_offset,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[1],
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(module)],
+        }
+    }
+
+    let plan = AttachPlan::from_slots(vec![slot(0, 7, 0x1000, 3), slot(1, 7, 0x2000, 3)]);
+    let key = |file_offset| AttachKey {
+        object: PinnedObjectId(7),
+        file_offset,
+    };
+    let watches = BTreeMap::from([(
+        PinnedObjectId(7),
+        crate::prearm_module::PrearmWatch::new(BTreeSet::from([key(0x1000), key(0x2000)])),
+    )]);
+    let proofs = Engine::pause_gate_exactness_proofs(
+        &watches,
+        &plan,
+        &BTreeMap::from([(0, 900), (1, 1200)]),
+        Some(scripted_hold(Some(50), Some(1200), true)),
+        true,
+        None,
+    );
+    assert!(
+        proofs.is_empty(),
+        "missing release must withhold, got {proofs:?}"
     );
 }
 

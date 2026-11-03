@@ -390,6 +390,38 @@ enum AuthorizationSource {
     Removal,
 }
 
+/// Gap-free hold of the owned child across the first pause epoch
+/// (R2-D1-6 proof source (i)): the pause-proven segment of the from-start
+/// hold the pre-arm exactness builder checks. A held child can neither map
+/// nor call. The segment alone does not prove the window: the child may
+/// run its command before the first *verified* pause stop, so the
+/// builder additionally requires every declared first-stamp to precede the
+/// barrier release — pre-release windows are barrier-covered exactly, and
+/// post-release stamps withhold the proof. The owned `run` path composes
+/// the claim start (its pre-spawn scope start, bridged by spawn order and
+/// the pre-exec barrier) and the release bound with this segment; the
+/// builder emits the proof only when the composed interval covers a
+/// pre-release window, and assembly still exact-matches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PauseGateHold {
+    /// Lower bound on the arm that opened the hold: the first arm's
+    /// `armed_at_ns`, installed before the barrier release. `None` when the
+    /// arm clock read failed: unboundable, never exact.
+    pub(crate) start_ns: Option<u64>,
+    /// Last instant the child was proven stopped before the first resume:
+    /// the latest stopped-sample clock of the first completed pause cycle,
+    /// sampled after the cycle's attach batch. `None` until the first
+    /// resume freezes a hold (an armed-but-never-stopped child ran free).
+    pub(crate) end_ns: Option<u64>,
+    /// The first epoch stayed gap-free. Anything unproven before the
+    /// first resume voids it, sticky: a failed cycle, a rejected or
+    /// refuted stop, a revalidation failure, a missing clock. The freeze at
+    /// the first completing resume is immutable: a re-arm starts a new
+    /// interval (the child ran between), and a later gap is after the
+    /// proven end, so neither moves nor voids the frozen hold.
+    pub(crate) continuous: bool,
+}
+
 pub(crate) struct PauseCoordinator {
     policy: PausePolicy,
     pid: u32,
@@ -407,6 +439,21 @@ pub(crate) struct PauseCoordinator {
     /// first see it. `None` when no arm recorded one, which keeps every record
     /// a candidate.
     armed_at_ns: Option<u64>,
+    /// First arm's `armed_at_ns` snapshot: the hold's start bound. Never
+    /// overwritten by successor installs, which only move the live arm.
+    hold_start_ns: Option<u64>,
+    /// A first arm already ran: the start snapshot is first-arm-only, so a
+    /// re-arm after a clockless first arm cannot smuggle in a later bound.
+    hold_armed_once: bool,
+    /// Latest stopped-sample instant of the first epoch, frozen at the
+    /// first completing resume; later cycles never move it, and the
+    /// accessor publishes it only once frozen.
+    hold_end_ns: Option<u64>,
+    /// Sticky pre-freeze gap latch (fail-closed): any unproven break
+    /// before the first resume voids the from-start claim.
+    hold_void: bool,
+    /// The first pause cycle completed its resume: the hold is frozen.
+    hold_frozen: bool,
     rearming_enabled: bool,
     may_be_stopped: bool,
     attempt_open: bool,
@@ -521,6 +568,11 @@ impl PauseCoordinator {
             epoch: PauseEpoch::default(),
             armed: false,
             armed_at_ns: None,
+            hold_start_ns: None,
+            hold_armed_once: false,
+            hold_end_ns: None,
+            hold_void: false,
+            hold_frozen: false,
             rearming_enabled: policy != PausePolicy::Never,
             may_be_stopped: false,
             attempt_open: false,
@@ -599,6 +651,13 @@ impl PauseCoordinator {
             Ok(Some(PAUSE_ARMED)) => {
                 self.armed = true;
                 self.armed_at_ns = armed_at;
+                // The hold's start bound is the first arm's clock only: a
+                // re-arm or successor install never moves it, not even
+                // after a clockless first arm (which stays unboundable).
+                if !self.hold_armed_once {
+                    self.hold_armed_once = true;
+                    self.hold_start_ns = armed_at;
+                }
                 self.successors_left = MAX_SUCCESSORS_PER_ARM;
                 Ok(ArmResult::Armed)
             }
@@ -811,6 +870,7 @@ impl PauseCoordinator {
         let mut received = received;
         if let Some(batch) = received.terminal_batch.take() {
             if self.terminal_batch.is_some() {
+                self.void_hold();
                 return Err(Self::policy_error(
                     self.policy,
                     "more than one terminal discovery batch reached the coordinator",
@@ -922,6 +982,9 @@ impl PauseCoordinator {
             }
             self.epoch.zero_candidate = false;
             self.may_be_stopped = false;
+            // Refuted: ARMED still held, so no hook won and nothing stopped
+            // the child — it ran unstopped past this record.
+            self.void_hold();
             return self.apply_unowned(io, None);
         }
         self.may_be_stopped = true;
@@ -1065,6 +1128,7 @@ impl PauseCoordinator {
             Ok(sample) => sample,
             Err(error) => return self.fail_cycle(io, error, false),
         };
+        self.note_hold_sample(second_sample);
         if second_sample
             .checked_sub(first_sample)
             .is_none_or(|delta| delta < SAMPLE_NS)
@@ -1136,8 +1200,9 @@ impl PauseCoordinator {
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
         }
-        if let Err(error) = self.sample_stopped(io, deadline) {
-            return self.fail_cycle(io, error, false);
+        match self.sample_stopped(io, deadline) {
+            Ok(sample) => self.note_hold_sample(sample),
+            Err(error) => return self.fail_cycle(io, error, false),
         }
         let marker_seen = match io.marker_seen() {
             Ok(seen) => seen,
@@ -1185,8 +1250,9 @@ impl PauseCoordinator {
             if let Err(error) = io.wait_one_ms() {
                 return self.fail_cycle(io, error, true);
             }
-            if let Err(error) = self.sample_stopped(io, deadline) {
-                return self.fail_cycle(io, error, false);
+            match self.sample_stopped(io, deadline) {
+                Ok(sample) => self.note_hold_sample(sample),
+                Err(error) => return self.fail_cycle(io, error, false),
             }
             match io.marker_seen() {
                 Ok(false) => {}
@@ -1224,6 +1290,9 @@ impl PauseCoordinator {
             return self.fail_cycle(io, error, true);
         }
         self.epoch.resume_succeeded = true;
+        // The first completing resume freezes the from-start hold: the
+        // child runs past here, so later cycles start a new interval.
+        self.hold_frozen = true;
         if install_successor {
             self.epoch = PauseEpoch {
                 successor_installed: true,
@@ -1370,6 +1439,9 @@ impl PauseCoordinator {
     }
 
     fn reject_cycle(&mut self, io: &mut impl PauseIo, deadline: u64) -> Result<(), PauseError> {
+        // Rejected: the helper refused the stop, so the child was never
+        // held by this epoch.
+        self.void_hold();
         self.set_diagnostic(PauseDiagnostic::PauseHelperRejected);
         if self.policy == PausePolicy::Always {
             return self.terminal_cleanup_with_cause(
@@ -1682,6 +1754,7 @@ impl PauseCoordinator {
         message: impl Into<String>,
         lifecycle: bool,
     ) -> Result<(), PauseError> {
+        self.void_hold();
         let message = message.into();
         self.set_message_diagnostic(&message);
         io.note_unconfirmed_cycle();
@@ -2071,6 +2144,42 @@ impl PauseCoordinator {
 
     pub(crate) fn counters(&self) -> PauseCounters {
         self.counters
+    }
+
+    /// Records a stopped-sample instant toward the first hold: the child
+    /// was proven stopped at `now`. Frozen holds never move.
+    fn note_hold_sample(&mut self, now: u64) {
+        if !self.hold_frozen {
+            let end = self.hold_end_ns.get_or_insert(now);
+            *end = (*end).max(now);
+        }
+    }
+
+    /// Voids the from-start claim after anything unproven. Sticky until
+    /// the freeze; frozen holds are immutable (a later gap lands after
+    /// the proven end, so it ends nothing).
+    fn void_hold(&mut self) {
+        if !self.hold_frozen {
+            self.hold_void = true;
+        }
+    }
+
+    /// The first-hold proof for pre-arm exactness, once the coordinator
+    /// armed: `None` while no arm proved a hold (a passive capture, a
+    /// failed or disabled arm, or a missing arm clock). The end bound
+    /// publishes only after the first resume freezes it, so a cycle that
+    /// never completes can never lend a partial end to a proof. A
+    /// returned hold carries its own gap flag; the builder trusts only a
+    /// continuous one.
+    pub(crate) fn pause_hold(&self) -> Option<PauseGateHold> {
+        let start = self.hold_start_ns?;
+        let end = self.hold_end_ns.filter(|_| self.hold_frozen);
+        let sane = end.is_none_or(|end| start <= end);
+        Some(PauseGateHold {
+            start_ns: Some(start),
+            end_ns: end,
+            continuous: !self.hold_void && sane,
+        })
     }
 
     #[allow(dead_code)] // Introspection accessor; exercised only by the pause tests.
@@ -3977,6 +4086,242 @@ mod tests {
         coordinator.service(&mut io).unwrap();
 
         assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+    }
+
+    /// Drives the real `arm` (not `arm_for_test`) so the hold snapshots
+    /// the arm clock, then points the scripted authorization at the won
+    /// REQUESTED the service cycle consumes. `arm_now` is consumed first.
+    fn armed_hold_coordinator(io: &mut FakeIo, arm_now: Result<u64, String>) -> PauseCoordinator {
+        io.now.push_front(arm_now);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut *io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+        coordinator
+    }
+
+    /// The first completed pause cycle freezes the from-start hold: the
+    /// arm lower bound plus the last stopped sample before the resume. A
+    /// re-arm and a second completed cycle neither move the frozen end nor
+    /// replace the first arm's start.
+    #[test]
+    fn pause_hold_freezes_first_hold_at_resume() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.resume_authorization = Some(None);
+        let mut coordinator = armed_hold_coordinator(&mut io, Ok(5));
+        coordinator.successors_left = 0;
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        let frozen = PauseGateHold {
+            start_ns: Some(5),
+            end_ns: Some(2_000_016),
+            continuous: true,
+        };
+        assert_eq!(coordinator.pause_hold(), Some(frozen));
+
+        // Re-arm after the freeze: the live arm moves, the snapshot stays.
+        io.now.push_front(Ok(20));
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        io.authorization = Some(PAUSE_REQUESTED);
+        io.resume_authorization = Some(Some(PAUSE_REQUESTED));
+        io.queue = VecDeque::from([
+            Ok(Some(DiscoveryItem::Record(record(25, 0, false)))),
+            Ok(None),
+            Ok(None),
+        ]);
+        io.now.push_back(Ok(26));
+        io.now.push_back(Ok(27));
+        io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(stopped())]);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(2));
+        assert_eq!(coordinator.pause_hold(), Some(frozen));
+    }
+
+    /// A cycle that fails after stopping voids the from-start claim and
+    /// publishes no end: without a completing resume nothing freezes.
+    #[test]
+    fn pause_hold_failed_cycle_voids() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.fail_apply = true;
+        let mut coordinator = armed_hold_coordinator(&mut io, Ok(5));
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: None,
+                continuous: false,
+            })
+        );
+    }
+
+    /// A passive capture never arms: no hold exists at all.
+    #[test]
+    fn pause_hold_never_policy_yields_none() {
+        let mut io = FakeIo::default();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Never, 41, 9, stopped());
+
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Disabled);
+        assert_eq!(coordinator.pause_hold(), None);
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(coordinator.pause_hold(), None);
+    }
+
+    /// An arm whose clock read failed proves no start bound: even a fully
+    /// confirmed cycle afterward yields no hold, and a later re-arm cannot
+    /// smuggle in its own clock as the first bound.
+    #[test]
+    fn pause_hold_missing_arm_clock_yields_none() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.resume_authorization = Some(None);
+        let mut coordinator = armed_hold_coordinator(&mut io, Err("clock".into()));
+        coordinator.successors_left = 0;
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(coordinator.pause_hold(), None);
+
+        io.now.push_front(Ok(20));
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        assert_eq!(coordinator.pause_hold(), None);
+    }
+
+    /// A rejected stop never held the child: the hold voids with no end.
+    #[test]
+    fn pause_hold_rejected_stop_voids() {
+        let mut io = successful_io(vec![record(10, -libc::EPERM as i64, false)]);
+        let mut coordinator = armed_hold_coordinator(&mut io, Ok(5));
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: None,
+                continuous: false,
+            })
+        );
+    }
+
+    /// A refuted stop candidate (ARMED still held: no hook won) means the
+    /// child ran unstopped: the hold voids even though service succeeds.
+    #[test]
+    fn pause_hold_refuted_candidate_voids() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.now.push_front(Ok(5));
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        // The arm exchange left ARMED behind: no hook won it.
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: None,
+                continuous: false,
+            })
+        );
+    }
+
+    /// A refuted first epoch voids sticky: even a fully confirmed later
+    /// cycle freezes a gapped hold, never a clean one.
+    #[test]
+    fn pause_hold_refute_then_complete_freezes_gapped() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.now.push_front(Ok(5));
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+        coordinator.successors_left = 0;
+
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: None,
+                continuous: false,
+            })
+        );
+
+        io.authorization = Some(PAUSE_REQUESTED);
+        io.queue = VecDeque::from([
+            Ok(Some(DiscoveryItem::Record(record(25, 0, false)))),
+            Ok(None),
+            Ok(None),
+        ]);
+        io.now.push_back(Ok(26));
+        io.now.push_back(Ok(27));
+        io.states = VecDeque::from([Ok(stopped()), Ok(stopped()), Ok(stopped())]);
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::confirmed(1));
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: Some(2_000_032),
+                continuous: false,
+            })
+        );
+    }
+
+    /// A second terminal batch colliding with the coordinator's is a
+    /// lifecycle failure before any stop: the hold voids.
+    #[test]
+    fn pause_hold_terminal_batch_collision_voids() {
+        let owner = crate::discovery::loader::LoaderContextId::from_case_id(1);
+        let mut held = TerminalBatch::empty(TerminalAuthority {
+            owner,
+            exports: Vec::new(),
+        });
+        held.extend([record(10, -libc::EPERM as i64, false)]);
+        let mut carried = TerminalBatch::empty(TerminalAuthority {
+            owner,
+            exports: Vec::new(),
+        });
+        carried.extend([record(10, -libc::EPERM as i64, false)]);
+        let mut io = FakeIo::default();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.hold_start_ns = Some(5);
+        coordinator.terminal_batch = Some(held);
+
+        let error = coordinator
+            .service_deferred(
+                &mut io,
+                TimedItem {
+                    before_ns: 1,
+                    after_ns: 2,
+                    item: DiscoveryItem::Record(record(10, -libc::EPERM as i64, false)),
+                    terminal_batch: Some(carried),
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("more than one terminal"),
+            "{error}"
+        );
+        // The void latches even though the collision precedes any stop.
+        assert_eq!(
+            coordinator.pause_hold(),
+            Some(PauseGateHold {
+                start_ns: Some(5),
+                end_ns: None,
+                continuous: false,
+            })
+        );
     }
 
     #[test]

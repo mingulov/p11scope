@@ -376,7 +376,18 @@ assembly from real attach-complete stamps. `unobserved_windows` is a list of
 `{start_ns, end_ns, reason}` with `reason` exactly `pre_attach`,
 `late_discovery`, `mapped_unattached`, `health_loss`, or `scope_uncertain`;
 absent means undisclosed, and an explicitly empty list reads as exact only
-with an R2-D1-6 proof behind it. Key presence never proves exactness.
+with an R2-D1-6 proof behind it. Key presence never proves exactness. The
+pause-gate proof ships for owned `run` only: `[]` appears on a pre-armed
+module only when every declared probe attached at or before the barrier
+release while the child was barrier-held from its start — the spawn barrier
+from start to release, then the pause gate's frozen first hold (continuous,
+both bounds clocked, every member stamped, every first-stamp at or before
+the release) — and the window stays in every other capture, including any
+declared stamp dated after the release (the child may run its command
+before the first *verified* pause stop). The empty list asserts only the
+pre-attach span;
+a later loss still discloses on `watch` (`ended_by: health_loss`) without
+reopening it.
 
 ## Residual additions: terminal verdict, override, handoff, environment, PID namespace
 

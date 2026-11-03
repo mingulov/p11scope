@@ -28993,6 +28993,73 @@ impl Engine {
         self.rerender_prearm_watches();
     }
 
+    /// Builds R2-D1-6 pause-gate proofs for pre-armed objects whose whole
+    /// `[hold_start_ns, declared-set attach]` window the barrier covered.
+    /// The attach instant applies the same rule as assembly (every declared
+    /// member's real stamp, never a subset maximum); the capture must own
+    /// its child, the hold must be continuous, clocked on both bounds,
+    /// sane, and reach the attach instant, and every declared first-stamp
+    /// must precede the barrier release — the child may run its command
+    /// before the first *verified* pause stop, so a post-release stamp is
+    /// outside any proven hold. Anything else emits no proof, and assembly still
+    /// exact-matches each emitted interval against the would-be window, so
+    /// a mismatched hold fails closed there too.
+    fn pause_gate_exactness_proofs(
+        watches: &BTreeMap<PinnedObjectId, crate::prearm_module::PrearmWatch>,
+        plan: &plan::AttachPlan,
+        stamps: &BTreeMap<u32, u64>,
+        hold: Option<crate::discovery::pause::PauseGateHold>,
+        owned_run: bool,
+        release_ns: Option<u64>,
+    ) -> BTreeMap<PinnedObjectId, crate::prearm_module::ExactnessProof> {
+        if !owned_run {
+            return BTreeMap::new();
+        }
+        let Some(release) = release_ns else {
+            return BTreeMap::new();
+        };
+        let Some(hold) = hold.filter(|hold| hold.continuous) else {
+            return BTreeMap::new();
+        };
+        let (Some(start), Some(end)) = (hold.start_ns, hold.end_ns) else {
+            return BTreeMap::new();
+        };
+        if start > end {
+            return BTreeMap::new();
+        }
+        let mut proofs = BTreeMap::new();
+        for (object, watch) in watches {
+            let mut latest: Option<u64> = None;
+            for key in watch.declared() {
+                let Some(stamped_at) = plan
+                    .slot_index_for_key(*key)
+                    .and_then(|index| stamps.get(&index).copied())
+                else {
+                    latest = None;
+                    break;
+                };
+                latest = Some(latest.map_or(stamped_at, |known| known.max(stamped_at)));
+            }
+            let Some(attached_at) = latest else {
+                continue;
+            };
+            if attached_at > release {
+                continue;
+            }
+            if end >= attached_at {
+                proofs.insert(
+                    *object,
+                    crate::prearm_module::ExactnessProof {
+                        interval_start_ns: start,
+                        interval_end_ns: attached_at,
+                        kind: crate::prearm_module::ExactnessProofKind::PauseGateHeld,
+                    },
+                );
+            }
+        }
+        proofs
+    }
+
     /// Closes the capture for every pre-arm watch (packet 6.13, R2-D1-4/5/7):
     /// final link evaluation, idle qualification over the closed interval
     /// (armed + clean terminal observation/scope/link health + no observed
@@ -29011,6 +29078,9 @@ impl Engine {
         now: Option<u64>,
         kernel: &crate::metrics::KernelEvidence,
         malformed_records: u64,
+        hold: Option<crate::discovery::pause::PauseGateHold>,
+        owned_run: bool,
+        release_ns: Option<u64>,
     ) {
         // Generic attach/window assembly is independent of the optional
         // pre-arm watch transitions below: a capture without pre-arm
@@ -29106,10 +29176,17 @@ impl Engine {
                     .map(|stamp| (slot.index, stamp))
             })
             .collect();
-        // No R2-D1-6 producer ships in this packet: proofs stay empty until
-        // C6-D wires installed proof, so attached modules always disclose
-        // their window here.
-        let proofs = BTreeMap::new();
+        // R2-D1-6 proofs behind explicitly empty windows: the pause-gate
+        // producer for owned `run` holds; later producers extend this map.
+        let mut proofs = BTreeMap::new();
+        proofs.extend(Self::pause_gate_exactness_proofs(
+            self.prearm.watches(),
+            &self.plan,
+            &stamps,
+            hold,
+            owned_run,
+            release_ns,
+        ));
         self.prearm
             .assemble(&mut self.discovery.modules, &self.plan, &stamps, &proofs);
         if !self.prearm.is_empty() {

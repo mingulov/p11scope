@@ -6257,6 +6257,122 @@ mod tests {
         );
     }
 
+    /// M2 RED: the named signal must agree with `--module` narrowing. A hint
+    /// matching the mapped path verbatim names the module even when the
+    /// observer cannot resolve the hint itself (a container target, whose
+    /// module lives only under `/proc/<pid>/root`): narrowing attributes by
+    /// verbatim path without consulting observer identity.
+    #[test]
+    fn module_hint_match_diverges_from_narrowing_on_unresolvable_verbatim_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let mapped = dir.path().join("libclosure.so.0");
+        std::fs::write(&mapped, b"fake").unwrap();
+        let file = File::open(&mapped).unwrap();
+        let hint = PathBuf::from("/target-namespace-only/libclosure.so.0");
+        assert_eq!(
+            module_hint_match(
+                "/target-namespace-only/libclosure.so.0",
+                &file,
+                std::slice::from_ref(&hint)
+            ),
+            Some(hint),
+            "verbatim narrowing attribution names the module without observer resolution"
+        );
+    }
+
+    /// M2: an exact `--module` path names the scanned module it narrows in.
+    /// Holds both before and after the narrowing derivation (the old
+    /// identity match agrees here); guards the mechanism swap.
+    #[test]
+    fn scan_names_a_module_narrowed_in_by_its_exact_path() {
+        let mut fixture = BracketFixture::new(8, true);
+        let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+        let hints = [fixture.path.clone()];
+        let outcome = scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut fixture,
+        )
+        .unwrap();
+        assert_eq!(outcome.modules().len(), 1, "{:#?}", outcome.skipped());
+        assert_eq!(
+            outcome.modules()[0].module_hint,
+            Some(fixture.path.clone()),
+            "the attributed narrowing hint is the named signal"
+        );
+    }
+
+    /// M2: an inode alias confirmed against the opened files (a hardlink)
+    /// names the scanned module. Holds both before and after the narrowing
+    /// derivation; guards the mechanism swap.
+    #[test]
+    fn scan_names_a_module_narrowed_in_by_a_confirmed_inode_alias() {
+        let mut fixture = BracketFixture::new(8, true);
+        let alias = fixture._dir.path().join("provider-alias.so");
+        std::fs::hard_link(&fixture.path, &alias).unwrap();
+        let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+        let hints = [alias.clone()];
+        let outcome = scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut fixture,
+        )
+        .unwrap();
+        assert_eq!(outcome.modules().len(), 1, "{:#?}", outcome.skipped());
+        assert_eq!(
+            outcome.modules()[0].module_hint,
+            Some(alias),
+            "the confirmed alias is the named signal"
+        );
+    }
+
+    /// M2: a bare `--module` name never narrows a mapped file in — not even
+    /// its own basename — so no scanned module can ever carry a
+    /// basename/soname naming. The basename/soname branches are dead.
+    #[test]
+    fn bare_module_name_narrows_no_mapped_file_in() {
+        let mut fixture = BracketFixture::new(8, true);
+        let view = ProcessView::open(fixture.view.id(), fixture.view.pid()).unwrap();
+        let bare = PathBuf::from("provider.so");
+        let outcome = scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: std::slice::from_ref(&bare),
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut CaptureWorkBudget::default(),
+            &mut fixture,
+        )
+        .unwrap();
+        assert!(
+            outcome.modules().is_empty(),
+            "a bare name narrows everything out: {:?}",
+            outcome
+                .modules()
+                .iter()
+                .map(|module| &module.path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            outcome.skipped().iter().any(|skip| {
+                skip.subject == "provider.so" && skip.reason == HINT_NOT_MAPPED_REASON
+            }),
+            "the bare hint matches no mapped file: {:?}",
+            outcome.skipped()
+        );
+    }
+
     #[test]
     fn held_scan_transfers_opened_nonprovider_and_invalidates_failed_brackets() {
         use crate::discovery::kernel_identity::ExaminedCustody;

@@ -4926,6 +4926,18 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             "{WHAT}: default kind 6 carries no status"
         );
         assert_eq!(exit.case_id, 0, "{WHAT}: default kind 6 carries no case");
+        assert_eq!(
+            exit.binding_id, 0,
+            "{WHAT}: default kind 6 carries no binding"
+        );
+        assert_eq!(
+            exit.announced_count, 0,
+            "{WHAT}: default kind 6 announces nothing"
+        );
+        assert_eq!(
+            exit.send_signal_rc, 0,
+            "{WHAT}: default kind 6 carries no signal result"
+        );
         assert!(
             exit.pointers.iter().all(|cell| *cell == 0),
             "{WHAT}: default kind 6 carries a zeroed payload"
@@ -4942,17 +4954,18 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
 /// smallest PID evicts first, deterministically.
 #[test]
 fn exit_mappings_exec_table_evicts_smallest_pid_when_full() {
+    use crate::discovery::elf_needed::HINT_MAX_EXE_STASH_ENTRIES;
     let mut state = ExitMappingState::default();
     state.set_enabled(true);
-    for pid in 0..=p11scope_ebpf_common::instance::FILE_SLOTS {
+    for pid in 0..=HINT_MAX_EXE_STASH_ENTRIES as u32 {
         state.note_exec(pid, u64::from(pid));
     }
-    assert_eq!(state.execs.len(), 256);
+    assert_eq!(state.execs.len(), HINT_MAX_EXE_STASH_ENTRIES);
     assert!(!state.execs.contains_key(&0));
     assert!(
         state
             .execs
-            .contains_key(&p11scope_ebpf_common::instance::FILE_SLOTS)
+            .contains_key(&(HINT_MAX_EXE_STASH_ENTRIES as u32))
     );
 }
 

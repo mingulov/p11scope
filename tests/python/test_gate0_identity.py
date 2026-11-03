@@ -247,12 +247,8 @@ class Gate0IdentityTests(unittest.TestCase):
             "map-hsh1",
             MAP_SHAPE_C.replace("MAP_TYPE", "1").replace("MAP_MAXE", "256"),
         )
-        cls.bss_4 = cls.compile_c(
-            work, "bss-004a", BSS_SIZE_C.replace("G_LEN", "4")
-        )
-        cls.bss_64 = cls.compile_c(
-            work, "bss-064a", BSS_SIZE_C.replace("G_LEN", "64")
-        )
+        cls.bss_4 = cls.compile_c(work, "bss-004a", BSS_SIZE_C.replace("G_LEN", "4"))
+        cls.bss_64 = cls.compile_c(work, "bss-064a", BSS_SIZE_C.replace("G_LEN", "64"))
 
     @classmethod
     def tearDownClass(cls):
@@ -391,12 +387,12 @@ class Gate0IdentityTests(unittest.TestCase):
         """The BTF base with its Alpha/Beta STRUCT slots swapped (I6).
 
         A true reordered-.BTF pair: .BTF bytes differ by order only, and
-        bpftool still loads the result.
+        bpftool still loads the result (raw JSON, the adjudication path).
         """
         twin = self.case_path(name)
         twin.write_bytes(swap_btf_struct_order(self.btf_base, "Alpha", "Beta"))
         dumped = subprocess.run(
-            ["bpftool", "btf", "dump", "file", str(twin), "format", "c"],
+            ["bpftool", "-j", "btf", "dump", "file", str(twin), "format", "raw"],
             capture_output=True,
             text=True,
             timeout=120,
@@ -444,7 +440,7 @@ class Gate0IdentityTests(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             with mock.patch.object(
                 CHECKER,
-                "btf_normalized_text",
+                "btf_canonical_multiset",
                 side_effect=AssertionError("bytes path must not consult bpftool"),
             ):
                 self.assertEqual(CHECKER.main(["check", str(base), str(cand)]), 1)

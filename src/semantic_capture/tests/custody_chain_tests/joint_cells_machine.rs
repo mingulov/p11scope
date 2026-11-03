@@ -2705,6 +2705,104 @@ impl<I: crate::inventory_semantics::LaneTestIo> crate::inventory_semantics::Lane
     }
 }
 
+/// The strict s1only gate stages a mechanism-bearing modeled call whose
+/// native BEGIN is entry-time (MECH_NONE, no mechanism capture) while its S1
+/// admission is return-time (mechanism value): the default producer never
+/// reads the mechanism word at entry, so exact fingerprint equality would
+/// refuse every such call that retains its native original first (live
+/// 10k-single lane death at the first C_GenerateKey staging).
+#[test]
+fn joint_machine_strict_s1only_stages_entry_time_begin_with_return_time_mechanism() {
+    use crate::semantics_objects::journal::{EndpointClass, endpoint_class};
+    use p11scope_ebpf_common::object_journal::decode_journal_record;
+    use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+    use p11scope_ebpf_common::{MECH_NONE, capture};
+    assert_eq!(
+        endpoint_class(crate::kinds::function_id("C_GenerateKey").unwrap()),
+        Some(EndpointClass::ModeledAffecting)
+    );
+    // Refused births keep the feed S1Only; the pushed native rows stay
+    // healthy, so the admission carries a joint resource: the strict gate.
+    let mut scene = MachineScene::with_initial_files_and_functions(
+        1,
+        &[0],
+        &[
+            "C_CreateObject",
+            "C_SignInit",
+            "C_SignUpdate",
+            "C_SignFinal",
+            "C_GetSessionInfo",
+            "C_GenerateKey",
+        ],
+        true,
+    );
+    scene.native.fail_births = true;
+    let pid = std::process::id();
+    // Production shape: an entry-time BEGIN carries no mechanism while the
+    // END's event (hence the S1 admission) carries the returned value. The
+    // END needs a real object tail: absent tails ride only non-object
+    // functions, and C_GenerateKey is modeled.
+    use p11scope_ebpf_common::object_wire::OBJECT_ACTION_GENERATE;
+    let (mut begin, _) = scene.scene.encoded(pid, 0, "C_GenerateKey", 1);
+    begin[112..120].copy_from_slice(&MECH_NONE.to_le_bytes());
+    let mut end = end_bytes(&begin, OBJECT_ACTION_GENERATE, 0, ENTRY_NS + 10);
+    // A successful generation mints its key: the tail result word the
+    // CREATE-only forge leaves zero.
+    end[424..432].copy_from_slice(&0x9090_9090_9090_9090u64.to_le_bytes());
+    end[506] = 1;
+    let base = end.len() - 608;
+    let mech_at = base + core::mem::offset_of!(p11scope_ebpf_common::Event, mechanism);
+    end[mech_at..mech_at + 8].copy_from_slice(&0x350u64.to_le_bytes());
+    let cap_at = base + core::mem::offset_of!(p11scope_ebpf_common::Event, capture);
+    let capture_value = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+    end[cap_at..cap_at + 4].copy_from_slice(&capture_value.to_le_bytes());
+    let descriptors = publish_object_descriptors();
+    assert!(
+        matches!(
+            decode_journal_record(&begin, &descriptors),
+            Some(p11scope_ebpf_common::object_journal::JournalRecord::Begin(
+                _
+            ))
+        ),
+        "the entry-time BEGIN still decodes"
+    );
+    let event = match decode_journal_record(&end, &descriptors) {
+        Some(p11scope_ebpf_common::object_journal::JournalRecord::End(end)) => {
+            end.payload_base().event
+        }
+        other => panic!("the patched END decodes: {other:?}"),
+    };
+    assert_eq!(
+        (event.mechanism, event.capture),
+        (0x350, capture_value),
+        "the END event carries the returned mechanism"
+    );
+    scene.scene.drain.source_mut().push_record(begin.to_vec());
+    scene.scene.drain.source_mut().push_record(end.to_vec());
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("strict-entry-time-mechanism", None);
+    assert_eq!(
+        scene.machine.staging_detail_for_test(),
+        None,
+        "successful Staging retains no refusal"
+    );
+    assert_eq!(
+        scene.scene.real.scene.coordinator.registry().joint_feeds(),
+        0,
+        "zero Joint feeds: the keygen staged through the strict S1Only gate"
+    );
+    let api: u64 = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|record| record.api_returns)
+        .sum();
+    assert_eq!(api, 1, "the keygen stages its S1 facts");
+}
+
 /// The machine publish path polls the EVENTS ring-loss counter like
 /// the plain commit path: a rise discloses exactly once even though
 /// both poll sites read the same cumulative counter.

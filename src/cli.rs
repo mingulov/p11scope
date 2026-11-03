@@ -796,15 +796,24 @@ fn include_exclude_conflict(flag: &str, include: &Path, exclude: &Path) -> Optio
 /// Validate `--prearm-module` inputs against `--exclude-module` at startup
 /// (same exit-2 usage-error shape as [`validate_excludes`]): a pre-armed
 /// provider matching an exclusion is refused, never silently coexisting
-/// with it. Same three rules (exact string, same file identity, bare-name
-/// basename match); bare-name soname conflicts surface during discovery
-/// where the target file is open and its soname is read.
+/// with it. PA-5 I3: opens each prearm path and reuses
+/// [`crate::discovery::scan::startup_exclude_conflict`] (identity, resolved
+/// basename, soname) in addition to the three string rules below, so
+/// `--prearm-module …/p11-kit-proxy.so --exclude-module libp11-kit.so.0`
+/// (a symlink whose soname matches) is refused here.
 pub fn validate_prearm_excludes(prearm: &[PathBuf], excludes: &[PathBuf]) -> Result<(), String> {
     for input in prearm {
         for exclude in excludes {
             if let Some(reason) = include_exclude_conflict("--prearm-module", input, exclude) {
                 return Err(reason);
             }
+        }
+        if let Some(matched) = crate::discovery::scan::startup_exclude_conflict(input, excludes) {
+            return Err(format!(
+                "--prearm-module {} is matched by --exclude-module {} (opened file); refusing a module that is both included and excluded",
+                input.display(),
+                matched.display()
+            ));
         }
     }
     Ok(())
@@ -814,8 +823,10 @@ pub fn validate_prearm_excludes(prearm: &[PathBuf], excludes: &[PathBuf]) -> Res
 /// exit-2 usage-error shape as [`validate_excludes`]): a manifest attesting
 /// a provider that matches an exclusion is refused. Attested paths are the
 /// manifest's `module_path` plus every attested object path, compared by
-/// the same three rules. Best-effort: an unreadable or unparsable manifest
-/// is left for discovery to report precisely.
+/// the same three rules plus PA-5 I3's opened-file check (identity, resolved
+/// basename, soname). Best-effort: an unreadable or unparsable manifest, or
+/// an unattested path that cannot be opened, is left for discovery to report
+/// precisely.
 pub fn validate_manifest_excludes(
     manifests: &[PathBuf],
     excludes: &[PathBuf],
@@ -826,6 +837,16 @@ pub fn validate_manifest_excludes(
                 if let Some(reason) = manifest_exclude_conflict(manifest, &attested, exclude) {
                     return Err(reason);
                 }
+            }
+            if let Some(matched) =
+                crate::discovery::scan::startup_exclude_conflict(&attested, excludes)
+            {
+                return Err(format!(
+                    "--manifest {} attests {}, matched by --exclude-module {} (opened file); refusing a module that is both included and excluded",
+                    manifest.display(),
+                    attested.display(),
+                    matched.display()
+                ));
             }
         }
     }
@@ -4845,6 +4866,54 @@ mod tests {
         // No conflict.
         assert!(validate_prearm_excludes(slice_of(&real), &[PathBuf::from("other.so")]).is_ok());
         assert!(validate_prearm_excludes(&[], slice_of(&real)).is_ok());
+    }
+
+    /// PA-5 I3 symlink twin: a prearm via a symlink is matched by the
+    /// resolved basename, not just the given basename. `liblink.so` ->
+    /// `libreal.so.1.2`, excluded by bare name `libreal.so.1.2`.
+    #[test]
+    fn validate_prearm_excludes_matches_resolved_basename_through_symlink() {
+        let slice_of = std::slice::from_ref;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("libreal.so.1.2");
+        std::fs::write(&real, b"fake").unwrap();
+        let link = dir.path().join("liblink.so");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = validate_prearm_excludes(slice_of(&link), &[PathBuf::from("libreal.so.1.2")])
+            .expect_err("resolved basename matches through the symlink");
+        assert!(error.contains("--prearm-module"), "{error}");
+        assert!(error.contains("--exclude-module"), "{error}");
+        assert!(
+            error.contains("refusing a module that is both included and excluded"),
+            "{error}"
+        );
+    }
+
+    /// PA-5 I3 soname twin: `--prearm-module …/p11-kit-proxy.so`
+    /// `--exclude-module libp11-kit.so.0`. The proxy is a symlink to
+    /// `libp11-kit.so.0.4.8` whose ELF soname is `libp11-kit.so.0`; neither
+    /// the given nor the resolved basename matches, only the soname.
+    #[test]
+    fn validate_prearm_excludes_matches_proxy_soname() {
+        let candidates = [
+            "/usr/lib/x86_64-linux-gnu/p11-kit-proxy.so",
+            "/usr/lib64/p11-kit-proxy.so",
+        ];
+        let Some(proxy) = candidates.iter().map(PathBuf::from).find(|p| p.is_file()) else {
+            // No p11-kit proxy on this host: nothing to conflict.
+            return;
+        };
+        let error = validate_prearm_excludes(
+            std::slice::from_ref(&proxy),
+            &[PathBuf::from("libp11-kit.so.0")],
+        )
+        .expect_err("proxy soname matches the exclusion");
+        assert!(error.contains("--prearm-module"), "{error}");
+        assert!(error.contains("libp11-kit.so.0"), "{error}");
+        assert!(
+            error.contains("refusing a module that is both included and excluded"),
+            "{error}"
+        );
     }
 
     /// A `--manifest` attesting an excluded provider is refused at startup

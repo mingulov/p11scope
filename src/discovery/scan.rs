@@ -3913,10 +3913,10 @@ fn hint_gate(kind: HintMatch, hint: &Path, actual: &File) -> Result<(), String> 
 
 /// `--exclude-module` path inputs resolved to file identity: the operator
 /// input plus the device and inode it resolved to.
-type ExcludePaths = Vec<(PathBuf, u64, u64)>;
+pub(crate) type ExcludePaths = Vec<(PathBuf, u64, u64)>;
 /// `--exclude-module` bare-name inputs: the operator input plus its match
 /// bytes (basename or ELF soname).
-type ExcludeNames = Vec<(PathBuf, Vec<u8>)>;
+pub(crate) type ExcludeNames = Vec<(PathBuf, Vec<u8>)>;
 
 /// Which `--exclude-module` input matches this opened mapped file, if any.
 /// Exact-file paths match by fstat identity (both sides opened files, never
@@ -3959,6 +3959,43 @@ pub(crate) fn exclude_match(
         return Some(input.clone());
     }
     None
+}
+
+/// PA-5 I3: which `--exclude-module` input conflicts with this startup
+/// `--prearm-module` or manifest-attested path, if any. Opens the file and
+/// reuses [`exclude_match`] (identity, resolved basename, soname), so a
+/// pre-armed provider matching an exclusion is refused at startup (exit 2),
+/// never silently coexisting with it. Unopenable paths yield no conflict
+/// here; discovery reports them precisely.
+pub(crate) fn startup_exclude_conflict(
+    include: &std::path::Path,
+    excludes: &[PathBuf],
+) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    if excludes.is_empty() {
+        return None;
+    }
+    let file = std::fs::File::open(include).ok()?;
+    let exclude_paths: ExcludePaths = excludes
+        .iter()
+        .filter(|e| e.as_os_str().as_bytes().contains(&b'/'))
+        .filter_map(|e| {
+            std::fs::metadata(e)
+                .ok()
+                .map(|m| (e.clone(), m.dev(), m.ino()))
+        })
+        .collect();
+    let exclude_names: ExcludeNames = excludes
+        .iter()
+        .filter(|e| !e.as_os_str().as_bytes().contains(&b'/'))
+        .map(|e| (e.clone(), e.as_os_str().as_bytes().to_vec()))
+        .collect();
+    // Resolved basename: follow symlinks so a prearm via `p11-kit-proxy.so`
+    // (a symlink to `libp11-kit.so.0.4.8`) matches by its real name or soname.
+    let resolved = std::fs::canonicalize(include).unwrap_or_else(|_| include.to_path_buf());
+    let path_str = resolved.to_str()?;
+    exclude_match(path_str, &file, &exclude_paths, &exclude_names)
 }
 
 /// Why `/proc/<pid>/mem` could not be opened, and whether that is a published

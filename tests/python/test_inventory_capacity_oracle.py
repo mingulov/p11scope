@@ -325,10 +325,8 @@ class CapacityOracleTests(unittest.TestCase):
                       1, "CAPACITY-AUTHORITY")
 
     def test_scan_pinned_callers_with_disclosure_pass_authority(self):
-        def scan_lane(manifest, _ledger, first, last):
-            for doc in (first, manifest["middle_doc"], last):
-                scan_lane_authority(doc)
-        self.run_case(scan_lane)
+        # population() already applies scan_lane_authority to all three docs.
+        self.run_case()
 
     def test_authority_rejects_stale_native_exact(self):
         def stale(_manifest, _ledger, _first, last):

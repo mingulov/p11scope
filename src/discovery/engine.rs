@@ -688,6 +688,10 @@ pub struct Engine {
     /// capture-local exe stash, scan-learned paths, and hint counts.
     /// Disabled unless the operator armed `--track-short-lived`.
     extensive: elf_needed::ExtensiveState,
+    /// 6.14 Option A exit-time mapping split: capture-local
+    /// mapped/unknown counts over the novel unmatched-exit
+    /// subpopulation. Read only while extensive mode is armed.
+    exit_map: ExitMappingState,
     task_uprobe_link_losses: u64,
     next_selection_binding_id: Option<u64>,
     selection_bindings: BTreeMap<u64, SelectionBindingFact>,
@@ -2828,6 +2832,14 @@ pub(crate) trait EngineSession {
     fn mutation_stopped(&self) -> bool {
         false
     }
+    /// 6.14 Option A: whether the session's instance-continuity hooks
+    /// are refused (or were never wanted), so an empty exit summary is
+    /// `unknown`, never a watched-provider negative. Fail-closed
+    /// default: sessions that cannot prove live hooks classify every
+    /// kind-7 summary as hooks-refused unknown.
+    fn instance_hooks_refused(&self) -> bool {
+        true
+    }
     fn bind_exec(
         &self,
         _: &ProcessView,
@@ -3087,6 +3099,9 @@ impl EngineSession for Session {
     }
     fn mutation_stopped(&self) -> bool {
         Session::mutation_stopped(self)
+    }
+    fn instance_hooks_refused(&self) -> bool {
+        Session::instance_tracking(self).refused().is_some()
     }
     fn bind_exec(
         &self,
@@ -9727,6 +9742,36 @@ fn process_view_is_current(
         .is_some_and(ProcessView::still_the_same)
 }
 
+/// 6.14 Option A exit-time verdict for one novel unmatched kind-7
+/// exit: `Mapped` (the kernel named a watched-provider slot with no
+/// disqualifying refusal) or one `unknown` reason. Publication
+/// collapses every non-`Mapped` reason into the single `unknown`
+/// count; the reasons exist so each arm stays testable and no
+/// negative ("did not map") can be smuggled through an unnamed
+/// path. There is deliberately no negative variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitMappingReason {
+    Mapped,
+    UnknownSharedMm,
+    UnknownHooksRefused,
+    UnknownLateWatch,
+    UnknownLocalFault,
+    UnknownEmpty,
+}
+
+/// 6.14 Option A capture-local state: the mapped/unknown counts plus
+/// the bounded per-PID exec-timing behind the late-watch rule.
+/// Active only while extensive mode is armed; the published key is
+/// `None` otherwise.
+#[derive(Debug, Default)]
+pub(crate) struct ExitMappingState {
+    mapped: u64,
+    unknown: u64,
+    execs: BTreeMap<u32, u64>,
+    #[cfg(test)]
+    reasons: Vec<ExitMappingReason>,
+}
+
 fn lifecycle_retirement(
     views: &[ProcessView],
     pid: u32,
@@ -10056,6 +10101,7 @@ impl Engine {
             unmatched_leader_exit_events: BTreeSet::new(),
             cgroup_ingress_overflow: false,
             extensive: elf_needed::ExtensiveState::new(),
+            exit_map: ExitMappingState::default(),
             task_uprobe_link_losses: 0,
             next_selection_binding_id: Some(1),
             selection_bindings: BTreeMap::new(),
@@ -11070,6 +11116,21 @@ impl Engine {
     /// the split is `None` (key omitted) unless armed.
     pub(crate) fn gap_exe_hints(&self) -> Option<&elf_needed::GapExeHints> {
         self.extensive.enabled().then_some(self.extensive.hints())
+    }
+
+    /// 6.14 Option A exit-time split, present only when armed. Like
+    /// the gap counter it never moves calls or attribution; unlike
+    /// it, the split is `None` (key omitted) unless armed.
+    pub(crate) fn gap_exit_mappings(&self) -> Option<render::GapExitMappings> {
+        self.extensive.enabled().then(|| render::GapExitMappings {
+            mapped: self.exit_map.mapped,
+            unknown: self.exit_map.unknown,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exit_mapping_reasons_for_test(&self) -> &[ExitMappingReason] {
+        &self.exit_map.reasons
     }
 
     /// 6.14 Option B: arm extensive mode from `--track-short-lived`
@@ -29641,6 +29702,11 @@ pub(crate) mod session_fixture {
         /// T4b seam: report a logical retirement leaf (the G24 Singles
         /// twin takes no native path).
         pub(crate) logical_retirement: Cell<bool>,
+        /// 6.14 Option A seam: the instance-continuity hooks are live
+        /// for this scripted capture. Default false (refused), matching
+        /// the trait's fail-closed default; a test proving `mapped` sets
+        /// it explicitly, never by relying on the default.
+        pub(crate) instance_hooks_live: Cell<bool>,
         pub(crate) dequeues: VecDeque<Result<Option<crate::events::DiscoveryItem>>>,
         /// The staged FIFO, mirroring production: `stage_discovery` moves
         /// scripted ring outcomes here, `discovery_dequeue` serves it
@@ -29957,6 +30023,9 @@ pub(crate) mod session_fixture {
             self.pid_continuity
                 .as_ref()
                 .is_some_and(|state| !self.detach_failures.is_empty() || state.borrow().stopped())
+        }
+        fn instance_hooks_refused(&self) -> bool {
+            !self.instance_hooks_live.get()
         }
         fn bind_exec(
             &self,

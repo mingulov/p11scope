@@ -33,6 +33,9 @@ use crate::discovery::scheduler::MAX_PENDING_REFRESH;
 use crate::{semantics, trace};
 use p11scope_ebpf_common::{
     CounterMode, DISCOVERY_EXEC_SAME_TASK_CANDIDATE, DISCOVERY_EXEC_TASK_REPLACED,
+    DISCOVERY_KIND_EXEC, DISCOVERY_KIND_LEADER_EXIT_MAPPINGS,
+    DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED, DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT,
+    DISCOVERY_STATUS_EXIT_MAP_OVERFLOW, DISCOVERY_STATUS_EXIT_MAP_SHARED_MM,
 };
 use p11scope_manifest::manifest::{
     Acquisition, AliasEntry, AliasGroup, FunctionRecord, InterfaceClassification, SurfaceRecord,
@@ -3672,6 +3675,19 @@ fn cgroup_generation_engine() -> Engine {
     engine
 }
 
+/// 6.14 Option A: an armed cgroup engine classifies kind-7 exit
+/// summaries without test-process views.
+fn armed_cgroup_engine() -> Engine {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    engine.arm_extensive(true);
+    engine
+}
+
 /// RED: a kind-7 summary naming one watched slot must count its exit gap
 /// (A4 classifies this shape `mapped`).
 #[test]
@@ -3785,6 +3801,481 @@ fn leader_exit_mappings_kind6_inventory_build_still_counts_gap() {
 
     assert_eq!(engine.pid_descendant_gaps(), 1);
     assert!(engine.unmatched_finish_exit_for_test(pid, 1));
+}
+
+fn exit_mappings_record(pid: u32, hook_ts_ns: u64) -> DiscoveryRecord {
+    let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    exit.kind = DISCOVERY_KIND_LEADER_EXIT_MAPPINGS;
+    exit.pid_tgid = u64::from(pid) << 32;
+    exit.hook_ts_ns = hook_ts_ns;
+    exit
+}
+
+fn observed_exec_record(pid: u32, hook_ts_ns: u64) -> DiscoveryRecord {
+    let mut exec: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    exec.kind = DISCOVERY_KIND_EXEC;
+    exec.pid_tgid = u64::from(pid) << 32;
+    exec.hook_ts_ns = hook_ts_ns;
+    exec
+}
+
+/// A kind-7 summary naming one watched slot counts its exit gap and
+/// classifies `mapped`. Both split halves are asserted: an exit is
+/// never a completed-observation receipt (R57), so the ledger moves
+/// only in the exit-mapping split, never toward a call.
+#[test]
+fn exit_mappings_single_slot_counts_gap_and_mapped() {
+    let mut engine = armed_cgroup_engine();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7101, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(7101, 11);
+    exit.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.unmatched_finish_exit_for_test(7101, 11));
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((1, 0))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::Mapped]
+    );
+}
+
+/// OVERFLOW keeps the positive: named slots still count as `mapped`
+/// even when the leader record overflowed (the set may be partial).
+#[test]
+fn exit_mappings_overflow_with_slots_still_counts_mapped() {
+    let mut engine = armed_cgroup_engine();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7104, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(7104, 14);
+    exit.pointers[0] = 3;
+    exit.status_flags = DISCOVERY_STATUS_EXIT_MAP_OVERFLOW;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((1, 0))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::Mapped]
+    );
+}
+
+/// SHARED_MM voids the positive: slots that cannot be localized to
+/// the exiting process read `unknown`, never `mapped`, even when
+/// cells are named.
+#[test]
+fn exit_mappings_shared_mm_voids_named_slots_to_unknown() {
+    let mut engine = armed_cgroup_engine();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7103, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(7103, 13);
+    exit.pointers[0] = 3;
+    exit.status_flags = DISCOVERY_STATUS_EXIT_MAP_SHARED_MM;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownSharedMm]
+    );
+}
+
+/// Refused hooks void the positive: with the session reporting
+/// refused instance hooks, even named slots read `unknown`.
+#[test]
+fn exit_mappings_refused_session_reads_unknown_despite_slots() {
+    let mut engine = armed_cgroup_engine();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(false);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7102, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(7102, 12);
+    exit.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownHooksRefused]
+    );
+}
+
+/// A hooks-refused status word on the wire (no kernel producer sets
+/// it today; userspace applies the refusal) also reads `unknown`.
+#[test]
+fn exit_mappings_refused_wire_bit_reads_unknown() {
+    let mut engine = armed_cgroup_engine();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7112, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(7112, 22);
+    exit.pointers[0] = 3;
+    exit.status_flags = DISCOVERY_STATUS_EXIT_MAP_HOOKS_REFUSED;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownHooksRefused]
+    );
+}
+
+/// Late watch: no EXEC was observed for this PID during the capture,
+/// so the capture's watches were inserted between its exec and its
+/// exit. Empty slots then read `unknown` for the late-watch reason,
+/// explicitly modeled by the missing exec-vs-watch timing.
+#[test]
+fn exit_mappings_late_watch_without_exec_reads_unknown() {
+    let mut engine = armed_cgroup_engine();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exit = exit_mappings_record(7105, 15);
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownLateWatch]
+    );
+}
+
+/// Twin: the same empty summary with a timely observed EXEC is not a
+/// late watch; it reads `unknown` for the empty-slots reason. The
+/// reason differs while the published count is identical.
+#[test]
+fn exit_mappings_timely_exec_empty_slots_read_unknown_empty() {
+    let mut engine = armed_cgroup_engine();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7106, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let exit = exit_mappings_record(7106, 16);
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownEmpty]
+    );
+}
+
+/// LOCAL_FAULT fails closed to `unknown`, even with named slots. No
+/// hook sets the record bit today, so this arm is a tested guard.
+#[test]
+fn exit_mappings_local_fault_reads_unknown_despite_slots() {
+    let mut engine = armed_cgroup_engine();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7107, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(7107, 17);
+    exit.pointers[0] = 3;
+    exit.status_flags = DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownLocalFault]
+    );
+}
+
+/// A kind-7 exit counts exactly once: one gap, one split entry, and a
+/// replay of the same key counts nothing again. No duplicate kind-6
+/// count exists: the kernel emits one record per exit.
+#[test]
+fn exit_mappings_counts_gap_and_split_exactly_once() {
+    let mut engine = armed_cgroup_engine();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7108, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(7108, 18);
+    exit.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((1, 0))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::Mapped]
+    );
+    let mut other = exit_mappings_record(7109, 19);
+    other.pointers[0] = 3;
+    let other_exec = observed_exec_record(7109, 6);
+    engine.dispatch_lifecycle_record(&mut session, &other_exec, &mut pending);
+    engine.dispatch_lifecycle_record(&mut session, &other, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 2);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((2, 0))
+    );
+}
+
+/// A kind-7 record through the batch router is a leader exit, not
+/// live loss: it counts its gap and classifies, without an
+/// unknown-kind skip.
+#[test]
+fn exit_mappings_routed_record_is_gap_not_live_loss() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    engine.arm_extensive(true);
+    let mut exit = exit_mappings_record(pid, 1);
+    exit.pointers[0] = 3;
+    let mut session = ScriptedSession::with_records([], 0);
+    session.instance_hooks_live.set(true);
+
+    apply_ordinary_batch(&mut engine, &mut session, vec![exit])
+        .expect("a vanished candidate leaves its deferred exit processable");
+
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.unmatched_finish_exit_for_test(pid, 1));
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .all(|skip| !skip.reason.contains("unknown discovery kind")),
+        "kind 7 must not be unknown-kind live loss: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownLateWatch]
+    );
+}
+
+/// Guard: the kind-6 inventory build keeps counting its gap
+/// unchanged, before and after the kind-7 work.
+#[test]
+fn exit_mappings_kind6_inventory_build_still_counts_gap() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+    exit.pid_tgid = u64::from(pid) << 32;
+    exit.hook_ts_ns = 1;
+    let mut session = ScriptedSession::with_records([], 0);
+
+    apply_ordinary_batch(&mut engine, &mut session, vec![exit])
+        .expect("a vanished candidate leaves its deferred exit processable");
+
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.unmatched_finish_exit_for_test(pid, 1));
+}
+
+/// The ledger-full path keeps its one lower-bound gap plus PARTIAL
+/// and records no split entry: overflow sentinels carry no mapping
+/// verdict, like admissions and coalesced exits carry no hint.
+#[test]
+fn exit_mappings_overflow_sentinel_carries_no_split() {
+    let mut engine = armed_cgroup_engine();
+    engine.unmatched_leader_exit_events = (0..MAX_SCAN_PIDS)
+        .map(|index| (index as u32 + 1, index as u64 + 1))
+        .collect();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7201, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(7201, MAX_SCAN_PIDS as u64 + 100);
+    exit.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.cgroup_ingress_overflow);
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "cgroup ingress tracking")
+            .count(),
+        1
+    );
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 0))
+    );
+    assert!(engine.exit_mapping_reasons_for_test().is_empty());
+}
+
+/// A pre-admission kind-7 exit coalesces into the admission gap like
+/// kind 6: no second gap, and no split entry for the coalesced exit.
+#[test]
+fn exit_mappings_coalesced_exit_carries_no_split() {
+    let pid = std::process::id();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    engine.arm_extensive(true);
+    let mut exit = exit_mappings_record(pid, 0);
+    exit.pointers[0] = 3;
+    let mut session = ScriptedSession::with_records([], 0);
+    session.instance_hooks_live.set(true);
+
+    apply_ordinary_batch(&mut engine, &mut session, vec![exit])
+        .expect("accepted admission and deferred exit remain processable");
+
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.unmatched_leader_exit_events.contains(&(pid, 0)));
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 0))
+    );
+    assert!(engine.exit_mapping_reasons_for_test().is_empty());
+}
+
+/// A kind-7 exit matching an admitted generation retires exactly
+/// like kind 6: the admission closes, the exit assessment queues,
+/// and no gap (and no split entry) is recorded.
+#[test]
+fn exit_mappings_matched_exit_retires_like_kind6() {
+    let first = ProcessView::open(ProcessViewId(51), std::process::id()).unwrap();
+    let pid = first.pid();
+    let admitted = first.admitted_ns();
+    let mut engine = armed_cgroup_engine();
+    engine.views.push(first);
+    engine.record_cgroup_view_admissions([ProcessViewId(51)]);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(pid, admitted.saturating_sub(1));
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(pid, admitted);
+    exit.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(
+        engine
+            .pending_leader_exit_views
+            .contains(&ProcessViewId(51))
+    );
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 0))
+    );
+    assert!(engine.exit_mapping_reasons_for_test().is_empty());
+}
+
+/// Unit equivalence: kind 7 retires a retained generation with the
+/// same cause as kind 6.
+#[test]
+fn exit_mappings_retirement_matches_kind6_cause() {
+    let view = ProcessView::open(ProcessViewId(52), std::process::id()).unwrap();
+    let pid = view.pid();
+    assert_eq!(
+        lifecycle_retirement(&[view], pid, u64::MAX, DISCOVERY_KIND_LEADER_EXIT_MAPPINGS),
+        Some((ProcessViewId(52), RetirementCause::ExpectedRemoval))
+    );
+}
+
+/// Without extensive arming, a kind-7 record is still a leader exit
+/// (one gap, never live loss), but records no split: the published
+/// key stays absent.
+#[test]
+fn exit_mappings_unarmed_counts_gap_without_split() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7301, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(7301, 21);
+    exit.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(engine.gap_exit_mappings(), None);
+    assert!(engine.exit_mapping_reasons_for_test().is_empty());
 }
 
 #[test]

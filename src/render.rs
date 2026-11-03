@@ -649,6 +649,23 @@ pub struct DiscoveryEvidence {
     /// `Some("ptrace")` when the memory scan could not run.
     pub scan_unavailable: Option<String>,
     pub scan_ms: u64,
+    /// 6.14 Option A exit-time mapping split, `None` unless extensive
+    /// mode armed. Serde-skipped carrier: the profile lane hoists it to
+    /// the top-level `gap_exit_mappings` key in `versioned_evidence`,
+    /// while metrics and trace embed `Evidence` directly and never see
+    /// it. Stamped from live engine state on every `capture_facts()`.
+    #[serde(skip)]
+    pub gap_exit_mappings: Option<GapExitMappings>,
+}
+
+/// 6.14 Option A exit-time split of the novel unmatched-exit
+/// subpopulation: leaders that had a watched provider file mapped at
+/// exit (`mapped`) vs every other shape (`unknown`). Nominally `pub`
+/// for the `DiscoveryEvidence` carrier; only the two counts render.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GapExitMappings {
+    pub mapped: u64,
+    pub unknown: u64,
 }
 
 impl Default for DiscoveryEvidence {
@@ -664,6 +681,7 @@ impl Default for DiscoveryEvidence {
             manifest_object_fallbacks: Vec::new(),
             scan_unavailable: None,
             scan_ms: 0,
+            gap_exit_mappings: None,
         }
     }
 }

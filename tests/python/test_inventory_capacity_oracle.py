@@ -1879,6 +1879,66 @@ class C8GateFixtureTests(unittest.TestCase):
                 self.assertNotIn('LEDGER ', ledger.read_text())
 
 
+class AttachDrainGateTests(unittest.TestCase):
+    """The capacity burst waits for the kernel attach backlog to drain."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.oracle = runpy.run_path(str(ORACLE))
+
+    def rows(self, *events):
+        return [{"at_ns": at_ns, "kind": kind, "event": event}
+                for at_ns, kind, event in events]
+
+    def test_two_passes_without_gaps_are_drained(self):
+        drained = self.oracle["capacity_attach_drained"]
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "pass_committed", {"pass": 1}))
+        self.assertTrue(drained(rows))
+
+    def test_deferred_gap_after_last_pass_blocks(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "pass_committed", {"pass": 0}),
+                         (20, "gap_recorded", gap))
+        self.assertFalse(drained(rows))
+
+    def test_pass_after_deferred_gap_is_drained(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "gap_recorded", gap),
+                         (20, "pass_committed", {"pass": 0}),
+                         (30, "pass_committed", {"pass": 1}))
+        self.assertTrue(drained(rows))
+
+    def test_deferred_repeat_after_last_pass_blocks(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "gap_recorded", gap),
+                         (20, "pass_committed", {"pass": 0}),
+                         (30, "gap_repeated", {"index": 4, "repeats": 2}))
+        self.assertFalse(drained(rows))
+
+    def test_failed_only_gaps_do_not_block(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "2 of 68 endpoints failed to attach (sticky, never retried)"}
+        rows = self.rows((10, "gap_recorded", gap),
+                         (20, "pass_committed", {"pass": 0}))
+        self.assertTrue(drained(rows))
+
+    def test_final_pass_alone_is_not_drained(self):
+        drained = self.oracle["capacity_attach_drained"]
+        gap = {"index": 4, "subject": "native endpoint attach failed",
+               "reason": "68 endpoint(s) still deferred when the receipt closed"}
+        rows = self.rows((10, "gap_recorded", gap),
+                         (20, "pass_committed", {"pass": 3, "final": True}))
+        self.assertFalse(drained(rows))
+
+
 def parse_native_row(line):
     return dict(token.split("=", 1) for token in line.split()[1:])
 

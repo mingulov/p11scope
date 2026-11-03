@@ -6776,6 +6776,36 @@ def capacity_prepare(directory, population, demand=8192, custody=None):
     return manifest
 
 
+# The attach receipt's backlog marker (PARTIAL_ATTACH_SUBJECT in
+# src/discovery/inventory_coordinator.rs): a pass that records or repeats no
+# gap with this subject and a "still deferred" reason drained its kernel
+# attach backlog. Sticky "failed to attach" gaps never drain; they are
+# terminal and must not block the gate (the COUNT judgment prices them).
+ATTACH_DEFERRED_SUBJECT = "native endpoint attach failed"
+ATTACH_DEFERRED_MARKER = "still deferred"
+
+
+def capacity_attach_drained(rows):
+    """True once a pass committed after the last deferred-attach gap activity."""
+    deferred_indexes = set()
+    last_deferred_ns = None
+    last_pass_ns = None
+    for row in rows:
+        at_ns = row.get("at_ns") or 0
+        event = row.get("event") or {}
+        if row.get("kind") == "gap_recorded":
+            if event.get("subject") == ATTACH_DEFERRED_SUBJECT \
+                    and ATTACH_DEFERRED_MARKER in (event.get("reason") or ""):
+                deferred_indexes.add(event.get("index"))
+                last_deferred_ns = at_ns
+        elif row.get("kind") == "gap_repeated":
+            if event.get("index") in deferred_indexes:
+                last_deferred_ns = at_ns
+        elif row.get("kind") == "pass_committed" and not event.get("final"):
+            last_pass_ns = at_ns
+    return last_pass_ns is not None and (last_deferred_ns is None or last_pass_ns > last_deferred_ns)
+
+
 def capacity_run(binary, base, lane, population, limit, demand, uid, gid):
     """Root-scheduled public runner. Task2 prepares this; Task3 executes it."""
     with CapacityCustody() as custody:
@@ -6797,7 +6827,11 @@ def capacity_run_owned(binary, base, lane, population, limit, demand, uid, gid, 
     manifest.update(limit=limit, expect_lane=lane, require_retirement="closed", require_reload=population == "growth",
                     event_log="inventory.jsonl")
     providers = {provider["key"]: provider for provider in manifest["providers"]}
-    duration = int(os.environ.get("CAPACITY_DURATION", "180"))
+    # Quiet-host drain estimate: the observer paces kernel attach at 512
+    # endpoints per pass, so the capture window must fit the drain passes
+    # (~30s each with margin) plus the burst, settle, and SIGINT cleanup.
+    drain_passes = 2 + (demand + 511) // 512
+    duration = int(os.environ.get("CAPACITY_DURATION", str(min(600, max(180, 60 + 30 * drain_passes)))))
     wait_seconds = int(os.environ.get("CAPACITY_WAIT_S", "60"))
     if not 1 <= duration <= 600 or not 1 <= wait_seconds <= 120:
         raise ValueError("capacity duration/wait outside bounded runner ranges")
@@ -6837,6 +6871,22 @@ def capacity_run_owned(binary, base, lane, population, limit, demand, uid, gid, 
     def settle():
         wanted = passes() + 2
         wait_for(lambda: passes() >= wanted, "two completed passes")
+
+    def wait_for_attach_drain():
+        # The observer paces kernel attach per pass; the burst must wait
+        # for the backlog to drain or calls land on unarmed endpoints and
+        # COUNT fails. The deadline reserves the burst, settle passes, and
+        # SIGINT cleanup inside the capture window; failing loudly here
+        # beats firing blind.
+        deadline = launch_ns + max(duration - 90, 60)
+        while time.monotonic() < deadline:
+            custody.checkpoint()
+            if capacity_attach_drained(events()):
+                return
+            if observer is not None and observer.poll() is not None:
+                raise ValueError("observer exited before attach drained")
+            time.sleep(2)
+        raise ValueError("attach backlog did not drain within the capture window")
 
     def command(child, text):
         custody.checkpoint()
@@ -6947,7 +6997,9 @@ def capacity_run_owned(binary, base, lane, population, limit, demand, uid, gid, 
             raise ValueError("invalid capacity attach backend")
         observer_args += ["--attach-backend", backend]
     observer = custody.launch(observer_args, stdout=open_log("inventory.stdout"), stderr=open_log("inventory.stderr"))
+    launch_ns = time.monotonic()
     wait_for(lambda: passes() >= 2, "observer initial discovery")
+    wait_for_attach_drain()
     manifest["started_ns"] = next(row["event"]["started_ns"] for row in events() if row["kind"] == "started")
     if population == "growth":
         command(growth, "call initial 7")
@@ -6956,6 +7008,7 @@ def capacity_run_owned(binary, base, lane, population, limit, demand, uid, gid, 
             for key in keys[begin:end]:
                 command(growth, f"load {providers[key]['path']}")
             settle()
+            wait_for_attach_drain()
             command(growth, f"call {phase_name} {count}")
             record_phase(phase_name, keys[:end])
         first = providers[keys[0]]["path"]
@@ -6963,6 +7016,7 @@ def capacity_run_owned(binary, base, lane, population, limit, demand, uid, gid, 
         settle()
         command(growth, f"load {first}")
         settle()
+        wait_for_attach_drain()
         command(growth, "call reloaded 19")
         record_phase("reloaded", keys[:97])
         command(growth, f"close {first}")
@@ -6970,6 +7024,7 @@ def capacity_run_owned(binary, base, lane, population, limit, demand, uid, gid, 
         os.replace(providers[keys[-1]]["replacement_source"], first)
         command(growth, f"load {first}")
         settle()
+        wait_for_attach_drain()
         command(growth, "call replaced 23")
         record_phase("replaced", keys)
     elif population == "real":

@@ -8143,6 +8143,87 @@ fn d3a_directory_final_drop_fences_immediate_reuse() {
     assert_eq!(owner.state_for_test().0, [0; 4]);
 }
 
+/// Characterization (pins today's sweep rule): a userspace `map_files`
+/// identity equal to the held object's joins, and an unequal one refuses
+/// with the mismatch loss. The K1 witness avoids the joining shape for
+/// overlay keys by never producing `MapFiles` proofs.
+#[test]
+fn k1_sweep_userspace_identity_equality_joins() {
+    let expected = FileIdentity { dev: 42, ino: 7 };
+    let entry = mapping(0x7f00_0000, b"r-xp", 7, "/opt/prov.so");
+    let mapped =
+        MappedIdentities::from([((entry.start, entry.end), RangeProof::MapFiles(expected))]);
+    prove_match(expected, None, &[&entry], &mapped).expect("equal userspace identity joins");
+    let other = FileIdentity { dev: 42, ino: 9 };
+    let mapped = MappedIdentities::from([((entry.start, entry.end), RangeProof::MapFiles(other))]);
+    let (loss, _) =
+        prove_match(expected, None, &[&entry], &mapped).expect_err("unequal identity refuses");
+    assert_eq!(loss, AttributionLoss::IdentityMismatch);
+}
+
+/// K2 (witness): every userspace proof entry point refuses with the
+/// fixed marker, so a lost kernel run can never degrade to an edge.
+#[test]
+fn k1_witness_adapter_refuses_userspace_proof() {
+    let mut adapter = WitnessNoFallback::new(Io::healthy());
+    assert_eq!(
+        adapter.mapped_file(10_001, 0, 0x1000),
+        Err(WITNESS_NO_USERSPACE_PROOF.to_string())
+    );
+    let results = adapter.mapped_files(10_001, &[(0, 0x1000), (0x1000, 0x2000)]);
+    assert_eq!(results.len(), 2);
+    for result in &results {
+        assert_eq!(
+            result.as_ref().expect_err("batched proof refuses"),
+            WITNESS_NO_USERSPACE_PROOF
+        );
+    }
+    let reserved = adapter.mapped_files_reserved(10_001, &[(0, 0x1000)], None);
+    assert_eq!(reserved, vec![Err(WITNESS_NO_USERSPACE_PROOF.to_string())]);
+}
+
+/// The adapter refuses even when the inner IO would serve the read, and
+/// delegates every non-proof method untouched.
+#[test]
+fn k1_witness_adapter_delegates_everything_else() {
+    let mut inner = Io::healthy();
+    inner.mapped.insert(0, Ok(FileIdentity { dev: 1, ino: 2 }));
+    let mut adapter = WitnessNoFallback::new(inner);
+    assert!(
+        adapter.mapped_file(10_001, 0, 0x1000).is_err(),
+        "a servable inner read still refuses"
+    );
+    assert_eq!(adapter.open(10_001), Ok(1));
+    assert_eq!(adapter.start_time(&1), Some(4_242));
+    assert!(adapter.still_the_same(&1));
+    assert_eq!(adapter.exe(10_001), Some(exe()));
+    assert_eq!(
+        adapter.maps(10_001, &mut CaptureWorkBudget::default()),
+        Ok(provider_caller())
+    );
+    assert!(!adapter.gone(10_001));
+    assert!(
+        adapter
+            .mint_member(10_001, &1, &mut CaptureWorkBudget::default())
+            .is_ok()
+    );
+    assert!(adapter.take_member().is_none());
+    adapter.return_member(10_001, None);
+}
+
+/// The kernel run keeps its retained pidfd through the adapter;
+/// without it the run itself would fall back.
+#[test]
+fn k1_witness_adapter_keeps_the_kernel_run_pidfd() {
+    let mut inner = OsConfirmIo::with_pool(None);
+    let pin = inner.open(std::process::id()).expect("own pid opens");
+    let adapter = WitnessNoFallback::new(inner);
+    assert!(
+        adapter.borrowed_pidfd(&pin).is_some(),
+        "the adapter delegates the retained pidfd"
+    );
+}
+
 #[path = "d4_ext4_cells.rs"]
 mod d4_ext4_cells;
 #[path = "d4_overlay_cells.rs"]

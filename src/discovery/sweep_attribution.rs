@@ -2325,6 +2325,80 @@ impl ConfirmIo for OsConfirmIo<'_> {
     }
 }
 
+/// The original-file witness's confirm IO: every `map_files` proof is
+/// refused, so a confirm that loses its kernel run yields unavailable
+/// proofs instead of a userspace `(dev, ino)` edge. Everything else
+/// (pins, maps, exe, generation checks, member custody) delegates
+/// untouched — including [`ConfirmIo::borrowed_pidfd`], without which
+/// the kernel run itself would fall back.
+pub(crate) struct WitnessNoFallback<Io> {
+    inner: Io,
+}
+
+impl<Io> WitnessNoFallback<Io> {
+    pub(crate) fn new(inner: Io) -> Self {
+        Self { inner }
+    }
+}
+
+/// The refusal every userspace proof attempt gets. Fixed: the witness
+/// maps it to the gap, never to an edge.
+pub(crate) const WITNESS_NO_USERSPACE_PROOF: &str =
+    "the original-file witness refuses userspace proof";
+
+impl<Io: ConfirmIo> ConfirmIo for WitnessNoFallback<Io> {
+    type Pin = Io::Pin;
+
+    fn borrowed_pidfd<'a>(&self, pin: &'a Self::Pin) -> Option<std::os::fd::BorrowedFd<'a>> {
+        self.inner.borrowed_pidfd(pin)
+    }
+
+    fn mapped_file(&mut self, _pid: u32, _start: u64, _end: u64) -> Result<FileIdentity, String> {
+        Err(WITNESS_NO_USERSPACE_PROOF.to_string())
+    }
+
+    fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+        self.inner.open(pid)
+    }
+
+    fn start_time(&self, pin: &Self::Pin) -> Option<u64> {
+        self.inner.start_time(pin)
+    }
+
+    fn still_the_same(&self, pin: &Self::Pin) -> bool {
+        self.inner.still_the_same(pin)
+    }
+
+    fn exe(&self, pid: u32) -> Option<ExeIdentity> {
+        self.inner.exe(pid)
+    }
+
+    fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        self.inner.maps(pid, budget)
+    }
+
+    fn gone(&self, pid: u32) -> bool {
+        self.inner.gone(pid)
+    }
+
+    fn mint_member(
+        &mut self,
+        pid: u32,
+        pin: &Self::Pin,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<(), Confirmation> {
+        self.inner.mint_member(pid, pin, budget)
+    }
+
+    fn take_member(&mut self) -> Option<RetainedGroupMember> {
+        self.inner.take_member()
+    }
+
+    fn return_member(&mut self, pid: u32, member: Option<RetainedGroupMember>) {
+        self.inner.return_member(pid, member);
+    }
+}
+
 impl crate::discovery::confirm_shards::ShardableIo for OsConfirmIo<'_> {
     type Maps = std::fs::File;
 

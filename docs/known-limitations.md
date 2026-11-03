@@ -329,7 +329,9 @@ kept alive past attach. Only two kernels, four provider shapes and
 
 Container checks run for v0.5.0, each counted against an independent
 call ledger: Docker shared image layers and copy-up (Linux 7.0, and
-Fedora on Linux 7.2.9 with a private Docker daemon), the kind
+Fedora on Linux 7.2.9 with a private Docker daemon; since v0.6.0 the
+copy-up cells assert the stale mapper is unknown with the
+`original_file_unproven` gap and the fresh mapper exact), the kind
 DaemonSet, `attach-pod` into a kind pod from the node, a pre-attached
 provider in a newly created pod, a Knative pod scaled from zero, and a
 node-wide late provider that stays a reported boundary. They use one
@@ -468,8 +470,7 @@ or device identity.
 - Journal/key-operation uniformity for unregistered mechanism ids
   (0.7.0): in v0.6.0 key-operation rows name only registered
   mechanisms.
-- A named unknown edge for the copy-up case above instead of silent
-  misattribution, and for a late provider's unwatched window.
+- A named unknown edge for a late provider's unwatched window.
 - Accounting for remaining exit-caused loader rejects that lack a
   pid-and-hook-time binding to the ended process as exit-only, to
   further cut the short-run void rate.
@@ -1248,12 +1249,20 @@ The old bounds are measurements, not a product startup SLA.
   named mismatch), and never join on 6.8+ (lane B). A copy-up on
   6.8+ keeps the overlay file number (D-C7-3). A process that loaded
   the provider before the copy-up keeps running the original lower
-  file, but inventory attributes it to the copied-up file on both
-  identity backends: its original edge reads `ended`, its later calls
-  are not counted, and the new edge can read `watched_no_use`. The
-  kernel check refuses such a stale match only inside one pass under
-  `--capture scan`; ordinary captures re-check every pass, so this
-  does not protect long-running processes. With xino off,
+  file; since v0.6.0 inventory no longer attributes it to the
+  copied-up file. A provider file reached through overlayfs (or an
+  unproven filesystem) at the same key requires the kernel
+  original-file witness before its row joins, one query per file:
+  the kernel proves the association or the row is unknown with the
+  `original_file_unproven` gap — never a join to the fresh file, on
+  either identity backend and with no userspace `(dev, ino)`
+  fallback. The row's original edge reads `ended`, its later calls
+  are not counted, and no new-module edge is emitted; a process
+  that maps the upper copy is still attributed exactly. The
+  witness runs at most 8 queries per process scan; past the budget
+  further provider files are unknown with the same gap, while
+  files that prove not to be providers never spend witness work.
+  With xino off,
   equal real file numbers on distinct layers collide on the overlay
   device on 6.8+ (a named mismatch, never an edge), while before 6.8
   each layer keeps its real device in the key so there is no
@@ -1269,16 +1278,18 @@ The old bounds are measurements, not a product startup SLA.
   only claimed when the stat-based xino check agrees with the
   requested mode (never mountinfo).
 - Disclosure: a refused join surfaces as an `identity_mismatch` loss.
-  The copy-up misattribution above has no marker in the output: the
-  edges read like any other.
-- Workaround: none for the copy-up case. Restart processes that loaded
-  a provider before the file changed inside the container (for
-  example by chmod, touch or an in-place write). `--identity-backend
-  kernel` does not help here. Same-filesystem layer layouts avoid only
-  the xino-off collision.
-- Status: disclosed for v0.5.0. Marking such an edge unknown with a
-  named gap, when a live caller's mapping stays the same but its
-  module changes, is planned for a later release.
+  A stale copy-up mapping surfaces as an `original_file_unproven` gap
+  under the provider path, with one of four fixed causes (the witness
+  proved another file, the witness query budget was exhausted, the
+  witness was unavailable, the anchor binding failed).
+- Workaround: restart processes that loaded a provider before the file
+  changed inside the container (for example by chmod, touch or an
+  in-place write) to get exact attribution for their later calls.
+  `--identity-backend kernel` does not help here. Same-filesystem
+  layer layouts avoid only the xino-off collision.
+- Status: the copy-up stale join shipped fixed in v0.6.0 (kernel proof
+  or the named gap). The xino-off collision and the pre-6.8 lane-A
+  splits above remain disclosed limits.
 
 ### Pre-admission use voids the watch (R-C51-1)
 

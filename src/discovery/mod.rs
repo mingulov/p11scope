@@ -29,6 +29,7 @@ pub(crate) mod loader_lifetime;
 pub(crate) mod loader_ack;
 pub(crate) mod native_binding;
 pub mod noise;
+pub(crate) mod overlay_witness;
 pub(crate) mod pause;
 pub(crate) mod proof_stats;
 // Z2 retained-member custody substrate; the Task 3 N1 confirm-path routing

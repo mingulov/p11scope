@@ -641,7 +641,11 @@ non-null values needs a new allowlist row.
   the same way, to be that file. An object whose sweep matching was
   refused (non-unique inodes; only where a process past the cap maps
   it) or dropped (it changed after the confirmation reads) is a gap
-  under its path. Admission
+  under its path, as is a mapping on overlayfs (or an unproven
+  filesystem) the kernel witness could not prove is the held file:
+  reason `original_file_unproven` with one of four fixed causes (the
+  witness proved another file, the witness query budget was exhausted,
+  the witness was unavailable, the anchor binding failed). Admission
   failures record one `caller admission failed` gap per pass and kind:
   a single failure keeps its pid and exact reason; several aggregate
   with a count (`N admissions refused this pass: caller budget

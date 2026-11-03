@@ -9,15 +9,14 @@ see --self-test and tests/python/test_container_cells_oracle.py.
 D1 follows the live run-5/6 shape (dev host, over the deep-scan cap) and
 the d1fed1 shape (Fedora host, under it): pre-copy-up both backends
 collapse B onto A's module (same lower file, honest); the span shows
-B-pre's old edge ended plus a mapped edge to the new module with B's
-overlay key, and B2 mapped to that module, on BOTH backends with no named
-identity loss (B-pre's new edge is the known issue copy-up-stale-caller:
-B-pre still runs the lower file, and its later calls are not counted).
-The round-2 twin is new-only when first scanned after the collapse
-resolves (over-cap hosts) or keeps an ended old edge plus the mapped new
-edge, both deep_scan, when first scanned before it (under-cap hosts);
-its post-copy-up calls are measured as missed or fully counted (old +
-new entries together), never partial. A forced-kernel run either names
+B-pre's old edge ended and NO edge to the new module on either leg (a
+stale mapper is never joined to the fresh file: its row carries the
+original_file_unproven gap), and B2 mapped exactly to the new module, on
+BOTH backends with no named identity loss. The round-2 twin is gap-only
+when first scanned after the collapse resolves (over-cap hosts) or keeps
+its ended old edge only, deep_scan, when first scanned before it
+(under-cap hosts); its post-copy-up calls are uncounted (no edge, the gap
+names it). A forced-kernel run either names
 its first proof fallback or reports null (no proof attempted: the sweep
 skipped under the 256 cap, never a proof claim); the kernel and
 userspace legs of every phase must agree on the cell's own provider
@@ -300,14 +299,15 @@ def stat_key(dev_ino):
     return (major, minor, int(ino_text))
 
 
-def known_issue_line(pid, old_module, new_module):
-    return (f"KNOWN_ISSUE cell=D1 copy-up-stale-caller pid={pid} "
-            f"old_module={old_module} new_module={new_module}")
+def stale_caller_line(pid):
+    return (f"D1 cell=D1 copy-up-stale-caller resolved: pid={pid} "
+            f"gap=original_file_unproven (no new-module edge on either leg)")
 
 
-def measured_issue_line(pid, ledger, counted, module):
-    return ("KNOWN_ISSUE cell=D1 copy-up-stale-caller measured: "
-            f"ledger={ledger} counted={counted} pid={pid} module={module}")
+def round2_line(pid, ledger):
+    return ("D1 cell=D1 copy-up-stale-caller round2: "
+            f"pid={pid} ledger={ledger} gap=original_file_unproven "
+            f"(uncounted: no edge)")
 
 
 def boundary_line(unwatched_ns, entries):
@@ -394,15 +394,13 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
     LEDGER total of the round-2 caller b_pre_round2_pid (default pid_b_pre)
     when the driver ran that round, else None (unmeasured). The driver runs
     round 2 on a second pre-copy-up mapper (gated.c runs one round per
-    process); that twin takes exactly two span shapes: new-only (first
-    scanned after the collapse resolves, over-cap hosts) or old-ended plus
-    new-mapped with both edges deep_scan (first scanned before it,
-    under-cap hosts). The oracle accepts exactly two outcomes for its
-    post-copy-up calls: missed (counted 0, the R-41 known issue) or fully
-    counted (a future fix); the measured total is the old + new entries
-    together, and anything in between fails named. The same two outcomes
-    (new edge only) apply to B-pre's own later calls when measured. A
-    forced-kernel run names its first proof fallback or null (no proof
+    process); that twin takes exactly two span shapes: gap-only (first
+    scanned after the collapse resolves, over-cap hosts) or old-ended-only
+    with that edge deep_scan (first scanned before it, under-cap hosts).
+    Either way it carries no new-module edge and its post-copy-up calls
+    are uncounted with the original_file_unproven gap. The same applies
+    to B-pre's own later calls when measured. A forced-kernel run names
+    its first proof fallback or null (no proof
     attempted); the kernel and userspace legs of every phase must agree
     on the cell's own provider modules and edges (ambient host edges
     are outside the cell: they drift between the sequential legs).
@@ -482,8 +480,9 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
 
     # Span: both backends agree. A stays on its key; one new module carries
     # B's overlay key under a different id; the collapse gap repeats exactly
-    # once; B2 maps the new module with no loss; B-pre's exact known-issue
-    # shape is old-ended plus new-mapped.
+    # once; B2 maps the new module with no loss; B-pre runs stale code, so
+    # it keeps only its ended old edge and is unknown with the
+    # original_file_unproven gap — never mapped to the new module.
     span_k_pid, span_k_edges = inventory_maps(span_kernel, module_suffix)
     span_u_pid, span_u_edges = inventory_maps(span_userspace, module_suffix)
     span_k_keys = module_keys(span_kernel, module_suffix)
@@ -518,20 +517,20 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
         assert b2_record["entries"]["coverage"].get("lossy") is not True, \
             (label, "B2 lossy", b2_record)
         b_pre_modules = sorted(mid for (pid, mid) in records if pid == pid_b_pre)
-        assert b_pre_modules == sorted([old_id, new_id]), \
-            (label, "B-pre provider edges changed", b_pre_modules, old_id, new_id)
+        assert b_pre_modules == [old_id], \
+            (label, "B-pre must keep only its old edge", b_pre_modules, old_id, new_id)
         assert records[(pid_b_pre, old_id)]["mapping"]["state"] == "ended", \
             (label, "B-pre old edge is not ended")
-        assert records[(pid_b_pre, new_id)]["mapping"]["state"] == "mapped", \
-            (label, "B-pre new edge is not mapped")
+        b_pre_gaps = gaps_for(document, pid_of, pid_b_pre)
+        assert any("original_file_unproven" in (gap.get("reason") or "")
+                   for gap in b_pre_gaps), \
+            (label, "B-pre has no original_file_unproven gap", pid_b_pre)
         span_shapes[label] = (old_id, new_id)
     assert (span_k_keys[span_shapes["span-kernel"][0]],
             span_k_keys[span_shapes["span-kernel"][1]]) == \
            (span_u_keys[span_shapes["span-userspace"][0]],
             span_u_keys[span_shapes["span-userspace"][1]]), \
         ("span backends disagree", span_shapes)
-    known_issue = {"pid": pid_b_pre, "old_module": span_shapes["span-kernel"][0],
-                   "new_module": span_shapes["span-kernel"][1]}
 
     round2_pid = None
     if b_pre_round2_calls is None:
@@ -548,34 +547,40 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
             round2_pid = b_pre_round2_pid
         legs = {}
         shapes = {}
-        for label, records in (("span_kernel", span_k_records),
-                               ("span_userspace", span_u_records)):
+        for label, records, pid_of, document in (
+                ("span_kernel", span_k_records, span_k_pid, span_kernel),
+                ("span_userspace", span_u_records, span_u_pid, span_userspace)):
             old_id, new_id = span_shapes[label.replace("_", "-")]
-            assert (round2_pid, new_id) in records, \
-                (label, "no new-module edge for the round-2 caller", round2_pid)
-            m8_record = records[(round2_pid, new_id)]
-            assert m8_record["mapping"]["state"] == "mapped", \
-                (label, "the round-2 new edge is not mapped", round2_pid)
-            m8_entries = m8_record["entries"]["count"]
-            m8_status = m8_record["entries"]["coverage"]["state"]
+            # The round-2 caller runs stale code: no new-module edge on
+            # either leg, and the gap names it. There is no partial
+            # count — with no edge there is nothing to count on.
+            assert (round2_pid, new_id) not in records, \
+                (label, "stale round-2 caller mapped to the new module",
+                 round2_pid)
+            caller_gaps = gaps_for(document, pid_of, round2_pid)
+            gap_reasons = sorted(
+                gap.get("reason") or ""
+                for gap in caller_gaps
+                if "original_file_unproven" in (gap.get("reason") or ""))
+            assert gap_reasons, \
+                (label, "round-2 caller has no original_file_unproven gap",
+                 round2_pid)
             if round2_pid == pid_b_pre:
                 # B-pre was first scanned before the collapse resolved, so it
-                # keeps its ended old edge next to the new one.
+                # keeps its ended old edge and nothing else.
                 assert (round2_pid, old_id) in records, \
                     (label, "no old-module edge for B-pre", round2_pid)
-                m7_entries = records[(round2_pid, old_id)]["entries"]["count"]
-                counted = m8_entries
+                assert records[(round2_pid, old_id)]["mapping"]["state"] == "ended", \
+                    (label, "the round-2 B-pre old edge is not ended",
+                     round2_pid)
             elif (round2_pid, old_id) not in records:
                 # First scanned after the collapse resolves (over-cap
-                # hosts): new-only.
-                shapes[label] = "new-only"
-                m7_entries = None
-                counted = m8_entries
+                # hosts): no provider edge at all, only the gap.
+                shapes[label] = "gap-only"
             else:
                 # First scanned before the collapse resolves (under-cap
-                # hosts: every pid deep-scanned): old-ended plus
-                # new-mapped, both deep_scan, like B-pre.
-                shapes[label] = "old-ended-plus-new"
+                # hosts: every pid deep-scanned): the ended old edge only.
+                shapes[label] = "old-ended-only"
                 m7_record = records[(round2_pid, old_id)]
                 assert m7_record["mapping"]["state"] == "ended", \
                     (label, "the round-2 twin old edge is not ended",
@@ -583,18 +588,7 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
                 assert m7_record["mapping"]["evidence"] == "deep_scan", \
                     (label, "the round-2 twin old edge is not deep_scan",
                      round2_pid)
-                assert m8_record["mapping"]["evidence"] == "deep_scan", \
-                    (label, "the round-2 twin new edge is not deep_scan",
-                     round2_pid)
-                m7_entries = m7_record["entries"]["count"]
-                counted = m7_entries + m8_entries
-            assert counted == 0 or counted == b_pre_round2_calls, \
-                (label, "partial round-2 count: neither missed nor fully counted",
-                 round2_pid, counted, b_pre_round2_calls)
-            legs[label] = {"m7_entries": m7_entries, "m8_entries": m8_entries,
-                           "m8_status": m8_status, "counted": counted}
-        assert legs["span_kernel"]["counted"] == legs["span_userspace"]["counted"], \
-            ("span backends disagree on the round-2 count", legs)
+            legs[label] = {"gaps": gap_reasons}
         b_pre_round2 = {"measured": True, "calls": b_pre_round2_calls,
                         "pid": round2_pid, **legs}
         if round2_pid != pid_b_pre:
@@ -602,14 +596,15 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
                 ("span backends disagree on the round-2 twin shape", shapes)
             b_pre_round2["twin_shape"] = shapes["span_kernel"]
 
-    # Backend agreement runs after the round-2 rule so a partial count
-    # keeps its named failure instead of surfacing as a generic
-    # disagreement. Where no kernel proof ran both legs are the same
-    # userspace attribution; where proof ran it fell back to userspace
-    # decisions. Either way the legs must agree on the cell's own
-    # processes and provider modules (ambient host edges drift between
-    # the sequential legs), except fresh on lane A: that leg allows
-    # edge-or-named-gap per leg, so mixed legs are legal.
+    # Backend agreement runs after the round-2 rule so a stale caller
+    # mapped to the new module keeps its named failure instead of
+    # surfacing as a generic disagreement. Where no kernel proof ran
+    # both legs are the same userspace attribution; where proof ran it
+    # fell back to userspace decisions. Either way the legs must agree
+    # on the cell's own processes and provider modules (ambient host
+    # edges drift between the sequential legs), except fresh on lane A:
+    # that leg allows edge-or-named-gap per leg, so mixed legs are
+    # legal.
     cell_pids = {pid_a, pid_b_pre, pid_b_span, pid_b_post}
     if round2_pid is not None:
         cell_pids.add(round2_pid)
@@ -654,7 +649,6 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
                       "userspace_edges": sorted(fresh_u_edges)},
             "copy_up_proof": copy_up_proof,
             "kernel_proof": kernel_proof,
-            "known_issue": known_issue,
             "b_pre_round2": b_pre_round2}
 
 
@@ -830,18 +824,24 @@ def st_pre_edges():
     return [st_edge(101, "m7"), st_edge(102, "m7")]
 
 
+ST_STALE_GAP = "original_file_unproven: the kernel witness proved another file"
+
+
 def st_span_edges():
-    # Live runs 5/6: B-pre keeps old-ended plus new-mapped (deep_scan, first
-    # scanned before the collapse resolves); the round-2 twin (105) and B2
-    # (104) are first scanned after it resolves, so new-only maps_match.
+    # B-pre (102) runs stale code: ended old edge only, plus the gap (no
+    # new-module edge). B2 (104) maps the new module exactly. The round-2
+    # twin (105) is stale too: gap only.
     return [st_edge(101, "m7"),
             st_edge(102, "m7", state="ended"),
-            st_edge(102, "m8", cov="watched_no_use", since=3000,
-                    first_seen=2000),
             st_edge(104, "m8", evidence="maps_match", cov="watched_no_use",
-                    since=3000, first_seen=2000),
-            st_edge(105, "m8", evidence="maps_match", cov="watched_no_use",
                     since=3000, first_seen=2000)]
+
+
+def st_span_gaps():
+    gap = st_collapse()
+    return [gap,
+            (ST_PROVIDER, ST_STALE_GAP, 102),
+            (ST_PROVIDER, ST_STALE_GAP, 105)]
 
 
 def good_copy_up(lane="B"):
@@ -853,10 +853,11 @@ def good_copy_up(lane="B"):
         "pre_userspace": good_inventory(st_pre_edges(), [gap],
                                         backend="userspace", fallback=None,
                                         modules=ST_MODULES_PRE),
-        "span_kernel": good_inventory(st_span_edges(), [gap], backend="kernel",
+        "span_kernel": good_inventory(st_span_edges(), st_span_gaps(),
+                                      backend="kernel",
                                       fallback="anchor_not_installed",
                                       modules=ST_MODULES_SPAN),
-        "span_userspace": good_inventory(st_span_edges(), [gap],
+        "span_userspace": good_inventory(st_span_edges(), st_span_gaps(),
                                          backend="userspace", fallback=None,
                                          modules=ST_MODULES_SPAN),
         "fresh_kernel": good_inventory([st_edge(101, "m7"), st_edge(103, "m8")],
@@ -925,13 +926,13 @@ def accepts(label, check):
 def self_test():
     healthy = copy_up(**good_copy_up("B"))
     assert healthy["lane"] == "B"
-    assert healthy["known_issue"] == {"pid": 102, "old_module": "m7",
-                                      "new_module": "m8"}
+    assert "known_issue" not in healthy
     assert healthy["b_pre_round2"] == {"measured": False}
     assert "no proof attempted" in healthy["kernel_proof"]["finding"]
     assert copy_up(**good_copy_up("A"))["lane"] == "A"
-    assert known_issue_line(102, "m7", "m8") == \
-        "KNOWN_ISSUE cell=D1 copy-up-stale-caller pid=102 old_module=m7 new_module=m8"
+    assert stale_caller_line(102) == \
+        ("D1 cell=D1 copy-up-stale-caller resolved: pid=102 "
+         "gap=original_file_unproven (no new-module edge on either leg)")
     assert boundary_line(1000, 0) == \
         "BOUNDARY cell=N4 late-provider unwatched_ns=1000 entries=0"
 
@@ -990,12 +991,13 @@ def self_test():
     none_split = good_copy_up("B")
     for key in ("pre_kernel", "span_kernel", "fresh_kernel"):
         none_split[key]["observation"]["identity"]["fallback"] = None
-    split_edges = [item if (item["pid"], item["module"]) != (102, "m8")
-                   else st_edge(102, "m8", cov="counted", count=9,
+    split_edges = [item if (item["pid"], item["module"]) != (104, "m8")
+                   else st_edge(104, "m8", evidence="maps_match",
+                                cov="counted", count=9,
                                 since=3000, first_seen=2000)
                    for item in st_span_edges()]
     none_split["span_userspace"] = good_inventory(
-        split_edges, [st_collapse()], backend="userspace", fallback=None,
+        split_edges, st_span_gaps(), backend="userspace", fallback=None,
         modules=ST_MODULES_SPAN)
     refuses_with("fallback null without backend agreement", "disagree",
                  lambda: copy_up(**none_split))
@@ -1010,7 +1012,7 @@ def self_test():
                                  cov="unknown", since=3000, first_seen=2000)
                     for item in st_span_edges()]
     b2_split["span_userspace"] = good_inventory(
-        b2_split_edges, [st_collapse()], backend="userspace", fallback=None,
+        b2_split_edges, st_span_gaps(), backend="userspace", fallback=None,
         modules=ST_MODULES_SPAN)
     b2_split_caller = {caller["pid"]: caller["id"]
                        for caller in b2_split["span_userspace"]["callers"]}[104]
@@ -1023,7 +1025,7 @@ def self_test():
     for key in ("pre_kernel", "span_kernel", "fresh_kernel"):
         b2_loss[key]["observation"]["identity"]["fallback"] = None
     b2_loss["span_userspace"] = good_inventory(
-        b2_split_edges, [st_collapse()], backend="userspace", fallback=None,
+        b2_split_edges, st_span_gaps(), backend="userspace", fallback=None,
         modules=ST_MODULES_SPAN)
     b2_loss_caller = {caller["pid"]: caller["id"]
                       for caller in b2_loss["span_userspace"]["callers"]}[104]
@@ -1069,34 +1071,30 @@ def self_test():
     mutate_copy("span B2 edge ended",
                 span_kernel=good_inventory(
                     [st_edge(101, "m7"), st_edge(102, "m7", state="ended"),
-                     st_edge(102, "m8", cov="watched_no_use", since=3000,
-                            first_seen=2000),
                      st_edge(104, "m8", evidence="maps_match", state="ended")],
-                    [st_collapse()], backend="kernel", modules=ST_MODULES_SPAN))
+                    st_span_gaps(), backend="kernel", modules=ST_MODULES_SPAN))
     mutate_copy("span B2 with identity loss",
                 span_kernel=good_inventory(
                     st_span_edges(), [st_collapse(), ("x", "identity_mismatch", 104)],
                     backend="kernel", modules=ST_MODULES_SPAN))
     mutate_copy("span backends disagree on the new module",
                 span_userspace=good_inventory(
-                    st_span_edges(), [st_collapse()], backend="userspace",
+                    st_span_edges(), st_span_gaps(), backend="userspace",
                     fallback=None,
                     modules=(("m7", ST_KEY_A, ST_PROVIDER),
                              ("m8", (0, 141, 100), ST_PROVIDER))))
     mutate_copy("span B-pre old edge still mapped",
                 span_kernel=good_inventory(
                     [st_edge(101, "m7"), st_edge(102, "m7"),
-                     st_edge(102, "m8", cov="watched_no_use", since=3000,
-                            first_seen=2000),
                      st_edge(104, "m8", evidence="maps_match")],
-                    [st_collapse()], backend="kernel", modules=ST_MODULES_SPAN))
-    mutate_copy("span B-pre new edge ended",
+                    st_span_gaps(), backend="kernel", modules=ST_MODULES_SPAN))
+    mutate_copy("span B-pre new edge present",
                 span_kernel=good_inventory(
                     [st_edge(101, "m7"), st_edge(102, "m7", state="ended"),
                      st_edge(102, "m8", state="ended"),
                      st_edge(104, "m8", evidence="maps_match")],
-                    [st_collapse()], backend="kernel", modules=ST_MODULES_SPAN))
-    mutate_copy("span B-pre new edge missing",
+                    st_span_gaps(), backend="kernel", modules=ST_MODULES_SPAN))
+    mutate_copy("span B-pre without the gap",
                 span_kernel=good_inventory(
                     [st_edge(101, "m7"), st_edge(102, "m7", state="ended"),
                      st_edge(104, "m8", evidence="maps_match")],
@@ -1117,52 +1115,41 @@ def self_test():
                           "identity_mismatch is the correct leg.")
     round2 = good_copy_up("B")
     round2["b_pre_round2_calls"] = 1500
-    assert copy_up(**round2)["b_pre_round2"]["calls"] == 1500
-    round2_bad = good_copy_up("B")
-    round2_bad["b_pre_round2_calls"] = 1500
-    claimed = [st_edge(101, "m7"),
-               st_edge(102, "m7", state="ended"),
-               st_edge(102, "m8", cov="counted", count=9, since=3000,
-                      first_seen=2000),
-               st_edge(104, "m8", evidence="maps_match")]
-    round2_bad["span_kernel"] = good_inventory(claimed, [st_collapse()],
-                                               backend="kernel",
-                                               modules=ST_MODULES_SPAN)
-    refuses("round-2 calls claimed by the new edge",
-            lambda: copy_up(**round2_bad))
+    measured = copy_up(**round2)["b_pre_round2"]
+    assert measured["calls"] == 1500
+    assert measured["pid"] == 102
+    assert measured["span_kernel"]["gaps"] == [ST_STALE_GAP]
+    assert measured["span_userspace"]["gaps"] == [ST_STALE_GAP]
+    # The twin measured instead of B-pre: gap only (first scanned after
+    # the collapse resolves).
     round2_twin = good_copy_up("B")
     round2_twin["b_pre_round2_calls"] = 1500
     round2_twin["b_pre_round2_pid"] = 105
-    assert copy_up(**round2_twin)["b_pre_round2"]["pid"] == 105
-    assert copy_up(**round2_twin)["b_pre_round2"]["span_kernel"]["m7_entries"] is None
-    assert copy_up(**round2_twin)["b_pre_round2"]["twin_shape"] == "new-only"
-    assert copy_up(**round2_twin)["b_pre_round2"]["span_kernel"]["counted"] == 0
-    # The Fedora twin shape is old-ended plus new-mapped, both deep_scan:
-    # first scanned before the collapse resolves (under the cap every pid
-    # is deep-scanned). The measured total is old + new entries together.
+    twin_measured = copy_up(**round2_twin)["b_pre_round2"]
+    assert twin_measured["pid"] == 105
+    assert twin_measured["twin_shape"] == "gap-only"
+    assert twin_measured["span_kernel"]["gaps"] == [ST_STALE_GAP]
+    # The Fedora twin shape is the ended old edge only: first scanned
+    # before the collapse resolves (under the cap every pid is
+    # deep-scanned).
     fedora_twin = [st_edge(101, "m7"),
                    st_edge(102, "m7", state="ended"),
-                   st_edge(102, "m8", cov="watched_no_use", since=3000,
-                          first_seen=2000),
                    st_edge(104, "m8", evidence="maps_match"),
-                   st_edge(105, "m7", state="ended"),
-                   st_edge(105, "m8", cov="watched_no_use", since=3000,
-                          first_seen=2000)]
+                   st_edge(105, "m7", state="ended")]
     round2_twin_old = good_copy_up("B")
     round2_twin_old["b_pre_round2_calls"] = 1500
     round2_twin_old["b_pre_round2_pid"] = 105
     round2_twin_old["span_kernel"] = good_inventory(
-        fedora_twin, [st_collapse()], backend="kernel",
+        fedora_twin, st_span_gaps(), backend="kernel",
         modules=ST_MODULES_SPAN)
     round2_twin_old["span_userspace"] = good_inventory(
-        fedora_twin, [st_collapse()], backend="userspace", fallback=None,
+        fedora_twin, st_span_gaps(), backend="userspace", fallback=None,
         modules=ST_MODULES_SPAN)
     fedora_round2 = copy_up(**round2_twin_old)["b_pre_round2"]
-    assert fedora_round2["twin_shape"] == "old-ended-plus-new"
-    assert fedora_round2["span_kernel"]["m7_entries"] == 0
-    assert fedora_round2["span_kernel"]["counted"] == 0
-    assert fedora_round2["span_userspace"]["counted"] == 0
-    # Shape (b) boundaries: the old edge must be ended and both deep_scan.
+    assert fedora_round2["twin_shape"] == "old-ended-only"
+    assert fedora_round2["span_kernel"]["gaps"] == [ST_STALE_GAP]
+    assert fedora_round2["span_userspace"]["gaps"] == [ST_STALE_GAP]
+    # Boundaries: the old edge must be ended and deep_scan.
     twin_old_mapped = [item if (item["pid"], item["module"]) != (105, "m7")
                        else st_edge(105, "m7")
                        for item in fedora_twin]
@@ -1170,7 +1157,7 @@ def self_test():
     round2_old_mapped["b_pre_round2_calls"] = 1500
     round2_old_mapped["b_pre_round2_pid"] = 105
     round2_old_mapped["span_kernel"] = good_inventory(
-        twin_old_mapped, [st_collapse()], backend="kernel",
+        twin_old_mapped, st_span_gaps(), backend="kernel",
         modules=ST_MODULES_SPAN)
     refuses_with("round-2 twin old edge mapped", "is not ended",
                  lambda: copy_up(**round2_old_mapped))
@@ -1182,159 +1169,63 @@ def self_test():
     round2_old_match["b_pre_round2_calls"] = 1500
     round2_old_match["b_pre_round2_pid"] = 105
     round2_old_match["span_kernel"] = good_inventory(
-        twin_old_match, [st_collapse()], backend="kernel",
+        twin_old_match, st_span_gaps(), backend="kernel",
         modules=ST_MODULES_SPAN)
     refuses_with("round-2 twin old edge not deep_scan", "deep_scan",
                  lambda: copy_up(**round2_old_match))
-    twin_new_match = [item if (item["pid"], item["module"]) != (105, "m8")
-                      else st_edge(105, "m8", evidence="maps_match",
-                                   cov="watched_no_use", since=3000,
-                                   first_seen=2000)
-                      for item in fedora_twin]
-    round2_new_match = good_copy_up("B")
-    round2_new_match["b_pre_round2_calls"] = 1500
-    round2_new_match["b_pre_round2_pid"] = 105
-    round2_new_match["span_kernel"] = good_inventory(
-        twin_new_match, [st_collapse()], backend="kernel",
+    # Any new-module edge for the stale twin refuses, whatever its shape:
+    # no partial count and no full count either.
+    twin_new = [item for item in fedora_twin] + [
+        st_edge(105, "m8", cov="counted", count=9, since=3000,
+                first_seen=2000)]
+    round2_new = good_copy_up("B")
+    round2_new["b_pre_round2_calls"] = 1500
+    round2_new["b_pre_round2_pid"] = 105
+    round2_new["span_kernel"] = good_inventory(
+        twin_new, st_span_gaps(), backend="kernel",
         modules=ST_MODULES_SPAN)
-    refuses_with("round-2 twin new edge not deep_scan", "deep_scan",
-                 lambda: copy_up(**round2_new_match))
-    # Shape (b) measurement: old + new together, missed or fully counted.
-    twin_b_counted = [item if (item["pid"], item["module"]) != (105, "m8")
-                      else st_edge(105, "m8", cov="counted", count=1500,
-                                   since=3000, first_seen=2000)
-                      for item in fedora_twin]
-    round2_b_counted = good_copy_up("B")
-    round2_b_counted["b_pre_round2_calls"] = 1500
-    round2_b_counted["b_pre_round2_pid"] = 105
-    round2_b_counted["span_kernel"] = good_inventory(
-        twin_b_counted, [st_collapse()], backend="kernel",
+    refuses_with("round-2 twin new edge present", "mapped to the new module",
+                 lambda: copy_up(**round2_new))
+    twin_new_full = [item for item in fedora_twin] + [
+        st_edge(105, "m8", evidence="maps_match", cov="counted",
+                count=1500, since=3000, first_seen=2000)]
+    round2_new_full = good_copy_up("B")
+    round2_new_full["b_pre_round2_calls"] = 1500
+    round2_new_full["b_pre_round2_pid"] = 105
+    round2_new_full["span_kernel"] = good_inventory(
+        twin_new_full, st_span_gaps(), backend="kernel",
         modules=ST_MODULES_SPAN)
-    round2_b_counted["span_userspace"] = good_inventory(
-        twin_b_counted, [st_collapse()], backend="userspace", fallback=None,
-        modules=ST_MODULES_SPAN)
-    assert copy_up(**round2_b_counted)["b_pre_round2"]["span_kernel"]["counted"] == 1500
-    # Old-edge entries count too: all 1500 on the ended edge is fixed.
-    twin_b_old_counted = [item if (item["pid"], item["module"]) != (105, "m7")
-                          else st_edge(105, "m7", state="ended", count=1500,
-                                       cov="counted", since=3000,
-                                       first_seen=2000)
-                          for item in fedora_twin]
-    round2_b_old_counted = good_copy_up("B")
-    round2_b_old_counted["b_pre_round2_calls"] = 1500
-    round2_b_old_counted["b_pre_round2_pid"] = 105
-    round2_b_old_counted["span_kernel"] = good_inventory(
-        twin_b_old_counted, [st_collapse()], backend="kernel",
-        modules=ST_MODULES_SPAN)
-    round2_b_old_counted["span_userspace"] = good_inventory(
-        twin_b_old_counted, [st_collapse()], backend="userspace",
+    round2_new_full["span_userspace"] = good_inventory(
+        twin_new_full, st_span_gaps(), backend="userspace",
         fallback=None, modules=ST_MODULES_SPAN)
-    assert copy_up(**round2_b_old_counted)["b_pre_round2"]["span_kernel"]["counted"] == 1500
-    twin_b_partial = [item if (item["pid"], item["module"]) != (105, "m8")
-                      else st_edge(105, "m8", cov="counted", count=9,
-                                   since=3000, first_seen=2000)
-                      for item in fedora_twin]
-    round2_b_partial = good_copy_up("B")
-    round2_b_partial["b_pre_round2_calls"] = 1500
-    round2_b_partial["b_pre_round2_pid"] = 105
-    round2_b_partial["span_kernel"] = good_inventory(
-        twin_b_partial, [st_collapse()], backend="kernel",
-        modules=ST_MODULES_SPAN)
-    refuses_with("round-2 twin shape (b) partial count refused", "partial",
-                 lambda: copy_up(**round2_b_partial))
-    twin_b_old_partial = [item if (item["pid"], item["module"]) != (105, "m7")
-                          else st_edge(105, "m7", state="ended", count=9,
-                                       cov="counted", since=3000,
-                                       first_seen=2000)
-                          for item in fedora_twin]
-    round2_b_old_partial = good_copy_up("B")
-    round2_b_old_partial["b_pre_round2_calls"] = 1500
-    round2_b_old_partial["b_pre_round2_pid"] = 105
-    round2_b_old_partial["span_kernel"] = good_inventory(
-        twin_b_old_partial, [st_collapse()], backend="kernel",
-        modules=ST_MODULES_SPAN)
-    refuses_with("round-2 twin shape (b) old-edge partial refused", "partial",
-                 lambda: copy_up(**round2_b_old_partial))
-    # The two backends must agree on the twin shape, not just the count.
+    refuses_with("round-2 twin counted new edge refused",
+                 "mapped to the new module",
+                 lambda: copy_up(**round2_new_full))
+    # A stale twin without the gap is silence, not a pass.
+    twin_no_gap = good_copy_up("B")
+    twin_no_gap["b_pre_round2_calls"] = 1500
+    twin_no_gap["b_pre_round2_pid"] = 105
+    twin_no_gap["span_kernel"] = good_inventory(
+        st_span_edges(), [st_collapse(),
+                          (ST_PROVIDER, ST_STALE_GAP, 102)],
+        backend="kernel", modules=ST_MODULES_SPAN)
+    refuses_with("round-2 twin without the gap", "has no original_file_unproven gap",
+                 lambda: copy_up(**twin_no_gap))
+    # The two backends must agree on the twin shape.
     round2_shape_split = good_copy_up("B")
     round2_shape_split["b_pre_round2_calls"] = 1500
     round2_shape_split["b_pre_round2_pid"] = 105
     round2_shape_split["span_kernel"] = good_inventory(
-        fedora_twin, [st_collapse()], backend="kernel",
+        fedora_twin, st_span_gaps(), backend="kernel",
         modules=ST_MODULES_SPAN)
     refuses_with("round-2 backends disagree on the twin shape", "twin shape",
                  lambda: copy_up(**round2_shape_split))
-    # A future fix that counts every post-copy-up call passes too.
-    twin_counted_edges = [st_edge(101, "m7"),
-                          st_edge(102, "m7", state="ended"),
-                          st_edge(102, "m8", cov="watched_no_use", since=3000,
-                                 first_seen=2000),
-                          st_edge(104, "m8", evidence="maps_match"),
-                          st_edge(105, "m8", evidence="maps_match", cov="counted",
-                                 count=1500, since=3000, first_seen=2000)]
-    round2_twin_counted = good_copy_up("B")
-    round2_twin_counted["b_pre_round2_calls"] = 1500
-    round2_twin_counted["b_pre_round2_pid"] = 105
-    round2_twin_counted["span_kernel"] = good_inventory(
-        twin_counted_edges, [st_collapse()], backend="kernel",
-        modules=ST_MODULES_SPAN)
-    round2_twin_counted["span_userspace"] = good_inventory(
-        twin_counted_edges, [st_collapse()], backend="userspace",
-        fallback=None, modules=ST_MODULES_SPAN)
-    assert copy_up(**round2_twin_counted)["b_pre_round2"]["span_kernel"]["m8_entries"] == 1500
-    # Anything between missed (0) and fully counted (ledger) fails named.
-    twin_claimed = [st_edge(101, "m7"),
-                    st_edge(102, "m7", state="ended"),
-                    st_edge(102, "m8", cov="watched_no_use", since=3000,
-                           first_seen=2000),
-                    st_edge(104, "m8", evidence="maps_match"),
-                    st_edge(105, "m8", evidence="maps_match", cov="counted",
-                           count=9, since=3000, first_seen=2000)]
-    round2_twin_bad = good_copy_up("B")
-    round2_twin_bad["b_pre_round2_calls"] = 1500
-    round2_twin_bad["b_pre_round2_pid"] = 105
-    round2_twin_bad["span_kernel"] = good_inventory(twin_claimed, [st_collapse()],
-                                                    backend="kernel",
-                                                    modules=ST_MODULES_SPAN)
-    refuses_with("round-2 twin partial count refused", "partial",
-                 lambda: copy_up(**round2_twin_bad))
-    # Same two outcomes for B-pre's own later calls when measured.
-    b_pre_counted_edges = [st_edge(101, "m7"),
-                           st_edge(102, "m7", state="ended"),
-                           st_edge(102, "m8", cov="counted", count=1500,
-                                  since=3000, first_seen=2000),
-                           st_edge(104, "m8", evidence="maps_match")]
-    round2_b_pre_counted = good_copy_up("B")
-    round2_b_pre_counted["b_pre_round2_calls"] = 1500
-    round2_b_pre_counted["span_kernel"] = good_inventory(
-        b_pre_counted_edges, [st_collapse()], backend="kernel",
-        modules=ST_MODULES_SPAN)
-    round2_b_pre_counted["span_userspace"] = good_inventory(
-        b_pre_counted_edges, [st_collapse()], backend="userspace",
-        fallback=None, modules=ST_MODULES_SPAN)
-    assert copy_up(**round2_b_pre_counted)["b_pre_round2"]["span_kernel"]["m8_entries"] == 1500
-    refuses_with("round-2 B-pre partial count refused", "partial",
-                 lambda: copy_up(**round2_bad))
-    # The two backends must agree on missed vs counted.
-    round2_split = good_copy_up("B")
-    round2_split["b_pre_round2_calls"] = 1500
-    round2_split["b_pre_round2_pid"] = 105
-    round2_split["span_userspace"] = good_inventory(
-        twin_counted_edges, [st_collapse()], backend="userspace",
-        fallback=None, modules=ST_MODULES_SPAN)
-    refuses_with("round-2 backends disagree on the count", "disagree",
-                 lambda: copy_up(**round2_split))
-    assert measured_issue_line(105, 1500, 0, "m8") == \
-        ("KNOWN_ISSUE cell=D1 copy-up-stale-caller measured: ledger=1500 "
-         "counted=0 pid=105 module=m8")
-    twin_missing = good_copy_up("B")
-    twin_missing["b_pre_round2_calls"] = 1500
-    twin_missing["b_pre_round2_pid"] = 105
-    twin_missing["span_kernel"] = good_inventory(
-        [item for item in st_span_edges() if item["pid"] != 105],
-        [st_collapse()], backend="kernel", modules=ST_MODULES_SPAN)
-    refuses("round-2 twin without a new edge",
-            lambda: copy_up(**twin_missing))
+    assert stale_caller_line(102) == \
+        ("D1 cell=D1 copy-up-stale-caller resolved: pid=102 "
+         "gap=original_file_unproven (no new-module edge on either leg)")
+    assert round2_line(105, 1500) == \
+        ("D1 cell=D1 copy-up-stale-caller round2: "
+         "pid=105 ledger=1500 gap=original_file_unproven (uncounted: no edge)")
     twin_nocalls = good_copy_up("B")
     twin_nocalls["b_pre_round2_pid"] = 105
     refuses("round-2 pid without a measured total",
@@ -1343,10 +1234,8 @@ def self_test():
     mutate_copy("A inexact in the span",
                 span_kernel=good_inventory(
                     [st_edge(102, "m7", state="ended"),
-                     st_edge(102, "m8", cov="watched_no_use", since=3000,
-                            first_seen=2000),
                      st_edge(104, "m8", evidence="maps_match")],
-                    [st_collapse()], backend="kernel", modules=ST_MODULES_SPAN))
+                    st_span_gaps(), backend="kernel", modules=ST_MODULES_SPAN))
     mutate_copy("lane-B fresh kernel lost restarted B",
                 fresh_kernel=good_inventory([st_edge(101, "m7")],
                                             backend="kernel",
@@ -1558,15 +1447,10 @@ def main(argv):
                          options.b_pre_round2_calls, options.b_pre_round2_pid,
                          options.module_suffix)
         print(json.dumps(result, sort_keys=True))
-        known = result["known_issue"]
-        print(known_issue_line(known["pid"], known["old_module"],
-                               known["new_module"]),
-              file=sys.stderr)
+        print(stale_caller_line(options.pid_b_pre), file=sys.stderr)
         round2 = result["b_pre_round2"]
         if round2.get("measured"):
-            print(measured_issue_line(round2["pid"], round2["calls"],
-                                      round2["span_kernel"]["counted"],
-                                      known["new_module"]),
+            print(round2_line(round2["pid"], round2["calls"]),
                   file=sys.stderr)
     elif options.command == "late-reported":
         with open(options.file, encoding="utf-8") as handle:

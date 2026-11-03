@@ -9,8 +9,13 @@
 use crate::discovery::caller_registry::cold_admit_member;
 use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::identity::{ExaminedObject, Pin, pin_of};
+use crate::discovery::identity::{ExaminedObject, MappedFile, Pin, pin_of};
+use crate::discovery::overlay_witness::{
+    OVERLAY_WITNESS_QUERIES_PER_SCAN, WitnessFailure, WitnessVerdict,
+    original_file_witness_required, prove_original_file,
+};
 use crate::discovery::retained_member::RetainedGroupMember;
+use crate::discovery::sweep_attribution::is_caller_range;
 use crate::process::{MountNamespaceId, PidPin, ProcessView, ProcessViewId};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot, SymbolFact};
 use p11scope_manifest::identity::{InspectedObject, open_object};
@@ -4141,21 +4146,40 @@ fn opened_file_identity_guard(
 /// backing file). Best effort by design: without the privilege, or for a
 /// range unmapped since, the path open and key match stay the proof,
 /// exactly as before; only a proven different file refuses.
-fn mapped_file_guard(
+///
+/// A caller range the equality cannot prove — held file on overlayfs (or
+/// an unproven filesystem) at the same key, where a copy-up keeps the
+/// stale lower mapping at the fresh upper `(dev, ino)` — marks the join
+/// unproven instead of spending the witness here: the query runs once
+/// per file at the provider branch (`witness_join`), over the group's
+/// first witness-requiring range, and only for files that prove to be
+/// providers. Anything but a same-file verdict then refuses with the
+/// `original_file_unproven` gap, never a join.
+pub(crate) fn mapped_file_guard(
     io: &mut impl ScanIo,
     view: &ProcessView,
-    scanned: Option<crate::discovery::identity::FileIdentity>,
+    file: &File,
+    held: Option<MappedFile>,
     key: ObjectKey,
     group: &[&MapEntry],
     budget: &mut CaptureWorkBudget,
-) -> Result<(), String> {
-    let Some(expected) = scanned else {
-        return Ok(());
+) -> Result<GuardOutcome, String> {
+    let Some(held) = held else {
+        return Ok(GuardOutcome::Proven);
     };
+    let expected = held.identity;
+    let mut unproven: Option<(u64, u64)> = None;
     for entry in group {
         let mapped = io.range_identity(view, entry.start, entry.end, budget)?;
         match mapped {
-            Ok(identity) if identity == expected => {}
+            Ok(identity) if identity == expected => {
+                if unproven.is_none()
+                    && is_caller_range(entry)
+                    && original_file_witness_required(&held, &identity)
+                {
+                    unproven = Some((entry.start, entry.end));
+                }
+            }
             Ok(identity) => {
                 return Err(format!(
                     "mapped range {:x}-{:x} is another file (st_dev {} st_ino {}) than the opened \
@@ -4174,7 +4198,39 @@ fn mapped_file_guard(
             Err(_) => {}
         }
     }
-    Ok(())
+    Ok(match unproven {
+        Some(range) => GuardOutcome::UnprovenOverlay { range },
+        None => GuardOutcome::Proven,
+    })
+}
+
+/// What `mapped_file_guard` established for one candidate file: either
+/// the legacy equality proved the join, or an overlay (or unproven
+/// filesystem) caller range matched by `(dev, ino)` and still needs the
+/// kernel witness before a provider row may join it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuardOutcome {
+    Proven,
+    UnprovenOverlay { range: (u64, u64) },
+}
+
+/// Prove one witness-requiring provider file with the original-file
+/// witness: `None` joins, `Some` refuses with the gap reason. Runs once
+/// per file at the provider branch; every range of the group shares the
+/// file, so the one verdict over the first witness-requiring range
+/// covers all of them.
+pub(crate) fn witness_join(
+    io: &mut impl ScanIo,
+    view: &ProcessView,
+    file: &File,
+    held: &MappedFile,
+    key: ObjectKey,
+    range: (u64, u64),
+    budget: &mut CaptureWorkBudget,
+) -> Option<String> {
+    io.prove_original_file(view, file, held, key, range, budget)
+        .gap_reason()
+        .map(str::to_string)
 }
 
 fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
@@ -4734,8 +4790,9 @@ fn scan_stopped_before_view(started: Instant, reason: &'static str) -> ScanOutco
     }
 }
 
-// Private I/O seam: production and mutation tests share the entire acquisition loop.
-trait ScanMemory {
+// Scan I/O seam: production and mutation tests share the entire acquisition
+// loop; the privileged overlay cells drive the production IO too.
+pub(crate) trait ScanMemory {
     fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize>;
 }
 
@@ -4745,7 +4802,7 @@ impl ScanMemory for File {
     }
 }
 
-trait ScanIo {
+pub(crate) trait ScanIo {
     type Memory: ScanMemory;
     fn open_maps(
         &mut self,
@@ -4809,10 +4866,53 @@ trait ScanIo {
     fn accepts_cold_member(&self) -> bool {
         false
     }
+    /// Prove the witness-requiring caller range `[start, end)` of the
+    /// scanned process is the held file. The default has no backend and
+    /// reports unavailable; the production IO spends the per-scan
+    /// witness budget and runs the kernel witness.
+    fn prove_original_file(
+        &mut self,
+        view: &ProcessView,
+        file: &File,
+        held: &MappedFile,
+        key: ObjectKey,
+        range: (u64, u64),
+        budget: &mut CaptureWorkBudget,
+    ) -> WitnessVerdict {
+        let _ = (view, file, held, key, range, budget);
+        WitnessVerdict::Failed(WitnessFailure::Unavailable)
+    }
 }
 
-struct ProcScanIo {
+pub(crate) struct ProcScanIo {
     cold: Option<ProcColdMember>,
+    witness_used: u32,
+}
+
+impl ProcScanIo {
+    pub(crate) fn new() -> Self {
+        Self {
+            cold: None,
+            witness_used: 0,
+        }
+    }
+
+    /// A scan that already spent `used` witness queries (the privileged
+    /// budget-exhaustion cell drives production with a spent budget).
+    #[cfg(test)]
+    pub(crate) fn with_witness_used(used: u32) -> Self {
+        Self {
+            cold: None,
+            witness_used: used,
+        }
+    }
+
+    /// Witness queries this scan spent (the privileged cells assert the
+    /// production budget spend exactly).
+    #[cfg(test)]
+    pub(crate) fn witness_used(&self) -> u32 {
+        self.witness_used
+    }
 }
 
 /// One scan's cold survivor: the member plus the minter Arc that keeps
@@ -4885,6 +4985,24 @@ impl ScanIo for ProcScanIo {
                     }
                 }))
         })
+    }
+
+    fn prove_original_file(
+        &mut self,
+        view: &ProcessView,
+        file: &File,
+        held: &MappedFile,
+        key: ObjectKey,
+        range: (u64, u64),
+        budget: &mut CaptureWorkBudget,
+    ) -> WitnessVerdict {
+        // The per-scan budget spends before the run: a failed attempt
+        // still spends, and exhaustion refuses without running.
+        if self.witness_used >= OVERLAY_WITNESS_QUERIES_PER_SCAN {
+            return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
+        }
+        self.witness_used += 1;
+        prove_original_file(view.pid(), file, held, key, range, budget)
     }
 
     fn note_cold_member(&mut self, pid: u32, member: RetainedGroupMember, minter: Arc<PidPin>) {
@@ -5209,7 +5327,7 @@ pub fn scan_process_view(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    let result = scan_process_view_with_io(request, view, budget, &mut ProcScanIo { cold: None });
+    let result = scan_process_view_with_io(request, view, budget, &mut ProcScanIo::new());
     #[cfg(test)]
     crate::first_use_probe::scan_returned(view, true, budget, &result);
     result
@@ -5223,13 +5341,8 @@ pub(crate) fn scan_process_view_without_memory(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ScanOutcome, String> {
-    let result = scan_process_view_with_io_mode(
-        request,
-        view,
-        budget,
-        &mut ProcScanIo { cold: None },
-        false,
-    );
+    let result =
+        scan_process_view_with_io_mode(request, view, budget, &mut ProcScanIo::new(), false);
     #[cfg(test)]
     crate::first_use_probe::scan_returned(view, false, budget, &result);
     result
@@ -5255,8 +5368,7 @@ pub(crate) fn scan_process_view_examined(
     view: &ProcessView,
     budget: &mut CaptureWorkBudget,
 ) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
-    let result =
-        scan_view_with_examined(request, view, budget, &mut ProcScanIo { cold: None }, true);
+    let result = scan_view_with_examined(request, view, budget, &mut ProcScanIo::new(), true);
     #[cfg(test)]
     {
         let probe = result
@@ -5304,7 +5416,7 @@ pub(crate) fn scan_process_view_held(
         request,
         view,
         budget,
-        &mut ProcScanIo { cold: None },
+        &mut ProcScanIo::new(),
         true,
         custody,
         scan,
@@ -5575,12 +5687,15 @@ fn scan_view_examined_mode(
             .retained_mapped_identity(&file)
             .or_else(|| io.held_identity(&file));
         let scanned_identity = held.map(|held| held.identity);
-        if let Err(reason) = mapped_file_guard(io, view, scanned_identity, key, &group, budget) {
-            if !narrowed_out {
-                skipped.push(Skipped { subject, reason });
+        let guarded = match mapped_file_guard(io, view, &file, held, key, &group, budget) {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                if !narrowed_out {
+                    skipped.push(Skipped { subject, reason });
+                }
+                continue;
             }
-            continue;
-        }
+        };
         // Corroborate an inode-only match before attributing the object to
         // the hint. The attributed hint is also the operator-named signal
         // the planner reads; naming follows the narrowing exactly.
@@ -5724,6 +5839,17 @@ fn scan_view_examined_mode(
         // the planner reads it for the operator-named closure exception.
         let module_hint = named_hint;
         let same_file_loads = duplicate_exec_load_count(&group);
+        // A provider file the guard could not prove needs the kernel
+        // witness before its row joins: one query over the group's first
+        // witness-requiring range. Anything but a same-file verdict
+        // refuses with the finite gap, never a join. Files that prove
+        // not to be providers (above) never spend witness work.
+        if let (GuardOutcome::UnprovenOverlay { range }, Some(held)) = (guarded, held) {
+            if let Some(reason) = witness_join(io, view, &file, &held, key, range, budget) {
+                skipped.push(Skipped { subject, reason });
+                continue;
+            }
+        }
         let mut module = ScannedModule {
             module_hint,
             mapped_identity: scanned_identity,
@@ -6519,9 +6645,12 @@ mod tests {
         }
         fn held_identity(&mut self, file: &File) -> Option<crate::discovery::identity::MappedFile> {
             match self.mapped {
+                // Scripted identities model an ordinary filesystem: the
+                // magic is explicit (an unproven filesystem would require
+                // the original-file witness instead of the legacy join).
                 Some((held, _)) => Some(crate::discovery::identity::MappedFile {
                     identity: held,
-                    fs_magic: None,
+                    fs_magic: Some(0xef53),
                 }),
                 None => crate::discovery::identity::self_mapped_file(file).ok(),
             }
@@ -13505,11 +13634,472 @@ mod tests {
             0,
             "a scripted IO spends no mint budget"
         );
-        let mut production = ProcScanIo { cold: None };
+        let mut production = ProcScanIo {
+            cold: None,
+            witness_used: 0,
+        };
         let mut control_budget = CaptureWorkBudget::default();
         let maps = acquire_cold_survivor_maps(&warm.view, &mut control_budget, &mut production)
             .expect("the production IO mints the same group's survivor");
         assert!(!maps.is_empty(), "the control serves real survivor maps");
+    }
+
+    /// The deep-scan guard must not join a stale lower mapping whose
+    /// `(dev, ino)` equals the held upper file (R-41). These tests pin the
+    /// production contract: an overlay-held, `(dev, ino)`-equal caller
+    /// range requires a kernel original-file verdict, and anything but a
+    /// same-file verdict refuses with the finite gap
+    /// `original_file_unproven` — never a join.
+    const K1_RED_OVERLAY_MAGIC: u64 = p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC;
+    const K1_RED_EXT4_MAGIC: u64 = 0xef53;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum K1RedVerdict {
+        SameFile,
+        OtherFile,
+        Unavailable,
+        BindingFailed,
+    }
+
+    struct K1RedIo {
+        reads: std::collections::BTreeMap<(u64, u64), crate::discovery::identity::FileIdentity>,
+        held_magic: Option<u64>,
+        witness: std::collections::VecDeque<K1RedVerdict>,
+        prove_calls: usize,
+        witness_used: u32,
+        witness_max: u32,
+    }
+
+    impl K1RedIo {
+        fn overlay(
+            reads: std::collections::BTreeMap<(u64, u64), crate::discovery::identity::FileIdentity>,
+        ) -> Self {
+            Self {
+                reads,
+                held_magic: Some(K1_RED_OVERLAY_MAGIC),
+                witness: std::collections::VecDeque::new(),
+                prove_calls: 0,
+                witness_used: 0,
+                witness_max: 8,
+            }
+        }
+
+        fn ext4(
+            reads: std::collections::BTreeMap<(u64, u64), crate::discovery::identity::FileIdentity>,
+        ) -> Self {
+            Self {
+                reads,
+                held_magic: Some(K1_RED_EXT4_MAGIC),
+                witness: std::collections::VecDeque::new(),
+                prove_calls: 0,
+                witness_used: 0,
+                witness_max: 8,
+            }
+        }
+
+        fn script_same_file(&mut self) {
+            self.witness.push_back(K1RedVerdict::SameFile);
+        }
+
+        fn script_other_file(&mut self) {
+            self.witness.push_back(K1RedVerdict::OtherFile);
+        }
+
+        fn script_unavailable(&mut self) {
+            self.witness.push_back(K1RedVerdict::Unavailable);
+        }
+
+        fn script_binding_failed(&mut self) {
+            self.witness.push_back(K1RedVerdict::BindingFailed);
+        }
+
+        fn exhaust(&mut self) {
+            self.witness_used = self.witness_max;
+        }
+    }
+
+    impl ScanIo for K1RedIo {
+        type Memory = std::fs::File;
+
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn std::io::Read>> {
+            panic!("the guard never opens maps")
+        }
+
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Self::Memory> {
+            panic!("the guard never opens memory")
+        }
+
+        fn final_generation(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            panic!("the guard never checks the final generation")
+        }
+
+        fn range_identity(
+            &mut self,
+            _: &ProcessView,
+            start: u64,
+            end: u64,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
+            Ok(self
+                .reads
+                .get(&(start, end))
+                .copied()
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound)))
+        }
+
+        fn prove_original_file(
+            &mut self,
+            _: &ProcessView,
+            _: &std::fs::File,
+            _: &MappedFile,
+            _: ObjectKey,
+            range: (u64, u64),
+            _: &mut CaptureWorkBudget,
+        ) -> WitnessVerdict {
+            if self.witness_used >= self.witness_max {
+                return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
+            }
+            self.prove_calls += 1;
+            self.witness_used += 1;
+            let _ = range;
+            match self
+                .witness
+                .pop_front()
+                .expect("scripted witness queried past its script")
+            {
+                K1RedVerdict::SameFile => WitnessVerdict::SameFile,
+                K1RedVerdict::OtherFile => WitnessVerdict::OtherFile,
+                K1RedVerdict::Unavailable => WitnessVerdict::Failed(WitnessFailure::Unavailable),
+                K1RedVerdict::BindingFailed => {
+                    WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed)
+                }
+            }
+        }
+    }
+
+    fn k1_red_identity() -> crate::discovery::identity::FileIdentity {
+        crate::discovery::identity::FileIdentity { dev: 42, ino: 7 }
+    }
+
+    fn k1_red_key() -> ObjectKey {
+        ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 42,
+            },
+            inode: 7,
+        }
+    }
+
+    fn k1_red_entry(start: u64, permissions: &[u8; 4]) -> MapEntry {
+        MapEntry {
+            start,
+            end: start + 0x1000,
+            file_offset: 0,
+            permissions: *permissions,
+            device: Device {
+                major: 0,
+                minor: 42,
+            },
+            inode: 7,
+            raw_path: Some(b"/opt/prov.so".to_vec()),
+        }
+    }
+
+    /// The guard under test. The held magic rides the fake into the
+    /// held `MappedFile`; the file is a placeholder the scripted witness
+    /// never reads. The guard marks witness-requiring joins unproven and
+    /// never consults the witness itself.
+    fn run_k1_guard(
+        io: &mut K1RedIo,
+        held: crate::discovery::identity::FileIdentity,
+        group: &[&MapEntry],
+    ) -> Result<GuardOutcome, String> {
+        let view = ProcessView::open(crate::process::ProcessViewId(1), std::process::id()).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let held = MappedFile {
+            identity: held,
+            fs_magic: io.held_magic,
+        };
+        mapped_file_guard(
+            io,
+            &view,
+            &file,
+            Some(held),
+            k1_red_key(),
+            group,
+            &mut budget,
+        )
+    }
+
+    /// The provider-branch prove step under test: one witness query over
+    /// the outcome's range, mirroring the production call site. Panics
+    /// for a proven outcome, which production never proves.
+    fn run_k1_prove(
+        io: &mut K1RedIo,
+        held: crate::discovery::identity::FileIdentity,
+        outcome: GuardOutcome,
+    ) -> Option<String> {
+        let GuardOutcome::UnprovenOverlay { range } = outcome else {
+            panic!("the prove step runs only for unproven outcomes, got {outcome:?}");
+        };
+        let view = ProcessView::open(crate::process::ProcessViewId(1), std::process::id()).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let held = MappedFile {
+            identity: held,
+            fs_magic: io.held_magic,
+        };
+        witness_join(io, &view, &file, &held, k1_red_key(), range, &mut budget)
+    }
+
+    #[test]
+    fn k1_guard_marks_unproven_without_spending() {
+        // The D1 pin: marking a witness-requiring join never consults
+        // the witness, so non-provider files spend nothing. No script:
+        // any consultation fails loud.
+        let held = k1_red_identity();
+        let entries: Vec<MapEntry> = (0..3)
+            .map(|index| k1_red_entry(0x7f00_0000 + index * 0x1000, b"r-xp"))
+            .collect();
+        let group: Vec<&MapEntry> = entries.iter().collect();
+        let reads: std::collections::BTreeMap<
+            (u64, u64),
+            crate::discovery::identity::FileIdentity,
+        > = entries
+            .iter()
+            .map(|entry| ((entry.start, entry.end), held))
+            .collect();
+        let mut io = K1RedIo::overlay(reads);
+        let outcome = run_k1_guard(&mut io, held, &group)
+            .expect("the guard marks, never refuses, an equal overlay group");
+        assert_eq!(
+            outcome,
+            GuardOutcome::UnprovenOverlay {
+                range: (entries[0].start, entries[0].end),
+            },
+            "the outcome names the first witness-requiring range"
+        );
+        assert_eq!(io.prove_calls, 0, "marking spends no query");
+        assert_eq!(io.witness_used, 0, "marking spends no budget");
+    }
+
+    #[test]
+    fn k1_guard_stale_lower_refuses_with_named_gap() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        assert_eq!(io.held_magic, Some(K1_RED_OVERLAY_MAGIC));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        assert!(matches!(outcome, GuardOutcome::UnprovenOverlay { .. }));
+        assert_eq!(io.prove_calls, 0, "marking spends nothing");
+        io.script_other_file();
+        let reason = run_k1_prove(&mut io, held, outcome)
+            .expect("the stale lower mapping must refuse, never join the held upper file");
+        assert!(
+            reason.contains("original_file_unproven"),
+            "the refusal carries the finite gap, got {reason:?}"
+        );
+        assert_eq!(io.prove_calls, 1, "the refusal came from the witness");
+    }
+
+    #[test]
+    fn k1_guard_fresh_upper_joins_through_one_witness_query() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        assert_eq!(io.held_magic, Some(K1_RED_OVERLAY_MAGIC));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        assert!(matches!(outcome, GuardOutcome::UnprovenOverlay { .. }));
+        io.script_same_file();
+        assert!(
+            run_k1_prove(&mut io, held, outcome).is_none(),
+            "the fresh upper mapping joins the held upper file"
+        );
+        assert_eq!(io.prove_calls, 1, "the join came from the witness");
+        assert_eq!(io.witness_used, 1, "one budgeted query per file");
+    }
+
+    #[test]
+    fn k1_guard_budget_exhaustion_refuses_never_joins() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        io.exhaust();
+        let outcome = run_k1_guard(&mut io, held, &[&entry]).expect("marking needs no budget");
+        assert!(matches!(outcome, GuardOutcome::UnprovenOverlay { .. }));
+        io.script_same_file();
+        let reason = run_k1_prove(&mut io, held, outcome)
+            .expect("exhaustion refuses, never degrades to (dev, ino)");
+        assert!(
+            reason.contains("original_file_unproven"),
+            "exhaustion carries the finite gap, got {reason:?}"
+        );
+        assert_eq!(io.prove_calls, 0, "no query runs past the budget");
+    }
+
+    #[test]
+    fn k1_prove_spends_one_query_per_file() {
+        // Nine witness-requiring ranges in one file: the guard marks the
+        // first and the prove step runs exactly one query for all of
+        // them, however large the group.
+        let held = k1_red_identity();
+        let entries: Vec<MapEntry> = (0..9)
+            .map(|index| k1_red_entry(0x7f00_0000 + index * 0x1000, b"r-xp"))
+            .collect();
+        let group: Vec<&MapEntry> = entries.iter().collect();
+        let reads: std::collections::BTreeMap<
+            (u64, u64),
+            crate::discovery::identity::FileIdentity,
+        > = entries
+            .iter()
+            .map(|entry| ((entry.start, entry.end), held))
+            .collect();
+        let mut io = K1RedIo::overlay(reads);
+        let outcome = run_k1_guard(&mut io, held, &group)
+            .expect("the guard marks a multi-range overlay group unproven");
+        assert_eq!(
+            outcome,
+            GuardOutcome::UnprovenOverlay {
+                range: (entries[0].start, entries[0].end),
+            },
+            "the outcome names the first witness-requiring range"
+        );
+        assert_eq!(io.prove_calls, 0, "marking spends nothing");
+        io.script_same_file();
+        assert!(
+            run_k1_prove(&mut io, held, outcome).is_none(),
+            "one verdict joins the whole file"
+        );
+        assert_eq!(io.prove_calls, 1, "exactly one query ran for nine ranges");
+        assert_eq!(io.witness_used, 1, "exactly one budget unit spent");
+    }
+
+    #[test]
+    fn k1_guard_witness_unavailable_refuses_with_gap() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        io.script_unavailable();
+        let reason = run_k1_prove(&mut io, held, outcome)
+            .expect("an unavailable witness refuses, never silently joins");
+        assert!(
+            reason.contains("original_file_unproven"),
+            "unavailability carries the finite gap, got {reason:?}"
+        );
+        assert_eq!(
+            io.prove_calls, 1,
+            "the failed attempt still spends the budget"
+        );
+    }
+
+    #[test]
+    fn k1_guard_anchor_binding_failure_refuses_with_gap() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        io.script_binding_failed();
+        let reason = run_k1_prove(&mut io, held, outcome)
+            .expect("an anchor binding failure refuses with the named gap");
+        assert!(
+            reason.contains("original_file_unproven"),
+            "binding failure carries the finite gap, got {reason:?}"
+        );
+        assert_eq!(
+            io.prove_calls, 1,
+            "the failed attempt still spends the budget"
+        );
+    }
+
+    #[test]
+    fn k1_guard_non_overlay_keys_join_without_witness() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        // No script: any witness consultation fails loud.
+        let mut io = K1RedIo::ext4(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        assert_eq!(io.held_magic, Some(K1_RED_EXT4_MAGIC));
+        let outcome =
+            run_k1_guard(&mut io, held, &[&entry]).expect("non-overlay keys keep today's join");
+        assert_eq!(
+            outcome,
+            GuardOutcome::Proven,
+            "no witness marking off overlayfs"
+        );
+        assert_eq!(io.prove_calls, 0, "the witness is never consulted");
+        assert_eq!(io.witness_used, 0, "no budget spent off the witness path");
+    }
+
+    #[test]
+    fn k1_guard_legacy_refusal_needs_no_witness() {
+        let held = k1_red_identity();
+        let other = crate::discovery::identity::FileIdentity { dev: 42, ino: 9 };
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        // No script: any witness consultation fails loud.
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            other,
+        )]));
+        let reason = run_k1_guard(&mut io, held, &[&entry])
+            .expect_err("an already-unequal (dev, ino) keeps today's refusal");
+        assert!(
+            reason.contains("names more than one file"),
+            "the legacy refusal text stands, got {reason:?}"
+        );
+        assert_eq!(io.prove_calls, 0, "the witness is never consulted");
+        assert_eq!(io.witness_used, 0, "no budget spent off the witness path");
+    }
+
+    #[test]
+    fn k1_guard_data_range_needs_no_witness() {
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r--p");
+        // No script: any witness consultation fails loud.
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("a data range keeps the legacy equality join");
+        assert_eq!(outcome, GuardOutcome::Proven, "data ranges need no witness");
+        assert_eq!(io.prove_calls, 0, "only caller ranges consult the witness");
+        assert_eq!(io.witness_used, 0, "no budget spent off the witness path");
     }
 }
 

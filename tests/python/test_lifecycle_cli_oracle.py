@@ -1,0 +1,210 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Lifecycle CLI oracle unit tests (WP-10, S9/S10).
+
+Exercises tests/fixtures/lifecycle-cli/oracle.py on synthetic reports,
+ledgers and receipts: each judge passes on a healthy input and fails on
+a mutated one (non-vacuity). Live privileged runs prove the same judges
+against real captures; these pin the logic.
+
+Run: python3 -I tests/python/test_lifecycle_cli_oracle.py -v
+"""
+
+import json
+import runpy
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+ORACLE = ROOT / "tests/fixtures/lifecycle-cli/oracle.py"
+
+
+def run_oracle(tmp, *, cell, report, ledger, receipt, stderr=""):
+    report_path = tmp / "report.json"
+    ledger_path = tmp / "ledger.txt"
+    receipt_path = tmp / "receipt.json"
+    stderr_path = tmp / "stderr.txt"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    ledger_path.write_text(ledger, encoding="utf-8")
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    stderr_path.write_text(stderr, encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, "-I", str(ORACLE), "--cell", cell,
+         "--report", str(report_path), "--ledger", str(ledger_path),
+         "--receipt", str(receipt_path), "--stderr", str(stderr_path)],
+        capture_output=True, text=True, timeout=30)
+    row = json.loads(completed.stdout.strip().splitlines()[-1])
+    return completed.returncode, row
+
+
+def provider():
+    return {"dev": [8, 1], "ino": 11, "sha256": "aa",
+            "path": "/w/owned.so"}
+
+
+def profile_report(*, calls, scope="pid", exact=True, hints=None,
+                   loop_end="expiry"):
+    functions = []
+    for name, count in calls.items():
+        functions.append({
+            "names": [name], "calls": count, "errors": 0,
+            "in_flight": 0, "pending_returns": 0,
+            "target": {"file_offset": 1234, "object": dict(provider())},
+        })
+    evidence = {
+        "event_loss": 0, "semantic_capture_failures": 0,
+        "gap_classes": {"observation": {
+            "status": "exact" if exact else "partial",
+            "causes": [] if exact else ["late_load"]}},
+        "scheduling": {"phase_mono_ns": {"loop_end_reason": loop_end}},
+        "discovery": [],
+    }
+    if hints is not None:
+        evidence["gap_exe_hints"] = hints
+    return {"schema": "p11scope/observed-profile/v3",
+            "capture": {"scope": scope, "mode": "profile"},
+            "functions": functions, "evidence": evidence}
+
+
+def cli_ledger(calls):
+    functions = ",".join(
+        f'{{"name":"{name}","attempts":{count},"successful":{count}}}'
+        for name, count in calls.items())
+    return (f'LEDGER {{"schema":"p11scope/public-cli-ledger/v1","pid":4242,'
+            f'"complete":true,"functions":[{functions}]}}\n')
+
+
+def receipt_for(cell, scope="pid", **extra):
+    receipt = {
+        "cell": cell, "scope": scope, "workload_ready": True,
+        "capture_ready": True, "gate_released": True,
+        "observer_exit": 0, "workload_exit": 0,
+        "ledger_complete": True,
+        "provider_before": provider(), "provider_after": provider(),
+    }
+    receipt.update(extra)
+    return receipt
+
+
+class ReloadTests(unittest.TestCase):
+    def test_exact_passes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="profile-pid-reload",
+                report=profile_report(calls={"C_GenerateRandom": 100}),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("profile-pid-reload"))
+        self.assertEqual(rc, 0)
+        self.assertTrue(row["pass"])
+
+    def test_doubled_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="profile-pid-reload",
+                report=profile_report(calls={"C_GenerateRandom": 200}),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("profile-pid-reload"))
+        self.assertEqual(rc, 1)
+        self.assertFalse(row["pass"])
+
+
+class ReuseTests(unittest.TestCase):
+    def test_target_exact_reuser_excluded(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="profile-pid-reuse",
+                report=profile_report(calls={"C_GenerateRandom": 100},
+                                      loop_end="target_exit"),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("profile-pid-reuse", reuser_calls=200),
+                stderr="p11scope: capture ended: target exited after 9 ticks\n")
+        self.assertEqual(rc, 0)
+        self.assertTrue(row["pass"])
+
+    def test_reuser_calls_included_fails(self):
+        # Non-vacuity: if the reuser's 200 calls leaked into the report
+        # (300 observed vs 100 ledgered), the cell must fail.
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="profile-pid-reuse",
+                report=profile_report(calls={"C_GenerateRandom": 300},
+                                      loop_end="target_exit"),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("profile-pid-reuse", reuser_calls=200),
+                stderr="p11scope: capture ended: target exited after 9 ticks\n")
+        self.assertEqual(rc, 1)
+        self.assertFalse(row["pass"])
+
+    def test_vacuous_reuser_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="profile-pid-reuse",
+                report=profile_report(calls={"C_GenerateRandom": 100},
+                                      loop_end="target_exit"),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("profile-pid-reuse", reuser_calls=0),
+                stderr="p11scope: capture ended: target exited after 9 ticks\n")
+        self.assertEqual(rc, 1)
+        self.assertIn("vacuous", row["detail"])
+
+
+class ShortLivedTests(unittest.TestCase):
+    def test_cgroup_hints_match(self):
+        ledger = "".join(cli_ledger({"C_GenerateRandom": 5})
+                         for _ in range(20))
+        hints = {"links_provider": 20, "links_pkcs11_loader": 0,
+                 "no_static_link_within_scope": 0, "unknown": 0}
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="track-short-lived-cgroup",
+                report=profile_report(calls={}, scope="cgroup", hints=hints),
+                ledger=ledger,
+                receipt=receipt_for("track-short-lived-cgroup",
+                                    scope="cgroup"))
+        self.assertEqual(rc, 0)
+        self.assertTrue(row["pass"])
+
+    def test_cgroup_hint_shortfall_fails(self):
+        ledger = "".join(cli_ledger({"C_GenerateRandom": 5})
+                         for _ in range(20))
+        hints = {"links_provider": 19, "links_pkcs11_loader": 0,
+                 "no_static_link_within_scope": 0, "unknown": 0}
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="track-short-lived-cgroup",
+                report=profile_report(calls={}, scope="cgroup", hints=hints),
+                ledger=ledger,
+                receipt=receipt_for("track-short-lived-cgroup",
+                                    scope="cgroup"))
+        self.assertEqual(rc, 1)
+        self.assertFalse(row["pass"])
+
+    def test_pid_records_nothing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="track-short-lived-pid",
+                report=profile_report(calls={"C_GenerateRandom": 100},
+                                      hints=None),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("track-short-lived-pid"))
+        self.assertEqual(rc, 0)
+        self.assertTrue(row["pass"])
+
+    def test_pid_with_hints_fails(self):
+        hints = {"links_provider": 1, "links_pkcs11_loader": 0,
+                 "no_static_link_within_scope": 0, "unknown": 0}
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="track-short-lived-pid",
+                report=profile_report(calls={"C_GenerateRandom": 100},
+                                      hints=hints),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("track-short-lived-pid"))
+        self.assertEqual(rc, 1)
+        self.assertIn("exe hints", row["detail"])
+
+
+if __name__ == "__main__":
+    unittest.main()

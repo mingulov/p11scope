@@ -118,6 +118,7 @@ RUN = [
     ("test_kubernetes_runtime.py", []),
     ("test_kubernetes_runtime_workflow.py", []),
     ("test_lib_cells_vng.py", []),
+    ("test_lifecycle_cli_oracle.py", []),
     ("test_loader.py", []),
     ("test_loader_lifetimes.py", []),
     ("test_matched_cost_run.py", []),

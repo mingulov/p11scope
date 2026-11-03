@@ -2357,6 +2357,19 @@ fn prearm_terminal_kernel(session: &Session) -> Result<metrics::KernelEvidence> 
     metrics::kernel_evidence(session)
 }
 
+/// The pre-arm hold claim for the terminal proofs builder, if this capture
+/// is an owned `run` whose pause gate proved a hold: the run's own
+/// pre-spawn scope start (spawn order plus the pre-exec barrier bridge the
+/// prefix before the pause segment) composed with the coordinator's proven
+/// end and gap flag. Every other capture threads nothing, so its windows
+/// stay disclosed.
+fn owned_prearm_hold(owned: Option<&Owned>) -> Option<crate::discovery::pause::PauseGateHold> {
+    let owned = owned?;
+    let mut hold = owned.coordinator.pause_hold()?;
+    hold.start_ns = owned.prearm_scope_start_ns;
+    Some(hold)
+}
+
 /// Closes pre-arm watches at terminal publication (packet 6.13, R2-D1-4/7):
 /// idle qualification over observed use and terminal health, the end for
 /// the capture end, and the attach-key assembly merge onto the discovery
@@ -3104,6 +3117,9 @@ struct Owned {
     pid: u32,
     exit_code: Option<i32>,
     still_running: bool,
+    /// The run's own pre-spawn scope start: the claim start the terminal
+    /// pre-arm hold composes with the coordinator's proven segment.
+    prearm_scope_start_ns: Option<u64>,
 }
 
 /// Non-cloneable terminal authority: exact original reap AND that owner's
@@ -3852,6 +3868,7 @@ fn run_owned_inner_with_host(
         pid,
         exit_code: None,
         still_running: false,
+        prearm_scope_start_ns: scope_start_ns,
     };
 
     // Arm before the barrier: the owned window has to be protected from the
@@ -6376,7 +6393,7 @@ fn capture_profile(
             &kernel_evidence,
             *consumers.malformed_records,
             stop_ns,
-            None,
+            owned_prearm_hold(context.2.as_deref()),
         );
         let settle_start = crate::attach::monotonic_ns();
         context.0.settle_terminal_drain();
@@ -7235,7 +7252,7 @@ fn capture_trace(
                         &watch_kernel,
                         *consumers.malformed_records,
                         watch_stop_ns,
-                        None,
+                        owned_prearm_hold(context.2.as_deref()),
                     );
                     let settle_start = crate::attach::monotonic_ns();
                     context.0.settle_terminal_drain();

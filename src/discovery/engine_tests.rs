@@ -11192,6 +11192,67 @@ fn prearm_no_pause_hold_keeps_window() {
     assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
 }
 
+/// The proofs builder reads the declared-set maximum over every member
+/// (never a subset maximum) and emits one proof per covered object:
+/// synthetic two-slot plan, no fixture.
+#[test]
+fn pause_gate_proofs_need_every_declared_stamp_per_object() {
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::plan::{AttachKey, AttachPlan, ModuleId, Slot};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn slot(index: u32, object: u32, file_offset: u64, module: u32) -> Slot {
+        Slot {
+            index,
+            descriptor_index: 1,
+            object: PinnedObjectId(object),
+            object_path: format!("/proc/self/fd/{object}"),
+            file_offset,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[1],
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(module)],
+        }
+    }
+
+    let plan = AttachPlan::from_slots(vec![slot(0, 7, 0x1000, 3), slot(1, 7, 0x2000, 3)]);
+    let key = |file_offset| AttachKey {
+        object: PinnedObjectId(7),
+        file_offset,
+    };
+    let watches = BTreeMap::from([(
+        PinnedObjectId(7),
+        crate::prearm_module::PrearmWatch::new(BTreeSet::from([key(0x1000), key(0x2000)])),
+    )]);
+    let hold = Some(scripted_hold(Some(50), Some(1200), true));
+
+    // Both members stamped: one proof at the declared-set maximum.
+    let proofs = Engine::pause_gate_exactness_proofs(
+        &watches,
+        &plan,
+        &BTreeMap::from([(0, 900), (1, 1200)]),
+        hold,
+    );
+    assert_eq!(proofs.len(), 1);
+    assert_eq!(
+        proofs.get(&PinnedObjectId(7)),
+        Some(&crate::prearm_module::ExactnessProof {
+            interval_start_ns: 50,
+            interval_end_ns: 1200,
+            kind: crate::prearm_module::ExactnessProofKind::PauseGateHeld,
+        })
+    );
+
+    // Either member unstamped: no proof for the object.
+    for stamps in [BTreeMap::from([(0, 900)]), BTreeMap::from([(1, 1200)])] {
+        let proofs = Engine::pause_gate_exactness_proofs(&watches, &plan, &stamps, hold);
+        assert!(proofs.is_empty(), "stamps {stamps:?}");
+    }
+}
+
 /// A hold naming a later start than the scope start mismatches the
 /// would-be window: the assembly gate fails closed to the window.
 #[test]

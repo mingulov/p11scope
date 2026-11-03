@@ -377,9 +377,9 @@ pub(crate) struct DeclaredLink {
 /// identified interval plus which of the two proof sources backs it. An
 /// empty list is emitted only when the identified interval exactly equals
 /// the would-be `[scope_start_ns, attached_at_ns]` window — a mismatched
-/// proof fails closed to the window. No producer ships in this packet
-/// (first producers land with C6-D installed proof); the gate and its
-/// fail-closed rule are unit-tested here.
+/// proof fails closed to the window. The pause-gate producer ships for
+/// owned `run` holds; the gate and its fail-closed rule are unit-tested
+/// here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExactnessProof {
     pub(crate) interval_start_ns: u64,
@@ -387,15 +387,15 @@ pub(crate) struct ExactnessProof {
     pub(crate) kind: ExactnessProofKind,
 }
 
-/// The two R2-D1-6 proof sources. Nothing constructs these outside tests
-/// until C6-D wires the first installed producer.
+/// The two R2-D1-6 proof sources. `OrderingEvidence` keeps its staging
+/// until its producer lands; nothing constructs it outside tests yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum ExactnessProofKind {
     /// The `run` child held by pause/loader gate across the load.
     PauseGateHeld,
     /// Capture-held ordering evidence: attach-complete strictly before
     /// first mapping of that inode in every scope member.
+    #[allow(dead_code)]
     OrderingEvidence,
 }
 

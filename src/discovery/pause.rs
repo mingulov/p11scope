@@ -643,6 +643,11 @@ impl PauseCoordinator {
             Ok(Some(PAUSE_ARMED)) => {
                 self.armed = true;
                 self.armed_at_ns = armed_at;
+                // The hold's start bound is the first arm's clock only: a
+                // re-arm or successor install never moves it.
+                if self.hold_start_ns.is_none() {
+                    self.hold_start_ns = armed_at;
+                }
                 self.successors_left = MAX_SUCCESSORS_PER_ARM;
                 Ok(ArmResult::Armed)
             }
@@ -855,6 +860,7 @@ impl PauseCoordinator {
         let mut received = received;
         if let Some(batch) = received.terminal_batch.take() {
             if self.terminal_batch.is_some() {
+                self.void_hold();
                 return Err(Self::policy_error(
                     self.policy,
                     "more than one terminal discovery batch reached the coordinator",
@@ -966,6 +972,9 @@ impl PauseCoordinator {
             }
             self.epoch.zero_candidate = false;
             self.may_be_stopped = false;
+            // Refuted: ARMED still held, so no hook won and nothing stopped
+            // the child — it ran unstopped past this record.
+            self.void_hold();
             return self.apply_unowned(io, None);
         }
         self.may_be_stopped = true;
@@ -1109,6 +1118,7 @@ impl PauseCoordinator {
             Ok(sample) => sample,
             Err(error) => return self.fail_cycle(io, error, false),
         };
+        self.note_hold_sample(second_sample);
         if second_sample
             .checked_sub(first_sample)
             .is_none_or(|delta| delta < SAMPLE_NS)
@@ -1180,8 +1190,9 @@ impl PauseCoordinator {
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
         }
-        if let Err(error) = self.sample_stopped(io, deadline) {
-            return self.fail_cycle(io, error, false);
+        match self.sample_stopped(io, deadline) {
+            Ok(sample) => self.note_hold_sample(sample),
+            Err(error) => return self.fail_cycle(io, error, false),
         }
         let marker_seen = match io.marker_seen() {
             Ok(seen) => seen,
@@ -1229,8 +1240,9 @@ impl PauseCoordinator {
             if let Err(error) = io.wait_one_ms() {
                 return self.fail_cycle(io, error, true);
             }
-            if let Err(error) = self.sample_stopped(io, deadline) {
-                return self.fail_cycle(io, error, false);
+            match self.sample_stopped(io, deadline) {
+                Ok(sample) => self.note_hold_sample(sample),
+                Err(error) => return self.fail_cycle(io, error, false),
             }
             match io.marker_seen() {
                 Ok(false) => {}
@@ -1268,6 +1280,9 @@ impl PauseCoordinator {
             return self.fail_cycle(io, error, true);
         }
         self.epoch.resume_succeeded = true;
+        // The first completing resume freezes the from-start hold: the
+        // child runs past here, so later cycles start a new interval.
+        self.hold_frozen = true;
         if install_successor {
             self.epoch = PauseEpoch {
                 successor_installed: true,
@@ -1414,6 +1429,9 @@ impl PauseCoordinator {
     }
 
     fn reject_cycle(&mut self, io: &mut impl PauseIo, deadline: u64) -> Result<(), PauseError> {
+        // Rejected: the helper refused the stop, so the child was never
+        // held by this epoch.
+        self.void_hold();
         self.set_diagnostic(PauseDiagnostic::PauseHelperRejected);
         if self.policy == PausePolicy::Always {
             return self.terminal_cleanup_with_cause(
@@ -1726,6 +1744,7 @@ impl PauseCoordinator {
         message: impl Into<String>,
         lifecycle: bool,
     ) -> Result<(), PauseError> {
+        self.void_hold();
         let message = message.into();
         self.set_message_diagnostic(&message);
         io.note_unconfirmed_cycle();
@@ -2117,19 +2136,37 @@ impl PauseCoordinator {
         self.counters
     }
 
+    /// Records a stopped-sample instant toward the first hold: the child
+    /// was proven stopped at `now`. Frozen holds never move.
+    fn note_hold_sample(&mut self, now: u64) {
+        if !self.hold_frozen {
+            let end = self.hold_end_ns.get_or_insert(now);
+            *end = (*end).max(now);
+        }
+    }
+
+    /// Voids the from-start claim after anything unproven. Sticky until
+    /// the freeze; frozen holds are immutable (a later gap lands after
+    /// the proven end, so it ends nothing).
+    fn void_hold(&mut self) {
+        if !self.hold_frozen {
+            self.hold_void = true;
+        }
+    }
+
     /// The first-hold proof for pre-arm exactness, once the coordinator
     /// armed: `None` while no arm proved a hold (a passive capture, a
     /// failed or disabled arm, a missing arm clock, or an epoch whose
     /// first resume never completed). A returned hold carries its own gap
     /// flag; the builder trusts only a continuous one.
     pub(crate) fn pause_hold(&self) -> Option<PauseGateHold> {
-        let _ = (
-            self.hold_start_ns,
-            self.hold_end_ns,
-            self.hold_void,
-            self.hold_frozen,
-        );
-        None
+        let start = self.hold_start_ns?;
+        let sane = self.hold_end_ns.is_none_or(|end| start <= end);
+        Some(PauseGateHold {
+            start_ns: Some(start),
+            end_ns: self.hold_end_ns,
+            continuous: !self.hold_void && sane,
+        })
     }
 
     #[allow(dead_code)] // Introspection accessor; exercised only by the pause tests.

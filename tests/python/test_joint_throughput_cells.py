@@ -420,6 +420,90 @@ class ResultsRows(unittest.TestCase):
             self.assertIn("Session-loop seal wire pending (WU-2)",
                           rows[1]["detail"])
 
+    def joint_feed_state(self, doc):
+        with tempfile.TemporaryDirectory(prefix="jtp-feed-") as tmp:
+            report = Path(tmp) / "report.json"
+            if doc is not None:
+                report.write_text(doc if isinstance(doc, str)
+                                  else json.dumps(doc), encoding="utf-8")
+            proc = run_sourced(f'joint_feed_state "{report}"')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout.strip()
+
+    def test_joint_feed_state_reads_the_report(self):
+        absent = {"object_observations": {"status": "unavailable",
+                                          "reason": "journal_unavailable"}}
+        lost = {"object_observations": {"status": "unavailable",
+                                        "reason": "authority_lost"}}
+        populated = {"object_observations": {"status": "populated",
+                                             "reason": "none"}}
+        self.assertEqual(self.joint_feed_state(absent), "absent")
+        self.assertEqual(self.joint_feed_state({"edges": []}), "absent")
+        self.assertEqual(self.joint_feed_state(lost), "present")
+        self.assertEqual(self.joint_feed_state(populated), "present")
+        self.assertEqual(self.joint_feed_state(None), "unknown")
+        self.assertEqual(self.joint_feed_state("not json"), "unknown")
+        self.assertEqual(self.joint_feed_state([]), "unknown")
+
+    def finish_row(self, cell, report, oracle_rc, reason):
+        """Run finish_cell over one scripted cell directory and return
+        its results row and the function's exit status."""
+        with tempfile.TemporaryDirectory(prefix="jtp-finish-") as tmp:
+            cell_dir = Path(tmp) / cell
+            cell_dir.mkdir()
+            (cell_dir / "report.json").write_text(json.dumps(report),
+                                                  encoding="utf-8")
+            (cell_dir / "oracle.json").write_text(
+                json.dumps({"verdict": "fail", "reason": reason}),
+                encoding="utf-8")
+            results = Path(tmp) / "results.jsonl"
+            env = {"RESULTS_JSONL": str(results), "RATE": "10k",
+                   "DURATION": "5", "MIN_RATE": "10000"}
+            proc = run_sourced(
+                f'ORACLE_RC={oracle_rc}; ORACLE_REASON="{reason}"; '
+                'LOAD_MAX=1.0; LOAD_TRACE=1.0; PROVIDER=p; '
+                f'if finish_cell {cell} "{cell_dir}" "flow=ok"; '
+                'then echo rc=0; else echo rc=1; fi', env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            rows = [json.loads(line) for line in
+                    results.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            return rows[0], proc.stdout.strip().splitlines()[-1]
+
+    def test_joint_cell_without_a_joint_feed_is_nonqualifying(self):
+        s1_only = {"object_observations": {"status": "unavailable",
+                                           "reason": "journal_unavailable"}}
+        for cell in ("joint-10k-single", "joint-10k-churn"):
+            with self.subTest(cell=cell):
+                row, status = self.finish_row(
+                    cell, s1_only, 1,
+                    "operations.calls 50002 != issued 50006")
+                self.assertIs(row["pass"], False)
+                self.assertEqual(row["qualification"], "nonqualifying")
+                self.assertIn("s1-only: no Joint feed", row["detail"])
+                self.assertNotIn("expected-failure", row["detail"])
+                self.assertEqual(status, "rc=0")
+
+    def test_joint_cell_with_a_lost_joint_feed_stays_failed(self):
+        lost = {"object_observations": {"status": "unavailable",
+                                        "reason": "authority_lost"}}
+        row, status = self.finish_row(
+            "joint-10k-single", lost, 1,
+            "object_observations status unavailable reason "
+            "authority_lost, not the Joint marker populated/none")
+        self.assertEqual(row["qualification"], "failed")
+        self.assertNotIn("s1-only", row["detail"])
+        self.assertEqual(status, "rc=1")
+
+    def test_twin_cell_ignores_the_joint_feed_check(self):
+        s1_only = {"object_observations": {"status": "unavailable",
+                                           "reason": "journal_unavailable"}}
+        row, status = self.finish_row(
+            "s1-10k-twin", s1_only, 1, "operations.calls 5 != issued 6")
+        self.assertEqual(row["qualification"], "failed")
+        self.assertNotIn("s1-only", row["detail"])
+        self.assertEqual(status, "rc=1")
+
     def test_skip_all_is_nonqualifying_with_the_prerequisite(self):
         with tempfile.TemporaryDirectory(prefix="jtp-skip-") as tmp:
             results = Path(tmp) / "results.jsonl"

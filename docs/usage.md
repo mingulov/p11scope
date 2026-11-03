@@ -1401,8 +1401,12 @@ timestamp to registry application is histogrammed in 1 ms buckets to
 p50/p99/max, overflow, unknown timestamps) prints beside the stop line.
 ENTRY precedes END by the call's own microseconds, so the line
 overstates END-based settlement by that negligible amount; percentiles
-are exact to 1 ms. Counts only, never a contract. The throughput
-harness passes it through sudo with `SETTLEMENT_LAT=1`.
+are exact to 1 ms. Counts only, never a contract. A clean stop prints
+the line once. When calls are still applied after the stop counts are
+disclosed (a lane held for exit applies its last commit then), a
+second, cumulative line follows; the last `settlement latency` line is
+the final one. The throughput harness passes it through sudo with
+`SETTLEMENT_LAT=1`.
 
 ## Offline inventory comparison
 

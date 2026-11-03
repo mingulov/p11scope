@@ -28,6 +28,10 @@
 #             delays in the observer (1 ms buckets) and prints the
 #             cumulative p50/p99/max line beside the stop line in
 #             observer.out (default unset records nothing)
+#   STAGE_TIMINGS
+#             =1 enables stage-timing telemetry in the observer,
+#             including the lifecycle ring high-water mark on the
+#             stop line (default unset records nothing)
 #
 # Cells:
 #   joint-10k-single  --system --key-operations over keyed RATE/DURATION
@@ -99,14 +103,17 @@ log() {
 # --- library (the python suite sources this file with
 # --- JOINT_TP_SOURCED=1 and calls these functions directly) ---
 
-# Echo the sudo command-line passthrough for the diagnostic
-# settlement toggle, or nothing. Sudo scrubs the environment, so
-# SETTLEMENT_LAT=1 must ride the sudo command line as an explicit
-# assignment; anything else prints nothing. The output is empty or
-# exactly one assignment (never user text).
+# Echo the sudo command-line passthrough for diagnostic toggles, or
+# nothing. Sudo scrubs the environment, so SETTLEMENT_LAT=1 and
+# STAGE_TIMINGS=1 must ride the sudo command line as explicit assignments;
+# anything else prints nothing. Each line is exactly one assignment
+# (never user text).
 observer_env() {
     if [ "${SETTLEMENT_LAT:-0}" = "1" ]; then
         echo "P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY=1"
+    fi
+    if [ "${STAGE_TIMINGS:-0}" = "1" ]; then
+        echo "P11SCOPE_STAGE_TIMINGS=1"
     fi
 }
 
@@ -483,7 +490,7 @@ run_joint_cell() {
     # The lock fd is inherited; run sudo directly under the held lock.
     # Stdout stays unprivileged by design (the -o outputs are chmodded
     # after the run); shellcheck SC2024 does not apply.
-    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment.
+    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment per line.
     sudo -n $(observer_env) "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
         --key-operations --duration "$obs_dur" --json -o "$dir/report.json" \
         --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
@@ -638,7 +645,7 @@ run_twin_cell() {
     # The lock fd is inherited; run sudo directly under the held lock.
     # Stdout stays unprivileged by design (the -o outputs are chmodded
     # after the run); shellcheck SC2024 does not apply.
-    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment.
+    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment per line.
     sudo -n $(observer_env) "$P11SCOPE" inventory --pid "$gen_pid" --manifest "$MANIFEST" \
         --duration "$obs_dur" --json -o "$dir/report.json" \
         --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &

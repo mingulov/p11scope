@@ -2721,10 +2721,27 @@ def main(argv=None):
             name for name, definition in BPF_MAP_DEFS["UNSAFE_MAPS"].items()
             if definition["type"] == RINGBUF
         }, "a new owned ringbuf needs its exact record length here"
-        # The marker map must be in the default policy, or the subtraction
-        # below would hold vacuously.
+        # The birth-marker maps (the control row and the PID-scope birth
+        # witness) must be in the default policy, or the subtraction below
+        # would hold vacuously; the feature build carries no birth marker.
+        birth_marker_maps = {"JOURNAL_MARKER_CTL", "PID_START_TICK"}
         assert "JOURNAL_MARKER_CTL" in SAFE_MAPS, "default policy lacks the marker map"
-        assert SAFE_MAPS and FEATURE_MAPS == (SAFE_MAPS - {"JOURNAL_MARKER_CTL"}) | {"ATTR_BOOL_BITS", "PAIR_CALLS"}
+        assert "PID_START_TICK" in SAFE_MAPS, "default policy lacks the PID birth witness map"
+
+        def feature_policy_matches(safe, feature):
+            return (
+                bool(safe)
+                and birth_marker_maps <= safe
+                and not birth_marker_maps & feature
+                and feature == (safe - birth_marker_maps) | {"ATTR_BOOL_BITS", "PAIR_CALLS"}
+            )
+
+        assert feature_policy_matches(SAFE_MAPS, FEATURE_MAPS)
+        # Refusal twins: a feature build that gains the PID witness, or a
+        # default policy that loses it, no longer matches.
+        assert not feature_policy_matches(SAFE_MAPS, FEATURE_MAPS | {"PID_START_TICK"})
+        assert not feature_policy_matches(SAFE_MAPS - {"PID_START_TICK"}, FEATURE_MAPS)
+        assert not feature_policy_matches(SAFE_MAPS, FEATURE_MAPS | {"JOURNAL_MARKER_CTL"})
         assert {
             "COUNTERS", "DISCOVERY", "DISCOVERY_STATE", "PAUSE_PIDS",
             "TASK_COOKIE", "COOKIE_CTL", "THREAD_OWNER", "OWNER_CTL",

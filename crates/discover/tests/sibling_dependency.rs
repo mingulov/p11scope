@@ -104,6 +104,32 @@ fn provider_with_a_sibling_dependency_in_its_own_directory_is_discovered() {
     );
 }
 
+/// Safety pin: a symlink inside the provider directory pointing at an
+/// outside library must never be preloaded — the fallback loads regular
+/// files only, so this stays refused. (If the fallback followed links,
+/// the load below would succeed.)
+#[test]
+fn provider_whose_sibling_is_a_symlink_pointing_outside_is_refused() {
+    let _guard = DISCOVER_LOCK.lock().unwrap();
+    let tag = "link";
+    let soname = soname(tag);
+    let base = fixture_dir(tag);
+    let dep_dir = base.join("dep");
+    let prov_dir = base.join("prov");
+    std::fs::create_dir_all(&dep_dir).unwrap();
+    std::fs::create_dir_all(&prov_dir).unwrap();
+    let dep = build_dep(&dep_dir, &soname);
+    let provider = build_provider(&prov_dir, &dep_dir, &soname);
+    assert_sibling_needed_without_rpath(&provider, &soname);
+    std::os::unix::fs::symlink(&dep, prov_dir.join(&soname)).unwrap();
+
+    let error = discover(&provider).unwrap_err();
+    assert!(
+        error.contains("cannot dlopen"),
+        "a symlink to an outside dependency must refuse, got: {error}"
+    );
+}
+
 #[test]
 fn provider_whose_dependency_lives_outside_its_directory_is_refused() {
     let _guard = DISCOVER_LOCK.lock().unwrap();

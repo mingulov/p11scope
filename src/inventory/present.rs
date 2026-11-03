@@ -1313,11 +1313,12 @@ pub(crate) fn key_operation_tallies(
 /// (`disclose_s1_birth_refusal`).
 pub(crate) const JOINT_BIRTH_UNAVAILABLE_SUBJECT: &str = "Joint birth unavailable; retained S1";
 
-/// A linked lane that observed semantic calls but neither published a
+/// A linked lane with registered instances that neither published a
 /// Joint feed nor disclosed why reads `bootstrap_unavailable` with no
 /// cause anywhere in the document. Name that once, at presentation:
-/// `joint_birth_unoffered` (no birth was ever offered for the observed
-/// calls). Any recorded birth refusal already names the cause.
+/// `joint_birth_unoffered` (no birth was ever offered for the
+/// registered instances, whether or not any call reduced yet). Any
+/// recorded birth refusal already names the cause.
 pub(crate) fn silent_bootstrap_gap(
     observations: &crate::key_operation_projection::ObjectObservations,
     semantic_edges: usize,

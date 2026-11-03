@@ -18,6 +18,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -483,6 +484,67 @@ class EmitterLedgerCeiling(unittest.TestCase):
                     capture_output=True, text=True, timeout=30)
                 self.assertEqual(dry.returncode, 0, dry.stderr)
                 self.assertIn("600000 calls", dry.stdout)
+
+
+class BpfEvidenceSum(unittest.TestCase):
+    """Sum EVIDENCE[0] (ring loss) over CPUs and maps from bpftool JSON."""
+
+    HELPER = ROOT / "scripts/bpf-evidence-sum.py"
+
+    def _run_helper(self, show_json, dumps, timeout=30):
+        with tempfile.TemporaryDirectory(prefix="bpf-ev-") as tmp:
+            show = Path(tmp) / "show.json"
+            show.write_text(show_json, encoding="utf-8")
+            args = [sys.executable, "-I", str(self.HELPER), "--show", str(show)]
+            for map_id, dump_json in dumps.items():
+                dump = Path(tmp) / f"dump-{map_id}.json"
+                dump.write_text(dump_json, encoding="utf-8")
+                args += ["--dump", f"{map_id}={dump}"]
+            return subprocess.run(args, capture_output=True, text=True,
+                                  timeout=timeout)
+
+    def test_sums_key_zero_over_cpus_and_maps(self):
+        show = json.dumps([
+            {"id": 11, "name": "EVIDENCE", "max_entries": 9},
+            {"id": 12, "name": "EVIDENCE", "max_entries": 9},
+            {"id": 13, "name": "EVENTS", "max_entries": 4},
+        ])
+        dumps = {
+            11: json.dumps([
+                {"key": [0, 0, 0, 0], "values": [3, 0, 7, 0]},
+                {"key": [1, 0, 0, 0], "values": [99, 99, 99, 99]},
+            ]),
+            12: json.dumps([
+                {"key": [0, 0, 0, 0], "values": [1, 1, 1, 1]},
+            ]),
+        }
+        proc = self._run_helper(show, dumps)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["maps"], [
+            {"id": 11, "ring_loss_sum": 10, "cpus": 4},
+            {"id": 12, "ring_loss_sum": 4, "cpus": 4},
+        ])
+        self.assertEqual(summary["total_ring_loss_sum"], 14)
+
+    def test_empty_show_is_empty_summary(self):
+        proc = self._run_helper("[]", {})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["maps"], [])
+        self.assertEqual(summary["total_ring_loss_sum"], 0)
+
+    def test_missing_key_zero_is_zero_not_an_error(self):
+        show = json.dumps([{"id": 21, "name": "EVIDENCE", "max_entries": 9}])
+        dumps = {21: json.dumps([
+            {"key": [5, 0, 0, 0], "values": [1, 2]},
+        ])}
+        proc = self._run_helper(show, dumps)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["maps"],
+                         [{"id": 21, "ring_loss_sum": 0, "cpus": 0}])
+        self.assertEqual(summary["total_ring_loss_sum"], 0)
 
 
 if __name__ == "__main__":

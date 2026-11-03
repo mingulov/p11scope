@@ -7449,6 +7449,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// EXEC hooks for never-admitted pids that drained after the last
+    /// completed scan pass: those processes started too late to be
+    /// scanned, so one scope gap names their unknown provider
+    /// mappings. Silent when nothing drained post-pass. Cgroup scope
+    /// stays unjudged (transaction coverage, not scan passes).
+    /// (Seam wiring: the disclosure lands with the fix; until then the
+    /// RED tests fail on the missing gap.)
+    pub(crate) fn note_post_pass_exec_newcomers(&mut self) {}
+
     /// The physical tail and registry share the actual publication boundary.
     pub(crate) fn commit_batch(&mut self, engine_changed: bool) -> Result<BatchReceipt> {
         match self.commit_batch_inner(engine_changed, None, None, None)? {

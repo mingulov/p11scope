@@ -287,14 +287,11 @@ static __always_inline void bank_refuse(struct image_bank_select *select)
         identity_count(select, &select->refusals);
 }
 
-#ifdef P11SCOPE_LOADER_GATE
-/* Gate-1 only: inline the bank-select leaf at its single call site so
- * the return path pays no call frame for it (its 16 rounded bytes
- * decide the 512 budget). Gate-0 keeps the outline. */
+/* Inline the bank-select leaf at its single call site so the return path
+ * pays no call frame for it (its 16 rounded bytes decide the 512 budget).
+ * This region is already gate-1-only (see the guard above), so there is
+ * no gate-0 fallback arm. */
 __attribute__((always_inline))
-#else
-__attribute__((noinline))
-#endif
 u32 p11_image_bank_select(void)
 {
     struct image_bank_select *select;
@@ -323,14 +320,11 @@ u32 p11_image_bank_select(void)
     return (u32)bank;
 }
 
-#ifdef P11SCOPE_LOADER_GATE
-/* Gate-1 only: inline the bank-cut step at its single call site so the
- * link frame closes the return-path chain (no subprogram call keeps a
- * fourth frame on the 512 budget). Gate-0 keeps the outline. */
+/* Inline the bank-cut step at its single call site so the link frame closes
+ * the return-path chain (no subprogram call keeps a fourth frame on the
+ * 512 budget). This region is already gate-1-only (see the guard above),
+ * so there is no gate-0 fallback arm. */
 __attribute__((always_inline))
-#else
-__attribute__((noinline))
-#endif
 u32 p11_image_bank_cut(u64 target)
 {
     struct image_bank_select *select;
@@ -437,7 +431,11 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
         result.status = COOKIE_STATUS_BAD_CONFIG;
         return result;
     }
-    /* Epochs load at each use before the cell read: incarnation-first. */
+    /* Probes first, then the source epoch below: the stored cell is found
+     * before its bank's incarnation is read. Safe today because no epoch
+     * can change mid-read -- only the zero publish writes incarnation and
+     * prepared[1] is never set, so no cut, fold or re-prepare can happen.
+     * P3b must restore epoch-before-cell when it enables them. */
     source = bank;
     cell = bpf_task_storage_get((bank == 0) ? (void *)&TASK_COOKIE : (void *)&TASK_COOKIE_B,
                                 task, (void *)0, 0);
@@ -451,7 +449,10 @@ static __always_inline struct cookie_result cookie_for(struct task_struct *task,
         void *origin_map = (source == 0) ? (void *)&COOKIE_CTL : (void *)&COOKIE_CTL_B;
         struct control *origin = (source == bank) ? control
             : bpf_map_lookup_elem(origin_map, &control_row_key);
-        /* Source known; its epoch loads before the cell read below. */
+        /* Source known; its epoch loads here, after the probes above, and
+         * the cell content below is consumed under it. Safe today for the
+         * same reason: incarnations are immutable until P3b enables
+         * re-prepare. */
         u64 source_epoch = select->incarnation[source];
         if (!origin) {
             result.status = COOKIE_STATUS_NO_CONTROL;

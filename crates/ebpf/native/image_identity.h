@@ -57,10 +57,11 @@ u32 p11_link_task_identity(struct task_struct *task, struct image_identity *out)
 /* Cookie only; zero is unavailable. No exec-ID or target-memory read. */
 u64 p11_link_current_cookie(void);
 #ifdef P11SCOPE_LOADER_GATE
-/* T-L2 ticket-query extends (see image_identity.c). Host harnesses define
- * P11SCOPE_LOADER_GATE; no production build does, so production builds
- * carry no code, map or symbol changes from this extend -- only DWARF
- * line info shifts where the guarded source lines sit. */
+/* T-L2 ticket-query extends (see image_identity.c). Host harnesses and
+ * gate-1 production builds (P11SCOPE_LOADER_GATE=1) define
+ * P11SCOPE_LOADER_GATE; gate-0 production builds do not, so they carry
+ * no code, map or symbol changes from this extend -- only DWARF line
+ * info shifts where the guarded source lines sit. */
 u32 p11_link_task_ticket(struct task_struct *task, u64 *ticket_out);
 u32 p11_image_identity_issued(u64 *watermark_out);
 /* Production bank promotion: one cut from bank A to bank B. Second-bank
@@ -109,8 +110,10 @@ struct image_bank_select {
  * 1..16384 local budget. The ticket query and the EXEC binding keep
  * returning the local ticket; only the task identity carries the
  * qualifier. Incarnations past the 48-bit range refuse (BAD_CONFIG)
- * instead of wrapping into an alias; re-queries read the epoch before
- * the cell and issues bind the guard value, so the qualifier always
+ * instead of wrapping into an alias; stored-cell re-queries probe first
+ * and read the source epoch after (safe today because incarnations are
+ * immutable until P3b enables re-prepare), while fresh issues bind the
+ * guard value read before the ticket CAS, so the qualifier always
  * matches the ticket's epoch. */
 static __always_inline u64 image_identity_qualify(u64 ticket, u64 bank, u64 incarnation)
 {

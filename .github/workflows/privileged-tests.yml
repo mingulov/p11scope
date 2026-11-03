@@ -682,6 +682,75 @@ jobs:
             ${{ runner.temp }}/qual.log
           if-no-files-found: warn
           retention-days: 7
+  # SoftHSM 2.7 table-shape exact cells: a synthetic 68-slot provider
+  # labelled {3,2} plus the stock module as control, each through the
+  # profile-pid and system public-CLI cells. The Ubuntu runner's stock
+  # SoftHSM 2.6.1 is the control (a 2.7 stock would fail for the shape
+  # reason, so the job asserts the 2.6.x stock first).
+  legacy32-shape:
+    needs: release-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo -n apt-get update && sudo -n apt-get install -y binutils gcc jq procps python3 softhsm2 util-linux
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Run the legacy32 shape cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          stock_ver=$(dpkg-query -W -f='${Version}' softhsm2)
+          echo "stock SoftHSM: $stock_ver"
+          case "$stock_ver" in
+            2.6.*) ;;
+            *) echo "stock control needs SoftHSM 2.6.x, have $stock_ver" >&2; exit 1 ;;
+          esac
+          out="$GITHUB_WORKSPACE/legacy32-out"
+          # Ruling CI-GAP-1, as in the public-cli host leg: the system
+          # cells disclose shared-runner descendant exits as runner noise.
+          sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 scripts/ci/legacy32-shape.sh "$in/p11scope" "$out"
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          python3 -I - "$out/results.jsonl" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+          cells = {row["cell"]: row for row in rows}
+          need = {"legacy32-pid", "legacy32-system", "stock-pid", "stock-system"}
+          problems = sorted("missing cell " + name for name in need - set(cells))
+          problems += sorted("extra cell " + name for name in set(cells) - need)
+          for row in rows:
+              status = "PASS" if row["pass"] else "FAIL"
+              print(status, row["cell"], row["qualification"], row["detail"][:200])
+              if not row["pass"] or row["qualification"] != "qualified":
+                  problems.append("unqualified cell " + row["cell"])
+          if problems:
+              raise SystemExit("\n".join(problems))
+          PY
+      - name: Upload the legacy32 results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: legacy32-shape
+          path: |
+            ${{ github.workspace }}/legacy32-out/results.jsonl
+            ${{ github.workspace }}/legacy32-out/legacy32/qual.log
+            ${{ github.workspace }}/legacy32-out/legacy32/results.jsonl
+            ${{ github.workspace }}/legacy32-out/stock/qual.log
+            ${{ github.workspace }}/legacy32-out/stock/results.jsonl
+          if-no-files-found: warn
+          retention-days: 7
   # Real browsers: Firefox and Chromium started through Playwright with
   # a SoftHSM token, observed by the release binary as root, in strict
   # mode (a missing prerequisite fails instead of skipping).

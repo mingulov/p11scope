@@ -3,6 +3,13 @@
 # qualify-public-cli.sh P11SCOPE OUTDIR: independently ledgered public cells.
 # Requires root for live cells. --control-gated OBSERVER OUTDIR FIXTURE [CELL]
 # executes one bounded profile-pid, mt-exact or system lifecycle unprivileged.
+# P11SCOPE_PUBLIC_CLI_CELLS="cell ..." runs only the named gated lifecycle
+# cells (profile-pid, metrics-pid, trace-pid, mt-exact, system) instead of
+# the full campaign; anything else fails closed here as a usage error.
+# P11SCOPE_QUALIFY_GATED_BIN=PATH P11SCOPE_QUALIFY_MT_BIN=PATH: prebuilt
+# gated/mt workloads for tests-only hosts (no gcc); when both are set the
+# gcc builds are skipped. Setting only one, or a missing file, fails
+# closed before any campaign starts.
 # Every terminal result has cell/pass/detail/qualification. Exit 1 means failed
 # evidence, 2 means valid smoke/nonqualifying evidence, 0 qualifies the subset.
 # P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 (ruling CI-GAP-1) discloses hosted
@@ -15,6 +22,21 @@ CONTROL_KIND=gated
 if [ "${1:-}" = --control-gated ]; then CONTROL=1; shift
 elif [ "${1:-}" = --control-second-sigint ]; then CONTROL=1; CONTROL_KIND=signal; shift
 elif [ "${1:-}" = --control-fifo ]; then CONTROL=1; CONTROL_KIND=fifo; shift; fi
+# The cell filter is validated before any setup, so a typo fails before a
+# privileged campaign starts. Only the gated lifecycle cells are runnable
+# as a subset; derived and smoke cells stay full-campaign-only.
+if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ] && [ "$CONTROL" = 1 ]; then
+  echo 'P11SCOPE_PUBLIC_CLI_CELLS cannot be combined with a --control mode' >&2
+  exit 64
+fi
+# shellcheck disable=SC2086
+for _cell in ${P11SCOPE_PUBLIC_CLI_CELLS:-}; do
+  case $_cell in
+    profile-pid|metrics-pid|trace-pid|mt-exact|system) ;;
+    *) echo "unsupported subset cell: $_cell (supported: profile-pid metrics-pid trace-pid mt-exact system)" >&2; exit 64 ;;
+  esac
+done
+unset _cell
 if [ "$CONTROL" = 1 ]; then
   if [ "$CONTROL_KIND" = signal ]; then
     [ $# = 2 ] || exit 64
@@ -386,7 +408,13 @@ if [ "$CONTROL" = 1 ]; then
 fi
 SRC=$HERE/../tests/fixtures/public-cli
 FIX=$OUT/fix; mkdir -p "$FIX"
-gcc -O1 -o "$FIX/gated" "$SRC/gated.c" -ldl && gcc -O2 -o "$FIX/mt" "$SRC/mt.c" -ldl -lpthread && gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$FIX/prearm-first-use" "$SRC/prearm-first-use.c" -ldl || exit 65
+if [ -n "${P11SCOPE_QUALIFY_GATED_BIN:-}" ] || [ -n "${P11SCOPE_QUALIFY_MT_BIN:-}" ]; then
+  [ -x "${P11SCOPE_QUALIFY_GATED_BIN:-}" ] && [ -x "${P11SCOPE_QUALIFY_MT_BIN:-}" ] || exit 65
+  cp -- "$P11SCOPE_QUALIFY_GATED_BIN" "$FIX/gated" && cp -- "$P11SCOPE_QUALIFY_MT_BIN" "$FIX/mt" || exit 65
+else
+  gcc -O1 -o "$FIX/gated" "$SRC/gated.c" -ldl && gcc -O2 -o "$FIX/mt" "$SRC/mt.c" -ldl -lpthread || exit 65
+fi
+gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$FIX/prearm-first-use" "$SRC/prearm-first-use.c" -ldl || exit 65
 GATED=$FIX/gated; MT=$FIX/mt; PREARM_LOADER=$FIX/prearm-first-use
 chmod 755 "$FIX" "$GATED" "$MT"
 export SOFTHSM2_CONF=$OUT/softhsm2.conf
@@ -398,6 +426,23 @@ sh -c 'kill -HUP $$' >/dev/null 2>&1; status=$?
 [ "$status" = 129 ] || { echo "SIGHUP positive control failed rc=$status" >&2; exit 65; }
 env --default-signal=INT sh -c 'kill -INT $$' >/dev/null 2>&1 & wait $!
 [ $? = 130 ] || { echo 'SIGINT positive control failed' >&2; exit 65; }
+# Filtered subset (names validated above): run only the requested gated
+# cells through the same lifecycles and judge exactly that set.
+# scripts/ci/legacy32-shape.sh selects 'profile-pid system'.
+if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ]; then
+  # shellcheck disable=SC2086
+  set -- $P11SCOPE_PUBLIC_CLI_CELLS
+  for cell in "$@"; do
+    case $cell in
+      profile-pid) gated profile-pid pid "$GATED" profile --pid @PID@ --duration 12 -o "$OUT/profile-pid.json" ;;
+      metrics-pid) gated metrics-pid pid "$GATED" profile --mode metrics --pid @PID@ --duration 12 -o "$OUT/metrics-pid.json" ;;
+      trace-pid) gated trace-pid pid "$GATED" trace --pid @PID@ --duration 12 -o "$OUT/trace-pid.txt" ;;
+      mt-exact) gated mt-exact pid "$MT" profile --pid @PID@ --duration 25 -o "$OUT/mt-exact.json" ;;
+      system) system_cell ;;
+    esac
+  done
+  summary "$@"; exit $?
+fi
 "$P" doctor > doctor.out 2>&1; rc=$?
 result doctor "$([ "$rc" = 0 ] && grep -q 'capture available' doctor.out && echo 1 || echo 0)" "rc=$rc"
 gated profile-pid pid "$GATED" profile --pid @PID@ --duration 12 -o "$OUT/profile-pid.json"

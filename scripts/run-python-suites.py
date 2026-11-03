@@ -117,6 +117,7 @@ RUN = [
     ("test_key_operations_system.py", []),
     ("test_kubernetes_runtime.py", []),
     ("test_kubernetes_runtime_workflow.py", []),
+    ("test_legacy32_shape.py", []),
     ("test_lib_cells_vng.py", []),
     ("test_lifecycle_cli_oracle.py", []),
     ("test_loader.py", []),

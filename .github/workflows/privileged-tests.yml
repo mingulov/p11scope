@@ -127,7 +127,8 @@ jobs:
         with:
           fetch-depth: 0
       # Runtime tools only: gcc (and -m32) for the C fixtures, SoftHSM2 and
-      # p11-kit for the provider workloads, e2fsprogs for the ext4 cell.
+      # p11-kit for the provider workloads, opensc (pkcs11-tool) for the
+      # pause wrapper cells, e2fsprogs for the ext4 cell.
       - run: sudo apt-get update && sudo apt-get install -y gcc gcc-multilib jq libp11-kit-dev opensc p11-kit python3 softhsm2 e2fsprogs util-linux
       - name: Download the build
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

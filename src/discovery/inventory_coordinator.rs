@@ -2733,8 +2733,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// every watch before stop (C5.2 D2): each ongoing interval freezes at
     /// `min(custody at_ns, last clean read)` — watches staged earlier in
     /// the same batch freeze with the rest, and one no clean read proved
-    /// reads unknown — the loss is a gap, and no watch starts after.
-    /// After stop it stages nothing: ended intervals are frozen facts.
+    /// reads unknown — every counted column is a lower bound (bound-pair
+    /// growth stages nothing more past this point), the loss is a gap,
+    /// and no watch starts after. After stop it stages nothing: ended
+    /// intervals are frozen facts.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards custody.
     pub(crate) fn note_capture_custody(&mut self, custody: &ScopeCustody) {
         let Some(capture) = self.capture.as_mut() else {
@@ -2773,6 +2775,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             matches!(capture.scope, CaptureScopeCoverage::Pid(scope) if scope == proof.scope())
         });
         capture.unproven = Some(reason.clone());
+        // Bound-pair growth stages nothing more past this point, so
+        // counted columns are lower bounds from here on.
+        self.registry.note_counted_loss();
         let until = capture.last_clean_ns.map_or(0, |clean| clean.min(at_ns));
         self.registry.note_watch_end(
             format!(
@@ -2992,8 +2997,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// System scope: lifecycle evidence was lost (C5.2 D4). A lost exec or
     /// exit record may belong to any watched caller and cannot be
     /// localized, so every watch interval reaching past `at_ns` demotes to
-    /// unknown, the loss is a gap, and — sticky — no watch starts again in
-    /// this capture. Only the first loss stages anything.
+    /// unknown, every counted column is a lower bound (bound-pair growth
+    /// stages nothing more past this point), the loss is a gap, and —
+    /// sticky — no watch starts again in this capture. Only the first
+    /// loss stages anything.
     fn note_lifecycle_loss(&mut self, loss: &LifecycleLoss) {
         let Some(capture) = self.capture.as_mut() else {
             return;
@@ -3003,6 +3010,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return;
         }
         capture.unproven = Some(loss.reason.clone());
+        self.registry.note_counted_loss();
         if let Some(recorder) = &mut self.diagnostics {
             let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
             record.reason = Some(DiagnosticReason::CaptureLoss);

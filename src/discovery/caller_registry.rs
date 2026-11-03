@@ -2616,6 +2616,11 @@ enum Mutation {
     NoteRefreshLoss {
         reason: String,
     },
+    /// The capture scope went unproven (lifecycle evidence or scope
+    /// custody lost): bound-pair growth stages nothing more, so every
+    /// counted column is a lower bound. The lifecycle/custody gap
+    /// discloses the cause; this carries no second gap.
+    NoteCountedLoss,
     NoteWitness {
         caller: CallerId,
         module: ModuleKey,
@@ -2789,6 +2794,12 @@ pub(crate) struct CallerRegistry {
     last_health_regression_ns: Option<u64>,
     /// The producer stopped: every watch ended here and none starts.
     watches_ended_ns: Option<u64>,
+    /// The capture scope went unproven (lifecycle evidence or scope
+    /// custody lost): bound-pair growth stages nothing more, so every
+    /// counted column is a lower bound — set by `NoteCountedLoss`,
+    /// sticky for the capture, and honored by every later counted
+    /// install and `Counted` note, including edges born after the loss.
+    counted_loss: bool,
     /// Coverage-note gaps already recorded, once per (caller, module,
     /// subject); bounded by the gap retention bound (past it the gap
     /// list is full and further gaps only count as suppressed).
@@ -2909,6 +2920,7 @@ impl CallerRegistry {
             uncovered_reason: UnknownReason::ScanOnly,
             last_health_regression_ns: None,
             watches_ended_ns: None,
+            counted_loss: false,
             coverage_gap_memo: BTreeSet::new(),
             witness_gap_memo: BTreeSet::new(),
             witness_placement: WitnessPlacement::default(),
@@ -3626,6 +3638,15 @@ impl CallerRegistry {
         self.staged.push(Mutation::NoteRefreshLoss { reason });
     }
 
+    /// Stage one capture-unproven boundary: lifecycle evidence or scope
+    /// custody was lost, so bound-pair growth stages nothing more and
+    /// every counted column is a lower bound (`lossy`). Observed counts
+    /// stand; the lifecycle/custody gap discloses the cause, so this
+    /// stages no second gap — never silent loss.
+    pub(crate) fn note_counted_loss(&mut self) {
+        self.staged.push(Mutation::NoteCountedLoss);
+    }
+
     /// Stage one caller retirement: the caller's edges end with the
     /// reason and its counts freeze. Evidence is retained.
     pub(crate) fn retire_caller(&mut self, caller: CallerId, reason: String, at_ns: u64) {
@@ -4180,6 +4201,21 @@ impl CallerRegistry {
                     reason,
                     budget: None,
                 });
+            }
+            Mutation::NoteCountedLoss => {
+                // Sticky for the capture: every later counted install
+                // and `Counted` note honors it, including edges born
+                // after the loss.
+                self.counted_loss = true;
+                for edge in self.edges.values_mut() {
+                    // The capture scope went unproven: bound-pair growth
+                    // stages nothing more, so every counted column is a
+                    // lower bound. Observed counts stand; the
+                    // lifecycle/custody gap discloses the cause.
+                    if edge.coverage.counted_since_ns.is_some() || edge.entry_count > 0 {
+                        edge.coverage.lossy = true;
+                    }
+                }
             }
             Mutation::NoteWitness {
                 caller,
@@ -5027,9 +5063,13 @@ impl CallerRegistry {
         first_ns: u64,
         last_ns: u64,
     ) {
+        let counted_loss = self.counted_loss;
         let Some(edge) = self.coverage_edge(caller, module) else {
             return;
         };
+        if counted_loss {
+            edge.coverage.lossy = true;
+        }
         if count > edge.entry_count {
             edge.entry_rose_since_previous_pass = true;
             if count == MAX_EDGE_ENTRY_COUNT {
@@ -5155,6 +5195,7 @@ impl CallerRegistry {
         let module_id = self.modules_by_key.get(module).copied();
         let regression = self.last_health_regression_ns;
         let ended = self.watches_ended_ns.is_some();
+        let counted_loss = self.counted_loss;
         let positive = matches!(
             note,
             CoverageNote::Counted { .. } | CoverageNote::Watched { .. }
@@ -5195,6 +5236,9 @@ impl CallerRegistry {
                         .counted_since_ns
                         .map_or(since_ns, |was| was.min(since_ns)),
                 );
+                if counted_loss {
+                    coverage.lossy = true;
+                }
             }
             CoverageNote::Watched { since_ns } => {
                 if ended
@@ -5340,6 +5384,7 @@ impl CallerRegistry {
             });
             return EntryOutcome::UnknownEdge;
         };
+        let counted_loss = self.counted_loss;
         let Some(edge) = self.edges.get_mut(&(caller, id)) else {
             self.push_gap(RegistryGap {
                 caller: Some(caller),
@@ -5351,6 +5396,9 @@ impl CallerRegistry {
             });
             return EntryOutcome::UnknownEdge;
         };
+        if counted_loss {
+            edge.coverage.lossy = true;
+        }
         let (count, overflowed) = edge.entry_count.overflowing_add(delta);
         if count > edge.entry_count {
             edge.entry_rose_since_previous_pass = true;

@@ -4893,12 +4893,13 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         let threaded_pid = threaded_child.id();
         // Guarded: a panic mid-reap still kills and reaps whatever
         // the drain below has not consumed yet.
-        let mut owned_children = ExitMappingChildrenGuard(vec![
-            (mapper_child, "mapper"),
-            (plain_child, "plain"),
-            (threaded_child, "threaded"),
-        ]);
-        for (child, role) in owned_children.0.drain(..) {
+        let mut owned_children =
+            ExitMappingChildrenGuard(vec![mapper_child, plain_child, threaded_child]);
+        for (child, role) in owned_children
+            .0
+            .drain(..)
+            .zip(["mapper", "plain", "threaded"])
+        {
             let output = child.wait_with_output().expect("reap owned child");
             assert!(
                 output.status.success(),

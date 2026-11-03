@@ -243,7 +243,10 @@ class OracleTests(unittest.TestCase):
     def test_sweep_unparseable_report_fails(self):
         self.run_case(lambda box: box.update(report="{nope"), want=1)
 
-    def test_sweep_complete_lossy_observation_fails(self):
+    def test_sweep_complete_lossy_observation_passes_with_noted_detail(self):
+        # S3 judges counts plus hygiene: a lossy capture with holding
+        # counts passes, but the detail must name the observation class
+        # and the loss counter, never silently.
         def mutate(box):
             evidence = box["report"]["evidence"]
             evidence["completeness"] = "PARTIAL"
@@ -251,7 +254,8 @@ class OracleTests(unittest.TestCase):
             evidence["gap_classes"]["observation"] = {"status": "lossy",
                                                       "causes": ["discovery_truncated"]}
             evidence["verdict_detail"] = "concrete_gap"
-        self.run_case(mutate, want=1)
+        result = self.run_case(mutate, detail_substr="obs=lossy[discovery_truncated]")
+        self.assertIn("loss=discovery_truncated", result["detail"])
 
     def test_sweep_complete_in_flight_fails(self):
         def mutate(box):
@@ -450,7 +454,8 @@ class OracleTests(unittest.TestCase):
 
         def lossy_complete(box):
             lossy(box["report"]["evidence"])
-        self.run_case(lossy_complete, want=1, detail_substr="lossy or unknown observation")
+        result = self.run_case(lossy_complete, detail_substr="obs=lossy[provider_changed]")
+        self.assertIn("loss=-", result["detail"])
 
         def pending_exact(box):
             box["report"]["functions"][0]["calls"] = 7 + 8

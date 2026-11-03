@@ -57,6 +57,7 @@ refuse() { echo "qualify-stop-races: prerequisite missing: $1" >&2; exit 77; }
 [ "$(id -u)" = 0 ] || refuse 'must run as root'
 [ -n "${EPOCHREALTIME:-}" ] || refuse 'bash without EPOCHREALTIME'
 command -v gcc >/dev/null 2>&1 || refuse 'gcc not installed'
+command -v stdbuf >/dev/null 2>&1 || refuse 'stdbuf not installed'
 command -v softhsm2-util >/dev/null 2>&1 || refuse 'softhsm2-util not installed'
 command -v setpriv >/dev/null 2>&1 || refuse 'setpriv not installed'
 P=$(realpath -e -- "$P") || refuse "observer not found: $1"
@@ -314,25 +315,31 @@ burst_trial() {
   fi
   local burst_start; burst_start=$(now_us)
   local -a pids=()
-  local i pid
+  local -A newcomer_of=()
+  local i pid code
   for ((i=0;i<BURST_NEWCOMERS;i++)); do
-    asuser "$GATED" "$COPY" 1 0 - > "$prefix-pv$i.wl" 2>&1 & pid=$!
+    # Unbuffered so a crashing newcomer keeps its partial ledger.
+    asuser stdbuf -o0 -e0 "$GATED" "$COPY" 1 0 - > "$prefix-pv$i.wl" 2>&1 & pid=$!
     register "$pid" || return 2
-    pids+=("$pid")
+    pids+=("$pid"); newcomer_of[$pid]="pv$i"
   done
   for ((i=0;i<BURST_NEWCOMERS;i++)); do
     asuser /bin/true & pid=$!
     register "$pid" || return 2
-    pids+=("$pid")
+    pids+=("$pid"); newcomer_of[$pid]="true$i"
   done
   local burst_end; burst_end=$(now_us)
-  local failures=0
+  local failures=0 failed_codes=''
   for pid in "${pids[@]}"; do
-    if wait "$pid"; then :; else failures=$((failures + 1)); fi
+    code=0; wait "$pid" || code=$?
     unset 'CHILDREN[$pid]'
+    if [ "$code" != 0 ]; then
+      failures=$((failures + 1))
+      failed_codes="$failed_codes ${newcomer_of[$pid]:-pid$pid}=$code"
+    fi
   done
   [ "$failures" = 0 ] || {
-    trial_log "TRIAL cmd=burst trial=$n seed=$seed setup_fail=newcomer-exits-$failures"; return 2; }
+    trial_log "TRIAL cmd=burst trial=$n seed=$seed setup_fail=newcomer-exits-$failures codes:$failed_codes"; return 2; }
   if finish_quiet "$pp" "$EXIT_TICKS"; then rc_obs=$LAST_EXIT; else rc_obs=124; fi
   if [ -n "${CHILDREN[$wlpid]:-}" ]; then terminate "$wlpid" || true; fi
   pin > "$prefix.pin_after" || return 2

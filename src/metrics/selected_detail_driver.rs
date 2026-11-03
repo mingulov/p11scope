@@ -4565,9 +4565,10 @@ mod tests {
         }
     }
 
-    /// A scripted read with explicit producer health, through the
-    /// genuine fold and pack (mirrors `scripted_read`, which is
-    /// always healthy).
+    /// A scripted read with explicit producer health and consistent
+    /// return values (`rv {0: returned}` on every row), through the
+    /// genuine fold and pack (mirrors `scripted_read_consistent`,
+    /// which is always healthy).
     fn k0_scripted_read(
         pool: &SemanticResourcePool,
         plan: &AttachPlan,
@@ -4582,6 +4583,10 @@ mod tests {
             plan.slots.len(),
             "one explicit sample per plan slot"
         );
+        let limits = CounterLimits {
+            rows: plan.slots.len(),
+            rv_keys: plan.slots.len(),
+        };
         let mut rows = Vec::with_capacity(plan.slots.len());
         let held: Vec<CountStats> = counts
             .iter()
@@ -4593,13 +4598,21 @@ mod tests {
             .collect();
         for (slot, index) in plan.slots.iter().zip(0..) {
             let cells = vec![CounterCell::Counts(&held[index])];
+            let slot_rvs = [(
+                RvKey {
+                    slot: slot.index,
+                    _pad: 0,
+                    rv: 0,
+                },
+                counts[index].1,
+            )];
             rows.push(
-                CounterRow::fold(slot, mode, cells, Vec::new(), limits_for(plan))
+                CounterRow::fold(slot, mode, cells, slot_rvs, limits)
                     .expect("explicit cells fold"),
             );
         }
-        let reservation =
-            ReadReservation::reserve(rows.len(), 0, &pool.reserver()).expect("read reserves");
+        let reservation = ReadReservation::reserve(rows.len(), rows.len(), &pool.reserver())
+            .expect("read reserves");
         CounterRead::new(
             generation,
             mode,
@@ -5300,7 +5313,7 @@ mod tests {
         assert!(
             open_k0_window(
                 resolved,
-                limits_for(&scene.plan),
+                limits_consistent(&scene.plan),
                 scene.pool.reserver(),
                 Ok(saturated_before),
                 k0_clean(),
@@ -5321,7 +5334,7 @@ mod tests {
         let mut ledger = SelectionLedger::new();
         let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
             .expect("live name resolves for the K0 window");
-        let before = scripted_read(
+        let before = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -5331,7 +5344,7 @@ mod tests {
         );
         let window = open_k0_window(
             resolved,
-            limits_for(&scene.plan),
+            limits_consistent(&scene.plan),
             scene.pool.reserver(),
             Ok(before),
             k0_clean(),

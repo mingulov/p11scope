@@ -214,6 +214,9 @@ impl SameUidNonDescendant {
 
     fn spawn_with_failure(failure: Option<LaunchFailure>) -> io::Result<Self> {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/non-descendant.sh");
+        // No parent-death guard can reach the detached target below: the
+        // double fork reparents it to init, so on test SIGKILL it sleeps
+        // out its ~287 s bound (non-descendant is the point of this fixture).
         let mut wrapper = ChildGuard::new(
             Command::new("setsid")
                 .arg("--fork")

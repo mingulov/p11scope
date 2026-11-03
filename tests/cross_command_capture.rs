@@ -330,6 +330,7 @@ fn scoped_renderer_uses_only_scope_kinds_and_keeps_legacy_consumer_valid() {
             "profile",
             CapturePolicy::Allowlisted,
             kind,
+            &std::collections::BTreeMap::new(),
         );
         let header = text.lines().next().unwrap();
         let scope = header.find(&format!("{label} scope")).unwrap();

@@ -146,6 +146,7 @@ RUN = [
     ("test_s1_throughput_compare.py", []),
     ("test_schema_json.py", []),
     ("test_skip_reason_vocabulary.py", []),
+    ("test_stop_race_oracle.py", []),
     ("test_system_first_use_fixture.py", []),
     ("test_system_first_use_receipt.py", []),
     ("test_system_manifest_soak_oracle.py", []),

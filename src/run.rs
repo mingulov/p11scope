@@ -1456,6 +1456,13 @@ pub(crate) struct OwnedChild {
     exec_reader: Option<OwnedFd>,
     prepared: Option<PreparedExecutable>,
     released: bool,
+    /// `CLOCK_MONOTONIC` instant the barrier release completed (exec EOF
+    /// observed), bounding pre-release attach stamps for the pre-arm
+    /// exactness proof. `None` until a proven release, or when the clock
+    /// read failed: unboundable, never exact. No attach runs while the
+    /// release blocks, so a stamp at or before this instant predates the
+    /// child's first free userspace.
+    release_ns: Option<u64>,
     /// The CLOEXEC exec pipe reached EOF with no errno frame, so the child
     /// has left this process's pre-exec image (it exec'd, or it died) and can
     /// no longer take a release byte and start the command late. Only such a
@@ -1639,6 +1646,7 @@ impl OwnedChild {
             exec_reader: Some(exec_reader),
             prepared,
             released: false,
+            release_ns: None,
             exec_confirmed: false,
             reaped: false,
             reaped_exit_code: None,
@@ -1650,6 +1658,10 @@ impl OwnedChild {
 
     pub(crate) fn pid(&self) -> u32 {
         self.pid
+    }
+
+    pub(crate) fn release_ns(&self) -> Option<u64> {
+        self.release_ns
     }
 
     pub(crate) fn seed_pin(&self) -> std::sync::Arc<PidPin> {
@@ -1772,6 +1784,7 @@ impl OwnedChild {
                         return Err(ExecHandoffError::Cancelled(signal));
                     }
                     self.released = true;
+                    self.release_ns = crate::attach::monotonic_ns();
                     return Ok(());
                 }
                 ExecDrain::Pending => pending(),
@@ -2361,35 +2374,52 @@ fn prearm_terminal_kernel(session: &Session) -> Result<metrics::KernelEvidence> 
 /// capture owns its child (the only scope whose pre-spawn start, barrier,
 /// and pause segment compose the from-start claim), plus the run's own
 /// pre-spawn scope start composed with the coordinator's proven end and gap
-/// flag when the pause gate proved a hold. Captures without an owned child
-/// thread `(None, false)`, so their windows stay disclosed.
+/// flag when the pause gate proved a hold, and the barrier-release instant
+/// bounding pre-release attach stamps. Captures without an owned child
+/// thread `(None, false, None)`, so their windows stay disclosed.
 fn owned_prearm_hold(
     owned: Option<&Owned>,
-) -> (Option<crate::discovery::pause::PauseGateHold>, bool) {
-    let (hold, scope_start_ns) = match owned {
-        None => (None, None),
-        Some(owned) => (owned.coordinator.pause_hold(), owned.prearm_scope_start_ns),
+) -> (
+    Option<crate::discovery::pause::PauseGateHold>,
+    bool,
+    Option<u64>,
+) {
+    let (hold, scope_start_ns, release_ns) = match owned {
+        None => (None, None, None),
+        Some(owned) => (
+            owned.coordinator.pause_hold(),
+            owned.prearm_scope_start_ns,
+            owned.prearm_release_ns,
+        ),
     };
-    compose_prearm_hold(hold, scope_start_ns, owned.is_some())
+    compose_prearm_hold(hold, scope_start_ns, release_ns, owned.is_some())
 }
 
 /// Pure composition for the terminal hold claim (pinned below): only an
 /// owned run forwards a hold, and the forwarded hold always carries the
 /// run's pre-spawn scope start — which bridges the barrier-held prefix
 /// before the pause segment — in place of the coordinator's arm bound.
+/// The barrier-release bound travels alongside: the builder requires every
+/// declared first-stamp at or before it, since the child runs free between
+/// release and its first pause stop.
 fn compose_prearm_hold(
     hold: Option<crate::discovery::pause::PauseGateHold>,
     scope_start_ns: Option<u64>,
+    release_ns: Option<u64>,
     owned_run: bool,
-) -> (Option<crate::discovery::pause::PauseGateHold>, bool) {
+) -> (
+    Option<crate::discovery::pause::PauseGateHold>,
+    bool,
+    Option<u64>,
+) {
     if !owned_run {
-        return (None, false);
+        return (None, false, None);
     }
     let Some(mut hold) = hold else {
-        return (None, true);
+        return (None, true, release_ns);
     };
     hold.start_ns = scope_start_ns;
-    (Some(hold), true)
+    (Some(hold), true, release_ns)
 }
 
 /// Closes pre-arm watches at terminal publication (packet 6.13, R2-D1-4/7):
@@ -2411,6 +2441,7 @@ fn finish_prearm_terminal(
     stop_ns: Option<u64>,
     hold: Option<crate::discovery::pause::PauseGateHold>,
     owned_run: bool,
+    release_ns: Option<u64>,
 ) {
     let used = if engine.has_prearm_watches() {
         prearm_used_modules(reports, engine.plan(), engine.pinned())
@@ -2427,6 +2458,7 @@ fn finish_prearm_terminal(
         malformed_records,
         hold,
         owned_run,
+        release_ns,
     );
 }
 
@@ -3144,6 +3176,11 @@ struct Owned {
     /// The run's own pre-spawn scope start: the claim start the terminal
     /// pre-arm hold composes with the coordinator's proven segment.
     prearm_scope_start_ns: Option<u64>,
+    /// Barrier-release instant bounding pre-release attach stamps: the
+    /// terminal proof requires every declared first-stamp at or before it.
+    /// Copied from the child after a proven release; `None` (unreleased or
+    /// clock failure) withholds every proof.
+    prearm_release_ns: Option<u64>,
 }
 
 /// Non-cloneable terminal authority: exact original reap AND that owner's
@@ -3893,6 +3930,7 @@ fn run_owned_inner_with_host(
         exit_code: None,
         still_running: false,
         prearm_scope_start_ns: scope_start_ns,
+        prearm_release_ns: None,
     };
 
     // Arm before the barrier: the owned window has to be protected from the
@@ -3934,6 +3972,7 @@ fn run_owned_inner_with_host(
             &stop,
         ));
     }
+    owned.prearm_release_ns = owned.child.as_ref().and_then(|child| child.release_ns());
     {
         let marker = marker_never_seen();
         let cancelled = cancelled_by(&stop);
@@ -6408,7 +6447,8 @@ fn capture_profile(
             .pinned()
             .check_unchanged()
             .map_err(anyhow::Error::msg)?;
-        let (prearm_hold, prearm_owned_run) = owned_prearm_hold(context.2.as_deref());
+        let (prearm_hold, prearm_owned_run, prearm_release_ns) =
+            owned_prearm_hold(context.2.as_deref());
         finish_prearm_terminal(
             context.0,
             &*context.1,
@@ -6420,6 +6460,7 @@ fn capture_profile(
             stop_ns,
             prearm_hold,
             prearm_owned_run,
+            prearm_release_ns,
         );
         let settle_start = crate::attach::monotonic_ns();
         context.0.settle_terminal_drain();
@@ -7269,7 +7310,8 @@ fn capture_trace(
                     // watch health only; the publication sample stays after
                     // `settle_terminal_drain` (trace terminal-order contract).
                     let watch_kernel = prearm_terminal_kernel(context.1)?;
-                    let (prearm_hold, prearm_owned_run) = owned_prearm_hold(context.2.as_deref());
+                    let (prearm_hold, prearm_owned_run, prearm_release_ns) =
+                        owned_prearm_hold(context.2.as_deref());
                     finish_prearm_terminal(
                         context.0,
                         &*context.1,
@@ -7281,6 +7323,7 @@ fn capture_trace(
                         watch_stop_ns,
                         prearm_hold,
                         prearm_owned_run,
+                        prearm_release_ns,
                     );
                     let settle_start = crate::attach::monotonic_ns();
                     context.0.settle_terminal_drain();
@@ -10963,6 +11006,27 @@ mod tests {
     }
 
     #[test]
+    fn release_clocks_the_barrier_instant_for_prearm_proofs() {
+        // The barrier-release bound for the pre-arm exactness proof: `None`
+        // behind the barrier, a comparable monotonic instant after.
+        let mut child = spawn("/bin/true", &[]);
+        assert_eq!(child.release_ns(), None);
+        child.release().unwrap();
+        let release = child
+            .release_ns()
+            .expect("a proven release clocks its instant");
+        let later = crate::attach::monotonic_ns().expect("monotonic clock reads");
+        assert!(
+            release <= later,
+            "release {release} precedes a later read {later}"
+        );
+        assert_eq!(
+            child.wait_for(None, false).unwrap(),
+            ChildOutcome::Exited(0)
+        );
+    }
+
+    #[test]
     fn owned_child_launch_errors_preserve_elf_reason_and_script_guidance() {
         let directory = tempfile::tempdir().unwrap();
         let x32 = [
@@ -13732,6 +13796,7 @@ mod tests {
                 Some(1000),
                 None,
                 false,
+                None,
             );
             let watch = engine.discovery().modules[0]
                 .watch
@@ -13746,7 +13811,7 @@ mod tests {
     fn owned_prearm_hold_without_owned_child_threads_no_claim() {
         // A non-`run` scope has no owned child: no hold and no owned-run
         // claim, so the terminal builder keeps every window.
-        assert_eq!(owned_prearm_hold(None), (None, false));
+        assert_eq!(owned_prearm_hold(None), (None, false, None));
     }
 
     #[test]
@@ -13759,37 +13824,58 @@ mod tests {
             continuous: true,
         };
         // Owned run with a proven hold: the run's pre-spawn scope start
-        // replaces the coordinator's arm bound.
+        // replaces the coordinator's arm bound, and the release bound
+        // travels alongside for the builder's pre-release check.
         assert_eq!(
-            compose_prearm_hold(Some(held()), Some(50), true),
+            compose_prearm_hold(Some(held()), Some(50), Some(1000), true),
             (
                 Some(PauseGateHold {
                     start_ns: Some(50),
                     end_ns: Some(900),
                     continuous: true,
                 }),
-                true
+                true,
+                Some(1000),
             )
         );
         // Owned run without a scope start: the unboundable claim start
         // fails closed downstream, never silently armed.
         assert_eq!(
-            compose_prearm_hold(Some(held()), None, true),
+            compose_prearm_hold(Some(held()), None, Some(1000), true),
             (
                 Some(PauseGateHold {
                     start_ns: None,
                     end_ns: Some(900),
                     continuous: true,
                 }),
-                true
+                true,
+                Some(1000),
             )
         );
-        // Passive owned run: no hold, but the owned-run scope stands.
-        assert_eq!(compose_prearm_hold(None, Some(50), true), (None, true));
+        // Owned run without a release bound: the builder withholds every
+        // proof, never silently barrier-covered.
+        assert_eq!(
+            compose_prearm_hold(Some(held()), Some(50), None, true),
+            (
+                Some(PauseGateHold {
+                    start_ns: Some(50),
+                    end_ns: Some(900),
+                    continuous: true,
+                }),
+                true,
+                None,
+            )
+        );
+        // Passive owned run: no hold, but the owned-run scope and release
+        // bound stand.
+        assert_eq!(
+            compose_prearm_hold(None, Some(50), Some(1000), true),
+            (None, true, Some(1000))
+        );
         // Non-`run` scope: any hold-shaped input is dropped entirely.
         assert_eq!(
-            compose_prearm_hold(Some(held()), Some(50), false),
-            (None, false)
+            compose_prearm_hold(Some(held()), Some(50), Some(1000), false),
+            (None, false, None)
         );
     }
 
@@ -13877,6 +13963,7 @@ mod tests {
                 continuous: true,
             }),
             true,
+            Some(1000),
         );
         let record = &engine.discovery().modules[0];
         assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -13884,14 +13971,17 @@ mod tests {
     }
 
     #[test]
-    fn prearm_terminal_pause_hold_post_release_stamp_keeps_window() {
+    fn prearm_terminal_pause_hold_post_release_stamp_withholds_proof() {
         use crate::attach::BackendSelection;
         use crate::discovery::engine::session_fixture::ScriptedSession;
         use crate::discovery::hooks::HookRegistry;
 
         // Twin of the emptying terminal above with the declared stamps dated
-        // after the modeled barrier release (800): the child ran free before
-        // its first pause stop, so the exact window stays.
+        // after the barrier release (800): the child ran free before its
+        // first pause stop, so no proof is emitted. This bare fixture never
+        // maps the provider, so a withheld proof leaves the windows
+        // undisclosed (`None`) rather than an explicit window — the
+        // regression is that it is not `Some([])`.
         let dir = tempfile::tempdir().unwrap();
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/discovery-lifecycle.c");
@@ -13964,17 +14054,99 @@ mod tests {
                 continuous: true,
             }),
             true,
+            Some(800),
         );
         let record = &engine.discovery().modules[0];
         assert_eq!(record.attached_at_ns, Some(Some(900)));
-        assert_eq!(
-            record.unobserved_windows,
-            Some(vec![crate::render::UnobservedWindow {
-                start_ns: 50,
-                end_ns: 900,
-                reason: crate::render::UnobservedReason::PreAttach,
-            }])
+        assert_eq!(record.unobserved_windows, None);
+    }
+
+    #[test]
+    fn prearm_terminal_pause_hold_missing_release_withholds_proof() {
+        use crate::attach::BackendSelection;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+        use crate::discovery::hooks::HookRegistry;
+
+        // Unboundable release (clock failure): the terminal forwards `None`
+        // and the builder withholds every proof. Bare fixture, so the
+        // withheld proof leaves windows undisclosed (`None`).
+        let dir = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/discovery-lifecycle.c");
+        let provider = dir.path().join("hold-provider.so");
+        assert!(
+            std::process::Command::new("gcc")
+                .args([
+                    "-std=c11",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-shared",
+                    "-fPIC",
+                    "-DDISCOVERY_LIFECYCLE_PROVIDER",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&provider)
+                .arg("-ldl")
+                .status()
+                .unwrap()
+                .success()
         );
+        let pid = std::process::id();
+        let args = CaptureArgs {
+            kind: Kind::Profile,
+            modules: Vec::new(),
+            manifests: Vec::new(),
+            prearm_modules: vec![provider],
+            hooks: HookRegistry::builtin(),
+            scope: ScopeArg::Pid(pid),
+            metrics: false,
+            counter_mode: None,
+            select_endpoint: None,
+            track_short_lived: false,
+            duration: None,
+            out: None,
+            max_events: None,
+            max_scan_pids: None,
+            ring_bytes: None,
+            drain_interval: None,
+            unsafe_requested: false,
+            allow_confined_uretprobe: false,
+            attach_backend: BackendSelection::default(),
+        };
+        let view = ProcessView::open(ProcessViewId(0), pid).expect("retain the self view");
+        let mut engine =
+            Engine::discover(&args, &Scope::Pid(pid), Some(view)).expect("pre-arm discover");
+        assert!(engine.has_prearm_watches());
+        engine.set_scope_start_ns(Some(50));
+        let mut session = ScriptedSession::default();
+        for slot in engine.plan().slots.iter() {
+            session.scripted_links.insert(slot.index);
+            session.scripted_stamps.insert(slot.index, 900);
+        }
+        let reports: Vec<metrics::SlotReport> = Vec::new();
+        finish_prearm_terminal(
+            &mut engine,
+            &session,
+            &[],
+            CaptureEnd::DurationExpired,
+            &reports,
+            &metrics::KernelEvidence::default(),
+            0,
+            Some(5000),
+            Some(crate::discovery::pause::PauseGateHold {
+                start_ns: Some(50),
+                end_ns: Some(900),
+                continuous: true,
+            }),
+            true,
+            None,
+        );
+        let record = &engine.discovery().modules[0];
+        assert_eq!(record.attached_at_ns, Some(Some(900)));
+        assert_eq!(record.unobserved_windows, None);
     }
 
     #[test]

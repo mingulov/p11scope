@@ -10440,6 +10440,7 @@ fn prearm_finish_closes_watches_and_merges_assembly_keys() {
         0,
         None,
         false,
+        None,
     );
     assert_eq!(engine.discovery.modules.len(), 1);
     let record = &engine.discovery.modules[0];
@@ -10491,6 +10492,7 @@ fn finish_prearm_terminal_health(
         malformed_records,
         None,
         false,
+        None,
     );
     assert_eq!(engine.discovery.modules.len(), 1);
     *engine.discovery.modules[0]
@@ -10578,6 +10580,7 @@ fn prearm_scope_identity_refusal_ends_scope_uncertain() {
         0,
         None,
         false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10630,6 +10633,7 @@ fn prearm_link_gaps_refuse_idle() {
         0,
         None,
         false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10699,6 +10703,7 @@ fn prearm_object_change_detected_after_stop_never_exceeds_first_stop() {
         0,
         None,
         false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10783,6 +10788,7 @@ fn prearm_unknown_first_stop_keeps_end_unknown_after_object_change() {
         0,
         None,
         false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10831,6 +10837,7 @@ fn prearm_unknown_first_stop_healthy_watch_ends_unknown() {
         0,
         None,
         false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10891,6 +10898,7 @@ fn prearm_unknown_first_stop_preserves_pre_stop_close() {
         0,
         None,
         false,
+        None,
     );
     let watch = engine.discovery.modules[0]
         .watch
@@ -10958,6 +10966,7 @@ fn generic_terminal_assembly_discloses_late_discovery_window() {
         0,
         None,
         false,
+        None,
     );
     let record = &engine.discovery.modules[0];
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11074,6 +11083,7 @@ fn prearm_pause_hold_across_window_empties_windows() {
         0,
         Some(scripted_hold(Some(50), Some(900), true)),
         true,
+        Some(1000),
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11096,6 +11106,7 @@ fn prearm_pause_hold_gap_keeps_window() {
         0,
         Some(scripted_hold(Some(50), Some(900), false)),
         true,
+        Some(1000),
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11119,6 +11130,7 @@ fn prearm_pause_hold_released_before_last_stamp_keeps_window() {
         0,
         Some(scripted_hold(Some(50), Some(800), true)),
         true,
+        Some(1000),
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11147,6 +11159,7 @@ fn prearm_pause_hold_missing_clock_keeps_window() {
             0,
             Some(hold),
             true,
+            Some(1000),
         );
         let record = watched_prearm_record(&engine);
         assert_eq!(record.attached_at_ns, Some(Some(900)), "hold {hold:?}");
@@ -11179,6 +11192,7 @@ fn prearm_pause_hold_unstamped_member_discloses_nothing() {
         0,
         Some(scripted_hold(Some(50), Some(900), true)),
         true,
+        Some(1000),
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(None));
@@ -11204,6 +11218,7 @@ fn prearm_no_pause_hold_keeps_window() {
             0,
             None,
             owned_run,
+            owned_run.then_some(1000),
         );
         let record = watched_prearm_record(&engine);
         assert_eq!(record.attached_at_ns, Some(Some(900)), "owned {owned_run}");
@@ -11259,6 +11274,7 @@ fn pause_gate_proofs_need_every_declared_stamp_per_object() {
         &BTreeMap::from([(0, 900), (1, 1200)]),
         hold,
         true,
+        Some(5000),
     );
     assert_eq!(proofs.len(), 1);
     assert_eq!(
@@ -11272,7 +11288,8 @@ fn pause_gate_proofs_need_every_declared_stamp_per_object() {
 
     // Either member unstamped: no proof for the object.
     for stamps in [BTreeMap::from([(0, 900)]), BTreeMap::from([(1, 1200)])] {
-        let proofs = Engine::pause_gate_exactness_proofs(&watches, &plan, &stamps, hold, true);
+        let proofs =
+            Engine::pause_gate_exactness_proofs(&watches, &plan, &stamps, hold, true, Some(5000));
         assert!(proofs.is_empty(), "stamps {stamps:?}");
     }
 
@@ -11283,6 +11300,7 @@ fn pause_gate_proofs_need_every_declared_stamp_per_object() {
         &BTreeMap::from([(0, 900), (1, 1200)]),
         hold,
         false,
+        None,
     );
     assert!(proofs.is_empty());
 }
@@ -11304,6 +11322,7 @@ fn prearm_pause_hold_late_start_keeps_window() {
         0,
         Some(scripted_hold(Some(60), Some(900), true)),
         true,
+        Some(1000),
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11327,6 +11346,7 @@ fn prearm_non_run_scope_with_hold_keeps_window() {
         0,
         Some(scripted_hold(Some(50), Some(900), true)),
         false,
+        None,
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11335,8 +11355,8 @@ fn prearm_non_run_scope_with_hold_keeps_window() {
 
 /// A declared first-stamp dated after the barrier release proves nothing:
 /// the child runs free between release and its first pause stop, so the
-/// window stays even when the frozen hold reaches the stamp. Modeled
-/// release at 800 precedes the 900 stamps below.
+/// window stays even when the frozen hold reaches the stamp. Release at
+/// 800 precedes the 900 stamps below.
 #[test]
 fn prearm_pause_hold_post_release_stamp_keeps_window() {
     use crate::render::PrearmWatchEnd;
@@ -11352,15 +11372,16 @@ fn prearm_pause_hold_post_release_stamp_keeps_window() {
         0,
         Some(scripted_hold(Some(50), Some(900), true)),
         true,
+        Some(800),
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
     assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
 }
 
-/// Synthetic two-slot plan: one declared stamp after the modeled release
-/// withholds the proof for its object. Modeled release at 5s, one member
-/// stamped 100ns after, the frozen hold reaching it.
+/// Synthetic two-slot plan: one declared stamp after the release
+/// withholds the proof for its object. Release at 5s, one member stamped
+/// 100ns after, the frozen hold reaching it.
 #[test]
 fn pause_gate_proofs_post_release_stamp_must_not_prove() {
     use crate::discovery::identity::PinnedObjectId;
@@ -11400,10 +11421,83 @@ fn pause_gate_proofs_post_release_stamp_must_not_prove() {
         &BTreeMap::from([(0, 5_000_000_000), (1, 5_000_000_100)]),
         hold,
         true,
+        Some(5_000_000_000),
     );
     assert!(
         proofs.is_empty(),
         "post-release declared stamp must withhold the proof, got {proofs:?}"
+    );
+}
+
+/// An unboundable release (clock failure or unreleased child) withholds
+/// every proof however complete the hold and stamps.
+#[test]
+fn prearm_pause_hold_missing_release_keeps_window() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(900), true)),
+        true,
+        None,
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
+}
+
+/// Synthetic two-slot plan: a missing release bound withholds the proof
+/// for a fully stamped, hold-covered object.
+#[test]
+fn pause_gate_proofs_missing_release_must_not_prove() {
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::plan::{AttachKey, AttachPlan, ModuleId, Slot};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn slot(index: u32, object: u32, file_offset: u64, module: u32) -> Slot {
+        Slot {
+            index,
+            descriptor_index: 1,
+            object: PinnedObjectId(object),
+            object_path: format!("/proc/self/fd/{object}"),
+            file_offset,
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantics: crate::kinds::DESCRIPTORS[1],
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(module)],
+        }
+    }
+
+    let plan = AttachPlan::from_slots(vec![slot(0, 7, 0x1000, 3), slot(1, 7, 0x2000, 3)]);
+    let key = |file_offset| AttachKey {
+        object: PinnedObjectId(7),
+        file_offset,
+    };
+    let watches = BTreeMap::from([(
+        PinnedObjectId(7),
+        crate::prearm_module::PrearmWatch::new(BTreeSet::from([key(0x1000), key(0x2000)])),
+    )]);
+    let proofs = Engine::pause_gate_exactness_proofs(
+        &watches,
+        &plan,
+        &BTreeMap::from([(0, 900), (1, 1200)]),
+        Some(scripted_hold(Some(50), Some(1200), true)),
+        true,
+        None,
+    );
+    assert!(
+        proofs.is_empty(),
+        "missing release must withhold, got {proofs:?}"
     );
 }
 

@@ -393,12 +393,15 @@ enum AuthorizationSource {
 /// Proven continuous hold of the owned child across the first pause epoch
 /// (R2-D1-6 proof source (i)): the pause-proven segment of the from-start
 /// hold the pre-arm exactness builder checks. A held child can neither map
-/// nor call, so a hold whose end reaches the declared-set attach instant
-/// proves the `[scope_start_ns, attached_at_ns]` window exactly observed —
-/// no load instant is needed. The owned `run` path composes the claim start
-/// (its pre-spawn scope start, bridged by spawn order and the pre-exec
-/// barrier) with this segment; the builder emits the proof only when the
-/// composed interval covers the window, and assembly still exact-matches it.
+/// nor call. The segment alone does not prove the window: the child runs
+/// free between the barrier release and its first pause stop, so the
+/// builder additionally requires every declared first-stamp to precede the
+/// barrier release — pre-release windows are barrier-covered exactly, and
+/// post-release stamps withhold the proof. The owned `run` path composes
+/// the claim start (its pre-spawn scope start, bridged by spawn order and
+/// the pre-exec barrier) and the release bound with this segment; the
+/// builder emits the proof only when the composed interval covers a
+/// pre-release window, and assembly still exact-matches it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PauseGateHold {
     /// Lower bound on the arm that opened the hold: the first arm's

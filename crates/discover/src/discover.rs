@@ -35,6 +35,97 @@ pub fn discover(module_path: &Path) -> Result<Manifest, String> {
     discover_with_self_memory(module_path, ProcessMemory::open()?.0)
 }
 
+/// Upper bound on provider-directory siblings preloaded for one discovery.
+/// The Firefox snap needs five; the bound keeps a hostile DT_NEEDED closure
+/// finite. Past it the fallback gives up and the original loader diagnosis
+/// stands.
+const MAX_SIBLING_PRELOADS: usize = 64;
+
+/// A DT_NEEDED name the sibling fallback may resolve: a bare file name with
+/// no path separator, so the candidate can only name the provider's own
+/// directory. Names with a separator (absolute or relative paths the loader
+/// resolves itself), `.`/`..` and empty names are never preloaded.
+fn is_bare_library_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+}
+
+/// Preload this provider's own-directory dependencies: for every DT_NEEDED
+/// bare name (transitively, from the provider and every preloaded sibling),
+/// `dlopen` the same-directory regular file by absolute path, keeping each
+/// handle alive in the returned vector. Only regular files are loaded —
+/// symlinks (which could point outside the directory), directories and
+/// anything else are skipped, and names absent from the directory stay for
+/// the normal loader search. No environment is read or set: the loader
+/// environment stays sanitized. Any failure aborts the fallback; the caller
+/// keeps the original loader diagnosis.
+fn preload_sibling_dependencies(module_path: &Path) -> Result<Vec<Library>, String> {
+    let dir = module_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .ok_or_else(|| "--module names no directory".to_string())?;
+    let mut preloads = Vec::new();
+    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut queue = vec![module_path.to_path_buf()];
+    visited.insert(module_path.to_path_buf());
+    while let Some(next) = queue.pop() {
+        let file = std::fs::File::open(&next)
+            .map_err(|error| format!("cannot open {} for reuse: {error}", next.display()))?;
+        let needed = p11scope_manifest::elf::needed_libraries(&file)?;
+        for name in needed {
+            if !is_bare_library_name(&name) {
+                continue;
+            }
+            let candidate = dir.join(&name);
+            if !visited.insert(candidate.clone()) {
+                continue;
+            }
+            // `symlink_metadata` does not follow links, so `is_file` is
+            // false for a symlink however valid its target: only a real
+            // regular file beside the provider is ever loaded.
+            let usable = std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.is_file());
+            if !usable {
+                continue;
+            }
+            if preloads.len() >= MAX_SIBLING_PRELOADS {
+                return Err(format!(
+                    "provider directory holds more than {MAX_SIBLING_PRELOADS} needed siblings"
+                ));
+            }
+            let sibling = unsafe { Library::new(&candidate) }
+                .map_err(|error| format!("cannot dlopen {}: {error}", candidate.display()))?;
+            preloads.push(sibling);
+            queue.push(candidate);
+        }
+    }
+    Ok(preloads)
+}
+
+/// `dlopen` the provider, resolving its own-directory siblings on failure.
+/// The first attempt is exactly today's load: when every dependency
+/// resolves through the normal search, nothing else runs and no behavior
+/// changes. Only when that fails, the sibling fallback preloads validated
+/// same-directory dependencies (see `preload_sibling_dependencies`) and
+/// retries once. With no usable sibling the original loader diagnosis is
+/// returned unchanged; after a retry the retry's diagnosis names what is
+/// still missing. Returned sibling handles must stay alive while `lib` is
+/// used.
+fn dlopen_with_sibling_fallback(module_path: &Path) -> Result<(Library, Vec<Library>), String> {
+    match unsafe { Library::new(module_path) } {
+        Ok(lib) => Ok((lib, Vec::new())),
+        Err(first) => {
+            let first = format!("cannot dlopen {}: {first}", module_path.display());
+            let preloads = match preload_sibling_dependencies(module_path) {
+                Ok(preloads) if !preloads.is_empty() => preloads,
+                _ => return Err(first),
+            };
+            match unsafe { Library::new(module_path) } {
+                Ok(lib) => Ok((lib, preloads)),
+                Err(retry) => Err(format!("cannot dlopen {}: {retry}", module_path.display())),
+            }
+        }
+    }
+}
+
 /// Discover with a retained descriptor for the helper's post-exec address
 /// space. The helper hardens itself before releasing the provider-load barrier.
 pub fn discover_with_self_memory(
@@ -54,8 +145,9 @@ pub fn discover_with_self_memory(
     let before_keys: BTreeSet<ObjectKey> =
         before_index.entries().iter().map(ObjectKey::of).collect();
 
-    let lib = unsafe { Library::new(module_path) }
-        .map_err(|e| format!("cannot dlopen {}: {e}", module_path.display()))?;
+    // Sibling handles stay alive for the whole discovery: dropping one
+    // would unload a library the provider is bound to.
+    let (lib, _sibling_preloads) = dlopen_with_sibling_fallback(module_path)?;
     let raw_exports = ExportAddresses {
         get_function_list: symbol_address(&lib, b"C_GetFunctionList\0"),
         get_interface_list: symbol_address(&lib, b"C_GetInterfaceList\0"),
@@ -2926,6 +3018,23 @@ mod tests {
             (0..16).collect::<Vec<_>>()
         );
         assert!(evidence.selection_truncated);
+    }
+
+    #[test]
+    fn only_bare_names_resolve_inside_the_provider_directory() {
+        for name in ["libmozsqlite3.so", "libnspr4.so", "a", "x.y"] {
+            assert!(is_bare_library_name(name), "{name}");
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "sub/dir.so",
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "a\0b",
+        ] {
+            assert!(!is_bare_library_name(name), "{name:?}");
+        }
     }
 
     #[test]

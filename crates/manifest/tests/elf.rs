@@ -1,7 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 use object::elf;
 use p11scope_manifest::elf::{
-    ElfAbi, ElfSnapshot, entry_file_offset, exports_matching, read_export_facts,
+    ElfAbi, ElfSnapshot, entry_file_offset, exports_matching, needed_libraries, read_export_facts,
     read_export_facts_bounded, symbol_file_offset,
 };
 use std::os::unix::fs::FileExt as _;
@@ -1425,4 +1425,58 @@ fn per_symbol_faults_set_the_sticky_witness_flag() {
         facts.witness_fault,
         "an untranslatable address sets the sticky fault"
     );
+}
+
+#[test]
+fn needed_libraries_lists_direct_dependencies_in_dynamic_order() {
+    let d = tmp("elf-needed");
+    let dep_c = d.join("needed_dep.c");
+    std::fs::write(&dep_c, "int needed_helper(void){return 1;}\n").unwrap();
+    let dep = d.join("needed-dep.so");
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-Wl,-soname,needed-dep.so", "-o"])
+            .arg(&dep)
+            .arg(&dep_c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let user_c = d.join("needed_user.c");
+    std::fs::write(&user_c, "int use_it(void){return 0;}\n").unwrap();
+    let user = d.join("needed-user.so");
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&user)
+            .arg(&user_c)
+            .arg(format!("-L{}", d.display()))
+            .arg("-Wl,--no-as-needed")
+            .arg("-l:needed-dep.so")
+            .arg("-Wl,--as-needed")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = p11scope_manifest::identity::open_object(&user).unwrap();
+    let needed = needed_libraries(&file).unwrap();
+    assert!(
+        needed.contains(&"needed-dep.so".to_string()),
+        "DT_NEEDED must name the linked sibling: {needed:?}"
+    );
+    let dep_file = p11scope_manifest::identity::open_object(&dep).unwrap();
+    let dep_needed = needed_libraries(&dep_file).unwrap();
+    assert!(
+        !dep_needed.iter().any(|name| name == "needed-dep.so"),
+        "the dependency itself must not need itself: {dep_needed:?}"
+    );
+}
+
+#[test]
+fn needed_libraries_refuses_a_non_elf_file() {
+    let d = tmp("elf-needed-garbage");
+    let bad = d.join("bad.so");
+    std::fs::write(&bad, b"not an ELF object").unwrap();
+    let file = std::fs::File::open(&bad).unwrap();
+    needed_libraries(&file).unwrap_err();
 }

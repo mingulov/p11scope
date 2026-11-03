@@ -295,8 +295,11 @@ release.
 `--prearm-module` pins the named provider before any mapping and watches
 its proved offsets (`watch` on the discovery record, with `attached_at_ns`
 and `unobserved_windows` merged at capture end). A quiet pre-armed interval
-is a stated watch interval, not proven-exact coverage: no R2-D1-6 exactness
-producer ships yet, so attached modules always disclose their window.
+is a stated watch interval, not proven-exact coverage, except on an owned
+`run` whose pause gate held the child across the whole window: that capture
+publishes an explicitly empty `unobserved_windows` on the pre-armed module.
+Every other capture still discloses its window; ordering-evidence exactness
+for other scopes is later work.
 Inventory accepts and retains pre-arm inputs, attaches proved offsets
 through the inventory lane, and reports one interval row per input in
 `prearm[]`. An in-place rewrite that preserves `(ino, size, ctime)`

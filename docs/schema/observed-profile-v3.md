@@ -376,7 +376,11 @@ assembly from real attach-complete stamps. `unobserved_windows` is a list of
 `{start_ns, end_ns, reason}` with `reason` exactly `pre_attach`,
 `late_discovery`, `mapped_unattached`, `health_loss`, or `scope_uncertain`;
 absent means undisclosed, and an explicitly empty list reads as exact only
-with an R2-D1-6 proof behind it. Key presence never proves exactness.
+with an R2-D1-6 proof behind it. Key presence never proves exactness. The
+pause-gate proof ships for owned `run` only: `[]` appears on a pre-armed
+module exactly when the pause gate held the child from its start until every
+declared probe attached (continuous hold, both bounds clocked, every member
+stamped), and the window stays in every other capture.
 
 ## Residual additions: terminal verdict, override, handoff, environment, PID namespace
 

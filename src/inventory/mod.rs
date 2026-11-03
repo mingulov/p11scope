@@ -1186,7 +1186,10 @@ pub(crate) fn reset_reclaim_pass_heap_calls() {
 /// glibc only: musl provides no `malloc_trim` at all (absent from musl
 /// 1.2.5 and from rustc's self-contained musl libc, so an unconditional
 /// call would not link the static release observer), and the call is
-/// compiled out on non-glibc targets.
+/// compiled out on non-glibc targets. The static musl release observer
+/// therefore keeps its allocator's default retention; three Fedora
+/// 1800 s release soaks hold RSS flat at ~80 MB peak (round 2),
+/// bounded without the trim.
 fn reclaim_pass_heap() {
     #[cfg(test)]
     RECLAIM_PASS_HEAP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

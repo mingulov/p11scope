@@ -3970,3 +3970,101 @@ fn joint_machine_return_enriched_calls_seal_populated() {
         "the first seal certifies across the return-enriched calls"
     );
 }
+
+/// Drive one begun commit until it publishes, through the machine and
+/// the commit poll, with a finite bound.
+fn publish_followup(scene: &mut MachineScene, label: &str) {
+    use crate::inventory_semantics::JointServiceProgress;
+    for _ in 0..600 {
+        if matches!(
+            scene.service(1024).unwrap(),
+            JointServiceProgress::Published
+        ) {
+            return;
+        }
+        if matches!(
+            scene.poll_commit(1024).unwrap(),
+            JointCommitProgress::Published(_)
+        ) {
+            return;
+        }
+    }
+    panic!(
+        "{label}: the follow-up never published; snapshot={:?} audit={:?}",
+        scene.machine.diagnostic_snapshot_for_test(),
+        scene.machine.diagnostic_audit_for_test(),
+    );
+}
+
+/// The live linked `--system --key-operations` client ends with a
+/// successful `C_Finalize` that its first seal certifies and publishes.
+/// `--system` always has later activity: another image's call starts a
+/// further quantum, which seals every Joint target again, including the
+/// finalized one. That era is completed history: the further seal
+/// succeeds with nothing new and the section stays Populated. Before the
+/// fix the further seal hit the model's ended domain, refused it as
+/// `DomainEnded` and ended the feed as a proof-refused fallback.
+#[test]
+fn joint_machine_sealed_finalize_stays_populated_across_later_quantum() {
+    use crate::key_operation_projection::ObsStatus;
+
+    let functions = [
+        "C_Initialize",
+        "C_OpenSession",
+        "C_GenerateKeyPair",
+        "C_SignInit",
+        "C_CloseAllSessions",
+        "C_Finalize",
+    ];
+    let mut scene = MachineScene::with_initial_files_and_functions(1, &[0], &functions, true);
+    let child = OwnedStoppedChild::new();
+    add_initial_machine_image(
+        &mut scene,
+        child.id(),
+        ImageIdentity {
+            task_cookie: 73,
+            exec_id: 0,
+        },
+    );
+    let pid = std::process::id();
+    for (sequence, name) in functions.iter().enumerate() {
+        scene.scene.push(pid, 0, name, sequence as u64 + 1);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("finalize-q1", None);
+    let _ = scene.poll_commit(0);
+    let registry = scene.scene.real.scene.coordinator.registry();
+    let first = registry.joint_observations(registry.published_revision());
+    assert_eq!(
+        (registry.joint_feeds(), first.status, first.reason),
+        (1, ObsStatus::Populated, "none"),
+        "the first quantum certifies the whole client, C_Finalize included"
+    );
+    let revision_q1 = registry.published_revision();
+    // Another image's activity: the next quantum seals again.
+    scene.scene.push(child.id(), 0, "C_Initialize", 1);
+    scene.machine.begin_commit(false).unwrap();
+    publish_followup(&mut scene, "finalize-q2");
+    let registry = scene.scene.real.scene.coordinator.registry();
+    assert!(
+        registry.published_revision() > revision_q1,
+        "the later quantum published"
+    );
+    let reasons: Vec<String> = registry
+        .gaps()
+        .iter()
+        .map(|gap| gap.reason.clone())
+        .collect();
+    assert!(
+        !reasons
+            .iter()
+            .any(|reason| reason.contains("domain_ended") || reason.contains("DomainEnded")),
+        "a sealed successful C_Finalize is not a refusal: {reasons:?}"
+    );
+    let later = registry.joint_observations(registry.published_revision());
+    assert_eq!(
+        (later.status, later.reason),
+        (ObsStatus::Populated, "none"),
+        "the finalized era stays populated: gaps {reasons:?}"
+    );
+}

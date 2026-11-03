@@ -94,6 +94,19 @@ impl CollectedCallOrigin {
     }
 }
 
+#[cfg(test)]
+impl CollectedCallOrigin {
+    /// A scripted END origin at one H0 position, for journal algorithm
+    /// fixtures that do not run the production collection driver.
+    pub(crate) fn scripted(position: u64) -> Self {
+        Self {
+            quantum: RawQuantumIdentity(0),
+            wire_index: 0,
+            position,
+        }
+    }
+}
+
 impl std::fmt::Debug for CollectedCallOrigin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CollectedCallOrigin(<private>)")

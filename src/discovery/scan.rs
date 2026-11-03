@@ -8059,6 +8059,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         // Anchor address: the r-x mapping runs 0x1000-0x3000 at file
         // offset 0, so file offset 0x500 lands at 0x1500.
@@ -8113,6 +8115,8 @@ mod tests {
                 inode: 7,
             },
             symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
         };
         let getter = 0x1500u64;
         let mut snapshot = 0x2802u64.to_le_bytes().to_vec();

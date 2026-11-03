@@ -63,6 +63,10 @@ WIDE_EXPECTED = [
 
 
 INTEGRATION_EXPECTED = [
+    "tests/bpf_load_feasibility.rs:per_program_load_times",
+    "tests/bpf_load_feasibility.rs:parallel_load_measures_kernel_overlap",
+    "tests/bpf_load_feasibility.rs:parallel_load_partial_failure_retains_cleanup_owner",
+    "tests/bpf_load_feasibility.rs:resident_service_cost_parts",
     "tests/entry_object_paired.rs:paired_default_and_unsafe_objects_satisfy_the_entry_contract",
     "tests/exec_task_continuity.rs:exec_task_core_shapes_kernel_load_without_attachment",
     "tests/identity_iter_standalone.rs:identity_loader_strict_gate_requires_btf_and_both_programs",
@@ -1527,8 +1531,8 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
         # The fake lists both load-gate alternatives (a real binary has
-        # exactly one), so the default section shows 184 + 2.
-        self.assertIn("default (186)", result.stdout)
+        # exactly one), so the default section shows 190 + 2.
+        self.assertIn("default (192)", result.stdout)
         self.assertIn("btrfs (14, --include-btrfs only)", result.stdout)
         self.assertIn("overlay (2, --include-overlay only)", result.stdout)
         self.assertIn("expected-failures (4, --include-expected-failures "
@@ -1536,7 +1540,7 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
-        self.assertIn("verify: curation matches the binary (244 tests)",
+        self.assertIn("verify: curation matches the binary (250 tests)",
                       result.stdout)
 
     def test_real_tree_skip_entries_carry_until(self):
@@ -1730,7 +1734,7 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=184",
+            "DEFAULT_TESTS=190",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
             "BTRFS_TESTS=14",
@@ -1742,7 +1746,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",
-            "INTEGRATION_TESTS=7",
+            "INTEGRATION_TESTS=11",
         ):
             with self.subTest(pin=pin):
                 self.assertIn(pin, result.stdout)
@@ -1836,6 +1840,12 @@ class IgnoredTestsTests(unittest.TestCase):
             deps = Path(tmp) / "deps"
             deps.mkdir()
             write_fake_integration_binary(
+                deps, "bpf_load_feasibility",
+                ["per_program_load_times",
+                 "parallel_load_measures_kernel_overlap",
+                 "parallel_load_partial_failure_retains_cleanup_owner",
+                 "resident_service_cost_parts"])
+            write_fake_integration_binary(
                 deps, "entry_object_paired",
                 ["paired_default_and_unsafe_objects_satisfy_the_entry_contract"])
             write_fake_integration_binary(
@@ -1858,11 +1868,11 @@ class IgnoredTestsTests(unittest.TestCase):
             result = run_runner("--list-integration", str(deps))
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
-        self.assertIn("integration (7)", result.stdout)
+        self.assertIn("integration (11)", result.stdout)
         for entry in INTEGRATION_EXPECTED:
             self.assertIn(entry, result.stdout)
         self.assertIn("verify: integration curation selects exactly one "
-                      "test per entry (7 entries)", result.stdout)
+                      "test per entry (11 entries)", result.stdout)
 
     def test_integration_list_mode_refuses_zero_selection(self):
         # The inventory_identity binary below is missing one of its two

@@ -6165,6 +6165,7 @@ mod tests {
                     file_offset: Some(table as u64 * 0x1000),
                     live_return: false,
                     manifest_supported: false,
+                    extension_impossible: false,
                 })
                 .collect();
             provider
@@ -7514,6 +7515,7 @@ mod tests {
         let plain = |pid: u32, status: MemberStatus| ProcessRecord {
             application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
             complete_scan: None,
+            hints_examined: false,
             pid,
             status,
             objects: Vec::new(),

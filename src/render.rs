@@ -2738,6 +2738,19 @@ pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
             }),
         );
     }
+    // 6.14 Option A: present if and only if extensive mode armed. A
+    // kernel exit-time observation, not a hint: no label or scope
+    // rides it, only the two counts, which never feed shares,
+    // verdicts, or completeness.
+    if let Some(split) = ev.discovery.gap_exit_mappings {
+        object.insert(
+            "gap_exit_mappings".into(),
+            serde_json::json!({
+                "mapped": split.mapped,
+                "unknown": split.unknown,
+            }),
+        );
+    }
     // B17 W2: present whenever the capture produced reload evidence:
     // a disclosed tainted identity, or nonzero count snapshots with
     // an empty identities list (mint exhaustion). Per-identity
@@ -3785,6 +3798,128 @@ pub(crate) mod tests {
             .as_object_mut()
             .unwrap()
             .remove("gap_exe_hints");
+        assert_eq!(armed, plain);
+    }
+
+    #[test]
+    fn profile_v3_gap_exit_mappings_split_is_exact_when_armed() {
+        let mut ev = evidence();
+        ev.discovery.gap_exit_mappings = Some(GapExitMappings {
+            mapped: 2,
+            unknown: 3,
+        });
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["evidence"]["gap_exit_mappings"],
+            serde_json::json!({"mapped": 2, "unknown": 3})
+        );
+        // The metrics lane embeds `Evidence` directly: the
+        // serde-skipped carrier keeps this profile-only key absent
+        // even when armed.
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        assert!(metrics["evidence"].get("gap_exit_mappings").is_none());
+    }
+
+    #[test]
+    fn profile_v3_gap_exit_mappings_absent_unless_armed() {
+        let ev = evidence();
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert!(profile["evidence"].get("gap_exit_mappings").is_none());
+    }
+
+    // The exit-mapping split is informational, never a call, share,
+    // verdict, or completeness input: armed and plain renders of one
+    // observed surface differ only in the split key itself.
+    #[test]
+    fn profile_v3_gap_exit_mappings_do_not_move_call_or_attribution_surfaces() {
+        use p11scope_ebpf_common::shape;
+
+        let observed_state = || {
+            let mut state =
+                crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+            let mut event = init_event(0, 0x0D, shape::NONE, 0, 0, 0);
+            event.cgroup_id = 111;
+            state.observe(&event);
+            state.observe(&event);
+            state.observe(&event);
+            state
+        };
+        let reports = || {
+            let mut sign = report("C_Sign", 25, 2, false);
+            sign.module = Some(crate::plan::ModuleId(0));
+            sign.errors = 3;
+            sign.total_ns = 2_500;
+            sign.max_ns = 100;
+            sign.rv_counts.insert(0, 22);
+            sign.rv_counts.insert(5, 3);
+            let mut encrypt = report("C_Encrypt", 7, 0, false);
+            encrypt.module = Some(crate::plan::ModuleId(0));
+            encrypt.rv_counts.insert(0, 7);
+            vec![sign, encrypt]
+        };
+        let mut plain_ev = evidence();
+        plain_ev.pid_descendant_gaps = 2;
+        let mut armed_ev = evidence();
+        armed_ev.pid_descendant_gaps = 2;
+        armed_ev.discovery.gap_exit_mappings = Some(GapExitMappings {
+            mapped: 1,
+            unknown: 1,
+        });
+
+        let plain = profile_json(
+            &reports(),
+            VersionedEvidence::wrap(&plain_ev),
+            &observed_state(),
+            &capture_fixture(),
+        );
+        let mut armed = profile_json(
+            &reports(),
+            VersionedEvidence::wrap(&armed_ev),
+            &observed_state(),
+            &capture_fixture(),
+        );
+
+        let total_calls: u64 = plain["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|function| function["calls"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total_calls, 32, "twin must observe nonzero calls");
+        assert!(plain["evidence"].get("gap_exit_mappings").is_none());
+        assert_eq!(armed["evidence"]["gap_exit_mappings"]["mapped"], 1);
+        assert_eq!(armed["evidence"]["gap_exit_mappings"]["unknown"], 1);
+
+        for surface in ["functions", "mechanisms", "sessions", "logins", "cgroups"] {
+            assert_eq!(armed[surface], plain[surface], "{surface} must not move");
+        }
+        assert_eq!(
+            armed["evidence"]["completeness"], plain["evidence"]["completeness"],
+            "completeness must not move"
+        );
+        assert_eq!(
+            armed["evidence"]["verdict_detail"], plain["evidence"]["verdict_detail"],
+            "verdict must not move"
+        );
+        assert_eq!(
+            armed["evidence"]["pid_descendant_gaps"],
+            plain["evidence"]["pid_descendant_gaps"]
+        );
+
+        armed["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gap_exit_mappings");
         assert_eq!(armed, plain);
     }
 

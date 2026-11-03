@@ -11156,8 +11156,13 @@ impl Engine {
             exit_ended,
             "the per-route exit-only buckets sum to the total"
         );
+        // 6.14 Option A: stamp the exit-mapping carrier from live
+        // engine state on every read, so the projection is always
+        // current without depending on projection timing.
+        let mut discovery = self.discovery.clone();
+        discovery.gap_exit_mappings = self.gap_exit_mappings();
         render::CaptureFacts {
-            discovery: self.discovery.clone(),
+            discovery,
             table_entries: self.plan.entries_seen,
             slots: self.plan.slots.len(),
             // U-14: mirrors how `slots` reads the plan, but counts only what

@@ -4347,6 +4347,27 @@ fn exit_mappings_unarmed_classify_records_nothing() {
     assert!(state.execs.is_empty());
 }
 
+/// The published carrier is stamped from live engine state on
+/// every capture-facts read: classified counts reach the report
+/// projection without a run-flow change.
+#[test]
+fn exit_mappings_capture_facts_stamp_carries_live_split() {
+    let mut engine = armed_cgroup_engine();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7401, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(7401, 31);
+    exit.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    let carried = engine.capture_facts().discovery().gap_exit_mappings;
+    assert_eq!(
+        carried.map(|split| (split.mapped, split.unknown)),
+        Some((1, 0))
+    );
+}
+
 /// The exec-timing table is bounded: past the stash bound the
 /// smallest PID evicts first, deterministically.
 #[test]

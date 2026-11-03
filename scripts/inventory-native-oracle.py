@@ -6818,6 +6818,25 @@ def capacity_attach_drained(rows):
     return last_pass_ns is not None and (last_deferred_ns is None or last_pass_ns > last_deferred_ns)
 
 
+def wait_until_attach_drained(deadline, rows_fn, custody, observer):
+    """Block until the attach backlog drains, the observer exits, or the deadline passes.
+
+    The drained state is checked before the deadline: a late growth-phase
+    call whose window already elapsed still returns when the backlog has
+    drained instead of failing on the spent budget.
+    """
+    import time
+    while True:
+        custody.checkpoint()
+        if capacity_attach_drained(rows_fn()):
+            return
+        if time.monotonic() >= deadline:
+            raise ValueError("attach backlog did not drain within the capture window")
+        if observer is not None and observer.poll() is not None:
+            raise ValueError("observer exited before attach drained")
+        time.sleep(2)
+
+
 def capacity_run(binary, base, lane, population, limit, demand, uid, gid):
     """Root-scheduled public runner. Task2 prepares this; Task3 executes it."""
     with CapacityCustody() as custody:
@@ -6891,14 +6910,7 @@ def capacity_run_owned(binary, base, lane, population, limit, demand, uid, gid, 
         # SIGINT cleanup inside the capture window; failing loudly here
         # beats firing blind.
         deadline = launch_ns + max(duration - 90, 60)
-        while time.monotonic() < deadline:
-            custody.checkpoint()
-            if capacity_attach_drained(events()):
-                return
-            if observer is not None and observer.poll() is not None:
-                raise ValueError("observer exited before attach drained")
-            time.sleep(2)
-        raise ValueError("attach backlog did not drain within the capture window")
+        wait_until_attach_drained(deadline, events, custody, observer)
 
     def command(child, text):
         custody.checkpoint()

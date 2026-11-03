@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Section-level gate-0 identity check (ruling P2F-2, hardened by P2F-5 F3).
+"""Section-level gate-0 identity check (ruling P2F-2, hardened by P2F-5 F3,
+I1 program sections and the I6 .BTF fallback).
 
 Compares the seven default BPF objects between two build output directories
 (a base OUT_DIR and a candidate OUT_DIR). For each object the following must
 be byte-identical:
 
 - .text (executable code)
+- every other allocated or executable non-debug section, enumerated from
+  readelf flags (the BPF program sections: uprobe, fentry/*, ...), so a
+  same-length code change inside a program section fails naming it
 - .rodata (read-only data; both missing counts as identical)
 - .maps and maps (map definitions, C and Rust sides)
 - symbol table (llvm-nm output)
-- .BTF raw bytes (type/func records; line info lives in .BTF.ext, not .BTF)
+- .BTF raw bytes (type/func records; line info lives in .BTF.ext, not .BTF),
+  with the I6 fallback below
 - every relocation section (.rel*) present in either object, except
   relocations against debug metadata (see below); absent on both counts
   as identical, as for .rodata. Both spellings (.rel.text and .reluprobe)
   are covered, so a change that only re-targets references (e.g. map-index
   churn with identical code bytes) fails.
+
+When .BTF is the only differing section, the comparison falls back to a
+bpftool-normalized check (bpftool BTF C dump, sorted: the type multiset in
+name form, which a pure type-ID permutation leaves identical) and the
+report says which path decided. Any other differing section fails by
+bytes without consulting bpftool. Note: the ruling names `format raw`,
+but raw dumps embed type IDs, so a reordered .BTF still differs after
+sorting (proven on the round-4 flake shape); the C dump is the check the
+noninterference fallback already uses for the same flake.
 
 Debug metadata (.debug_*, .BTF.ext line info) may differ: clang -g embeds the
 source MD5, so any edit to a shared C file changes those bytes. They are
@@ -119,8 +133,14 @@ def is_informational_relocation(name: str) -> bool:
     return target == ".BTF.ext" or target.startswith(".debug")
 
 
-def readelf_section_names(path: Path) -> list[str]:
-    """All ELF section names via readelf -S -W (wide: never truncated)."""
+def readelf_sections(path: Path) -> list[tuple[str, str]]:
+    """Every ELF section's (name, flags) via readelf -S -W (wide: never truncated).
+
+    Flags are the single-letter section flags (WAXMSILOGT...); flag-less
+    rows report "". The first token after the fixed columns is flags
+    exactly when it is all letters: link/info/align are numeric, so a
+    missing flags field cannot be mistaken for the link number.
+    """
     readelf = shutil.which("readelf")
     if readelf is None:
         raise RuntimeError("readelf not on PATH")
@@ -132,12 +152,46 @@ def readelf_section_names(path: Path) -> list[str]:
     )
     if result.returncode != 0:
         raise RuntimeError(f"readelf failed on {path}: {result.stderr.strip()}")
-    names = []
+    sections = []
     for line in result.stdout.splitlines():
-        match = re.match(r"\s*\[\s*\d+\]\s+(\S+)", line)
+        match = re.match(
+            r"\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+"
+            r"\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s*(.*)$",
+            line,
+        )
         if match:
-            names.append(match.group(1))
-    return names
+            rest = match.group(2).split()
+            flags = (
+                rest[0]
+                if rest and re.fullmatch(r"[A-Za-z]+", rest[0])
+                else ""
+            )
+            sections.append((match.group(1), flags))
+    return sections
+
+
+def readelf_section_names(path: Path) -> list[str]:
+    """All ELF section names via readelf -S -W (wide: never truncated)."""
+    return [name for name, _ in readelf_sections(path)]
+
+
+def is_program_section(name: str, flags: str) -> bool:
+    """True for allocated or executable non-debug sections (I1).
+
+    These hold code and live data: .text plus every BPF program section
+    (uprobe, uretprobe, fentry/*, ...). Debug metadata never carries A/X
+    but is excluded by name anyway, as is .BTF.ext line info.
+    """
+    if name.startswith(".debug") or name == ".BTF.ext":
+        return False
+    return "A" in flags or "X" in flags
+
+
+def program_sections(path: Path) -> list[str]:
+    """Allocated/executable non-debug sections of one object, sorted."""
+    return sorted(
+        name for name, flags in readelf_sections(path) if is_program_section(name, flags)
+    )
 
 
 def relocation_sections(path: Path) -> list[str]:
@@ -156,16 +210,24 @@ def relocation_sections(path: Path) -> list[str]:
 def compare_object(base_obj: Path, cand_obj: Path) -> list[str]:
     """Problems comparing one object pair; [] means identical.
 
-    Every required section plus every relocation section present in either
-    object must be byte-identical (absent on both counts as identical),
-    and the symbol listings must match. Raises RuntimeError when a
-    required tool is missing or fails.
+    Every required section, every allocated/executable non-debug section
+    present in either object, and every relocation section present in
+    either object must be byte-identical (absent on both counts as
+    identical), and the symbol listings must match. Raises RuntimeError
+    when a required tool is missing or fails.
     """
     problems: list[str] = []
     relocs = sorted(
         set(relocation_sections(base_obj)) | set(relocation_sections(cand_obj))
     )
-    for section in list(REQUIRED_SECTIONS) + relocs:
+    programs = sorted(
+        set(program_sections(base_obj)) | set(program_sections(cand_obj))
+    )
+    sections: list[str] = []
+    for section in list(REQUIRED_SECTIONS) + programs + relocs:
+        if section not in sections:
+            sections.append(section)
+    for section in sections:
         base_bytes = section_bytes(base_obj, section)
         cand_bytes = section_bytes(cand_obj, section)
         if base_bytes is None and cand_bytes is None:
@@ -182,6 +244,59 @@ def compare_object(base_obj: Path, cand_obj: Path) -> list[str]:
     if base_syms != cand_syms:
         problems.append("symbols (llvm-nm) differ")
     return problems
+
+
+def btf_normalized_text(path: Path) -> str:
+    """The bpftool BTF C dump with lines sorted: the BTF type multiset.
+
+    bpftool prints types by name without type IDs, so a pure type-order
+    permutation sorts to identical text while any added, removed or
+    reshaped type changes the multiset (the same normalization the
+    noninterference fallback uses for the same flake). Both sides always
+    use this run's bpftool, so no cross-version text skew can pass or
+    fail the comparison. Raises RuntimeError when bpftool is missing or
+    fails.
+    """
+    bpftool = shutil.which("bpftool")
+    if bpftool is None:
+        raise RuntimeError("bpftool not on PATH")
+    result = subprocess.run(
+        [bpftool, "btf", "dump", "file", str(path), "format", "c"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(
+            f"bpftool BTF dump failed on {path}: {result.stderr.strip()[:200]}"
+        )
+    return "\n".join(sorted(result.stdout.splitlines()))
+
+
+def is_btf_only_problems(problems: list[str]) -> bool:
+    """True when .BTF bytes are the only difference (the I6 trigger).
+
+    Only a byte mismatch (".BTF differs") qualifies: a .BTF section
+    present on one side only is a structural difference, never an order
+    flake, and fails by bytes.
+    """
+    return len(problems) == 1 and problems[0].startswith(".BTF differs")
+
+
+def adjudicate_btf_only(base_obj: Path, cand_obj: Path) -> str | None:
+    """None when the .BTF-only pair normalizes equal, else its problem.
+
+    A normalized match means the byte difference is a semantically null
+    type-ID permutation (the round-4 flake); a mismatch, or an
+    unavailable bpftool, fails closed naming .BTF.
+    """
+    try:
+        match = btf_normalized_text(base_obj) == btf_normalized_text(cand_obj)
+    except RuntimeError as error:
+        return f".BTF differs (bpftool unavailable for normalized comparison: {error})"
+    if match:
+        return None
+    return ".BTF differs (bpftool-normalized forms differ)"
 
 
 def main(argv: list[str]) -> int:
@@ -222,11 +337,19 @@ def main(argv: list[str]) -> int:
             print(f"{short}: FAIL ({error})")
             failed = True
             continue
+        btf_note = ""
+        if is_btf_only_problems(problems):
+            decision = adjudicate_btf_only(base_obj, cand_obj)
+            if decision is None:
+                problems = []
+                btf_note = ".BTF decided by bpftool-normalized comparison"
+            else:
+                problems = [decision]
         if problems:
             print(f"{short}: FAIL ({'; '.join(problems)})")
             failed = True
         else:
-            notes: list[str] = []
+            notes: list[str] = [btf_note] if btf_note else []
             for section in INFORMATIONAL_SECTIONS:
                 base_bytes = section_bytes(base_obj, section)
                 cand_bytes = section_bytes(cand_obj, section)

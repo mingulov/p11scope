@@ -61,8 +61,10 @@ DIAGNOSTICS=0
 OBSERVER_STUB=
 KERNEL_PROFILE=current/default
 TEST_ID=
-# Probed at startup via release-matrix-contract.py --select-module (Debian
-# and Fedora layouts); SOURCE_MODULE in the environment overrides the probe.
+# Probed at startup via release-matrix-contract.py --select-module, which
+# tries the Debian layouts plus /usr/lib64/softhsm/libsofthsm2.so and the
+# Fedora layout /usr/lib64/pkcs11/libsofthsm2.so; SOURCE_MODULE in the
+# environment overrides the probe.
 SOURCE_MODULE=${SOURCE_MODULE:-}
 MODULE=
 LOCK=${LOCK:-/var/tmp/p11scope-ws-tmp/privileged.lock}

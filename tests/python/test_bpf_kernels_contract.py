@@ -198,14 +198,30 @@ class BpfKernelsContractTests(unittest.TestCase):
         self.assertTrue(others, "privileged-tests.yml names no guest kernels")
         self.assertEqual([], check_kernel_sums(self.bpf, SUMS_DIR, others))
 
-    def test_active_positives_and_one_combined_stock_refusal_are_separate(self):
+    def test_active_positives_and_combined_stock_refusals_are_separate(self):
         self.assertEqual(matrix_kernels(self.bpf),
                          ["v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1"])
         controls = re.findall(r"- kernel: (v[0-9.]+)\n\s+refusal_control: true", self.bpf)
-        self.assertEqual(controls, ["v6.1.188"])
+        self.assertEqual(controls, ["v6.1.188", "v5.15.221"])
         self.assertEqual(self.bpf.count("scripts/check-multi-host-refusal.py"), 1)
         self.assertIn("if: matrix.refusal_control != true", self.bpf)
         self.assertIn("if: matrix.refusal_control == true", self.bpf)
+
+    def test_lib_cells_run_in_66_and_612_guests(self):
+        match = re.search(r"lib-cells-kernels:.*?matrix:\n\s+kernel: \[(.*?)\]",
+                          self.bpf, re.S)
+        self.assertTrue(match, "lib-cells-kernels names no matrix kernels")
+        kernels = [kernel.strip() for kernel in match.group(1).split(",")]
+        self.assertEqual(kernels, ["v6.6.157", "v6.12.111"])
+        self.assertEqual(self.bpf.count("scripts/ci/lib-cells-vng.sh"), 2)
+        job = self.bpf[match.start():self.bpf.index("bpf-load-host:")]
+        self.assertIn("gcc", job)
+
+    def test_only_515_runs_the_denial_cell_for_its_denied_branch(self):
+        branches = re.findall(r"- kernel: (v[0-9.]+)\n\s+refusal_control: true\n(?:\s+#.*\n)*\s+denial_branch: (\w+)",
+                              self.bpf)
+        self.assertEqual(branches, [("v5.15.221", "denied")])
+        self.assertIn("--denial \"${{ matrix.denial_branch }}\"", self.bpf)
 
     def test_kernel_workflow_preserves_existing_concurrency_policy(self):
         self.assertIn("cancel-in-progress: true", self.bpf)

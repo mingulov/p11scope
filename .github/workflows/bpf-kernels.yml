@@ -10,9 +10,10 @@ name: bpf-kernels
 # lists untouched; promote it (or delete it) without touching ci.yml.
 #
 # How it works: bpf-load-build compiles the default observer (release
-# features, no P11SCOPE_SMALL_*) and the verifier-stats probe once and
-# ships both as a 1-day artifact, because a cargo target plus kernel trees
-# do not fit the 14 GB runner disk twice. Each bpf-load-kernels shard
+# features, no P11SCOPE_SMALL_*), the verifier-stats probe and the
+# lib-test executable once and ships all three as a 1-day artifact,
+# because a cargo target plus kernel trees do not fit the 14 GB runner
+# disk twice. Each bpf-load-kernels shard
 # downloads that artifact, boots its own kernel's guest with virtme-ng,
 # and runs scripts/check-bpf-load-kernels.sh for that one kernel.
 # Kernels come precompiled from the Ubuntu mainline repository: each
@@ -24,7 +25,8 @@ name: bpf-kernels
 # keeps per version (image + modules, never headers).
 # kvm-probe is the Stage 0 canary (host KVM facts plus one timed guest
 # boot); bpf-load-host closes the gap that CI compares BPF objects but
-# never loads them on the runner kernel.
+# never loads them on the runner kernel. lib-cells-kernels runs the
+# kernel-sensitive privileged lib-cell subset in 6.6/6.12 guests.
 on:
   push:
   pull_request:
@@ -223,12 +225,20 @@ jobs:
         run: |
           python3 -I scripts/measure-verifier-headroom.py build "$RUNNER_TEMP/probe"
           test -f "$RUNNER_TEMP/probe/verifier-stats-probe.so"
+      - name: Build the lib-test executable for the guest cells
+        shell: bash
+        run: |
+          toolchain=$(cat .release-rust-version)
+          cargo +"$toolchain" test --locked --offline --lib --no-run --message-format=json >"$RUNNER_TEMP/lib-build.jsonl"
+          lib=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "p11scope" and (.target.kind | any(. == "lib"))) | .executable' "$RUNNER_TEMP/lib-build.jsonl" | grep -v '^null$' | tail -1)
+          test -x "$lib"
+          cp -p "$lib" "$RUNNER_TEMP/lib-tests"
       - name: Stage the artifact
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/bpf-load-inputs"
-          cp -p target/debug/p11scope "$RUNNER_TEMP/probe/verifier-stats-probe.so" "$RUNNER_TEMP/bpf-load-inputs/"
-          (cd "$RUNNER_TEMP/bpf-load-inputs" && sha256sum p11scope verifier-stats-probe.so > SHA256SUMS)
+          cp -p target/debug/p11scope "$RUNNER_TEMP/probe/verifier-stats-probe.so" "$RUNNER_TEMP/lib-tests" "$RUNNER_TEMP/bpf-load-inputs/"
+          (cd "$RUNNER_TEMP/bpf-load-inputs" && sha256sum p11scope verifier-stats-probe.so lib-tests > SHA256SUMS)
           cat "$RUNNER_TEMP/bpf-load-inputs/SHA256SUMS"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -248,9 +258,14 @@ jobs:
       matrix:
         kernel: [v6.6.157, v6.12.111, v6.18.58, v7.3.1]
         include:
-          # One combined refusal control, never an old positive campaign.
+          # Combined refusal controls, never an old positive campaign.
           - kernel: v6.1.188
             refusal_control: true
+          # 5.15 refuses with the same named reason (OD32) and additionally
+          # runs the identity cell for its denied branch.
+          - kernel: v5.15.221
+            refusal_control: true
+            denial_branch: denied
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -301,7 +316,7 @@ jobs:
           SUMS="$GITHUB_WORKSPACE/tests/fixtures/vng-kernel-sha256sums/${{ matrix.kernel }}.sums"
           (cd "$VNGD" && sha256sum --check "$SUMS") || { echo "kernel integrity check failed: ${{ matrix.kernel }}" >&2; exit 1; }
           test "$(cd "$VNGD" && ls -1q *.deb | wc -l)" -eq "$(wc -l < "$SUMS")" || { echo "kernel deb set changed: ${{ matrix.kernel }} (re-record the sums)" >&2; exit 1; }
-      - name: Download the observer and probe
+      - name: Download the observer, probe and lib tests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: bpf-load-inputs
@@ -329,14 +344,18 @@ jobs:
           # driver's own verdict line, pinning the pass to OVERALL: PASS
           # even if a future driver exits 0 on a FAIL table (P2F-5 F2).
           grep -q '^# OVERALL: PASS$' "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
-      - name: Check one stock pre-Multi host refuses before capture side effects
+      - name: Check each stock pre-Multi host refuses before capture side effects
         if: matrix.refusal_control == true
         shell: bash
         run: |
           (cd "$GITHUB_WORKSPACE/bpf-load-inputs" && sha256sum --check SHA256SUMS)
-          chmod +x "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope"
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope" "$GITHUB_WORKSPACE/bpf-load-inputs/lib-tests"
           mkdir -p "$GITHUB_WORKSPACE/bpf-load-out"
-          python3 -I scripts/check-multi-host-refusal.py \
+          denial_args=()
+          if [ -n "${{ matrix.denial_branch }}" ]; then
+            denial_args=(--libtest "$GITHUB_WORKSPACE/bpf-load-inputs/lib-tests" --denial "${{ matrix.denial_branch }}")
+          fi
+          python3 -I scripts/check-multi-host-refusal.py "${denial_args[@]}" \
             "$GITHUB_WORKSPACE/bpf-load-inputs/p11scope" \
             "$GITHUB_WORKSPACE/bpf-load-out/refusal-${{ matrix.kernel }}" "${{ matrix.kernel }}" \
             | tee "$GITHUB_WORKSPACE/bpf-load-out/table-${{ matrix.kernel }}.txt"
@@ -611,6 +630,92 @@ jobs:
             ${{ github.workspace }}/bpf-load-gate1-journal/out/results.jsonl
           if-no-files-found: error
           retention-days: 7
+  # Kernel-sensitive lib cells in guests: PID-scope tiers, PID-filter
+  # Multi cells, the identity iterator, counter readers and the uretprobe
+  # hazard probe (scripts/ci/lib-cells-vng.sh). One guest per kernel; the
+  # script judges every cell and exits nonzero on any failure.
+  lib-cells-kernels:
+    needs: bpf-load-build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [v6.6.157, v6.12.111]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Scripts only (the guest driver); no test runs here.
+          fetch-depth: 1
+      - name: Enable KVM for the runner user
+        shell: bash
+        run: |
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static gcc qemu-system-x86 qemu-utils seabios ipxe-qemu
+      - name: Install pinned virtme-ng
+        shell: bash
+        run: |
+          pipx install "virtme-ng==$CI_VNG_VERSION"
+          bindir=$(pipx environment --value PIPX_BIN_DIR)
+          test "$("$bindir/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
+          echo "$bindir" >>"$GITHUB_PATH"
+      # Cache keys (as in ci.yml): the runner image, so an image update
+      # starts the kernel cache cold.
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/virtme-ng/${{ matrix.kernel }}
+          key: vng-kernel-${{ matrix.kernel }}-vng-${{ env.CI_VNG_VERSION }}-${{ steps.keys.outputs.image }}
+      # Same checksum gate as the load jobs: download without booting,
+      # then verify the exact deb set before the first boot.
+      - name: Verify the kernel download
+        shell: bash
+        run: |
+          vng --dry-run --run "${{ matrix.kernel }}" >/dev/null
+          VNGD="$HOME/.cache/virtme-ng/${{ matrix.kernel }}/amd64"
+          SUMS="$GITHUB_WORKSPACE/tests/fixtures/vng-kernel-sha256sums/${{ matrix.kernel }}.sums"
+          (cd "$VNGD" && sha256sum --check "$SUMS") || { echo "kernel integrity check failed: ${{ matrix.kernel }}" >&2; exit 1; }
+          test "$(cd "$VNGD" && ls -1q *.deb | wc -l)" -eq "$(wc -l < "$SUMS")" || { echo "kernel deb set changed: ${{ matrix.kernel }} (re-record the sums)" >&2; exit 1; }
+      - name: Download the observer, probe and lib tests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bpf-load-inputs
+          # Under the workspace (hence under $HOME): vng hides host /tmp
+          # and /var/tmp from the guest, and the driver passes these
+          # paths into the guest command.
+          path: bpf-load-inputs
+      - name: Run the lib-cell subset in this kernel's guest
+        shell: bash
+        run: |
+          (cd "$GITHUB_WORKSPACE/bpf-load-inputs" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$GITHUB_WORKSPACE/bpf-load-inputs/lib-tests"
+          mkdir -p "$GITHUB_WORKSPACE/lib-cells-out"
+          scripts/ci/lib-cells-vng.sh \
+            "$GITHUB_WORKSPACE/bpf-load-inputs/lib-tests" \
+            "$GITHUB_WORKSPACE/lib-cells-out" "${{ matrix.kernel }}"
+      - name: Upload the cell results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lib-cells-${{ matrix.kernel }}
+          path: |
+            ${{ github.workspace }}/lib-cells-out/results.jsonl
+            ${{ github.workspace }}/lib-cells-out/${{ matrix.kernel }}/status.txt
+            ${{ github.workspace }}/lib-cells-out/${{ matrix.kernel }}/uname.txt
+            ${{ github.workspace }}/lib-cells-out/${{ matrix.kernel }}/vng-console.log
+            ${{ github.workspace }}/lib-cells-out/${{ matrix.kernel }}/cell-*.log
+          if-no-files-found: error
+          retention-days: 7
   # No VM: load every BPF program on the runner kernel itself with sudo
   # and file the same table.
   bpf-load-host:
@@ -622,7 +727,7 @@ jobs:
         with:
           # The report script only; no custody test runs here.
           fetch-depth: 1
-      - name: Download the observer and probe
+      - name: Download the observer, probe and lib tests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: bpf-load-inputs

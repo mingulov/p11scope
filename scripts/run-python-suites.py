@@ -117,6 +117,7 @@ RUN = [
     ("test_key_operations_system.py", []),
     ("test_kubernetes_runtime.py", []),
     ("test_kubernetes_runtime_workflow.py", []),
+    ("test_lib_cells_vng.py", []),
     ("test_loader.py", []),
     ("test_loader_lifetimes.py", []),
     ("test_matched_cost_run.py", []),
@@ -159,6 +160,7 @@ RUN = [
     ("test_system_test_manifest.py", []),
     ("test_t7_campaign.py", []),
     ("test_uprobe_close_throughput_probe.py", []),
+    ("test_vng_wrapper_exits.py", []),
 ]
 
 _ARTIFACT_CONTRACTS = "tests/artifact_contracts.rs"

@@ -239,5 +239,120 @@ class CombinedRefusalTests(unittest.TestCase):
                 self.check(self.observer, self.work)
 
 
+FAKE_LIBTEST = r'''#!/usr/bin/env python3
+import os,sys
+assert 'inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed' in sys.argv, sys.argv
+assert '--exact' in sys.argv and '--ignored' in sys.argv
+mode=os.environ.get('FAKE_DENIAL_CELL','denied')
+if mode in ('denied','eligible'):
+    print('IDENTITY_515_DENIAL outcome=%s reason=kernel_fix_missing bpf_delta=0' % mode,file=sys.stderr)
+    print('test result: ok. 1 passed');sys.exit(0)
+if mode=='no-marker':
+    print('test result: ok. 1 passed');sys.exit(0)
+if mode=='zero-passed':
+    print('test result: ok. 0 passed');sys.exit(0)
+print('boom',file=sys.stderr);sys.exit(1)
+'''
+
+
+@contextmanager
+def _disk(path):
+    yield path
+
+
+class DenialCellTests(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue(SCRIPT.is_file(), "combined unsupported-host driver is missing")
+        self.temp = tempfile.TemporaryDirectory(prefix="denial-cell-")
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+        self.libtest = self.work / "lib-tests"
+        self.libtest.write_text(FAKE_LIBTEST)
+        self.libtest.chmod(0o700)
+        self.check = runpy.run_path(str(SCRIPT))["check_denial_cell"]
+
+    def test_denied_branch_is_disclosed(self):
+        with patch.dict(os.environ, {"FAKE_DENIAL_CELL": "denied"}):
+            row = self.check(self.libtest, self.work, "denied")
+        self.assertEqual((row["case"], row["outcome"], row["rc"]),
+                         ("identity-515-denial", "disclosed", 0))
+        self.assertEqual(row["reason"], "IDENTITY_515_DENIAL outcome=denied")
+
+    def test_eligible_branch_is_disclosed(self):
+        with patch.dict(os.environ, {"FAKE_DENIAL_CELL": "eligible"}):
+            row = self.check(self.libtest, self.work, "eligible")
+        self.assertEqual((row["case"], row["outcome"], row["rc"]),
+                         ("identity-515-denial", "disclosed", 0))
+
+    def test_wrong_expected_branch_fails(self):
+        with patch.dict(os.environ, {"FAKE_DENIAL_CELL": "denied"}):
+            with self.assertRaisesRegex(RuntimeError, "IDENTITY_515_DENIAL"):
+                self.check(self.libtest, self.work, "eligible")
+
+    def test_missing_marker_fails(self):
+        with patch.dict(os.environ, {"FAKE_DENIAL_CELL": "no-marker"}):
+            with self.assertRaisesRegex(RuntimeError, "missing"):
+                self.check(self.libtest, self.work, "denied")
+
+    def test_zero_passes_and_nonzero_exit_fail(self):
+        for mode, pattern in (("zero-passed", "exactly one pass"),
+                              ("rc1", "nonzero")):
+            with self.subTest(mode=mode), \
+                    patch.dict(os.environ, {"FAKE_DENIAL_CELL": mode}):
+                with self.assertRaisesRegex(RuntimeError, pattern):
+                    self.check(self.libtest, self.work, "denied")
+
+    def test_unknown_branch_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "denied or eligible"):
+            self.check(self.libtest, self.work, "bogus")
+
+    def test_guest_runs_the_denial_cell_when_metadata_requests_it(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        observer = self.work / "p11scope"
+        observer.write_text("observer")
+        libtest = self.work / "lib-tests"
+        libtest.write_text("libtest")
+        metadata = {"kernel": "v" + os.uname().release,
+                    "runner_uid": self.work.stat().st_uid,
+                    "denial": "denied",
+                    "sha256": {"p11scope": namespace["digest"](observer),
+                               "lib-tests": namespace["digest"](libtest)}}
+        (self.work / "inputs.json").write_text(json.dumps(metadata))
+        seen = {}
+
+        def fake_denial(path, work, expect, progress=None):
+            seen.update(path=path, expect=expect, progress=progress)
+            return {"case": "identity-515-denial", "outcome": "disclosed"}
+
+        with tempfile.TemporaryDirectory(prefix="guest-disk-",
+                                         dir=self.work.parent) as temp, \
+                patch("os.geteuid", return_value=0), \
+                patch.dict(namespace["guest"].__globals__,
+                           {"check_commands": lambda *a, **k: [],
+                            "check_denial_cell": fake_denial,
+                            "guest_disk_work": lambda stage: _disk(Path(temp))}):
+            namespace["guest"](self.work)
+        self.assertEqual(seen["path"], self.work / "lib-tests")
+        self.assertEqual(seen["expect"], "denied")
+        cases = json.loads((self.work / "result.json").read_text())["cases"]
+        self.assertEqual([row["case"] for row in cases],
+                         ["identity-515-denial"])
+
+    def test_denial_options_are_required_together(self):
+        main = runpy.run_path(str(SCRIPT))["main"]
+        base = ["check-multi-host-refusal.py", str(self.libtest),
+                str(self.work / "stage"), "v5.15.221"]
+        with patch.object(sys, "argv", base[:1] + ["--libtest", str(self.libtest)] + base[1:]):
+            with self.assertRaisesRegex(SystemExit, "2"):
+                main()
+        with patch.object(sys, "argv", base[:1] + ["--denial", "denied"] + base[1:]):
+            with self.assertRaisesRegex(SystemExit, "2"):
+                main()
+        with patch.object(sys, "argv", base[:1] + ["--libtest", str(self.libtest),
+                                                   "--denial", "bogus"] + base[1:]):
+            with self.assertRaisesRegex(SystemExit, "2"):
+                main()
+
+
 if __name__ == "__main__":
     unittest.main()

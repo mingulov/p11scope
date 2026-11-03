@@ -11,13 +11,14 @@
 # Layout: a SoftHSM token, a user-owned `p11-kit server` on the default
 # socket, and `pkcs11-tool -O --login` under `p11scope run --pause auto`.
 # Oracle: the same workload against libsofthsm2.so directly. Twins: a
-# provider+closure capture (`trust list`) in two halves — twin 1 pins the
-# template prefix present with any count (stable under load, green even
-# when starved), twin 1b re-runs the workload until the trust backend is
-# admitted with a substantial count or all N attempts stay tiny
-# (systematic starvation fails, one loader-timing flake does not) — and
-# the remote workload with `--exclude-module` (excluded to 0, reported
-# "excluded by you").
+# provider+closure capture (`trust list`) in two halves — twin 1 requires
+# a counted run and records the closure shape (a `run` capture maps the
+# closure mid-capture, so usually no prefix record), twin 1b re-runs the
+# workload until the trust backend is admitted with a substantial count
+# or all N attempts stay tiny (systematic starvation fails, one
+# loader-timing flake does not) and fails on any non-closure refusal or
+# omission — and the remote workload with `--exclude-module` (excluded
+# to 0, reported "excluded by you").
 #
 # Needs root for the observer (sudo -n), plus p11-kit, opensc (pkcs11-tool),
 # softhsm2 and trust on PATH. Provider paths are probed (Debian and Fedora
@@ -298,9 +299,11 @@ def main(binary, work, keep):
         print("remote is direct minus C_GetFunctionList: the client entry point "
               "is served from its own code, never a closure slot")
 
-        # Twin 1: provider + closure array together. Stable by design:
-        # the template prefix is present with any count, green even when
-        # the backend is starved — twin 1b below guards the admission.
+        # Twin 1: provider + closure array together. The closure shape is
+        # recorded, not pinned: a `run` capture maps the closure
+        # mid-capture, so it admits its published tables with no prefix
+        # record (a prefix appears only on the late-start race) — twin 1b
+        # below guards the admission.
         trust_doc, _ = capture_until_counted(
             binary, conf, work, "trust",
             lambda out: ["run", "--pause", "auto", "-o", str(out),
@@ -310,11 +313,14 @@ def main(binary, work, keep):
         trust_prefix = doc_template(trust_doc, "libp11-kit.so.0")
         if trust_prefix is None:
             trust_prefix = doc_template(trust_doc, "libp11-kit.so")
-        require(trust_prefix is not None, "trust report names no template prefix")
         require(trust_total > 0, "trust counted nothing")
         results["trust"] = {"total": trust_total, "prefix": trust_prefix}
-        print("trust twin: %d calls, libp11-kit prefix %d of %d"
-              % (trust_total, *trust_prefix))
+        if trust_prefix is None:
+            print("trust twin: %d calls, mid-capture closure without a prefix record"
+                  % trust_total)
+        else:
+            print("trust twin: %d calls, libp11-kit prefix %d of %d"
+                  % (trust_total, *trust_prefix))
 
         # Twin 1b: the trust backend must be ADMITTED, not only prefixed.
         # Twin 1 passes even when starved (7 calls locally, 11 on Fedora);

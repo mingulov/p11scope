@@ -389,9 +389,10 @@ enum AdmissionClass {
     /// that provider is attached, and the whole array (~6,656 endpoints)
     /// never fits, so it is admitted last in every scope: whole when it
     /// fits (late-start, reserve-capped), otherwise a reserve-capped
-    /// leading-templates prefix in a named scope when first seen, and its
-    /// published tables only when first mapped mid-capture — refused whole
-    /// when none of those admit.
+    /// leading-templates prefix in a named scope when first seen or when
+    /// its opened file matched an operator-named `--module` input, and
+    /// its published tables only when first mapped mid-capture unnamed —
+    /// refused whole when none of those admit.
     ClosureArray,
 }
 
@@ -624,10 +625,11 @@ pub enum AdmissionScope {
     /// array is decided after every provider: whole when it fits
     /// (late-start, reserve-capped), otherwise a reserve-capped
     /// leading-templates prefix only when first seen in the capture's first
-    /// plan — the prefix never takes the [`shared_scope_reserve`] slots, so
-    /// a provider decoded later still fits — and its published tables only
-    /// when first mapped mid-capture. A later provider that still does not
-    /// fit is refused by name with the `--exclude-module` remedy.
+    /// plan or when operator-named — the prefix never takes the
+    /// [`shared_scope_reserve`] slots, so a provider decoded later still
+    /// fits — and its published tables only when first mapped mid-capture
+    /// unnamed. A later provider that still does not fit is refused by name
+    /// with the `--exclude-module` remedy.
     #[default]
     Named,
     /// Cgroup or system scope without `--module` (GT-5). Every process in
@@ -2505,6 +2507,12 @@ struct Discovered<'a> {
     object: PinnedObjectId,
     key: ObjectKey,
     path: &'a str,
+    /// The scanned piece's opened file matched an operator-named `--module`
+    /// input (scan-time match, carried from
+    /// [`crate::discovery::scan::ScannedModule::module_hint`]). The
+    /// operator-named closure exception reads it; manifest and prearm
+    /// pieces carry `false`.
+    module_named: bool,
     source: &'static str,
     tables: Vec<TableSummary>,
     interfaces: usize,
@@ -2677,11 +2685,13 @@ fn merge(
         order.sort_by_key(|&position| classes[position].0 == AdmissionClass::ClosureArray);
     }
     let reserve = shared_scope_reserve(capacity);
-    // PA-5 C1: the heuristic closure prefix is allowed only for a closure
-    // object already mapped when the capture's first plan was built (the
-    // late-start case). A closure first mapped during the capture never gets
-    // the prefix; it admits only its publication-authorized tables below.
-    // Generic object identity only — no provider names, offsets or symbols.
+    // PA-5 C1 plus the operator-named exception: the heuristic closure
+    // prefix is allowed only for a closure object already mapped when the
+    // capture's first plan was built (the late-start case), or whose
+    // opened file matched an operator-named `--module` input. Any other
+    // closure first mapped during the capture never gets the prefix; it
+    // admits only its publication-authorized tables below. Generic object
+    // identity only — no provider names, offsets or symbols.
     // Retired slots stay allocated for the capture lifetime and are never
     // reused; refusals say so apart from the active endpoints.
     let retired = allocated.slots.saturating_sub(existing_slots.len());
@@ -2721,21 +2731,27 @@ fn merge(
             None => true,
             Some(first) => first.contains(&object),
         };
-        // PA-5 C1+C2+M3: a Detailed closure array in a named scope, late-
-        // start, with no provider refused or omitted ahead of it, falls back
-        // to its leading-templates prefix when whole does not fit — outside
+        // Operator-named exception: any scan piece of this object matched an
+        // operator-named `--module` input at scan time. Generic object
+        // identity only — no provider names, offsets or symbols.
+        let closure_named = group.iter().any(|module| module.module_named);
+        // PA-5 C1+C2+M3 plus the operator-named exception: a Detailed
+        // closure array in a named scope, late-start or operator-named,
+        // with no provider refused or omitted ahead of it, falls back to
+        // its leading-templates prefix when whole does not fit — outside
         // the reserve, so a provider decoded later still fits. Shared scope
-        // stays whole-or-nothing for closures (no prefix); a mid-capture
-        // closure admits only its published tables below, never a prefix.
+        // stays whole-or-nothing for closures (no prefix); an unnamed
+        // mid-capture closure admits only its published tables below.
         let closure_prefix_allowed = is_detailed_closure
             && !shared
-            && closure_late_start
+            && (closure_late_start || closure_named)
             && !provider_refused
             && !provider_omitted;
         // PA-5 C2+M4: shared scope admits every non-operator module whole or
         // not at all (closures included, no prefix); a Detailed closure
         // admitted whole respects the reserve cap and the first-plan rule —
-        // mid-capture closures skip whole entirely for published-only below.
+        // mid-capture closures skip whole entirely, for published-only below
+        // (or the prefix attempt when operator-named).
         // Inventory/Counters and broad admit keep their complete-union whole.
         let whole_original = broad_admit
             || admission_policy.admits_complete_validated_union()
@@ -2748,15 +2764,19 @@ fn merge(
         // reserve as before.
         let reserved = if is_detailed_closure {
             // Late-start starts whole (reserve-capped, M4); mid-capture
-            // starts published-only (full budget, corroborated tables).
-            // The retries below re-cap accordingly.
+            // starts published-only (full budget, corroborated tables) or
+            // at the reserve-capped prefix attempt when operator-named.
+            // The passes below re-cap accordingly.
             closure_late_start
         } else {
             shared && class.leaves_reserve()
         };
         // Mid-capture Detailed closures admit published tables only, never
-        // whole and never a heuristic prefix.
-        let closure_published_only_first = is_detailed_closure && !closure_late_start;
+        // whole and never a heuristic prefix — unless operator-named with
+        // the prefix allowed, in which case the first pass below is the
+        // prefix attempt itself. The exception never grants whole.
+        let closure_published_only_first =
+            is_detailed_closure && !closure_late_start && !closure_prefix_allowed;
         let budget = GroupBudget {
             policy: admission_policy,
             ceiling: if reserved {
@@ -2800,17 +2820,18 @@ fn merge(
         // first pass spilled before the refusal would be counted again on
         // the retry — a double spill alongside the omission.
         let spill_baseline = uncorroborated_candidates;
-        // PA-5 C1: late-start whole first; on whole failure a prefix-allowed
-        // closure retries as a K4 prefix, then (or directly, when the prefix
-        // is blocked or admits nothing) as published-tables-only. Mid-capture
-        // closures start published-only, never whole and never a prefix.
-        let mut use_prefix_fallback = false;
+        // PA-5 C1 plus the operator-named exception: late-start whole
+        // first; on whole failure a prefix-allowed closure retries as a K4
+        // prefix, then (or directly, when the prefix is blocked or admits
+        // nothing) as published-tables-only. An operator-named mid-capture
+        // closure starts at the prefix attempt and retries published-only;
+        // other mid-capture closures start published-only and never retry.
+        let mut use_prefix_fallback =
+            is_detailed_closure && !closure_late_start && closure_prefix_allowed;
         let mut use_published_fallback = false;
         let outcome = 'admission: loop {
             let published_only = closure_published_only_first || use_published_fallback;
-            let whole = if published_only
-                || (closure_prefix_allowed && use_prefix_fallback)
-            {
+            let whole = if published_only || (closure_prefix_allowed && use_prefix_fallback) {
                 false
             } else {
                 whole_original
@@ -3192,12 +3213,15 @@ fn merge(
                 uncorroborated_candidates = spill_baseline;
                 continue 'admission;
             }
-            // PA-5 C1: a late-start Detailed closure with nothing to keep
-            // retries whole, then prefix (when allowed), then published-only.
-            // Whole never spills, so the baseline resets are exact. Shared
-            // scope and prefix-blocked closures retry published-only
-            // directly; mid-capture closures start there and never retry.
-            if is_detailed_closure && closure_late_start && kept.is_empty() {
+            // PA-5 C1 plus the operator-named exception: a late-start
+            // Detailed closure with nothing to keep retries whole, then
+            // prefix (when allowed), then published-only; an operator-named
+            // mid-capture closure retries its prefix as published-only.
+            // Prefix and whole never spill, so the baseline resets are
+            // exact. Shared scope, prefix-blocked, and unnamed mid-capture
+            // closures never retry.
+            if is_detailed_closure && kept.is_empty() && (closure_late_start || use_prefix_fallback)
+            {
                 if closure_prefix_allowed && !use_prefix_fallback && !use_published_fallback {
                     use_prefix_fallback = true;
                     uncorroborated_candidates = spill_baseline;
@@ -4193,6 +4217,7 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
         object: module.object,
         key: scanned.key,
         path: &scanned.path,
+        module_named: module.scanned.module_hint.is_some(),
         source: "scan",
         tables,
         interfaces: scanned.interfaces.len(),
@@ -4447,6 +4472,7 @@ fn lower_manifest(
             // resolved into, which for a forwarded entry is a dependency, not this.
             key,
             path: &m.module_path,
+            module_named: false,
             source: "manifest",
             tables,
             interfaces: m
@@ -4505,6 +4531,7 @@ fn lower_prearm(piece: &PrearmPlanPiece) -> Discovered<'_> {
         object: piece.object,
         key: piece.key,
         path: &piece.path,
+        module_named: false,
         source: "prearm",
         tables: Vec::new(),
         interfaces: 0,
@@ -4734,6 +4761,10 @@ struct OwnedPiece {
     object: PinnedObjectId,
     key: ObjectKey,
     path: String,
+    /// The scanned piece's opened file matched an operator-named `--module`
+    /// input, carried from [`Discovered::module_named`] so the stop-time
+    /// owned copy preserves the signal every admission pass reads.
+    module_named: bool,
     source: &'static str,
     tables: Vec<TableSummary>,
     interfaces: usize,
@@ -4749,6 +4780,7 @@ fn own_piece(piece: Discovered<'_>) -> OwnedPiece {
         object: piece.object,
         key: piece.key,
         path: piece.path.to_owned(),
+        module_named: piece.module_named,
         source: piece.source,
         tables: piece.tables,
         interfaces: piece.interfaces,
@@ -6635,6 +6667,7 @@ mod tests {
             object,
             entry_objects: vec![vec![object; entries.len()]],
             scanned: ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
                 view: ProcessViewId(0),
@@ -8602,6 +8635,7 @@ mod tests {
                 inode: u64::from(object.0),
             },
             path,
+            module_named: false,
             source: "manifest",
             tables: vec![],
             interfaces: 0,
@@ -13167,6 +13201,144 @@ mod tests {
         );
         assert_eq!(
             first.uncorroborated_candidates, 64,
+            "the 64 heuristic templates spill as evidence"
+        );
+    }
+
+    /// Operator-named exception: a mid-capture closure whose opened file
+    /// matched a `--module` path gets the heuristic prefix (the Part 0
+    /// remote-client shape: `run --module <client>` maps the closure after
+    /// the first plan). Reserve-capped, like the late-start prefix.
+    #[test]
+    fn mid_capture_closure_named_by_module_gets_prefix() {
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let first = empty.rebuild_from_sources(
+            std::slice::from_ref(&closure),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        // Nothing else admitted, reserve-capped ceiling 384: 3 tables (309)
+        // fit, the 4th would take the reserve.
+        assert_eq!(
+            slots_of(&first, 31),
+            3 * 103,
+            "the named mid-capture closure takes its prefix"
+        );
+        let partial = refusal_of(&first, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("3 of 64 template tables attached"),
+            "{}",
+            partial.reason
+        );
+    }
+
+    /// Operator-named exception with several `--module` paths: the named
+    /// non-closure module is admitted first and in full, and the named
+    /// closure's prefix fits only the remaining budget outside the
+    /// reserve — in either discovery order.
+    #[test]
+    fn two_module_paths_admit_provider_first_then_closure_prefix() {
+        for order in ["closure-first", "provider-first"] {
+            let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+            closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+            let mut provider = provider_with_tables(33, SOFTHSM, 1, 68, false);
+            provider.scanned.module_hint = Some(std::path::PathBuf::from(SOFTHSM));
+            let input = if order == "closure-first" {
+                vec![closure, provider]
+            } else {
+                vec![provider, closure]
+            };
+            let empty = scoped_plan(&[], AdmissionScope::Named);
+            let settled = empty.rebuild_from_sources(&input, &[], &PinnedObjects::empty());
+            assert_eq!(
+                slots_of(&settled, 33),
+                68,
+                "the named provider is admitted in full: {order}"
+            );
+            // 68 in use, reserve-capped ceiling 384: 3 tables (309) fit.
+            assert_eq!(
+                slots_of(&settled, 31),
+                3 * 103,
+                "the named closure prefixes after the provider: {order}"
+            );
+            assert!(
+                refusal_of(&settled, SOFTHSM).is_none(),
+                "the provider carries no refusal: {:?}",
+                settled.modules_skipped
+            );
+            let partial = refusal_of(&settled, P11_KIT).expect("prefix partial reported");
+            assert!(
+                partial.reason.contains("3 of 64 template tables attached"),
+                "{}",
+                partial.reason
+            );
+        }
+    }
+
+    /// PA-7 twin: the stop-time owned copy preserves the operator-named
+    /// signal, and a later rebuild over settled providers (the stop-time
+    /// rebuild shape: the first plan is carried, the closure arrives in
+    /// the rebuild input) admits the reserve-capped prefix for the
+    /// operator-named closure and still applies C1 published-only to the
+    /// unnamed one. Generic object identity only — no provider names,
+    /// offsets or symbols.
+    #[test]
+    fn stop_time_rebuild_applies_the_operator_named_exception() {
+        let provider = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let mut named = provider_with_tables(31, P11_KIT, 64, 103, false);
+        named.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let unnamed = provider_with_tables(31, P11_KIT, 64, 103, false);
+        // The stop-time owned copy keeps the scan-time signal.
+        assert!(
+            own_piece(lower_scanned(&named)).module_named,
+            "the stop-time copy keeps the operator-named signal"
+        );
+        assert!(
+            !own_piece(lower_scanned(&unnamed)).module_named,
+            "an unnamed closure stays unnamed through the stop-time copy"
+        );
+        // Providers settled in the first plan; the closure arrives later.
+        let settled = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Named);
+        assert_eq!(slots_of(&settled, 33), 68, "the provider settles whole");
+        // Named: the reserve-capped prefix after the provider.
+        let rebuilt =
+            settled.rebuild_from_sources(&[provider.clone(), named], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&rebuilt, 33), 68, "the provider stays whole");
+        // 68 in use, reserve-capped ceiling 384: 3 tables (309) fit.
+        assert_eq!(
+            slots_of(&rebuilt, 31),
+            3 * 103,
+            "the named closure takes its prefix in the later rebuild"
+        );
+        let partial = refusal_of(&rebuilt, P11_KIT).expect("prefix partial reported");
+        assert!(
+            partial.reason.contains("3 of 64 template tables attached"),
+            "{}",
+            partial.reason
+        );
+        // Unnamed: C1 published-only, never the prefix.
+        let mut lone = provider_with_tables(31, P11_KIT, 65, 68, false);
+        lone.scanned.tables[64].live_return = true;
+        assert!(
+            !own_piece(lower_scanned(&lone)).module_named,
+            "the C1 closure stays unnamed through the stop-time copy"
+        );
+        let settled = scoped_plan(std::slice::from_ref(&provider), AdmissionScope::Named);
+        let rebuilt = settled.rebuild_from_sources(&[provider, lone], &[], &PinnedObjects::empty());
+        assert_eq!(
+            slots_of(&rebuilt, 31),
+            68,
+            "only the published table attaches, no heuristic prefix"
+        );
+        assert!(
+            refusal_of(&rebuilt, P11_KIT).is_none(),
+            "published-only admission carries no prefix record: {:?}",
+            rebuilt.modules_skipped
+        );
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 64,
             "the 64 heuristic templates spill as evidence"
         );
     }

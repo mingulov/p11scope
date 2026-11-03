@@ -20251,6 +20251,7 @@ mod tests {
                 inode: mapping.inode,
             };
             let module = crate::discovery::scan::ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
                 view: view.id(),

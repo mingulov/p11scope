@@ -1471,6 +1471,7 @@ pub(crate) mod tests {
             object,
             entry_objects: vec![entry_objects],
             scanned: ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
                 view: ProcessViewId(0),

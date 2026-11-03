@@ -174,7 +174,9 @@ layer was captured. A live Detailed capture admits a late-start closure (one
 already mapped when the capture's first plan is built) as a reserve-capped
 leading-templates prefix with a named partial gap when no provider was
 refused or omitted; a closure first mapped mid-capture admits only its
-published tables. The terminal report names each refused or partially
+published tables, unless its opened file matches an operator-named
+`--module` path, which admits the reserve-capped prefix after the named
+non-closure modules. The terminal report names each refused or partially
 covered module
 with its reason: `run` and `profile` print a `Module gaps` section with the
 first five and an "and K more" line, and `inventory` prints the admission

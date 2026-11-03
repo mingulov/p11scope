@@ -576,6 +576,7 @@ fn owning_module_for_test(
         .collect::<Vec<_>>();
     crate::discovery::identity::ReconciledModule {
         scanned: ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             view: crate::process::ProcessViewId(0),
             mount_namespace,

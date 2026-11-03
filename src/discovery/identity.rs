@@ -4176,6 +4176,15 @@ mod conservative_copy {
                 .ok_or(GraphRefusal::Overflow)
         }
 
+        fn charge_hint(hint: &std::path::Path) -> Result<usize, GraphRefusal> {
+            use std::os::unix::ffi::OsStrExt as _;
+            hint.as_os_str()
+                .as_bytes()
+                .len()
+                .checked_add(OWNED_ALLOCATION_PADDING)
+                .ok_or(GraphRefusal::Overflow)
+        }
+
         fn normalization_bound(path: &str) -> Result<usize, GraphRefusal> {
             text_bytes(path)?
                 .checked_add(bytes_for::<usize>(path.len() / 2 + 1)?)
@@ -4555,6 +4564,9 @@ mod conservative_copy {
                 match self.stage {
                     0 => {
                         add(&mut self.bytes, charge_text(&source.path)?)?;
+                        if let Some(hint) = source.module_hint.as_ref() {
+                            add(&mut self.bytes, charge_hint(hint)?)?;
+                        }
                         add(
                             &mut self.bytes,
                             bytes_for::<String>(source.exports.capacity())?,
@@ -7806,6 +7818,7 @@ pub(crate) mod test_fixture {
 
     pub(crate) fn module(key: ObjectKey) -> ScannedModule {
         ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
             view: ProcessViewId(key.device.minor as u32),
@@ -8937,6 +8950,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
             view: view.id(),
@@ -9049,6 +9063,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
             view: view.id(),
@@ -9123,6 +9138,7 @@ mod tests {
         let mapping = mapping_file_key(&file).unwrap();
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let module = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             double_loaded: false,
             view: view.id(),
@@ -10903,6 +10919,7 @@ mod tests {
         let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
         let read = FileIdentity { dev: 37, ino: 9 };
         let module = |mapped_identity| ScannedModule {
+            module_hint: None,
             mapped_identity,
             double_loaded: false,
             view: view.id(),
@@ -13962,6 +13979,42 @@ mod tests {
             required.unwrap(),
             total,
             "cursor input accounting matches the standalone measure"
+        );
+    }
+
+    #[test]
+    fn scanned_input_measure_charges_the_operator_module_hint() {
+        use crate::discovery::scan::ScannedModule;
+        use std::os::unix::ffi::OsStrExt as _;
+        let key = overlay(9);
+        let plain = module(key);
+        let mut named = module(key);
+        named.module_hint = Some(PathBuf::from("/opt/operator/provider.so"));
+        let measured = |source: &ScannedModule| {
+            let mut measure = ScannedInputMeasure::new(1).unwrap();
+            for _ in 0..4096 {
+                if measure.step(source).unwrap() {
+                    return measure.bytes();
+                }
+            }
+            panic!("the tiny module must measure over finite steps");
+        };
+        let plain_bytes = measured(&plain);
+        let named_bytes = measured(&named);
+        let hint_len = named
+            .module_hint
+            .as_ref()
+            .unwrap()
+            .as_os_str()
+            .as_bytes()
+            .len();
+        let expected = hint_len
+            .checked_add(crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)
+            .unwrap();
+        assert_eq!(
+            named_bytes - plain_bytes,
+            expected,
+            "the hint bytes are reserved with the row"
         );
     }
 

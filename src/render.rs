@@ -5350,6 +5350,7 @@ pub(crate) mod tests {
             object,
             entry_objects: vec![vec![object, object], vec![object]],
             scanned: ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
                 view: ProcessViewId(0),
@@ -5460,6 +5461,7 @@ pub(crate) mod tests {
             object: crate::plan::TEST_PINNED_OBJECT,
             entry_objects: vec![vec![crate::plan::TEST_PINNED_OBJECT]],
             scanned: ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
                 view: ProcessViewId(0),

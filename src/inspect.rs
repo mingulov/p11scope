@@ -922,6 +922,7 @@ mod tests {
     fn sample() -> ScanOutcome {
         ScanOutcome::Scanned {
             modules: vec![ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
                 view: crate::process::ProcessViewId(0),
@@ -1107,6 +1108,7 @@ mod tests {
         let outcome = ScanOutcome::Unavailable {
             reason: "ptrace",
             modules: vec![ScannedModule {
+                module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
                 view: crate::process::ProcessViewId(0),

@@ -4797,8 +4797,9 @@ struct OwnedPiece {
     key: ObjectKey,
     path: String,
     /// The scanned piece's opened file matched an operator-named `--module`
-    /// input, carried from [`Discovered::module_named`] so the stop-time
-    /// owned copy preserves the signal every admission pass reads.
+    /// input, carried from [`Discovered::module_named`]. Kept for copy
+    /// fidelity; the removal-only cursor never re-admits, so no admission
+    /// pass reads it back.
     module_named: bool,
     source: &'static str,
     tables: Vec<TableSummary>,
@@ -13448,14 +13449,14 @@ mod tests {
     }
 
     /// PA-7 twin: the stop-time owned copy preserves the operator-named
-    /// signal, and a later rebuild over settled providers (the stop-time
-    /// rebuild shape: the first plan is carried, the closure arrives in
-    /// the rebuild input) admits the reserve-capped prefix for the
-    /// operator-named closure and still applies C1 published-only to the
-    /// unnamed one. Generic object identity only — no provider names,
-    /// offsets or symbols.
+    /// signal (copy fidelity — the removal-only cursor never re-admits),
+    /// and a later rebuild over settled providers (the first plan is
+    /// carried, the closure arrives in the rebuild input) admits the
+    /// reserve-capped prefix for the operator-named closure and still
+    /// applies C1 published-only to the unnamed one. Generic object
+    /// identity only — no provider names, offsets or symbols.
     #[test]
-    fn stop_time_rebuild_applies_the_operator_named_exception() {
+    fn stop_time_copy_preserves_the_signal_that_rebuild_applies() {
         let provider = provider_with_tables(33, SOFTHSM, 1, 68, false);
         let mut named = provider_with_tables(31, P11_KIT, 64, 103, false);
         named.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));

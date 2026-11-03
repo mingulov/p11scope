@@ -2210,10 +2210,7 @@ pub(crate) fn export_agreement(
 /// a missing file owner, a getter in any symbol type, or a faulted walk
 /// all stay unproven. Callers publish through [`published_walk`], which
 /// adds the linked-table gate.
-fn proven_complete_legacy_prefix(
-    table: &ScannedTable,
-    exports: &ObjectExports<'_>,
-) -> bool {
+fn proven_complete_legacy_prefix(table: &ScannedTable, exports: &ObjectExports<'_>) -> bool {
     if !table.extension_impossible {
         return false;
     }

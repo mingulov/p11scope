@@ -56039,7 +56039,12 @@ fn stamped_legacy_publishers(
         .find(|surface| {
             surface.functions == 68 && surface.source.ends_with(&format!("table 3.{minor}"))
         })
-        .unwrap_or_else(|| panic!("{tag}: 68-function plan surface missing: {:?}", lowered.surfaces))
+        .unwrap_or_else(|| {
+            panic!(
+                "{tag}: 68-function plan surface missing: {:?}",
+                lowered.surfaces
+            )
+        })
         .walk
         .clone();
 
@@ -56065,8 +56070,8 @@ fn stamped_legacy_publishers(
         .surfaces
         .values()
         .map(|surface| {
-            let stamped = surface.functions == 68
-                && surface.source.ends_with(&format!("table 3.{minor}"));
+            let stamped =
+                surface.functions == 68 && surface.source.ends_with(&format!("table 3.{minor}"));
             (stamped, surface.walk.clone(), surface.functions)
         })
         .collect();
@@ -56109,7 +56114,11 @@ fn stamped_legacy_scan_merges_to_a_complete_engine_surface() {
             witness_fault: reconciled.witness_fault,
         };
         let reconciled_table = stamped_legacy_table(&tag, &reconciled.scanned, address);
-        assert_eq!(reconciled_table.entries.len(), 68, "{tag}: all slots retained");
+        assert_eq!(
+            reconciled_table.entries.len(),
+            68,
+            "{tag}: all slots retained"
+        );
         let agreement = crate::discovery::scan::export_agreement(reconciled_table, &exports);
         assert_eq!(
             (agreement.agreeing, agreement.disagreeing),
@@ -56176,7 +56185,11 @@ fn stamped_legacy_fixture_reports_no_surface_gap() {
         assert!(module.interfaces.is_empty(), "{tag}: no interfaces");
         let table = stamped_legacy_table(&tag, &module, address);
         assert_eq!(table.version, (3, minor), "{tag}");
-        assert_eq!(table.decoded_slot_count(), 68, "{tag}: complete 68-slot prefix");
+        assert_eq!(
+            table.decoded_slot_count(),
+            68,
+            "{tag}: complete 68-slot prefix"
+        );
         assert_eq!(
             table.walk, "known_prefix",
             "{tag}: the decoder still reports the declared-layout prefix"

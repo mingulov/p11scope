@@ -22,9 +22,16 @@ Six fail-closed gates:
   count and every budget refusal has a named gap; every gap carries a
   subject and a reason; gaps_suppressed == 0.
 - resource_accounting: the trace spans the window without stalls, RSS
-  stays within 256 MiB, and neither RSS nor FDs grow steadily
-  (last-quartile median within margin of the first quartile, with the
-  third quartile confirming a sustained rise rather than a spike).
+  stays within 256 MiB, and neither RSS nor FDs grow steadily after
+  arming completes. Growth is judged on samples at or after the
+  product-reported arming point (pass 0 published, carried as
+  run.json timing.t_go_sampler_ms in the sampler's clock domain):
+  the late-half floor (10th percentile) must stay within margin of
+  the early-half floor, so a bounded arming ramp and the
+  pass-synchronous FD sawtooth (module files pinned per pass) read
+  as flat while a real leak still fails. Without an arming point,
+  or with fewer than eight post-arming samples, the whole trace is
+  judged instead (fail closed).
 - journal_disclosure: key operations stay honestly unavailable with
   the journal_unavailable reason (they arrive in 0.6.0).
 - clean_exit: the sampler and every workload exited 0 (the observer
@@ -82,13 +89,18 @@ def strict_str(value, name):
     return value
 
 
-def median(sorted_values):
+def quantile(sorted_values, fraction):
+    """Linear-interpolated quantile of ascending values (0 <= fraction <= 1)."""
+    require(0 <= fraction <= 1, "quantile fraction out of range")
     count = len(sorted_values)
-    require(count > 0, "median of no values")
-    middle = count // 2
-    if count % 2:
-        return sorted_values[middle]
-    return (sorted_values[middle - 1] + sorted_values[middle]) / 2
+    require(count > 0, "quantile of no values")
+    if count == 1:
+        return sorted_values[0]
+    position = fraction * (count - 1)
+    low = int(position)
+    high = min(low + 1, count - 1)
+    weight = position - low
+    return sorted_values[low] * (1 - weight) + sorted_values[high] * weight
 
 
 class Evidence:
@@ -362,37 +374,54 @@ def gate_resource_accounting(evidence):
     worst_gap = max(b - a for a, b in zip(stamps, stamps[1:]))
     if worst_gap > 30_000:
         return False, f"sampler stalled for {worst_gap / 1000:.1f}s mid-window"
-    rss = [row[1] for row in rows]
-    hwm = [row[2] for row in rows]
-    fds = [row[3] for row in rows]
-    rss_max = max(rss)
+    rss_all = [row[1] for row in rows]
+    hwm_all = [row[2] for row in rows]
+    fds_all = [row[3] for row in rows]
+    rss_max = max(rss_all)
     if rss_max > RSS_LIMIT_KB:
         return False, f"rss_max {rss_max} KiB exceeds the 256 MiB bound"
-    growth = growth_check(rss, RSS_GROWTH_MARGIN_KB, "RSS")
+    # Growth is judged after arming completes: the vehicle stamps GO
+    # (pass 0 published, observed in the sampler's clock domain) into
+    # run.json. Without that point, or with fewer than eight
+    # post-arming samples, the whole trace is judged (fail closed).
+    timing = run.get("timing")
+    go_ms = timing.get("t_go_sampler_ms") if isinstance(timing, dict) else None
+    judged = rows
+    window = "whole trace judged (no arming point)"
+    if go_ms is not None:
+        require(type(go_ms) is int and go_ms >= 0,
+                "timing t_go_sampler_ms must be a nonnegative integer")
+        post = [row for row in rows if row[0] >= go_ms]
+        if len(post) >= 8:
+            judged = post
+            window = (f"growth judged on {len(judged)} of {len(rows)} samples "
+                      f"from arming at {go_ms}ms")
+    growth = growth_check([row[1] for row in judged], RSS_GROWTH_MARGIN_KB, "RSS")
     if growth:
-        return False, growth
-    growth = growth_check(fds, FD_GROWTH_MARGIN, "FDs")
+        return False, f"{growth} [{window}]"
+    growth = growth_check([row[3] for row in judged], FD_GROWTH_MARGIN, "FDs")
     if growth:
-        return False, growth
+        return False, f"{growth} [{window}]"
     return True, (f"{len(rows)} samples spanning {span_ms / 1000:.1f}s, worst gap "
-                  f"{worst_gap / 1000:.1f}s; rss_max={rss_max} hwm_max={max(hwm)} "
-                  f"KiB fds_max={max(fds)}")
+                  f"{worst_gap / 1000:.1f}s; rss_max={rss_max} "
+                  f"hwm_max={max(hwm_all)} KiB fds_max={max(fds_all)}; {window}")
 
 
 def growth_check(series, margin, label):
-    """Steady-growth veto: the last quartile must stay within margin of the
-    first, with the third quartile confirming a sustained rise (a lone
-    spike is bounded, not growth). Margins are absolute-or-quarter."""
+    """Steady-growth veto on the judged window: the late-half floor
+    (10th percentile) must stay within margin of the early-half floor.
+    A retained leak raises the floor; a bounded oscillation between
+    fixed levels (or a lone spike, or a detach tail dip) does not move
+    it. Margins are absolute-or-quarter of the early floor."""
     if len(series) < 8:
         return None
-    quarter = len(series) // 4
-    first = median(sorted(series[:quarter]))
-    third = median(sorted(series[2 * quarter:3 * quarter]))
-    last = median(sorted(series[3 * quarter:]))
-    allowed = max(margin, first / 4)
-    if last > first + allowed and third > first + allowed / 2:
-        return (f"{label} grows steadily: quartile medians first={first:.0f} "
-                f"third={third:.0f} last={last:.0f} (margin {allowed:.0f})")
+    half = len(series) // 2
+    floor_early = quantile(sorted(series[:half]), 0.10)
+    floor_late = quantile(sorted(series[half:]), 0.10)
+    allowed = max(margin, floor_early / 4)
+    if floor_late > floor_early + allowed:
+        return (f"{label} grows steadily: floor {floor_early:.0f} "
+                f"-> {floor_late:.0f} (margin {allowed:.0f})")
     return None
 
 

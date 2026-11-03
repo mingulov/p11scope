@@ -6741,6 +6741,80 @@ mod tests {
     }
 
     #[test]
+    fn k0_torn_unselected_row_refuses_as_broad_plan_topology() {
+        // The guard checks every windowed row before the slot
+        // filter: a tear confined to a non-selected row still
+        // refuses, because the aggregate is built scope-wide from
+        // the same deltas. Only slot 0 tears here (entered/returned
+        // 0 with `rv_counts {"0": 4}`); the selected slot 2 stays
+        // consistent.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        assert_eq!(resolved.slot, 2);
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let limits = limits_with_rvs(&scene.plan, 4);
+        let before = scripted_read_with_rvs(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            &vec![vec![(0, 100)]; scene.plan.slots.len()],
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits,
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read_with_rvs(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &[(100, 100, 0), (110, 110, 0), (110, 110, 0), (110, 110, 0)],
+            &[
+                vec![(0, 104)],
+                vec![(0, 110)],
+                vec![(0, 110)],
+                vec![(0, 110)],
+            ],
+            window_of(20, 30),
+        );
+        close_k0_window(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("broad_plan_topology"),
+            "a tear outside the selected slot still refuses"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_none(), "no detail on a refusal");
+        assert!(
+            section.get("aggregate").is_none(),
+            "no aggregate on a refusal"
+        );
+    }
+
+    #[test]
     fn k0_consistent_return_value_window_renders() {
         // The guard fires only on torn reads: a window whose
         // `rv_counts` sums equal their `returned` deltas renders, with

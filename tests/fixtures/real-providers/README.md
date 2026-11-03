@@ -94,7 +94,10 @@ ledger on Fedora).
 
 ## expected-causes.json: the ratchet
 
-Each cell lists one entry per `(os-release ID, tool package version)`:
+Each cell lists one entry per `(os-release ID, tool package version)`.
+`real-opencryptoki*` key `tool_version` as
+`opensc/<pkcs11-tool version>+ock/<opencryptoki version>`, since OCK
+call shape depends on both packages:
 
 - `observation`: the exact pinned observation-cause set. Every entry
   carries a `reason` and an `owner`; the oracle refuses pins without
@@ -107,8 +110,27 @@ Each cell lists one entry per `(os-release ID, tool package version)`:
   expected, the exact endpoint count the skip reason must name, tied to
   the installed p11-kit version; `null` where no capacity skip is
   expected (any skip then fails).
+- `provisional`: optional boolean. Entries taken from a single sample
+  carry `"provisional": true` until a quiet host confirms them; the
+  ratchet still applies in full, and the marker never changes a
+  verdict. The oracle ignores any other unknown pin fields.
+- `alternates`: optional list of further accepted shapes, each with its
+  own `observation` and `pause` (same reason+owner rules, no duplicate
+  causes, and no shape duplicated). For cells whose outcome flaps
+  between exact-count shapes, one entry pins every observed shape; the
+  actual (cause set, pause) pair must equal the primary or one
+  alternate jointly, so a mix of two shapes or any third shape fails.
+  Alternates share the entry's `p11kit_skip`; the entry names the lane
+  that owns the flap and the recheck.
 
-Counts, tool exit, report schema and the metrics no-skip rule are
-strict and never pinned. Cells whose prerequisites are missing (tool,
-module, SoftHSM, smart-card reader, usable slot daemon) are recorded
-`nonqualifying` with `SKIP (77): ...` and never pass.
+Counts, tool exit, report schema and the metrics skip rule are
+strict and never pinned: a metrics twin must skip nothing except,
+where the pin declares a p11-kit skip, exactly that pinned p11-kit
+closure skip (W3-2 finding 1; any other skip still fails). Cells whose
+prerequisites are missing (tool, module, SoftHSM, smart-card reader,
+usable slot daemon) are recorded `nonqualifying` with `SKIP (77): ...`
+and never pass.
+
+All p11-kit closure pins are provisional until re-taken on the
+integrated tree after p11kit-admission lands (batch 5b); their
+`modules_skipped` rows carry that owner.

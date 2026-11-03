@@ -89,6 +89,25 @@ def spy_log(counts, loaded=SPY_PATH):
     return "\n".join(lines) + "\n"
 
 
+def alternate_pin(primary_causes, primary_pause, alt_causes, alt_pause):
+    def mutate(doc, rec, exp):
+        entry = exp["cells"][rec["cell"]][0]
+        entry["observation"] = [{"cause": cause, "reason": "primary shape",
+                                 "owner": "exec-real-providers"}
+                                for cause in primary_causes]
+        entry["pause"] = {"status": primary_pause, "reason": "primary shape",
+                          "owner": "exec-real-providers"}
+        entry["alternates"] = [{
+            "observation": [{"cause": cause, "reason": "alternate shape",
+                             "owner": "wu11-k0, batch 5b"} for cause in alt_causes],
+            "pause": {"status": alt_pause, "reason": "alternate shape",
+                      "owner": "wu11-k0, batch 5b"}}]
+    return mutate
+
+
+ALT = alternate_pin(("skipped",), "sigstop", ("skipped", "surfaces"), "partial")
+
+
 # Forwarded functions match exactly; the boundary pair does not: the tool's
 # C_GetInterface reaches the spy log but is never forwarded (SoftHSM
 # exports no C_GetInterface), while the spy's own C_GetFunctionList call
@@ -236,6 +255,17 @@ class JudgeTests(unittest.TestCase):
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
             self.judge(causes=("pause_partial",), pause="partial", mutate=mutate)
 
+    def test_fixed_cause_against_stale_pin_fails(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["observation"] = [
+                {"cause": "skipped", "reason": "pinned gap skipped",
+                 "owner": "exec-real-providers"},
+                {"cause": "surfaces", "reason": "pinned gap surfaces",
+                 "owner": "exec-real-providers"}]
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]) as raised:
+            self.judge(causes=("skipped",), mutate=mutate)
+        self.assertIn("fixed: surfaces", str(raised.exception))
+
     def test_new_cause_fails(self):
         doc = report_functions(OBS_COUNTS, causes=("event_loss",))
         rec = receipt()
@@ -330,15 +360,125 @@ class JudgeTests(unittest.TestCase):
         with self.assertRaises(ORACLE_MOD["EvidenceError"]):
             self.judge(mode="metrics", mutate=mutate)
 
+    def test_metrics_twin_with_pinned_closure_skip_passes(self):
+        qualification, detail = self.judge(causes=("modules_skipped", "skipped", "surfaces"),
+                                           skip=6120, mode="metrics")
+        self.assertEqual(qualification, "expected-failure")
+        self.assertIn("p11-kit skip pinned at 6120", detail)
+
+    def test_metrics_twin_with_spied_module_skip_fails(self):
+        def mutate(doc, rec, exp):
+            doc["evidence"]["modules_skipped"].append(
+                {"name": SPY_PATH,
+                 "reason": "module needs 10 more; only 512 slots are available"})
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]) as raised:
+            self.judge(causes=("modules_skipped", "skipped", "surfaces"), skip=6120,
+                       mode="metrics", mutate=mutate)
+        self.assertIn("metrics twin skipped modules", str(raised.exception))
+
+    def test_metrics_twin_with_other_module_skip_fails(self):
+        def mutate(doc, rec, exp):
+            doc["evidence"]["modules_skipped"].append(
+                {"name": "/usr/lib64/pkcs11-spy.so",
+                 "reason": "module needs 67 more; only 512 slots are available"})
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]) as raised:
+            self.judge(causes=("modules_skipped", "skipped", "surfaces"), skip=6120,
+                       mode="metrics", mutate=mutate)
+        self.assertIn("metrics twin skipped modules", str(raised.exception))
+
     def test_unknown_host_pin_is_a_harness_error(self):
         with self.assertRaises(ORACLE_MOD["HarnessError"]):
             self.judge(tool_version="9.9.9")
+
+    def test_pin_without_os_key_is_a_harness_error(self):
+        def mutate(doc, rec, exp):
+            del exp["cells"][rec["cell"]][0]["os"]
+        with self.assertRaises(ORACLE_MOD["HarnessError"]):
+            self.judge(mutate=mutate)
 
     def test_pin_without_reason_is_a_harness_error(self):
         def mutate(doc, rec, exp):
             exp["cells"][rec["cell"]][0]["observation"][0]["reason"] = ""
         with self.assertRaises(ORACLE_MOD["HarnessError"]):
             self.judge(causes=("pause_partial",), pause="partial", mutate=mutate)
+
+    def test_duplicate_pinned_cause_is_a_harness_error(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["observation"] = [
+                {"cause": "skipped", "reason": "first justification",
+                 "owner": "exec-real-providers"},
+                {"cause": "skipped", "reason": "second justification",
+                 "owner": "exec-real-providers"}]
+        with self.assertRaises(ORACLE_MOD["HarnessError"]):
+            self.judge(causes=("skipped",), mutate=mutate)
+
+    def test_provisional_pin_judges_identically(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["provisional"] = True
+        qualification, _ = self.judge(mutate=mutate)
+        self.assertEqual(qualification, "qualified")
+
+    def test_alternate_shape_passes(self):
+        qualification, detail = self.judge(causes=("skipped", "surfaces"),
+                                           pause="partial", mutate=ALT)
+        self.assertEqual(qualification, "expected-failure")
+        self.assertIn("surfaces", detail)
+
+    def test_primary_shape_still_passes_with_alternates(self):
+        qualification, _ = self.judge(causes=("skipped",), mutate=ALT)
+        self.assertEqual(qualification, "expected-failure")
+
+    def test_third_shape_fails(self):
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]):
+            self.judge(causes=("skipped", "loader_discovery"), pause="partial",
+                       mutate=ALT)
+
+    def test_mixed_primary_causes_with_alternate_pause_fails(self):
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]):
+            self.judge(causes=("skipped",), pause="partial", mutate=ALT)
+
+    def test_mixed_alternate_causes_with_primary_pause_fails(self):
+        with self.assertRaises(ORACLE_MOD["EvidenceError"]):
+            self.judge(causes=("skipped", "surfaces"), mutate=ALT)
+
+    def test_duplicate_shape_is_a_harness_error(self):
+        mutate = alternate_pin(("skipped",), "sigstop", ("skipped",), "sigstop")
+        with self.assertRaises(ORACLE_MOD["HarnessError"]):
+            self.judge(causes=("skipped",), mutate=mutate)
+
+    def test_malformed_alternate_is_a_harness_error(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["alternates"] = [
+                {"observation": [{"cause": "skipped", "reason": "x",
+                                  "owner": "exec-real-providers"}],
+                 "pause": {"status": "bogus", "reason": "x",
+                           "owner": "exec-real-providers"}}]
+        with self.assertRaises(ORACLE_MOD["HarnessError"]):
+            self.judge(causes=("skipped",), mutate=mutate)
+
+    def test_duplicate_cause_in_alternate_is_a_harness_error(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["alternates"] = [
+                {"observation": [{"cause": "skipped", "reason": "x",
+                                  "owner": "exec-real-providers"},
+                                 {"cause": "skipped", "reason": "y",
+                                  "owner": "exec-real-providers"}],
+                 "pause": {"status": "sigstop", "reason": "x",
+                           "owner": "exec-real-providers"}}]
+        with self.assertRaises(ORACLE_MOD["HarnessError"]):
+            self.judge(causes=("skipped",), mutate=mutate)
+
+    def test_unknown_pin_field_is_ignored(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["future_field"] = 123
+        qualification, _ = self.judge(mutate=mutate)
+        self.assertEqual(qualification, "qualified")
+
+    def test_malformed_provisional_is_a_harness_error(self):
+        def mutate(doc, rec, exp):
+            exp["cells"][rec["cell"]][0]["provisional"] = "yes"
+        with self.assertRaises(ORACLE_MOD["HarnessError"]):
+            self.judge(mutate=mutate)
 
 
 class CliTests(unittest.TestCase):

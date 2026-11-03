@@ -913,7 +913,7 @@ fn assert_row_identity(record: &serde_json::Value, provider: &Path) {
 /// before the end, terminal shape after) proves the twin sees the
 /// transition; exact key sets prove no key drifts.
 #[test]
-fn inventory_prearm_row_never_mapped_terminal_shape() {
+fn discovery_prearm_row_never_mapped_terminal_shape() {
     let lifecycle = build_lifecycle("row-never");
     let child = sleep_child();
     let pid = child.child.id();
@@ -956,7 +956,7 @@ fn inventory_prearm_row_never_mapped_terminal_shape() {
 /// the detection instant (no terminal clamp here — the inventory hook's
 /// clamp is pinned in-crate).
 #[test]
-fn inventory_prearm_row_replacement_terminal_shape() {
+fn discovery_prearm_row_replacement_terminal_shape() {
     let lifecycle = build_lifecycle("row-replace");
     let child = sleep_child();
     let pid = child.child.id();
@@ -1026,7 +1026,7 @@ fn inventory_prearm_row_replacement_terminal_shape() {
 /// contrast proves the twin sees both the mapping and the still-live
 /// wait.
 #[test]
-fn inventory_prearm_row_mapped_live_shape() {
+fn discovery_prearm_row_mapped_live_shape() {
     let lifecycle = build_lifecycle("row-mapped");
     let mut barrier = Barrier::start(&lifecycle.driver, &lifecycle.provider);
     let pre_engine = discover_pid(
@@ -1081,7 +1081,7 @@ fn inventory_prearm_row_mapped_live_shape() {
 /// (arming itself needs attach receipts, a privileged cell; the
 /// assembly math is pinned in-crate).
 #[test]
-fn inventory_prearm_row_armed_and_window_value_shapes() {
+fn prearm_watch_and_window_value_shapes() {
     let armed_live = PrearmWatch {
         since_ns: Some(7),
         state: PrearmWatchState::Armed,

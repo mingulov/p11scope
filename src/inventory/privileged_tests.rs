@@ -6685,6 +6685,299 @@ fn first_birth_leader_gap_diagnosis(
     );
 }
 
+/// One JOINT_R16 coverage-state line: capture/router image_failed
+/// flags, discovery completeness, faulted keys, the faulted-overflow
+/// latch and router counters. The stuck dump and the healthy q1
+/// baseline share it, so a refusal names the mechanism it proved.
+fn joint_coverage_line(lane: &crate::inventory_semantics::AttestedSemanticLane, tag: &str) {
+    let Some((capture_failed, discovery_complete, (router_failed, faulted, overflowed), counters)) =
+        lane.router_coverage_for_test()
+    else {
+        eprintln!("JOINT_R16 {tag}-cover none");
+        return;
+    };
+    eprintln!(
+        "JOINT_R16 {tag}-cover capture_failed={capture_failed} \
+         discovery_complete={discovery_complete} router_failed={router_failed} \
+         faulted={faulted} overflowed={overflowed} joined={} observations={} \
+         coverage_faults={} eras={} miss_eras={} observed_evict={} faulted_evict={} \
+         retired_evict={} absence_overflows={}",
+        counters.joined,
+        counters.observations,
+        counters.coverage_faults,
+        counters.eras,
+        counters.miss_eras,
+        counters.observed_evictions,
+        counters.faulted_evictions,
+        counters.retired_evictions,
+        counters.absence_overflows,
+    );
+    match lane.instance_fault_cells_for_test() {
+        Some((fault, sticky)) => {
+            eprintln!("JOINT_R16 {tag}-cover fault_cell={fault} sticky_cell={sticky}");
+        }
+        None => eprintln!("JOINT_R16 {tag}-cover cells=unreadable"),
+    }
+    match lane.instance_hook_misses_for_test() {
+        Some(misses) => {
+            let total: u64 = misses.iter().map(|(_, misses)| misses).sum();
+            let detail = misses
+                .iter()
+                .map(|(name, misses)| format!("{name}={misses}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("JOINT_R16 {tag}-cover hook_misses={total} [{detail}]");
+        }
+        None => eprintln!("JOINT_R16 {tag}-cover hook_misses=unreadable"),
+    }
+}
+
+/// The q1 shed verdict: a host cross-talk coverage failure shed the
+/// pre-release calls and no edge can ever mint, so the cell FAILS
+/// with a named environmental refusal (the runner records FAIL),
+/// never passes or skips. Every input must hold: the calls account
+/// (balanced, with visible shed), an edge is still missing, the
+/// lane latched image_failed (no future observation, receipt,
+/// binding or edge is possible), and the shed discloses its
+/// coverage-fault reason. Anything weaker waits for the drain (or
+/// the backstop deadline), so a late bind or an unproven stuck
+/// shape never mislabels. Pinned below.
+fn r16_q1_shed_verdict(
+    balanced: bool,
+    edges_missing: bool,
+    shed: u64,
+    capture_failed: bool,
+    coverage_fault_disclosed: bool,
+    detail: &str,
+) -> Result<()> {
+    if balanced && edges_missing && shed > 0 && capture_failed && coverage_fault_disclosed {
+        bail!(
+            "r16-q1: environmental refusal (host cross-talk coverage failure voids the \
+             first-birth q1 baseline): {detail}"
+        );
+    }
+    Ok(())
+}
+
+// Branch-forcing pins: the full stuck shape refuses (Err carries the
+// named refusal and the evidence detail), while each single missing
+// input proceeds (Ok). Reverting the verdict tail to `Ok(())` turns
+// the refusal pin red; dropping any input check turns its pin red.
+#[test]
+fn r16_q1_shed_verdict_refuses_the_proven_stuck_shape() {
+    let err = r16_q1_shed_verdict(true, true, 17, true, true, "entered 17 vs api 0 + shed 17")
+        .expect_err("the proven stuck shape must refuse, never pass-or-skip");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("environmental refusal"),
+        "the refusal names itself: {message}"
+    );
+    assert!(
+        message.contains("entered 17 vs api 0 + shed 17"),
+        "the refusal carries the evidence detail: {message}"
+    );
+}
+
+#[test]
+fn r16_q1_shed_verdict_waits_unless_every_input_holds() {
+    // Each single missing input proceeds: unbalanced spillover,
+    // satisfied edges, no visible shed, a healthy lane (late bind),
+    // and an undisclosed shed (unproven shape) all wait.
+    assert!(r16_q1_shed_verdict(false, true, 17, true, true, "d").is_ok());
+    assert!(r16_q1_shed_verdict(true, false, 17, true, true, "d").is_ok());
+    assert!(r16_q1_shed_verdict(true, true, 0, true, true, "d").is_ok());
+    assert!(r16_q1_shed_verdict(true, true, 17, false, true, "d").is_ok());
+    assert!(r16_q1_shed_verdict(true, true, 17, true, false, "d").is_ok());
+}
+
+/// The stuck-q1 dump shared by the early refusal and the backstop
+/// deadline: bound/feed/gap state, the full gap fingerprint, lane
+/// loss counters, the first failed quantum's audit (if any tick
+/// delivered one), and the coverage state. Green runs never call it.
+fn r16_q1_dump_stuck(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    lane: &crate::inventory_semantics::AttestedSemanticLane,
+    pid_a: u32,
+    pid_b: u32,
+) -> Result<()> {
+    s1_feed_check(
+        coordinator,
+        "r16-q1-stuck",
+        &[("A", pid_a, false), ("B", pid_b, false)],
+    )?;
+    first_birth_leader_gap_diagnosis(coordinator, "r16-q1-stuck");
+    for row in joint_gaps_fingerprint(coordinator) {
+        eprintln!("JOINT_R16 r16-q1-stuck-gap {row}");
+    }
+    let (stop_collected, stop_joined, stop_shed, stop_refused) = lane.semantic_stop_call_counts();
+    eprintln!(
+        "JOINT_R16 r16-q1-stuck-stop collected={stop_collected} joined={stop_joined} \
+         shed={stop_shed} refused={stop_refused} \
+         events_lost={} bindings={} scan_refusals={:?}",
+        lane.events_ring_loss_disclosed(),
+        coordinator.semantic_bindings().len(),
+        lane.scan_refusal_counts(),
+    );
+    match lane.first_failed_quantum_audit_for_test() {
+        Some(audit) => eprintln!(
+            "JOINT_R16 r16-q1-stuck-audit ingested={} ordinary={} malformed={} \
+             discarded={} counter_error={} resource_refused={} \
+             fault={}->{} fault_error={:?} drain_domain={}",
+            audit.ingested,
+            audit.ordinary,
+            audit.malformed_delta,
+            audit.discarded_delta,
+            audit.counter_error,
+            audit.resource_refused,
+            audit.fault_before,
+            audit.fault_after,
+            audit.fault_error,
+            audit.drain_domain,
+        ),
+        None => eprintln!("JOINT_R16 r16-q1-stuck-audit none"),
+    }
+    joint_coverage_line(lane, "r16-q1-stuck");
+    Ok(())
+}
+
+/// Scan published gaps for the disclosed q1 coverage-fault
+/// shape: the `semantic calls unrouted` subject whose reason names
+/// `coverage_fault` (the `record_gap` call in
+/// `inventory_coordinator/semantics.rs` with the
+/// `UnknownReason::CoverageFault` label). Returns the last matching
+/// reason for the refusal's evidence detail, or `None` when the shed
+/// is undisclosed. Pinned below: a producer rename turns the pin red
+/// instead of silently losing the named refusal.
+fn r16_q1_coverage_fault_gap(
+    gaps: &[crate::discovery::caller_registry::RegistryGap],
+) -> Option<String> {
+    let mut disclosed = None;
+    for gap in gaps {
+        if gap.subject == "semantic calls unrouted" && gap.reason.contains("coverage_fault") {
+            disclosed = Some(gap.reason.clone());
+        }
+    }
+    disclosed
+}
+
+// Pin: the q1 refusal fires only on the producer-shaped
+// coverage-fault gap (the `semantic calls unrouted` subject plus
+// `coverage_fault` in the reason); anything else waits. A renamed
+// subject or a shed without the fault disclosure returns None, so
+// the wiring cannot silently stop matching the producer.
+#[test]
+fn r16_q1_coverage_fault_gap_matches_only_the_disclosed_shape() {
+    use crate::discovery::caller_registry::RegistryGap;
+    fn gap(subject: &str, reason: &str) -> RegistryGap {
+        RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: subject.into(),
+            reason: reason.into(),
+            budget: None,
+        }
+    }
+    // Exact producer shape (the `record_gap` call in
+    // `inventory_coordinator/semantics.rs` with the
+    // `UnknownReason::CoverageFault` label).
+    let disclosed = "17 calls shed without a route (coverage_fault=17) with 0 bindings";
+    let gaps = [gap("semantic calls unrouted", disclosed)];
+    assert_eq!(
+        r16_q1_coverage_fault_gap(&gaps),
+        Some(disclosed.to_string())
+    );
+    // Wrong subject: the fault label alone never matches.
+    let gaps = [gap("semantic call outcome capacity", disclosed)];
+    assert_eq!(r16_q1_coverage_fault_gap(&gaps), None);
+    // An unrouted shed without the fault disclosure never matches.
+    let gaps = [gap(
+        "semantic calls unrouted",
+        "17 calls shed without a route (sticky=17) with 0 bindings",
+    )];
+    assert_eq!(r16_q1_coverage_fault_gap(&gaps), None);
+    // No gaps: nothing disclosed.
+    assert_eq!(r16_q1_coverage_fault_gap(&[]), None);
+    // A later plain unrouted row never clears an earlier disclosure.
+    let gaps = [
+        gap("semantic calls unrouted", disclosed),
+        gap(
+            "semantic calls unrouted",
+            "1 calls shed without a route (sticky=1) with 1 bindings",
+        ),
+    ];
+    assert_eq!(
+        r16_q1_coverage_fault_gap(&gaps),
+        Some(disclosed.to_string())
+    );
+    // Two disclosures: the last one wins (the refusal's evidence detail).
+    let later = "5 calls shed without a route (coverage_fault=5) with 2 bindings";
+    let gaps = [
+        gap("semantic calls unrouted", disclosed),
+        gap("semantic calls unrouted", later),
+    ];
+    assert_eq!(r16_q1_coverage_fault_gap(&gaps), Some(later.to_string()));
+}
+
+/// Dump-and-refuse for a stuck q1 drain. When the proven cross-talk
+/// shape holds (balanced with visible shed, an edge missing, the
+/// lane's coverage latched failed, and the shed disclosing its
+/// coverage-fault reason), dumps the stuck state and FAILS with the
+/// named environmental refusal; otherwise Ok (the caller waits or,
+/// at the deadline, fails unaccounted). The per-drive call fails a
+/// doomed drain in milliseconds instead of the 60 s backstop; the
+/// latch is monotonic and blocks every future observation, receipt,
+/// binding and edge, so the early refusal cannot misfire on a run
+/// that could still mint.
+#[allow(clippy::too_many_arguments)]
+fn r16_q1_refuse_if_proven_stuck(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    lane: &crate::inventory_semantics::AttestedSemanticLane,
+    pid_a: u32,
+    pid_b: u32,
+    q1_drives: u64,
+    entered: u64,
+    api: u64,
+    shed: u64,
+    slot: u64,
+    inst: u64,
+    edge_a: bool,
+    edge_b: bool,
+) -> Result<()> {
+    let balanced = entered == api + shed + slot + inst;
+    let edges_missing = !edge_a || !edge_b;
+    let capture_failed = lane
+        .router_coverage_for_test()
+        .is_some_and(|(failed, _, _, _)| failed);
+    if !(balanced && edges_missing && shed > 0 && capture_failed) {
+        return Ok(());
+    }
+    let Some(unrouted) = r16_q1_coverage_fault_gap(coordinator.registry().gaps()) else {
+        return Ok(());
+    };
+    r16_q1_dump_stuck(coordinator, lane, pid_a, pid_b)?;
+    let cells = match lane.instance_fault_cells_for_test() {
+        Some((fault, sticky)) => format!("fault_cell={fault} sticky_cell={sticky}"),
+        None => String::from("cells=unreadable"),
+    };
+    let misses = match lane.instance_hook_misses_for_test() {
+        Some(misses) => format!(
+            "hook_misses={}",
+            misses.iter().map(|(_, misses)| misses).sum::<u64>()
+        ),
+        None => String::from("hook_misses=unreadable"),
+    };
+    let detail = format!(
+        "after {q1_drives} pre-release publishes: entered {entered} vs api {api} + shed {shed} \
+         + slot {slot} + inst {inst}, edges a={} b={}, bindings={}, {cells} {misses}, \
+         unrouted: \"{unrouted}\"",
+        u8::from(edge_a),
+        u8::from(edge_b),
+        coordinator.semantic_bindings().len(),
+    );
+    r16_q1_shed_verdict(true, true, shed, true, true, &detail)
+}
+
 /// R1.6 cell 1: the first birth through a held q1 to q2 and stop. Process
 /// A runs C_SignInit (returns at once) and enters a held C_Sign (its
 /// return is genuinely absent until the harness releases the FIFO); the
@@ -6781,7 +7074,125 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
 
     // q1: B completed, A's return genuinely absent. The publication keeps
     // A retained without replaying anything through the missing END.
-    let q1_polls = service_to_published(&mut lane, &mut coordinator, true, "r16-q1")?;
+    //
+    // The ring is system-wide: under ambient load one requested publish
+    // can saturate on pre-fixture backlog (pending >= MAX_PENDING) and
+    // publish ambient-only, leaving B's and A's SignInit calls for a
+    // later window. A one-shot q1 would then baseline the idle window
+    // before the fixture calls land, and the idle no-movement proof
+    // would fail on correct spillover. Keep driving publishes until
+    // every pre-release entered call is accounted (attributed, refused
+    // or disclosed-shed) and both edges are minted, so the asserts
+    // below read the drained publication. Pre-release entered is B's
+    // whole ledger plus A's SignInit (the held Sign has no END until
+    // the release; both A calls are semantic, pinned by the q2 split).
+    // Bounded: a product that never accounts them fails here with its
+    // name on it.
+    let caller_a = caller_of(&coordinator, process_a.pid())?;
+    let caller_b = caller_of(&coordinator, process_b.pid())?;
+    let q1_accounted_by = Instant::now() + Duration::from_secs(60);
+    let mut q1_polls = 0u64;
+    let mut q1_drives = 0u64;
+    loop {
+        let engine_changed = q1_drives == 0;
+        q1_polls += service_to_published(&mut lane, &mut coordinator, engine_changed, "r16-q1")?;
+        q1_drives += 1;
+        let edge_a_probe =
+            joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so").ok();
+        let edge_b_probe = joint_edge_snapshot(&coordinator, process_b.pid(), "soft-copy.so").ok();
+        let api_a_probe = edge_a_probe
+            .as_ref()
+            .and_then(|edge| edge.api_returns)
+            .unwrap_or(0);
+        let api_b_probe = edge_b_probe
+            .as_ref()
+            .and_then(|edge| edge.api_returns)
+            .unwrap_or(0);
+        let slot_probe = count_disclosed_gaps(
+            &coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_a),
+        ) + count_disclosed_gaps(
+            &coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_b),
+        );
+        let inst_probe = coordinator.registry().instance_calls_refused(caller_a)
+            + coordinator.registry().instance_calls_refused(caller_b);
+        let shed_probe = lane.shed_calls_disclosed();
+        let api_probe = api_a_probe + api_b_probe;
+        eprintln!(
+            "JOINT_R16 r16-q1-drive n={q1_drives} revision={} entered={} api={api_probe} \
+             shed={shed_probe} slot={slot_probe} inst={inst_probe} \
+             a_edge={} b_edge={}",
+            coordinator.registry().published_revision(),
+            b_total + 1,
+            u8::from(edge_a_probe.is_some()),
+            u8::from(edge_b_probe.is_some()),
+        );
+        // A shed call is accounted but mints no edge: the idle
+        // fingerprint compares edge presence too, so the baseline needs
+        // both edges minted (a late bind mints in the next publish,
+        // requested or idle — waiting here keeps it out of the idle
+        // window). A coverage-latched drain refuses named below (it
+        // can never mint); anything else waits for the deadline.
+        if b_total + 1 == api_probe + shed_probe + slot_probe + inst_probe
+            && edge_a_probe.is_some()
+            && edge_b_probe.is_some()
+        {
+            break;
+        }
+        // Early environmental refusal: a coverage-latched drain whose
+        // calls shed edgeless can never mint (see the helper), so
+        // refuse in milliseconds instead of the 60 s backstop.
+        r16_q1_refuse_if_proven_stuck(
+            &coordinator,
+            &lane,
+            process_a.pid(),
+            process_b.pid(),
+            q1_drives,
+            b_total + 1,
+            api_probe,
+            shed_probe,
+            slot_probe,
+            inst_probe,
+            edge_a_probe.is_some(),
+            edge_b_probe.is_some(),
+        )?;
+        if Instant::now() >= q1_accounted_by {
+            // Backstop: re-evaluate the refusal at the deadline (a
+            // drain that latched on its last drive still refuses
+            // named), else fail unaccounted with the stuck dump.
+            r16_q1_refuse_if_proven_stuck(
+                &coordinator,
+                &lane,
+                process_a.pid(),
+                process_b.pid(),
+                q1_drives,
+                b_total + 1,
+                api_probe,
+                shed_probe,
+                slot_probe,
+                inst_probe,
+                edge_a_probe.is_some(),
+                edge_b_probe.is_some(),
+            )?;
+            r16_q1_dump_stuck(&coordinator, &lane, process_a.pid(), process_b.pid())?;
+            bail!(
+                "r16-q1: calls still unaccounted after {q1_drives} pre-release publishes: entered {} \
+                 vs api {api_probe} + shed {shed_probe} + slot {slot_probe} + inst {inst_probe} \
+                 a_edge={} b_edge={}",
+                b_total + 1,
+                u8::from(edge_a_probe.is_some()),
+                u8::from(edge_b_probe.is_some()),
+            );
+        }
+    }
+    // Healthy-baseline coverage state: one line per run, shared with
+    // the stuck dump so a refusal names the mechanism it proved.
+    joint_coverage_line(&lane, "r16-q1");
     s1_feed_check(
         &coordinator,
         "r16-q1",
@@ -6902,8 +7313,8 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         gaps_q1.len(),
     );
     eprintln!(
-        "JOINT_R16 r16-q1 polls={q1_polls} revision={revision_before}->{revision_q1} \
-         reduced={reduced_q1} b_edge={} a_edge={}",
+        "JOINT_R16 r16-q1 polls={q1_polls} drives={q1_drives} \
+         revision={revision_before}->{revision_q1} reduced={reduced_q1} b_edge={} a_edge={}",
         edge_b_q1.is_ok(),
         edge_a_q1.is_ok(),
     );
@@ -6941,7 +7352,61 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
     // are counted but refused from semantic conversion by design, each
     // refusal disclosed; `api_returns`/`reduced` cover the semantic
     // side only, never the raw entered total.
-    let q2_polls = service_to_published(&mut lane, &mut coordinator, false, "r16-q2")?;
+    //
+    // A demandless idle collection still in flight at the release binds
+    // q2's demand and publishes first, without A's END: its collection
+    // began pre-release, and service_to_published returns at that first
+    // publish. Keep driving publishes until every entered call is
+    // accounted (attributed, refused or disclosed-shed), so the asserts
+    // below read the post-release publication. Bounded: a product that
+    // never accounts the END fails here with its name on it.
+    // (caller_a/b hoisted above the q1 loop; joint publishes do not move
+    // adapter ids.)
+    let q2_accounted_by = Instant::now() + Duration::from_secs(60);
+    let mut q2_polls = 0u64;
+    let mut q2_drives = 0u64;
+    loop {
+        q2_polls += service_to_published(&mut lane, &mut coordinator, false, "r16-q2")?;
+        q2_drives += 1;
+        let api_a_probe = joint_edge_snapshot(&coordinator, process_a.pid(), "live-joint-held.so")
+            .ok()
+            .and_then(|edge| edge.api_returns)
+            .unwrap_or(0);
+        let api_b_probe = joint_edge_snapshot(&coordinator, process_b.pid(), "soft-copy.so")
+            .ok()
+            .and_then(|edge| edge.api_returns)
+            .unwrap_or(0);
+        let slot_probe = count_disclosed_gaps(
+            &coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_a),
+        ) + count_disclosed_gaps(
+            &coordinator,
+            "semantic input refused",
+            "slot",
+            Some(caller_b),
+        );
+        let inst_probe = coordinator.registry().instance_calls_refused(caller_a)
+            + coordinator.registry().instance_calls_refused(caller_b);
+        let shed_probe = lane.shed_calls_disclosed();
+        let api_probe = api_a_probe + api_b_probe;
+        eprintln!(
+            "JOINT_R16 r16-q2-drive n={q2_drives} revision={} entered={} api={api_probe} \
+             shed={shed_probe} slot={slot_probe} inst={inst_probe}",
+            coordinator.registry().published_revision(),
+            a_total + b_total,
+        );
+        if a_total + b_total == api_probe + shed_probe + slot_probe + inst_probe {
+            break;
+        }
+        ensure!(
+            Instant::now() < q2_accounted_by,
+            "r16-q2: calls still unaccounted after {q2_drives} post-release publishes: entered {} \
+             vs api {api_probe} + shed {shed_probe} + slot {slot_probe} + inst {inst_probe}",
+            a_total + b_total,
+        );
+    }
     s1_feed_check(
         &coordinator,
         "r16-q2",
@@ -6971,8 +7436,6 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
         "soft-copy.so",
         &b_by_fn,
     );
-    let caller_a = caller_of(&coordinator, process_a.pid())?;
-    let caller_b = caller_of(&coordinator, process_b.pid())?;
     let api_a = edge_a.api_returns.unwrap_or(0);
     let api_b = edge_b.api_returns.unwrap_or(0);
     let slot_a = count_disclosed_gaps(
@@ -7219,7 +7682,7 @@ fn privileged_joint_first_birth_q2_and_stop_lp64() -> Result<()> {
     }
     assert_quiet_twins_except(&coordinator, "r16-q2", &exemptions)?;
     eprintln!(
-        "JOINT_R16 r16-q2 polls={q2_polls} revision={revision} feeds={} receipts={} key_aggs={} \
+        "JOINT_R16 r16-q2 polls={q2_polls} drives={q2_drives} revision={revision} feeds={} receipts={} key_aggs={} \
          key_rows={} a_api={:?} b_api={:?}",
         coordinator.registry().joint_feeds(),
         receipts.len(),

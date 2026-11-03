@@ -3987,6 +3987,94 @@ fn collected_transient_discard_fails_its_quantum_then_recovers() {
 }
 
 #[test]
+fn first_failed_quantum_audit_latches_the_failing_audit_only() {
+    use crate::events::{EventDrain, EventsDomain, RecordSource, record_bytes};
+    use crate::semantics_edge::resources::SemanticResourcePool;
+    use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
+    use std::collections::VecDeque;
+    use std::ops::Deref;
+    /// One lost reservation behind genuine records, like ring pressure:
+    /// the drain reports the loss only after the queued bytes.
+    struct DiscardingRecords {
+        queue: VecDeque<Vec<u8>>,
+        discarded: u64,
+    }
+    impl RecordSource for DiscardingRecords {
+        fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
+            if let Some(record) = self.queue.pop_front() {
+                return Some(record);
+            }
+            self.discarded = 1;
+            None
+        }
+        fn discarded(&self) -> u64 {
+            self.discarded
+        }
+    }
+    struct Fault;
+    impl crate::semantics_objects::journal::FaultEpoch for Fault {
+        fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+            Ok(0)
+        }
+    }
+    let mut io = ScriptIo::small(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    // Healthy first: nothing latches.
+    io.semantic_call("C_SignInit", 0, 0);
+    let (mut primed, _, _) = retained_joint_quantum(&mut io);
+    capture.tick_collected_with(&mut io, &mut primed).unwrap();
+    assert!(
+        capture.first_failed_quantum_audit_for_test().is_none(),
+        "a healthy quantum must not latch a failure audit"
+    );
+    // Failed quantum: the latch fires with the failing audit.
+    io.semantic_call("C_Sign", 0, 0);
+    let records: Vec<_> = io
+        .records
+        .drain(..)
+        .map(|record| record_bytes(&record.base))
+        .collect();
+    let events = EventsDomain::test_standin(0xef01);
+    let producers = crate::attach::SessionDrainProducers::test_pair(io.domain, events.clone());
+    let mut drain = EventDrain::over_domain(
+        DiscardingRecords {
+            queue: records.into(),
+            discarded: 0,
+        },
+        events,
+    );
+    let pool = SemanticResourcePool::default();
+    let mut failed = RawJointQuantum::collect(
+        &mut drain,
+        &p11scope_ebpf_common::object_wire::publish_object_descriptors(),
+        4_096,
+        &Fault,
+        &producers,
+        |bytes| pool.reserve(bytes),
+    )
+    .unwrap();
+    capture.tick_collected_with(&mut io, &mut failed).unwrap();
+    let audit = capture
+        .first_failed_quantum_audit_for_test()
+        .expect("a failed quantum latches its audit");
+    assert_eq!(audit.discarded_delta, 1);
+    assert_eq!(audit.malformed_delta, 0);
+    assert!(!audit.counter_error);
+    assert!(audit.fault_error.is_none());
+    // Recovery: a later healthy quantum must not overwrite the latch.
+    io.semantic_call("C_Sign", 0, 1);
+    let (mut healed, _, _) = retained_joint_quantum(&mut io);
+    capture.tick_collected_with(&mut io, &mut healed).unwrap();
+    let audit = capture
+        .first_failed_quantum_audit_for_test()
+        .expect("the first failure sticks");
+    assert_eq!(
+        audit.discarded_delta, 1,
+        "later healthy quanta must not overwrite the first failure"
+    );
+}
+
+#[test]
 fn collected_bounded_loss_with_failed_raise_fails_coverage_permanently() {
     use crate::events::{EventDrain, EventsDomain, RecordSource, record_bytes};
     use crate::semantics_edge::resources::SemanticResourcePool;

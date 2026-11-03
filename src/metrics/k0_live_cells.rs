@@ -1132,6 +1132,21 @@ fn require_detail_matches_main_counts(document: &serde_json::Value, log: &str) -
     let entered = rows[0]["entered"].as_u64().context("detail entered")?;
     let returned = rows[0]["returned"].as_u64().context("detail returned")?;
     let errors = rows[0]["errors"].as_u64().context("detail errors")?;
+    // Torn-read check: every counted return adds exactly one
+    // return-value count, so a rendered row's `rv_counts` sum equals
+    // its `returned` delta; anything else fails the cell instead of
+    // passing a disagreeing row.
+    let rv_counts = rows[0]["rv_counts"]
+        .as_object()
+        .context("detail rv_counts")?;
+    let mut rv_sum = 0u128;
+    for (rv, count) in rv_counts {
+        rv_sum += u128::from(count.as_u64().with_context(|| format!("rv_counts[{rv}]"))?);
+    }
+    ensure!(
+        rv_sum == u128::from(returned),
+        "detail rv_counts sum equals returned: {rv_sum} vs {returned}"
+    );
     let functions = document["functions"]
         .as_array()
         .context("functions array")?;

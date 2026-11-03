@@ -803,7 +803,10 @@ Limits that matter in pods:
   observer attaches. The detail
   is the function's own broad-counter cells between a selection-time
   read and the close read, in the measurement's own mode (counts,
-  timestamps or latency cells). If the watched process replaces
+  timestamps or latency cells). With `run` the selection-time read
+  happens after the owned child is released, so the window may start
+  after the child has started and early calls can fall outside the
+  detail. If the watched process replaces
   itself (exec) between the two reads, the slot retires, or the close
   boundary cannot be proven clean, the detail is withheld with a named
   reason; a leader exit that is the last lifecycle record ends the

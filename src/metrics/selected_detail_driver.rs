@@ -1314,6 +1314,22 @@ pub(super) fn close_k0_window_with_tail_and_losses(
             return;
         }
     };
+    // Torn-read guard: each bracketing read takes the return-value map
+    // first and the slot stats after, so a window overlapping live
+    // calls can pair one read's stats with the other's return-value
+    // counts. Every counted return adds exactly one return-value
+    // count (BPF `account_return`), and any return-value update
+    // failure already voids the read, so a windowed row whose
+    // `rv_counts` sum differs from its `returned` delta is torn in
+    // either direction: refuse the detail as a topology mismatch
+    // rather than render rows that disagree with the main report.
+    if deltas.iter().any(|delta| {
+        delta.rv_counts.values().map(|&count| u128::from(count)).sum::<u128>()
+            != u128::from(delta.returned)
+    }) {
+        ledger.mark_selection_refused(Detail(SelectedDetailRefusal::BroadPlanTopology).name());
+        return;
+    }
     let current = collector
         .current()
         .expect("an advanced K0 collector holds its close read");
@@ -1556,7 +1572,7 @@ mod tests {
     };
     use crate::plan::Slot;
     use crate::semantics_edge::resources::SemanticResourcePool;
-    use p11scope_ebpf_common::{CountStats, SlotStats, TimestampStats};
+    use p11scope_ebpf_common::{CountStats, RvKey, SlotStats, TimestampStats};
     use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroU64;
     use std::time::{Duration, Instant};
@@ -1654,6 +1670,138 @@ mod tests {
 
     fn window_of(started: u64, finished: u64) -> Option<ReadWindow> {
         ReadWindow::new(Some(started), Some(finished))
+    }
+
+    /// A scripted read with explicit per-row return-value totals through
+    /// the genuine fold and pack (mirrors `scripted_read`, which carries
+    /// no return values). `rvs` parallels `plan.slots`: one (rv, total)
+    /// list per row.
+    fn scripted_read_with_rvs(
+        pool: &SemanticResourcePool,
+        plan: &AttachPlan,
+        generation: NonZeroU64,
+        mode: CounterMode,
+        counts: &[(u64, u64, u64)],
+        rvs: &[Vec<(u64, u64)>],
+        window: Option<ReadWindow>,
+    ) -> CounterRead {
+        assert_eq!(
+            counts.len(),
+            plan.slots.len(),
+            "one explicit sample per plan slot"
+        );
+        assert_eq!(
+            rvs.len(),
+            plan.slots.len(),
+            "one return-value list per plan slot"
+        );
+        let keys: usize = rvs.iter().map(Vec::len).sum();
+        let limits = CounterLimits {
+            rows: plan.slots.len(),
+            rv_keys: keys,
+        };
+        let mut rows = Vec::with_capacity(plan.slots.len());
+        let held_counts: Vec<CountStats> = counts
+            .iter()
+            .map(|&(entered, returned, errors)| CountStats {
+                entered,
+                returned,
+                errors,
+            })
+            .collect();
+        let held_timestamps: Vec<TimestampStats> = counts
+            .iter()
+            .map(|&(entered, returned, errors)| TimestampStats {
+                entered,
+                returned,
+                errors,
+                total_ns: 10 * returned,
+                max_ns: u64::from(returned != 0) * 10,
+            })
+            .collect();
+        let held_latency: Vec<SlotStats> = counts
+            .iter()
+            .map(|&(entered, returned, errors)| SlotStats {
+                entered,
+                returned,
+                errors,
+                total_ns: 10 * returned,
+                max_ns: u64::from(returned != 0) * 10,
+                buckets: [0; 32],
+            })
+            .collect();
+        for (slot, index) in plan.slots.iter().zip(0..) {
+            let cells: Vec<CounterCell<'_>> = match mode {
+                CounterMode::Counts => {
+                    vec![CounterCell::Counts(&held_counts[index])]
+                }
+                CounterMode::Timestamps => {
+                    vec![CounterCell::Timestamps(&held_timestamps[index])]
+                }
+                CounterMode::Latency => {
+                    vec![CounterCell::Latency(&held_latency[index])]
+                }
+            };
+            let slot_rvs = rvs[index].iter().map(|&(rv, total)| {
+                (
+                    RvKey {
+                        slot: slot.index,
+                        _pad: 0,
+                        rv,
+                    },
+                    total,
+                )
+            });
+            rows.push(
+                CounterRow::fold(slot, mode, cells, slot_rvs, limits)
+                    .expect("explicit cells fold"),
+            );
+        }
+        let reservation =
+            ReadReservation::reserve(rows.len(), keys, &pool.reserver()).expect("read reserves");
+        CounterRead::new(
+            generation,
+            mode,
+            window,
+            Ok(rows),
+            CounterHealth::default(),
+            KernelEvidence::default(),
+            reservation,
+        )
+        .expect("scripted read packs")
+    }
+
+    /// Window limits for return-value reads: every row plus every key.
+    fn limits_with_rvs(plan: &AttachPlan, keys: usize) -> CounterLimits {
+        CounterLimits {
+            rows: plan.slots.len(),
+            rv_keys: keys,
+        }
+    }
+
+    /// A scripted read whose return-value totals mirror `returned` on
+    /// every row (`rv {0: returned}`): the production shape, where
+    /// every counted return adds exactly one return-value count. K0
+    /// render twins use this; the torn-read twin scripts its return
+    /// values explicitly through `scripted_read_with_rvs`.
+    fn scripted_read_consistent(
+        pool: &SemanticResourcePool,
+        plan: &AttachPlan,
+        generation: NonZeroU64,
+        mode: CounterMode,
+        counts: &[(u64, u64, u64)],
+        window: Option<ReadWindow>,
+    ) -> CounterRead {
+        let rvs: Vec<Vec<(u64, u64)>> = counts
+            .iter()
+            .map(|&(_, returned, _)| vec![(0, returned)])
+            .collect();
+        scripted_read_with_rvs(pool, plan, generation, mode, counts, &rvs, window)
+    }
+
+    /// Window limits for consistent return-value reads: one key per row.
+    fn limits_consistent(plan: &AttachPlan) -> CounterLimits {
+        limits_with_rvs(plan, plan.slots.len())
     }
 
     fn counts_for(plan: &AttachPlan, entered: u64, returned: u64) -> Vec<(u64, u64, u64)> {
@@ -4459,7 +4607,7 @@ mod tests {
             .expect("live name resolves for the K0 window");
         assert_eq!(resolved.slot, 2);
         let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-        let before = scripted_read(
+        let before = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -4469,14 +4617,14 @@ mod tests {
         );
         let window = open_k0_window(
             resolved,
-            limits_for(&scene.plan),
+            limits_consistent(&scene.plan),
             scene.pool.reserver(),
             Ok(before),
             k0_clean(),
             &mut ledger,
         )
         .expect("a healthy selection-time read opens the window");
-        let after = scripted_read(
+        let after = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -4540,7 +4688,7 @@ mod tests {
             let resolved = k0_stage(&scene, "C_Toggle0001", &mut ledger)
                 .expect("live name resolves for the K0 window");
             let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-            let before = scripted_read(
+            let before = scripted_read_consistent(
                 &scene.pool,
                 &scene.plan,
                 generation,
@@ -4550,14 +4698,14 @@ mod tests {
             );
             let window = open_k0_window(
                 resolved,
-                limits_for(&scene.plan),
+                limits_consistent(&scene.plan),
                 scene.pool.reserver(),
                 Ok(before),
                 k0_clean(),
                 &mut ledger,
             )
             .expect("a healthy selection-time read opens the window");
-            let after = scripted_read(
+            let after = scripted_read_consistent(
                 &scene.pool,
                 &scene.plan,
                 generation,
@@ -4711,7 +4859,7 @@ mod tests {
         let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
             .expect("live name resolves for the K0 window");
         let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-        let before = scripted_read(
+        let before = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -4721,14 +4869,14 @@ mod tests {
         );
         let window = open_k0_window(
             resolved,
-            limits_for(&scene.plan),
+            limits_consistent(&scene.plan),
             scene.pool.reserver(),
             Ok(before),
             k0_clean(),
             &mut ledger,
         )
         .expect("a healthy selection-time read opens the window");
-        let after = scripted_read(
+        let after = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -4926,7 +5074,7 @@ mod tests {
         let resolved = k0_stage(&scene, "C_Toggle0000", &mut ledger)
             .expect("live name resolves for the K0 window");
         let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-        let before = scripted_read(
+        let before = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -4936,14 +5084,14 @@ mod tests {
         );
         let window = open_k0_window(
             resolved,
-            limits_for(&scene.plan),
+            limits_consistent(&scene.plan),
             scene.pool.reserver(),
             Ok(before),
             k0_clean(),
             &mut ledger,
         )
         .expect("a healthy selection-time read opens the window");
-        let after = scripted_read(
+        let after = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -5477,7 +5625,7 @@ mod tests {
             .expect("live name resolves for the K0 window");
         let pid = resolved.original.pid();
         let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-        let before = scripted_read(
+        let before = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -5487,14 +5635,14 @@ mod tests {
         );
         let window = open_k0_window(
             resolved,
-            limits_for(&scene.plan),
+            limits_consistent(&scene.plan),
             scene.pool.reserver(),
             Ok(before),
             k0_clean(),
             &mut ledger,
         )
         .expect("a healthy selection-time read opens the window");
-        let after = scripted_read(
+        let after = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -5595,7 +5743,7 @@ mod tests {
         let other = resolved.original.pid().wrapping_add(7);
         assert_ne!(other, resolved.original.pid());
         let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-        let before = scripted_read(
+        let before = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -5605,14 +5753,14 @@ mod tests {
         );
         let window = open_k0_window(
             resolved,
-            limits_for(&scene.plan),
+            limits_consistent(&scene.plan),
             scene.pool.reserver(),
             Ok(before),
             k0_clean(),
             &mut ledger,
         )
         .expect("a healthy selection-time read opens the window");
-        let after = scripted_read(
+        let after = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -5656,7 +5804,7 @@ mod tests {
         let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
             .expect("live name resolves for the K0 window");
         let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-        let before = scripted_read(
+        let before = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -5666,14 +5814,14 @@ mod tests {
         );
         let window = open_k0_window(
             resolved,
-            limits_for(&scene.plan),
+            limits_consistent(&scene.plan),
             scene.pool.reserver(),
             Ok(before),
             k0_clean(),
             &mut ledger,
         )
         .expect("a healthy selection-time read opens the window");
-        let after = scripted_read(
+        let after = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -6280,7 +6428,7 @@ mod tests {
         let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
             .expect("live name resolves for the K0 window");
         let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-        let before = scripted_read(
+        let before = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -6290,7 +6438,7 @@ mod tests {
         );
         let window = open_k0_window_with_losses(
             resolved,
-            limits_for(&scene.plan),
+            limits_consistent(&scene.plan),
             scene.pool.reserver(),
             Ok(before),
             k0_clean(),
@@ -6298,7 +6446,7 @@ mod tests {
             &mut ledger,
         )
         .expect("a healthy selection-time read opens the window");
-        let after = scripted_read(
+        let after = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -6378,7 +6526,7 @@ mod tests {
         let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
             .expect("live name resolves for the K0 window");
         let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-        let before = scripted_read(
+        let before = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -6389,7 +6537,7 @@ mod tests {
         let before_facts = k0_facts(1, 1);
         let window = open_k0_window_with_losses(
             resolved,
-            limits_for(&scene.plan),
+            limits_consistent(&scene.plan),
             scene.pool.reserver(),
             Ok(before),
             k0_clean(),
@@ -6397,7 +6545,7 @@ mod tests {
             &mut ledger,
         )
         .expect("a healthy selection-time read opens the window");
-        let after = scripted_read(
+        let after = scripted_read_consistent(
             &scene.pool,
             &scene.plan,
             generation,
@@ -6490,6 +6638,140 @@ mod tests {
             Some("broad_stopping"),
             "mixed growth voids"
         );
+    }
+
+    #[test]
+    fn k0_torn_return_value_window_refuses_as_broad_plan_topology() {
+        // The run-12 shape: the selection read paired pre-call stats
+        // with post-call return-value counts, so the windowed row is
+        // entered/returned 0 with `rv_counts {"0": 4}`. Every counted
+        // return adds exactly one return-value count, so the torn row
+        // refuses as a topology mismatch instead of rendering rows
+        // that disagree with themselves and the main report.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let limits = limits_with_rvs(&scene.plan, 4);
+        let before = scripted_read_with_rvs(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            &vec![vec![(0, 100)]; scene.plan.slots.len()],
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits,
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read_with_rvs(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            &vec![vec![(0, 104)]; scene.plan.slots.len()],
+            window_of(20, 30),
+        );
+        close_k0_window(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            Some("broad_plan_topology"),
+            "the torn window refuses"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        assert!(section.get("detail").is_none(), "no detail on a refusal");
+        assert!(
+            section.get("aggregate").is_none(),
+            "no aggregate on a refusal"
+        );
+    }
+
+    #[test]
+    fn k0_consistent_return_value_window_renders() {
+        // The guard fires only on torn reads: a window whose
+        // `rv_counts` sums equal their `returned` deltas renders, with
+        // the return-value counts carried into the detail row.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let mut ledger = SelectionLedger::new();
+        let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
+            .expect("live name resolves for the K0 window");
+        let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
+        let limits = limits_with_rvs(&scene.plan, 4);
+        let before = scripted_read_with_rvs(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &counts_for(&scene.plan, 100, 100),
+            &vec![vec![(0, 100)]; scene.plan.slots.len()],
+            window_of(10, 20),
+        );
+        let window = open_k0_window(
+            resolved,
+            limits,
+            scene.pool.reserver(),
+            Ok(before),
+            k0_clean(),
+            &mut ledger,
+        )
+        .expect("a healthy selection-time read opens the window");
+        let after = scripted_read_with_rvs(
+            &scene.pool,
+            &scene.plan,
+            generation,
+            CounterMode::Counts,
+            &[(110, 110, 0), (110, 110, 0), (104, 104, 0), (110, 110, 0)],
+            &vec![vec![(0, 110)], vec![(0, 110)], vec![(0, 104)], vec![(0, 110)]],
+            window_of(20, 30),
+        );
+        close_k0_window(
+            window,
+            &scene.plan,
+            Ok(after),
+            k0_clean(),
+            true,
+            &mut ledger,
+        );
+        assert_eq!(
+            ledger
+                .selection
+                .as_ref()
+                .expect("selection records")
+                .refusal,
+            None,
+            "a consistent window renders"
+        );
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let section = &composed["evidence"]["selected_detail"];
+        let detail = section.get("detail").expect("detail renders");
+        let rows = detail["rows"].as_array().expect("detail rows");
+        assert_eq!(rows.len(), 1, "detail carries only the selected slot");
+        assert_eq!(rows[0]["entered"], serde_json::json!(4));
+        assert_eq!(rows[0]["returned"], serde_json::json!(4));
+        assert_eq!(rows[0]["rv_counts"], serde_json::json!({"0": 4}));
     }
 
     #[test]
@@ -6619,7 +6901,7 @@ mod tests {
             let resolved = k0_stage(&scene, "C_Toggle0002", &mut ledger)
                 .expect("live name resolves for the K0 window");
             let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-            let before = scripted_read(
+            let before = scripted_read_consistent(
                 &scene.pool,
                 &scene.plan,
                 generation,
@@ -6629,7 +6911,7 @@ mod tests {
             );
             let window = open_k0_window_with_losses(
                 resolved,
-                limits_for(&scene.plan),
+                limits_consistent(&scene.plan),
                 scene.pool.reserver(),
                 Ok(before),
                 k0_clean(),
@@ -6637,7 +6919,7 @@ mod tests {
                 &mut ledger,
             )
             .expect("a healthy selection-time read opens the window");
-            let after = scripted_read(
+            let after = scripted_read_consistent(
                 &scene.pool,
                 &scene.plan,
                 generation,
@@ -6692,7 +6974,7 @@ mod tests {
                 .expect("live name resolves for the K0 window");
             let pid = resolved.original.pid();
             let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-            let before = scripted_read(
+            let before = scripted_read_consistent(
                 &scene.pool,
                 &scene.plan,
                 generation,
@@ -6702,7 +6984,7 @@ mod tests {
             );
             let window = open_k0_window_with_losses(
                 resolved,
-                limits_for(&scene.plan),
+                limits_consistent(&scene.plan),
                 scene.pool.reserver(),
                 Ok(before),
                 k0_clean(),
@@ -6710,7 +6992,7 @@ mod tests {
                 &mut ledger,
             )
             .expect("a healthy selection-time read opens the window");
-            let after = scripted_read(
+            let after = scripted_read_consistent(
                 &scene.pool,
                 &scene.plan,
                 generation,
@@ -6884,7 +7166,7 @@ mod tests {
                 .expect("live name resolves for the K0 window");
             let pid = resolved.original.pid();
             let generation = NonZeroU64::new(BROAD_GENERATION).unwrap();
-            let before = scripted_read(
+            let before = scripted_read_consistent(
                 &scene.pool,
                 &scene.plan,
                 generation,
@@ -6894,14 +7176,14 @@ mod tests {
             );
             let window = open_k0_window(
                 resolved,
-                limits_for(&scene.plan),
+                limits_consistent(&scene.plan),
                 scene.pool.reserver(),
                 Ok(before),
                 k0_clean(),
                 &mut ledger,
             )
             .expect("a healthy selection-time read opens the window");
-            let after = scripted_read(
+            let after = scripted_read_consistent(
                 &scene.pool,
                 &scene.plan,
                 generation,

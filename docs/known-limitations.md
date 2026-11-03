@@ -45,13 +45,13 @@ clean, or discovery ring loss, read failures, or truncation grow
 inside the window, the detail is withheld with a named reason while
 aggregate counts continue. A leader exit that is the last lifecycle
 record ends the window cleanly and the detail renders the calls made
-before the exit. Loader scans left unfinished by the exit itself
-are counted apart as exit-only and do not void the detail; only
-truncation the exiting process cannot explain counts. Loader records
-that arrive after the process retires still count as real truncation
-and withhold the detail as `broad_stopping`, so an owned `run` child
-that loads and exits at once may still void intermittently (3 of 13
-immediate runs in local testing). A child that keeps running for a
+before the exit. Loader scans left unfinished by the exit itself, and
+loader rejects the exiting process explains, are counted apart as
+exit-only and do not void the detail; only truncation the exiting
+process cannot explain counts. Other loader rejects still count as real
+truncation and withhold the detail as `broad_stopping`, so an owned `run`
+child that loads and exits at once may still void intermittently (about
+1 in 10 runs in local testing). A child that keeps running for a
 few seconds after its provider loads is unaffected (measured with a
 3-second gap).
 With `run`, a host whose kernel and userspace monotonic clocks cannot
@@ -324,6 +324,9 @@ admission, absence, or call (R57).
 - A per-mechanism counter view and per-mechanism key-operation rows.
 - A named unknown edge for the copy-up case above instead of silent
   misattribution, and for a late provider's unwatched window.
+- Accounting for remaining exit-caused loader rejects that lack a
+  pid-and-hook-time binding to the ended process as exit-only, to
+  further cut the short-run void rate.
 - Tracking short-lived processes that exit before their first binding.
 - Parallel BPF program loading for faster startup.
 - File identity edge cases on Btrfs subvolumes and snapshots, FUSE and

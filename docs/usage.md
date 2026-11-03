@@ -808,12 +808,14 @@ Limits that matter in pods:
   boundary cannot be proven clean, the detail is withheld with a named
   reason; a leader exit that is the last lifecycle record ends the
   window cleanly and the detail renders the counts up to the exit.
-  Loader scans left unfinished by the exit itself do not void it:
-  they are counted apart as exit-only, and only truncation the
-  exiting process cannot explain counts. Loader records that arrive
-  after the process retires, though, still count as real truncation
-  and withhold the detail as `broad_stopping`, so a `run` child that
-  loads and exits at once may still void intermittently; a child
+  Loader scans left unfinished by the exit itself, and loader rejects
+  the exiting process explains (a hook address that no longer maps, a
+  late record bound to the ended process, a zero-state scan that never
+  completed), do not void it: they are counted apart as exit-only, and
+  only truncation the exiting process cannot explain counts. Other
+  loader rejects still count as real truncation and withhold the detail
+  as `broad_stopping`, so a `run` child that loads and exits at once may
+  still void intermittently, about 1 in 10 runs in local testing; a child
   that runs on for a few seconds after loading is unaffected. With
   `run`, the window must
   tell the child's own startup exec apart from the window by kernel

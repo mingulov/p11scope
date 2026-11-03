@@ -111,14 +111,15 @@ always renders (possibly empty).
      Live cells: a `--pid` target exiting in the window renders the
      calls before the exit, and so does an owned `run` child that
      exits a few seconds after loading. Exit-ended loader-scan
-     truncations (`record_pending_loader_scan_end`, counted apart as
+     truncations and exit-caused loader rejects (a zero-state scan
+     that never completed, a hook address that no longer maps, a
+     late record bound to the ended origin; counted apart as
      exit-only) do not void: step 1 compares the total minus that
      count, so the immediate-exit shape renders whenever its loader
-     fallout is exit-only. Loader records that arrive after the view
-     retires still reject as real truncation and void as
-     `broad_stopping`, so an immediate exit voids intermittently (3
-     of 13 local runs); the delayed-exit cell pins the deterministic
-     shape.
+     fallout is exit-only. Other loader rejects still count as real
+     truncation and void as `broad_stopping`, so an immediate exit
+     may still void intermittently (about 1 in 10 local runs); the
+     delayed-exit cell pins the deterministic shape.
 4. Capture loss/overflow in the window, via the close read and the
    collector: failed close read ⇒ `quarantined` / `budget` / else
    `broad_plan_topology`; collector `Unavailable` (saturated, contended,

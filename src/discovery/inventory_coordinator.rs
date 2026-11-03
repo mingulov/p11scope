@@ -1056,15 +1056,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let unknown_stop = stop.is_none();
         // Health state before any link verification: a final link-only
         // snapshot must not advance the proven-clean bound when the
-        // counters already show loss.
+        // counters already show loss. The sticky first loss counts too: a
+        // mid-run counter rise or unreadable health truncates even when a
+        // later sweep reads clean.
         let (health_dirty, loss_cause) = match self.capture.as_ref() {
             Some(capture) if capture.unproven.is_some() => {
                 (true, crate::render::PrearmWatchEnd::ScopeUncertain)
             }
             Some(capture)
+                if capture.prearm_first_loss.as_ref().is_some_and(|loss| {
+                    loss.cause == crate::render::PrearmWatchEnd::ScopeUncertain
+                }) =>
+            {
+                (true, crate::render::PrearmWatchEnd::ScopeUncertain)
+            }
+            Some(capture)
                 if capture.health_unproven.is_some()
                     || capture.pairs_unproven.is_some()
-                    || capture.pairs_uncounted.is_some() =>
+                    || capture.pairs_uncounted.is_some()
+                    || capture.prearm_first_loss.is_some() =>
             {
                 (true, crate::render::PrearmWatchEnd::HealthLoss)
             }
@@ -1082,14 +1092,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let _ = self.refresh_prearm_object_changes_inner(unknown_stop);
         // A health-dirty armed watch truncates at the last proven-clean
-        // bound instead of riding to the natural end. The bound never falls
-        // below the arm instant: no clean proof after arming caps the claim
-        // to the arm itself, never to an end before its start.
+        // bound instead of riding to the natural end. When a mid-run loss
+        // latched the sticky first loss, the bound is the earlier of that
+        // first loss (`min(clean_before, baseline)`) and the terminal clean
+        // read, so a later clean sweep cannot extend past the loss. The
+        // bound never falls below the arm instant: no clean proof after
+        // arming caps the claim to the arm itself, never to an end before
+        // its start.
         if health_dirty {
-            let clean = self
+            let (clean, first_loss) = self
                 .capture
                 .as_ref()
-                .and_then(|capture| capture.last_clean_ns);
+                .map(|capture| (capture.last_clean_ns, capture.prearm_first_loss))
+                .unwrap_or((None, None));
             let ids: Vec<crate::discovery::identity::PinnedObjectId> =
                 self.prearm_state.watches().keys().copied().collect();
             for id in ids {
@@ -1101,7 +1116,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 let Some(since) = armed_since else {
                     continue;
                 };
-                let bound = clean.map(|proven| proven.max(since));
+                let first_bound = first_loss.map(|loss| {
+                    let base = loss
+                        .clean_before_ns
+                        .map_or(loss.baseline_ns, |clean| clean.min(loss.baseline_ns));
+                    base.max(since)
+                });
+                let current_bound = clean.map(|proven| proven.max(since));
+                let bound = match (first_bound, current_bound) {
+                    (Some(first), Some(current)) => Some(first.min(current)),
+                    (Some(first), None) => Some(first),
+                    (None, Some(current)) => Some(current),
+                    (None, None) => None,
+                };
                 if let Some(watch) = self.prearm_state.get_mut(id) {
                     watch.cap_verified_to(bound);
                     watch.end(loss_cause, stop);
@@ -2525,6 +2552,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pairs_unproven: None,
             pairs_uncounted: None,
             last_clean_ns: None,
+            prearm_first_loss: None,
             sweep_began_ns: None,
             preadmission: PreadmissionStash::new(PREADMISSION_STASH_LIMIT),
             stopped: false,
@@ -2820,6 +2848,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
             return;
         };
+        // Sticky first loss for pre-arm truncation: the first batch carrying
+        // a counter rise, unreadable health, or lifecycle loss latches its
+        // baseline and the last clean read before it. First wins; a later
+        // clean sweep must not wash the loss away.
+        if capture.prearm_first_loss.is_none()
+            && (batch.health_regression.is_some()
+                || batch.health_unproven.is_some()
+                || batch.lifecycle_loss.is_some())
+        {
+            let mut baseline = batch.health_baseline_ns;
+            let mut cause = crate::render::PrearmWatchEnd::HealthLoss;
+            if let Some(loss) = &batch.lifecycle_loss {
+                baseline = baseline.min(loss.at_ns);
+                cause = crate::render::PrearmWatchEnd::ScopeUncertain;
+            }
+            capture.prearm_first_loss = Some(PrearmFirstLoss {
+                cause,
+                baseline_ns: baseline,
+                clean_before_ns: capture.last_clean_ns,
+            });
+        }
         capture.health_unproven = batch.health_unproven.clone();
         if capture.pairs_unproven.is_none() {
             capture.pairs_unproven = pair_precondition_failure(batch);
@@ -9438,6 +9487,19 @@ impl PairRecovery {
     }
 }
 
+/// Sticky first health loss for pre-arm truncation: the first witness
+/// batch carrying a counter rise, unreadable health, or lifecycle loss.
+/// Records the loss baseline (the earliest instant of the drop) and the
+/// last clean read before it, so a later clean sweep cannot wash the loss
+/// away. The terminal close truncates at `min(clean_before, baseline)`,
+/// floored at the arm instant.
+#[derive(Debug, Clone, Copy)]
+struct PrearmFirstLoss {
+    cause: crate::render::PrearmWatchEnd,
+    baseline_ns: u64,
+    clean_before_ns: Option<u64>,
+}
+
 /// Per-endpoint attach state from the capture facade's receipts. Bounded by
 /// the endpoint budget N: each endpoint is attached or failed at most once.
 struct CaptureCoverage {
@@ -9471,6 +9533,10 @@ struct CaptureCoverage {
     /// The latest witness read with proven health, no rise, and held
     /// custody: where a watch ends at stop.
     last_clean_ns: Option<u64>,
+    /// Sticky first health loss for pre-arm truncation (see
+    /// `PrearmFirstLoss`): latched by the first witness batch carrying a
+    /// counter rise, unreadable health, or lifecycle loss.
+    prearm_first_loss: Option<PrearmFirstLoss>,
     /// The health read of the batch the open CALLER_USE sweep began in
     /// (`None`: the next batch begins one).
     sweep_began_ns: Option<u64>,
@@ -10860,7 +10926,7 @@ pub(crate) mod tests {
         );
         coordinator.end_capture_coverage(5_000);
         coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(9_000));
-        let watch = coordinator.prearm_rows()[0].watch.as_ref().unwrap().clone();
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
         assert_eq!(watch.until_ns, Some(5_000));
         assert_eq!(
             watch.ended_by,
@@ -10905,7 +10971,7 @@ pub(crate) mod tests {
         }
         coordinator.end_capture_coverage(5_000);
         coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(5_000));
-        let watch = coordinator.prearm_rows()[0].watch.as_ref().unwrap().clone();
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
         assert_eq!(
             watch.ended_by,
             Some(crate::render::PrearmWatchEnd::HealthLoss)
@@ -10948,12 +11014,88 @@ pub(crate) mod tests {
         }
         coordinator.end_capture_coverage(5_000);
         coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(5_000));
-        let watch = coordinator.prearm_rows()[0].watch.as_ref().unwrap().clone();
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
         assert_eq!(
             watch.ended_by,
             Some(crate::render::PrearmWatchEnd::ScopeUncertain)
         );
         assert_eq!(watch.until_ns, Some(4_000));
+    }
+
+    #[test]
+    fn prearm_counter_rise_through_witness_batches_truncates() {
+        // A counter rise through `note_witness_batch` truncates the armed
+        // interval at the loss baseline even when a later clean sweep would
+        // otherwise wash the loss away: armed at 3000, clean read at 3200,
+        // regression dated at baseline 3200 (read 3600), clean read at 4000,
+        // stop at 5000. The watch ends `health_loss` with `until` 3200, not
+        // `scope_end` at 5000.
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "counter-rise");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        assert_eq!(
+            coordinator.prearm_rows()[0].watch.as_ref().unwrap().state,
+            crate::render::PrearmWatchState::Armed,
+        );
+        let mut clean_before = witness_batch();
+        clean_before.custody = ScopeCustody::System;
+        clean_before.health_baseline_ns = 1_000;
+        clean_before.health_read_ns = 3_200;
+        clean_before.rows_anchor_ns = 3_201;
+        clean_before.rows_read_ns = 3_201;
+        clean_before.counts_read_ns = 3_201;
+        coordinator.note_witness_batch(&clean_before);
+        let mut regressed = witness_batch();
+        regressed.custody = ScopeCustody::System;
+        regressed.health_baseline_ns = 3_200;
+        regressed.health_read_ns = 3_600;
+        regressed.health_regression =
+            Some("native capture health counters rose: EVIDENCE[1] 0->1".into());
+        regressed.rows_anchor_ns = 3_601;
+        regressed.rows_read_ns = 3_601;
+        regressed.counts_read_ns = 3_601;
+        coordinator.note_witness_batch(&regressed);
+        let mut clean_after = witness_batch();
+        clean_after.custody = ScopeCustody::System;
+        clean_after.health_baseline_ns = 3_600;
+        clean_after.health_read_ns = 4_000;
+        clean_after.rows_anchor_ns = 4_001;
+        clean_after.rows_read_ns = 4_001;
+        clean_after.counts_read_ns = 4_001;
+        coordinator.note_witness_batch(&clean_after);
+        coordinator.end_capture_coverage(5_000);
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(5_000));
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::HealthLoss)
+        );
+        assert_eq!(watch.until_ns, Some(3_200));
+        assert!(
+            watch.until_ns.is_some_and(|until| until <= 3_200),
+            "truncation never rides past the loss baseline: {watch:?}"
+        );
     }
 
     #[test]

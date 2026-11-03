@@ -4712,7 +4712,8 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         if armed {
             assert!(
                 session.instance_tracking().refused().is_none(),
-                "{what}: the armed cell needs live instance hooks"
+                "{what}: the armed cell needs live instance hooks: {:?}",
+                session.instance_tracking().refused()
             );
         }
         // Born inside the scope: the test moves itself in, spawns the

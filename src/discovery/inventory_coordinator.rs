@@ -11695,6 +11695,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn partial_attach_subject_matches_the_oracle_drain_gate() {
+        // Pinned verbatim: scripts/inventory-native-oracle.py matches this
+        // subject to gate the attach drain; a rewording breaks the gate.
+        assert_eq!(PARTIAL_ATTACH_SUBJECT, "native endpoint attach failed");
+    }
+
+    #[test]
     fn partial_or_unrecorded_admission_is_never_watched() {
         use crate::discovery::inventory_attach_set::tests as fx;
         let dir = tempfile::tempdir().unwrap();

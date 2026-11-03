@@ -3137,7 +3137,10 @@ fn detect_tables_for_layout(
 /// overlap pass below (validated desc, length desc, start asc). A
 /// candidate covered by a validated table, or by an overlapping longer
 /// decode, adds no coverage; equal-length unvalidated ties go to the
-/// earlier start.
+/// earlier start. Accepted residuals: same-start pairs where a future
+/// longer decode covers the shorter (the survivor covers the same words;
+/// admission dedups by object+offset), and validated discards that hide
+/// an overlapping candidate from a future validated survivor (contrived).
 fn anchor_kept_dominates(
     kept_start: usize,
     kept_len: usize,
@@ -3148,7 +3151,9 @@ fn anchor_kept_dominates(
     candidate != kept_start
         && candidate < kept_start.saturating_add(kept_len)
         && kept_start < candidate.saturating_add(candidate_len)
-        && (kept_validated || kept_len >= candidate_len)
+        && (kept_validated
+            || kept_len > candidate_len
+            || (kept_len == candidate_len && kept_start < candidate))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3333,8 +3338,9 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                 let count = ((snapshot.len() - candidate - width) / width).min(limit);
                 // Skip anchor decodes the overlap pass below would discard:
                 // a candidate covered by a validated table, or by an
-                // overlapping decode at least as long, adds no coverage but
-                // burns a table candidate each. An aliased export tail
+                // overlapping longer (or equal-length earlier-start) decode,
+                // adds no coverage but burns a table candidate each. An
+                // aliased export tail
                 // otherwise spends ~36 candidates per provider and exhausts
                 // the per-pass budget at system scale. Same-start
                 // extensions, longer recoveries, and candidates touching a

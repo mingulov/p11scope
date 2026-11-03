@@ -52,7 +52,7 @@ OUTDIR=$(cd "$OUTDIR" && pwd -P) || { echo "cannot resolve OUTDIR: $OUTDIR" >&2;
 }
 
 # Preflight: missing prerequisites exit 77 before any cell runs.
-for tool in docker gcc python3 softhsm2-util systemd-run capsh setpriv unshare nsenter sudo; do
+for tool in bash docker gcc python3 softhsm2-util systemd-run capsh setpriv unshare nsenter sudo; do
     command -v "$tool" >/dev/null || { echo "$tool required" >&2; exit 77; }
 done
 if command -v gnutimeout >/dev/null 2>&1; then
@@ -145,9 +145,10 @@ else
 fi
 
 echo "=== cell: pidns ==="
-# The redirect stays outside sudo deliberately: the caller owns OUTDIR/pidns.log.
+# verify-pidns.sh is bash (arrays); invoke via bash, not sh. The redirect stays
+# outside sudo deliberately: the caller owns OUTDIR/pidns.log.
 # shellcheck disable=SC2024
-if sudo -n sh scripts/matrix/verify-pidns.sh "$P11SCOPE" "$OUTDIR/pidns" >"$OUTDIR/pidns.log" 2>&1; then
+if sudo -n bash scripts/matrix/verify-pidns.sh "$P11SCOPE" "$OUTDIR/pidns" >"$OUTDIR/pidns.log" 2>&1; then
     if python3 -c 'import json,sys; rows=[json.loads(l) for l in open(sys.argv[1])]; sys.exit(0 if len(rows)==9 and all(r["pass"] for r in rows) else 1)' "$OUTDIR/pidns/results.jsonl" 2>/dev/null; then
         record pidns 1 qualified "9/9 subcells passed (refusals named, cgroup lossy, trace initial PIDs)"
     else

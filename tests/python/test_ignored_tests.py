@@ -1088,6 +1088,58 @@ class IgnoredTestsTests(unittest.TestCase):
                    / "pressure_live256_all_blocked_twin_refuses_once.log")
         self.assertFalse(xfail_log_matches("", excerpt))
 
+    def test_xfail_excerpts_contain_no_home_or_worktree_paths(self):
+        # Canned logs are ground truth for the next editor: a baked-in
+        # author path (/home/..., .worktrees/...) would be mistaken for
+        # real content. TMPDIR-scoped /var/tmp names are the runner's
+        # conventional temp location, not an author path.
+        logs = sorted(XFAIL_EXCERPT_DIR.glob("*.log"))
+        self.assertGreater(len(logs), 0, "no excerpts to check")
+        for path in logs:
+            text = path.read_text(encoding="utf-8")
+            for marker in ("/home/", "/root/", ".worktrees/"):
+                with self.subTest(excerpt=path.name, marker=marker):
+                    self.assertNotIn(marker, text)
+
+    def test_pressure_failure_excerpts_have_distinct_run_footers(self):
+        # The two pressure excerpts are distinct privileged runs with
+        # distinct panic timings; an identical "finished in" footer
+        # means one was copied onto the other.
+        footers = []
+        for stem in ("pressure_live256_genuine_episode_admits_late_then_head",
+                     "pressure_live256_all_blocked_twin_refuses_once"):
+            path = XFAIL_EXCERPT_DIR / (stem + ".log")
+            lines = [line for line in
+                     path.read_text(encoding="utf-8").splitlines()
+                     if line.startswith("test result:")]
+            self.assertEqual(len(lines), 1, f"{stem} has no footer")
+            footers.append(lines[0])
+        self.assertNotEqual(footers[0], footers[1],
+                            "both pressure excerpts share one footer")
+
+    def test_xfail_known_limit_citations_resolve_in_tree(self):
+        # A reason that cites a known limit must name the in-tree file
+        # that carries it, so the citation can be checked; a bare
+        # "(doc Known limit ...)" with no path is dangling.
+        reasons = runner_array_lines(RUNNER, "XFAIL_REASONS")
+        cited = [reason for reason in reasons
+                 if "Known limit" in reason]
+        self.assertGreater(len(cited), 0, "no cited limits to check")
+        for reason in cited:
+            with self.subTest(reason=reason[:60]):
+                match = re.search(
+                    r"\b((?:src|docs|tests|scripts)/"
+                    r"[A-Za-z0-9_./-]+\.(?:rs|md|sh|py))",
+                    reason)
+                self.assertIsNotNone(
+                    match, f"citation names no in-tree path: {reason}")
+                target = ROOT / match.group(1)
+                self.assertTrue(target.is_file(),
+                                f"citation target missing: {target}")
+                self.assertIn(
+                    "Known limit", target.read_text(encoding="utf-8"),
+                    f"citation target carries no limit: {target}")
+
     def test_runner_list_refuses_skip_misalignment(self):
         text = RUNNER.read_text(encoding="utf-8")
         match = re.search(r"^SKIP_REASONS=\(\n(.*?)\n\)", text, re.M | re.S)

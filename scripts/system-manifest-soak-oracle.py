@@ -434,7 +434,8 @@ def gate_resource_accounting(evidence):
     # arming point) and must leave at least half the required window
     # for post-arming judging. Without that point, or with fewer than
     # eight post-arming samples, the whole trace is judged (fail
-    # closed). Growth before GO is judged against pre-GO margins.
+    # closed). Growth before GO is judged against pre-GO margins
+    # (pre windows under eight samples by their range).
     timing = run.get("timing")
     go_ms = timing.get("t_go_sampler_ms") if isinstance(timing, dict) else None
     judged = rows
@@ -502,8 +503,18 @@ def growth_check(series, margin, label, pre_arming=False):
     (10th percentile) must stay within an absolute margin of the
     early-half floor, so the same leak fails on any base. A retained
     leak raises the floor; a bounded oscillation between fixed levels
-    (or a lone spike, or a detach tail dip) does not move it."""
+    (or a lone spike, or a detach tail dip) does not move it. A
+    pre-arming window with fewer than eight samples is judged by its
+    range (max - min) against the same margin instead of being
+    skipped, so an early GO cannot leave pre-GO growth unjudged;
+    honest admission over a few samples stays well under the
+    pre-GO margins."""
     if len(series) < 8:
+        if pre_arming and len(series) >= 2:
+            low, high = min(series), max(series)
+            if high > low + margin:
+                return (f"{label} grows pre-arming: range {low:.0f} "
+                        f"-> {high:.0f} (margin {margin:.0f})")
         return None
     half = len(series) // 2
     floor_early = quantile(sorted(series[:half]), 0.10)

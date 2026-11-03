@@ -37,19 +37,57 @@ def _evidence_ids(show):
             if entry.get("name") == "EVIDENCE" and "id" in entry]
 
 
+def _is_zero_word(value):
+    if isinstance(value, int):
+        return value == 0
+    if isinstance(value, str):
+        try:
+            return int(value, 16) == 0
+        except ValueError:
+            return False
+    return False
+
+
 def _is_zero_key(key):
-    if key == 0:
-        return True
-    return isinstance(key, list) and len(key) > 0 and all(v == 0 for v in key)
+    if isinstance(key, int):
+        return key == 0
+    return (isinstance(key, list) and len(key) > 0
+            and all(_is_zero_word(v) for v in key))
+
+
+def _decode_u64(value):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, list):
+        total = 0
+        for pos, word in enumerate(value):
+            if isinstance(word, int):
+                byte = word
+            elif isinstance(word, str):
+                try:
+                    byte = int(word, 16)
+                except ValueError:
+                    return 0
+            else:
+                return 0
+            total |= (byte & 0xFF) << (8 * pos)
+        return total
+    return 0
 
 
 def _key_zero_sum(dump):
     for row in dump:
         if _is_zero_key(row.get("key")):
             values = row.get("values", [])
-            if isinstance(values, list):
-                return sum(values), len(values)
-            return 0, 0
+            if not isinstance(values, list):
+                return 0, 0
+            total = 0
+            for entry in values:
+                if isinstance(entry, dict):
+                    total += _decode_u64(entry.get("value", []))
+                else:
+                    total += _decode_u64(entry)
+            return total, len(values)
     return 0, 0
 
 

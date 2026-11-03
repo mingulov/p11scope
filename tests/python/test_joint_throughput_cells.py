@@ -558,6 +558,25 @@ class BpfEvidenceSum(unittest.TestCase):
                          [{"id": 31, "ring_loss_sum": 0, "cpus": 12}])
         self.assertEqual(summary["total_ring_loss_sum"], 0)
 
+    def test_real_bpftool_hex_format_decodes(self):
+        show = json.dumps([{"id": 41, "name": "EVIDENCE", "max_entries": 9}])
+        zero8 = ["0x00"] * 8
+        dumps = {41: json.dumps([
+            {"key": ["0x00", "0x00", "0x00", "0x00"], "values": [
+                {"cpu": 0, "value": ["0x03"] + zero8[1:]},
+                {"cpu": 1, "value": ["0x07"] + zero8[1:]},
+            ]},
+            {"key": ["0x01", "0x00", "0x00", "0x00"], "values": [
+                {"cpu": 0, "value": ["0x63"] + zero8[1:]},
+            ]},
+        ])}
+        proc = self._run_helper(show, dumps)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["maps"],
+                         [{"id": 41, "ring_loss_sum": 10, "cpus": 2}])
+        self.assertEqual(summary["total_ring_loss_sum"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

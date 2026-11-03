@@ -17412,7 +17412,7 @@ fn joint_capture_owner_commit_batch_below_prepay_refuses_full_gracefully() {
     }
 
     // Healthy twin: generous pool; the observation stages.
-    let mut healthy = Pipeline::new();
+    let mut healthy = Box::new(Pipeline::new());
     let healthy_id = RegistryInstanceId::from_raw(0);
     let healthy_base = healthy.pool_charged();
     let healthy_key = healthy.register(true, 101, 1, healthy_id);
@@ -17433,14 +17433,14 @@ fn joint_capture_owner_commit_batch_below_prepay_refuses_full_gracefully() {
     let (h_facts, h_pos) = healthy.admit(Some(SESSION));
     // S1Only twin under capture-wide accounting: a silent Joint
     // latch plus the direct feed.
-    let mut s1 = Pipeline::new();
+    let mut s1 = Box::new(Pipeline::new());
     s1.register(true, 201, 11, RegistryInstanceId::from_raw(0));
     let s1_id = RegistryInstanceId::from_raw(1);
     let s1_key = s1.register(false, 102, 2, s1_id);
     let (s1_facts, s1_pos) = s1.admit(Some(SESSION));
     // Refusal twin: admitted early for lockstep; pinned and
     // registered after the twins measure its headroom.
-    let mut refusal = Pipeline::new();
+    let mut refusal = Box::new(Pipeline::new());
     let (r_facts, r_pos) = refusal.admit(Some(SESSION));
     assert_eq!(s1_pos, h_pos, "lockstep admissions agree");
     assert_eq!(r_pos, h_pos, "lockstep admissions agree");

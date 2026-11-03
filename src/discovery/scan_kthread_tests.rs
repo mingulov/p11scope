@@ -115,6 +115,29 @@ fn pinned_start_time() -> u64 {
         .expect("the test process pins a start time")
 }
 
+/// [`scan_view_with_examined`] over scripted maps with operator hints: the
+/// flag reports whether the scan reached its `--module` hint loop. Memory
+/// reads stay off: the flag is about the mapping pass, not `/proc/<pid>/mem`.
+fn run_examined(
+    fixture: &mut EmptyMapsFixture,
+    budget: &mut CaptureWorkBudget,
+    hints: &[PathBuf],
+) -> Result<(ScanOutcome, Vec<ExaminedObject>, bool), String> {
+    let view = self_view();
+    let hooks = HookRegistry::builtin();
+    scan_view_with_examined(
+        &ScanRequest {
+            pid: view.pid(),
+            hints,
+            hooks: &hooks,
+        },
+        &view,
+        budget,
+        fixture,
+        false,
+    )
+}
+
 #[test]
 fn scan_kernel_thread_empty_maps_is_verified_absence() {
     let mut fixture = EmptyMapsFixture {
@@ -145,6 +168,83 @@ fn scan_kernel_thread_empty_maps_is_verified_absence() {
         budget.kernel_thread_absences(),
         1,
         "one verified absence is counted once"
+    );
+}
+
+#[test]
+fn kernel_thread_scan_never_examines_hints() {
+    // Verified absence never evaluates hints: the collapse must not read
+    // the missing miss notes as a match.
+    let mut fixture = EmptyMapsFixture {
+        maps: Vec::new(),
+        stat: Ok(kthread_stat(pinned_start_time())),
+        exe: Err(io::ErrorKind::NotFound),
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let (outcome, examined, hints_examined) =
+        run_examined(&mut fixture, &mut budget, &[]).expect("kernel thread must scan, not error");
+    assert!(
+        !hints_examined,
+        "a kernel thread never reaches the hint loop, got {outcome:?}"
+    );
+    assert!(examined.is_empty());
+    assert!(outcome.skipped().is_empty());
+}
+
+#[test]
+fn refused_initial_scan_never_examines_hints() {
+    // A refusal before the hint loop is hint-silent too: no miss notes,
+    // no match implied.
+    let mut fixture = EmptyMapsFixture {
+        maps: Vec::new(),
+        stat: Ok(user_stat(pinned_start_time())),
+        exe: Ok(PathBuf::from("/usr/bin/worker")),
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let (outcome, _, hints_examined) = run_examined(&mut fixture, &mut budget, &[])
+        .expect("refusal must keep scanning, not error");
+    assert!(
+        !hints_examined,
+        "a refused-initial scan never reaches the hint loop, got {outcome:?}"
+    );
+    assert!(
+        outcome.skipped().iter().any(|skip| skip
+            .reason
+            .contains("empty or truncated /proc maps snapshot")),
+        "live exe must keep today's refusal, got {:?}",
+        outcome.skipped()
+    );
+}
+
+#[test]
+fn completed_scan_marks_hints_examined() {
+    // One executable group with an unopenable path and an unmatched hint:
+    // the ordinary miss disclosure plus the examined flag.
+    let mut fixture = EmptyMapsFixture {
+        maps: b"7f0000000000-7f0000001000 r-xp 00000000 08:01 424242 /nonexistent-dir/missing.so\n"
+            .to_vec(),
+        stat: Err(io::ErrorKind::NotFound),
+        exe: Err(io::ErrorKind::NotFound),
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let hints = [PathBuf::from("/opt/typo.so")];
+    let (outcome, _, hints_examined) = run_examined(&mut fixture, &mut budget, &hints)
+        .expect("an ordinary scan must complete, not error");
+    assert!(
+        hints_examined,
+        "a completed scan reached the hint loop, got {outcome:?}"
+    );
+    assert!(
+        outcome.unavailable_reason().is_none(),
+        "the mapping bracket must complete, got {outcome:?}"
+    );
+    assert!(
+        outcome
+            .skipped()
+            .iter()
+            .any(|skip| skip.subject == "/opt/typo.so" && skip.reason == HINT_NOT_MAPPED_REASON),
+        "the unmatched hint is owed one miss note, got {:?}",
+        outcome.skipped()
     );
 }
 

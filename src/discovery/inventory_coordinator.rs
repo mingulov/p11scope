@@ -9177,6 +9177,87 @@ pub(crate) mod tests {
         );
     }
 
+    /// A catalog whose three members shape the examining projection:
+    /// pids 1 and 2 examined hints and missed `subject` in both views;
+    /// pid 3 is a hint-silent Scanned view (kernel thread shape) with the
+    /// given flag. No objects: only the miss collapse is under test.
+    fn examining_catalog(pid3_examined: bool) -> crate::inspect_system::Catalog {
+        use crate::inspect_system::{MemberStatus, ProcessRecord};
+        let mut catalog = capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            1,
+            None,
+        );
+        let application = || {
+            crate::inspect_identity::InspectApplicationResult::Unknown(
+                crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+            )
+        };
+        let member = |pid: u32, hints_examined: bool| ProcessRecord {
+            application: application(),
+            complete_scan: None,
+            hints_examined,
+            pid,
+            status: MemberStatus::Scanned,
+            objects: Vec::new(),
+            generation: None,
+        };
+        catalog.processes = vec![member(1, true), member(2, true), member(3, pid3_examined)];
+        catalog.notes = vec![
+            hint_miss_note(1, "/opt/typo.so"),
+            hint_miss_note(2, "/opt/typo.so"),
+        ];
+        catalog
+    }
+
+    #[test]
+    fn silent_unexamined_view_does_not_mask_unmatched_hint() {
+        // The projection behind the collapse: examining is {1, 2} (pid 3
+        // never evaluated hints), so a hint missed in both examining
+        // views still owes one pid-less scope gap.
+        let catalog = examining_catalog(false);
+        let mut coordinator = coordinator();
+        coordinator.project_catalog(&catalog, &BTreeMap::new(), 60);
+        coordinator.registry.publish();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "/opt/typo.so")
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "silent pid 3 must not mask the miss: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert_eq!(gaps[0].pid, None);
+        assert_eq!(
+            gaps[0].reason,
+            crate::discovery::scan::HINT_NOT_MAPPED_REASON
+        );
+    }
+
+    #[test]
+    fn silent_examined_view_matches_its_hint() {
+        // Healthy twin: pid 3 examined hints and reports no miss, so its
+        // silence is a match and no scope gap is owed.
+        let catalog = examining_catalog(true);
+        let mut coordinator = coordinator();
+        coordinator.project_catalog(&catalog, &BTreeMap::new(), 60);
+        coordinator.registry.publish();
+        assert!(
+            coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "/opt/typo.so"),
+            "an examining view's silence is a match: {:?}",
+            coordinator.registry.gaps()
+        );
+    }
+
     #[test]
     fn hint_matched_by_maps_identity_collapses_to_no_gap() {
         // A hint no deep scan matched but maps identity attributed (a

@@ -31253,6 +31253,58 @@ fn kernel_thread_exclusion_needs_empty_maps_and_the_thread_flag() {
     let _ = std::fs::remove_dir_all(&proc_root);
 }
 
+/// The selection call sites share one helper: kernel threads with no
+/// user memory are excluded before the cap, counted on the pass budget,
+/// and the rest select by rarity. The twins above pin the exclusion
+/// predicate; this pins the helper the call sites run, including the
+/// budget count.
+#[test]
+fn select_excluding_kernel_threads_counts_absences_on_the_budget() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let proc_root =
+        std::env::temp_dir().join(format!("demo2-select-nokthreads-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proc_root);
+    for (pid, flags) in [
+        (10u32, crate::process::PF_KTHREAD),
+        (11, 0x0040_0000u32),
+        (12, crate::process::PF_KTHREAD),
+        (13, crate::process::PF_KTHREAD),
+    ] {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), stat_line(pid, "p", flags)).unwrap();
+    }
+    let sweep: SweepSnapshots = vec![
+        (10, Vec::new()),
+        (11, Vec::new()),
+        (12, Vec::new()),
+        (13, vec![map_entry("/usr/bin/worker", 7)]),
+        (14, Vec::new()),
+    ];
+    let unavailable: BTreeSet<u32> = [12].into_iter().collect();
+    let mut budget = CaptureWorkBudget::default();
+    let selected =
+        select_excluding_kernel_threads(&sweep, &unavailable, &proc_root, 4, &mut budget);
+    // Only pid 10 is a flagged thread with an empty available snapshot;
+    // the cap then fits every remaining pid.
+    assert_eq!(selected, vec![11, 12, 13, 14], "{selected:?}");
+    assert_eq!(budget.kernel_thread_absences(), 1);
+    let _ = std::fs::remove_dir_all(&proc_root);
+}
+
 /// Package C: rotation's fairness tier agrees with plain selection when
 /// nothing is stale, prefers never-evicted members within each rarity
 /// class, and still lets global rarity beat pid order across groups.

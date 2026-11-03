@@ -1983,6 +1983,7 @@ pub(crate) fn apply_counter_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn live_snapshot_scoped(
     snapshot: &crate::metrics::CaptureSnapshot,
     ev: &Evidence,
@@ -2014,6 +2015,7 @@ pub(crate) fn live_snapshot_scoped(
 /// (`State::mechanisms`): an empty map renders nothing new, a nonempty one
 /// renders a compact name/calls/errors table under the function table. No
 /// parameters are shown, so no decoder policy applies here.
+#[allow(clippy::too_many_arguments)]
 pub fn live_scoped(
     reports: &[SlotReport],
     ev: &Evidence,

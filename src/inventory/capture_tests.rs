@@ -1132,6 +1132,10 @@ impl LaneHost<Pin> for Scene {
         self.coordinator.take_target_delta()
     }
 
+    fn has_pending_targets(&self) -> bool {
+        self.coordinator.has_pending_targets()
+    }
+
     fn capture_targets(&self) -> &dyn CaptureTargets {
         self.coordinator.attach_set()
     }
@@ -1385,6 +1389,57 @@ const STOP: [&str; 15] = [
 ];
 
 /// Invariants 1, 2 and 4 as one exact call sequence: activation before the
+/// I3: the activation extend carries the host's pending delta (pre-arm
+/// proved offsets absorbed before passes), not an empty delta. A host with
+/// two pending pre-arm endpoints sees them in the activating extend, so the
+/// module is watched before it is mapped; an empty host still activates
+/// empty (the contract order below is unchanged).
+#[test]
+fn activation_extend_carries_pending_prearm_delta() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    // Real pre-arm pinning: two proved standard-name exports.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("prearm-act.c");
+    std::fs::write(
+        &src,
+        "unsigned long C_Initialize(void *p){(void)p;return 0;}\n\
+         unsigned long C_GetFunctionList(void *l){(void)l;return 0;}\n",
+    )
+    .unwrap();
+    let so = dir.path().join("prearm-act.so");
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let pinning = crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
+        &[so],
+        &[],
+        None,
+        0,
+        0,
+        &mut crate::discovery::scan::CaptureWorkBudget::default(),
+    )
+    .expect("test pre-arm pins");
+    scene.coordinator.set_prearm_pinning(pinning);
+    scene.coordinator.absorb_prearm_plan(1_000);
+    let lane = ScriptedLane::new(&log);
+    let started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    assert_eq!(started.attached, 2, "activation attaches the pre-arm delta");
+    let log_entries = entries(&log);
+    assert!(
+        log_entries.iter().any(|entry| entry == "extend[0,1]"),
+        "the activating extend carries the pending pre-arm endpoints, not empty: {log_entries:?}"
+    );
+}
+
 /// first scan with its receipt forwarded at once, then per pass scan →
 /// delta → extend → receipt → lifecycle → witness → commit → publish, then
 /// the terminal read before the coverage ends, retirement under service, one

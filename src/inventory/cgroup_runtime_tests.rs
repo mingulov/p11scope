@@ -58,6 +58,8 @@ impl<'a> ObservedDriver<'a> {
                 identity: None,
                 joint_finish: JointFinishDriver::NotBegun,
                 stop_requested: false,
+                prearm_stop_probe: None,
+                prearm_probe_stop: None,
                 joint_first_error: None,
                 suspended: false,
                 joint_commit_pending: false,

@@ -981,7 +981,8 @@ unobserved_windows?}`:
 
 Never-mapped rule: a pre-armed input no scope member maps carries no
 window — its watch speaks. When the declared set never attached, it
-ends at scope end with no arm instant and no attach instant; on the
+ends at the run's end (`scope_end` or `stop`) with no arm instant and
+no attach instant; on the
 native lane the declared set attaches and arms without any mapping
 (`mapped` false, `armed`, `since`/`attached_at` set). Attached modules
 without an R2-D1-6 proof always disclose their
@@ -996,6 +997,16 @@ set from proved offsets only (no manifest claims), while the Detailed
 lane also includes manifest-claimed offsets. The inventory set is
 conservative: manifest-only offsets that later attach surface as
 `mapped_unattached` windows, never as silent coverage.
+
+Truncation causes: a health-dirty terminal truncates armed watches at
+the last proven-clean bound (a counter rise or unreadable health
+anywhere in the run truncates even when a later sweep reads clean).
+`health_loss` also covers pair-precondition and pair-uncounted
+evidence conservatively: those void no-use proof rather than link or
+observation health, but they still truncate the watch. `scope_uncertain`
+covers any custody loss, including a proven PID-target exit: the exit
+itself is proven, but coverage past it is not, so the watch truncates
+conservatively instead of riding to the run end.
 
 ## Example (abridged)
 

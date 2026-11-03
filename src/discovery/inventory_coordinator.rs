@@ -250,7 +250,8 @@ pub(crate) struct PrearmReportRow {
     pub ino: u64,
     /// Whole-file digest of the retained pin, `None` when unproven.
     pub sha256: Option<String>,
-    /// Whether any registry module record names this object now.
+    /// Whether any registry module record names this object (observed mapped
+    /// by a scope member during the capture; records are never removed).
     pub mapped: bool,
     /// The watch interval; `None` only when the input resolved to no
     /// retained object (defensive: retained pins always resolve).
@@ -308,6 +309,13 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// endpoint ids their absorb minted: how receipt stamps address
     /// watches. Populated by [`Self::absorb_prearm_plan`].
     prearm_endpoints: BTreeMap<crate::plan::AttachKey, EndpointId>,
+    /// Frozen pre-arm stop boundary: set once, first wins, by
+    /// `end_capture_coverage` (native lane) or `freeze_prearm_stop`
+    /// (scan/no-lane path). `None` means not yet frozen (the terminal
+    /// close uses its passed instant); `Some(bound)` is frozen, with a
+    /// `None` bound meaning the stop instant is unknown (the blind tail
+    /// is never backfilled).
+    prearm_stop: Option<Option<u64>>,
     adapter: CallerAdapter<Source>,
     registry: CallerRegistry,
     attach_set: InventoryAttachSet,
@@ -437,6 +445,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     diagnostic_health: Option<u16>,
     diagnostic_refresh_loss: bool,
     diagnostic_native_unavailable: bool,
+    /// A capture failure was staged (`inventory capture failed` gap): the
+    /// pre-arm terminal cause reads `Stop` (6.13 maps errors to stop), never
+    /// a deadline `ScopeEnd`. Set by `note_scope_gap` on that pinned subject.
+    capture_failed: bool,
 }
 
 fn inventory_config(endpoint_budget: InventoryBudget) -> Result<InventoryDiscoveryConfig> {
@@ -721,6 +733,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             prearm_state: crate::prearm_module::PrearmState::empty(),
             prearm_scope_start_ns: None,
             prearm_endpoints: BTreeMap::new(),
+            prearm_stop: None,
             adapter,
             registry,
             attach_set: InventoryAttachSet::new(endpoint_budget),
@@ -773,6 +786,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             diagnostic_health: None,
             diagnostic_refresh_loss: false,
             diagnostic_native_unavailable: false,
+            capture_failed: false,
         })
     }
 
@@ -909,15 +923,37 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.prearm_state.create_watches(&watched, &declared, &pins);
     }
 
+    /// Freezes the pre-arm stop boundary for runs without native coverage
+    /// (scan lane, failed startup): the terminal close uses this instead of
+    /// a later publication read. First wins: a native `end_capture_coverage`
+    /// freeze (if any) stands. A `None` bound means the stop instant is
+    /// unknown: the blind tail is never backfilled.
+    pub(crate) fn freeze_prearm_stop(&mut self, stop_ns: Option<u64>) {
+        self.prearm_stop.get_or_insert(stop_ns);
+    }
+
     /// Re-runs per-object held-fd checks on pre-arm watched objects and
     /// publishes fresh `pinned_object_changed` brackets (R2-D1-8). Returns
     /// the newly changed object ids (sticky: already-reported objects are
     /// not returned again). A newly detected change also stages the run's
     /// changed-identity gap: the global disclosure beside the per-module
     /// bracket. An `fstat` failure records nothing here — the attach path's
-    /// global check is the backstop that surfaces it.
+    /// global check is the backstop that surfaces it. Tests only: production
+    /// closes through `finish_prearm_watches`, which threads the unknown-stop
+    /// flag.
+    #[cfg(test)]
     pub(crate) fn refresh_prearm_object_changes(
         &mut self,
+    ) -> Vec<crate::discovery::identity::PinnedObjectId> {
+        self.refresh_prearm_object_changes_inner(false)
+    }
+
+    /// Terminal refresh under a possibly unknown stop: when `unknown_stop`
+    /// the detection ran in the blind tail after the stop, so the bracket
+    /// stays exact but the coverage end stays unknown.
+    fn refresh_prearm_object_changes_inner(
+        &mut self,
+        unknown_stop: bool,
     ) -> Vec<crate::discovery::identity::PinnedObjectId> {
         let Some(prearm) = self.prearm.as_ref() else {
             return Vec::new();
@@ -934,13 +970,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     if let Some(watch) = self.prearm_state.get_mut(id) {
                         let was_ended = watch.is_ended();
                         match bracket {
+                            Some(bracket) if unknown_stop => {
+                                watch.note_object_changed_unknown_stop(bracket)
+                            }
                             Some(bracket) => watch.note_object_changed(bracket),
                             // Detected but the clock never yielded the
                             // bounds: the end is still disclosed, only its
-                            // instants are not.
+                            // instants are not. Under an unknown stop the
+                            // terminal detection ran in the blind tail:
+                            // disclose the end, never a bound past it.
                             None => watch.end(
                                 crate::render::PrearmWatchEnd::ObjectChanged,
-                                crate::attach::monotonic_ns(),
+                                if unknown_stop {
+                                    None
+                                } else {
+                                    crate::attach::monotonic_ns()
+                                },
                             ),
                         }
                         if !was_ended {
@@ -961,10 +1006,43 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         newly
     }
 
-    /// Terminal pre-arm close: a last held-fd refresh (a change detected
-    /// here ends its watch with the exact bracket), then every watch ends
-    /// for `cause` exactly once, clamped to the first stop. The run loop
-    /// calls this after the capture stops, before the final view.
+    /// Current declared-link facts per pre-armed object from the lane's own
+    /// attach stamps: how the terminal close re-evaluates arming and link
+    /// liveness. A missing stamp reads unlinked (partial attachment stays
+    /// unarmed; a lost link truncates).
+    fn prearm_links_by_object(
+        &self,
+    ) -> BTreeMap<crate::discovery::identity::PinnedObjectId, Vec<crate::prearm_module::DeclaredLink>>
+    {
+        let mut links_by_object: BTreeMap<
+            crate::discovery::identity::PinnedObjectId,
+            Vec<crate::prearm_module::DeclaredLink>,
+        > = BTreeMap::new();
+        let Some(capture) = self.capture.as_ref() else {
+            return links_by_object;
+        };
+        for (key, id) in &self.prearm_endpoints {
+            let stamped = capture.attached_at.get(id).copied();
+            links_by_object.entry(key.object).or_default().push(
+                crate::prearm_module::DeclaredLink {
+                    key: *key,
+                    linked: stamped.is_some(),
+                    stamped_at: stamped,
+                },
+            );
+        }
+        links_by_object
+    }
+
+    /// Terminal pre-arm close: final link evaluation, a last held-fd refresh
+    /// (a change detected here ends its watch with the exact bracket),
+    /// health truncation at the last proven-clean bound, then every watch
+    /// ends for `cause` exactly once, clamped to the frozen first stop. The
+    /// frozen boundary (`end_capture_coverage` or `freeze_prearm_stop`) wins
+    /// over the passed instant, so the published interval excludes the blind
+    /// tail past the detach. A `None` boundary means the stop instant is
+    /// unknown: coverage ends stay unknown. The run loop stages this before
+    /// its final commit; the final view reads the rows directly.
     pub(crate) fn finish_prearm_watches(
         &mut self,
         cause: crate::render::PrearmWatchEnd,
@@ -973,9 +1051,92 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if self.prearm_state.is_empty() {
             return;
         }
-        let _ = self.refresh_prearm_object_changes();
-        self.prearm_state.end_all(cause, now);
-        self.prearm_state.clamp_all_to_stop(now);
+        // The frozen first-stop boundary wins over any later read.
+        let stop = self.prearm_stop.unwrap_or(now);
+        let unknown_stop = stop.is_none();
+        // Health state before any link verification: a final link-only
+        // snapshot must not advance the proven-clean bound when the
+        // counters already show loss. The sticky first loss counts too: a
+        // mid-run counter rise or unreadable health truncates even when a
+        // later sweep reads clean.
+        let (health_dirty, loss_cause) = match self.capture.as_ref() {
+            Some(capture) if capture.unproven.is_some() => {
+                (true, crate::render::PrearmWatchEnd::ScopeUncertain)
+            }
+            Some(capture)
+                if capture.prearm_first_loss.as_ref().is_some_and(|loss| {
+                    loss.cause == crate::render::PrearmWatchEnd::ScopeUncertain
+                }) =>
+            {
+                (true, crate::render::PrearmWatchEnd::ScopeUncertain)
+            }
+            Some(capture)
+                if capture.health_unproven.is_some()
+                    || capture.pairs_unproven.is_some()
+                    || capture.pairs_uncounted.is_some()
+                    || capture.prearm_first_loss.is_some() =>
+            {
+                (true, crate::render::PrearmWatchEnd::HealthLoss)
+            }
+            _ => (false, cause),
+        };
+        // Final link evaluation: unarmed watches arm from the landed
+        // stamps; armed watches verify their links stay up. A dirty
+        // terminal verifies presence without advancing the bound.
+        let links_by_object = self.prearm_links_by_object();
+        for (object, links) in &links_by_object {
+            if let Some(watch) = self.prearm_state.get_mut(*object) {
+                watch.evaluate_arm(links);
+                watch.verify_links(links, if health_dirty { None } else { stop });
+            }
+        }
+        let _ = self.refresh_prearm_object_changes_inner(unknown_stop);
+        // A health-dirty armed watch truncates at the last proven-clean
+        // bound instead of riding to the natural end. When a mid-run loss
+        // latched the sticky first loss, the bound is the earlier of that
+        // first loss (`min(clean_before, baseline)`) and the terminal clean
+        // read, so a later clean sweep cannot extend past the loss. The
+        // bound never falls below the arm instant: no clean proof after
+        // arming caps the claim to the arm itself, never to an end before
+        // its start.
+        if health_dirty {
+            let (clean, first_loss) = self
+                .capture
+                .as_ref()
+                .map(|capture| (capture.last_clean_ns, capture.prearm_first_loss))
+                .unwrap_or((None, None));
+            let ids: Vec<crate::discovery::identity::PinnedObjectId> =
+                self.prearm_state.watches().keys().copied().collect();
+            for id in ids {
+                let armed_since = self.prearm_state.get(id).and_then(|watch| {
+                    (watch.render().state == crate::render::PrearmWatchState::Armed)
+                        .then(|| watch.render().since_ns)
+                        .flatten()
+                });
+                let Some(since) = armed_since else {
+                    continue;
+                };
+                let first_bound = first_loss.map(|loss| {
+                    let base = loss
+                        .clean_before_ns
+                        .map_or(loss.baseline_ns, |clean| clean.min(loss.baseline_ns));
+                    base.max(since)
+                });
+                let current_bound = clean.map(|proven| proven.max(since));
+                let bound = match (first_bound, current_bound) {
+                    (Some(first), Some(current)) => Some(first.min(current)),
+                    (Some(first), None) => Some(first),
+                    (None, Some(current)) => Some(current),
+                    (None, None) => None,
+                };
+                if let Some(watch) = self.prearm_state.get_mut(id) {
+                    watch.cap_verified_to(bound);
+                    watch.end(loss_cause, stop);
+                }
+            }
+        }
+        self.prearm_state.end_all(cause, stop);
+        self.prearm_state.clamp_all_to_stop(stop);
     }
 
     /// Assembled pre-arm report rows: one row per retained input
@@ -1001,6 +1162,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(prearm) = self.prearm.as_ref() else {
             return Vec::new();
         };
+        let undeclared_max = self.prearm_undeclared_max_all();
         let mut rows = Vec::with_capacity(prearm.inputs.len());
         for input in &prearm.inputs {
             let object = prearm.pins.id_for_prearm(input.key, &input.path);
@@ -1016,7 +1178,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     end_ns: end,
                     reason: crate::render::UnobservedReason::PreAttach,
                 });
-                if let Some(end) = object.and_then(|id| self.prearm_undeclared_max(id)) {
+                if let Some(end) = object.and_then(|id| undeclared_max.get(&id).copied()) {
                     windows.push(crate::render::UnobservedWindow {
                         start_ns: start,
                         end_ns: end,
@@ -1077,42 +1239,76 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         latest
     }
 
-    /// Max attach stamp over this object's attached endpoints outside its
-    /// declared set (scan-corroborated unproved offsets), if any: same-object
-    /// endpoints matched by retained identity over the dense id range,
-    /// skipping keys the declared set already owns.
-    fn prearm_undeclared_max(
+    /// Max attach stamp per pre-armed object over its attached endpoints
+    /// outside its declared set (scan-corroborated unproved offsets):
+    /// same-object endpoints matched by retained identity, skipping keys the
+    /// declared set already owns. One pass over the dense id range for all
+    /// inputs (not one scan per input per view).
+    fn prearm_undeclared_max_all(
         &self,
-        object: crate::discovery::identity::PinnedObjectId,
-    ) -> Option<u64> {
-        let capture = self.capture.as_ref()?;
-        let watch = self.prearm_state.get(object)?;
-        let declared = watch.declared();
-        let pins = &self.prearm.as_ref()?.pins;
-        let mut latest: Option<u64> = None;
+    ) -> BTreeMap<crate::discovery::identity::PinnedObjectId, u64> {
+        let mut max_by_object: BTreeMap<crate::discovery::identity::PinnedObjectId, u64> =
+            BTreeMap::new();
+        let (Some(capture), Some(prearm)) = (self.capture.as_ref(), self.prearm.as_ref()) else {
+            return max_by_object;
+        };
+        let pins = &prearm.pins;
+        // Attach-object → pinned-object index from the declared endpoints
+        // (one target per pre-armed file; undeclared same-object endpoints
+        // share it), so each endpoint resolves without scanning all inputs.
+        let mut attach_to_pin: BTreeMap<
+            AttachObjectId,
+            crate::discovery::identity::PinnedObjectId,
+        > = BTreeMap::new();
+        for (key, endpoint_id) in &self.prearm_endpoints {
+            if let Some(endpoint) = self.attach_set.endpoint(*endpoint_id) {
+                attach_to_pin.insert(endpoint.object, key.object);
+            }
+        }
+        // Endpoints whose target predates the declared index (absorbed
+        // without a declared endpoint, e.g. scan-only same-object offsets)
+        // still resolve by retained identity, one lookup per endpoint.
         for raw in 0..self.attach_set.len() {
             let id = EndpointId(raw as u32);
             let Some(endpoint) = self.attach_set.endpoint(id) else {
                 continue;
             };
-            let Some(target) = self.attach_set.target(endpoint.object) else {
+            let pin = match attach_to_pin.get(&endpoint.object).copied() {
+                Some(pin) => pin,
+                None => {
+                    let Some(target) = self.attach_set.target(endpoint.object) else {
+                        continue;
+                    };
+                    let Some(pin) = self
+                        .prearm_state
+                        .watches()
+                        .keys()
+                        .copied()
+                        .find(|pin| target.same_object_as(pins, *pin))
+                    else {
+                        continue;
+                    };
+                    pin
+                }
+            };
+            let Some(watch) = self.prearm_state.get(pin) else {
                 continue;
             };
-            if !target.same_object_as(pins, object) {
-                continue;
-            }
             let key = crate::plan::AttachKey {
-                object,
+                object: pin,
                 file_offset: endpoint.file_offset,
             };
-            if declared.contains(&key) || self.prearm_endpoints.contains_key(&key) {
+            if watch.declared().contains(&key) || self.prearm_endpoints.contains_key(&key) {
                 continue;
             }
             if let Some(stamped) = capture.attached_at.get(&id).copied() {
-                latest = Some(latest.map_or(stamped, |known| known.max(stamped)));
+                max_by_object
+                    .entry(pin)
+                    .and_modify(|max| *max = (*max).max(stamped))
+                    .or_insert(stamped);
             }
         }
-        latest
+        max_by_object
     }
 
     /// Whether any registry module record names this retained object: the
@@ -2215,6 +2411,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// mismatch (`pidns::numbering_gap`, review F4), capture failures,
     /// and the zero-pass stop diagnostic all ride this path.
     pub(crate) fn note_scope_gap(&mut self, subject: String, reason: String) {
+        if subject == "inventory capture failed" {
+            self.capture_failed = true;
+        }
         self.registry.record_gap(RegistryGap {
             caller: None,
             module: None,
@@ -2239,6 +2438,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// however many quanta run unlinked.
     pub(crate) fn disclose_joint_journal_unavailable_once(&mut self) {
         self.registry.disclose_joint_journal_unavailable_once();
+    }
+
+    /// Whether a capture failure was staged this run (the pre-arm terminal
+    /// cause reads `Stop` for failures, per 6.13).
+    pub(crate) fn capture_failed(&self) -> bool {
+        self.capture_failed
+    }
+
+    /// Whether this run retains any `--prearm-module` pinning (the terminal
+    /// close and its guarded scan commit run only then, never on every run).
+    pub(crate) fn has_prearm(&self) -> bool {
+        self.prearm.is_some()
     }
 
     /// Stages one pass-wide count-refresh loss boundary from the lane
@@ -2315,6 +2526,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         std::mem::take(&mut self.pending_targets)
     }
 
+    /// Whether a target delta pends (pre-arm proved offsets absorbed before
+    /// passes): the lane's activation extend carries it instead of waiting
+    /// for the first pass.
+    pub(crate) fn has_pending_targets(&self) -> bool {
+        !self.pending_targets.endpoints.is_empty() || !self.pending_targets.objects.is_empty()
+    }
+
     /// Native capture starts: from now on each scan projection stages a
     /// coverage note per mapped edge from the capture's attach receipts.
     /// `scope` is explicitly System, Cgroup, or the capture's PID incarnation:
@@ -2334,6 +2552,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pairs_unproven: None,
             pairs_uncounted: None,
             last_clean_ns: None,
+            prearm_first_loss: None,
             sweep_began_ns: None,
             preadmission: PreadmissionStash::new(PREADMISSION_STASH_LIMIT),
             stopped: false,
@@ -2629,6 +2848,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
             return;
         };
+        // Sticky first loss for pre-arm truncation: the first batch carrying
+        // a counter rise, unreadable health, or lifecycle loss latches its
+        // baseline and the last clean read before it. First wins; a later
+        // clean sweep must not wash the loss away.
+        if capture.prearm_first_loss.is_none()
+            && (batch.health_regression.is_some()
+                || batch.health_unproven.is_some()
+                || batch.lifecycle_loss.is_some())
+        {
+            let mut baseline = batch.health_baseline_ns;
+            let mut cause = crate::render::PrearmWatchEnd::HealthLoss;
+            if let Some(loss) = &batch.lifecycle_loss {
+                baseline = baseline.min(loss.at_ns);
+                cause = crate::render::PrearmWatchEnd::ScopeUncertain;
+            }
+            capture.prearm_first_loss = Some(PrearmFirstLoss {
+                cause,
+                baseline_ns: baseline,
+                clean_before_ns: capture.last_clean_ns,
+            });
+        }
         capture.health_unproven = batch.health_unproven.clone();
         if capture.pairs_unproven.is_none() {
             capture.pairs_unproven = pair_precondition_failure(batch);
@@ -2790,6 +3030,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return;
         }
         capture.stopped = true;
+        // Freeze the pre-arm stop boundary (C1): the published watch
+        // interval ends here, never at a later publication read past the
+        // detach. First wins: the loop-end freeze (if any) stands.
+        self.prearm_stop.get_or_insert(Some(at_ns));
         if let Some(recorder) = &mut self.diagnostics {
             let mut record = DiagnosticRecord::new(DiagnosticKind::CaptureHealth);
             record.reason = Some(DiagnosticReason::CaptureStopped);
@@ -9243,6 +9487,19 @@ impl PairRecovery {
     }
 }
 
+/// Sticky first health loss for pre-arm truncation: the first witness
+/// batch carrying a counter rise, unreadable health, or lifecycle loss.
+/// Records the loss baseline (the earliest instant of the drop) and the
+/// last clean read before it, so a later clean sweep cannot wash the loss
+/// away. The terminal close truncates at `min(clean_before, baseline)`,
+/// floored at the arm instant.
+#[derive(Debug, Clone, Copy)]
+struct PrearmFirstLoss {
+    cause: crate::render::PrearmWatchEnd,
+    baseline_ns: u64,
+    clean_before_ns: Option<u64>,
+}
+
 /// Per-endpoint attach state from the capture facade's receipts. Bounded by
 /// the endpoint budget N: each endpoint is attached or failed at most once.
 struct CaptureCoverage {
@@ -9276,6 +9533,10 @@ struct CaptureCoverage {
     /// The latest witness read with proven health, no rise, and held
     /// custody: where a watch ends at stop.
     last_clean_ns: Option<u64>,
+    /// Sticky first health loss for pre-arm truncation (see
+    /// `PrearmFirstLoss`): latched by the first witness batch carrying a
+    /// counter rise, unreadable health, or lifecycle loss.
+    prearm_first_loss: Option<PrearmFirstLoss>,
     /// The health read of the batch the open CALLER_USE sweep began in
     /// (`None`: the next batch begins one).
     sweep_began_ns: Option<u64>,
@@ -10629,6 +10890,215 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn prearm_armed_watch_clamps_to_frozen_stop() {
+        // C1: the watch end is the frozen first-stop boundary from
+        // `end_capture_coverage`, never a later publication read. Armed at
+        // 3000, coverage ends at 5000, the terminal close samples 9000 (the
+        // blind tail after detach): the published `until` stays 5000.
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "frozen-stop");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        assert_eq!(delta.endpoints.len(), 2);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        assert_eq!(
+            coordinator.prearm_rows()[0].watch.as_ref().unwrap().state,
+            crate::render::PrearmWatchState::Armed,
+        );
+        coordinator.end_capture_coverage(5_000);
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(9_000));
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
+        assert_eq!(watch.until_ns, Some(5_000));
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::ScopeEnd)
+        );
+    }
+
+    #[test]
+    fn prearm_armed_watch_truncates_for_health_loss() {
+        // I2 (health_loss): a lossy capture truncates the armed interval at
+        // the last proven-clean bound instead of riding to the natural end.
+        // Armed at 3000, last clean read at 4000, health regressed after:
+        // the watch ends `health_loss` with `until` 4000, not `scope_end`.
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "health-loss");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        {
+            let capture = coordinator.capture.as_mut().expect("native coverage");
+            capture.last_clean_ns = Some(4_000);
+            capture.health_unproven = Some("scripted witness health loss".to_string());
+        }
+        coordinator.end_capture_coverage(5_000);
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(5_000));
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::HealthLoss)
+        );
+        assert_eq!(watch.until_ns, Some(4_000));
+    }
+
+    #[test]
+    fn prearm_armed_watch_truncates_for_scope_uncertain() {
+        // I2 (scope_uncertain): custody loss truncates with the scope cause
+        // at the same proven-clean bound.
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "scope-uncertain");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        {
+            let capture = coordinator.capture.as_mut().expect("native coverage");
+            capture.last_clean_ns = Some(4_000);
+            capture.unproven = Some("scripted custody loss".to_string());
+        }
+        coordinator.end_capture_coverage(5_000);
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(5_000));
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::ScopeUncertain)
+        );
+        assert_eq!(watch.until_ns, Some(4_000));
+    }
+
+    #[test]
+    fn prearm_counter_rise_through_witness_batches_truncates() {
+        // A counter rise through `note_witness_batch` truncates the armed
+        // interval at the loss baseline even when a later clean sweep would
+        // otherwise wash the loss away: armed at 3000, clean read at 3200,
+        // regression dated at baseline 3200 (read 3600), clean read at 4000,
+        // stop at 5000. The watch ends `health_loss` with `until` 3200, not
+        // `scope_end` at 5000.
+        use crate::attach::capture::AttachedEndpoint;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "counter-rise");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        let delta = coordinator.take_target_delta();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![
+                AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                },
+                AttachedEndpoint {
+                    id: delta.endpoints[1].id,
+                    object: delta.endpoints[1].object,
+                    at_ns: 3_000,
+                },
+            ],
+            ..ExtendReceipt::default()
+        });
+        assert_eq!(
+            coordinator.prearm_rows()[0].watch.as_ref().unwrap().state,
+            crate::render::PrearmWatchState::Armed,
+        );
+        let mut clean_before = witness_batch();
+        clean_before.custody = ScopeCustody::System;
+        clean_before.health_baseline_ns = 1_000;
+        clean_before.health_read_ns = 3_200;
+        clean_before.rows_anchor_ns = 3_201;
+        clean_before.rows_read_ns = 3_201;
+        clean_before.counts_read_ns = 3_201;
+        coordinator.note_witness_batch(&clean_before);
+        let mut regressed = witness_batch();
+        regressed.custody = ScopeCustody::System;
+        regressed.health_baseline_ns = 3_200;
+        regressed.health_read_ns = 3_600;
+        regressed.health_regression =
+            Some("native capture health counters rose: EVIDENCE[1] 0->1".into());
+        regressed.rows_anchor_ns = 3_601;
+        regressed.rows_read_ns = 3_601;
+        regressed.counts_read_ns = 3_601;
+        coordinator.note_witness_batch(&regressed);
+        let mut clean_after = witness_batch();
+        clean_after.custody = ScopeCustody::System;
+        clean_after.health_baseline_ns = 3_600;
+        clean_after.health_read_ns = 4_000;
+        clean_after.rows_anchor_ns = 4_001;
+        clean_after.rows_read_ns = 4_001;
+        clean_after.counts_read_ns = 4_001;
+        coordinator.note_witness_batch(&clean_after);
+        coordinator.end_capture_coverage(5_000);
+        coordinator.finish_prearm_watches(crate::render::PrearmWatchEnd::ScopeEnd, Some(5_000));
+        let watch = *coordinator.prearm_rows()[0].watch.as_ref().unwrap();
+        assert_eq!(
+            watch.ended_by,
+            Some(crate::render::PrearmWatchEnd::HealthLoss)
+        );
+        assert_eq!(watch.until_ns, Some(3_200));
+        assert!(
+            watch.until_ns.is_some_and(|until| until <= 3_200),
+            "truncation never rides past the loss baseline: {watch:?}"
+        );
+    }
+
+    #[test]
     fn prearm_mapped_rows_emit_pre_attach_and_undeclared_windows() {
         // Window-emission half: a registry module record matching the pinned
         // object (`mapped == true`) with the declared set stamped [1000 →
@@ -10793,6 +11263,53 @@ pub(crate) mod tests {
                     reason: crate::render::UnobservedReason::MappedUnattached,
                 },
             ]),
+        );
+    }
+
+    #[test]
+    fn prearm_mapped_requires_matching_digest() {
+        // Digest negative: the same physical key (device, inode) with a
+        // different digest does not count as mapped. Kills mutants of the
+        // `is_none_or` / `!pin_sha.is_empty()` guard.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports(dir.path(), "digest-neg");
+        let pinning = pin_prearm_for_test(&[provider]);
+        let summary = pinning.pins.pinned().next().expect("one pinned object");
+        let (key, sha256) = (summary.key, summary.sha256.to_string());
+        assert!(!sha256.is_empty(), "the pin carries a proven digest");
+        let mut coordinator = coordinator();
+        coordinator.set_prearm_pinning(pinning);
+        coordinator.absorb_prearm_plan(1_000);
+        coordinator.take_target_delta();
+        // Same key, wrong digest: unmapped.
+        coordinator.registry_mut().scripted_module_edge(
+            ModuleKey::physical(
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                Some("deadbeef".repeat(8)),
+                "/scripted/prearm.so",
+            ),
+            CallerId(7),
+        );
+        assert!(
+            !coordinator.prearm_rows()[0].mapped,
+            "a digest mismatch is not the pinned object"
+        );
+        // Same key, matching digest: mapped.
+        coordinator.registry_mut().scripted_module_edge(
+            ModuleKey::physical(
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                Some(sha256),
+                "/scripted/prearm.so",
+            ),
+            CallerId(7),
+        );
+        assert!(
+            coordinator.prearm_rows()[0].mapped,
+            "the matching digest names the pinned object"
         );
     }
 

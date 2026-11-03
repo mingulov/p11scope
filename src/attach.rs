@@ -434,6 +434,20 @@ fn validate_identity_inventory<'a>(
     Ok(())
 }
 
+/// Presence gate for the gate-1 identity maps: every name in
+/// [`GATE_IDENTITY_MAPS`] must exist before per-map validation.
+/// `prepare_identity` runs it ahead of the metadata checks so a
+/// missing gate map refuses naming the map.
+fn validate_gate_map_presence<'a>(names: impl Iterator<Item = &'a str>) -> Result<()> {
+    let names: BTreeSet<&'a str> = names.collect();
+    for (name, _) in GATE_IDENTITY_MAPS {
+        if !names.contains(name) {
+            bail!("missing {name} map");
+        }
+    }
+    Ok(())
+}
+
 fn identity_map_data<'a>(name: &str, map: &'a Map) -> Result<&'a aya::maps::MapData> {
     let expected = IDENTITY_MAPS
         .iter()
@@ -682,6 +696,7 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
         )?;
     }
     if LOADER_GATE_BUILD {
+        validate_gate_map_presence(ebpf.maps().map(|(name, _)| name))?;
         for (name, _) in GATE_IDENTITY_MAPS {
             identity_map_data(
                 name,
@@ -12322,6 +12337,35 @@ mod tests {
             ("ROOT_CTL", false),
         ];
         assert!(validate_identity_inventory(no_bank.into_iter(), true).is_err());
+    }
+
+    #[test]
+    fn gate_preparation_refuses_each_missing_array_map() {
+        // `prepare_identity` names the missing gate map: each of the
+        // four Array gate maps is refused when absent from a gate-1
+        // object, while the complete set passes presence.
+        let full = [
+            "TASK_COOKIE_B",
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "LOADER_GATE",
+            "LOADER_GATE_CTL",
+        ];
+        validate_gate_map_presence(full.into_iter()).unwrap();
+        for missing in [
+            "COOKIE_CTL_B",
+            "IMAGE_BANK_SELECT",
+            "LOADER_GATE",
+            "LOADER_GATE_CTL",
+        ] {
+            let error =
+                validate_gate_map_presence(full.into_iter().filter(|name| *name != missing))
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains(missing),
+                "the refusal must name {missing}: {error:?}"
+            );
+        }
     }
 
     #[test]

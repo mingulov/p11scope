@@ -6183,6 +6183,31 @@ pub(crate) fn kernel_thread_exclusions(
     excluded
 }
 
+/// Deep-scan selection with kernel threads excluded first: threads with
+/// no user address space never consume cap slots. Every excluded pid is
+/// counted on the pass budget's kernel-thread note, and the rest select
+/// by provider rarity. The three selection call sites (capture,
+/// system inspect, cgroup inventory) share this; the exclusion predicate
+/// above stays separately pinned.
+pub(crate) fn select_excluding_kernel_threads(
+    sweep: &SweepSnapshots,
+    unavailable: &BTreeSet<u32>,
+    proc_root: &Path,
+    cap: usize,
+    budget: &mut CaptureWorkBudget,
+) -> Vec<u32> {
+    let excluded = kernel_thread_exclusions(sweep, unavailable, proc_root);
+    for _ in &excluded {
+        budget.note_kernel_thread_absence();
+    }
+    let eligible: SweepSnapshots = sweep
+        .iter()
+        .filter(|(pid, _)| !excluded.contains(pid))
+        .cloned()
+        .collect();
+    select_deep_scan_candidates(&eligible, cap)
+}
+
 /// Rotation's fairness-tiered variant of the selection above: identical
 /// grouping, global rarity census, and group order — but within each group
 /// the representative is the lowest never-evicted member (falling back to
@@ -6526,15 +6551,13 @@ fn discover_plan(
             discovered.base_counters.object_skips.push(skipped);
         }
         let select_start = crate::attach::monotonic_ns();
-        let excluded = kernel_thread_exclusions(&sweep, &sweep_unavailable, Path::new("/proc"));
-        for _ in &excluded {
-            discovered.budget.note_kernel_thread_absence();
-        }
-        let eligible: SweepSnapshots = sweep
-            .into_iter()
-            .filter(|(pid, _)| !excluded.contains(pid))
-            .collect();
-        let selected = select_deep_scan_candidates(&eligible, max_scan_pids);
+        let selected = select_excluding_kernel_threads(
+            &sweep,
+            &sweep_unavailable,
+            Path::new("/proc"),
+            max_scan_pids,
+            &mut discovered.budget,
+        );
         discovered.stage_timings.span(
             crate::timing::StageKind::Scan,
             "select_deep_scan_candidates",

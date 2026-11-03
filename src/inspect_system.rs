@@ -28,9 +28,8 @@ use crate::attach::monotonic_ns;
 use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
 use crate::discovery::confirm_shards::attribute_unselected_with_policy;
 use crate::discovery::engine::{
-    MAX_SCAN_PIDS, capture_manifest_object_key, kernel_thread_exclusions, parse_manifest_text,
-    retarget_to_pins, scope_pids, select_deep_scan_candidates, sweep_process_maps,
-    unreadable_member_skip,
+    MAX_SCAN_PIDS, capture_manifest_object_key, parse_manifest_text, retarget_to_pins, scope_pids,
+    select_excluding_kernel_threads, sweep_process_maps, unreadable_member_skip,
 };
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{
@@ -439,18 +438,15 @@ fn collect_members_identity(
             scope_gaps.push(PidGap::scope(skip));
         }
         let select_start = monotonic_ns();
-        let excluded = kernel_thread_exclusions(&swept, &unavailable, Path::new("/proc"));
-        for _ in &excluded {
-            budget.note_kernel_thread_absence();
-        }
         // The stored sweep keeps every pid for maps attribution; only the
         // selection input drops the threads with no user memory.
-        let eligible: Vec<(u32, Vec<MapEntry>)> = swept
-            .iter()
-            .filter(|(pid, _)| !excluded.contains(pid))
-            .cloned()
-            .collect();
-        let selected = select_deep_scan_candidates(&eligible, cap);
+        let selected = select_excluding_kernel_threads(
+            &swept,
+            &unavailable,
+            Path::new("/proc"),
+            cap,
+            &mut budget,
+        );
         timings.span(StageKind::Scan, "select", select_start, monotonic_ns());
         sweep = swept;
         sweep_unavailable = unavailable;

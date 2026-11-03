@@ -8313,7 +8313,15 @@ fn template_walker_uses_narrow_global_output_and_preserves_read_policy() {
     let types_count = types.find("output.count += 1;").unwrap();
     assert!(types_read < types_write && types_write < types_count);
 
-    let implementation = between(&source, "fn walk_template_impl<", "fn arg_u64(");
+    // The walker's own body, through its closing brace: the next item may
+    // carry attributes or comments (arg_u64 is #[inline(always)]).
+    let implementation = {
+        let body = source
+            .split_once("fn walk_template_impl<")
+            .expect("missing section start: fn walk_template_impl<")
+            .1;
+        &body[..body.find("\n}\n").expect("walker body end") + "\n}".len()]
+    };
     assert!(source.contains(
         "#[cfg(feature = \"unsafe-unvalidated-metadata\")]\n#[inline(never)]\nfn walk_template_impl<"
     ));

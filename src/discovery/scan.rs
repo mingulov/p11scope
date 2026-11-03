@@ -5050,8 +5050,7 @@ fn scan_process_view_with_io_mode(
     io: &mut impl ScanIo,
     scan_memory: bool,
 ) -> Result<ScanOutcome, String> {
-    scan_view_with_examined(request, view, budget, io, scan_memory)
-        .map(|(outcome, _, _)| outcome)
+    scan_view_with_examined(request, view, budget, io, scan_memory).map(|(outcome, _, _)| outcome)
 }
 
 /// Post-read pin check: the export facts read after `before` are trusted only

@@ -1427,9 +1427,10 @@ pub mod capture {
     /// published, parameters stay undecoded, and the
     /// `EVIDENCE_UNREGISTERED_MECHANISMS` total still counts every
     /// occurrence in both lanes. Orthogonal to the state enums above:
-    /// masked comparisons are unaffected. Never set at entry (the
-    /// frozen journal BEGIN `CAPTURE_MASK` refuses it) and never
-    /// cleared.
+    /// masked comparisons are unaffected. Set at entry only by the
+    /// unsafe diagnostic arm (whose builds never carry the journal
+    /// object); the frozen journal BEGIN `CAPTURE_MASK` refuses it.
+    /// Never cleared.
     pub const MECHANISM_UNREGISTERED: u32 = 1 << 7;
 }
 

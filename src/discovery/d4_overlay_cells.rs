@@ -2715,7 +2715,7 @@ fn k1_production_guard(
         .get(&key)
         .ok_or_else(|| format!("k1 production: key {key:?} has no candidate group"))?;
     let (before, _) = witness_stats_for_test();
-    let guarded = mapped_file_guard(io, &view, &file, held, key, group, budget);
+    let guarded = mapped_file_guard(io, &view, held, key, group, budget);
     let result = match guarded {
         Err(reason) => Err(reason),
         Ok(GuardOutcome::Proven) => Ok(()),
@@ -2729,6 +2729,48 @@ fn k1_production_guard(
     };
     let (after, _) = witness_stats_for_test();
     Ok((result, after.saturating_sub(before)))
+}
+
+/// Retry the production guard across transient witness-infrastructure
+/// loss. A vCPU deschedule longer than 10ms trips the identity
+/// file-descriptor census and the query fail-closes unavailable; that
+/// exercises the fail-closed path, not the join/refuse logic the row
+/// asserts. Each attempt carries the fresh scan budget a later
+/// production pass would, spends exactly one query, and re-reads the
+/// child's maps; only the unavailable gap retries, at most three
+/// attempts. Systematic unavailability still fails: the third strike
+/// returns the outcome. Returns the outcome, the total queries spent,
+/// and the attempts used.
+fn k1_production_guard_retry(
+    label: &str,
+    pid: u32,
+    merged: &std::path::Path,
+    key: ObjectKey,
+    maps: &dyn Fn() -> Vec<MapEntry>,
+) -> Result<(Result<(), String>, u64, u32), String> {
+    use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
+    let mut total = 0u64;
+    for attempt in 1..=3u32 {
+        let live = maps();
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let mut io = crate::discovery::scan::ProcScanIo::new();
+        let (result, queries) = k1_production_guard(pid, merged, key, &live, &mut budget, &mut io)?;
+        total += queries;
+        if io.witness_used() != 1 || queries != 1 {
+            return Err(format!(
+                "{label}: attempt {attempt} spent {} queries and ran {queries}, not one",
+                io.witness_used()
+            ));
+        }
+        let retry =
+            matches!(&result, Err(reason) if reason == GAP_WITNESS_UNAVAILABLE) && attempt < 3;
+        if retry {
+            eprintln!("K1_DEEP_SCAN {label} attempt {attempt}: transient unavailable, retrying");
+            continue;
+        }
+        return Ok((result, total, attempt));
+    }
+    unreachable!("k1 {label}: retry loop returns on attempt 3");
 }
 
 /// Stale-negative twin (privileged): in the B16 direction the observer
@@ -2840,29 +2882,28 @@ fn k1_stale_row(work: &std::path::Path, mode: XinoMode, lane: OverlayLane) -> Re
         ));
     }
     let started = Instant::now();
-    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
-    let mut io = crate::discovery::scan::ProcScanIo::new();
-    let (result, queries) =
-        k1_production_guard(pid, &merged, key, &stale.maps(), &mut budget, &mut io)?;
     if required {
-        // The witness refusal: exactly one query ran and proved another
-        // file. A join here, or a fallback edge, would fail the cell.
+        // The witness refusal: each attempt spends exactly one query and
+        // the settled outcome proves another file. A join here, or a
+        // fallback edge, would fail the cell.
+        let (result, queries, attempts) =
+            k1_production_guard_retry("k1 stale", pid, &merged, key, &|| stale.maps())?;
         match result {
             Err(reason) if reason == GAP_WITNESS_REFUSED => {}
             other => return Err(format!("k1 stale: guard refused to refuse: {other:?}")),
         }
-        if io.witness_used() != 1 {
-            return Err(format!(
-                "k1 stale: scan spent {} queries, not one",
-                io.witness_used()
-            ));
-        }
-        if queries != 1 {
-            return Err(format!("k1 stale: witness ran {queries} queries, not one"));
-        }
+        eprintln!(
+            "K1_DEEP_SCAN mode={mode:?} row=stale-lower lane={lane:?} verdict=refuse wall_ms={} queries={queries} attempts={attempts} target-{}",
+            started.elapsed().as_millis(),
+            truth_verdict(&t_truth)
+        );
     } else {
         // The legacy refusal: the stale mapping already separates by
         // `(dev, ino)` and no witness work is spent.
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let mut io = crate::discovery::scan::ProcScanIo::new();
+        let (result, queries) =
+            k1_production_guard(pid, &merged, key, &stale.maps(), &mut budget, &mut io)?;
         match result {
             Err(reason) if reason.contains("names more than one file") => {}
             other => {
@@ -2877,13 +2918,13 @@ fn k1_stale_row(work: &std::path::Path, mode: XinoMode, lane: OverlayLane) -> Re
                 io.witness_used()
             ));
         }
+        eprintln!(
+            "K1_DEEP_SCAN mode={mode:?} row=stale-lower lane={lane:?} verdict=refuse wall_ms={} queries={queries} used={} target-{}",
+            started.elapsed().as_millis(),
+            io.witness_used(),
+            truth_verdict(&t_truth)
+        );
     }
-    eprintln!(
-        "K1_DEEP_SCAN mode={mode:?} row=stale-lower lane={lane:?} verdict=refuse wall_ms={} queries={queries} used={} target-{}",
-        started.elapsed().as_millis(),
-        io.witness_used(),
-        truth_verdict(&t_truth)
-    );
     Ok(())
 }
 
@@ -2982,16 +3023,8 @@ fn k1_fresh_row(work: &std::path::Path, mode: XinoMode, lane: OverlayLane) -> Re
         );
     }
     let started = Instant::now();
-    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
-    let mut io = crate::discovery::scan::ProcScanIo::new();
-    let (result, queries) =
-        k1_production_guard(pid, &merged, key, &target.maps(), &mut budget, &mut io)?;
-    if io.witness_used() != 1 || queries != 1 {
-        return Err(format!(
-            "k1 fresh: scan spent {} queries and ran {queries}, not one",
-            io.witness_used()
-        ));
-    }
+    let (result, queries, attempts) =
+        k1_production_guard_retry("k1 fresh", pid, &merged, key, &|| target.maps())?;
     match (capable, result) {
         (true, Ok(())) => {}
         (true, Err(reason)) => {
@@ -3007,7 +3040,7 @@ fn k1_fresh_row(work: &std::path::Path, mode: XinoMode, lane: OverlayLane) -> Re
         }
     }
     eprintln!(
-        "K1_DEEP_SCAN mode={mode:?} row=fresh-upper lane={lane:?} verdict={} wall_ms={} queries={queries} target-{}",
+        "K1_DEEP_SCAN mode={mode:?} row=fresh-upper lane={lane:?} verdict={} wall_ms={} queries={queries} attempts={attempts} target-{}",
         if capable {
             "join"
         } else {
@@ -3113,6 +3146,86 @@ fn k1_budget_row(work: &std::path::Path, mode: XinoMode, lane: OverlayLane) -> R
         "K1_DEEP_SCAN mode={mode:?} row=budget-exhausted lane={lane:?} verdict=refuse wall_ms={} queries=0 target-{}",
         started.elapsed().as_millis(),
         truth_verdict(&t_truth)
+    );
+    Ok(())
+}
+
+/// Same-key-twice twin (privileged): the D1 shape — two scans of the same
+/// provider key in one observer process (two passes, or two mappers of the
+/// same lower file). The process-wide session serves every query, so the
+/// second install must succeed exactly like the first; both joins prove.
+#[test]
+#[ignore = "root: loop overlay mounts drive the production original-file witness"]
+fn privileged_k1_same_key_twice_proves() {
+    overlay_preflight().expect("overlay preconditions hold");
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        k1_same_key_twice_row(work.path(), mode)
+            .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+    }
+    eprintln!("K1_DEEP_SCAN direction=same-key-twice modes=on,off,same-fs verdict=join");
+}
+
+/// One same-key-twice row over a fresh fixture: two production prove
+/// steps over the same key, each with the fresh scan state a later
+/// pass would carry.
+fn k1_same_key_twice_row(work: &std::path::Path, mode: XinoMode) -> Result<(), String> {
+    use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
+    eprintln!("K1_DEEP_SCAN start mode={mode:?} row=same-key-twice");
+    let fixture = OverlayFixture::mount(work, mode)?;
+    std::fs::write(fixture.lower_path("lib.so"), vec![0xE2u8; 8192])
+        .map_err(|error| format!("k1 twice lower write: {error}"))?;
+    let merged = fixture.merged_path("lib.so");
+    trigger_copy_up(
+        &merged,
+        &fixture.upper_path("lib.so"),
+        &fixture.lower_path("lib.so"),
+    )?;
+    let anchor = SwapChild::spawn(&merged);
+    let target = SwapChild::spawn(&merged);
+    let a_line = find_line(&anchor.maps(), anchor_range(&anchor), *b"r-xp")?;
+    let t_line = find_line(&target.maps(), target_range(&target), *b"r-xp")?;
+    let key = ObjectKey::of(&a_line);
+    if ObjectKey::of(&t_line) != key {
+        return Err("k1 twice premise broken: target key differs from the anchor key".into());
+    }
+    let pids = [anchor.pid as u32, target.pid as u32];
+    let capable = k1_witness_capable();
+    let mut attempts_total = 0u32;
+    for (pass, pid) in pids.into_iter().enumerate() {
+        let pass = pass + 1;
+        let maps = || {
+            if pid == anchor.pid as u32 {
+                anchor.maps()
+            } else {
+                target.maps()
+            }
+        };
+        let (result, queries, attempts) =
+            k1_production_guard_retry("k1 twice", pid, &merged, key, &maps)?;
+        attempts_total += attempts;
+        if queries != attempts as u64 {
+            return Err(format!(
+                "k1 twice pass {pass}: ran {queries} queries in {attempts} attempts, not one per attempt"
+            ));
+        }
+        match (capable, result) {
+            (true, Ok(())) => {}
+            (true, Err(reason)) => {
+                return Err(format!(
+                    "k1 twice pass {pass}: guard refused the fresh upper: {reason:?}"
+                ));
+            }
+            (false, Err(reason)) if reason == GAP_WITNESS_UNAVAILABLE => {}
+            (false, other) => {
+                return Err(format!(
+                    "k1 twice pass {pass} without the kernel proof must refuse unavailable: {other:?}"
+                ));
+            }
+        }
+    }
+    eprintln!(
+        "K1_DEEP_SCAN mode={mode:?} row=same-key-twice verdict=join passes=2 attempts={attempts_total}"
     );
     Ok(())
 }

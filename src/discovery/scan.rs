@@ -4158,7 +4158,6 @@ fn opened_file_identity_guard(
 pub(crate) fn mapped_file_guard(
     io: &mut impl ScanIo,
     view: &ProcessView,
-    file: &File,
     held: Option<MappedFile>,
     key: ObjectKey,
     group: &[&MapEntry],
@@ -4218,7 +4217,12 @@ pub(crate) enum GuardOutcome {
 /// witness: `None` joins, `Some` refuses with the gap reason. Runs once
 /// per file at the provider branch; every range of the group shares the
 /// file, so the one verdict over the first witness-requiring range
-/// covers all of them.
+/// covers all of them. A group whose ranges straddle a copy-up (one
+/// process mapping the provider both before and after) joins its stale
+/// ranges with the fresh ones on a same-file verdict; per-range proving
+/// would exhaust the per-scan budget on honest multi-range joins, so
+/// the mixed-mapping corner stays disclosed, not proved (see the
+/// overlay copy-up section in `docs/known-limitations.md`).
 pub(crate) fn witness_join(
     io: &mut impl ScanIo,
     view: &ProcessView,
@@ -5687,7 +5691,7 @@ fn scan_view_examined_mode(
             .retained_mapped_identity(&file)
             .or_else(|| io.held_identity(&file));
         let scanned_identity = held.map(|held| held.identity);
-        let guarded = match mapped_file_guard(io, view, &file, held, key, &group, budget) {
+        let guarded = match mapped_file_guard(io, view, held, key, &group, budget) {
             Ok(outcome) => outcome,
             Err(reason) => {
                 if !narrowed_out {
@@ -5844,11 +5848,11 @@ fn scan_view_examined_mode(
         // witness-requiring range. Anything but a same-file verdict
         // refuses with the finite gap, never a join. Files that prove
         // not to be providers (above) never spend witness work.
-        if let (GuardOutcome::UnprovenOverlay { range }, Some(held)) = (guarded, held) {
-            if let Some(reason) = witness_join(io, view, &file, &held, key, range, budget) {
-                skipped.push(Skipped { subject, reason });
-                continue;
-            }
+        if let (GuardOutcome::UnprovenOverlay { range }, Some(held)) = (guarded, held)
+            && let Some(reason) = witness_join(io, view, &file, &held, key, range, budget)
+        {
+            skipped.push(Skipped { subject, reason });
+            continue;
         }
         let mut module = ScannedModule {
             module_hint,
@@ -13819,9 +13823,8 @@ mod tests {
     }
 
     /// The guard under test. The held magic rides the fake into the
-    /// held `MappedFile`; the file is a placeholder the scripted witness
-    /// never reads. The guard marks witness-requiring joins unproven and
-    /// never consults the witness itself.
+    /// held `MappedFile`. The guard marks witness-requiring joins
+    /// unproven and never consults the witness itself.
     fn run_k1_guard(
         io: &mut K1RedIo,
         held: crate::discovery::identity::FileIdentity,
@@ -13829,20 +13832,11 @@ mod tests {
     ) -> Result<GuardOutcome, String> {
         let view = ProcessView::open(crate::process::ProcessViewId(1), std::process::id()).unwrap();
         let mut budget = CaptureWorkBudget::default();
-        let file = std::fs::File::open("/dev/null").unwrap();
         let held = MappedFile {
             identity: held,
             fs_magic: io.held_magic,
         };
-        mapped_file_guard(
-            io,
-            &view,
-            &file,
-            Some(held),
-            k1_red_key(),
-            group,
-            &mut budget,
-        )
+        mapped_file_guard(io, &view, Some(held), k1_red_key(), group, &mut budget)
     }
 
     /// The provider-branch prove step under test: one witness query over

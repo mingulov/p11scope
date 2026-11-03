@@ -15,7 +15,7 @@
 
 use crate::discovery::identity::{ExaminedObject, FileIdentity, MappedFile, PinnedObjects};
 use crate::discovery::kernel_identity::{
-    AnchorPass, ExaminedCustody, IdentitySession, KernelMemberProbe,
+    AnchorPass, ExaminedCustody, IdentitySession, KernelAnchorExclusions, KernelMemberProbe,
 };
 use crate::discovery::scan::CaptureWorkBudget;
 use crate::discovery::sweep_attribution::{
@@ -65,6 +65,15 @@ pub(crate) const GAP_WITNESS_UNAVAILABLE: &str =
 /// The held file could not be installed as the witness anchor.
 pub(crate) const GAP_ANCHOR_BINDING_FAILED: &str =
     "original_file_unproven: witness anchor binding failed";
+
+/// Mint the next witness generation. Each query mints fresh under the
+/// session lock and holds the lock across install and confirm, so both
+/// share exactly one generation: a stale-generation confirmation cannot
+/// validate, and the only generation failure is counter overflow, which
+/// fail-closes unavailable.
+fn next_witness_generation(current: u64) -> Option<u64> {
+    current.checked_add(1)
+}
 
 /// Whether the held file plus the target identity needs the witness: the
 /// held file sits on overlayfs (or its filesystem is unproven, fail
@@ -268,16 +277,18 @@ fn prove_original_file_inner(
         return WitnessVerdict::Failed(WitnessFailure::Unavailable);
     }
     let pins = PinnedObjects::empty();
-    let pass = AnchorPass::prepare_excluding(
-        &pins,
-        std::iter::empty(),
-        custody,
-        budget.kernel_anchor_exclusions(),
-    );
+    // The witness session is private (own BPF maps, own fresh arena per
+    // pass) and maps only the scan's freshly opened file, never a
+    // retained lease — so the sweep's capture-anchor exclusions do not
+    // apply here. Honoring them refuses every provider key the live
+    // capture watches (the D1 shape); the pass builds exclusion-free,
+    // exactly like the experiment's `AnchorPass::prepare`.
+    let no_exclusions = KernelAnchorExclusions::default();
+    let pass = AnchorPass::prepare_excluding(&pins, std::iter::empty(), custody, &no_exclusions);
     if pass.fallback.contains_key(&key) {
         return WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed);
     }
-    let Some(generation) = guard.generation.checked_add(1) else {
+    let Some(generation) = next_witness_generation(guard.generation) else {
         return WitnessVerdict::Failed(WitnessFailure::Unavailable);
     };
     guard.generation = generation;
@@ -557,6 +568,13 @@ mod tests {
     #[test]
     fn budget_size_is_pinned() {
         assert_eq!(OVERLAY_WITNESS_QUERIES_PER_SCAN, 8);
+    }
+
+    #[test]
+    fn generation_mint_increments_and_overflow_fail_closes() {
+        assert_eq!(next_witness_generation(0), Some(1));
+        assert_eq!(next_witness_generation(7), Some(8));
+        assert_eq!(next_witness_generation(u64::MAX), None);
     }
 
     fn confirmed_with(

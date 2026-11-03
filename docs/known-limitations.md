@@ -1255,11 +1255,22 @@ The old bounds are measurements, not a product startup SLA.
   original-file witness before its row joins, one query per file:
   the kernel proves the association or the row is unknown with the
   `original_file_unproven` gap — never a join to the fresh file, on
-  either identity backend and with no userspace `(dev, ino)`
-  fallback. The row's original edge reads `ended`, its later calls
-  are not counted, and no new-module edge is emitted; a process
-  that maps the upper copy is still attributed exactly. The
-  witness runs at most 8 queries per process scan; past the budget
+  either identity backend, and the deep-scan row takes no userspace
+  `(dev, ino)` fallback. The row's original edge reads `ended`, its
+  later calls are not counted, and no new-module edge is emitted; a
+  process that maps the upper copy is still attributed exactly. The
+  sweep's observed-call path still falls back to userspace `(dev, ino)`
+  identity when its kernel run is unavailable, including for overlay
+  keys (the K2 sweep-side rule is not in this packet); only the
+  deep-scan row carries the witness guarantee. One verdict covers the
+  file: the witness proves the first witness-requiring caller range,
+  and a same-file verdict joins every range of the group. A process
+  that maps one provider both before and after a copy-up (mappings on
+  both sides of the boundary) would join its stale ranges with the
+  fresh ones; per-range proving would exhaust the per-scan budget on
+  honest multi-range joins, so the packet keeps one query per file
+  and discloses this corner; the witness runs at most 8 queries per
+  process scan; past the budget
   further provider files are unknown with the same gap, while
   files that prove not to be providers never spend witness work.
   With xino off,

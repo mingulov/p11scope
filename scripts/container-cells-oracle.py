@@ -1094,11 +1094,14 @@ def self_test():
                      st_edge(102, "m8", state="ended"),
                      st_edge(104, "m8", evidence="maps_match")],
                     st_span_gaps(), backend="kernel", modules=ST_MODULES_SPAN))
-    mutate_copy("span B-pre without the gap",
-                span_kernel=good_inventory(
-                    [st_edge(101, "m7"), st_edge(102, "m7", state="ended"),
-                     st_edge(104, "m8", evidence="maps_match")],
-                    [st_collapse()], backend="kernel", modules=ST_MODULES_SPAN))
+    b_pre_no_gap = good_copy_up("B")
+    b_pre_no_gap["span_kernel"] = good_inventory(
+        st_span_edges(), [st_collapse(), (ST_PROVIDER, ST_STALE_GAP, 105)],
+        backend="kernel", fallback="anchor_not_installed",
+        modules=ST_MODULES_SPAN)
+    refuses_with("span B-pre without the gap",
+                 "B-pre has no original_file_unproven gap",
+                 lambda: copy_up(**b_pre_no_gap))
     mutate_copy("copy-up unproven: upper inode unchanged",
                 facts_text=ST_FACTS.replace("upper-stat-b=51:200",
                                             "upper-stat-b=140:100"))

@@ -55899,3 +55899,321 @@ fn extensive_arm_requires_generation_admitting_scope() {
     cgroup_engine.arm_extensive(false);
     assert!(cgroup_engine.gap_exe_hints().is_none());
 }
+
+/// Build knobs of the stamped legacy-only fixture
+/// (`crates/discover/tests/fixture/legacy3x_provider.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StampedLegacyKnob {
+    /// The Fedora SoftHSM 2.7 shape: no getter, first tail failure at 70.
+    Plain,
+    /// `-DWITH_GETTER`: also exports a `C_GetInterface` stub.
+    WithGetter,
+    /// `-DEXEC_TAIL24`: 24 executable tail words, data at ordinal 92.
+    ExecTail24,
+}
+
+/// Build, load and self-scan the stamped legacy-only fixture: the temp dir
+/// (keeps the .so alive for pinning), the scanned fixture module and the
+/// getter-returned table address.
+fn scan_stamped_legacy_fixture(
+    minor: u8,
+) -> (
+    tempfile::TempDir,
+    crate::discovery::scan::ScannedModule,
+    u64,
+) {
+    scan_stamped_legacy_fixture_with(minor, StampedLegacyKnob::Plain)
+}
+
+/// [`scan_stamped_legacy_fixture`] with a build knob. Every build gets a
+/// process-unique file name, so a fixture another test left mapped in this
+/// shared libtest process is never mistaken for this one.
+fn scan_stamped_legacy_fixture_with(
+    minor: u8,
+    knob: StampedLegacyKnob,
+) -> (
+    tempfile::TempDir,
+    crate::discovery::scan::ScannedModule,
+    u64,
+) {
+    use crate::discovery::hooks::HookRegistry;
+    use crate::discovery::scan::{CaptureWorkBudget, ScanOutcome, ScanRequest, scan_pid};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static BUILDS: AtomicUsize = AtomicUsize::new(0);
+    let (suffix, knob_define) = match knob {
+        StampedLegacyKnob::Plain => ("", None),
+        StampedLegacyKnob::WithGetter => ("-getter", Some("-DWITH_GETTER")),
+        StampedLegacyKnob::ExecTail24 => ("-tail24", Some("-DEXEC_TAIL24")),
+    };
+    let build = BUILDS.fetch_add(1, Ordering::Relaxed);
+    let tag = format!("stamped-legacy-3-{minor}{suffix}-{build}");
+    let dir = tempfile::tempdir().unwrap();
+    let so = dir.path().join(format!("{tag}.so"));
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/discover/tests/fixture/legacy3x_provider.c");
+    let minor_define = format!("-DSTAMP_MINOR={minor}");
+    let mut gcc = Command::new("gcc");
+    gcc.args(["-shared", "-fPIC", "-O1", "-o"])
+        .arg(&so)
+        .arg(&source)
+        .arg("-DSTAMP_MAJOR=3")
+        .arg(&minor_define);
+    if let Some(define) = knob_define {
+        gcc.arg(define);
+    }
+    let status = gcc.status().unwrap();
+    assert!(status.success(), "{tag}: gcc failed");
+    // Populate like a real application: dlopen + C_GetFunctionList.
+    let name = std::ffi::CString::new(so.to_str().unwrap()).unwrap();
+    let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    assert!(!handle.is_null(), "{tag}: dlopen {}", so.display());
+    let symbol = std::ffi::CString::new("C_GetFunctionList").unwrap();
+    let entry = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
+    assert!(!entry.is_null(), "{tag}: C_GetFunctionList missing");
+    let entry: extern "C" fn(*mut *mut std::ffi::c_void) -> u64 =
+        unsafe { std::mem::transmute(entry) };
+    let mut table: *mut std::ffi::c_void = std::ptr::null_mut();
+    assert_eq!(entry(&mut table), 0, "{tag}: getter must succeed");
+    let address = table as usize as u64;
+
+    let hooks = HookRegistry::builtin();
+    let mut budget = CaptureWorkBudget::default();
+    let outcome = scan_pid(
+        &ScanRequest {
+            pid: std::process::id(),
+            hints: std::slice::from_ref(&so),
+            hooks: &hooks,
+        },
+        &mut budget,
+    )
+    .expect("{tag}: self scan must not fail");
+    let ScanOutcome::Scanned { modules, .. } = outcome else {
+        panic!("{tag}: scan must be available");
+    };
+    let module = modules
+        .iter()
+        .find(|module| module.path.ends_with(&format!("{tag}.so")))
+        .unwrap_or_else(|| panic!("{tag}: fixture module not scanned"))
+        .clone();
+    (dir, module, address)
+}
+
+/// The scanned stamped table at the getter-returned address.
+fn stamped_legacy_table<'a>(
+    tag: &str,
+    module: &'a crate::discovery::scan::ScannedModule,
+    address: u64,
+) -> &'a ScannedTable {
+    module
+        .tables
+        .iter()
+        .find(|table| table.address == address)
+        .unwrap_or_else(|| panic!("{tag}: stamped table not decoded"))
+}
+
+/// Pin, reconcile, lower and merge one scanned stamped fixture: the
+/// reconciled module, the plan surface walk of its 68-function table and
+/// every engine history surface as `(is the stamped 68-function table,
+/// walk, functions)`.
+fn stamped_legacy_publishers(
+    tag: &str,
+    minor: u8,
+    module: &crate::discovery::scan::ScannedModule,
+) -> (ReconciledModule, String, Vec<(bool, String, usize)>) {
+    let mut budget = CaptureWorkBudget::default();
+    let (mut pinned, _) = pin_scanned_objects(
+        std::process::id(),
+        std::slice::from_ref(module),
+        &mut budget,
+    )
+    .unwrap_or_else(|error| panic!("{tag}: pin failed: {error}"));
+    let (reconciled, _, _) = reconcile_scanned_modules(std::slice::from_ref(module), &mut pinned);
+    assert_eq!(reconciled.len(), 1, "{tag}: one reconciled module");
+
+    let lowered = plan::build_from_reconciled_modules(&reconciled);
+    let plan_walk = lowered
+        .surfaces
+        .iter()
+        .find(|surface| {
+            surface.functions == 68 && surface.source.ends_with(&format!("table 3.{minor}"))
+        })
+        .unwrap_or_else(|| panic!("{tag}: 68-function plan surface missing: {:?}", lowered.surfaces))
+        .walk
+        .clone();
+
+    let mut facts = CaptureFacts::default();
+    let counters = DiscoveryCounters::default();
+    let mut plan = plan::build_from_reconciled_modules(&[]);
+    facts
+        .bind_plan_module_ids(&mut plan, &reconciled, &[], &pinned)
+        .unwrap_or_else(|error| panic!("{tag}: bind failed: {error}"));
+    facts
+        .merge_current(
+            &plan,
+            &pinned,
+            &reconciled,
+            &[],
+            &[],
+            &counters,
+            &crate::prearm_module::PrearmState::empty(),
+        )
+        .unwrap_or_else(|error| panic!("{tag}: merge failed: {error}"));
+    let engine = facts
+        .history
+        .surfaces
+        .values()
+        .map(|surface| {
+            let stamped = surface.functions == 68
+                && surface.source.ends_with(&format!("table 3.{minor}"));
+            (stamped, surface.walk.clone(), surface.functions)
+        })
+        .collect();
+    (reconciled.into_iter().next().unwrap(), plan_walk, engine)
+}
+
+/// The live-engine half of the stamped-legacy surface: the same real scan
+/// merges to a complete engine surface, not a surface gap. The proof is
+/// structural, not a label rule: minors 3 and 255 prove the same way, the
+/// decoder itself still reports the declared-layout prefix, and the table
+/// is `full` only because the scan refuted the 92/104-wide layouts, no
+/// getter is exported and all 68 entries agree with their exports.
+#[test]
+fn stamped_legacy_scan_merges_to_a_complete_engine_surface() {
+    for minor in [0u8, 1, 2, 3, 255] {
+        let tag = format!("stamped-legacy-3-{minor}");
+        let (_dir, module, address) = scan_stamped_legacy_fixture(minor);
+        assert_eq!(
+            module.exports,
+            ["C_GetFunctionList"],
+            "{tag}: legacy-only exports"
+        );
+        assert!(module.interfaces.is_empty(), "{tag}: no interfaces");
+        let table = stamped_legacy_table(&tag, &module, address);
+        assert_eq!(table.version, (3, minor), "{tag}");
+        assert_eq!(table.walk, "known_prefix", "{tag}: raw decoder walk");
+        assert_eq!(table.decoded_slot_count(), 68, "{tag}: 68-slot prefix");
+        assert!(
+            table.extension_impossible,
+            "{tag}: the unmapped tail word at ordinal 70 refutes 92/104"
+        );
+
+        let (reconciled, plan_walk, engine) = stamped_legacy_publishers(&tag, minor, &module);
+        assert!(!reconciled.getter_present, "{tag}: no getter in any type");
+        assert!(!reconciled.witness_fault, "{tag}: complete exports walk");
+        let exports = ObjectExports {
+            object: reconciled.scanned.key,
+            symbols: &reconciled.exports,
+            getter_present: reconciled.getter_present,
+            witness_fault: reconciled.witness_fault,
+        };
+        let reconciled_table = stamped_legacy_table(&tag, &reconciled.scanned, address);
+        assert_eq!(reconciled_table.entries.len(), 68, "{tag}: all slots retained");
+        let agreement = crate::discovery::scan::export_agreement(reconciled_table, &exports);
+        assert_eq!(
+            (agreement.agreeing, agreement.disagreeing),
+            (68, 0),
+            "{tag}: export agreement 68/68"
+        );
+        assert_eq!(plan_walk, "full", "{tag}: plan surface");
+        assert_eq!(
+            engine,
+            [(true, "full".to_string(), 68)],
+            "{tag}: one engine surface"
+        );
+    }
+}
+
+/// Negative twins of the stamped-legacy proof: an exported 3.x getter (a
+/// conforming route to a wider table) keeps the structural refutation but
+/// refuses the proof; executable words through ordinal 91 leave the
+/// 92-wide layout unrefuted. Both publish the raw `known_prefix` walk from
+/// the plan and the engine alike. (The 24 executable tail words also decode
+/// as a second, unrelated heuristic table; only the stamped one is judged.)
+#[test]
+fn stamped_legacy_twins_keep_the_raw_prefix_walk() {
+    for (knob, refuted) in [
+        (StampedLegacyKnob::WithGetter, true),
+        (StampedLegacyKnob::ExecTail24, false),
+    ] {
+        let tag = format!("stamped-legacy-3-2 {knob:?}");
+        let (_dir, module, address) = scan_stamped_legacy_fixture_with(2, knob);
+        let table = stamped_legacy_table(&tag, &module, address);
+        assert_eq!(table.version, (3, 2), "{tag}");
+        assert_eq!(table.walk, "known_prefix", "{tag}: raw decoder walk");
+        assert_eq!(table.decoded_slot_count(), 68, "{tag}: 68-slot prefix");
+        assert_eq!(table.extension_impossible, refuted, "{tag}: refutation");
+        let (_, plan_walk, engine) = stamped_legacy_publishers(&tag, 2, &module);
+        assert_eq!(plan_walk, "known_prefix", "{tag}: plan surface");
+        let stamped: Vec<_> = engine.iter().filter(|surface| surface.0).collect();
+        assert_eq!(
+            stamped,
+            [&(true, "known_prefix".to_string(), 68)],
+            "{tag}: engine surface"
+        );
+    }
+}
+
+/// Fedora SoftHSM 2.7 without Fedora: a legacy-only fixture whose frozen
+/// 68-slot list is stamped 3.x is a complete surface, not a surface gap.
+/// BPF-free (scan, pin, reconcile, plan and verdict only) so it runs
+/// anywhere the privileged campaign runs. The getter and executable-tail
+/// twins keep the surface gap.
+#[test]
+#[ignore]
+fn stamped_legacy_fixture_reports_no_surface_gap() {
+    let cells = [0u8, 1, 2, 3, 255]
+        .map(|minor| (minor, StampedLegacyKnob::Plain, false))
+        .into_iter()
+        .chain([
+            (2, StampedLegacyKnob::WithGetter, true),
+            (2, StampedLegacyKnob::ExecTail24, true),
+        ]);
+    for (minor, knob, gap) in cells {
+        let tag = format!("stamped-legacy-3-{minor} {knob:?}");
+        let (_dir, module, address) = scan_stamped_legacy_fixture_with(minor, knob);
+        assert!(module.interfaces.is_empty(), "{tag}: no interfaces");
+        let table = stamped_legacy_table(&tag, &module, address);
+        assert_eq!(table.version, (3, minor), "{tag}");
+        assert_eq!(table.decoded_slot_count(), 68, "{tag}: complete 68-slot prefix");
+        assert_eq!(
+            table.walk, "known_prefix",
+            "{tag}: the decoder still reports the declared-layout prefix"
+        );
+
+        let mut budget = CaptureWorkBudget::default();
+        let (mut pinned, _) = pin_scanned_objects(
+            std::process::id(),
+            std::slice::from_ref(&module),
+            &mut budget,
+        )
+        .unwrap_or_else(|error| panic!("{tag}: pin failed: {error}"));
+        let (reconciled, _, _) =
+            reconcile_scanned_modules(std::slice::from_ref(&module), &mut pinned);
+        assert_eq!(reconciled.len(), 1, "{tag}: one reconciled module");
+        let plan = crate::plan::build_from_reconciled_modules(&reconciled);
+        let surface = plan
+            .surfaces
+            .iter()
+            .find(|surface| {
+                surface.functions == 68 && surface.source.ends_with(&format!("table 3.{minor}"))
+            })
+            .unwrap_or_else(|| panic!("{tag}: 68-function surface missing: {:?}", plan.surfaces));
+        let expected_walk = if gap { "known_prefix" } else { "full" };
+        assert_eq!(surface.walk, expected_walk, "{tag}");
+
+        let mut evidence = evidence_verdict(&plan, &pinned, &DiscoveryCounters::default());
+        evidence.verdict();
+        assert_eq!(
+            evidence
+                .gap_classes(false)
+                .observation
+                .causes
+                .contains(&"surfaces"),
+            gap,
+            "{tag}: surface gap (verdict {})",
+            evidence.completeness
+        );
+    }
+}

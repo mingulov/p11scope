@@ -9,8 +9,9 @@
 # flag as a loss-attribution twin. Rows:
 #   churn-on       loss gates on the flag run (exit, ring_loss, loss
 #                  gaps, complete stop, churn floors) plus peak RSS/CPU
-#   churn-on-ledger  the rsa-ledger rows: compared (pass) or refused
-#                  with the sample kept (expected-failure)
+#   churn-on-ledger  the rsa-ledger rows: compared (pass), refused on
+#                  a populated report (failed, sample kept), or
+#                  unavailable (expected-failure)
 #   churn-twin     the same loss gates on the flag-off twin
 #
 # Usage: flock "$LOCK" scripts/ci/key-operations-system.sh P11SCOPE OUTDIR
@@ -587,9 +588,19 @@ elif python3 -I "$LEDGER_CHECK" "$OUTDIR/churn-on-ledger.jsonl" \
             else
                 cp "$OUTDIR/churn-on-out.json" "$OUTDIR/churn-linked-sample.json" || die "sample copy failed"
                 oracle_text=$(tail -n 5 "$OUTDIR/churn-on-oracle.log" | tr '\n' ';')
-                row churn-on-ledger 1 expected-failure \
-                    "OPEN-6: oracle refused the populated linked shape: $oracle_text (sample: churn-linked-sample.json)"
+                row churn-on-ledger 0 failed \
+                    "oracle refused the populated linked shape: $oracle_text (sample: churn-linked-sample.json)"
+                FAILURES=$((FAILURES + 1))
             fi
+        # journal_unavailable stays expected-failure here, unlike the
+        # stale-pin failure in key-operations-linked-control.sh: the
+        # linked lane pins populated-with-an-oracle-pass, while this
+        # churn cell still pins unavailable/journal_unavailable with
+        # an oracle refusal as its exact signature (an oracle pass
+        # goes stale below). WB4-2 forbids expected-failure without
+        # an exact signature; this branch has one. When the linked
+        # feed populates, move the churn pin to populated and fail
+        # here like the linked lane.
         elif [ "$oo_status" = "unavailable" ] && [ "$oo_reason" = "journal_unavailable" ]; then
             if python3 -I "$QUALIFY" "$OUTDIR/churn-on-ledger.jsonl" \
                     "$OUTDIR/churn-on-out.json" \
@@ -605,7 +616,7 @@ elif python3 -I "$LEDGER_CHECK" "$OUTDIR/churn-on-ledger.jsonl" \
             fi
         else
             row churn-on-ledger 0 failed \
-                "object_observations $oo_status ($oo_reason) on exit $ON_EXIT: not the pinned signature (exit 0 + unavailable journal_unavailable, or a populated oracle refusal)"
+                "object_observations $oo_status ($oo_reason) on exit $ON_EXIT: not the pinned signature (exit 0 + unavailable journal_unavailable with an oracle refusal, or populated with an oracle pass)"
             FAILURES=$((FAILURES + 1))
         fi
     fi

@@ -11836,6 +11836,8 @@ mod tests {
         let exports = ElfExportFacts {
             abi: ElfAbi::Lp64,
             exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
             excluded_anchor_ranges: Vec::new(),
         };
         assert!(budget.note_elf_export_facts(export_key(1), exports.clone()));

@@ -4,10 +4,11 @@
 # Runs the seeded sweep + newcomer burst, then the Joint last-waiter library
 # cell. Writes OUTDIR/results.jsonl rows
 # {cell, pass, qualification, detail} with qualification in
-# qualified|expected-failure|failed. Exit 0 means every qualified cell
-# passed; 1 means a cell failed; 2 means a harness error; 77 means a
-# prerequisite is missing. Must run as root (passwordless sudo on hosted
-# runners is fine); umask 022; TMPDIR on a disk filesystem.
+# qualified|expected-failure|environment-precluded|failed. Exit 0 means
+# every qualified cell passed; 1 means a cell failed; 2 means a harness
+# error; 77 means a prerequisite is missing. Must run as root
+# (passwordless sudo on hosted runners is fine); umask 022; TMPDIR on a
+# disk filesystem.
 #
 # Apt prerequisites (Ubuntu 26.04): gcc python3 softhsm2 util-linux
 #
@@ -21,7 +22,11 @@
 #   JOINT_EXPECTED_FAILURE (default 1): while the joint-wedge fix is
 #     unlanded, the Joint cell fails with the wedge signature and is
 #     recorded expected-failure. Set 0 once the fix lands; an unexpected
-#     pass, or a failure without the wedge signature, fails the run.
+#     pass, or a failure without the wedge signature, fails the run. A
+#     failure carrying the S1-preclusion tag is recorded
+#     environment-precluded instead: the wedge path needs a Linked host,
+#     so an S1-only host cannot evaluate the cell either way. This holds
+#     whatever JOINT_EXPECTED_FAILURE says.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 64
 ROOT=$(cd "$HERE/../.." && pwd) || exit 64
@@ -85,6 +90,9 @@ else
   elif [ "$EXPECT_JOINT_FAIL" = 1 ] && grep -q "$JOINT_WEDGE_SIGNATURE" joint-cell.log; then
     joint_detail='expected failure: joint finish wedges without the joint-wedge fix (task/v060-joint-wedge 244ac82ec); see joint-cell.log'
     joint_qual='expected-failure'
+  elif grep -q 'P11SCOPE_CELL_BRANCH=.*:s1-precluded' joint-cell.log; then
+    joint_detail='environment-precluded: S1-only host without joint feeds; wedge path unevaluated; see joint-cell.log'
+    joint_qual='environment-precluded'
   else
     joint_detail='joint cell failed without the wedge signature (regression or new failure); see joint-cell.log'
   fi
@@ -98,10 +106,11 @@ import json,sys
 rows=[json.loads(line) for line in open('results.jsonl') if line.strip()]
 ids=[row['cell'] for row in rows]
 valid=len(ids)==len(set(ids)) and len(ids)==6
-failed=[r['cell'] for r in rows if not r['pass'] and r['qualification'] not in ('expected-failure',)]
-print('SUMMARY pass=%d fail=%d expected-failures=%d failed=%s terminal_rows_valid=%s' % (
+failed=[r['cell'] for r in rows if not r['pass'] and r['qualification'] not in ('expected-failure','environment-precluded')]
+print('SUMMARY pass=%d fail=%d expected-failures=%d precluded=%d failed=%s terminal_rows_valid=%s' % (
   sum(r['pass'] for r in rows),len(failed),
-  sum(r['qualification']=='expected-failure' for r in rows),failed,valid))
+  sum(r['qualification']=='expected-failure' for r in rows),
+  sum(r['qualification']=='environment-precluded' for r in rows),failed,valid))
 sys.exit(1 if failed or not valid else 0)
 PY
 summary_rc="${PIPESTATUS[0]}"

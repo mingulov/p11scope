@@ -16746,6 +16746,9 @@ mod tests {
 mod privileged_tests;
 
 #[cfg(test)]
+mod joint_stop_races_privileged_tests;
+
+#[cfg(test)]
 #[path = "manifest_e2e_tests.rs"]
 mod manifest_e2e_tests;
 

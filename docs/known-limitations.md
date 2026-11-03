@@ -76,8 +76,9 @@ calls a provider makes after a late load can be missed before its
 probes land, and use before admission voids that watch (`unknown`,
 `use_before_admission`). Very short-lived callers can stay unbound or
 unattributed (see below); the `--track-short-lived` opt-in mode
-classifies their gaps into static-linkage hints instead of leaving
-bare counts, but full call attribution for them is still planned.
+classifies their gaps into static-linkage hints and exit-time mapping
+verdicts instead of leaving bare counts, but full call attribution
+for them is still planned.
 Short-lived processes missed at system scale are counted only as gaps
 (`pid_descendant_gaps`); their calls through attached providers still
 count. A process whose main thread had already exited when the capture
@@ -317,6 +318,20 @@ it (the flag records no exe identity there). Hints never
 move call or attribution shares; exit records still settle no birth,
 admission, absence, or call (R57).
 
+The same opt-in publishes a `gap_exit_mappings` split beside
+`pid_descendant_gaps`: at exit the kernel reports the
+watched-provider slots it had recorded for the leader. `mapped`
+means a slot named a watched provider file with no disqualifying
+refusal; everything else reads `unknown`, including two systematic
+blind spots. Multi-threaded exits read `unknown`: a process with
+more than one mm user never localizes its mappings, so its empty
+slots are not a negative. Late watches read `unknown`: a watch
+inserted between the process's exec and its exit cannot see
+mappings established before it. Shared-mm exits, refused hooks,
+and local faults likewise read `unknown`. Admissions and overflow
+sentinels carry no verdict, and there is no "did not map" claim:
+nothing here proves a process did not map a watched provider.
+
 ## Planned for later versions
 
 - Live key operations (key type and size, sign/verify per key) in 0.6.0.
@@ -331,7 +346,8 @@ admission, absence, or call (R57).
 - Accounting for remaining exit-caused loader rejects that lack a
   pid-and-hook-time binding to the ended process as exit-only, to
   further cut the short-run void rate.
-- Tracking short-lived processes that exit before their first binding.
+- Tracking short-lived processes that exit before their first binding
+  (exit-time mapping verdicts shipped; full call attribution still planned).
 - Parallel BPF program loading for faster startup.
 - File identity edge cases on Btrfs subvolumes and snapshots, FUSE and
   `inode32` tmpfs, with a filesystem test matrix in CI (0.7.0).

@@ -474,6 +474,12 @@ in the JSON report reads `"system"`. Fork children are admitted without a
 destination check, and short-lived processes that exit between refreshes
 count `pid_descendant_gaps` through the same bounded unmatched-exit ledger
 as cgroup scope (overflow latches one lower-bound increment and `PARTIAL`).
+With `--track-short-lived`, each novel unmatched exit also gains an
+exit-time mapping verdict (`gap_exit_mappings` beside the gap count):
+whether the kernel saw a watched provider file mapped when the process
+exited (`mapped`) or cannot tell (`unknown`). Multi-threaded exits and
+late watches read `unknown`; nothing here proves a process did not map
+a watched provider.
 `p11scope doctor` needs no scope flags for a system capture: its host
 program preflight already covers the whole-machine lane.
 `--duration` (bare
@@ -561,7 +567,13 @@ admitted generation, with each generation or unmatched exit counted once.
 When the bounded unmatched-exit ledger is full, a novel unmatched exit latches
 one lower-bound overflow increment. If admission already counted the gap,
 coalescing overflow marks `PARTIAL` without another increment. Replayed or
-further unremembered exits do not increment again.
+further unremembered exits do not increment again. With
+`--track-short-lived`, each novel unmatched exit also gains an exit-time
+mapping verdict (`gap_exit_mappings` beside `pid_descendant_gaps`):
+whether the kernel saw a watched provider file mapped when the process
+exited (`mapped`) or cannot tell (`unknown`). Multi-threaded exits and
+late watches read `unknown`; nothing here proves a process did not map
+a watched provider.
 Arbitrary enter-then-migrate-out before refresh or exit remains outside the
 `COMPLETE` and runtime-qualified claims; no migration subsystem is provided.
 PID scope remains exact and does not attach process-creation tracking.
@@ -843,8 +855,18 @@ Limits that matter in pods:
   beside `pid_descendant_gaps`): does the dead process's executable
   name a pinned watched provider, or the PKCS#11 loader, within two
   `DT_NEEDED` steps. A hint is labelled `STATIC HINT`, never a call
-  or verdict, and never moves call/attribution shares. Beside
-  `--trace`, `--mode metrics`, exact `--pid` scope, or an owned
+  or verdict, and never moves call/attribution shares. Each novel
+  unmatched exit also gains an exit-time mapping verdict
+  (`gap_exit_mappings` beside `pid_descendant_gaps`): at exit the
+  kernel reports the watched-provider slots it had recorded for the
+  leader — `mapped` if one names a watched provider file with no
+  disqualifying refusal, else `unknown` (no record, shared mm,
+  refused hooks, late watch, local fault, or empty slots). The
+  split is a kernel observation: never a call, caller, share, or
+  conformance input, and never a negative. Multi-threaded exits
+  and late watches read `unknown`, and nothing here proves a
+  process did not map a watched provider.
+  Beside `--trace`, `--mode metrics`, exact `--pid` scope, or an owned
   `run` the flag is accepted but arms nothing: no exe identity is
   recorded there, because nothing there classifies gaps (614b P1
   narrow authorization — the read arms only where hints publish).

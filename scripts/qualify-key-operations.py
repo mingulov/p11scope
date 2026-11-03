@@ -8,7 +8,9 @@ than summaries) and the observer's saved `p11scope/inventory/v1` document,
 from which the `object_observations` section is read (a bare section
 is also accepted). When the document carries top-level `edges`, the S1
 `edges[].mechanisms` rows are additionally checked for the expected
-CKM_SHA256_RSA_PKCS attribution of sign/verify; bare sections and
+CKM_SHA256_RSA_PKCS attribution of sign/verify, reading the owned
+instance child's `semantic_edges[]` with the same checks (the current
+topology withholds the parent summary there); bare sections and
 edge-less envelopes leave the mechanism dimension unknown. The oracle
 re-sums observed completed/failed outcomes from the per-row counters
 itself, pins the frozen H9 key/enum contract and the row equation, and
@@ -516,6 +518,11 @@ def _check_mechanism_row(row):
 def _check_mechanisms(doc):
     """Check the S1 mechanism dimension when the document carries edges.
 
+    The current topology withholds the parent's semantic summary: the
+    owned instance child's `semantic_edges[]` carries the mechanisms
+    while the parent's `edges[]` is null. Both lists are read with the
+    same row checks; a mechanism on neither still refuses.
+
     Returns the observed operations of the expected CKM_SHA256_RSA_PKCS
     row, or None when the document has no edges (bare section or
     edge-less envelope: mechanism unknown, judged on the
@@ -525,6 +532,9 @@ def _check_mechanisms(doc):
         return None
     edges = doc["edges"]
     _require(type(edges) is list, "unexpected edges shape")
+    children = doc.get("semantic_edges", [])
+    _require(type(children) is list, "unexpected edges shape")
+    edges = edges + children
     found = None
     for edge in edges:
         _require(type(edge) is dict, "unexpected edges shape")

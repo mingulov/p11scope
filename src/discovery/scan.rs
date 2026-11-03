@@ -2208,8 +2208,9 @@ pub(crate) fn export_agreement(
 /// saw a getter it could not list as a definition (`getter_present`).
 /// Truncation, a getter export, a disagreeing entry, an unpinned record,
 /// a missing file owner, a getter in any symbol type, or a faulted walk
-/// all stay unproven.
-pub(crate) fn proven_complete_legacy_prefix(
+/// all stay unproven. Callers publish through [`published_walk`], which
+/// adds the linked-table gate.
+fn proven_complete_legacy_prefix(
     table: &ScannedTable,
     exports: &ObjectExports<'_>,
 ) -> bool {
@@ -2237,13 +2238,24 @@ pub(crate) fn proven_complete_legacy_prefix(
     agreement.corroborates() && agreement.agreeing == table.entries.len()
 }
 
-/// The walk label every surface publisher reports for one scanned table:
-/// `full` when the legacy-prefix proof holds, otherwise the raw decoder
-/// walk. Plan lowering, engine history and semantic completeness all use
-/// this one helper, so a proven table is never `full` in one place and
-/// `known_prefix` in another.
-pub(crate) fn published_walk(table: &ScannedTable, exports: &ObjectExports<'_>) -> &'static str {
-    if proven_complete_legacy_prefix(table, exports) {
+/// The walk label every surface publisher reports for scanned table
+/// `index` of a module: `full` when the legacy-prefix proof holds,
+/// otherwise the raw decoder walk. A table an interface record links
+/// keeps the raw decoder walk, as the interface surfaces do, so one table
+/// never publishes both `full` and `known_prefix`. Plan lowering, engine
+/// history and semantic completeness all use this one helper, so a proven
+/// table is never `full` in one place and `known_prefix` in another.
+pub(crate) fn published_walk(
+    index: usize,
+    tables: &[ScannedTable],
+    interfaces: &[ScannedInterface],
+    exports: &ObjectExports<'_>,
+) -> &'static str {
+    let table = &tables[index];
+    let linked = interfaces
+        .iter()
+        .any(|interface| interface.table == Some(index));
+    if !linked && proven_complete_legacy_prefix(table, exports) {
         "full"
     } else {
         table.walk

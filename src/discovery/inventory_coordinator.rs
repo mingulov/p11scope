@@ -9152,6 +9152,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn hint_silent_inventoried_view_does_not_mask_unmatched_hint() {
+        // System-scope shape: pid 3 is a hint-silent inventoried view
+        // (kernel thread: Scanned with no hint-miss notes, never evaluated
+        // hints). A hint missed in every examining view still owes one
+        // pid-less scope gap; silence is not a match.
+        let inventoried: BTreeSet<u32> = [1, 2, 3].into_iter().collect();
+        let object_paths: BTreeSet<&str> = BTreeSet::new();
+        let notes = vec![
+            hint_miss_note(1, "/opt/typo.so"),
+            hint_miss_note(2, "/opt/typo.so"),
+        ];
+        let collapsed = collapse_hint_misses(&inventoried, &object_paths, &notes);
+        assert_eq!(collapsed.len(), 1, "silent pid 3 must not mask the miss");
+        assert_eq!(collapsed[0].pid, None);
+        assert_eq!(collapsed[0].subject, "/opt/typo.so");
+        assert_eq!(
+            collapsed[0].reason,
+            crate::discovery::scan::HINT_NOT_MAPPED_REASON
+        );
+    }
+
+    #[test]
     fn hint_matched_by_maps_identity_collapses_to_no_gap() {
         // A hint no deep scan matched but maps identity attributed (a
         // catalog object carries its path) is mapped: drop the miss notes.

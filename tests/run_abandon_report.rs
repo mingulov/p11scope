@@ -41,6 +41,13 @@ fn wait_for(path: &std::path::Path, needle: &str, timeout: Duration) -> Vec<u8> 
     bytes
 }
 
+/// The observer under test: the matrix `P11SCOPE_BIN` override when the
+/// runner stages a prebuilt binary elsewhere, else the binary Cargo built
+/// beside this test target.
+fn bin() -> String {
+    std::env::var("P11SCOPE_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_p11scope").to_string())
+}
+
 /// True when any live process still runs under the marker argv[0].
 fn stray_child_present() -> bool {
     let Ok(proc) = std::fs::read_dir("/proc") else {
@@ -78,7 +85,7 @@ fn second_sigint_during_teardown_publishes_truthful_report_and_exits_130() {
     // Mirror the public `second-sigint` cell: the child ignores INT/TERM so
     // settlement is still in flight when the second SIGINT lands (the 5s
     // TERM grace dwarfs the 1s signal spacing).
-    let mut observer = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+    let mut observer = Command::new(bin())
         .args(["run", "-o"])
         .arg(&out)
         .args([
@@ -200,4 +207,5 @@ fn second_sigint_during_teardown_publishes_truthful_report_and_exits_130() {
         !stray_child_present(),
         "the owned signal-ignoring child must be settled, not left running"
     );
+    eprintln!("P11SCOPE_TEST_BRANCH=completed");
 }

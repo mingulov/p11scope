@@ -22,8 +22,12 @@ mod multi_host;
 #[allow(dead_code)]
 mod support;
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_p11scope")
+/// The observer under test: the matrix `P11SCOPE_BIN` override when the
+/// runner stages a prebuilt binary elsewhere, else the binary Cargo built
+/// beside this test target.
+fn bin() -> String {
+    std::env::var("P11SCOPE_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_p11scope").to_string())
+}
 }
 
 struct Outcome {
@@ -61,6 +65,23 @@ fn assert_scoped_hint(stderr: &str, command: &str) {
 /// asked with the observer's own doctor rather than a second copy of the rule.
 fn capture_available() -> bool {
     p11scope::doctor::verdict(&p11scope::doctor::probe(None, None)) == 0
+}
+
+/// With `P11SCOPE_REQUIRE_CAPTURE=1` (the privileged root run) the
+/// capture-unavailable branch is a named failure instead of a passing
+/// refusal, so the run proves the positive branch. Without the variable
+/// this is a no-op and the test keeps its two-branch behavior.
+fn require_capture_positive(test: &str) {
+    if !matches!(
+        std::env::var("P11SCOPE_REQUIRE_CAPTURE").as_deref(),
+        Ok("1")
+    ) {
+        return;
+    }
+    panic!(
+        "P11SCOPE_REQUIRE_CAPTURE=1 requires the positive branch, \
+         but capture is unavailable ({test})"
+    );
 }
 
 /// A live same-uid target the suite owns; killed and reaped on drop.
@@ -239,12 +260,15 @@ fn b6_doctor_reports_rows_and_verdict() {
     // prompt no longer lands on the verdict line.
     assert!(doctor.stdout.ends_with('\n'), "{:?}", doctor.stdout);
     if capture_available() {
+        eprintln!("P11SCOPE_TEST_BRANCH=positive");
         assert!(
             matches!(doctor.code, Some(0) | Some(1)),
             "{:?}",
             doctor.code
         );
     } else {
+        eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+        require_capture_positive("b6_doctor_reports_rows_and_verdict");
         assert_eq!(doctor.code, Some(1));
         assert!(
             doctor.stdout.contains("capture unavailable"),
@@ -256,7 +280,14 @@ fn b6_doctor_reports_rows_and_verdict() {
 
 #[test]
 fn b7_run_refuses_without_capture_lane() {
-    if !capture_available() && unsafe { libc::geteuid() } != 0 {
+    // The hoisted check also covers the root-without-capture hole below,
+    // which otherwise asserts nothing.
+    let available = capture_available();
+    if !available {
+        eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+        require_capture_positive("b7_run_refuses_without_capture_lane");
+    }
+    if !available && unsafe { libc::geteuid() } != 0 {
         // HIGH-1 (flipped from the F-01 hazard pin): without privilege the
         // uretprobe self-probe cannot load BPF, which is a missing-privilege
         // fact, not a seccomp hazard. The refusal says so, points at doctor,
@@ -298,7 +329,8 @@ fn b7_run_refuses_without_capture_lane() {
                 refused.stderr
             );
         }
-    } else if capture_available() {
+    } else if available {
+        eprintln!("P11SCOPE_TEST_BRANCH=positive");
         let outcome = run(&["run", "--", "/bin/true"]);
         assert!(outcome.code.is_some());
     }
@@ -513,12 +545,15 @@ fn t3_f3_doctor_verdict_ends_with_newline() {
     assert!(doctor.stdout.contains("verdict:"), "{}", doctor.stdout);
     assert!(doctor.stdout.ends_with('\n'), "{:?}", doctor.stdout);
     if capture_available() {
+        eprintln!("P11SCOPE_TEST_BRANCH=positive");
         assert!(
             matches!(doctor.code, Some(0) | Some(1)),
             "{:?}",
             doctor.code
         );
     } else {
+        eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+        require_capture_positive("t3_f3_doctor_verdict_ends_with_newline");
         assert_eq!(doctor.code, Some(1));
     }
 }
@@ -1223,4 +1258,67 @@ fn b2_huge_duration_is_a_usage_error_not_a_panic() {
         );
         assert_scoped_hint(&usage.stderr, argv[0].as_str());
     }
+}
+
+/// Static guard: every dual-outcome test in this file reads
+/// `P11SCOPE_REQUIRE_CAPTURE` through `require_capture_positive`, so the
+/// privileged root run cannot pass on the refusal branch. A new
+/// dual-outcome test that forgets the call fails here by name.
+///
+/// Exempt by design, not by omission:
+/// - `j2_unprivileged_profile_names_inspect_and_doctor`,
+///   `t3_f7_attach_refusal_points_at_doctor` and
+///   `high1_missing_privilege_is_named_and_never_offers_the_override` pin
+///   the unprivileged refusal itself and assert nothing once capture
+///   exists; requiring capture there would invert their purpose.
+/// - `high4_a_closed_stdout_reader_never_panics` asserts on both paths and
+///   only uses availability to pick the expected doctor code.
+#[test]
+fn every_capture_branch_names_the_require_guard() {
+    let path = format!("{}/tests/ux_journeys.rs", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        source.contains("fn require_capture_positive"),
+        "the require guard is missing from {path}"
+    );
+    assert!(
+        source.contains("P11SCOPE_REQUIRE_CAPTURE"),
+        "the require guard no longer reads the variable in {path}"
+    );
+    let exempt = [
+        "j2_unprivileged_profile_names_inspect_and_doctor",
+        "t3_f7_attach_refusal_points_at_doctor",
+        "high1_missing_privilege_is_named_and_never_offers_the_override",
+        "high4_a_closed_stdout_reader_never_panics",
+    ];
+    let mut seen = Vec::new();
+    for segment in source.split("#[test]") {
+        let Some(name) = test_fn_name(segment) else {
+            continue;
+        };
+        seen.push(name.to_string());
+        if name == "every_capture_branch_names_the_require_guard" {
+            continue;
+        }
+        if segment.contains("capture_available()") && !exempt.contains(&name) {
+            assert!(
+                segment.contains("require_capture_positive"),
+                "{name} branches on capture availability without reading \
+                 P11SCOPE_REQUIRE_CAPTURE"
+            );
+        }
+    }
+    for name in exempt {
+        assert!(
+            seen.iter().any(|found| found == name),
+            "exemption {name} names no test in {path}"
+        );
+    }
+}
+
+/// The `fn` name of a `#[test]` segment, if the segment holds a test.
+fn test_fn_name(segment: &str) -> Option<&str> {
+    let rest = segment.split("fn ").nth(1)?;
+    let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+    Some(&rest[..end])
 }

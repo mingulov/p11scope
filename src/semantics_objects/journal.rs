@@ -597,6 +597,40 @@ struct ImageSighting {
     first_affecting: Option<u64>,
 }
 
+/// One key's attribution of its image's staged history at a frontier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttributionReadiness {
+    /// Every staged call is attributed and this key's claims cover its own.
+    Ready,
+    /// A claim can still arrive: the seal waits (`BoundNotReady`).
+    Pending,
+    /// A staged call no claim can ever name: the seal ends named.
+    Unmatched,
+}
+
+/// Whether one unclaimed staged call's END sits at an H0 position the
+/// audit shows already disposed: clean H3 coverage through it, no pending
+/// floor at or below it, and below the allocation watermark. Admission
+/// files the claim when it disposes the position, so a disposed position
+/// without a claim can never gain one. A scripted audit without a
+/// watermark (zero) never qualifies.
+fn admission_disposed_unclaimed(entry: &OpenEntry, audit: &JournalAuditReceipt) -> bool {
+    let (Some(_), Some(origin)) = (entry.end, entry.collected_origin) else {
+        return false;
+    };
+    let position = origin.position();
+    let H3DispositionEvidence::Clean {
+        staged_max,
+        pending_floor,
+    } = audit.h3
+    else {
+        return false;
+    };
+    staged_max >= position
+        && pending_floor.is_none_or(|floor| floor > position)
+        && position < audit.h0_below
+}
+
 /// Per-key adapter state: the current era, refusal stickiness, model
 /// registration, the bootstrap cuts and bounded-loss uppers that gate
 /// later seals, and the void fence (history at or below it is explicitly
@@ -5051,8 +5085,18 @@ impl JournalAdapter {
         // wait for their own seal, and unclaimed shapes (or live
         // collisions) hold the seal until admission authority names
         // them.
-        if !self.attribution_ready(key, &live, frontier) {
-            return Err(self.failure(JournalGap::BoundNotReady));
+        match self.attribution_readiness(key, &live, frontier, audit) {
+            AttributionReadiness::Ready => {}
+            AttributionReadiness::Pending => {
+                return Err(self.failure(JournalGap::BoundNotReady));
+            }
+            AttributionReadiness::Unmatched => {
+                // No claim can ever name this staged call: the image's
+                // history cannot be accounted for under any key. End the
+                // attempt named (like duplicate claims) instead of holding.
+                self.taint_image(image);
+                return Err(self.failure(JournalGap::ClaimUnmatched));
+            }
         }
         // A fresh birth (no pinned cut for this era) must ground its
         // authority in new staged history: naming the void fence with
@@ -5316,17 +5360,27 @@ impl JournalAdapter {
     /// Whether every staged entry for one image at or below a frontier
     /// is attributed under a sealing key: this key's entries, a
     /// sibling's (left for their own seal), or solely dead claims. An
-    /// unclaimed shape or a live collision holds the seal; multiset
-    /// claim counts must cover this key's staged entries — including
-    /// under a sole live key.
-    fn attribution_ready(
+    /// unclaimed shape or a live collision holds the seal while its claim
+    /// can still arrive; multiset claim counts must cover this key's
+    /// staged entries — including under a sole live key.
+    ///
+    /// A staged call no claim can ever name is `Unmatched`, never an
+    /// unbounded hold: a claim on its own entry-time identity that does
+    /// not name it (the identity is one invocation, and a second claim on
+    /// it taints), two staged calls sharing one entry-time identity with
+    /// too few claims (the missing one can never be filed without
+    /// tainting), or an END whose H0 position the audit shows disposed
+    /// with no claim filed for it.
+    fn attribution_readiness(
         &self,
         key: JournalDomainKey,
         live: &[JournalDomainKey],
         frontier: u64,
-    ) -> bool {
+        audit: &JournalAuditReceipt,
+    ) -> AttributionReadiness {
         let image = (key.cookie, key.exec);
         let mut needs: BTreeMap<CallIdentity, u64> = BTreeMap::new();
+        let mut pending = false;
         for entry in self.open.values() {
             if entry.image != image
                 || entry.converted_ticket.is_some()
@@ -5340,7 +5394,14 @@ impl JournalAdapter {
                     *needs.entry(shape.identity).or_default() += 1;
                 }
                 CallAttribution::Sibling => {}
-                CallAttribution::Unclaimed => return false,
+                CallAttribution::Unclaimed => {
+                    if self.identity_claimed(&shape.identity)
+                        || admission_disposed_unclaimed(entry, audit)
+                    {
+                        return AttributionReadiness::Unmatched;
+                    }
+                    pending = true;
+                }
             }
         }
         for refused in &self.refused {
@@ -5353,17 +5414,34 @@ impl JournalAdapter {
                     *needs.entry(shape.identity).or_default() += 1;
                 }
                 CallAttribution::Sibling => {}
-                CallAttribution::Unclaimed => return false,
+                CallAttribution::Unclaimed => {
+                    if self.identity_claimed(&shape.identity) {
+                        return AttributionReadiness::Unmatched;
+                    }
+                    pending = true;
+                }
             }
         }
-        needs.into_iter().all(|(identity, need)| {
-            self.claims
+        let mut covered = true;
+        for (identity, need) in needs {
+            let have = self
+                .claims
                 .get(&identity)
                 .and_then(|claimants| claimants.get(&key))
                 .map(|ordinals| ordinals.len() as u64)
-                .unwrap_or(0)
-                >= need
-        })
+                .unwrap_or(0);
+            if have < need {
+                if need > 1 {
+                    return AttributionReadiness::Unmatched;
+                }
+                covered = false;
+            }
+        }
+        if pending || !covered {
+            AttributionReadiness::Pending
+        } else {
+            AttributionReadiness::Ready
+        }
     }
 
     fn awaits_future_terminal(

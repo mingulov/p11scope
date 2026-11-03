@@ -427,3 +427,80 @@ fn key_ops_line_carries_no_object_identity() {
         );
     }
 }
+
+fn named_gap(subject: &str, reason: &str) -> GapView {
+    GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: subject.into(),
+        reason: reason.into(),
+        budget: None,
+        repeats: 1,
+    }
+}
+
+/// A linked lane with observed semantic calls and no Joint feed or
+/// birth refusal names its `bootstrap_unavailable` once; the twins
+/// (no calls, a named refusal, any other reason) add nothing.
+#[test]
+fn silent_bootstrap_unavailable_is_named_once() {
+    let silent = ObjectObservations::unavailable(7, "bootstrap_unavailable");
+    let gap = silent_bootstrap_gap(&silent, 1, &[named_gap("semantic input refused", "slot")])
+        .expect("observed calls with no birth and no refusal are named");
+    assert_eq!(gap.subject, "Joint birth unavailable; retained S1");
+    assert_eq!(gap.reason, "joint_birth_unoffered");
+    assert_eq!(gap.repeats, 1);
+    assert!(
+        silent_bootstrap_gap(&silent, 0, &[]).is_none(),
+        "no observed calls: nothing owed"
+    );
+    let refused = [named_gap(
+        "Joint birth unavailable; retained S1",
+        "joint_birth_native_RowUnreadable",
+    )];
+    assert!(
+        silent_bootstrap_gap(&silent, 1, &refused).is_none(),
+        "a refusal already names it"
+    );
+    for reason in [
+        "journal_unavailable",
+        "proof_refused_fallback",
+        "authority_lost",
+    ] {
+        let other = ObjectObservations::unavailable(7, reason);
+        assert!(
+            silent_bootstrap_gap(&other, 1, &[]).is_none(),
+            "{reason} carries its own cause"
+        );
+    }
+    assert!(silent_bootstrap_gap(&populated(7), 1, &[]).is_none());
+}
+
+/// The wiring's twin: a linked capture without any observed semantic
+/// call has nothing to name, so its presentation adds no gap.
+#[test]
+fn presentation_without_semantic_calls_adds_no_bootstrap_gap() {
+    let mut harness = Harness::new(RegistryLimits::default_limits()).unwrap();
+    harness.stage_scale(&ScaleSpec {
+        name: "idle-bootstrap",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 93_000,
+    });
+    harness.commit();
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    assert_eq!(
+        presentation.object_observations.reason,
+        "bootstrap_unavailable"
+    );
+    assert!(presentation.semantic_edges.is_empty());
+    assert!(
+        presentation
+            .gaps
+            .iter()
+            .all(|gap| gap.reason != "joint_birth_unoffered")
+    );
+}

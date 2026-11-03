@@ -1194,6 +1194,12 @@ impl ObjectSemantics {
             .begin_with_resource(origin, ledger, Some(resource))
     }
 
+    /// Whether `domain` ended through a qualified successful
+    /// `C_Finalize` with nothing of it left unfinished.
+    pub(crate) fn domain_completed(&self, domain: ObjectDomain) -> bool {
+        self.state.domain_completed(domain)
+    }
+
     /// Stage one matched completion privately; publishes no object claim.
     pub(crate) fn complete(
         &mut self,

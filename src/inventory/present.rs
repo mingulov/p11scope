@@ -832,7 +832,7 @@ impl Presentation {
                 }
             })
             .collect();
-        let gaps = registry
+        let mut gaps: Vec<GapView> = registry
             .gaps()
             .iter()
             .zip(registry.gap_repeats())
@@ -846,6 +846,10 @@ impl Presentation {
                 repeats,
             })
             .collect();
+        let object_observations = coordinator.registry().joint_observations(passes);
+        if let Some(gap) = silent_bootstrap_gap(&object_observations, semantic_edges.len(), &gaps) {
+            gaps.push(gap);
+        }
         let limits = registry.limits();
         let (observed_edges, saturated_edges) = registry.counter_census();
         let render_index = PresentationRenderIndex::build(&instances, &semantic_edges);
@@ -877,7 +881,7 @@ impl Presentation {
             // commits; without it this stays unavailable, exactly as
             // before (production holds no receipts, seals or
             // projections).
-            object_observations: coordinator.registry().joint_observations(passes),
+            object_observations,
             prearm: coordinator.prearm_rows(),
             budgets: BudgetView {
                 callers_limit: limits.max_callers,
@@ -1303,6 +1307,36 @@ pub(crate) fn key_operation_tallies(
             unit,
         })
         .collect()
+}
+
+/// The subject every Joint birth refusal discloses under
+/// (`disclose_s1_birth_refusal`).
+pub(crate) const JOINT_BIRTH_UNAVAILABLE_SUBJECT: &str = "Joint birth unavailable; retained S1";
+
+/// A linked lane that observed semantic calls but neither published a
+/// Joint feed nor disclosed why reads `bootstrap_unavailable` with no
+/// cause anywhere in the document. Name that once, at presentation:
+/// `joint_birth_unoffered` (no birth was ever offered for the observed
+/// calls). Any recorded birth refusal already names the cause.
+pub(crate) fn silent_bootstrap_gap(
+    observations: &crate::key_operation_projection::ObjectObservations,
+    semantic_edges: usize,
+    gaps: &[GapView],
+) -> Option<GapView> {
+    (observations.reason == "bootstrap_unavailable"
+        && semantic_edges > 0
+        && !gaps
+            .iter()
+            .any(|gap| gap.subject == JOINT_BIRTH_UNAVAILABLE_SUBJECT))
+    .then(|| GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
+        reason: "joint_birth_unoffered".into(),
+        budget: None,
+        repeats: 1,
+    })
 }
 
 /// Pager-friendly snapshot: a deterministic, stable text rendering of a

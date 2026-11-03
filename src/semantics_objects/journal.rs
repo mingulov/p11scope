@@ -597,6 +597,40 @@ struct ImageSighting {
     first_affecting: Option<u64>,
 }
 
+/// One key's attribution of its image's staged history at a frontier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttributionReadiness {
+    /// Every staged call is attributed and this key's claims cover its own.
+    Ready,
+    /// A claim can still arrive: the seal waits (`BoundNotReady`).
+    Pending,
+    /// A staged call no claim can ever name: the seal ends named.
+    Unmatched,
+}
+
+/// Whether one unclaimed staged call's END sits at an H0 position the
+/// audit shows already disposed: clean H3 coverage through it, no pending
+/// floor at or below it, and below the allocation watermark. Admission
+/// files the claim when it disposes the position, so a disposed position
+/// without a claim can never gain one. A scripted audit without a
+/// watermark (zero) never qualifies.
+fn admission_disposed_unclaimed(entry: &OpenEntry, audit: &JournalAuditReceipt) -> bool {
+    let (Some(_), Some(origin)) = (entry.end, entry.collected_origin) else {
+        return false;
+    };
+    let position = origin.position();
+    let H3DispositionEvidence::Clean {
+        staged_max,
+        pending_floor,
+    } = audit.h3
+    else {
+        return false;
+    };
+    staged_max >= position
+        && pending_floor.is_none_or(|floor| floor > position)
+        && position < audit.h0_below
+}
+
 /// Per-key adapter state: the current era, refusal stickiness, model
 /// registration, the bootstrap cuts and bounded-loss uppers that gate
 /// later seals, and the void fence (history at or below it is explicitly
@@ -611,6 +645,11 @@ struct JournalDomainState {
     s1only_original_refused: bool,
     tainted: bool,
     era_ended: bool,
+    /// A seal of this key settled a qualified successful `C_Finalize`
+    /// that left nothing unfinished (the model's completed domain). The
+    /// era is completed history: a later seal with nothing new for this
+    /// key succeeds empty instead of refusing `DomainEnded`.
+    era_completed: bool,
     sealed_through: u64,
     bootstraps: BTreeMap<u64, u64>,
     /// The maximum recorded bounded-loss upper for this key. The fence
@@ -762,6 +801,12 @@ pub(crate) enum JournalGap {
     /// derived. The seal refuses explicitly instead of saturating
     /// into a vacuous re-seal; staged inputs are kept.
     CutExhausted,
+    /// A staged entry no admission claim can ever name: a claim on its
+    /// own entry-time identity reports a return it cannot have made,
+    /// two entries share one entry-time identity, or its END's H0
+    /// position was disposed (clean H3 coverage) without a claim. The
+    /// image is tainted; the seal ends named instead of waiting.
+    ClaimUnmatched,
 }
 
 impl JournalGap {
@@ -792,6 +837,7 @@ impl JournalGap {
             Self::H3Exhausted => "h3_exhausted",
             Self::Discarded => "discarded",
             Self::CutExhausted => "cut_exhausted",
+            Self::ClaimUnmatched => "claim_unmatched",
         }
     }
 }
@@ -2453,10 +2499,11 @@ fn sealed_fingerprint(
     )
 }
 
-/// One staged END to its sealed completion fact. Session outputs are never
-/// observed (no session-result protocol exists): session-creating lifecycle
-/// calls report their output unreadable, honestly unknown rather than
-/// absent; everything else reports no output.
+/// One staged END to its sealed completion fact. A successful
+/// `C_OpenSession` END carries the handle the return read from the
+/// application's output cell (allowlist v1; the BEGIN/END agreement admits
+/// that rewrite only on an OK or pending return with a non-null output);
+/// see [`session_output_of`]. Everything else reports no session output.
 fn completed_of(end_ordinal: u64, function: u32, end: &ValidatedJournalEnd) -> CompletedFact {
     let base = end.payload_base();
     let tail = end.payload_tail();
@@ -2476,7 +2523,7 @@ fn completed_of(end_ordinal: u64, function: u32, end: &ValidatedJournalEnd) -> C
         rv: event.rv,
         return_mechanism: mechanism_evidence(event.capture, event.mechanism),
         results,
-        session_out: session_output_of(function),
+        session_out: session_output_of(function, event),
         found: find_of(action, &tail, end.tail_absent()),
         attributes: attributes_of(action, &tail, end.tail_absent()),
     }
@@ -2495,11 +2542,25 @@ fn tail_u64(tail: &[u8; 240], offset: usize) -> u64 {
     ])
 }
 
-fn session_output_of(function: u32) -> HandleInput<SessionHandle> {
-    if Some(function) == crate::kinds::function_id("C_OpenSession") {
-        HandleInput::Unreadable
+/// The session output of one sealed END, by the same rule S1 applies to
+/// the same return event: a `CKR_OK` `C_OpenSession` whose return read
+/// produced a word (not `SESSION_NONE`, the unread or failed-read value)
+/// names its new session. Any other `C_OpenSession` outcome stays
+/// honestly unreadable rather than absent; other calls have no output.
+fn session_output_of(
+    function: u32,
+    event: &p11scope_ebpf_common::Event,
+) -> HandleInput<SessionHandle> {
+    if Some(function) != crate::kinds::function_id("C_OpenSession") {
+        return HandleInput::Absent;
+    }
+    if event.rv == pkcs11_types::CkRv::OK.0
+        && event.session != p11scope_ebpf_common::SESSION_NONE
+        && let Some(handle) = SessionHandle::new(event.session)
+    {
+        HandleInput::Value(handle)
     } else {
-        HandleInput::Absent
+        HandleInput::Unreadable
     }
 }
 
@@ -4935,6 +4996,7 @@ impl JournalAdapter {
         if state.era_ended {
             return Err(self.failure(JournalGap::DomainEnded));
         }
+        let completed = state.era_completed;
         // Era discipline: the proof carries the live era, or the next era
         // once the live one ended (handled below after the ended check can
         // observe it). Anything else is a mismatched bootstrap.
@@ -5023,8 +5085,18 @@ impl JournalAdapter {
         // wait for their own seal, and unclaimed shapes (or live
         // collisions) hold the seal until admission authority names
         // them.
-        if !self.attribution_ready(key, &live, frontier) {
-            return Err(self.failure(JournalGap::BoundNotReady));
+        match self.attribution_readiness(key, &live, frontier, audit) {
+            AttributionReadiness::Ready => {}
+            AttributionReadiness::Pending => {
+                return Err(self.failure(JournalGap::BoundNotReady));
+            }
+            AttributionReadiness::Unmatched => {
+                // No claim can ever name this staged call: the image's
+                // history cannot be accounted for under any key. End the
+                // attempt named (like duplicate claims) instead of holding.
+                self.taint_image(image);
+                return Err(self.failure(JournalGap::ClaimUnmatched));
+            }
         }
         // A fresh birth (no pinned cut for this era) must ground its
         // authority in new staged history: naming the void fence with
@@ -5107,7 +5179,69 @@ impl JournalAdapter {
             Some(pinned) if pinned < floors => None,
             _ => Some(floors),
         };
+        // A completed era (its sealed successful C_Finalize ended the
+        // model domain with nothing left unfinished) has nothing left
+        // to prove: with no new history for this key it seals empty,
+        // like an idle key, never reaching the ended model domain. New
+        // history after it cannot be proved under the ended domain and
+        // keeps the ordinary path's refusal.
+        if completed && !self.has_history_through(key, &live, frontier) {
+            return self.seal_completed_era(key, bootstrap, frontier, replay);
+        }
         self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay)
+    }
+
+    /// Whether any staged wire truth for one key sits at or below a
+    /// frontier: a begin converting here or already converted for it,
+    /// or a refused begin converting here.
+    fn has_history_through(
+        &self,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        frontier: u64,
+    ) -> bool {
+        self.open
+            .values()
+            .any(|entry| entry.begin_ordinal <= frontier && self.abandons_here(key, live, entry))
+            || self.refused.iter().any(|refused| {
+                refused.cut <= frontier && self.refused_converts_here(key, live, refused)
+            })
+    }
+
+    /// The empty success of a completed era: nothing settles, no
+    /// bootstrap is claimed, and the frontier advances exactly as an
+    /// idle key's empty seal would. The model is not consulted.
+    fn seal_completed_era(
+        &mut self,
+        key: JournalDomainKey,
+        bootstrap: &BootstrapReceipt,
+        frontier: u64,
+        replay: Option<ReplayPreparation>,
+    ) -> Result<SealSuccess, SealFailure> {
+        let mut prefix = SealedObjectPrefix {
+            domain: ObjectDomain::sealed(&bootstrap.proof()),
+            frontier,
+            birth_cut: bootstrap.birth_cut(),
+            bootstrap: None,
+            settled: Vec::new(),
+            settled_len: 0,
+            replay_steps: Vec::new(),
+            replay_index: None,
+            open: Vec::new(),
+        };
+        if let Some(replay) = replay {
+            let Some((steps, index)) = replay.finish(0) else {
+                return Err(self.failure(JournalGap::ModelRefused));
+            };
+            prefix.replay_steps = steps;
+            prefix.replay_index = Some(index);
+        }
+        let state = self.keys.get_mut(&key).expect("sealed key");
+        state.sealed_through = frontier;
+        Ok(SealSuccess {
+            prefix,
+            effects: ObjectEffects::default(),
+        })
     }
 
     /// Preserve staged unbounded abandonments across a void: each
@@ -5226,17 +5360,27 @@ impl JournalAdapter {
     /// Whether every staged entry for one image at or below a frontier
     /// is attributed under a sealing key: this key's entries, a
     /// sibling's (left for their own seal), or solely dead claims. An
-    /// unclaimed shape or a live collision holds the seal; multiset
-    /// claim counts must cover this key's staged entries — including
-    /// under a sole live key.
-    fn attribution_ready(
+    /// unclaimed shape or a live collision holds the seal while its claim
+    /// can still arrive; multiset claim counts must cover this key's
+    /// staged entries — including under a sole live key.
+    ///
+    /// A staged call no claim can ever name is `Unmatched`, never an
+    /// unbounded hold: a claim on its own entry-time identity that does
+    /// not name it (the identity is one invocation, and a second claim on
+    /// it taints), two staged calls sharing one entry-time identity with
+    /// too few claims (the missing one can never be filed without
+    /// tainting), or an END whose H0 position the audit shows disposed
+    /// with no claim filed for it.
+    fn attribution_readiness(
         &self,
         key: JournalDomainKey,
         live: &[JournalDomainKey],
         frontier: u64,
-    ) -> bool {
+        audit: &JournalAuditReceipt,
+    ) -> AttributionReadiness {
         let image = (key.cookie, key.exec);
         let mut needs: BTreeMap<CallIdentity, u64> = BTreeMap::new();
+        let mut pending = false;
         for entry in self.open.values() {
             if entry.image != image
                 || entry.converted_ticket.is_some()
@@ -5250,7 +5394,14 @@ impl JournalAdapter {
                     *needs.entry(shape.identity).or_default() += 1;
                 }
                 CallAttribution::Sibling => {}
-                CallAttribution::Unclaimed => return false,
+                CallAttribution::Unclaimed => {
+                    if self.identity_claimed(&shape.identity)
+                        || admission_disposed_unclaimed(entry, audit)
+                    {
+                        return AttributionReadiness::Unmatched;
+                    }
+                    pending = true;
+                }
             }
         }
         for refused in &self.refused {
@@ -5263,17 +5414,34 @@ impl JournalAdapter {
                     *needs.entry(shape.identity).or_default() += 1;
                 }
                 CallAttribution::Sibling => {}
-                CallAttribution::Unclaimed => return false,
+                CallAttribution::Unclaimed => {
+                    if self.identity_claimed(&shape.identity) {
+                        return AttributionReadiness::Unmatched;
+                    }
+                    pending = true;
+                }
             }
         }
-        needs.into_iter().all(|(identity, need)| {
-            self.claims
+        let mut covered = true;
+        for (identity, need) in needs {
+            let have = self
+                .claims
                 .get(&identity)
                 .and_then(|claimants| claimants.get(&key))
                 .map(|ordinals| ordinals.len() as u64)
-                .unwrap_or(0)
-                >= need
-        })
+                .unwrap_or(0);
+            if have < need {
+                if need > 1 {
+                    return AttributionReadiness::Unmatched;
+                }
+                covered = false;
+            }
+        }
+        if pending || !covered {
+            AttributionReadiness::Pending
+        } else {
+            AttributionReadiness::Ready
+        }
     }
 
     fn awaits_future_terminal(
@@ -6087,6 +6255,9 @@ impl JournalAdapter {
         }
         debug_assert!(prefix.settled_len <= prefix.settled.len());
         self.keys.get_mut(&key).expect("sealed key").sealed_through = frontier;
+        if model.domain_completed(domain) {
+            self.keys.get_mut(&key).expect("sealed key").era_completed = true;
+        }
         self.keys
             .get_mut(&key)
             .expect("sealed key")
@@ -15269,6 +15440,291 @@ pub(crate) mod tests {
         );
     }
 
+    /// A later collected ordinal that is not this key's history: an
+    /// ordinary CALL of another image. It only advances the frontier.
+    fn foreign_pad(scene: &mut Scene) {
+        let mut pad = ordinary_for(&begin_bytes(1, 9, function_id("C_CreateObject"), 0), 0);
+        pad.image.task_cookie ^= 0x5a5a;
+        assert_eq!(
+            scene.ingest_ordinary(pad),
+            JournalDisposition::OrdinaryCounted
+        );
+    }
+
+    /// One sealed `C_Finalize` with return value `rv`, then a later seal
+    /// of the same key at an advanced frontier with nothing new for it.
+    fn finalize_then_later_seal(
+        rv: u64,
+    ) -> (Scene, BootstrapReceipt, Result<SealSuccess, SealFailure>) {
+        let (mut scene, proof) = enriched_claim_scene(
+            "C_Finalize",
+            |_, facts| {
+                facts.rv = rv;
+            },
+            |_| {},
+        );
+        let bootstrap = scene.bootstrap(proof, 0);
+        let first = scene
+            .seal(&bootstrap)
+            .expect("the C_Finalize seal certifies");
+        assert_eq!(
+            first.prefix.settled().len(),
+            1,
+            "the first seal settles C_Finalize"
+        );
+        foreign_pad(&mut scene);
+        let later = scene.seal(&bootstrap);
+        (scene, bootstrap, later)
+    }
+
+    /// A sealed successful `C_Finalize` completes its era: a later seal
+    /// (any later H0 activity in `--system`) succeeds with nothing new,
+    /// never `DomainEnded`, and the model counts no ended-domain gap.
+    #[test]
+    fn object_journal_sealed_finalize_completes_era() {
+        let (mut scene, bootstrap, later) = finalize_then_later_seal(0);
+        let later = later.unwrap_or_else(|failure| {
+            panic!("a completed era seals with nothing new: {:?}", failure.gap)
+        });
+        assert!(later.prefix.settled().is_empty(), "nothing new is settled");
+        assert!(
+            !later.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: ObjectGap::DomainEnded
+                }
+            )),
+            "no ended-domain effect"
+        );
+        assert_eq!(scene.model.project().gap(ObjectGap::DomainEnded), 0);
+        // Repeated later seals stay complete.
+        foreign_pad(&mut scene);
+        let again = scene.seal(&bootstrap);
+        assert!(
+            again
+                .as_ref()
+                .is_ok_and(|seal| seal.prefix.settled().is_empty()),
+            "the completed era stays complete: {:?}",
+            again.err().map(|failure| failure.gap)
+        );
+        assert_eq!(scene.model.project().gap(ObjectGap::DomainEnded), 0);
+    }
+
+    /// Twin: a `C_Finalize` whose outcome is ambiguous (GENERAL_ERROR)
+    /// still ends the model domain, but it proves no completion: the later
+    /// seal keeps today's `DomainEnded` refusal.
+    #[test]
+    fn object_journal_ambiguous_finalize_still_ends_era() {
+        let (scene, _, later) = finalize_then_later_seal(pkcs11_types::CkRv::GENERAL_ERROR.0);
+        let failure = later.expect_err("an ambiguous Finalize is no completed history");
+        assert_eq!(failure.gap, JournalGap::DomainEnded);
+        assert_eq!(scene.model.project().gap(ObjectGap::DomainEnded), 1);
+    }
+
+    /// Twin: a failed `C_Finalize` (an ordinary error) ends nothing; the
+    /// key stays live and a later seal is an ordinary empty success.
+    #[test]
+    fn object_journal_failed_finalize_keeps_era_live() {
+        let (_, _, later) = finalize_then_later_seal(pkcs11_types::CkRv::ARGUMENTS_BAD.0);
+        let later = later.unwrap_or_else(|failure| panic!("live era: {:?}", failure.gap));
+        assert!(later.prefix.settled().is_empty());
+    }
+
+    /// Twin: new history for the finalized key after its completed era
+    /// (the client calls again) cannot be proved under the ended domain;
+    /// the seal keeps today's refusal (the ended model refuses the new
+    /// call's conversion) instead of succeeding with nothing new.
+    #[test]
+    fn object_journal_sealed_finalize_with_new_history_still_ends_era() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let (mut scene, proof) = enriched_claim_scene("C_Finalize", |_, _| {}, |_| {});
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("the C_Finalize seal certifies");
+        scene.attest();
+        let create = begin_bytes(1, 2, function_id("C_CreateObject"), 0);
+        assert_eq!(scene.ingest(&create), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes(&create, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50)),
+            JournalDisposition::EndStaged
+        );
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("new history after a completed era is not nothing new");
+        assert_eq!(failure.gap, JournalGap::ModelRefused);
+        assert_eq!(
+            crate::semantics_key_use::disposition_of(failure.gap),
+            crate::semantics_key_use::SealFailureDisposition::Fallback
+        );
+    }
+
+    /// A claim on the entry's own entry-time identity that reports a
+    /// return this call cannot have made can never be corrected (the
+    /// identity is one invocation): the seal ends with a named,
+    /// non-retry gap and the image is tainted, never an unbounded
+    /// `BoundNotReady` hold. Each enriched word is covered, BEGIN-only
+    /// (rewrite rules) and with the END staged (exact match).
+    #[test]
+    fn object_journal_contradicting_claim_ends_seal_named() {
+        use crate::semantics_key_use::{SealFailureDisposition, disposition_of};
+        type Forge = fn(&mut Event);
+        let cases: [(&str, &str, Forge); 6] = [
+            ("C_Initialize", "session", |event| event.session = 5),
+            ("C_Finalize", "session", |event| event.session = 0x9090),
+            ("C_CloseAllSessions", "session", |event| event.session = 1),
+            ("C_OpenSession", "rv", |event| event.rv = 5),
+            ("C_SignInit", "session", |event| event.session ^= 1),
+            ("C_SignInit", "capture", |event| {
+                event.capture ^= capture::OUTPUT_NULL
+            }),
+        ];
+        let mut wrong = Vec::new();
+        for (name, field, forge) in cases {
+            for staged_end in [false, true] {
+                let (mut scene, proof) = if staged_end {
+                    enriched_claim_scene(name, |_, _| {}, forge)
+                } else {
+                    begin_only_claim_scene(name, |_, _| {}, forge)
+                };
+                let image = (scene.fixture.image.task_cookie, scene.fixture.image.exec_id);
+                let bootstrap = scene.bootstrap(proof, 0);
+                let gap = scene.seal(&bootstrap).map(|_| ()).map_err(|f| f.gap);
+                if gap != Err(JournalGap::ClaimUnmatched)
+                    || disposition_of(JournalGap::ClaimUnmatched)
+                        != SealFailureDisposition::Fallback
+                    || !scene.adapter.is_tainted(image)
+                {
+                    wrong.push(format!("{name} {field} end={staged_end}: {gap:?}"));
+                }
+                // No retry loop: the next seal also refuses without holding.
+                let again = scene.seal(&bootstrap).map(|_| ()).map_err(|f| f.gap);
+                if again.is_ok() || again == Err(JournalGap::BoundNotReady) {
+                    wrong.push(format!("{name} {field} end={staged_end} again: {again:?}"));
+                }
+            }
+            // Healthy twin: the producer's own return names its BEGIN.
+            let (mut scene, proof) = enriched_claim_scene(name, |_, _| {}, |_| {});
+            let bootstrap = scene.bootstrap(proof, 0);
+            if let Err(failure) = scene.seal(&bootstrap) {
+                wrong.push(format!("{name} healthy: {:?}", failure.gap));
+            }
+        }
+        assert!(wrong.is_empty(), "contradictions end named: {wrong:#?}");
+    }
+
+    /// An unclaimed staged call whose END's H0 position the audit shows
+    /// disposed (clean H3 coverage below the allocation watermark) can
+    /// never be claimed later: the seal ends named. Twins: the same call
+    /// while its position is still pending, uncovered or without a
+    /// collected origin keeps waiting (`BoundNotReady`).
+    #[test]
+    fn object_journal_unclaimed_entry_past_audit_bound_ends_named() {
+        use super::joint_driver::CollectedCallOrigin;
+        // (origin position, h0_below, pending floor, expected)
+        let cases: [(Option<u64>, u64, Option<u64>, JournalGap); 5] = [
+            (Some(3), 20, None, JournalGap::ClaimUnmatched),
+            (Some(3), 3, None, JournalGap::BoundNotReady),
+            // An admission still pending at its position holds in H3.
+            (Some(3), 20, Some(3), JournalGap::H3Pending),
+            (Some(30), 20, None, JournalGap::BoundNotReady),
+            (None, 20, None, JournalGap::BoundNotReady),
+        ];
+        let mut wrong = Vec::new();
+        for (origin, h0_below, pending_floor, expected) in cases {
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest();
+            let (begin, end) = producer_agreement_pair("C_SignInit", |_, _| {});
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            assert_eq!(scene.ingest(&end), JournalDisposition::EndStaged);
+            scene
+                .adapter
+                .open
+                .values_mut()
+                .next()
+                .expect("staged")
+                .collected_origin = origin.map(CollectedCallOrigin::scripted);
+            let staged_max = scene.fixture.next_token.max(h0_below.saturating_sub(1));
+            let audit = JournalAuditReceipt::scripted_h0(
+                7,
+                7,
+                None,
+                0,
+                H3DispositionEvidence::scripted_clean_pending(staged_max, pending_floor),
+                scene.closure_generation(),
+                h0_below,
+            );
+            let bootstrap = scene.bootstrap(proof, 0);
+            let frontier = scene.adapter.consumed_frontier();
+            let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
+            let gap = scene
+                .seal_explicit(&audit, &bootstrap, frontier, fresh)
+                .map(|_| ())
+                .map_err(|failure| failure.gap);
+            if gap != Err(expected) {
+                wrong.push(format!(
+                    "origin {origin:?} below {h0_below} floor {pending_floor:?}: {gap:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "past-audit unclaimed entries: {wrong:#?}");
+    }
+
+    /// The END of a successful `C_OpenSession` carries the returned
+    /// handle (read at return under allowlist v1, validated by the
+    /// BEGIN/END agreement), so the sealed open mints an opened session
+    /// with no `output_unreadable` gap. Twins: a failed open and an OK
+    /// whose return read failed (`SESSION_NONE`) mint nothing; the
+    /// unreadable one keeps its honest gap.
+    #[test]
+    fn object_journal_open_session_seals_its_returned_handle() {
+        use crate::semantics_objects::SessionOrigin;
+        use p11scope_ebpf_common::SESSION_NONE;
+        type Rewrite = fn(
+            &mut p11scope_ebpf_common::CallStart,
+            &mut p11scope_ebpf_common::object_flow::ReturnEventFacts,
+        );
+        // (case, rewrite, opened sessions, output_unreadable gaps)
+        let cases: [(&str, Rewrite, usize, u64); 3] = [
+            ("returned-handle", |_, _| {}, 1, 0),
+            (
+                "failed-rv",
+                |_, facts| {
+                    facts.rv = 5;
+                    facts.session = SESSION_NONE;
+                },
+                0,
+                0,
+            ),
+            (
+                "return-unreadable-word",
+                |_, facts| facts.session = SESSION_NONE,
+                0,
+                1,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (case, rewrite, opened, unreadable) in cases {
+            let (mut scene, proof) = enriched_claim_scene("C_OpenSession", rewrite, |_| {});
+            let bootstrap = scene.bootstrap(proof, 0);
+            if let Err(failure) = scene.seal(&bootstrap) {
+                wrong.push(format!("{case}: seal {:?}", failure.gap));
+                continue;
+            }
+            let projection = scene.model.project();
+            let seen = projection
+                .sessions
+                .iter()
+                .filter(|view| view.origin == SessionOrigin::Opened)
+                .count();
+            let gaps = projection.gap(ObjectGap::OutputUnreadable);
+            if (seen, gaps) != (opened, unreadable) {
+                wrong.push(format!("{case}: opened {seen} output_unreadable {gaps}"));
+            }
+        }
+        assert!(wrong.is_empty(), "OpenSession outputs: {wrong:#?}");
+    }
+
     /// Attribution of the scene's one staged entry under `proof`'s key.
     fn staged_attribution(scene: &Scene, proof: JournalDomainProof) -> CallAttribution {
         let entry = scene.adapter.open.values().next().expect("staged BEGIN");
@@ -15434,18 +15890,33 @@ pub(crate) mod tests {
             let healthy = staged_attribution(&scene, proof);
             let (mut scene, proof) = begin_only_claim_scene(name, rewrite, forge);
             let forged = staged_attribution(&scene, proof);
+            // A forged return on the BEGIN's own entry-time identity
+            // contradicts it for good: the seal ends named. A forge that
+            // moved the identity leaves the BEGIN's own claim still able
+            // to arrive: the seal holds.
+            let contradicted = {
+                let entry = scene.adapter.open.values().next().expect("staged BEGIN");
+                scene
+                    .adapter
+                    .identity_claimed(&shape_of_entry(entry).identity)
+            };
+            let expected = if contradicted {
+                JournalGap::ClaimUnmatched
+            } else {
+                JournalGap::BoundNotReady
+            };
             let bootstrap = scene.bootstrap(proof, 0);
             let sealed = scene.seal(&bootstrap).map(|_| ()).map_err(|hold| hold.gap);
             if healthy != CallAttribution::Mine
                 || forged != CallAttribution::Unclaimed
-                || sealed != Err(JournalGap::BoundNotReady)
+                || sealed != Err(expected)
             {
                 wrong.push(format!("{name} {shape}: {healthy:?} {forged:?} {sealed:?}"));
             }
         }
         assert!(
             wrong.is_empty(),
-            "healthy twins name their BEGIN, forged returns stay Unclaimed and hold: {wrong:#?}"
+            "healthy twins name their BEGIN, forged returns stay Unclaimed and end named or hold: {wrong:#?}"
         );
         // The absent-session healthy twin really is a rewrite.
         let (scene, _) = begin_only_claim_scene("C_Initialize", |_, _| {}, |_| {});
@@ -15540,10 +16011,12 @@ pub(crate) mod tests {
             "another returned mechanism than the END"
         );
         let bootstrap = scene.bootstrap(proof, 0);
-        let hold = scene
+        let ended = scene
             .seal(&bootstrap)
             .expect_err("the END contradicts the claim");
-        assert_eq!(hold.gap, JournalGap::BoundNotReady);
+        // The claim on this entry-time identity can never name it, so
+        // the seal ends named rather than waiting for a claim.
+        assert_eq!(ended.gap, JournalGap::ClaimUnmatched);
     }
 
     /// Two staged BEGINs identical at entry (same thread word, same entry
@@ -15575,8 +16048,11 @@ pub(crate) mod tests {
             let failure = scene
                 .seal(&bootstrap)
                 .expect_err("one identity never converts two BEGINs");
+            // One admission can name only one of the two: the other can
+            // never be claimed (a second claim on one identity taints), so
+            // the seal ends named instead of holding BoundNotReady.
             let expected = if admissions == 1 {
-                JournalGap::BoundNotReady
+                JournalGap::ClaimUnmatched
             } else {
                 JournalGap::ImageTainted
             };

@@ -534,6 +534,12 @@ struct DomainState {
     /// A new bootstrap must lie strictly above this cut.
     fence_floor: Option<u64>,
     ended: Option<ObjectGap>,
+    /// The domain ended through a qualified successful `C_Finalize`
+    /// applied while every other call of the domain had already
+    /// completed: completed history, not a refusal. Any other ending
+    /// (an ambiguous Finalize, exec, fork, unload, ID exhaustion, or a
+    /// Finalize overlapping an unfinished call) leaves it false.
+    completed: bool,
     /// Proof generation: every void increments it, so snapshots taken
     /// under an earlier proof can never publish.
     generation: u64,
@@ -1720,7 +1726,7 @@ impl ModelState {
                     self.apply_close_all(token, call, outcome, effects)
                 }
                 lifecycle::LOGOUT => self.apply_logout(call, outcome, session, effects),
-                lifecycle::FINALIZE => self.apply_finalize(call, outcome, effects, ledger),
+                lifecycle::FINALIZE => self.apply_finalize(token, call, outcome, effects, ledger),
                 lifecycle::SESSION_CANCEL => self.apply_cancel(outcome, session),
                 _ => {}
             },
@@ -3693,6 +3699,7 @@ impl ModelState {
 
     fn apply_finalize(
         &mut self,
+        token: CallToken,
         call: &PendingCall,
         outcome: Outcome,
         effects: &mut ObjectEffects,
@@ -3706,10 +3713,30 @@ impl ModelState {
         } else {
             Lifetime::Retired(ObjectGap::AmbiguousOutcome)
         };
+        // Completed history: a successful Finalize with nothing else of
+        // this domain still unfinished. end_domain removes every other
+        // call; one that never completed was cut short, not completed.
+        let completed = outcome == Outcome::Ok
+            && self.domain_calls(call.domain).into_iter().all(|other| {
+                other == token || self.pending.get(&other).is_some_and(|c| c.end_applied)
+            });
         for id in self.live_views(call.domain) {
             self.end_view(id, lifetime, effects);
         }
         self.end_domain(call.domain, ObjectGap::Finalize, effects, ledger);
+        self.domains
+            .get_mut(&call.domain)
+            .expect("ended domain")
+            .completed = completed;
+    }
+
+    /// Whether `domain` ended through a qualified successful
+    /// `C_Finalize` with nothing of it left unfinished (completed
+    /// history). False for a live, unknown or otherwise ended domain.
+    pub(super) fn domain_completed(&self, domain: ObjectDomain) -> bool {
+        self.domains
+            .get(&domain)
+            .is_some_and(|state| state.ended == Some(ObjectGap::Finalize) && state.completed)
     }
 
     // -----------------------------------------------------------------------

@@ -3497,6 +3497,11 @@ impl ClassicDriver<'_> {
             warn.emit(&line);
         }
         let counts = SemanticStopCounts::read(&lane, coordinator);
+        // The terminal commits below can apply staged calls past
+        // this disclosure: snapshot the cumulative diagnostic
+        // settlement summary so the hold can re-emit it when the
+        // commits moved it.
+        let pre_commit_settlement = coordinator.settlement_latency_summary();
         match winding_disclosed {
             // A stop path already disclosed this winding: stay silent.
             Some(disclosed) if !stop_counts_owed(*disclosed) => {}
@@ -3538,6 +3543,21 @@ impl ClassicDriver<'_> {
                     format!("{error:#}"),
                 );
             }
+        }
+        // Re-emit the cumulative diagnostic settlement summary when
+        // the terminal commits applied calls past the disclosure:
+        // the last settlement line then always carries the final
+        // applied count. Silent unless the toggle enabled recording
+        // and a commit applied past the disclosure (no second line
+        // on clean holds). Outside the stop-counts once-gate by
+        // design: the counts still disclose exactly once; only the
+        // cumulative diagnostic refreshes.
+        if let Some(summary) = coordinator.settlement_latency_summary()
+            && Some(summary) != pre_commit_settlement
+        {
+            warn.emit(&crate::inventory_semantics::settlement_latency_line(
+                &summary,
+            ));
         }
         // Read the post-commit summary before the hold takes the
         // lane: the entry poll and the abandon commit above disclosed

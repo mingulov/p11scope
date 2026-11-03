@@ -982,6 +982,18 @@ impl InstanceRouter {
         self.counters
     }
 
+    /// Coverage-failure state for the stuck-transaction diagnostic only:
+    /// (router image_failed, faulted key count, faulted-overflow latch).
+    /// Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    pub(crate) fn coverage_state_for_test(&self) -> (bool, usize, bool) {
+        (
+            self.image_failed,
+            self.faulted.len(),
+            self.faulted_overflowed,
+        )
+    }
+
     /// Borrow the real deferred route facts for Capture's original matching.
     /// Neither a copied pending queue nor an instance observation is minted.
     pub(crate) fn pending_facts(&self) -> impl Iterator<Item = &CallFacts> {

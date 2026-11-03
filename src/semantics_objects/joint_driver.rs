@@ -1422,6 +1422,14 @@ impl RawJointQuantum {
         Ok((&self.ordinary, self.collection_failed()))
     }
 
+    /// This quantum's collection audit (malformed/discard deltas,
+    /// counter/fault errors, fault bracket), for the stuck-transaction
+    /// diagnostic only. Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    pub(crate) fn collection_audit_for_test(&self) -> JournalCollection {
+        self.audit
+    }
+
     pub(crate) fn h0_delivery(
         &mut self,
         native: NativeDomainId,

@@ -2313,6 +2313,61 @@ impl AttestedSemanticLane {
         )
     }
 
+    /// First failed collected quantum's audit, if any tick delivered
+    /// a failed quantum. Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    pub(crate) fn first_failed_quantum_audit_for_test(
+        &self,
+    ) -> Option<crate::semantics_objects::journal::JournalCollection> {
+        self.live
+            .as_deref()
+            .and_then(|live| live.capture.first_failed_quantum_audit_for_test())
+    }
+
+    /// Coverage-failure state for the stuck-transaction diagnostic only:
+    /// (capture image_failed, pending discovery complete, router
+    /// image_failed, faulted key count, faulted-overflow latch, router
+    /// counters). Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    pub(crate) fn router_coverage_for_test(
+        &self,
+    ) -> Option<(
+        bool,
+        bool,
+        (bool, usize, bool),
+        crate::discovery::instances::RouterCounters,
+    )> {
+        self.live
+            .as_deref()
+            .map(|live| live.capture.router_coverage_for_test())
+    }
+
+    /// The live fault/sticky generation cells, for the
+    /// stuck-transaction diagnostic only. None without a live lane
+    /// or when the cells cannot be read. Test-visible; production
+    /// behavior never reads it.
+    #[cfg(test)]
+    pub(crate) fn instance_fault_cells_for_test(&self) -> Option<(u64, u64)> {
+        self.live
+            .as_deref()
+            .and_then(|live| live.session.instance_fault_cells_for_test().ok())
+    }
+
+    /// Per-hook kernel recursion misses, for the stuck-transaction
+    /// diagnostic only. None without a live lane or when the stats
+    /// cannot be read. Test-visible; production behavior never
+    /// reads it.
+    #[cfg(test)]
+    pub(crate) fn instance_hook_misses_for_test(&self) -> Option<Vec<(&'static str, u64)>> {
+        let live = self.live.as_deref()?;
+        live.session.instance_hook_stats().ok().map(|stats| {
+            stats
+                .into_iter()
+                .map(|(name, stats)| (name, stats.recursion_misses))
+                .collect()
+        })
+    }
+
     /// Test-only no-progress guard trip cause for the current transaction,
     /// if the bound expired a true stall.
     #[cfg(test)]

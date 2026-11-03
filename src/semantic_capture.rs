@@ -1554,6 +1554,13 @@ pub(crate) struct SemanticCapture {
     /// stuck-transaction diagnostic only. Test-visible.
     #[cfg(test)]
     last_refusal_by_key_for_test: BTreeMap<(u64, u64, u32), ImageQueryRefusal>,
+    /// First failed collected quantum's audit, latched for the
+    /// stuck-transaction diagnostic only. Later (usually empty,
+    /// healthy) quanta must not overwrite the failure that shed.
+    /// Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    first_failed_quantum_audit_for_test:
+        Option<crate::semantics_objects::journal::JournalCollection>,
 }
 
 pub(crate) type PendingH3Original<'a> = (
@@ -1639,6 +1646,8 @@ impl SemanticCapture {
             last_tick_refusals_for_test: Vec::new(),
             #[cfg(test)]
             last_refusal_by_key_for_test: BTreeMap::new(),
+            #[cfg(test)]
+            first_failed_quantum_audit_for_test: None,
         })
     }
     /// The classic attested lane owns this Session and its sole cursor. This
@@ -2872,6 +2881,36 @@ impl SemanticCapture {
         })
     }
 
+    /// First failed collected quantum's audit, if any tick delivered
+    /// a failed quantum. Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    pub(crate) fn first_failed_quantum_audit_for_test(
+        &self,
+    ) -> Option<crate::semantics_objects::journal::JournalCollection> {
+        self.first_failed_quantum_audit_for_test
+    }
+
+    /// Coverage-failure state for the stuck-transaction diagnostic only:
+    /// (capture image_failed, pending discovery complete, router
+    /// image_failed, faulted key count, faulted-overflow latch, router
+    /// counters). Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    pub(crate) fn router_coverage_for_test(
+        &self,
+    ) -> (
+        bool,
+        bool,
+        (bool, usize, bool),
+        crate::discovery::instances::RouterCounters,
+    ) {
+        (
+            self.image_failed,
+            self.pending_discovery_status == CollectionStatus::Complete,
+            self.router.coverage_state_for_test(),
+            self.router.counters(),
+        )
+    }
+
     /// Test-only stuck-transaction diagnostic: awaiting tokens grouped by
     /// (pin present, job present, job deadline remaining, last scan
     /// refusal, binding present/current, retained hold inside its horizon),
@@ -3539,9 +3578,17 @@ impl SemanticCapture {
         quantum
             .pin_h0_owner(CollectedH0Owner(self.identity))
             .map_err(|reason| anyhow::anyhow!("retained semantic owner: {reason:?}"))?;
+        // Snapshot before delivery borrows the quantum: latch the
+        // first failed audit for the stuck-transaction diagnostic.
+        #[cfg(test)]
+        let audit = quantum.collection_audit_for_test();
         let delivery = quantum
             .h0_delivery(self.router.domain(), self.limits.records)
             .map_err(|reason| anyhow::anyhow!("retained semantic collection: {reason:?}"))?;
+        #[cfg(test)]
+        if delivery.failed && self.first_failed_quantum_audit_for_test.is_none() {
+            self.first_failed_quantum_audit_for_test = Some(audit);
+        }
         let mut report = self.tick_with_inner(io, Some(delivery))?;
         self.stamp_disposition(&mut report);
         self.note_collected_disposition(quantum, &report)?;

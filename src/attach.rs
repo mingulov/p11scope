@@ -7571,6 +7571,17 @@ impl Session {
             .fold(0u64, u64::saturating_add))
     }
 
+    /// The live fault/sticky generation cells (INSTANCE_GEN fault,
+    /// sticky), for the stuck-transaction diagnostic only: sticky
+    /// names a host-wide fork-marking failure, fault counts BPF plus
+    /// userspace raises. Test-visible; production behavior never
+    /// reads it.
+    #[cfg(test)]
+    pub(crate) fn instance_fault_cells_for_test(&self) -> Result<(u64, u64)> {
+        let maps = self.instance_maps();
+        Ok((maps.fault()?, maps.sticky()?))
+    }
+
     pub(crate) fn counter_snapshot(&self) -> Result<CounterSnapshot> {
         let counters: PerCpuArray<_, u64> =
             PerCpuArray::try_from(self.ebpf.map("COUNTERS").context("COUNTERS map")?)?;

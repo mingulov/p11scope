@@ -920,8 +920,12 @@ static void check_scope_gap(void)
 static void check_exit_summary(void)
 {
     struct instance_exit_summary out;
+    /* Exit context: the exiting thread is the leader in every case
+     * below except the deliberate no-current-task refusal. reset()
+     * restores a non-leader child, so each case re-arms the leader. */
     /* No record: a no-create read contributes zero slots and no flags. */
     reset();
+    current_task = &leader;
     memset(&out, 0xa5, sizeof(out));
     out.flags = 0x40; /* caller pre-seed survives: flags are ORed, never cleared */
     assert(p11_instance_exit_summary(&out) == 0);
@@ -931,6 +935,7 @@ static void check_exit_summary(void)
     assert(!storage_creates);
     /* Present record: copies all eight slot+1 cells, ORs the record flags. */
     reset();
+    current_task = &leader;
     record_present[0] = 1;
     records[0].slot_plus1[0] = 6;
     records[0].slot_plus1[7] = 1024;
@@ -950,18 +955,23 @@ static void check_exit_summary(void)
     memset(&out, 0xa5, sizeof(out));
     out.flags = 0x40;
     assert(p11_instance_exit_summary(&out) == 0);
+    for (int i = 0; i < INST_RECORD_SLOTS; i++)
+        assert(out.slot_plus1[i] == 0);
     assert(out.flags == 0x40);
     reset();
     record_present[0] = 1;
-    current_task = &leader; /* the exiting thread is the leader */
+    current_task = &leader;
     leader.group_leader = 0;
     memset(&out, 0xa5, sizeof(out));
+    out.flags = 0x40;
     assert(p11_instance_exit_summary(&out) == 0);
     for (int i = 0; i < INST_RECORD_SLOTS; i++)
         assert(out.slot_plus1[i] == 0);
+    assert(out.flags == 0x40);
     leader.group_leader = &leader;
     /* A null out pointer refuses without touching storage. */
     reset();
+    current_task = &leader;
     record_present[0] = 1;
     assert(p11_instance_exit_summary(0) == 0);
     assert(!storage_creates);

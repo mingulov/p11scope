@@ -2776,6 +2776,50 @@ mod tests {
         assert!(valid_discovery_record(&empty));
     }
 
+    /// 6.14 Option A remap contract: the BPF exit hook projects each
+    /// set native record bit to the ABI status bit one position
+    /// higher and drops every other bit. The native values are read
+    /// from the C header (no literals on either side of the header
+    /// comparison); the ABI values are pinned by the value test.
+    #[test]
+    fn exit_map_native_to_abi_remap_matches_c_header() {
+        let header = include_str!("../../ebpf/native/instance_epoch.h");
+        let native = |name: &str| -> u64 {
+            let line = header
+                .lines()
+                .find(|line| {
+                    line.strip_prefix("#define ").is_some_and(|rest| {
+                        rest.starts_with(name) && rest[name.len()..].starts_with(' ')
+                    })
+                })
+                .unwrap_or_else(|| panic!("{name} missing from instance_epoch.h"));
+            let shift: u32 = line
+                .split("<<")
+                .nth(1)
+                .expect("native record bit is a left shift")
+                .trim()
+                .trim_end_matches(')')
+                .parse()
+                .expect("numeric shift");
+            1u64 << shift
+        };
+        assert_eq!(native("INST_RECORD_SHARED_MM"), instance::RECORD_SHARED_MM);
+        assert_eq!(native("INST_RECORD_OVERFLOW"), instance::RECORD_OVERFLOW);
+        assert_eq!(native("INST_RECORD_LOCAL_FAULT"), instance::RECORD_LOCAL_FAULT);
+        assert_eq!(
+            u64::from(DISCOVERY_STATUS_EXIT_MAP_SHARED_MM),
+            instance::RECORD_SHARED_MM << 1
+        );
+        assert_eq!(
+            u64::from(DISCOVERY_STATUS_EXIT_MAP_OVERFLOW),
+            instance::RECORD_OVERFLOW << 1
+        );
+        assert_eq!(
+            u64::from(DISCOVERY_STATUS_EXIT_MAP_LOCAL_FAULT),
+            instance::RECORD_LOCAL_FAULT << 1
+        );
+    }
+
     #[test]
     fn exec_exe_identity_abi_pointers_shape() {
         // 6.14 Option B RED: an EXEC may carry the raw exe (s_dev,

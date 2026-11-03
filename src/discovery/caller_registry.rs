@@ -58,6 +58,25 @@ pub(crate) fn now_ns() -> u64 {
     crate::attach::monotonic_ns().unwrap_or(0)
 }
 
+/// Diagnostic-only settlement-latency toggle:
+/// `P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY` set to exactly `1`
+/// records the per-applied-call ENTRY-to-application delay in 1 ms
+/// buckets and prints the cumulative p50/p99/max line beside the
+/// stop line. Anything else, including unset, records nothing;
+/// default paths are behavior-identical.
+pub(crate) const DIAGNOSTIC_SETTLEMENT_LATENCY_ENV: &str = "P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY";
+
+/// Pure predicate over the toggle value: only exactly `1` enables.
+pub(crate) fn diagnostic_settlement_latency_by_env_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+pub(crate) fn diagnostic_settlement_latency_by_env() -> bool {
+    diagnostic_settlement_latency_by_env_value(
+        std::env::var_os(DIAGNOSTIC_SETTLEMENT_LATENCY_ENV).as_deref(),
+    )
+}
+
 /// Stable capture-local caller ID. Minted monotonically per incarnation,
 /// never reused — not after exit, exec, or PID reuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2747,6 +2766,109 @@ enum Mutation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct JointPublicationPending;
 
+/// Diagnostic settlement-latency histogram buckets: 1 ms linear
+/// buckets over [0, 10 s), plus overflow. The 1 ms resolution is the
+/// measurement's stated resolution against the 250 ms budget.
+pub(crate) const SETTLEMENT_LATENCY_BUCKETS: usize = 10_000;
+/// Bucket width in nanoseconds.
+const SETTLEMENT_LATENCY_BUCKET_NS: u64 = 1_000_000;
+
+/// Diagnostic per-call settlement delay: ENTRY timestamp (the
+/// record's `ts_ns` on the ktime/CLOCK_MONOTONIC basis) to registry
+/// application, histogrammed in 1 ms buckets. ENTRY precedes END by
+/// the call's own duration (microseconds for the throughput
+/// providers), so ENTRY-based delays overstate END-based settlement
+/// by that negligible amount; plumbing END would cost a field on
+/// every admitted call for no verdict change at 250 ms. Counts
+/// only, never identities: the histogram cannot name a call.
+/// Allocated only while the diagnostic toggle enables it.
+pub(crate) struct SettlementLatencyHist {
+    buckets: Box<[u64; SETTLEMENT_LATENCY_BUCKETS]>,
+    overflow: u64,
+    unknown_ts: u64,
+    samples: u64,
+    max_ms: u64,
+}
+
+/// Cumulative settlement-latency summary for the stop line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SettlementLatencySummary {
+    pub samples: u64,
+    /// Smallest ms `m` with at least `ceil(q * samples)` samples at
+    /// or below `m`, treating overflow as +infinity; when the rank
+    /// falls in overflow the percentile is `max_ms` (a finite upper
+    /// bound) with `overflow > 0` disclosing it. `None` without samples.
+    pub p50_ms: Option<u64>,
+    pub p99_ms: Option<u64>,
+    pub max_ms: u64,
+    pub overflow: u64,
+    pub unknown_ts: u64,
+}
+
+impl SettlementLatencyHist {
+    pub(crate) fn new() -> Self {
+        Self {
+            buckets: Box::new([0; SETTLEMENT_LATENCY_BUCKETS]),
+            overflow: 0,
+            unknown_ts: 0,
+            samples: 0,
+            max_ms: 0,
+        }
+    }
+
+    /// Record one applied call's ENTRY-to-application delay. A zero
+    /// timestamp (scripted calls, or a failed clock read on either
+    /// side) carries no delay and counts unknown instead.
+    pub(crate) fn record(&mut self, ts_ns: u64, now_ns: u64) {
+        if ts_ns == 0 || now_ns == 0 {
+            self.unknown_ts = self.unknown_ts.saturating_add(1);
+            return;
+        }
+        let ms = now_ns.saturating_sub(ts_ns) / SETTLEMENT_LATENCY_BUCKET_NS;
+        if let Some(bucket) = self.buckets.get_mut(ms as usize) {
+            *bucket = bucket.saturating_add(1);
+        } else {
+            self.overflow = self.overflow.saturating_add(1);
+        }
+        self.samples = self.samples.saturating_add(1);
+        self.max_ms = self.max_ms.max(ms);
+    }
+
+    fn percentile(&self, numerator: u64, denominator: u64) -> Option<u64> {
+        if self.samples == 0 {
+            return None;
+        }
+        // 1-based rank: ceil(q * n), saturating (n > 0 here).
+        let rank = self
+            .samples
+            .saturating_mul(numerator)
+            .saturating_add(denominator - 1)
+            / denominator;
+        let rank = rank.max(1);
+        let mut cumulative = 0u64;
+        for (ms, count) in self.buckets.iter().enumerate() {
+            cumulative = cumulative.saturating_add(*count);
+            if cumulative >= rank {
+                return Some(ms as u64);
+            }
+        }
+        // The rank falls in overflow: max_ms bounds it above, and
+        // the disclosed overflow count says the bound is loose.
+        Some(self.max_ms)
+    }
+
+    pub(crate) fn summary(&self) -> SettlementLatencySummary {
+        SettlementLatencySummary {
+            samples: self.samples,
+            p50_ms: self.percentile(1, 2),
+            p99_ms: self.percentile(99, 100),
+            max_ms: self.max_ms,
+            overflow: self.overflow,
+            unknown_ts: self.unknown_ts,
+        }
+    }
+}
+
 struct AppliedJointPublication {
     identity: RawQuantumIdentity,
     frontier: Option<ConsumptionOrdinal>,
@@ -2862,6 +2984,11 @@ pub(crate) struct CallerRegistry {
     /// (no ledger supplied, or the shared ledger refused): S1
     /// preserved, Joint evidence absent for those calls.
     joint_direct_fallback: u64,
+    /// Diagnostic settlement-latency histogram (`None` unless the
+    /// diagnostic toggle enables it): per-applied-call
+    /// ENTRY-to-application delay. Boxed and absent by default, so
+    /// the default registry pays one branch per applied call.
+    settlement_latency: Option<Box<SettlementLatencyHist>>,
 }
 
 impl CallerRegistry {
@@ -2948,7 +3075,28 @@ impl CallerRegistry {
             joint_accounting: false,
             key_projection: None,
             joint_direct_fallback: 0,
+            settlement_latency: None,
         }
+    }
+
+    /// Enable or disable the diagnostic settlement-latency
+    /// histogram. Enabling allocates the buckets; disabling drops
+    /// them with their samples. Default off.
+    pub(crate) fn set_diagnostic_settlement_latency(&mut self, on: bool) {
+        if on {
+            if self.settlement_latency.is_none() {
+                self.settlement_latency = Some(Box::new(SettlementLatencyHist::new()));
+            }
+        } else {
+            self.settlement_latency = None;
+        }
+    }
+
+    /// The cumulative settlement-latency summary, when enabled.
+    pub(crate) fn settlement_latency_summary(&self) -> Option<SettlementLatencySummary> {
+        self.settlement_latency
+            .as_deref()
+            .map(SettlementLatencyHist::summary)
     }
 
     /// Why edges no producer covered read unknown. The scan lane leaves
@@ -8373,5 +8521,84 @@ pub(crate) mod tests {
             Some("CALLER_EVIDENCE[2] PairInsertFailure rose")
         );
         assert!(reason.text().starts_with("uncounted"), "{}", reason.text());
+    }
+
+    #[test]
+    fn settlement_latency_toggle_takes_exactly_one() {
+        use super::{
+            DIAGNOSTIC_SETTLEMENT_LATENCY_ENV, diagnostic_settlement_latency_by_env_value,
+        };
+        use std::ffi::OsStr;
+        assert_eq!(
+            DIAGNOSTIC_SETTLEMENT_LATENCY_ENV,
+            "P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY"
+        );
+        assert!(diagnostic_settlement_latency_by_env_value(Some(
+            OsStr::new("1")
+        )));
+        for other in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("0")),
+            Some(OsStr::new("true")),
+        ] {
+            assert!(
+                !diagnostic_settlement_latency_by_env_value(other),
+                "only exactly 1 enables: {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settlement_latency_histogram_percentiles_are_exact_to_1ms() {
+        use super::SettlementLatencyHist;
+        let mut hist = SettlementLatencyHist::new();
+        assert_eq!(hist.summary().samples, 0);
+        assert_eq!(hist.summary().p99_ms, None);
+        // 100 samples at 0..100 ms (entry 1_000_000_000, now staggered).
+        for ms in 0..100u64 {
+            hist.record(1_000_000_000, 1_000_000_000 + ms * 1_000_000);
+        }
+        let summary = hist.summary();
+        assert_eq!(summary.samples, 100);
+        // rank ceil(0.5*100)=50 -> bucket 49; rank ceil(0.99*100)=99 -> 98.
+        assert_eq!(summary.p50_ms, Some(49));
+        assert_eq!(summary.p99_ms, Some(98));
+        assert_eq!(summary.max_ms, 99);
+        assert_eq!(summary.overflow, 0);
+        assert_eq!(summary.unknown_ts, 0);
+    }
+
+    #[test]
+    fn settlement_latency_histogram_overflow_unknown_and_max() {
+        use super::SettlementLatencyHist;
+        let mut hist = SettlementLatencyHist::new();
+        hist.record(1_000, 1_000 + 250_000_000); // 250 ms in-bucket.
+        hist.record(1_000, 1_000 + 12_000_000_000); // 12 s overflows.
+        hist.record(0, 2_000); // no timestamp: unknown, not a sample.
+        hist.record(1_000, 0); // failed clock read: unknown, not a sample.
+        let summary = hist.summary();
+        assert_eq!(summary.samples, 2);
+        assert_eq!(summary.overflow, 1);
+        assert_eq!(summary.unknown_ts, 2);
+        assert_eq!(summary.max_ms, 12_000);
+        // Both ranks land on the only in-bucket sample.
+        assert_eq!(summary.p50_ms, Some(250));
+        // rank ceil(0.99*2)=2 falls past the buckets: max bounds it.
+        assert_eq!(summary.p99_ms, Some(12_000));
+    }
+
+    #[test]
+    fn settlement_latency_setter_allocates_and_drops() {
+        use super::RegistryLimits;
+        let mut registry = super::CallerRegistry::new(RegistryLimits::default_limits());
+        assert_eq!(registry.settlement_latency_summary(), None);
+        registry.set_diagnostic_settlement_latency(true);
+        let summary = registry
+            .settlement_latency_summary()
+            .expect("enabled registry reports");
+        assert_eq!(summary.samples, 0);
+        registry.set_diagnostic_settlement_latency(false);
+        assert_eq!(registry.settlement_latency_summary(), None);
     }
 }

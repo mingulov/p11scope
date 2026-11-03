@@ -1566,6 +1566,11 @@ fn run_with_terminal_budget(
     };
     driver.set_completion_source(Box::new(crate::attach::NativeCompletionMinter::new()));
     driver.initialize_joint_lane();
+    // Diagnostic-only settlement latency: one env read per run;
+    // unset (or anything but exactly `1`) records nothing.
+    if crate::discovery::caller_registry::diagnostic_settlement_latency_by_env() {
+        driver.coordinator.set_diagnostic_settlement_latency(true);
+    }
     let clock = LoopClock {
         deadline,
         stop,
@@ -2851,6 +2856,13 @@ fn disclose_semantic_stop(
         counts.bindings,
         counts.refused,
     ));
+    // Diagnostic-only settlement latency rides the same disclosure:
+    // cumulative since enabling, silent unless the toggle enabled it.
+    if let Some(summary) = coordinator.settlement_latency_summary() {
+        warn.emit(&crate::inventory_semantics::settlement_latency_line(
+            &summary,
+        ));
+    }
 }
 
 /// The shared once-gate predicate for winding stop disclosures: a
@@ -22338,6 +22350,42 @@ mod promotion_driver_tests {
             gaps[0].reason.contains("remainder unstaged"),
             "the gap names the unmatched remainder: {}",
             gaps[0].reason
+        );
+    }
+
+    #[test]
+    fn disclose_prints_settlement_line_while_diagnostic_enabled() {
+        // The diagnostic settlement line rides the stop disclosure
+        // only while the toggle enabled recording; the format pins
+        // the 1 ms-bucket cumulative shape the throughput campaign
+        // scrapes. Default silence is pinned by every exact warned
+        // assertion without it.
+        take_warned_for_test();
+        let mut coordinator = coordinator();
+        coordinator.set_diagnostic_settlement_latency(true);
+        let headless = headless_display();
+        let mut display = Some(headless.display);
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        let counts = SemanticStopCounts {
+            refusals: [0; 12],
+            collected: 5,
+            joined: 5,
+            shed: 0,
+            lost: 0,
+            bindings: 1,
+            refused: 0,
+        };
+        disclose_semantic_stop(&counts, &mut coordinator, &mut warn);
+        assert_eq!(
+            take_warned_for_test(),
+            vec![
+                crate::inventory_semantics::semantic_stop_line(5, 5, 0, 0, 1, 0),
+                "p11scope: settlement latency: samples=0 p50=- p99=- \
+                 max=0ms overflow=0 unknown_ts=0 (1ms buckets, entry-based)"
+                    .to_string(),
+            ]
         );
     }
 

@@ -1393,6 +1393,17 @@ attempts; an existing capture failure keeps precedence. Ring eviction and
 filtering alone do not fail capture. A normal stderr/dashboard-log summary
 names the destination, records retained, older records evicted and settlement.
 
+`P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY=1` (exactly `1`; unset records
+nothing) enables a diagnostic-only per-call settlement measurement on
+inventory runs: each applied call's delay from its record ENTRY
+timestamp to registry application is histogrammed in 1 ms buckets to
+10 s, and the cumulative `p11scope: settlement latency:` line (samples,
+p50/p99/max, overflow, unknown timestamps) prints beside the stop line.
+ENTRY precedes END by the call's own microseconds, so the line
+overstates END-based settlement by that negligible amount; percentiles
+are exact to 1 ms. Counts only, never a contract. The throughput
+harness passes it through sudo with `SETTLEMENT_LAT=1`.
+
 ## Offline inventory comparison
 
 `inventory diff` compares saved [inventory v1](schema/inventory-v1.md)

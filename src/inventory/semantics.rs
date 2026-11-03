@@ -1525,6 +1525,30 @@ pub(crate) fn semantic_stop_line(
     )
 }
 
+/// One stderr line for the diagnostic settlement-latency summary:
+/// cumulative samples with p50/p99/max in ms, overflow past the 10 s
+/// buckets, and unknown-timestamp samples. Percentiles print `-`
+/// without samples. Counts only; no identities, paths or payloads.
+/// Diagnostic-only: printed beside the stop line only while the
+/// diagnostic toggle enables recording, never a contract.
+pub(crate) fn settlement_latency_line(
+    summary: &crate::discovery::caller_registry::SettlementLatencySummary,
+) -> String {
+    fn ms(value: Option<u64>) -> String {
+        value.map_or_else(|| "-".to_string(), |ms| format!("{ms}ms"))
+    }
+    format!(
+        "p11scope: settlement latency: samples={} p50={} p99={} max={}ms overflow={} \
+         unknown_ts={} (1ms buckets, entry-based)",
+        summary.samples,
+        ms(summary.p50_ms),
+        ms(summary.p99_ms),
+        summary.max_ms,
+        summary.overflow,
+        summary.unknown_ts,
+    )
+}
+
 /// The live lane: the owned Detailed `Session` (the sole retained EVENTS
 /// cursor, maps and links), its H0 `SemanticCapture` driver, the sealed
 /// attachment receipt, and the terminal ownership state. Counts only;

@@ -2507,6 +2507,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self.registry
     }
 
+    /// Enable or disable the diagnostic settlement-latency
+    /// histogram on the registry. Default off; the run path enables
+    /// it from the diagnostic env toggle.
+    pub(crate) fn set_diagnostic_settlement_latency(&mut self, on: bool) {
+        self.registry.set_diagnostic_settlement_latency(on);
+    }
+
+    /// The cumulative settlement-latency summary, when enabled.
+    pub(crate) fn settlement_latency_summary(
+        &self,
+    ) -> Option<crate::discovery::caller_registry::SettlementLatencySummary> {
+        self.registry.settlement_latency_summary()
+    }
+
     /// Accepted semantic bindings (H3 Task 3): the tick window borrows
     /// from here; tests observe stable custody through it.
     #[cfg(test)]

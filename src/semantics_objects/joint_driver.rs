@@ -907,6 +907,16 @@ impl RawJointQuantum {
         self.resource_refused || self.invocations.len() >= self.invocations.capacity()
     }
 
+    #[cfg(test)]
+    pub(crate) fn resource_refused_for_test(&self) -> bool {
+        self.resource_refused
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invocations_for_test(&self) -> usize {
+        self.invocations.len()
+    }
+
     fn validate_owner(
         &self,
         adapter: &JournalAdapter,

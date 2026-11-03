@@ -1601,6 +1601,10 @@ impl ScriptedRecords {
     pub(crate) fn push_record(&mut self, record: Vec<u8>) {
         self.queue.push_back(Some(record));
     }
+    /// Records still on the scripted wire, not yet taken by a poll.
+    pub(crate) fn pending_records(&self) -> usize {
+        self.queue.len()
+    }
     /// One kernel-discarded reservation: advances the owned cursor without
     /// delivering a record, while retaining the reader's loss accounting.
     pub(crate) fn push_discard(&mut self) {

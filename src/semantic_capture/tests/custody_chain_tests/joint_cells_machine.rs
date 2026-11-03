@@ -3627,6 +3627,52 @@ fn joint_pregrant_begin_table_full_closes_during_extension() {
     );
 }
 
+/// One reservation the ledger already holds (a live key association)
+/// leaves room for 1,023 more. A thousand-START backlog then closes the
+/// quantum at that room: the 1,024th START stays on the wire for the
+/// next quantum instead of being refused for want of a reservation.
+#[test]
+fn joint_pregrant_ledger_room_closes_before_refusing_a_begin() {
+    use crate::semantics_objects::journal::tests::{begin_bytes, function_id};
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .ledger_mut()
+        .mint_keyassoc(0)
+        .expect("one held association");
+    scene.scene.drain.source_mut().bound = 4_096;
+    let pid = std::process::id();
+    push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
+    for thread in 1..=1_024 {
+        let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
+        scene.scene.drain.source_mut().push_record(begin.to_vec());
+    }
+    scene.service(100_000).expect("the backlog collects");
+    assert!(
+        drive_until_closed(&mut scene, 512),
+        "the ledger's room closes the quantum"
+    );
+    let raw = scene
+        .machine
+        .retained_raw_for_test()
+        .expect("a retained raw");
+    assert!(
+        !raw.resource_refused_for_test(),
+        "no START was refused for want of a reservation"
+    );
+    assert_eq!(raw.invocations_for_test(), 1_023, "the quantum took exactly its room");
+    assert_eq!(
+        scene.scene.drain.source_mut().pending_records(),
+        1,
+        "the last START waits on the wire for the next quantum"
+    );
+}
+
 /// A refused record closes an extending quantum: the open START and
 /// the count-only record would hold, but the refusal wins.
 #[test]

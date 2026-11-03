@@ -2827,7 +2827,7 @@ impl ModelState {
     /// public keys only, so the provider never establishes the
     /// private size directly; reusing the mate's established read
     /// adds no new read. Anything else (an unpaired view, a failed
-    /// call, a non-RSA or non-private mate, an unestablished mate
+    /// call, a non-RSA mate, a non-public mate, an unestablished mate
     /// size) stays unlabeled. Every snapshot site (references,
     /// receipts, projections) resolves through here, so admission
     /// and publication cannot disagree.

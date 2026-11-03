@@ -3406,19 +3406,21 @@ impl ClassicDriver<'_> {
     /// Hold a Joint lane for exit after its finish failed (item 7,
     /// §6.4): disclose the lane's stop counts once, abandon where
     /// admitted (best-effort commit, whose failure is kept as its
-    /// own gap; first error kept), then hold the whole lane. The
-    /// disclosure runs before the abandon commit so its gap rides
-    /// that commit. A winding hold threads its winding's disclosed
-    /// flag and joins the shared once-gate (silent past a stop,
-    /// arming when it discloses); a live-lane hold passes `None` and
-    /// always discloses. Each caller names the abandon gap subject:
-    /// exit holds say "for exit"; a mid-run lane-stop conversion
-    /// says "for lane stop", so the gap never claims the run is
-    /// leaving while it continues. Returns the first error (the
-    /// disposition where latched, else the trigger cause) with the
-    /// post-commit lane summary, so callers serve counts the hold
-    /// disclosed instead of a stale pre-hold snapshot. Callers
-    /// disclose the skips (finished or unadmitted holds).
+    /// own gap; first error kept), finish a requested but unlatched
+    /// unfinished lane anyway with its remainder named, then hold
+    /// the whole lane. The disclosure runs before the abandon
+    /// commit so its gap rides that commit. A winding hold threads
+    /// its winding's disclosed flag and joins the shared once-gate
+    /// (silent past a stop, arming when it discloses); a live-lane
+    /// hold passes `None` and always discloses. Each caller names
+    /// the abandon gap subject: exit holds say "for exit"; a
+    /// mid-run lane-stop conversion says "for lane stop", so the gap
+    /// never claims the run is leaving while it continues. Returns
+    /// the first error (the disposition where latched, else the
+    /// trigger cause) with
+    /// the post-commit lane summary, so callers serve counts the
+    /// hold disclosed instead of a stale pre-hold snapshot. Callers
+    /// disclose the skips (finished or unrequested holds).
     fn hold_joint_lane_for_exit(
         mut lane: crate::inventory_semantics::AttestedSemanticLane,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
@@ -3504,6 +3506,23 @@ impl ClassicDriver<'_> {
             if let Err(error) = commit_semantic_finish(coordinator, &mut lane) {
                 coordinator.note_scope_gap(
                     "joint abandon commit failed".to_string(),
+                    format!("{error:#}"),
+                );
+            }
+        }
+        // A requested but unlatched hold (settle bound, second
+        // stop) admits no abandon, but the stop must still finish:
+        // the lane method runs the H0 stop on the unfinished lane
+        // and names the unmatched remainder, so the served summary
+        // never stalls at partial/not_requested/null. Best-effort
+        // commit, whose failure is its own gap, as above.
+        if !lane.is_finished()
+            && let Some(batch) = lane.finish_unfinished_held_lane(coordinator, cause)
+        {
+            coordinator.stage_semantic_batch(batch);
+            if let Err(error) = commit_semantic_finish(coordinator, &mut lane) {
+                coordinator.note_scope_gap(
+                    "joint forced-finish commit failed".to_string(),
                     format!("{error:#}"),
                 );
             }
@@ -22268,6 +22287,57 @@ mod promotion_driver_tests {
             (summary.unrouted_returns, summary.events_lost),
             (0, 9),
             "the served summary counts the loss past the handoff"
+        );
+    }
+
+    #[test]
+    fn escalate_hold_finishes_an_unlatched_lane_with_a_named_gap() {
+        // A requested but not-latched Joint lane held for exit
+        // (settle bound): the request disabled the H0 stop, so the
+        // hold must still finish the lane instead of leaving
+        // live.finished=false behind, and the unmatched remainder
+        // gets its own named gap. Live shape:
+        // partial/not_requested/null becomes
+        // stopped/not_requested/false with the remainder named
+        // (this shell twin keeps Disabled while proving the same
+        // finished flag through final_drain).
+        take_warned_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.mark_collected_finish_requested();
+        assert!(
+            !lane.joint_finish_disposition_required(),
+            "the twin holds a not-latched lane"
+        );
+        driver.semantic = Some(lane);
+        driver.joint_finish = JointFinishDriver::Polling;
+        driver.escalate_joint_finish("joint finish settle bound reached");
+        assert!(driver.semantic.is_none(), "the lane is held for exit");
+        let summary = driver.semantic_summary();
+        assert_eq!(
+            summary.status,
+            crate::inventory_semantics::SemanticCaptureStatus::Disabled,
+            "the shell lane keeps its shape (live lanes report Stopped on the same flag)"
+        );
+        assert_eq!(
+            summary.final_drain,
+            Some(false),
+            "the held lane finished instead of stalling with null"
+        );
+        let gaps: Vec<_> = driver
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "joint finish abandoned for exit")
+            .collect();
+        assert_eq!(gaps.len(), 1, "the remainder is named: {gaps:?}");
+        assert!(
+            gaps[0].reason.contains("remainder unstaged"),
+            "the gap names the unmatched remainder: {}",
+            gaps[0].reason
         );
     }
 

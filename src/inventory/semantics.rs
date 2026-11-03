@@ -2821,6 +2821,70 @@ impl AttestedSemanticLane {
         Ok(batch)
     }
 
+    /// Finish an unlatched held lane whose collected finish was
+    /// requested: the settle bound (or a second stop) can hold a
+    /// finish that never latched a disposition and never completed,
+    /// and the latched abandon above refuses it. The request
+    /// disabled the H0 stop, so nothing else can finish the lane;
+    /// leaving it unfinished stalls the served summary at
+    /// partial/not_requested/null. Run the H0 stop, mark the lane
+    /// finished and exit-retained, and name the unmatched
+    /// remainder. Admitted only for a requested, unfinished,
+    /// non-retained lane: unrequested holds (mid-run conversions,
+    /// scripted in-flight finishes) keep their pinned no-abandon
+    /// shape, the latched abandon stays the only disposition path,
+    /// and an already-finished lane is untouched. Returns the
+    /// terminal batch for the hold to stage and commit.
+    pub(crate) fn finish_unfinished_held_lane(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        cause: &str,
+    ) -> Option<SemanticBatch> {
+        if self.exit_retained || self.is_finished() {
+            return None;
+        }
+        if !self.collected_finish_requested {
+            return None;
+        }
+        let domain = self.domain;
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            let batch = test.finish(domain);
+            self.finish_for_exit();
+            coordinator.note_scope_gap(
+                "joint finish abandoned for exit".to_string(),
+                format!("{cause}; finish incomplete, remainder unstaged"),
+            );
+            return Some(batch);
+        }
+        let batch = match self.live.as_mut() {
+            Some(live) => {
+                let live = &mut **live;
+                let mut io = LiveStopIo {
+                    session: &mut live.session,
+                    capture: &mut live.capture,
+                    pins: Vec::new(),
+                    domain,
+                    stash: None,
+                    collected: &mut live.collected_calls,
+                };
+                io.finish_h0()
+            }
+            // A shell lane has no H0 to stop; still finish it so
+            // the served summary never stalls unfinished.
+            None => {
+                SemanticBatch::from_tick_report(domain, TickReport::default(), Vec::new(), now_ns())
+                    .ok()?
+            }
+        };
+        self.finish_for_exit();
+        coordinator.note_scope_gap(
+            "joint finish abandoned for exit".to_string(),
+            format!("{cause}; finish incomplete, remainder unstaged"),
+        );
+        Some(batch)
+    }
+
     /// Mark the lane finished and exit-retained: nothing else moves.
     #[cfg_attr(not(test), allow(dead_code))] // The joint driver consumes the terminal API.
     fn finish_for_exit(&mut self) {

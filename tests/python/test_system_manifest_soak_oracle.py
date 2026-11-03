@@ -782,10 +782,12 @@ class SoakOracleTest(unittest.TestCase):
                               verdict["gates"]["resource_accounting"]["detail"])
 
     def test_red_resources_post_arming_bpf_leak(self):
-        """A +16 BPF-FD leak fails on a low and a high base.
+        """A +40 BPF-FD leak fails on a low and a high base.
 
         Total FDs stay flat and consistent, so only the BPF gate can
-        fail; the detail must name it.
+        fail; the detail must name it. Sized above the ~2x attach
+        settling tail the margin allows (113 to 122 over ~2 min
+        post-GO on Fedora).
         """
         for name, fds_base, bpf_base in (("low", 100, 4), ("high", 450, 127)):
             with self.subTest(base=name):
@@ -795,7 +797,7 @@ class SoakOracleTest(unittest.TestCase):
                     if n < 20:
                         bpf = bpf_base
                     else:
-                        bpf = bpf_base + (n - 20) * 16 // 170
+                        bpf = bpf_base + (n - 20) * 40 // 170
                     rows.append((n * 1000, 52_000 + (n % 5), 54_000,
                                  fds_base, 260 if name == "high" else 10, bpf))
 

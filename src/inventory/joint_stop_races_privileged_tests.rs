@@ -1359,12 +1359,19 @@ fn run_stop_offset(
         }
     }
     eprintln!("JOINT_STOP {tag}: prep={prep:?} done; stopping in {offset_ms} ms");
+    // The wedge needs Joint births, which need the journal build: only a
+    // session whose loaded object carries both journal roots seals linked.
+    // Default builds stage S1 directly and can never wedge (the full
+    // matrix passes pre-fix on S1), so running on would be a dry pass.
+    // Fail loudly with the branch tag instead.
     if !matches!(joint_branch(&coordinator), JointBranch::Linked) {
         eprintln!("P11SCOPE_CELL_BRANCH={tag}:s1-precluded");
         anyhow::bail!(
-            "{tag}: S1 world (no joint feeds): the wedge path needs a Linked host; not attempted"
+            "{tag}: no joint feeds: the wedge needs a journal-build libtest \
+             (P11SCOPE_JOURNAL=1 P11SCOPE_BIRTH_MARKER=1); not attempted"
         );
     }
+    eprintln!("P11SCOPE_CELL_BRANCH={tag}:linked");
     std::thread::sleep(Duration::from_millis(offset_ms));
     // Stop through the production finish driver; every loop is bounded.
     let mut driver = joint_finish_driver(&mut coordinator, lane);
@@ -1617,9 +1624,10 @@ fn run_stop_offset(
 /// reach Published, then WoundDown; the at-Q tick publishes the stashed
 /// calls; a latched machine names its code in both the abandon gap and
 /// the run error; and a finish that abandons with resolved calls still
-/// in the lane stash counts them or gaps them, never silently. Without
-/// joint feeds the wedge path cannot run, and the cell fails loudly
-/// with the s1-precluded branch tag instead of passing dry.
+/// in the lane stash counts them or gaps them, never silently. Run the
+/// journal flavor (`P11SCOPE_JOURNAL=1 P11SCOPE_BIRTH_MARKER=1`):
+/// default builds seal S1 and fail loudly with the s1-precluded branch
+/// tag instead of passing dry.
 /// `WP7_STOP_PREPS` / `WP7_STOP_OFFSETS` (comma-separated indices,
 /// default all) narrow the matrix for exploration.
 #[test]
@@ -1640,7 +1648,7 @@ fn privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64() -> Re
     )?;
     // Full matrix: three prep shapes times four stop offsets, with
     // the full assert set on every combination; the first failure ends
-    // the cell. The Fedora Linked run narrows this to the wedging prep
+    // the cell. The journal-build run narrows this to the wedging prep
     // once the matrix shows which prep wedges.
     const PREPS: [Prep; 3] = [Prep::Services(1), Prep::ServicesPolls(1, 1), Prep::FullQ2];
     const OFFSETS_MS: [u64; 4] = [0, 1, 5, 20];

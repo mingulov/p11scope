@@ -24,9 +24,9 @@
 #     recorded expected-failure. Set 0 once the fix lands; an unexpected
 #     pass, or a failure without the wedge signature, fails the run. A
 #     failure carrying the S1-preclusion tag is recorded
-#     environment-precluded instead: the wedge path needs a Linked host,
-#     so an S1-only host cannot evaluate the cell either way. This holds
-#     whatever JOINT_EXPECTED_FAILURE says.
+#     environment-precluded instead: the wedge needs a journal-build
+#     libtest, so a default-build run cannot evaluate the cell either
+#     way. This holds whatever JOINT_EXPECTED_FAILURE says.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 64
 ROOT=$(cd "$HERE/../.." && pwd) || exit 64

@@ -531,6 +531,17 @@ Detailed object contains the exec writer, but it stops at the gated read and wri
 
 New transient kernel read: the current group leader's `self_exec_id`, at exec only. It adds to the Stage A
 list (`group_leader`, `flags`, `mm`).
+Under `--pid` the same exec writer also reads the group leader's `start_boottime` (its thread-group
+start time), after the generation and control gates and before any write, and compares it in kernel,
+in USER_HZ ticks, with the target's start tick. Userspace reads that tick from the target's
+`/proc/PID/stat` field 22 at scope publication (it must match the retained process pin when the
+Session holds one) and publishes it into `PID_START_TICK`,
+a read-only map of the PID-scope tgid and the tick (at most 1,024 entries, frozen before any link) beside
+`PID_FILTER`, in both the Detailed marker object and the journal object. A missing entry, an
+unreadable task or a different tick refuses the write: no record, no admission, no latch and no
+`self_exec_id` read. Cgroup and system scopes skip the comparison. The start time is never stored in
+the record, emitted or published; a reader whose time namespace offsets boottime refuses the PID-scope
+session instead of publishing a tick the kernel cannot match.
 
 Scope note: under `--cgroup`, a process outside the selected scope that calls a watched function gets a
 record holding DIRTY (a record the gap creates holds only DIRTY and zero fields; a record Stage A created
@@ -541,11 +552,9 @@ reaches BPF (the kernel filter compares only the mm), so the scope check refuses
 row DIRTY, spending one admission; under the multi backend the kernel skips the call before BPF runs, so
 the row stays unmarked. Neither path is yet verified live. (The CLONE_VM fork hook
 already creates a shared-mm `PROC_EPOCH` row for such a child regardless of scope.)
-One more exception until the PID-scope start-time check reaches the journal object: `--pid` admits the
-exec hook by PID number, so under `--key-operations`, if the target exits and a different process later
-gets the same PID number and execs after closure, that process gets a READY record (its `self_exec_id`,
-the attach generation, one admission). Its watched calls never reach BPF (the uprobe filter holds the
-original task), so it is never born.
+`--pid` admits the exec hook by PID number, but the start-time comparison above means a different
+process that later gets the same PID number and execs after closure gets no record and spends no
+admission, under `--key-operations` too.
 Stage A already keeps unscoped `PROC_EPOCH` records for processes that map a watched
 provider file (see above), so this is not new in kind. It is never emitted, and it dies with the task.
 

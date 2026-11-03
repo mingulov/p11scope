@@ -956,6 +956,13 @@ pub(crate) struct K0Window {
     limits: CounterLimits,
 }
 
+impl K0Window {
+    /// Selection-time comparable losses, for the K0 debug line (T-2).
+    pub(crate) fn before_losses(&self) -> [u64; 4] {
+        self.before_losses
+    }
+}
+
 /// Map a failed K0 read to its ledger word: quarantine and pool
 /// pressure name themselves, a missing binding names the broad, and
 /// every other stage maps to the topology catch-all (the existing

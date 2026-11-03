@@ -26,7 +26,7 @@
 //! `--hold` keeps the watched pid alive through close, so the window
 //! closes on the observer's duration rather than on an exit.
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -744,6 +744,8 @@ fn spawn_run_observer(
     command
         .args(child_tail)
         .env("SOFTHSM2_CONF", conf)
+        // T-2: the K0 debug line carries comparable/exit-only counts.
+        .env("P11SCOPE_K0_DEBUG", "1")
         .stdin(Stdio::null())
         .stdout(log_file.try_clone()?)
         .stderr(log_file)
@@ -777,10 +779,9 @@ enum OwnedChild {
     /// after the gate for that long before its calls, so the
     /// observer's discovery frames process the child's provider-load
     /// records while the child still runs. Without the delay the
-    /// exit still voids intermittently: loader hits processed after
-    /// the view retires reject as real truncation (only the
-    /// exit-ended scan count renders), so the immediate shape cannot
-    /// pin a render.
+    /// exit still voids intermittently: unbound late loader records
+    /// reject as real truncation (only exit-explained counts
+    /// render), so the immediate shape cannot pin a render.
     ExitsAfter { delay_ms: u32 },
     /// No gate at all (`--gate -`): the short-program shape. The child
     /// runs at release, signs four times and exits on its own,
@@ -1012,8 +1013,69 @@ fn k0_live_run_gateless_exit_matches_main_counts_lp64() -> Result<()> {
         OwnedChild::Gateless,
         pause.as_deref(),
     )
-    .and_then(|document| require_detail_matches_main_counts(&document));
+    .and_then(|document| {
+        let log = std::fs::read_to_string(workload.path("k0g.observer.log"))
+            .context("reading the gateless observer log")?;
+        require_detail_matches_main_counts(&document, &log)
+    });
     keep_workload_on_failure(workload, outcome, "K0G")
+}
+
+/// One parsed `k0-debug` line (T-2): selection-time comparable losses
+/// plus close-time truncation, exit-only and comparable losses.
+struct K0DebugCounts {
+    before_comparable: [u64; 4],
+    after_truncated: u64,
+    after_exit: u64,
+    after_comparable: [u64; 4],
+}
+
+/// Parses the observer's `k0-debug` line from its log. Required: the
+/// cell fails closed when the line is missing or malformed.
+fn parse_k0_debug_counts(log: &str) -> Result<K0DebugCounts> {
+    let line = log
+        .lines()
+        .find(|line| line.starts_with("k0-debug:"))
+        .context("the observer logged its k0-debug line")?;
+    let rest = line.strip_prefix("k0-debug:").unwrap().trim();
+    let mut before_comparable = None;
+    let mut after_truncated = None;
+    let mut after_exit = None;
+    let mut after_comparable = None;
+    for part in rest.split_whitespace() {
+        let (key, value) = part.split_once('=').context("k0-debug part")?;
+        match key {
+            "before_comparable" => before_comparable = Some(parse_loss_array(value)?),
+            "after_truncated" => after_truncated = Some(value.parse::<u64>()?),
+            "after_exit" => after_exit = Some(value.parse::<u64>()?),
+            "after_comparable" => after_comparable = Some(parse_loss_array(value)?),
+            _ => bail!("unknown k0-debug key {key:?}"),
+        }
+    }
+    Ok(K0DebugCounts {
+        before_comparable: before_comparable.context("k0-debug before_comparable")?,
+        after_truncated: after_truncated.context("k0-debug after_truncated")?,
+        after_exit: after_exit.context("k0-debug after_exit")?,
+        after_comparable: after_comparable.context("k0-debug after_comparable")?,
+    })
+}
+
+fn parse_loss_array(text: &str) -> Result<[u64; 4]> {
+    let inner = text
+        .strip_prefix('[')
+        .and_then(|text| text.strip_suffix(']'))
+        .context("loss array brackets")?;
+    let mut parts = inner.split(',');
+    let mut out = [0u64; 4];
+    for slot in &mut out {
+        *slot = parts
+            .next()
+            .context("loss array arity")?
+            .trim()
+            .parse::<u64>()?;
+    }
+    ensure!(parts.next().is_none(), "loss array arity");
+    Ok(out)
 }
 
 /// The gate-less short-run shape: the selection names C_Sign, and the
@@ -1025,21 +1087,30 @@ fn k0_live_run_gateless_exit_matches_main_counts_lp64() -> Result<()> {
 /// exec cell). The ledger count (four clean signs, already ensured by
 /// the driver) and the aggregate count (also four: the uprobes attach
 /// before the child is released) keep the render comparison
-/// non-vacuous.
-fn require_detail_matches_main_counts(document: &serde_json::Value) -> Result<()> {
+/// non-vacuous. T-2 prints truncation plus comparable/exit-only
+/// counts on both paths and gates renders on comparable losses
+/// standing still, so a regression of the exit-only split fails.
+fn require_detail_matches_main_counts(document: &serde_json::Value, log: &str) -> Result<()> {
     let selected = &document["evidence"]["selected_detail"];
     let record = &selected["selection"];
     ensure!(
         record["endpoint"] == serde_json::json!("C_Sign"),
         "selection names C_Sign: {record}"
     );
+    let debug = parse_k0_debug_counts(log)?;
     if record.get("refusal").is_some() {
         let reason = record["refusal"].as_str().context("void reason")?;
         let truncated = document["evidence"]["discovery_truncated"]
             .as_u64()
             .context("the report carries its truncation count")?;
+        ensure!(
+            debug.after_truncated == truncated,
+            "debug and report truncation agree: {} vs {truncated}",
+            debug.after_truncated,
+        );
         eprintln!(
-            "k0-live-gateless-cell: void reason = {reason} (discovery_truncated={truncated})"
+            "k0-live-gateless-cell: void reason = {reason} (discovery_truncated={truncated} exit={} comparable={:?}->{:?})",
+            debug.after_exit, debug.before_comparable, debug.after_comparable,
         );
         ensure!(
             reason == "broad_stopping" && truncated >= 1,
@@ -1074,8 +1145,17 @@ fn require_detail_matches_main_counts(document: &serde_json::Value) -> Result<()
         .context("main report carries C_Sign")?;
     let main_calls = row["calls"].as_u64().context("main C_Sign calls")?;
     let main_errors = row["errors"].as_u64().context("main C_Sign errors")?;
+    let truncated = document["evidence"]["discovery_truncated"]
+        .as_u64()
+        .context("the report carries its truncation count")?;
+    ensure!(
+        debug.after_truncated == truncated,
+        "debug and report truncation agree: {} vs {truncated}",
+        debug.after_truncated,
+    );
     eprintln!(
-        "k0-live-gateless-cell: main={main_calls}/{main_errors} detail={entered}/{returned}/{errors}"
+        "k0-live-gateless-cell: main={main_calls}/{main_errors} detail={entered}/{returned}/{errors} (discovery_truncated={truncated} exit={} comparable={:?}->{:?})",
+        debug.after_exit, debug.before_comparable, debug.after_comparable,
     );
     ensure!(
         main_calls == 4 && main_errors == 0,
@@ -1084,6 +1164,12 @@ fn require_detail_matches_main_counts(document: &serde_json::Value) -> Result<()
     ensure!(
         entered == main_calls && returned == main_calls && errors == 0,
         "detail equals the main report: detail={entered}/{returned}/{errors} main={main_calls}"
+    );
+    ensure!(
+        debug.after_comparable == debug.before_comparable,
+        "a render grows no comparable loss: {:?} -> {:?}",
+        debug.before_comparable,
+        debug.after_comparable,
     );
     Ok(())
 }

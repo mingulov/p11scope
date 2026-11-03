@@ -3840,7 +3840,7 @@ mod tests {
     /// spending the causal deadline waiting for delivery.
     #[test]
     fn a_task_outside_r_s_d_t_fails_without_waiting_for_delivery() {
-        for state in [b'Z', b'X', b't'] {
+        for state in *b"ZXt" {
             let mut io = successful_io(vec![record(10, 0, false)]);
             let tasks: BTreeMap<u32, u8> = [(41, state), (42, b'T')].into_iter().collect();
             io.states = VecDeque::from([Ok(tasks)]);

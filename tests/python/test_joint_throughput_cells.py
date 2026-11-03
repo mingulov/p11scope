@@ -546,6 +546,18 @@ class BpfEvidenceSum(unittest.TestCase):
                          [{"id": 21, "ring_loss_sum": 0, "cpus": 0}])
         self.assertEqual(summary["total_ring_loss_sum"], 0)
 
+    def test_scalar_zero_key_counts(self):
+        show = json.dumps([{"id": 31, "name": "EVIDENCE", "max_entries": 9}])
+        dumps = {31: json.dumps([
+            {"key": 0, "values": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]},
+        ])}
+        proc = self._run_helper(show, dumps)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertEqual(summary["maps"],
+                         [{"id": 31, "ring_loss_sum": 0, "cpus": 12}])
+        self.assertEqual(summary["total_ring_loss_sum"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

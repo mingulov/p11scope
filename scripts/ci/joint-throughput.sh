@@ -344,6 +344,11 @@ capture_bpf_evidence() {
     else
         log "$dir: bpf-evidence-sum failed: $(cat "$tmp/helper.err")"
     fi
+    mkdir -p "$dir/bpftool-evidence-raw" 2>/dev/null
+    cp "$tmp/show.json" "$dir/bpftool-evidence-raw/show.json" 2>/dev/null
+    for raw in "$tmp"/dump-*.json; do
+        [ -f "$raw" ] && cp "$raw" "$dir/bpftool-evidence-raw/" 2>/dev/null
+    done
     rm -rf "$tmp"
     return 0
 }

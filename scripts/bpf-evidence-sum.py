@@ -38,6 +38,8 @@ def _evidence_ids(show):
 
 
 def _is_zero_key(key):
+    if key == 0:
+        return True
     return isinstance(key, list) and len(key) > 0 and all(v == 0 for v in key)
 
 

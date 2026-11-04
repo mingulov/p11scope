@@ -9100,19 +9100,23 @@ pub(crate) mod tests {
         ghost.verdict();
         let reasons = verdict_reasons(&ghost);
         assert!(
-            reasons.contains("BPF delivery failure") && reasons.contains("no EXEC acknowledgment"),
+            reasons.contains("BPF delivery failure")
+                && reasons.contains("no EXEC acknowledgment")
+                && reasons.contains("suspected"),
             "ghost names the delivery failure, got: {reasons:?}",
         );
     }
 
-    /// Zero hits with two bound contexts means the EXEC was acknowledged
-    /// (the live context exists) but the loader uprobe itself never fired:
-    /// a loader-specific miss, not a silent run. The report names that.
+    /// Zero hits with two bound contexts means the EXEC was processed (a
+    /// second live context exists via acknowledgment or immediate re-arm)
+    /// but the loader uprobe itself never fired: a loader-specific miss,
+    /// not a silent run. The report names that.
     #[test]
-    fn a_never_fired_acked_loader_names_uprobe_miss() {
+    fn a_never_fired_processed_loader_names_uprobe_miss() {
         let mut miss = evidence();
         miss.loader_discovery.strategies.debug_state_every_hit = 2;
         miss.loader_discovery.hits = 0;
+        miss.loader_discovery.dlopen_timing.unproven = 1;
         miss.loader_discovery.initial_set_timing.unproven = 1;
         miss.loader_discovery.initial_set_capture.none = 1;
         miss.pause_partial = 1;
@@ -9127,8 +9131,42 @@ pub(crate) mod tests {
         );
         let reasons = verdict_reasons(&miss);
         assert!(
-            reasons.contains("uprobe miss") && reasons.contains("EXEC acknowledg"),
-            "acked 0-hit loader names the uprobe miss, got: {reasons:?}",
+            reasons.contains("uprobe miss")
+                && reasons.contains("EXEC processing")
+                && reasons.contains("suspected"),
+            "processed 0-hit loader names the uprobe miss, got: {reasons:?}",
+        );
+    }
+
+    /// A loader that fired keeps the generic unproven-timing text: the
+    /// delivery-failure and uprobe-miss arms are 0-hit only.
+    #[test]
+    fn a_fired_loader_keeps_generic_unproven_timing_text() {
+        let mut fired = evidence();
+        fired.loader_discovery.strategies.debug_state_every_hit = 2;
+        fired.loader_discovery.hits = 2;
+        fired.loader_discovery.dlopen_timing.unproven = 1;
+        fired.loader_discovery.initial_set_timing.unproven = 1;
+        fired.loader_discovery.initial_set_capture.none = 1;
+        fired.pause_partial = 1;
+        fired.verdict();
+        assert!(
+            fired
+                .gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "{:?}",
+            fired.gap_classes(true)
+        );
+        let reasons = verdict_reasons(&fired);
+        assert!(
+            reasons.contains("live loader timing unproven"),
+            "fired loader keeps generic text, got: {reasons:?}",
+        );
+        assert!(
+            !reasons.contains("BPF delivery failure") && !reasons.contains("uprobe miss"),
+            "fired loader names no 0-hit cause, got: {reasons:?}",
         );
     }
 

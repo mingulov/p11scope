@@ -10883,7 +10883,7 @@ fn a_capture_refresh_ends_on_a_proven_exit_instead_of_failing() {
 /// Real child, /proc reads, offline table acquisition, inventory reconciliation,
 /// and publication. Only the BPF/link adapter is substituted. The child cannot
 /// load or exit until the test acknowledges the preceding engine operation.
-pub(super) struct DiscoveryLifecycleFixture {
+pub(crate) struct DiscoveryLifecycleFixture {
     _dir: tempfile::TempDir,
     provider: PathBuf,
     manifest: PathBuf,

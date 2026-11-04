@@ -408,10 +408,17 @@ from start to release, then the pause gate's frozen first hold (continuous,
 both bounds clocked, every member stamped, every first-stamp at or before
 the release) — and the window stays in every other capture, including any
 declared stamp dated after the release (the child may run its command
-before the first *verified* pause stop). The empty list asserts only the
-pre-attach span;
-a later loss still discloses on `watch` (`ended_by: health_loss`) without
-reopening it.
+before the first *verified* pause stop). The
+ordering-evidence proof ships for `profile` and `trace` (`--pid`, `--cgroup`,
+`--system`; detailed and `--mode metrics` policies): `[]` appears on a
+pre-armed module exactly when the mapping-instant witness finalized `Clear`
+for the object's slot with its hooks active strictly before the scope start,
+the witness fd matching the pin's held fd, and the finalize walk starting
+after the declared set's attach instant. `run` carries no ordering-evidence
+proof (the witness is inert there; owned holds keep the pause-gate proof),
+nor does inventory; the window stays wherever any condition refuses. The
+empty list asserts only the pre-attach span; a later loss still discloses on
+`watch` (`ended_by: health_loss`) without reopening it.
 
 ## Residual additions: terminal verdict, override, handoff, environment, PID namespace
 

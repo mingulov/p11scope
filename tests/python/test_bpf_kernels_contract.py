@@ -242,6 +242,7 @@ class BpfKernelsContractTests(unittest.TestCase):
         driver = (ROOT / "scripts/check-bpf-load-kernels.sh").read_text()
         self.assertIn("inventory --system --capture native --attach-backend multi", driver)
         self.assertIn("--attach-backend multi --counter-mode $MODE", driver)
+        self.assertIn("--prearm-module /bin/true --attach-backend multi", driver)
         self.assertNotIn("v5.15.*|v6.1.*)", driver)
 
 

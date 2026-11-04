@@ -29571,18 +29571,22 @@ impl Engine {
         proofs
     }
 
-    /// Condition 4: the witness fd's `(st_dev, st_ino)` equals one of the
-    /// object's pinned raw keys.
+    /// Condition 4: the witness fd's `(st_dev, st_ino)` equals the pin's
+    /// own held fd identity. Same-domain by construction: raw keys are
+    /// maps-visible identities, which live in a different device domain
+    /// than fd stats on split filesystems (btrfs: fd `0:37` vs maps
+    /// `00:23` for the same file), so comparing the witness fd against
+    /// raw keys would refuse every proof there.
     fn witness_pin_matches(
         fd_dev: u64,
         fd_ino: u64,
         object: PinnedObjectId,
         pins: &PinnedObjects,
     ) -> bool {
-        pins.raw_keys_for(object).iter().any(|key| {
-            u64::from(libc::major(fd_dev as libc::dev_t)) == key.device.major
-                && u64::from(libc::minor(fd_dev as libc::dev_t)) == key.device.minor
-                && fd_ino == key.inode
+        use std::os::unix::fs::MetadataExt as _;
+        pins.file_for(object).is_some_and(|file| {
+            file.metadata()
+                .is_ok_and(|meta| meta.dev() == fd_dev && meta.ino() == fd_ino)
         })
     }
 

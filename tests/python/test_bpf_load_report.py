@@ -55,6 +55,13 @@ EXCLUSIVE_VARIANT_GROUPS = [
 ] + [
     frozenset({f"{prefix}/p11_inst_vma_copy", f"{prefix}/p11_inst_vma_retcopy"})
     for prefix in ("detailed", "detailed-gate1", "journal-gate1")
+] + [
+    # The witness departure family (src/attach/prearm_witness.rs):
+    # Linux 6.6-7.2 loads the exit/exec pair, 7.3+ the single rename,
+    # exclusive by construction. Two overlapping pairs sharing the
+    # single, so each pair keeps the one-member-per-kernel shape.
+    frozenset({"prearm-witness/p11_pw_depart_exit", "prearm-witness/p11_pw_depart"}),
+    frozenset({"prearm-witness/p11_pw_depart_exec", "prearm-witness/p11_pw_depart"}),
 ]
 # Counter objects load only where the verifier accepts them (6.6+); the
 # old kernels keep the specified refusal, so the counter file pins its
@@ -558,8 +565,8 @@ class ReportTests(unittest.TestCase):
         # The match lives in the shared file, never copied per driver.
         self.assertIn('. "$SCRIPT_DIR/bpf-guest-release.sh"', text)
         self.assertNotIn("release_ok() {", text)
-        # The doctor, inventory and counter guests all use it.
-        self.assertEqual(text.count('if release_ok "$KERNEL" '), 3)
+        # The doctor, inventory, counter and witness guests all use it.
+        self.assertEqual(text.count('if release_ok "$KERNEL" '), 4)
         cases = [
             ("v6.1.188", "6.1.188", True),
             ("v6.1.188", "6.1.188-0601188-generic", True),
@@ -607,6 +614,17 @@ class ReportTests(unittest.TestCase):
                         "scripts/check-bpf-load-kernels.sh is missing")
         text = DRIVER.read_text(encoding="ascii")
         self.assertIn('--budgets "$BUDGETS" --object inventory', text)
+
+    def test_driver_scores_witness_side_against_budgets(self):
+        # The prearm-witness budget cells exist (pinned by the
+        # budgets-shape test above); the driver must pass them on the
+        # witness side so a witness regression fails the gate. Real
+        # guest runs prove the scoring; this pins the wiring against
+        # revert.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertIn('--budgets "$BUDGETS" --object prearm-witness', text)
 
     def bpf_loop_probe_row(self, errno):
         # The controller-allowlisted functional probe shape: `call 181;
@@ -1228,6 +1246,138 @@ class ReportTests(unittest.TestCase):
         self.assertIn("detailed-gate1/interface_entry", result.stdout)
         self.assertIn("5606", result.stdout)
 
+    def mixed_witness_loads(self):
+        # A profile --system --prearm-module probe file: the witness
+        # BTF group (old-kernel departure pair) plus the Detailed
+        # group the profile run loads beside it.
+        return [
+            load_row("p11_pw_unmap", processed=3997, btf_id=61),
+            load_row("p11_pw_depart_exit", processed=4028, btf_id=61),
+            load_row("p11_pw_depart_exec", processed=4028, btf_id=61),
+            load_row("p11_pw_torn", processed=92, btf_id=61),
+            load_row("p11_pw_migrate", processed=3552, btf_id=61),
+            load_row("p11_pw_walk", processed=3964, btf_id=61),
+            load_row("interface_entry", processed=83350, btf_id=62),
+            load_row("p11_image_query", processed=512, btf_id=62),
+        ]
+
+    def mixed_witness_budgets(self):
+        return self.write_budgets({
+            "prearm-witness/p11_pw_unmap": {KERNEL: 5000},
+            "prearm-witness/p11_pw_depart_exit": {KERNEL: 5000},
+            "prearm-witness/p11_pw_depart_exec": {KERNEL: 5000},
+            "prearm-witness/p11_pw_torn": {KERNEL: 500},
+            "prearm-witness/p11_pw_migrate": {KERNEL: 5000},
+            "prearm-witness/p11_pw_walk": {KERNEL: 5000},
+            "detailed/interface_entry": {KERNEL: 90000},
+            "detailed/p11_image_query": {KERNEL: 600},
+        })
+
+    def test_mixed_witness_detailed_file_scores_witness_only(self):
+        loads = self.mixed_witness_loads()
+        budgets = self.mixed_witness_budgets()
+        result = self.run_report(self.write_loads("witness.jsonl", loads),
+                                 budgets=budgets, object_name="prearm-witness")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("prearm-witness/p11_pw_walk", result.stdout)
+        self.assertIn("3964", result.stdout)
+        self.assertNotIn("83350", result.stdout)
+        self.assertNotIn("interface_entry", result.stdout)
+        # The other direction separates too: Detailed keeps its own
+        # counts and never sees the witness roots.
+        result = self.run_report(self.write_loads("witness.jsonl", loads),
+                                 budgets=budgets, object_name="detailed")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("detailed/interface_entry", result.stdout)
+        self.assertIn("83350", result.stdout)
+        self.assertNotIn("3964", result.stdout)
+        self.assertNotIn("p11_pw_", result.stdout)
+
+    def test_witness_missing_root_fails(self):
+        loads = [load for load in self.mixed_witness_loads()
+                 if load["root"] != "p11_pw_walk"]
+        budgets = self.mixed_witness_budgets()
+        result = self.run_report(self.write_loads("witness.jsonl", loads),
+                                 budgets=budgets, object_name="prearm-witness")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("prearm-witness/p11_pw_walk", result.stdout)
+        self.assertIn("missing from probe rows", result.stdout)
+        # The group itself is recognized: only the dropped root is
+        # missing, never the whole witness object as foreign.
+        self.assertNotIn("matches no object", result.stdout)
+        self.assertIn("prearm-witness/p11_pw_unmap", result.stdout)
+
+    def test_witness_root_over_budget_fails_with_both_numbers(self):
+        loads = [load_row("p11_pw_walk", processed=3964, btf_id=61),
+                 load_row("p11_pw_unmap", processed=3997, btf_id=61)]
+        budgets = self.write_budgets({
+            "prearm-witness/p11_pw_walk": {KERNEL: 5000},
+            "prearm-witness/p11_pw_unmap": {KERNEL: 3000}})
+        result = self.run_report(self.write_loads("witness.jsonl", loads),
+                                 budgets=budgets, object_name="prearm-witness")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("prearm-witness/p11_pw_unmap", result.stdout)
+        self.assertIn("3997", result.stdout)
+        self.assertIn("3000", result.stdout)
+
+    def test_witness_group_with_detailed_root_is_ambiguous(self):
+        # A BTF group holding both a witness root and a
+        # Detailed-only root matches two objects: it FAILs naming
+        # its BTF id, whichever object is scored.
+        loads = [
+            load_row("p11_pw_walk", processed=3964, btf_id=61),
+            load_row("p11_image_query", processed=512, btf_id=61),
+        ]
+        budgets = self.write_budgets({
+            "prearm-witness/p11_pw_walk": {KERNEL: 5000},
+        })
+        result = self.run_report(self.write_loads("mixed.jsonl", loads),
+                                 budgets=budgets, object_name="prearm-witness")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("btf-61-ambiguous", result.stdout)
+        self.assertIn("matches two objects", result.stdout)
+
+    def test_witness_depart_pair_loads_without_variant_conflict(self):
+        # Old kernels load the exit/exec pair and no single: the two
+        # overlapping pairs each see exactly one member, so no
+        # both-variants failure fires.
+        loads = self.mixed_witness_loads()
+        budgets = self.mixed_witness_budgets()
+        result = self.run_report(self.write_loads("witness.jsonl", loads),
+                                 budgets=budgets, object_name="prearm-witness")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+
+    def test_witness_depart_triple_loads_fail_both_variants(self):
+        # The loader names one departure family per kernel
+        # (exclusive by construction); a probe row set carrying the
+        # pair plus the single is refused as an impossible load set.
+        loads = self.mixed_witness_loads() + [
+            load_row("p11_pw_depart", processed=4028, btf_id=61)]
+        budgets = self.write_budgets({
+            **{f"prearm-witness/{load['root']}": {KERNEL: 5000}
+               for load in loads if load["root"].startswith("p11_pw_")},
+        })
+        result = self.run_report(self.write_loads("witness.jsonl", loads),
+                                 budgets=budgets, object_name="prearm-witness")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("both variants loaded", result.stdout)
+
+    def test_witness_variant_members_are_witness_unique_roots(self):
+        # Every witness root must assign its BTF group to the witness
+        # object; an unknown root fails the whole gate on that kernel.
+        text = SCRIPT.read_text(encoding="ascii")
+        block = text[text.index("WITNESS_UNIQUE_ROOTS"):
+                     text.index("KNOWN_ROOTS")]
+        for member in ["p11_pw_unmap", "p11_pw_depart_exit",
+                       "p11_pw_depart_exec", "p11_pw_depart",
+                       "p11_pw_torn", "p11_pw_migrate", "p11_pw_walk"]:
+            self.assertIn(f'"{member}"', block)
+
 
 # The FNV-1a 64 of `call 181; exit` (BPF_LOOP_PROBE_INSNS), cross-checked
 # against src/attach.rs by the fingerprint test above.
@@ -1252,11 +1402,21 @@ class DriverHarnessTests(unittest.TestCase):
         config.write_text("owned test config\n")
         rows = {"doctor": [load_row("p11_image_query", processed=100)],
                 "inventory": [load_row("p11_usage_entry_lp64", processed=100)],
-                "profile": [load_row("p11_counter_bank_entry", processed=100)]}
+                "profile": [load_row("p11_counter_bank_entry", processed=100)],
+                "witness": [load_row("p11_pw_unmap", processed=3997),
+                            load_row("p11_pw_depart_exit", processed=4028),
+                            load_row("p11_pw_depart_exec", processed=4028),
+                            load_row("p11_pw_torn", processed=92),
+                            load_row("p11_pw_migrate", processed=3552),
+                            load_row("p11_pw_walk", processed=3964)]}
         (self.work / "rows.json").write_text(json.dumps(rows))
         budgets = {"limit": 1000000, "min_headroom_percent": 5,
                    "programs": {name: {"v7.0.14": 1000} for name in
                                 ("detailed/p11_image_query", "inventory/p11_usage_entry_lp64")}}
+        budgets["programs"].update(
+            {f"prearm-witness/{root}": {"v7.0.14": 10000} for root in
+             ("p11_pw_unmap", "p11_pw_depart_exit", "p11_pw_depart_exec",
+              "p11_pw_torn", "p11_pw_migrate", "p11_pw_walk")})
         self.budgets = self.work / "budgets.json"
         self.budgets.write_text(json.dumps(budgets))
         budgets["programs"] = {"counter-" + mode + "/p11_counter_bank_entry": {"v7.0.14": 1000}
@@ -1294,7 +1454,8 @@ if name=='observer':
     work=pathlib.Path(os.environ.get('TMPDIR','/tmp'))
     if not work.is_relative_to(root) or work==root or not work.is_dir():
         print('unsafe inherited TMPDIR',file=sys.stderr);sys.exit(8)
-    rows=json.loads((root/'rows.json').read_text())[args[0]]
+    key='witness' if '--prearm-module' in args else args[0]
+    rows=json.loads((root/'rows.json').read_text())[key]
     if os.environ.get('FAKE_OBSERVER_REFUSAL') and args[0]=='inventory':
         rows[0].update(loaded=False,errno=13,returned_fd=-1,program_id=0,returned_program_type=0)
     for row in rows: os.write(9,(json.dumps(row)+'\n').encode())
@@ -1326,17 +1487,18 @@ raise SystemExit('unknown owned tool '+name)
         events = [json.loads(line) for line in self.events.read_text().splitlines()] if self.events.exists() else []
         return result, events
 
-    def test_driver_runs_five_disk_scoped_guests_and_cleans_each(self):
+    def test_driver_runs_six_disk_scoped_guests_and_cleans_each(self):
         result, events = self.run_driver()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         observers = [row["args"] for row in events if row["tool"] == "observer"]
-        self.assertEqual([args[0] for args in observers], ["doctor", "inventory", "profile", "profile", "profile"])
-        self.assertEqual([args[args.index("--counter-mode")+1] for args in observers[2:]], list(_COUNTER_MODES))
+        self.assertEqual([args[0] for args in observers], ["doctor", "inventory", "profile", "profile", "profile", "profile"])
+        self.assertEqual([args[args.index("--counter-mode")+1] for args in observers[2:5]], list(_COUNTER_MODES))
+        self.assertIn("--prearm-module", observers[5])
         guests = [row for row in events if row["tool"] == "vng"]
-        self.assertEqual(len(guests), 5)
+        self.assertEqual(len(guests), 6)
         self.assertTrue(all(len(row["args"][row["args"].index("--exec")+1]) <= 950 for row in guests))
-        self.assertEqual(sum(row["tool"] == "umount" for row in events), 5)
-        self.assertEqual(sum(row["tool"] == "losetup" and "-d" in row["args"] for row in events), 5)
+        self.assertEqual(sum(row["tool"] == "umount" for row in events), 6)
+        self.assertEqual(sum(row["tool"] == "losetup" and "-d" in row["args"] for row in events), 6)
         self.assertFalse(list(self.work.glob("guest-work-*")))
         self.assertIn("# OVERALL: PASS", result.stdout)
 
@@ -1357,14 +1519,14 @@ raise SystemExit('unknown owned tool '+name)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertFalse(any(row["tool"] == "observer" for row in events))
 
-    def test_refused_inventory_still_scores_and_cleans_all_five_guests(self):
+    def test_refused_inventory_still_scores_and_cleans_all_six_guests(self):
         result, events = self.run_driver(extra={"FAKE_OBSERVER_REFUSAL": "1"})
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("inventory --system exited rc=1", result.stdout)
         self.assertIn("# OVERALL: FAIL", result.stdout)
-        self.assertEqual(sum(row["tool"] == "vng" for row in events), 5)
-        self.assertEqual(sum(row["tool"] == "umount" for row in events), 5)
-        self.assertEqual(sum(row["tool"] == "losetup" and "-d" in row["args"] for row in events), 5)
+        self.assertEqual(sum(row["tool"] == "vng" for row in events), 6)
+        self.assertEqual(sum(row["tool"] == "umount" for row in events), 6)
+        self.assertEqual(sum(row["tool"] == "losetup" and "-d" in row["args"] for row in events), 6)
 
     def test_command_line_limit_refuses_before_any_guest(self):
         result, events = self.run_driver(long_path=True)

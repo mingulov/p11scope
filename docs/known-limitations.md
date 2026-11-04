@@ -383,10 +383,24 @@ is a stated watch interval, not proven-exact coverage, except on an owned
 `run` whose every declared probe attached at or before the barrier release
 while the barrier held the child from its start and whose pause gate
 completed a gap-free first epoch: that capture publishes an explicitly
-empty `unobserved_windows` on the pre-armed module.
+empty `unobserved_windows` on the pre-armed module. A `profile` or `trace`
+capture (`--pid`, `--cgroup`, `--system`; detailed and `--mode metrics`)
+whose mapping-instant witness finalized `Clear` for the object with every
+ordering condition met publishes one too.
 Every other capture still discloses its window, including any declared stamp
-dated after the release; ordering-evidence exactness for other scopes is
-later work.
+dated after the release, and a missing `unobserved_windows` key claims
+nothing. `run` carries no ordering-evidence proof (the witness is inert
+there), nor does inventory. Spurious windows
+stay possible where attribution is conservative: provider unmaps by
+multi-threaded non-member processes, by remote and kthread contexts, member
+migrations within the subtree, and microsecond-scale latch/torn/pending
+events at close. Measured idle rate: 0 spurious windows in 186 runs on a
+busy desktop and Fedora (all `[]`), with the key honestly absent in 2 runs
+(~1%, unknown rather than a false claim). The finalize walk delays the ready
+line only with `--prearm-module`: about 0.1 s on a 300k-VMA desktop, 0.71 s
+measured at 1M VMAs in a guest. Limits: at most 64 watched files, the
+observer must run in the initial pid namespace, LTO kernels are refused, and
+the walk fails closed past its 10 s deadline.
 Inventory accepts and retains pre-arm inputs, attaches proved offsets
 through the inventory lane, and reports one interval row per input in
 `prearm[]`. An in-place rewrite that preserves `(ino, size, ctime)`

@@ -38,24 +38,29 @@ fn finish(engine: &mut Engine, session: &ScriptedSession, owned_run: bool) {
     );
 }
 
-/// A clean proof input for `object` with the pinned identity mirrored, the
-/// witness active before the scope start and the walk after attach.
+/// A clean proof input for `object` with the pin's held-fd identity
+/// mirrored (the condition-4 join domain), the witness active before the
+/// scope start and the walk after attach.
 fn clean_proof(
     engine: &Engine,
     object: PinnedObjectId,
     scope_start: u64,
     attached_at: u64,
 ) -> WitnessProof {
-    let keys = engine.pinned.raw_keys_for(object);
-    let key = keys.first().expect("pinned key");
-    let dev = libc::makedev(key.device.major as _, key.device.minor as _);
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = engine
+        .pinned
+        .file_for(object)
+        .expect("pin holds an fd")
+        .metadata()
+        .expect("fstat the held fd");
     WitnessProof {
         verdict: FileVerdict::Clear,
         active_ns: scope_start - 10,
         scope_start_ns: Some(scope_start),
         walk_started_ns: attached_at + 1,
-        fd_dev: dev,
-        fd_ino: key.inode,
+        fd_dev: meta.dev(),
+        fd_ino: meta.ino(),
     }
 }
 
@@ -440,9 +445,14 @@ fn witness_verdict_slots_key_to_objects_by_pin_identity() {
     use crate::attach::prearm_witness::{WitnessSlot, WitnessVerdict};
     let (_fixture, engine, _session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
     let object = watched_object(&engine);
-    let keys = engine.pinned.raw_keys_for(object);
-    let key = keys.first().expect("pinned key");
-    let dev = libc::makedev(key.device.major as _, key.device.minor as _);
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = engine
+        .pinned
+        .file_for(object)
+        .expect("pin holds an fd")
+        .metadata()
+        .expect("fstat the held fd");
+    let (dev, ino) = (meta.dev(), meta.ino());
     let verdict = WitnessVerdict {
         active_ns: 40,
         scope_start_ns: Some(50),
@@ -451,13 +461,13 @@ fn witness_verdict_slots_key_to_objects_by_pin_identity() {
             WitnessSlot {
                 verdict: FileVerdict::Clear,
                 fd_dev: dev,
-                fd_ino: key.inode,
+                fd_ino: ino,
             },
             // An identity no object pins: dropped, never attributed.
             WitnessSlot {
                 verdict: FileVerdict::Clear,
                 fd_dev: dev ^ 0x79b9,
-                fd_ino: key.inode ^ 0x9e37,
+                fd_ino: ino ^ 0x9e37,
             },
         ],
     };
@@ -470,7 +480,7 @@ fn witness_verdict_slots_key_to_objects_by_pin_identity() {
     assert_eq!(proof.scope_start_ns, Some(50));
     assert_eq!(proof.walk_started_ns, 1000);
     assert_eq!(proof.fd_dev, dev);
-    assert_eq!(proof.fd_ino, key.inode);
+    assert_eq!(proof.fd_ino, ino);
 }
 
 #[test]

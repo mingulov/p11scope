@@ -668,6 +668,10 @@ pub(crate) fn start_with<B: WitnessBackend>(
 }
 
 /// Live kernel backend: real aya maps + held attach links.
+/// Presence-walk deadline (§4.5, §9.3): 10 s, fails closed. An
+/// engineering limit to raise when measured.
+pub(crate) const WITNESS_WALK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(crate) struct LiveBackend {
     ebpf: aya::Ebpf,
     #[allow(dead_code)]
@@ -676,6 +680,11 @@ pub(crate) struct LiveBackend {
     pidfd: Option<std::os::fd::OwnedFd>,
     #[cfg(test)]
     last_active: u32,
+    /// Last walk's `EAGAIN` resumptions and wall time (P2-7 scale cell).
+    #[cfg(test)]
+    last_walk_resumptions: u64,
+    #[cfg(test)]
+    last_walk_ns: u64,
 }
 
 impl LiveBackend {
@@ -687,7 +696,17 @@ impl LiveBackend {
             pidfd: None,
             #[cfg(test)]
             last_active: 0,
+            #[cfg(test)]
+            last_walk_resumptions: 0,
+            #[cfg(test)]
+            last_walk_ns: 0,
         }
+    }
+
+    /// Last walk's measurement: (`EAGAIN` resumptions, wall nanoseconds).
+    #[cfg(test)]
+    pub(crate) fn last_walk_measurement(&self) -> (u64, u64) {
+        (self.last_walk_resumptions, self.last_walk_ns)
     }
 
     pub(crate) fn set_pidfd(&mut self, pidfd: Option<std::os::fd::OwnedFd>) {
@@ -840,7 +859,6 @@ impl FinalizeBackend for LiveBackend {
     type Error = String;
     fn run_walk(&mut self) -> Result<WalkOutcome, String> {
         use std::os::fd::AsFd as _;
-        use std::os::unix::io::AsRawFd as _;
         let prog_fd = self
             .ebpf
             .program(PROGRAM_WALK)
@@ -857,24 +875,23 @@ impl FinalizeBackend for LiveBackend {
         .map_err(|e| format!("link: {e:?}"))?;
         let iter = crate::attach::identity_iter::iter_create(link.as_fd())
             .map_err(|e| format!("iter: {e:?}"))?;
-        let mut chunk = [0u8; 4096];
-        loop {
-            // SAFETY: reading a live iterator fd into a stack buffer.
-            let got =
-                unsafe { libc::read(iter.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
-            if got == 0 {
-                return Ok(WalkOutcome::Done);
-            }
-            if got > 0 {
-                continue;
-            }
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            match errno {
-                x if x == libc::EINTR || x == libc::ENOMEM || x == libc::EAGAIN => {
-                    return Ok(WalkOutcome::Retryable(format!("errno {errno}")));
-                }
-                _ => return Ok(WalkOutcome::Fatal(format!("errno {errno}"))),
-            }
+        // The walk program writes no bytes: cap 0 fails closed on any
+        // output. EAGAIN resumes the same iterator (§4.5); the deadline
+        // and any read error fail the walk.
+        let started = std::time::Instant::now();
+        let (result, _resumptions) = crate::attach::identity_iter::read_run_counted(
+            iter.as_fd(),
+            started + WITNESS_WALK_DEADLINE,
+            0,
+        );
+        #[cfg(test)]
+        {
+            self.last_walk_resumptions = _resumptions;
+            self.last_walk_ns = started.elapsed().as_nanos() as u64;
+        }
+        match result {
+            Ok(_) => Ok(WalkOutcome::Done),
+            Err(error) => Ok(WalkOutcome::Fatal(format!("{error:?}"))),
         }
     }
     fn read_state(&mut self) -> Result<PwState, String> {
@@ -924,11 +941,9 @@ impl FinalizeBackend for LiveBackend {
 /// One walk attempt outcome.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WalkOutcome {
-    /// Walk reached END cleanly.
+    /// Walk reached END cleanly (EAGAIN resumptions included).
     Done,
-    /// Transient failure (EINTR/ENOMEM, snapshot, link-temporary): retry once.
-    Retryable(String),
-    /// Permanent failure: keep windows.
+    /// Walk failure (create, read error, deadline, output): keep windows.
     Fatal(String),
 }
 
@@ -978,6 +993,7 @@ pub(crate) enum KeepReason {
 
 impl KeepReason {
     /// The exact §6.1 lowercase spelling, for twin assertions.
+    #[cfg(test)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Latched => "latched",
@@ -996,6 +1012,7 @@ impl KeepReason {
     }
 
     /// Every §6.1 reason, for exhaustive twin coverage.
+    #[cfg(test)]
     pub(crate) fn all() -> [Self; 12] {
         [
             Self::Latched,
@@ -1051,27 +1068,22 @@ pub(crate) trait FinalizeBackend {
     fn recursion_misses(&mut self, program: &str) -> Result<u64, Self::Error>;
 }
 
-/// Finalize: walk (at most two), deactivate, settle, read, release.
-/// Returns per-slot verdicts; any failure keeps windows with its §8
-/// group 3-5 reason. Ordering (walk vs attach) is the engine builder's:
-/// only `finish_prearm_capture` knows each object's exact attach stamp.
+/// Finalize: one walk, deactivate, settle, read, release. Returns
+/// per-slot verdicts; any failure keeps windows with its §8 group 3-5
+/// reason. Ordering (walk vs attach) is the engine builder's: only
+/// `finish_prearm_capture` knows each object's exact attach stamp.
 /// Checks run in close order; the first failure wins for every slot.
+///
+/// The walk runs exactly once: an abandoned walk emits no END, so a
+/// second walk could never satisfy `walk_end == 1` (§8 group 3).
+/// EAGAIN resumes inside the single walk (§4.5).
 pub(crate) fn finalize_with<B: FinalizeBackend>(
     backend: &mut B,
     slots: usize,
     ftrace_enabled: Option<String>,
 ) -> Vec<FileVerdict> {
     let keep_all = |reason: KeepReason| vec![FileVerdict::Keep(reason); slots];
-    // Walk #1, with one retry on transient failures; never beyond two.
-    let mut walks_run = 0u64;
-    let walk_ok = loop {
-        walks_run += 1;
-        match backend.run_walk() {
-            Ok(WalkOutcome::Done) => break true,
-            Ok(WalkOutcome::Retryable(_)) if walks_run < 2 => continue,
-            _ => break false,
-        }
-    };
+    let walk_ok = matches!(backend.run_walk(), Ok(WalkOutcome::Done));
     // Close ordering: deactivate, settle, read, release (always release).
     let _ = backend.deactivate();
     let settled = backend.settle_busy(3).unwrap_or(false);
@@ -1102,7 +1114,7 @@ pub(crate) fn finalize_with<B: FinalizeBackend>(
         None => return keep_all(KeepReason::Fault),
     };
     // Global conditions (§2.5-7).
-    if state.walk_end != walks_run {
+    if state.walk_end != 1 {
         return keep_all(KeepReason::Walk);
     }
     if state.faults != 0 {
@@ -1135,16 +1147,21 @@ pub(crate) fn finalize_with<B: FinalizeBackend>(
         }
     }
     // Per-slot lattice: any bit keeps that slot. A slot with several
-    // bits reports latch first, then torn, then found.
+    // bits reports found first, then latch, then torn: a positive
+    // sighting at close dominates (mprotect splits fire the unmap hook
+    // via vma_prepare/complete without detaching anything, so latch can
+    // be spurious while found is ground truth); a live detach dominates
+    // exit-path (accounted) activity. Pinned live by the P2-7
+    // mprotect-dance cell.
     (0..slots)
         .map(|slot| {
             let bit = 1u64 << slot;
-            if state.latch_slots & bit != 0 {
+            if state.found_slots & bit != 0 {
+                FileVerdict::Keep(KeepReason::Found)
+            } else if state.latch_slots & bit != 0 {
                 FileVerdict::Keep(KeepReason::Latched)
             } else if state.torn_slots & bit != 0 {
                 FileVerdict::Keep(KeepReason::Torn)
-            } else if state.found_slots & bit != 0 {
-                FileVerdict::Keep(KeepReason::Found)
             } else {
                 FileVerdict::Clear
             }
@@ -1203,6 +1220,10 @@ pub(crate) fn start(
         || crate::attach::monotonic_ns().unwrap_or(0),
     )
 }
+
+#[cfg(test)]
+#[path = "prearm_witness_tests.rs"]
+mod prearm_witness_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2178,45 +2199,21 @@ mod tests {
             "one walk on success: {:?}",
             backend.ops
         );
-        // Retryable walk error: exactly two walks, then Clear.
-        let mut backend = ScriptFinalize::clean();
-        backend.walks = vec![
-            super::WalkOutcome::Retryable("EINTR".into()),
-            super::WalkOutcome::Done,
-        ];
-        backend.state.walk_end = 2;
-        let verdicts = super::finalize_with(&mut backend, 1, Some("1".into()));
-        assert_eq!(verdicts, vec![super::FileVerdict::Clear]);
-        assert_eq!(
-            backend.ops.iter().filter(|op| *op == "walk").count(),
-            2,
-            "two walks after retryable: {:?}",
-            backend.ops
-        );
-        // Two failures: `walk`, never a third walk.
-        let mut backend = ScriptFinalize::clean();
-        backend.walks = vec![
-            super::WalkOutcome::Retryable("ENOMEM".into()),
-            super::WalkOutcome::Retryable("link-temporary".into()),
-        ];
-        let verdicts = super::finalize_with(&mut backend, 1, Some("1".into()));
-        assert_eq!(
-            verdicts,
-            vec![super::FileVerdict::Keep(super::KeepReason::Walk)]
-        );
-        assert_eq!(
-            backend.ops.iter().filter(|op| *op == "walk").count(),
-            2,
-            "never beyond two: {:?}",
-            backend.ops
-        );
-        // Fatal walk: `walk` after one walk.
+        // Fatal walk: `walk` after exactly one walk (no second walk:
+        // an abandoned walk emits no END, so a retry could never satisfy
+        // `walk_end == 1`; EAGAIN resumes inside the single walk).
         let mut backend = ScriptFinalize::clean();
         backend.walks = vec![super::WalkOutcome::Fatal("snapshot".into())];
         let verdicts = super::finalize_with(&mut backend, 1, Some("1".into()));
         assert_eq!(
             verdicts,
             vec![super::FileVerdict::Keep(super::KeepReason::Walk)]
+        );
+        assert_eq!(
+            backend.ops.iter().filter(|op| *op == "walk").count(),
+            1,
+            "exactly one walk even on failure: {:?}",
+            backend.ops
         );
         // Unsettled busy: `quiesce`.
         let mut backend = ScriptFinalize::clean();
@@ -2276,6 +2273,22 @@ mod tests {
                 super::FileVerdict::Clear,
                 super::FileVerdict::Keep(KeepReason::Latched)
             ]
+        );
+        // Priority: found beats latch beats torn (the mprotect dance
+        // latches spuriously while the mapping stays present).
+        let mut backend = ScriptFinalize::clean();
+        backend.state.latch_slots = 1;
+        backend.state.torn_slots = 1;
+        backend.state.found_slots = 1;
+        let verdicts = super::finalize_with(&mut backend, 1, Some("1".into()));
+        assert_eq!(verdicts, vec![super::FileVerdict::Keep(KeepReason::Found)]);
+        let mut backend = ScriptFinalize::clean();
+        backend.state.latch_slots = 1;
+        backend.state.torn_slots = 1;
+        let verdicts = super::finalize_with(&mut backend, 1, Some("1".into()));
+        assert_eq!(
+            verdicts,
+            vec![super::FileVerdict::Keep(KeepReason::Latched)]
         );
     }
 

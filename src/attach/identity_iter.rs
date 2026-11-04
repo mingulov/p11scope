@@ -599,11 +599,27 @@ pub enum ReadError {
     Errno(i32),
 }
 
-/// Drain `fd` to EOF. Retries `EINTR` and `EAGAIN` (F4: a 1M-object read
-/// with no output keeps the iterator state, so the next `read()` continues
-/// the same walk). Stops after the END record plus the EOF read; the parser
-/// then proves the stream held exactly one END. `max_bytes` caps a runaway
-/// stream.
+/// One raw read outcome for `drive_read_run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadOutcome {
+    /// `n` fresh bytes were written into the chunk.
+    Bytes(usize),
+    /// End of stream.
+    Eof,
+    /// Reschedule-and-resume signal; the iterator keeps its state.
+    Again,
+    /// Interrupted; no bytes, no state change.
+    Intr,
+    /// Any other errno: the run fails.
+    Errno(i32),
+}
+
+/// Drain reads to EOF over a scriptable reader. Retries `EINTR` and
+/// `EAGAIN` (F4: a 1M-object read with no output keeps the iterator
+/// state, so the next `read()` continues the same walk); counts the
+/// `EAGAIN` resumptions. Stops after the END record plus the EOF read;
+/// the parser then proves the stream held exactly one END. `max_bytes`
+/// caps a runaway stream.
 ///
 /// The `deadline` is mandatory (a plain `Instant`, never optional): every
 /// kernel run must bound its retries. It is checked before every read and
@@ -611,42 +627,96 @@ pub enum ReadError {
 /// expiry is rejected. This is a COOPERATIVE deadline only: a single
 /// blocked `read()` cannot be interrupted, so the wait for one read is
 /// unbounded; the guarantee is that overdue RESULTS are never accepted.
+///
+/// `read` fills `chunk` and reports; on `Bytes(n)` the first `n` chunk
+/// bytes are consumed. Returns the bytes and the resumption count.
+fn drive_read_run(
+    chunk: &mut [u8; READ_BUF_LEN],
+    read: &mut impl FnMut(&mut [u8]) -> ReadOutcome,
+    deadline: Instant,
+    max_bytes: usize,
+) -> (Result<Vec<u8>, ReadError>, u64) {
+    let mut out = Vec::new();
+    let mut resumptions = 0u64;
+    loop {
+        if Instant::now() >= deadline {
+            return (Err(ReadError::Deadline), resumptions);
+        }
+        match read(chunk) {
+            ReadOutcome::Again => {
+                resumptions += 1;
+                continue;
+            }
+            ReadOutcome::Intr => continue,
+            ReadOutcome::Errno(errno) => {
+                return (Err(ReadError::Errno(errno)), resumptions);
+            }
+            ReadOutcome::Eof => {
+                // The read itself may have crossed the deadline (a blocked
+                // read is uninterruptible): reject overdue results, EOF
+                // included.
+                if Instant::now() >= deadline {
+                    return (Err(ReadError::Deadline), resumptions);
+                }
+                return (Ok(out), resumptions);
+            }
+            ReadOutcome::Bytes(got) => {
+                // The read itself may have crossed the deadline (a blocked
+                // read is uninterruptible): reject overdue results.
+                if Instant::now() >= deadline {
+                    return (Err(ReadError::Deadline), resumptions);
+                }
+                let fresh = &chunk[..got];
+                if out.len() + fresh.len() > max_bytes {
+                    return (Err(ReadError::TooLarge), resumptions);
+                }
+                out.extend_from_slice(fresh);
+            }
+        }
+    }
+}
+
+/// Drain `fd` to EOF: `drive_read_run` over the real `read()`. See the
+/// drive for the retry, cap and deadline contract.
 pub fn read_run(
     fd: BorrowedFd<'_>,
     deadline: Instant,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ReadError> {
-    let mut out = Vec::new();
+    read_run_counted(fd, deadline, max_bytes).0
+}
+
+/// Drain `fd` to EOF like `read_run`, also returning the `EAGAIN`
+/// resumption count (WU-13 P-C phase 2 scale measurement).
+pub(crate) fn read_run_counted(
+    fd: BorrowedFd<'_>,
+    deadline: Instant,
+    max_bytes: usize,
+) -> (Result<Vec<u8>, ReadError>, u64) {
     let mut chunk = [0u8; READ_BUF_LEN];
-    loop {
-        if Instant::now() >= deadline {
-            return Err(ReadError::Deadline);
-        }
-        // SAFETY: `read()` writes at most `chunk.len()` bytes into `chunk`.
-        let got = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
-        if got < 0 {
-            let errno = io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO);
-            if errno == libc::EINTR || errno == libc::EAGAIN {
-                continue;
+    drive_read_run(
+        &mut chunk,
+        &mut |buf| {
+            // SAFETY: `read()` writes at most `buf.len()` bytes into `buf`.
+            let got = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if got == 0 {
+                return ReadOutcome::Eof;
             }
-            return Err(ReadError::Errno(errno));
-        }
-        // The read itself may have crossed the deadline (a blocked read is
-        // uninterruptible): reject overdue results, EOF included.
-        if Instant::now() >= deadline {
-            return Err(ReadError::Deadline);
-        }
-        if got == 0 {
-            return Ok(out);
-        }
-        let fresh = &chunk[..got as usize];
-        if out.len() + fresh.len() > max_bytes {
-            return Err(ReadError::TooLarge);
-        }
-        out.extend_from_slice(fresh);
-    }
+            if got > 0 {
+                return ReadOutcome::Bytes(got as usize);
+            }
+            match io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+            {
+                errno if errno == libc::EAGAIN => ReadOutcome::Again,
+                errno if errno == libc::EINTR => ReadOutcome::Intr,
+                errno => ReadOutcome::Errno(errno),
+            }
+        },
+        deadline,
+        max_bytes,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4236,6 +4306,125 @@ mod tests {
             ),
             Err(ReadError::TooLarge)
         );
+    }
+
+    /// Scripted reader for `drive_read_run`: yields each outcome in order,
+    /// filling the chunk on byte outcomes.
+    fn scripted_read(script: Vec<ScriptOutcome>) -> impl FnMut(&mut [u8]) -> ReadOutcome {
+        let mut script = script.into_iter();
+        move |buf: &mut [u8]| match script.next().expect("scripted read") {
+            ScriptOutcome::Bytes(data) => {
+                buf[..data.len()].copy_from_slice(&data);
+                ReadOutcome::Bytes(data.len())
+            }
+            ScriptOutcome::Eof => ReadOutcome::Eof,
+            ScriptOutcome::Again => ReadOutcome::Again,
+            ScriptOutcome::Intr => ReadOutcome::Intr,
+            ScriptOutcome::Errno(errno) => ReadOutcome::Errno(errno),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum ScriptOutcome {
+        Bytes(Vec<u8>),
+        Eof,
+        Again,
+        Intr,
+        Errno(i32),
+    }
+
+    fn drive_scripted(
+        script: Vec<ScriptOutcome>,
+        deadline: Instant,
+        max_bytes: usize,
+    ) -> (Result<Vec<u8>, ReadError>, u64) {
+        let mut chunk = [0u8; READ_BUF_LEN];
+        drive_read_run(&mut chunk, &mut scripted_read(script), deadline, max_bytes)
+    }
+
+    /// WU-13 P-C phase 2 reader contract: the loop continues on
+    /// EAGAIN×3 then EOF, counting exactly three resumptions.
+    #[test]
+    fn drive_continues_on_eagain_thrice_then_eof() {
+        use ScriptOutcome::*;
+        let (result, resumptions) = drive_scripted(
+            vec![Again, Again, Again, Eof],
+            Instant::now() + Duration::from_secs(60),
+            1 << 20,
+        );
+        assert_eq!(result, Ok(Vec::new()));
+        assert_eq!(resumptions, 3);
+    }
+
+    #[test]
+    fn drive_resumes_intr_without_counting_and_caps_bytes() {
+        use ScriptOutcome::*;
+        // EINTR resumes silently; bytes accumulate; the cap still bites.
+        let (result, resumptions) = drive_scripted(
+            vec![Intr, Bytes(vec![1, 2]), Intr, Eof],
+            Instant::now() + Duration::from_secs(60),
+            1 << 20,
+        );
+        assert_eq!(result, Ok(vec![1, 2]));
+        assert_eq!(resumptions, 0);
+        let (result, _) = drive_scripted(
+            vec![Bytes(vec![1, 2, 3]), Eof],
+            Instant::now() + Duration::from_secs(60),
+            2,
+        );
+        assert_eq!(result, Err(ReadError::TooLarge));
+        // Any other errno fails the run outright.
+        let (result, resumptions) = drive_scripted(
+            vec![Again, Errno(libc::EIO)],
+            Instant::now() + Duration::from_secs(60),
+            1 << 20,
+        );
+        assert_eq!(result, Err(ReadError::Errno(libc::EIO)));
+        assert_eq!(resumptions, 1);
+    }
+
+    #[test]
+    fn drive_rejects_overdue_results() {
+        use ScriptOutcome::*;
+        // An already-past deadline fails before the first read.
+        let (result, _) = drive_scripted(vec![Eof], Instant::now(), 1 << 20);
+        assert_eq!(result, Err(ReadError::Deadline));
+        // Data past the deadline fails too.
+        let (result, _) = drive_scripted(vec![Bytes(vec![9]), Eof], Instant::now(), 1 << 20);
+        assert_eq!(result, Err(ReadError::Deadline));
+    }
+
+    #[test]
+    fn counted_reader_counts_live_eagains() {
+        use std::os::unix::io::AsRawFd as _;
+        // Nonblocking read end: empty reads fail `EAGAIN` until the writer
+        // delivers; the count is positive but scheduling-dependent.
+        let (read_end, write_end) = pipe();
+        let flags = unsafe { libc::fcntl(read_end.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "getfl");
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    read_end.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                )
+            },
+            0,
+            "nonblock"
+        );
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            write_all(write_end.as_fd(), b"xy");
+        });
+        let (result, resumptions) = read_run_counted(
+            read_end.as_fd(),
+            Instant::now() + Duration::from_secs(10),
+            1 << 20,
+        );
+        writer.join().expect("writer thread");
+        assert_eq!(result.expect("drain").as_slice(), b"xy");
+        assert!(resumptions >= 1, "live EAGAINs counted");
     }
 
     #[test]

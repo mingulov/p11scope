@@ -760,6 +760,18 @@ jobs:
             fi
           done
           grep 'host program preflight' "$OUT/doctor-host.txt" | head -1 || echo "no host program preflight line"
+          # The witness leg: /bin/true is a universal identified ELF for
+          # --prearm-module (any identified file pins; the load gate
+          # scores BPF loads, never verdicts), so no provider install.
+          wrc=0
+          sudo bash -c 'LD_PRELOAD="$3" P11SCOPE_VERIFIER_STATS_FD=9 "$0" profile --system --prearm-module /bin/true --attach-backend multi --duration 5s 9>"$1" >"$2" 2>&1' \
+            "$OBSERVER" "$OUT/witness-probe-host.jsonl" "$OUT/witness-host.txt" "$PROBE" || wrc=$?
+          echo "witness rc=$wrc"
+          for f in "$OUT/witness-probe-host.jsonl" "$OUT/witness-host.txt"; do
+            if [ -e "$f" ]; then
+              sudo chown "$(id -un):$(id -gn)" "$f"
+            fi
+          done
           SHA=$(sha256sum "$OBSERVER" | cut -d' ' -f1)
           # Stable kernel label: the future budgets file keys the host leg
           # as `host` (guests use the vX.Y.Z matrix value). Never
@@ -770,7 +782,12 @@ jobs:
             --observer-sha256 "$SHA" "$OUT/probe-host.jsonl" 2>&1 | tee "$OUT/table-host.txt"
           test -s "$OUT/table-host.txt"
           echo "# host-release: $(uname -r)" >>"$OUT/table-host.txt"
+          python3 -I scripts/bpf-load-report.py --object prearm-witness --kernel host \
+            --observer-sha256 "$SHA" "$OUT/witness-probe-host.jsonl" 2>&1 | tee "$OUT/table-witness-host.txt"
+          test -s "$OUT/table-witness-host.txt"
+          echo "# host-release: $(uname -r)" >>"$OUT/table-witness-host.txt"
           test "$rc" -eq 0
+          test "$wrc" -eq 0
       - name: Upload the table and doctor output
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -780,5 +797,8 @@ jobs:
             ${{ github.workspace }}/bpf-load-host-out/table-host.txt
             ${{ github.workspace }}/bpf-load-host-out/doctor-host.txt
             ${{ github.workspace }}/bpf-load-host-out/probe-host.jsonl
+            ${{ github.workspace }}/bpf-load-host-out/table-witness-host.txt
+            ${{ github.workspace }}/bpf-load-host-out/witness-host.txt
+            ${{ github.workspace }}/bpf-load-host-out/witness-probe-host.jsonl
           if-no-files-found: error
           retention-days: 7

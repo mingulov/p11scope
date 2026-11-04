@@ -17,11 +17,13 @@ its largest count. Auxiliary rows never supply coverage and are ignored.
 With ``--object NAME`` loads are grouped by BTF id first and each
 group is assigned to one object by its unique roots (Inventory-only
 ``p11_usage_entry_*``, Detailed-only image/instance roots, counter
-``p11_counter_bank_*``, journal ``p11_*_journal``); only the requested
-object's groups supply coverage. Shared-only groups of known roots
-belong to Detailed (the lone Detailed return), and to Inventory only
-when every root sits in its program set; counter modes take only
-bank-carrying groups and journal takes only pair-carrying groups. A
+``p11_counter_bank_*``, journal ``p11_*_journal``, witness
+``p11_pw_*``); only the requested object's groups supply coverage.
+Shared-only groups of known roots belong to Detailed (the lone
+Detailed return), and to Inventory only when every root sits in its
+program set; counter modes take only bank-carrying groups, journal
+takes only pair-carrying groups, and ``prearm-witness`` takes only
+witness-root groups. A
 journal group also carries Detailed-only roots (the journal object is
 a Detailed object with the entry/return pair swapped), so the journal
 pair wins over Detailed; a group matching two other objects, or no
@@ -86,6 +88,12 @@ COUNTER_UNIQUE_ROOTS = frozenset({
 EXCLUSIVE_VARIANT_GROUPS = [
     frozenset({"p11_image_exec_release", "p11_image_mmap_release"}),
     frozenset({"p11_inst_vma_copy", "p11_inst_vma_retcopy"}),
+    # Witness departure family (src/attach/prearm_witness.rs): the
+    # loader names the exit/exec pair (Linux 6.6-7.2) or the single
+    # rename (7.3+), never both. Two overlapping pairs sharing the
+    # single keep the one-member-per-kernel shape.
+    frozenset({"p11_pw_depart_exit", "p11_pw_depart"}),
+    frozenset({"p11_pw_depart_exec", "p11_pw_depart"}),
 ]
 DETAILED_UNIQUE_ROOTS = frozenset({
     "p11_image_query", "p11_image_exec_release", "p11_image_mmap_release",
@@ -100,6 +108,13 @@ DETAILED_UNIQUE_ROOTS = frozenset({
 JOURNAL_UNIQUE_ROOTS = frozenset({
     "p11_entry_journal", "p11_return_journal",
 })
+# The pre-arm witness object (crates/ebpf/native/prearm_witness.c,
+# src/attach/prearm_witness.rs PROGRAM_*): standalone, shares no
+# roots with any other object. Scored as --object prearm-witness.
+WITNESS_UNIQUE_ROOTS = frozenset({
+    "p11_pw_unmap", "p11_pw_depart_exit", "p11_pw_depart_exec",
+    "p11_pw_depart", "p11_pw_torn", "p11_pw_migrate", "p11_pw_walk",
+})
 # Every root any shipped object loads (for foreign-group detection).
 # The 13 defaults are shared by Detailed and counter; 10 of them are
 # also shared by Inventory (which lacks p11_entry/p11_return/task_newtask).
@@ -112,7 +127,7 @@ KNOWN_SHARED_ROOTS = frozenset({
 })
 KNOWN_ROOTS = (KNOWN_SHARED_ROOTS | INVENTORY_UNIQUE_ROOTS
                | COUNTER_UNIQUE_ROOTS | DETAILED_UNIQUE_ROOTS
-               | JOURNAL_UNIQUE_ROOTS)
+               | JOURNAL_UNIQUE_ROOTS | WITNESS_UNIQUE_ROOTS)
 # Inventory's 12 loaded programs (for partial-group compatibility: a
 # shared-only group whose roots all sit in this set is an Inventory
 # partial that failed before its usage roots loaded).
@@ -204,27 +219,40 @@ def assign_btf_group(entries):
     """One object's name for a BTF group, or None when shared-only.
 
     Returns (object, error) where object is "inventory", "counter",
-    "detailed", "journal", or None, and error names an ambiguous (two
-    objects) or foreign (no known root) group. Shared-only groups of
-    known roots (the lone Detailed return, partial loads that failed
-    before their unique roots) return (None, None); the caller decides
-    by the requested object whether they belong. The journal pair wins
-    over Detailed (every journal group carries Detailed-only roots);
-    journal with inventory or counter roots is still ambiguous.
+    "detailed", "journal", "witness", or None, and error names an
+    ambiguous (two objects) or foreign (no known root) group.
+    Shared-only groups of known roots (the lone Detailed return,
+    partial loads that failed before their unique roots) return
+    (None, None); the caller decides by the requested object whether
+    they belong. The journal pair wins over Detailed (every journal
+    group carries Detailed-only roots); journal with inventory,
+    counter, or witness roots is still ambiguous. The witness object
+    shares no roots, so any mixing with it is ambiguous.
     """
     roots = {entry["root"] for entry in entries}
     has_inventory = bool(roots & INVENTORY_UNIQUE_ROOTS)
     has_counter = bool(roots & COUNTER_UNIQUE_ROOTS)
     has_detailed = bool(roots & DETAILED_UNIQUE_ROOTS)
     has_journal = bool(roots & JOURNAL_UNIQUE_ROOTS)
-    if has_journal and (has_inventory or has_counter):
+    has_witness = bool(roots & WITNESS_UNIQUE_ROOTS)
+    if has_journal and (has_inventory or has_counter or has_witness):
         kinds = sorted(kind for kind, has in
                        (("counter", has_counter),
                         ("inventory", has_inventory),
-                        ("journal", has_journal)) if has)
+                        ("journal", has_journal),
+                        ("witness", has_witness)) if has)
         return None, f"matches two objects ({','.join(kinds)})"
     if has_journal:
         return "journal", None
+    if has_witness and (has_inventory or has_counter or has_detailed):
+        kinds = sorted(kind for kind, has in
+                       (("counter", has_counter),
+                        ("detailed", has_detailed),
+                        ("inventory", has_inventory),
+                        ("witness", has_witness)) if has)
+        return None, f"matches two objects ({','.join(kinds)})"
+    if has_witness:
+        return "witness", None
     hits = sum((has_inventory, has_counter, has_detailed))
     if hits > 1:
         kinds = sorted(kind for kind, has in
@@ -306,8 +334,9 @@ def select_object_loads(parsed_loads, object_name, group_errors):
     Detailed return; partial loads that failed before their unique
     roots) belong to Detailed, and to Inventory only when every root
     sits in Inventory's program set; counter objects always carry
-    their bank roots and journal objects always carry their pair, so
-    shared-only groups never belong to them.
+    their bank roots, journal objects always carry their pair, and
+    witness groups always carry witness roots, so shared-only groups
+    never belong to them.
     "detailed-gate1" selects exactly the Detailed groups and
     "journal-gate1" exactly the journal groups (gate-1 objects carry the
     same unique roots); only the budget-key prefix differs.
@@ -323,6 +352,7 @@ def select_object_loads(parsed_loads, object_name, group_errors):
     want_counter = object_name.startswith("counter-")
     want_detailed = object_name in ("detailed", "detailed-gate1")
     want_journal = object_name in ("journal", "journal-gate1")
+    want_witness = object_name == "prearm-witness"
     for btf_id in sorted(by_btf):
         entries = by_btf[btf_id]
         if btf_id == 0:
@@ -347,6 +377,9 @@ def select_object_loads(parsed_loads, object_name, group_errors):
         elif assigned == "counter":
             if want_counter:
                 selected.extend(entries)
+        elif assigned == "witness":
+            if want_witness:
+                selected.extend(entries)
         elif assigned == "detailed":
             if want_detailed:
                 selected.extend(entries)
@@ -356,9 +389,10 @@ def select_object_loads(parsed_loads, object_name, group_errors):
                 selected.extend(entries)
             elif object_name == "inventory" and roots <= INVENTORY_PROGRAMS:
                 selected.extend(entries)
-            # Counter modes take only bank-carrying groups and journal
-            # takes only pair-carrying groups; shared-only groups (the
-            # lone Detailed return) never belong to them.
+            # Counter modes take only bank-carrying groups, journal
+            # takes only pair-carrying groups, and prearm-witness takes
+            # only witness-root groups; shared-only groups (the lone
+            # Detailed return) never belong to them.
     return selected
 
 

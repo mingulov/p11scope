@@ -16,14 +16,18 @@
 # every kernel passes; a timeout, a missing count or a nonzero report
 # is FAIL.
 #
-# Per kernel five throwaway guests run one command each under the probe:
+# Per kernel six throwaway guests run one command each under the probe:
 # `doctor` (Detailed plus Inventory objects in one file, probe-K.jsonl,
 # grouped by BTF id and scored as detailed; the Inventory groups in
 # that file are ignored there), a bounded
 # `inventory --system --capture native` (Inventory object,
-# inventory-probe-K.jsonl), and one bounded `profile --system --mode
+# inventory-probe-K.jsonl), one bounded `profile --system --mode
 # metrics --counter-mode <mode>` per mode (that mode's counter bank
-# object, counter-<mode>-probe-K.jsonl). Separate guests because virtme
+# object, counter-<mode>-probe-K.jsonl), and one bounded `profile
+# --system --prearm-module /bin/true` (witness object,
+# witness-probe-K.jsonl, scored as prearm-witness; /bin/true is a
+# universal identified ELF, and the load gate scores BPF loads, never
+# verdicts, so no provider is needed). Separate guests because virtme
 # carries --exec base64 on the kernel command line (2048 bytes); one
 # combined command overflows it and the guest then silently never runs.
 # Separate counter runs per mode because probe rows key programs by root
@@ -61,7 +65,10 @@
 # kernel set, since the main file's shape pin requires one kernel set
 # for every program), so a missing program or growth FAILs. The probe
 # file's 16th load (the lone Detailed return) belongs to no counter
-# group and is ignored when scoring counter modes. All positive capture
+# group and is ignored when scoring counter modes. The witness run's
+# 6 (7.3: 5) p11_pw_* programs are scored as prearm-witness against
+# the main budgets file (the 7.3 departure rename is an exclusive
+# variant pairs there). All positive capture
 # commands require Multi. Stock pre-Multi hosts use the separate combined
 # check-multi-host-refusal.py control, never this load/cost campaign.
 # Known gaps, not gated:
@@ -174,7 +181,7 @@ if [ -e "$GUEST_ENV" ] || [ -L "$GUEST_ENV" ] || [ -e "$WORK_IMAGE" ] || [ -L "$
     echo "# error: guest helper/work image already exists; use a fresh output directory" >&2
     exit 2
 fi
-# Only this invocation owns the image. Five sequential fresh guests reuse it
+# Only this invocation owns the image. Six sequential fresh guests reuse it
 # after checked unmount/detach; product temp I/O never inherits host /tmp/9p.
 (umask 077; set -C; : > "$WORK_IMAGE"; truncate -s 536870912 "$WORK_IMAGE")
 mkfs.ext4 -q -F "$WORK_IMAGE"
@@ -417,6 +424,70 @@ for KERNEL in "$@"; do
             fi
         fi
     done
+    W_PROBE_JSON="$OUTDIR/witness-probe-$KERNEL.jsonl"
+    W_TXT="$OUTDIR/witness-$KERNEL.txt"
+    W_VNG_LOG="$OUTDIR/vng-witness-$KERNEL.log"
+    rm -f "$W_PROBE_JSON" "$W_TXT" "$W_VNG_LOG"
+    EXEC_W="cd $(q "$OUTDIR") && $STAGE; ulimit -n 65536; timeout -k 10 -s INT 60 env LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") profile --system --prearm-module /bin/true --attach-backend multi --duration 5s 9>$(q "witness-probe-$KERNEL.jsonl") >$(q "witness-$KERNEL.txt") 2>&1; echo witness-rc=\$?; echo guest-release=\$(uname -r)"
+    if [ "${#EXEC_W}" -gt 950 ]; then
+        echo "# error: witness guest command exceeds the kernel-cmdline budget on $KERNEL"
+        FAILED=1
+        continue
+    fi
+    if ! timeout -k 30 300 vng --run "$KERNEL" --user root --cpus 4 --memory 4G \
+        --rwdir "$OUTDIR" --exec "$EXEC_W" < /dev/null >"$W_VNG_LOG" 2>&1; then
+        echo "# error: vng witness run failed or timed out on $KERNEL (see $W_VNG_LOG)"
+        FAILED=1
+        continue
+    fi
+    if ! grep -q '^witness-rc=' "$W_VNG_LOG"; then
+        echo "# error: no witness exit line on $KERNEL (see $W_VNG_LOG)"
+        FAILED=1
+        continue
+    fi
+    if ! grep -Eq '^(staged-boot-config|boot-config-present)-' "$W_VNG_LOG"; then
+        echo "# error: kernel config not staged for witness on $KERNEL (see $W_VNG_LOG)"
+        FAILED=1
+        continue
+    fi
+    W_RELEASE=$(grep '^guest-release=' "$W_VNG_LOG" | tail -1 | cut -d= -f2)
+    if release_ok "$KERNEL" "$W_RELEASE"; then
+        echo "# witness guest release $W_RELEASE (expected $KERNEL)"
+    else
+        echo "# error: witness guest booted $W_RELEASE, expected $KERNEL"
+        FAILED=1
+        continue
+    fi
+    W_RC=$(grep '^witness-rc=' "$W_VNG_LOG" | tail -1 | cut -d= -f2)
+    # A failed witness run still falls through to per-program scoring
+    # like the counter runs: the probe rows name the refused program.
+    # Only infrastructure failures above skip the kernel; a
+    # wrong-kernel guest never reaches scoring.
+    case "$W_RC" in
+        0)
+            echo "# witness rc=0 on $KERNEL"
+            ;;
+        *)
+            echo "# error: witness profile exited rc=$W_RC on $KERNEL (see $W_TXT)"
+            [ -f "$W_TXT" ] && tail -n 20 "$W_TXT" | sed 's/^/#   /'
+            FAILED=1
+            ;;
+    esac
+    if [ ! -f "$W_TXT" ] || grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$W_TXT"; then
+        echo "# error: witness profile crashed or left no log on $KERNEL (see $W_VNG_LOG)"
+        FAILED=1
+    fi
+    if [ -n "$BUDGETS" ]; then
+        if ! python3 -I "$REPORT" --budgets "$BUDGETS" --object prearm-witness --kernel "$KERNEL" \
+            --observer-sha256 "$OBSERVER_SHA" "$W_PROBE_JSON"; then
+            FAILED=1
+        fi
+    else
+        if ! python3 -I "$REPORT" --object prearm-witness --kernel "$KERNEL" \
+            --observer-sha256 "$OBSERVER_SHA" "$W_PROBE_JSON"; then
+            FAILED=1
+        fi
+    fi
 done
 
 if [ "$FAILED" -ne 0 ]; then

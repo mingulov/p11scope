@@ -287,6 +287,10 @@ pub(crate) struct InstanceTracking {
     keys: BTreeMap<InstanceFileKey, u32>,
     next_slot: u32,
     program_ids: BTreeMap<&'static str, u32>,
+    /// Each hook's recursion-miss count at the last audit (zero before
+    /// the first): growth raises the fault era, see
+    /// [`audit_image_hooks_with`].
+    hook_misses: std::sync::Mutex<BTreeMap<&'static str, u64>>,
 }
 
 /// Test-only Stage A measurement toggle (Task 1d): `P11SCOPE_T3A_DISABLE_HOOKS`
@@ -524,6 +528,10 @@ impl InstanceTracking {
         ebpf: &Ebpf,
         coverage: &super::image_query::CoverageControl,
     ) -> Result<()> {
+        let Ok(mut misses) = self.hook_misses.lock() else {
+            coverage.fail();
+            bail!("image hook miss baseline poisoned");
+        };
         audit_image_hooks_with(
             coverage,
             self.refused.is_none(),
@@ -535,6 +543,8 @@ impl InstanceTracking {
                 let maps = InstanceMaps { ebpf };
                 Ok((maps.sticky()?, maps.fault()?))
             },
+            &mut misses,
+            || InstanceMaps { ebpf }.raise_fault(),
         )
     }
 
@@ -2223,10 +2233,7 @@ fn validate_hook_health_with(
                 .any(|(required, _)| *required == name),
         };
         ensure!(
-            stats.program_id != 0
-                && stats.recursion_misses == 0
-                && known
-                && ids.insert(name, stats.program_id).is_none(),
+            stats.program_id != 0 && known && ids.insert(name, stats.program_id).is_none(),
             "image hook identity/statistics unavailable"
         );
         if let Some(expected) = expected {
@@ -2270,6 +2277,7 @@ fn activate_image_coverage_with(
     result
 }
 
+#[allow(clippy::too_many_arguments)] // Each live read stays an injectable seam for the latch and fault-era twins.
 pub(super) fn audit_image_hooks_with(
     coverage: &super::image_query::CoverageControl,
     active: bool,
@@ -2278,10 +2286,35 @@ pub(super) fn audit_image_hooks_with(
     read_ftrace: impl FnOnce() -> Result<String>,
     read_stats: impl FnOnce() -> Result<Vec<(&'static str, HookStats)>>,
     read_faults: impl FnOnce() -> Result<(u64, u64)>,
+    misses: &mut BTreeMap<&'static str, u64>,
+    raise_fault: impl FnOnce() -> Result<u64>,
 ) -> Result<()> {
     let result = (|| {
         ensure!(active && coverage.enabled(), "image continuity unavailable");
-        validate_hook_health_with(link_count, Some(expected), read_ftrace, read_stats)?;
+        let mut seen = BTreeMap::new();
+        validate_hook_health_with(link_count, Some(expected), read_ftrace, || {
+            let stats = read_stats()?;
+            for (name, stat) in &stats {
+                seen.insert(*name, stat.recursion_misses);
+            }
+            Ok(stats)
+        })?;
+        // A recursion miss is one skipped hook run (a preempted trampoline
+        // on a busy host), so some mapping change went unrecorded. That is
+        // a fault, not lost coverage: raise the era before reading it, so
+        // every call stamped across the miss (collected before this audit)
+        // fails as a counted coverage fault and later calls re-prove. A
+        // counter that went backwards, or a failed raise, stays permanent.
+        let mut grew = false;
+        for (name, now) in &seen {
+            let before = misses.get(name).copied().unwrap_or(0);
+            ensure!(*now >= before, "image hook miss counter regressed");
+            grew |= *now > before;
+        }
+        if grew {
+            raise_fault()?;
+        }
+        *misses = seen;
         let (sticky, fault) = read_faults()?;
         ensure!(
             sticky == 0 && fault <= u64::from(u32::MAX),
@@ -2597,15 +2630,23 @@ mod tests {
                         },
                     ))
                 },
+                &mut std::collections::BTreeMap::new(),
+                || Ok(1),
             );
             assert!(result.is_err(), "health case {case} was accepted");
             assert!(!coverage.enabled());
             assert!(coverage.enable().is_err());
         }
-        for missed in 0..super::INSTANCE_PROGRAMS.len() {
+        // A recursion-miss counter that runs backwards, or a fault raise
+        // that fails, cannot be scoped and still latches permanently.
+        for regressed in [true, false] {
             let coverage = super::super::image_query::CoverageControl::test_owner(true);
+            let mut misses = std::collections::BTreeMap::new();
             let mut stats = healthy_hook_stats();
-            stats[missed].1.recursion_misses = 1;
+            stats[0].1.recursion_misses = 1;
+            if regressed {
+                misses.insert(stats[0].0, 2);
+            }
             assert!(
                 super::audit_image_hooks_with(
                     &coverage,
@@ -2615,6 +2656,8 @@ mod tests {
                     || Ok("1".into()),
                     || Ok(stats),
                     || Ok((0, 0)),
+                    &mut misses,
+                    || Err(anyhow::anyhow!("unwritable fault cell")),
                 )
                 .is_err()
             );
@@ -2628,10 +2671,60 @@ mod tests {
                     || Ok("1".into()),
                     || Ok(healthy_hook_stats()),
                     || Ok((0, 0)),
+                    &mut std::collections::BTreeMap::new(),
+                    || Ok(1),
                 )
                 .is_err()
             );
             assert!(coverage.enable().is_err());
+        }
+    }
+
+    /// A hook recursion miss (a preempted trampoline on a busy host) is a
+    /// scoped fault: the audit raises the fault era so no call stamped
+    /// across the miss can join, and coverage stays enabled so later
+    /// calls re-prove instead of shedding for the rest of the capture.
+    #[test]
+    fn production_hook_recursion_misses_raise_the_fault_era_without_latching() {
+        let expected: std::collections::BTreeMap<_, _> = healthy_hook_stats()
+            .into_iter()
+            .map(|(name, stats)| (name, stats.program_id))
+            .collect();
+        for missed in 0..super::INSTANCE_PROGRAMS.len() {
+            let coverage = super::super::image_query::CoverageControl::test_owner(true);
+            let mut misses = std::collections::BTreeMap::new();
+            let raises = std::cell::Cell::new(0);
+            let mut audit = |count: u64| {
+                let mut stats = healthy_hook_stats();
+                stats[missed].1.recursion_misses = count;
+                super::audit_image_hooks_with(
+                    &coverage,
+                    true,
+                    4,
+                    &expected,
+                    || Ok("1".into()),
+                    || Ok(stats),
+                    || Ok((0, raises.get())),
+                    &mut misses,
+                    || {
+                        raises.set(raises.get() + 1);
+                        Ok(raises.get())
+                    },
+                )
+            };
+            assert!(audit(0).is_ok());
+            assert_eq!(raises.get(), 0, "no miss, no fault");
+            let result = audit(1);
+            assert!(
+                result.is_ok(),
+                "a recursion miss is not a coverage failure: {result:?}"
+            );
+            assert_eq!(raises.get(), 1, "a new miss raises the fault era once");
+            assert!(audit(1).is_ok());
+            assert_eq!(raises.get(), 1, "an unchanged count raises nothing");
+            assert!(audit(5).is_ok());
+            assert_eq!(raises.get(), 2, "each later growth raises again");
+            assert!(coverage.enabled(), "coverage survives recursion misses");
         }
     }
 

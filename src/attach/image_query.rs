@@ -1978,7 +1978,7 @@ mod tests {
                 .map(|(name, stat)| (*name, stat.program_id))
                 .collect();
             if reads == 2 {
-                stats[3].1.recursion_misses = 1;
+                stats[3].1.program_id = 0;
             }
             super::super::instance::audit_image_hooks_with(
                 &audit_owner,
@@ -1988,6 +1988,8 @@ mod tests {
                 || Ok("1".into()),
                 || Ok(stats),
                 || Ok((0, 0)),
+                &mut std::collections::BTreeMap::new(),
+                || Ok(1),
             )
             .map_err(|_| ImageQueryRefusal::Coverage)
         }));

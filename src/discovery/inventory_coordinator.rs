@@ -2734,8 +2734,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// `min(custody at_ns, last clean read)` — watches staged earlier in
     /// the same batch freeze with the rest, and one no clean read proved
     /// reads unknown — every counted column is a lower bound (bound-pair
-    /// growth stages nothing more past this point), the loss is a gap,
-    /// and no watch starts after. After stop it stages nothing: ended
+    /// growth stages nothing more past this point; pending first-sight
+    /// installs still land, now `lossy`), the loss is a gap, and no
+    /// watch starts after. After stop it stages nothing: ended
     /// intervals are frozen facts.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards custody.
     pub(crate) fn note_capture_custody(&mut self, custody: &ScopeCustody) {
@@ -2775,7 +2776,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             matches!(capture.scope, CaptureScopeCoverage::Pid(scope) if scope == proof.scope())
         });
         capture.unproven = Some(reason.clone());
-        // Bound-pair growth stages nothing more past this point, so
+        // Bound-pair growth stages nothing more past this point
+        // (pending first-sight installs still land, now lossy), so
         // counted columns are lower bounds from here on.
         self.registry.note_counted_loss();
         let until = capture.last_clean_ns.map_or(0, |clean| clean.min(at_ns));
@@ -2998,7 +3000,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// exit record may belong to any watched caller and cannot be
     /// localized, so every watch interval reaching past `at_ns` demotes to
     /// unknown, every counted column is a lower bound (bound-pair growth
-    /// stages nothing more past this point), the loss is a gap, and —
+    /// stages nothing more past this point; pending first-sight
+    /// installs still land, now `lossy`), the loss is a gap, and —
     /// sticky — no watch starts again in this capture. Only the first
     /// loss stages anything.
     fn note_lifecycle_loss(&mut self, loss: &LifecycleLoss) {

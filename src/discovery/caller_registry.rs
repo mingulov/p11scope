@@ -2617,9 +2617,10 @@ enum Mutation {
         reason: String,
     },
     /// The capture scope went unproven (lifecycle evidence or scope
-    /// custody lost): bound-pair growth stages nothing more, so every
-    /// counted column is a lower bound. The lifecycle/custody gap
-    /// discloses the cause; this carries no second gap.
+    /// custody lost): bound-pair growth stages nothing more (pending
+    /// first-sight installs still land, now `lossy`), so every counted
+    /// column is a lower bound. The lifecycle/custody gap discloses
+    /// the cause; this carries no second gap.
     NoteCountedLoss,
     NoteWitness {
         caller: CallerId,
@@ -2795,10 +2796,11 @@ pub(crate) struct CallerRegistry {
     /// The producer stopped: every watch ended here and none starts.
     watches_ended_ns: Option<u64>,
     /// The capture scope went unproven (lifecycle evidence or scope
-    /// custody lost): bound-pair growth stages nothing more, so every
-    /// counted column is a lower bound — set by `NoteCountedLoss`,
-    /// sticky for the capture, and honored by every later counted
-    /// install and `Counted` note, including edges born after the loss.
+    /// custody lost): bound-pair growth stages nothing more (pending
+    /// first-sight installs still land, now `lossy`), so every counted
+    /// column is a lower bound — set by `NoteCountedLoss`, sticky for
+    /// the capture, and honored by every later counted install and
+    /// `Counted` note, including edges born after the loss.
     counted_loss: bool,
     /// Coverage-note gaps already recorded, once per (caller, module,
     /// subject); bounded by the gap retention bound (past it the gap
@@ -3639,8 +3641,9 @@ impl CallerRegistry {
     }
 
     /// Stage one capture-unproven boundary: lifecycle evidence or scope
-    /// custody was lost, so bound-pair growth stages nothing more and
-    /// every counted column is a lower bound (`lossy`). Observed counts
+    /// custody was lost, so bound-pair growth stages nothing more
+    /// (pending first-sight installs still land, now `lossy`) and every
+    /// counted column is a lower bound (`lossy`). Observed counts
     /// stand; the lifecycle/custody gap discloses the cause, so this
     /// stages no second gap — never silent loss.
     pub(crate) fn note_counted_loss(&mut self) {
@@ -4209,8 +4212,9 @@ impl CallerRegistry {
                 self.counted_loss = true;
                 for edge in self.edges.values_mut() {
                     // The capture scope went unproven: bound-pair growth
-                    // stages nothing more, so every counted column is a
-                    // lower bound. Observed counts stand; the
+                    // stages nothing more (pending first-sight installs
+                    // still land, now lossy), so every counted column
+                    // is a lower bound. Observed counts stand; the
                     // lifecycle/custody gap discloses the cause.
                     if edge.coverage.counted_since_ns.is_some() || edge.entry_count > 0 {
                         edge.coverage.lossy = true;

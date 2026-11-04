@@ -217,9 +217,10 @@ explicit, narrow internal exceptions, not finite attribute values.
 
 ## Finite attribute vocabulary
 
-Class and key-type numbers follow the OASIS PKCS #11 3.0 `pkcs11t.h`;
-the pinned pkcs11-types `CkKeyType` table misnumbers values from 0x27
-upward and is not a source for this vocabulary. The selected attribute
+Class and key-type numbers follow the OASIS PKCS #11 3.0 `pkcs11t.h`.
+pkcs11-types is not a source for this vocabulary (its `CkKeyType` table
+misnumbered values from 0x27 upward before v0.2.3; the closed sets below
+stay the authority). The selected attribute
 selectors are a deliberately small subset of the pinned [pkcs11-types
 attribute definitions](https://github.com/mingulov/pkcs11-components/blob/v0.2.3/crates/types/src/attribute.rs).
 These sets are closed; support for another standard or vendor value requires

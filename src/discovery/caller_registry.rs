@@ -3014,6 +3014,14 @@ impl CallerRegistry {
         self.semantic_resources.snapshot()
     }
 
+    /// Shrink the pool to `room` bytes above its current charges, which
+    /// stay owned by the capture itself (no outside lease).
+    #[cfg(test)]
+    pub(crate) fn clamp_semantic_resource_room_for_test(&self, room: usize) {
+        let charged = self.semantic_resources.snapshot().charged_bytes;
+        self.semantic_resources.reference_set_limit(charged + room);
+    }
+
     #[cfg(test)]
     pub(crate) fn reference_semantic_resource_limit(&mut self, limit: usize) {
         assert_eq!(

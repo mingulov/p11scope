@@ -25,6 +25,8 @@ mod machine;
 #[cfg(test)]
 pub(crate) use machine::JointMachineIo;
 #[cfg(test)]
+pub(crate) use machine::MAX_UNPAID_VOID_YIELDS;
+#[cfg(test)]
 pub(crate) use machine::StagingDetail;
 pub(crate) use machine::{
     JOINT_FINISH_NO_PROGRESS_TIMEOUT, JOINT_FINISH_SETTLE_TIMEOUT, JointCommitRefusal,

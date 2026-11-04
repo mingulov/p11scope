@@ -54,6 +54,10 @@ fn reborrow_acquisition<'a, 'b: 'a>(
     }
 }
 
+/// Consecutive running Idle ticks an unpaid ingest-break void may yield
+/// before it takes the named disposition path.
+pub(crate) const MAX_UNPAID_VOID_YIELDS: u32 = 64;
+
 const RAW_CAPACITY: usize = 4_096;
 // Wall-time bound on a pre-grant linked quantum's extension: at most
 // this long from the quantum's first poll. An engineering limit: it
@@ -1228,6 +1232,9 @@ pub(crate) struct LiveJointMachine {
     absence_binding: usize,
     absence_after: Option<PinnedObjectId>,
     absence_entry: usize,
+    /// Consecutive running Idle ticks that yielded on an ingest-break
+    /// void the semantic pool could not pay for (reset when one applies).
+    unpaid_void_yields: u32,
     demand: Option<Demand>,
     prepared_base: u64,
     /// Diagnostic close-reason counts for pre-grant linked quanta
@@ -1333,6 +1340,7 @@ impl LiveJointMachine {
             absence_binding: 0,
             absence_after: None,
             absence_entry: 0,
+            unpaid_void_yields: 0,
             demand: None,
             prepared_base: 0,
             pregrant_close_counts: PregrantCloseCounts::default(),
@@ -2801,13 +2809,23 @@ impl LiveJointMachine {
                 // A void the semantic pool cannot pay for yet is retried on
                 // later running Idle ticks (it is idempotent and
                 // all-or-nothing): the tick yields instead of refusing, so
-                // a short pool never takes the disposition gate and stops
-                // S1. A finish keeps the refusal, so a stop never waits on
-                // the pool.
+                // a briefly short pool never takes the disposition gate.
+                // The wait is bounded: the pool may be full of the very
+                // custody the void would free, and collection waits behind
+                // it, so after MAX_UNPAID_VOID_YIELDS consecutive yields
+                // the void takes the named disposition path as before. A
+                // finish keeps the refusal, so a stop never waits on the
+                // pool.
                 if self.producers.journal_linked() {
                     let voided = match coordinator.joint_capture_mut().void_ingest_break() {
-                        Ok(voided) => voided,
-                        Err(RawQuantumRefusal::Resource(_)) if q.is_none() => {
+                        Ok(voided) => {
+                            self.unpaid_void_yields = 0;
+                            voided
+                        }
+                        Err(RawQuantumRefusal::Resource(_))
+                            if q.is_none() && self.unpaid_void_yields < MAX_UNPAID_VOID_YIELDS =>
+                        {
+                            self.unpaid_void_yields += 1;
                             return (Phase::Idle, Ok(Step::Yield));
                         }
                         Err(_) => return (Phase::Idle, Err(SemanticRefusal::Unavailable)),

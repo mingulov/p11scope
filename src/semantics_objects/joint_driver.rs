@@ -343,9 +343,10 @@ impl JointCaptureOwner {
         self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
         // Keep the abandonment (sessions Uncertain(Loss), views and objects
         // retired, bootstrap voided) for the next audit frame's consumers.
-        // An older void still awaiting its frame keeps its slot: it covers
-        // the earlier keys, and this one's effects are then dropped as
-        // before; its keys stay refused and its gap is still named.
+        // The next audit frame (ingested or disposed) takes the void in a
+        // slot of its own, and every void needs a re-sync and an ingest
+        // first, so an older void is always delivered before a newer one
+        // can apply. The guard keeps the first should that ever change.
         if self.pending_void.is_none() {
             self.pending_void = Some(PendingVoid {
                 failure,

@@ -8495,6 +8495,20 @@ fn joint_machine_break_void_carries_pre_break_session_ends() {
     use crate::semantics_objects::{ObjectEffect, ObjectGap, SessionEnd, SessionState};
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("pre-break-use", None);
+    let join_lost = |fixture: &MachineScene| {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .keyuse_for_test()
+            .evidence()
+            .join_lost
+    };
+    assert_eq!(join_lost(&fixture), 0, "the pre-break key use is open");
     let live: Vec<_> = fixture
         .scene
         .real
@@ -8563,6 +8577,11 @@ fn joint_machine_break_void_carries_pre_break_session_ends() {
         "the void keeps the pre-break session's Uncertain(Loss) end for the next frame"
     );
     fixture.published_labeled("linked-break-followup", None);
+    assert_eq!(
+        join_lost(&fixture),
+        1,
+        "the published per-key view loses the pre-break key use's join"
+    );
     assert!(
         fixture
             .scene
@@ -8667,6 +8686,90 @@ fn joint_machine_unpaid_linked_break_void_retries_until_paid() {
         api_returns(&fixture),
         before + 1,
         "S1 joins the follow-up call"
+    );
+}
+
+/// The unpaid-void wait is bounded. Here nothing outside the capture
+/// holds the pool: its limit sits just below the void's bound above the
+/// capture's own charges (the staged custody, model and ledger state the
+/// void would release). The void yields for the bounded number of Idle
+/// ticks, never applies partially, then takes the named disposition path
+/// instead of stalling collection indefinitely.
+#[test]
+fn joint_machine_unpaid_void_wait_is_bounded_by_the_lanes_own_custody() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    fixture.published_labeled("linked-break", None);
+    let pending = |fixture: &MachineScene| {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        (
+            adapter.stream_broken_for_test(),
+            adapter.invalidated_for_test(),
+        )
+    };
+    assert_eq!(pending(&fixture), (true, false), "the void is still due");
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let bound = coordinator
+        .joint_capture()
+        .void_storage_bound_for_test()
+        .expect("finite void bound");
+    let charged = coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .charged_bytes;
+    coordinator
+        .registry()
+        .clamp_semantic_resource_room_for_test(bound - 1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let cap = crate::inventory_semantics::MAX_UNPAID_VOID_YIELDS as usize;
+    let mut yields = 0;
+    let mut refused = None;
+    // A fixed window well past the bound: an unbounded wait never ends.
+    for _ in 0..1024 {
+        let result = fixture.service(1);
+        assert_eq!(pending(&fixture), (true, false), "no partial void");
+        match result {
+            Ok(_) => yields += 1,
+            Err(reason) => {
+                refused = Some(reason);
+                break;
+            }
+        }
+    }
+    assert!(
+        charged
+            <= fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .semantic_resource_snapshot()
+                .charged_bytes,
+        "the capture's own charges still fill the pool"
+    );
+    assert_eq!(
+        refused,
+        Some(SemanticRefusal::Unavailable),
+        "the wait ends on the named disposition path"
+    );
+    // Not every service reaches the Idle void tick, so the services that
+    // returned Ok bound the machine's Idle yields from above only.
+    assert!(
+        yields >= cap,
+        "{yields} services before the disposition (bound {cap} Idle yields)"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
     );
 }
 

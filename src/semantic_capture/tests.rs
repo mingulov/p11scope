@@ -1993,13 +1993,20 @@ fn joint_pre_key_raw_disposal_does_not_taint_the_callers_own_image() {
     harness.push_create(1);
     let mut raw = harness.collect();
     let (_report, admitted) = harness.route(&mut raw);
-    let image = (harness.io.current_image.task_cookie, harness.io.current_image.exec_id);
+    let image = (
+        harness.io.current_image.task_cookie,
+        harness.io.current_image.exec_id,
+    );
     let mut owner = JointCaptureOwner::from_existing_parts_for_test(
         harness.adapter,
         crate::semantics_objects::ObjectSemantics::new(),
     );
     let negative = raw
-        .dispose_without_ingest(&mut owner, &harness.producers, RawDisposeReason::NoAdmission)
+        .dispose_without_ingest(
+            &mut owner,
+            &harness.producers,
+            RawDisposeReason::NoAdmission,
+        )
         .unwrap_or_else(|(_, reason)| panic!("pre-key disposition: {reason:?}"));
     assert!(
         negative.failure().is_some(),
@@ -2036,13 +2043,20 @@ fn joint_raw_disposal_with_a_bound_key_still_taints_the_disposed_image() {
     harness.push_create(2);
     let mut raw = harness.collect();
     let (_report, next_admitted) = harness.route(&mut raw);
-    let image = (harness.io.current_image.task_cookie, harness.io.current_image.exec_id);
+    let image = (
+        harness.io.current_image.task_cookie,
+        harness.io.current_image.exec_id,
+    );
     let mut owner = JointCaptureOwner::from_existing_parts_for_test(
         harness.adapter,
         crate::semantics_objects::ObjectSemantics::new(),
     );
     let negative = raw
-        .dispose_without_ingest(&mut owner, &harness.producers, RawDisposeReason::NoAdmission)
+        .dispose_without_ingest(
+            &mut owner,
+            &harness.producers,
+            RawDisposeReason::NoAdmission,
+        )
         .unwrap_or_else(|(_, reason)| panic!("bound disposition: {reason:?}"));
     assert!(negative.failure().is_some(), "the loss stays named");
     assert!(

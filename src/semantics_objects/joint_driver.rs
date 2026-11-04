@@ -2177,12 +2177,9 @@ impl RawJointQuantum {
                 self.disposal_gap(&owner.adapter, unlocalized)
             };
             if pre_key {
-                owner.adapter.refuse_disposed_raw(
-                    &mut owner.model,
-                    std::iter::empty(),
-                    false,
-                    gap,
-                )
+                owner
+                    .adapter
+                    .refuse_disposed_raw(&mut owner.model, std::iter::empty(), false, gap)
             } else {
                 owner.adapter.refuse_disposed_raw(
                     &mut owner.model,

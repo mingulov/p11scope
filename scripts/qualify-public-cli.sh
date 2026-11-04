@@ -302,6 +302,68 @@ fifo_refused() {
   terminate "$wl"
   result fifo-refused "$([ "$rc" != 0 ] && [ "$rc" != 125 ] && [ "$rc" != 124 ] && [ -p fifo ] && grep -qai 'fifo\|not a regular\|refus' fifo.stderr && echo 1 || echo 0)" "rc=$rc"
 }
+run_prearm() {
+  # Owned-run pre-arm exactness (packet 6.13, R2-D1-6): the pause-held
+  # twin publishes unobserved_windows [] with exact ledger/trace counts;
+  # the passive twin (--pause never) keeps its single pre_attach window.
+  local name policy ledger output rc pp detail
+  for name in held passive; do
+    policy=auto; [ "$name" = passive ] && policy=never
+    ledger=$OUT/run-prearm-$name.wl
+    output=$(product_output "run-prearm-$name.txt")
+    rm -f -- "run-prearm-$name.txt" "run-prearm-$name.wl" "run-prearm-$name.stderr" "run-prearm-$name.stdout"
+    [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
+    # shellcheck disable=SC2086
+    SUDO_UID=$RUNUID SUDO_GID=$RUNGID "$P" run --trace --pause "$policy" --prearm-module "$MODULE" -o "$output" -- "$PREARM_LOADER" "$MODULE" "$ledger" 3 1500 > "run-prearm-$name.stdout" 2> "run-prearm-$name.stderr" & pp=$!; register "$pp" || true
+    if finish "$pp" "$EXIT_TICKS"; then rc=$LAST_EXIT; else rc=124; fi
+    publish_output "run-prearm-$name.txt" || rc=1
+    [ "$rc" = 0 ] || { result run-prearm 0 "$name twin failed rc=$rc" prearm-exactness; return 1; }
+  done
+  detail=$(python3 - <<'PY' 2>&1
+import json
+
+def load(name):
+    with open(f"run-prearm-{name}.stderr") as handle:
+        evidence = None
+        for line in handle:
+            if line.startswith("EVIDENCE "):
+                evidence = json.loads(line[len("EVIDENCE "):])
+    if evidence is None:
+        raise SystemExit(f"{name}: no EVIDENCE line")
+    with open(f"run-prearm-{name}.wl") as handle:
+        ledger = [json.loads(line) for line in handle if line.strip()]
+    with open(f"run-prearm-{name}.txt") as handle:
+        text = handle.read()
+    return evidence, ledger, text
+
+def prearmed_module(evidence):
+    mods = [m for m in evidence["discovery"] if "prearm" in m.get("sources", [])]
+    assert len(mods) == 1, f"one pre-armed module, got {len(mods)}"
+    return mods[0]
+
+def completed_calls(text, function):
+    return sum(1 for line in text.splitlines()
+               if f" {function} " in line and " \u2192 " in line)
+
+held_evidence, held_ledger, held_text = load("held")
+held = prearmed_module(held_evidence)
+assert held["unobserved_windows"] == [], held["unobserved_windows"]
+assert "scan" in held["sources"], held["sources"]
+summary = held_ledger[-1]
+assert (summary["initializes"], summary["finalizes"]) == (3, 3), summary
+counts = tuple(completed_calls(held_text, name)
+               for name in ("C_Initialize", "C_Finalize", "C_GetFunctionList"))
+assert counts == (3, 3, 1), counts
+passive = prearmed_module(load("passive")[0])
+assert "scan" in passive["sources"], passive["sources"]
+windows = passive["unobserved_windows"]
+assert windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach", windows
+assert windows[0]["end_ns"] == passive["attached_at_ns"], windows
+print("held [] with 3/3 ledger and 3/3/1 trace; passive keeps single pre_attach")
+PY
+) || { result run-prearm 0 "$(printf '%.600s' "$detail")" prearm-exactness; return 1; }
+  result run-prearm 1 "$detail" prearm-exactness
+}
 if [ "$CONTROL" = 1 ]; then
   if [ "$CONTROL_KIND" = signal ]; then second_sigint
   elif [ "$CONTROL_KIND" = fifo ]; then fifo_refused
@@ -311,8 +373,8 @@ if [ "$CONTROL" = 1 ]; then
 fi
 SRC=$HERE/../tests/fixtures/public-cli
 FIX=$OUT/fix; mkdir -p "$FIX"
-gcc -O1 -o "$FIX/gated" "$SRC/gated.c" -ldl && gcc -O2 -o "$FIX/mt" "$SRC/mt.c" -ldl -lpthread || exit 65
-GATED=$FIX/gated; MT=$FIX/mt
+gcc -O1 -o "$FIX/gated" "$SRC/gated.c" -ldl && gcc -O2 -o "$FIX/mt" "$SRC/mt.c" -ldl -lpthread && gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$FIX/prearm-first-use" "$SRC/prearm-first-use.c" -ldl || exit 65
+GATED=$FIX/gated; MT=$FIX/mt; PREARM_LOADER=$FIX/prearm-first-use
 chmod 755 "$FIX" "$GATED" "$MT"
 export SOFTHSM2_CONF=$OUT/softhsm2.conf
 mkdir -p tokens
@@ -357,6 +419,7 @@ PY
   then result "$cell" 0 'report smoke passed; first-call ledger and independent child exit remain unproved' nonqualifying
   else result "$cell" 0 "run smoke failed rc=$rc" failed; fi
 done
+run_prearm
 gated mt-exact pid "$MT" profile --pid @PID@ --duration 25 -o "$OUT/mt-exact.json"
 system_cell
 # Signal cells retain distinct expected exits; readiness is mandatory.
@@ -377,5 +440,5 @@ publish_output sigint.json || rc=1
 result sigint "$([ "$rc" = 0 ] && python3 -c 'import json; json.load(open("sigint.json"))' 2>/dev/null && echo 1 || echo 0)" "rc=$rc"
 second_sigint
 fifo_refused
-summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover mt-exact system sigint second-sigint fifo-refused
+summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm mt-exact system sigint second-sigint fifo-refused
 exit $?

@@ -636,7 +636,7 @@ jobs:
           rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
           cells = {row["cell"]: row for row in rows}
           need = {"doctor", "profile-pid", "names-pid", "verdict-pid", "metrics-pid", "trace-pid",
-                  "run-short", "run-cover", "mt-exact", "system", "sigint", "second-sigint",
+                  "run-short", "run-cover", "run-prearm", "mt-exact", "system", "sigint", "second-sigint",
                   "fifo-refused"}
           problems = sorted("missing cell " + name for name in need - set(cells))
           # The script marks these three as nonqualifying smoke by design;

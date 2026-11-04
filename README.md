@@ -491,10 +491,10 @@ report format.
   beside a non-closure provider, or when its opened file matches an
   operator-named `--module` path, and its published tables only when
   unnamed (mapped mid-capture, or alone in the first plan) — refused
-  whole when none of those admit. The prefix leaves the reserve free, so a
-  provider needing up to the remaining budget still fits, and a later
-  provider that still does not fit is
-  refused by name with the `--exclude-module` remedy. A `--cgroup` or `--system`
+  whole when none of those admit. The prefix leaves at least the reserve (128 of 512 slots) free, so one
+  later standard function list (at most 104 entries) always fits; a second
+  later provider may not fit and is then refused by name with the
+  `--exclude-module` remedy. A `--cgroup` or `--system`
   capture without `--module` admits each provider whole or not at all, by
   value — `--manifest` providers first, then providers whose function table
   is corroborated, then heuristic finds, proxy closure arrays last (closures:

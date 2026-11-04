@@ -182,9 +182,15 @@ provider). The terminal report names each refused or partially covered module
 with its reason: `run` and `profile` print a `Module gaps` section with the
 first five and an "and K more" line, and `inventory` prints the admission
 reason under each refused module. A capture whose only mapped provider is
-the proxy layer refuses it whole — with no provider beside it in the first
-plan there is no prefix — and stops at startup with that named refusal;
-naming it with `--module` admits the reserve-capped prefix instead.
+the proxy layer (a process that has not loaded the providers below it yet)
+starts with the proxy layer named as a `PARTIAL` gap — with no provider beside
+it in the first plan there is no prefix, and nothing of it is published yet —
+and attaches each provider below it whole as the process loads it. Naming the
+proxy layer with `--module` admits its reserve-capped prefix but narrows
+discovery to the named modules, so a provider below it is captured only when
+also named. A prefix leaves at least the reserve (128 of 512 slots) free, so
+one later standard function list (at most 104 entries) always fits; a second
+later provider may be refused by name.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,

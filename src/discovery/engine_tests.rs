@@ -5448,6 +5448,99 @@ fn exit_mapping_cgroup_kill_is_skipped_while_self_is_still_inside() {
     assert!(!cgroup_still_holds("garbage\n456\n", 123));
 }
 
+/// Whether `(uid, gid)` can search every ancestor directory of
+/// `path` (itself included): the owner needs `u+x`, a group member
+/// `g+x`, anyone else `o+x`. Mirrors the check the live exit-mapping
+/// cell needs before invoking the discover helper, which drops to an
+/// unprivileged identity before opening `--module`.
+fn helper_can_traverse_as(path: &std::path::Path, uid: u32, gid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut current: Option<&std::path::Path> = Some(path);
+    while let Some(dir) = current {
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return false;
+        };
+        if !meta.is_dir() && dir != path {
+            return false;
+        }
+        let mode = meta.mode();
+        let searchable = if meta.uid() == uid {
+            mode & 0o100 != 0
+        } else if meta.gid() == gid {
+            mode & 0o010 != 0
+        } else {
+            mode & 0o001 != 0
+        };
+        if !searchable {
+            return false;
+        }
+        current = dir.parent();
+    }
+    true
+}
+
+/// The identity the discover helper runs provider code as: root drops
+/// to `SUDO_UID`/`SUDO_GID` (nobody when unset), anyone else stays.
+fn helper_drop_target() -> (u32, u32) {
+    // SAFETY: geteuid/getegid only read this process's identities.
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if euid != 0 {
+        return (euid, egid);
+    }
+    let id = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .filter(|value| *value != 0 && *value != u32::MAX)
+            .unwrap_or(65_534)
+    };
+    (id("SUDO_UID"), id("SUDO_GID"))
+}
+
+/// The traversal pin fires on a private chain: a 0700 ancestor owned
+/// by someone else stops the dropped helper, like the campaign TMPDIR.
+#[test]
+fn exit_mapping_helper_traversal_rejects_private_ancestor() {
+    let dir = tempfile::Builder::new()
+        .prefix("exit-mapping-traverse-")
+        .tempdir_in("/var/tmp")
+        .expect("FHS /var/tmp must accept the probe dir");
+    let inner = dir.path().join("inner");
+    std::fs::create_dir(&inner).expect("inner");
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("private ancestor");
+    std::fs::set_permissions(&inner, std::os::unix::fs::PermissionsExt::from_mode(0o777))
+        .expect("open leaf");
+    assert!(!helper_can_traverse_as(&inner, u32::MAX - 1, u32::MAX - 1));
+    // The owner itself still traverses its own private chain.
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(dir.path()).expect("ancestor metadata");
+    assert!(helper_can_traverse_as(&inner, meta.uid(), meta.gid()));
+}
+
+/// The traversal pin passes a world-searchable chain with an open
+/// leaf, the shape the live cell builds its fixtures on.
+#[test]
+fn exit_mapping_helper_traversal_accepts_world_chain() {
+    let dir = tempfile::Builder::new()
+        .prefix("exit-mapping-traverse-")
+        .tempdir_in("/var/tmp")
+        .expect("FHS /var/tmp must accept the probe dir");
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("0755");
+    let inner = dir.path().join("inner");
+    std::fs::create_dir(&inner).expect("inner");
+    std::fs::set_permissions(&inner, std::os::unix::fs::PermissionsExt::from_mode(0o1777))
+        .expect("1777 leaf");
+    assert!(helper_can_traverse_as(&inner, u32::MAX - 1, u32::MAX - 1));
+}
+
 /// W8B-66: the virtme-guest predicate fires on the parameters
 /// virtme-ng unconditionally sets (`virtme_hostname=`,
 /// `virtme_console=`, bare `virtme.*` flags), never on host command
@@ -5692,6 +5785,12 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
     // tmpfs (/tmp is guest-local there), never under a host TMPDIR
     // naming the shared 9p tree, whose remapped ownership and device
     // identity the observer's checks rightly refuse.
+    //
+    // The discover helper drops to an unprivileged identity before
+    // opening --module, so the fixture dir must sit under a
+    // world-searchable base: the campaign TMPDIR is 0700 root, which
+    // the dropped helper cannot traverse. /var/tmp is FHS disk-backed
+    // 1777 on every campaign host.
     let dir = if running_in_virtme_guest() {
         tempfile::Builder::new()
             .prefix("exit-mappings-live-")
@@ -5700,8 +5799,8 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
     } else {
         tempfile::Builder::new()
             .prefix("exit-mappings-live-")
-            .tempdir()
-            .expect("disk-backed TMPDIR must accept the fixture dir")
+            .tempdir_in("/var/tmp")
+            .expect("FHS /var/tmp must accept the fixture dir")
     };
     // The discover helper drops privileges before executing provider
     // code and writing -o, so its output dir must stay writable to
@@ -5712,6 +5811,12 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         std::os::unix::fs::PermissionsExt::from_mode(0o1777),
     )
     .expect("fixture dir must accept the helper output");
+    let (drop_uid, drop_gid) = helper_drop_target();
+    assert!(
+        helper_can_traverse_as(dir.path(), drop_uid, drop_gid),
+        "{WHAT}: fixture dir {} is not traversable by the discover helper identity {drop_uid}:{drop_gid}",
+        dir.path().display()
+    );
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let provider = dir.path().join("provider.so");
     gcc_fixture(

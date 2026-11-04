@@ -3528,7 +3528,7 @@ fn quiet_collection_holds_at_most_the_batch_bound() {
     }
     assert_eq!(
         LaneWindows::PROVISIONAL.held_batches,
-        16_384,
+        65_536,
         "the shell budget pins the default"
     );
 }

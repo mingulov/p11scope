@@ -617,13 +617,17 @@ const _: () = assert!(
 pub const DISCOVERY_BYTES: u32 = 65_536;
 #[cfg(feature = "small-discovery-ring")]
 pub const DISCOVERY_BYTES: u32 = 4_096;
-/// The Inventory flavors' lifecycle (DISCOVERY) ring: 2 MiB holds 2,259
-/// records of 920 B plus an 8 B header, about 1.1 s of headroom at
-/// 1,000 execs/s against the ≤ 350 ms non-draining spans. The Detailed
-/// path keeps [`DISCOVERY_BYTES`]; the `small-discovery-ring` feature
-/// shrinks this constant to 4 KiB, as before, for the induced-loss leg.
+/// The Inventory flavors' lifecycle (DISCOVERY) ring: 8 MiB holds about
+/// 9,100 records of 920 B plus an 8 B header, about 4.3 s of headroom at
+/// 1,000 execs/s (two records each). Startup spans the semantic lane's
+/// load and the first pass, and under heavy churn 2 MiB lost about 18,000
+/// records there even with the startup drain; the userspace held bound
+/// absorbs the rest. Locked kernel memory: 8 MiB per Inventory capture.
+/// The Detailed path keeps [`DISCOVERY_BYTES`]; the `small-discovery-ring`
+/// feature shrinks this constant to 4 KiB, as before, for the induced-loss
+/// leg.
 #[cfg(not(feature = "small-discovery-ring"))]
-pub const INVENTORY_DISCOVERY_BYTES: u32 = 2 * 1024 * 1024;
+pub const INVENTORY_DISCOVERY_BYTES: u32 = 8 * 1024 * 1024;
 #[cfg(feature = "small-discovery-ring")]
 pub const INVENTORY_DISCOVERY_BYTES: u32 = 4_096;
 
@@ -1430,6 +1434,15 @@ pub mod capture {
 pub const RING_BYTES: u32 = 4 * 1024 * 1024;
 #[cfg(feature = "small-ring")]
 pub const RING_BYTES: u32 = 4096;
+
+/// EVENTS capacity for a capture whose journal (Joint key-operations)
+/// lane is active, sized at load; every other capture keeps
+/// [`RING_BYTES`]. A journaled call writes a 224 B START and a 632 B END,
+/// so 4 MiB holds about 0.45 s at 10,000 calls/s, less than one large
+/// quantum's seal; 16 MiB holds about 1.9 s. Locked kernel memory: 12 MiB
+/// more than the default, only while that lane is active.
+pub const JOINT_RING_BYTES: u32 = 16 * 1024 * 1024;
+const _: () = assert!(JOINT_RING_BYTES.is_power_of_two() && JOINT_RING_BYTES >= RING_BYTES);
 
 /// Maximum template attributes captured per event.
 pub const MAX_ATTRS: usize = 8;
@@ -2601,6 +2614,13 @@ mod tests {
         // opt-in only) can never change it silently.
         #[cfg(not(feature = "small-ring"))]
         assert_eq!(RING_BYTES, 4 * 1024 * 1024);
+    }
+
+    /// Only a journal (Joint) capture loads the larger EVENTS ring.
+    #[test]
+    fn joint_ring_bytes_is_16mib() {
+        assert_eq!(JOINT_RING_BYTES, 16 * 1024 * 1024);
+        assert_eq!(JOINT_RING_BYTES % 4096, 0);
     }
 
     #[test]
@@ -3863,12 +3883,12 @@ mod tests {
         }
     }
 
-    /// The Inventory flavors compile a 2 MiB lifecycle ring (4 KiB under
+    /// The Inventory flavors compile an 8 MiB lifecycle ring (4 KiB under
     /// the small-ring feature); Detailed keeps its 64 KiB constant above.
     #[test]
-    fn inventory_lifecycle_ring_is_two_mebibytes() {
+    fn inventory_lifecycle_ring_is_eight_mebibytes() {
         #[cfg(not(feature = "small-discovery-ring"))]
-        assert_eq!(INVENTORY_DISCOVERY_BYTES, 2 * 1024 * 1024);
+        assert_eq!(INVENTORY_DISCOVERY_BYTES, 8 * 1024 * 1024);
         #[cfg(feature = "small-discovery-ring")]
         assert_eq!(INVENTORY_DISCOVERY_BYTES, 4_096);
     }

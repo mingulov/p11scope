@@ -417,7 +417,7 @@ enum InventoryPreparation {
 }
 
 /// The DISCOVERY size this build's Inventory objects compiled with: the
-/// shared 2 MiB constant, or 4 KiB when `P11SCOPE_SMALL_DISCOVERY_RING=1`
+/// shared 8 MiB constant, or 4 KiB when `P11SCOPE_SMALL_DISCOVERY_RING=1`
 /// built them (the host dependency never carries that feature, so the
 /// small size is mirrored here from the build script's cfg). Both the
 /// exact-map validator and the lifecycle high-water share pin it.

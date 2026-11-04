@@ -100,22 +100,35 @@ pub(crate) struct StrictWitness {
     pub ebpf: aya::Ebpf,
 }
 
+/// Programs to verify at load: the family-independent set plus the
+/// caller's departure programs. The migrate program loads only for
+/// `--cgroup` (spec §4.4).
+pub(crate) fn witness_load_names(
+    depart_programs: &[&'static str],
+    need_migrate: bool,
+) -> Vec<&'static str> {
+    let mut names = vec![PROGRAM_UNMAP, PROGRAM_TORN, PROGRAM_WALK];
+    if need_migrate {
+        names.push(PROGRAM_MIGRATE);
+    }
+    names.extend(depart_programs.iter().copied());
+    names
+}
+
 /// Strict load: maps plus the named programs, with CO-RE relocated against
 /// readable `btf`. Every named program must verify; a missing target fails
 /// here (no silent skip).
 pub(crate) fn load_witness_programs(
     btf: &aya::Btf,
     depart_programs: &[&'static str],
+    need_migrate: bool,
 ) -> Result<StrictWitness, LoadError> {
     let mut loader = aya::EbpfLoader::new();
     loader.btf(Some(btf));
     let mut ebpf = loader
         .load(WITNESS_OBJECT)
         .map_err(|error| LoadError::Aya(format!("{error:#}")))?;
-    for name in [PROGRAM_UNMAP, PROGRAM_TORN, PROGRAM_MIGRATE, PROGRAM_WALK]
-        .into_iter()
-        .chain(depart_programs.iter().copied())
-    {
+    for name in witness_load_names(depart_programs, need_migrate) {
         let program = ebpf
             .program_mut(name)
             .ok_or(LoadError::MissingProgram(name))?;
@@ -1051,6 +1064,10 @@ pub(crate) struct WitnessVerdict {
     pub(crate) slots: Vec<WitnessSlot>,
 }
 
+/// Quiescent-close deadline (§4.6 step 3): 1 s as busy-poll flips.
+/// Each flip is one 1 ms sleep plus a state read.
+pub(crate) const QUIESCE_MAX_FLIPS: u32 = 1000;
+
 /// Backend operations for finalize (extends the start seam).
 pub(crate) trait FinalizeBackend {
     type Error: std::fmt::Debug;
@@ -1086,21 +1103,10 @@ pub(crate) fn finalize_with<B: FinalizeBackend>(
     let walk_ok = matches!(backend.run_walk(), Ok(WalkOutcome::Done));
     // Close ordering: deactivate, settle, read, release (always release).
     let _ = backend.deactivate();
-    let settled = backend.settle_busy(3).unwrap_or(false);
-    let mut state = backend.read_state().ok();
-    // Pending settle: a departure (exit_mm_release) and its teardown
-    // (fexit/exit_mmap) are microseconds apart; a state read landing
-    // between them sees a transient imbalance. Re-read briefly.
-    for _ in 0..5 {
-        match &state {
-            Some(s) if s.pending_in == s.pending_out => break,
-            Some(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-                state = backend.read_state().ok();
-            }
-            None => break,
-        }
-    }
+    let settled = backend.settle_busy(QUIESCE_MAX_FLIPS).unwrap_or(false);
+    // Single close-time read (§4.6 step 4): pending is frozen after
+    // deactivate + settle, so re-reading cannot observe a change.
+    let state = backend.read_state().ok();
     let _ = backend.release();
     if !walk_ok {
         return keep_all(KeepReason::Walk);
@@ -1194,7 +1200,7 @@ pub(crate) fn start(
         DepartFamily::Pair => &[PROGRAM_DEPART_EXIT, PROGRAM_DEPART_EXEC],
         DepartFamily::Single => &[PROGRAM_DEPART],
     };
-    let loaded = load_witness_programs(&btf, depart)
+    let loaded = load_witness_programs(&btf, depart, need_migrate)
         .map_err(|error| Unavailable::Btf(format!("{error}")))?;
     let mut backend = LiveBackend::from_loaded(loaded.ebpf);
     // --pid walks use a pidfd link; cgroup/system walk whole-system.
@@ -1288,6 +1294,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn witness_load_names_gates_migrate_on_cgroup() {
+        // Spec §4.4: the migrate program loads only for `--cgroup`.
+        let depart: &[&'static str] =
+            &[super::PROGRAM_DEPART_EXIT, super::PROGRAM_DEPART_EXEC];
+        let with = super::witness_load_names(depart, true);
+        assert!(
+            with.contains(&super::PROGRAM_MIGRATE),
+            "cgroup loads migrate: {with:?}"
+        );
+        let without = super::witness_load_names(depart, false);
+        assert!(
+            !without.contains(&super::PROGRAM_MIGRATE),
+            "pid/system skip migrate: {without:?}"
+        );
+        for name in [
+            super::PROGRAM_UNMAP,
+            super::PROGRAM_TORN,
+            super::PROGRAM_WALK,
+            super::PROGRAM_DEPART_EXIT,
+            super::PROGRAM_DEPART_EXEC,
+        ] {
+            assert!(with.contains(&name), "{name} loads for cgroup");
+            assert!(without.contains(&name), "{name} loads for pid/system");
+        }
+    }
+
     /// Privileged: the witness object loads and attaches on the host kernel.
     /// Records per-program verifier instruction counts via eprintln (copied
     /// into the phase report and P2-9 budgets).
@@ -1305,7 +1338,7 @@ mod tests {
             &[super::PROGRAM_DEPART_EXIT, super::PROGRAM_DEPART_EXEC]
         };
         let mut loaded =
-            super::load_witness_programs(&btf, depart).expect("witness programs verify");
+            super::load_witness_programs(&btf, depart, true).expect("witness programs verify");
         // Attach every loaded program; links drop at scope end.
         let mut attached = Vec::new();
         for name in [
@@ -1606,7 +1639,7 @@ mod tests {
         } else {
             &[super::PROGRAM_DEPART_EXIT, super::PROGRAM_DEPART_EXEC]
         };
-        let mut loaded = super::load_witness_programs(&btf, depart).expect("witness loads");
+        let mut loaded = super::load_witness_programs(&btf, depart, true).expect("witness loads");
         // Calibrate the kernel file key via a real unmap (Btrfs st_dev can
         // differ from the mapped s_dev, so fstat alone is wrong): attach the
         // unmap hook, mmap+munmap one page, and read back PW_CALIB.
@@ -2095,7 +2128,7 @@ mod tests {
             super::DepartFamily::Pair => &[super::PROGRAM_DEPART_EXIT, super::PROGRAM_DEPART_EXEC],
             super::DepartFamily::Single => &[super::PROGRAM_DEPART],
         };
-        let loaded = super::load_witness_programs(&btf, depart).expect("witness loads");
+        let loaded = super::load_witness_programs(&btf, depart, false).expect("witness loads");
         let backend = super::LiveBackend::from_loaded(loaded.ebpf);
         let witnessed = super::start_with(
             std::slice::from_ref(&path),
@@ -2124,6 +2157,7 @@ mod tests {
         state: super::PwState,
         busy_settles: bool,
         misses: u64,
+        settle_max: Option<u32>,
     }
 
     impl ScriptFinalize {
@@ -2138,6 +2172,7 @@ mod tests {
                 state,
                 busy_settles: true,
                 misses: 0,
+                settle_max: None,
             }
         }
     }
@@ -2156,8 +2191,9 @@ mod tests {
             self.ops.push("deactivate".into());
             Ok(())
         }
-        fn settle_busy(&mut self, _max: u32) -> Result<bool, String> {
+        fn settle_busy(&mut self, max: u32) -> Result<bool, String> {
             self.ops.push("settle".into());
+            self.settle_max = Some(max);
             Ok(self.busy_settles)
         }
         fn release(&mut self) -> Result<(), String> {
@@ -2222,6 +2258,41 @@ mod tests {
         assert_eq!(
             verdicts,
             vec![super::FileVerdict::Keep(super::KeepReason::Quiesce)]
+        );
+    }
+
+    #[test]
+    fn finalize_pending_reads_state_once() {
+        // Spec §4.6 step 4 reads PW_STATE once: pending is frozen after
+        // deactivate + settle (later hooks return before touching it),
+        // so re-reading cannot observe a change.
+        let mut backend = ScriptFinalize::clean();
+        backend.state.pending_in = 2;
+        backend.state.pending_out = 1;
+        let verdicts = super::finalize_with(&mut backend, 1, Some("1".into()));
+        assert_eq!(
+            verdicts,
+            vec![super::FileVerdict::Keep(super::KeepReason::Pending)]
+        );
+        assert_eq!(
+            backend.ops.iter().filter(|op| *op == "read").count(),
+            1,
+            "single state read: {:?}",
+            backend.ops
+        );
+    }
+
+    #[test]
+    fn finalize_quiesce_bound_is_one_second() {
+        // Spec §4.6 step 3: poll busy with a 1 s deadline. Each flip is
+        // one 1 ms sleep plus a read, so 1000 flips ≈ 1 s.
+        let mut backend = ScriptFinalize::clean();
+        super::finalize_with(&mut backend, 1, Some("1".into()));
+        assert_eq!(
+            backend.settle_max,
+            Some(1000),
+            "quiesce deadline flips: {:?}",
+            backend.settle_max
         );
     }
 
@@ -2445,7 +2516,7 @@ mod tests {
             super::DepartFamily::Pair => &[super::PROGRAM_DEPART_EXIT, super::PROGRAM_DEPART_EXEC],
             super::DepartFamily::Single => &[super::PROGRAM_DEPART],
         };
-        let loaded = super::load_witness_programs(&btf, depart).expect("witness loads");
+        let loaded = super::load_witness_programs(&btf, depart, false).expect("witness loads");
         let backend = super::LiveBackend::from_loaded(loaded.ebpf);
         let mut witnessed = super::start_with(
             std::slice::from_ref(&path),
@@ -2497,7 +2568,7 @@ mod tests {
             super::DepartFamily::Pair => &[super::PROGRAM_DEPART_EXIT, super::PROGRAM_DEPART_EXEC],
             super::DepartFamily::Single => &[super::PROGRAM_DEPART],
         };
-        let loaded = super::load_witness_programs(&btf, depart).expect("witness loads");
+        let loaded = super::load_witness_programs(&btf, depart, false).expect("witness loads");
         let backend = super::LiveBackend::from_loaded(loaded.ebpf);
         let mut witnessed = super::start_with(
             std::slice::from_ref(&path),

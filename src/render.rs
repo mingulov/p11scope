@@ -8602,6 +8602,49 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn profile_json_cgroup_mechanism_rows_carry_registered_flag() {
+        // The cgroup breakdown names the same registry membership as
+        // the top-level rows: system scope is the main surface, and an
+        // unregistered id there used to render with no flag at all. A
+        // later observation without the bit must not clear it —
+        // membership is fixed per capture, so the flag is sticky.
+        let mut state = crate::semantics::State::new(&init_plan());
+        let mut flagged = init_event(0, UNREGISTERED_SENTINEL, 0, 0, 0, 0);
+        flagged.cgroup_id = 111;
+        flagged.capture |= p11scope_ebpf_common::capture::MECHANISM_UNREGISTERED;
+        state.observe(&flagged);
+        let mut plain = init_event(0, UNREGISTERED_SENTINEL, 0, 0, 0, 0);
+        plain.cgroup_id = 111;
+        state.observe(&plain);
+        let mut registered = init_event(0, 0x0D, 0, 0, 0, 0);
+        registered.cgroup_id = 111;
+        state.observe(&registered);
+
+        let mut ev = evidence();
+        ev.verdict();
+        let capture = capture_fixture();
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
+
+        let cgroups = v["cgroups"].as_array().unwrap();
+        assert_eq!(cgroups.len(), 1);
+        let rows = cgroups[0]["mechanisms"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let unreg = rows
+            .iter()
+            .find(|row| row["mechanism"] == UNREGISTERED_SENTINEL)
+            .expect("unregistered cgroup row present");
+        assert_eq!(unreg["mechanism_hex"], "0xce5343a9");
+        assert_eq!(unreg["calls"], 2);
+        assert_eq!(unreg["registered"], false);
+        let reg = rows
+            .iter()
+            .find(|row| row["mechanism"] == 0x0D)
+            .expect("registered cgroup row present");
+        assert_eq!(reg["calls"], 1);
+        assert_eq!(reg["registered"], true);
+    }
+
     // ---- Slice 1b-2 public evidence contract (design §5.5–§5.7, §9) -------
     //
     // These freeze the exact published vocabulary. Every key below is named by

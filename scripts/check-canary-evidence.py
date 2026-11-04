@@ -2104,6 +2104,40 @@ def main(argv=None):
         bad_safe["evidence"]["semantic_capture_failures"] = 4
         reject("safe profile failure total", lambda: assert_safe_profile(bad_safe))
 
+        # 32-bit targets publish the narrow unknown ids as approved
+        # registered:false rows; 64-bit targets keep them absent (the
+        # self-test otherwise runs on 64-bit globals).
+        initialize(32)
+        safe32 = {
+            "schema": "p11scope/observed-profile/v3",
+            "capture": {"mode": "profile", "privacy_mode": "allowlisted"},
+            "evidence": {**full_fixture, **selection_fixture,
+                         "completeness": "PARTIAL", "unregistered_mechanisms": 2,
+                         "semantic_capture_failures": 3, "async_target_failures": 2},
+            "mechanisms": [
+                {"mechanism": REGISTERED, "params": None,
+                 "params_omitted": "policy", "registered": True, "calls": 1},
+                {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                 "params": None, "params_omitted": "policy",
+                 "registered": False, "calls": 1},
+                {"mechanism": MAXIMUM, "mechanism_hex": f"0x{MAXIMUM:x}",
+                 "params": None, "params_omitted": "policy",
+                 "registered": False, "calls": 1},
+            ],
+            "templates": {"operations": []},
+        }
+        assert_safe_profile(safe32)
+        param_leak = json.loads(json.dumps(safe32))
+        param_leak["mechanisms"][1]["params"] = [{
+            "shape": "rsa_pkcs_pss", "hash_alg": ALIASES["pss_hash"],
+            "hash_alg_hex": f"0x{ALIASES['pss_hash']:x}",
+            "mgf": ALIASES["pss_mgf"], "salt_len": ALIASES["pss_salt"],
+            "count": 1,
+        }]
+        reject("safe profile parameter value inside a registered:false row",
+               lambda: assert_safe_profile(param_leak))
+        initialize(64)
+
         safe_trace = "CAPTURE privacy=allowlisted\nC_DigestInit 0x250\n" + count_line() + \
             "EVIDENCE " + json.dumps(
             terminal("allowlisted", 3, 2)
@@ -2127,6 +2161,25 @@ def main(argv=None):
         reject("safe trace count evidence shape", lambda: assert_safe_trace(
             safe_trace.replace('"raw_calls": 3', '"raw_calls_extra": 3')
         ))
+
+        # 32-bit targets render the narrow unknown ids only as mechanism
+        # tokens (` C_<name> 0x… → `); parameter values stay absent.
+        initialize(32)
+        trace32 = ("CAPTURE privacy=allowlisted\nC_DigestInit 0x250\n"
+                   f"op C_EncryptInit 0x{UNKNOWN:x} → CKR_OK 1ns\n"
+                   f"op C_DecryptInit 0x{MAXIMUM:x} → CKR_OK 1ns\n"
+                   + count_line() + "EVIDENCE " + json.dumps(
+                       terminal("allowlisted", 3, 2)))
+        assert_safe_trace(trace32)
+        reject("safe trace 32-bit parameter value", lambda: assert_safe_trace(
+            trace32.replace("C_DigestInit 0x250",
+                            f"C_DigestInit 0x250 0x{ALIASES['pss_hash']:x}")
+        ))
+        reject("safe trace 32-bit misplaced mechanism value",
+               lambda: assert_safe_trace(trace32.replace(
+                   f"0x{UNKNOWN:x} → CKR_OK",
+                   f"0x{UNKNOWN:x} → CKR_OK 0x{UNKNOWN:x}")))
+        initialize(64)
 
         pss = [{
             "shape": "rsa_pkcs_pss", "hash_alg": ALIASES["pss_hash"],

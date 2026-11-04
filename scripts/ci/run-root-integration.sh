@@ -30,7 +30,7 @@
 #
 # Arguments:
 #   P11SCOPE      the observer binary under test (exported to the cells
-#                 as P11SCOPE_BIN; the cells honor it over their
+#                 as P11SCOPE_E2E_OBSERVER; the cells honor it over their
 #                 build-time binary path).
 #   OUTDIR        receives results.jsonl, summary.txt and one
 #                 <target>.<test>.log per cell.
@@ -222,10 +222,10 @@ for cell in "${CELLS[@]}"; do
     log="$OUT/$target.$test.log"
     start=$(date +%s%N)
     if [ -n "$ignored" ]; then
-        P11SCOPE_REQUIRE_CAPTURE=1 P11SCOPE_BIN="$P" TMPDIR="$PRIVTMP" \
+        P11SCOPE_REQUIRE_CAPTURE=1 P11SCOPE_E2E_OBSERVER="$P" TMPDIR="$PRIVTMP" \
             timeout 300 "$bin" --exact --ignored "$test" --nocapture --test-threads=1 >"$log" 2>&1
     else
-        P11SCOPE_REQUIRE_CAPTURE=1 P11SCOPE_BIN="$P" TMPDIR="$PRIVTMP" \
+        P11SCOPE_REQUIRE_CAPTURE=1 P11SCOPE_E2E_OBSERVER="$P" TMPDIR="$PRIVTMP" \
             timeout 300 "$bin" --exact "$test" --nocapture --test-threads=1 >"$log" 2>&1
     fi
     rc=$?

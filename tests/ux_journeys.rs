@@ -22,12 +22,12 @@ mod multi_host;
 #[allow(dead_code)]
 mod support;
 
-/// The observer under test: the matrix `P11SCOPE_BIN` override when the
+/// The observer under test: the `P11SCOPE_E2E_OBSERVER` override when the
 /// runner stages a prebuilt binary elsewhere, else the binary Cargo built
 /// beside this test target.
 fn bin() -> String {
-    std::env::var("P11SCOPE_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_p11scope").to_string())
-}
+    std::env::var("P11SCOPE_E2E_OBSERVER")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_p11scope").to_string())
 }
 
 struct Outcome {

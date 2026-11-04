@@ -2465,6 +2465,9 @@ def main(argv=None):
                lambda: assert_safe_trace(trace32.replace(
                    f"0x{UNKNOWN:x} → CKR_OK",
                    f"0x{UNKNOWN:x} → CKR_OK 0x{UNKNOWN:x}")))
+        reject("safe trace 32-bit digit in function name",
+               lambda: assert_safe_trace(trace32.replace(
+                   "C_EncryptInit", "C_Encrypt123")))
 
         # The lane-scan strip removes only the approved positions: a
         # parameter alias smuggled into a row, a misplaced token, or
@@ -2535,6 +2538,8 @@ def main(argv=None):
         assert alias_hits(strip_approved_mechanism_tokens(misplaced)) == {"mechanism"}
         packed = struct.pack("<Q", UNKNOWN)
         assert alias_hits(strip_approved_mechanism_tokens(packed)) == {"mechanism"}
+        digit_name = f"op C_Encrypt123 0x{UNKNOWN:x} → CKR_OK\n".encode()
+        assert alias_hits(strip_approved_mechanism_tokens(digit_name)) == {"mechanism"}
         with tempfile.TemporaryDirectory() as tmp:
             lane_log = Path(tmp) / "default-safe-trace.observer.log"
             lane_log.write_bytes(token_line + b"p11scope: capture ended\n")
@@ -2544,6 +2549,18 @@ def main(argv=None):
             reject("observer log misplaced mechanism value",
                    lambda: assert_safe_lane_alias_privacy(
                        "default-safe-trace", [lane_log]))
+        with tempfile.TemporaryDirectory() as tmp:
+            lane_out = Path(tmp) / "default-safe-trace.output"
+            lane_log = Path(tmp) / "default-safe-trace.observer.log"
+            lane_out.write_bytes(token_line)
+            lane_log.write_bytes(token_line + b"p11scope: capture ended\n")
+            assert_safe_lane_alias_privacy(
+                "default-safe-trace", [lane_out, lane_log])
+            log_only = f"diagnostic C_EncryptInit 0x{UNKNOWN:x} → note\n".encode()
+            lane_log.write_bytes(token_line + log_only)
+            reject("observer log token on a log-only line",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-trace", [lane_out, lane_log]))
         # The EVENTS.raw final scan zeroes only the approved mechanism
         # field: a packed parameter alias, or UNKNOWN outside [48,56),
         # still fails.

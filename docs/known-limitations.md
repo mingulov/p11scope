@@ -1429,6 +1429,30 @@ The old bounds are measurements, not a product startup SLA.
   exec/s and beyond any loss stays explicit, with its demotion rate
   published.
 
+### Busy hosts: skipped mapping hooks start new coverage eras (v0.6.0)
+
+- What the user sees: on a busy host the kernel can skip p11scope's
+  mapping hooks (a preempted hook counts a recursion miss). Each skip
+  starts a new coverage era: calls in flight are counted as unattributed
+  (`fault_era`), and key-operation tracking ends for keys that existed
+  before the skip, with a named gap. Each running program's load is
+  proven again; a load whose mapping is unchanged keeps its instance
+  row, which is then marked uncertain (`instance_reload_not_excluded`:
+  a same-address reload hidden by the skip would merge into that row).
+  A changed load gets a new row. Call totals stay exact.
+- Measured: under deliberate CPU contention (5 busy loops on a 5-vCPU
+  VM, 1,000 calls/s, 60 s) about 1,700-2,800 map and 5,400-5,900 unmap
+  misses; 91-93% of calls were joined and the rest were counted as
+  unattributed. Before v0.6.0 the first miss ended attribution for the
+  rest of the capture.
+- Disclosure: the stderr stop line ends with `hook misses N, eras N,
+  instances N`; the `semantic calls unrouted` gap counts `fault_era`
+  calls; the Joint gap names `joint_seal_fault_changed_history_loss`.
+- Workaround: a quieter host, or fewer competing CPU-bound jobs during
+  the capture.
+- Planned: moving the mapping hooks off preemptible trampolines
+  (v0.7.0 list).
+
 ### Data-only mappers are not callers; copied code is not inventoried (A6)
 
 - What the user sees: since v0.3.0 (unreleased), a process is a caller of a

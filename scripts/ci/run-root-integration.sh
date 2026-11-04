@@ -264,11 +264,11 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
     LOG_BODY='test one ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 300.00s'
     check 'ux_journeys::t3_f3_doctor_verdict_ends_with_newline' 124 1 False failed 'TIMEOUT after 300s'
-    # Expected-failure paths: a failing listed cell is recorded, a passing
-    # listed cell fails the run.
+    # Expected-failure paths: a failing listed cell is recorded without
+    # failing the run, a passing listed cell fails the run.
     LOG_BODY='test one ... FAILED
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s'
-    check 'fixture::expected_failure_cell' 101 1 False expected-failure '(expected: self-test expected reason)'
+    check 'fixture::expected_failure_cell' 101 0 False expected-failure '(expected: self-test expected reason)'
     LOG_BODY=$POSITIVE
     check 'fixture::expected_failure_cell' 0 1 True qualified 'XPASS'
     # Every emitted row carries exactly the shared 4-key shape.
@@ -290,8 +290,9 @@ PY
     if grep -v '^[[:space:]]*#' "${BASH_SOURCE[0]}" | grep -q "$matrix_var"; then
         fail 'the matrix observer variable is still referenced outside comments'
     fi
-    # The terminal gate: green rows pass, a failed cell, an XPASS row, and
-    # a missing row each fail.
+    # The terminal gate: green and expected-failure rows pass; a failed
+    # cell, an XPASS row, a missing row, a duplicate row, and an extra row
+    # each fail.
     gate="$self_tmp/gate.jsonl"
     printf '%s\n' '{"cell": "a", "pass": true, "detail": "ok", "qualification": "qualified"}' >"$gate"
     write_summary "$gate" "$self_tmp/gate.txt" a >/dev/null 2>&1 || fail 'summary rejects a green row set'
@@ -301,6 +302,12 @@ PY
     write_summary "$gate" "$self_tmp/gate.txt" a >/dev/null 2>&1 && fail 'summary accepts an unexpected pass'
     printf '%s\n' '{"cell": "a", "pass": true, "detail": "ok", "qualification": "qualified"}' >"$gate"
     write_summary "$gate" "$self_tmp/gate.txt" a b >/dev/null 2>&1 && fail 'summary accepts a missing row'
+    printf '%s\n' '{"cell": "a", "pass": true, "detail": "ok", "qualification": "qualified"}' '{"cell": "a", "pass": true, "detail": "ok", "qualification": "qualified"}' >"$gate"
+    write_summary "$gate" "$self_tmp/gate.txt" a >/dev/null 2>&1 && fail 'summary accepts a duplicate row'
+    printf '%s\n' '{"cell": "a", "pass": true, "detail": "ok", "qualification": "qualified"}' '{"cell": "b", "pass": true, "detail": "ok", "qualification": "qualified"}' >"$gate"
+    write_summary "$gate" "$self_tmp/gate.txt" a >/dev/null 2>&1 && fail 'summary accepts an extra row'
+    printf '%s\n' '{"cell": "a", "pass": false, "detail": "no (expected: reason)", "qualification": "expected-failure"}' >"$gate"
+    write_summary "$gate" "$self_tmp/gate.txt" a >/dev/null 2>&1 || fail 'summary rejects an expected-failure row'
     rm -rf "$self_tmp"
     if [ "$fails" -eq 0 ]; then
         echo "self-test: $n fixtures judged rightly, rows and summary gate ok"
